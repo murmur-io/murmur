@@ -87,6 +87,16 @@
   letter-spacing: -0.025em;
   font-variant-numeric: tabular-nums;
 }
+/*
+ * The honest gloss under a tile's number: what the unit means ("roughly ¾ of a word each"), or
+ * what the number does NOT cover ("names are not removed unless you turn on name masking").
+ * Deliberately quiet, but never truncated — it is the clause that keeps the tile from overclaiming.
+ */
+.eg-tile-note {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.35;
+}
 
 /* --- Section headings --- */
 .eg-section {

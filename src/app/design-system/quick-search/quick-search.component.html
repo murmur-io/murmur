@@ -64,7 +64,9 @@
               <span class="qs-row-snippet">{{ row.snippet }}</span>
             </span>
             <span class="qs-row-meta">
-              <span class="qs-chip">{{ row.matchedIn }}</span>
+              @if (row.matchedIn) {
+                <span class="qs-chip">{{ row.matchedIn }}</span>
+              }
               <span class="qs-date">{{ row.dateLabel }}</span>
             </span>
           </button>

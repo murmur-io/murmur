@@ -31,6 +31,7 @@ import {
   type AttachmentPastePlan,
   type MarkdownEdit,
 } from "../../../services/note-attachment.service";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 export interface ActionItemLine {
@@ -144,6 +145,7 @@ export class NotePanelComponent {
   private readonly attachmentService = inject(NoteAttachmentService);
   private readonly toast = inject(ToastService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
   private destroyed = false;
 
   constructor() {
@@ -397,7 +399,7 @@ export class NotePanelComponent {
         } catch (error) {
           if (this.meetingId() === meetingId && this.editing()) {
             this.replacePendingAttachment(id, "");
-            this.toast.danger(String(error));
+            this.toast.danger(this.errorCopy.humanize(error));
           }
         }
       }

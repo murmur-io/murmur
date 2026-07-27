@@ -1,5 +1,11 @@
 import { Injectable, inject } from "@angular/core";
 import { IpcService } from "../core/ipc.service";
+// P3: this service's refusals are the one population of frontend-authored, already-finished user
+// copy — the pasted-image preflight rejects a decompression bomb from its bounded header, before a
+// decoder allocates and before anything crosses IPC, so there is no `AppError` to carry an
+// `errcode`. Throwing the marker type is what tells `ErrorCopyService.humanize()` the sentence is
+// already the copy layer's own and must be shown verbatim rather than denied to the generic one.
+import { UserFacingError } from "../core/copy/error-copy.service";
 import type {
   NoteAttachmentDto,
   NoteAttachmentOwnerKind,
@@ -676,10 +682,10 @@ export class NoteAttachmentService {
   ): Promise<{ blob: Blob; mime: "image/webp" | "image/png"; width: number; height: number }> {
     const mimeType = sourceBlob.type.toLowerCase();
     if (!INPUT_IMAGE_TYPES.has(mimeType)) {
-      throw new Error("Choose a PNG, JPEG, or WebP image.");
+      throw new UserFacingError("Choose a PNG, JPEG, or WebP image.");
     }
     if (sourceBlob.size > MAX_SOURCE_BYTES) {
-      throw new Error("That image is too large to process safely (24 MB maximum).");
+      throw new UserFacingError("That image is too large to process safely (24 MB maximum).");
     }
 
     const header = new Uint8Array(
@@ -687,27 +693,27 @@ export class NoteAttachmentService {
     );
     const expected = imageDimensions(mimeType, header);
     if (!expected || expected.width < 1 || expected.height < 1) {
-      throw new Error("That image’s dimensions could not be validated safely.");
+      throw new UserFacingError("That image’s dimensions could not be validated safely.");
     }
     if (
       expected.width > MAX_SOURCE_EDGE ||
       expected.height > MAX_SOURCE_EDGE ||
       expected.width > MAX_SOURCE_PIXELS / expected.height
     ) {
-      throw new Error("That image’s dimensions are too large to process safely.");
+      throw new UserFacingError("That image’s dimensions are too large to process safely.");
     }
 
     const decoded = await this.decodeImage(sourceBlob);
     try {
       if (decoded.width < 1 || decoded.height < 1) {
-        throw new Error("That image could not be decoded.");
+        throw new UserFacingError("That image could not be decoded.");
       }
       const sameOrientation =
         decoded.width === expected.width && decoded.height === expected.height;
       const rotatedOrientation =
         decoded.width === expected.height && decoded.height === expected.width;
       if (!sameOrientation && !rotatedOrientation) {
-        throw new Error("That image’s decoded dimensions do not match its container.");
+        throw new UserFacingError("That image’s decoded dimensions do not match its container.");
       }
       const initialScale = Math.min(1, MAX_EDGE / Math.max(decoded.width, decoded.height));
       let width = Math.max(1, Math.round(decoded.width * initialScale));
@@ -721,7 +727,7 @@ export class NoteAttachmentService {
         canvas.height = height;
         const context = canvas.getContext("2d", { alpha: true });
         if (!context) {
-          throw new Error("Image processing is unavailable in this window.");
+          throw new UserFacingError("Image processing is unavailable in this window.");
         }
         context.drawImage(decoded.source, 0, 0, width, height);
 
@@ -771,11 +777,11 @@ export class NoteAttachmentService {
         height = nextHeight;
       }
       if (!producedAnyBlob) {
-        throw new Error(
+        throw new UserFacingError(
           "This browser can’t encode images for upload. Update macOS and try again.",
         );
       }
-      throw new Error("That image is too detailed to fit the 3 MB note-image limit.");
+      throw new UserFacingError("That image is too detailed to fit the 3 MB note-image limit.");
     } finally {
       decoded.close();
     }
@@ -806,7 +812,7 @@ export class NoteAttachmentService {
     const dataUrl = await this.readAsDataUrl(blob);
     await new Promise<void>((resolve, reject) => {
       image.onload = () => resolve();
-      image.onerror = () => reject(new Error("That image could not be decoded."));
+      image.onerror = () => reject(new UserFacingError("That image could not be decoded."));
       image.src = dataUrl;
     });
     return {
@@ -824,8 +830,8 @@ export class NoteAttachmentService {
       reader.onload = () =>
         typeof reader.result === "string"
           ? resolve(reader.result)
-          : reject(new Error("That image could not be decoded."));
-      reader.onerror = () => reject(new Error("That image could not be decoded."));
+          : reject(new UserFacingError("That image could not be decoded."));
+      reader.onerror = () => reject(new UserFacingError("That image could not be decoded."));
       reader.readAsDataURL(blob);
     });
   }

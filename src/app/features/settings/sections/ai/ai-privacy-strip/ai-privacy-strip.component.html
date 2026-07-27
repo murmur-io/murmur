@@ -4,11 +4,16 @@
   </div>
 
   <div class="strip-lines">
+    <!--
+      "embeddings" was on the never-show list (glossary.ts) — the user-facing name for what that
+      work produces is the search index. The list is otherwise unchanged: shortening it would drop
+      facts, which is the one thing a plain-language pass must not do.
+    -->
     <div class="strip-line">
       <span class="strip-dot is-local" aria-hidden="true"></span>
       <span class="text-secondary">
         <strong class="strip-strong">Stays on this Mac:</strong>
-        transcription, embeddings, name redaction, proactive hints, local
+        transcription, the search index, name masking, proactive hints, local
         models
       </span>
     </div>
@@ -22,18 +27,17 @@
         </span>
       </div>
       <!--
-        Honest caveat (fast-follow #3): personal-NAME masking is best-effort
-        and only active once the optional on-device NER model is downloaded.
-        Emails / phones / cards are always regex-scrubbed regardless. Shown
-        only when text actually leaves the Mac AND the model is absent — a
-        calm nudge, not an alarm. Enable it in the Privacy section.
+        PROTECTED CLAUSE — pinned by e2e/settings/privacy-honesty.spec.ts.
+        Name masking is only active once the optional on-device model is downloaded; emails,
+        phones and cards are always removed. Both halves must survive any rewrite: dropping the
+        negative ("names are NOT masked") is exactly how a de-jargoning pass makes the app less
+        honest. Shown only when text actually leaves the Mac AND the model is absent.
       -->
       @if (nerModelPresent() === false) {
         <p class="strip-subnote text-muted">
-          Personal names aren't masked before this leaves your Mac yet —
-          on-device name masking needs the optional model, and names are only
-          masked once it's downloaded (in Privacy &amp; integrations). Emails,
-          phone numbers and card numbers are always scrubbed.
+          Names are NOT removed. Emails, phone numbers and card numbers are
+          always removed before this leaves your Mac, but people's names go with
+          the text until you turn on name masking (in Privacy &amp; integrations).
         </p>
       }
     }
@@ -101,7 +105,8 @@
         }
       </button>
       <span class="text-muted strip-hint">
-        One-time, redacted first — required before any cloud provider runs.
+        One-time. Emails, phones and cards are removed first. Required before
+        any cloud provider runs.
       </span>
     }
   </div>

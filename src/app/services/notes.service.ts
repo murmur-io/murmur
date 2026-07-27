@@ -8,6 +8,7 @@ import type {
   PropertySchemaField,
   TypedNoteRow,
 } from "../core/models";
+import { ErrorCopyService } from "../core/copy/error-copy.service";
 
 /**
  * Signal store for the Notes section — the note list + the note-kind folder tree,
@@ -24,6 +25,7 @@ import type {
 export class NotesService {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _notes = signal<NoteSummary[]>([]);
   private readonly _noteFolders = signal<NoteFolder[]>([]);
@@ -130,7 +132,7 @@ export class NotesService {
     try {
       this._notes.set(await this.ipc.listNotes(folderId));
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._loading.set(false);
     }
@@ -143,7 +145,7 @@ export class NotesService {
     try {
       this._noteFolders.set(await this.ipc.listNoteFolders());
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._foldersLoading.set(false);
     }
@@ -162,7 +164,7 @@ export class NotesService {
     try {
       id = await this.ipc.createNote(folderId, title);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.loadNotes(folderId);
@@ -178,7 +180,7 @@ export class NotesService {
     try {
       await this.ipc.updateNoteDoc(id, title, markdown);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.loadNotes();
@@ -190,7 +192,7 @@ export class NotesService {
     try {
       await this.ipc.moveNoteDoc(id, folderId);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.loadNotes();
@@ -205,7 +207,7 @@ export class NotesService {
     try {
       await this.ipc.deleteNote(id);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     this._notes.update((list) => list.filter((n) => n.id !== id));
@@ -225,7 +227,7 @@ export class NotesService {
     try {
       folder = await this.ipc.createNoteFolder(name, parentId);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.loadFolders();
@@ -241,7 +243,7 @@ export class NotesService {
     try {
       await this.ipc.renameNoteFolder(id, name);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.loadFolders();
@@ -257,7 +259,7 @@ export class NotesService {
     try {
       await this.ipc.deleteNoteFolder(id);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.loadFolders();
@@ -274,7 +276,7 @@ export class NotesService {
     try {
       return await this.ipc.planOrganizeNotes(folderId);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
@@ -289,7 +291,7 @@ export class NotesService {
     try {
       await this.ipc.applyOrganizePlan({ moves });
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await Promise.allSettled([this.loadFolders(), this.loadNotes()]);
@@ -314,7 +316,7 @@ export class NotesService {
     try {
       this._folderSchema.set(await this.ipc.getNoteFolderSchema(folderId));
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._schemaLoading.set(false);
     }
@@ -336,7 +338,7 @@ export class NotesService {
     try {
       this._typedRows.set(await this.ipc.listNotesTyped(folderId));
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._typedLoading.set(false);
     }
@@ -356,7 +358,7 @@ export class NotesService {
     try {
       await this.ipc.setNoteFolderSchema(folderId, fields);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     // Reflect the saved set locally at once (optimistic-but-verified: the SAVE

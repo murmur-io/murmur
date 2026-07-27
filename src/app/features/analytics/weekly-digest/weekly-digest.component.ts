@@ -8,6 +8,7 @@ import {
 import { IpcService } from "../../../core/ipc.service";
 import type { DigestResult } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The selectable digest ranges, in days. */
 const RANGES = [7, 30] as const;
@@ -37,6 +38,7 @@ type Range = (typeof RANGES)[number];
 })
 export class WeeklyDigestComponent {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** Selectable ranges (days). */
   protected readonly ranges = RANGES;
@@ -75,7 +77,7 @@ export class WeeklyDigestComponent {
     try {
       this.result.set(await this.ipc.generateDigest(this.range()));
     } catch (e) {
-      this.error.set("Couldn’t generate the digest: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t generate the digest", e));
     } finally {
       this.pending.set(false);
     }

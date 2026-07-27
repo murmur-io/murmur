@@ -10,6 +10,7 @@ import { IpcService } from "../../../core/ipc.service";
 import type { PersonCard } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
 import { PersonDossierComponent } from "../person-dossier/person-dossier.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * The `/people` page — a personal CRM over the people across your meetings.
@@ -37,6 +38,7 @@ import { PersonDossierComponent } from "../person-dossier/person-dossier.compone
 export class PeopleComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   readonly people = signal<PersonCard[]>([]);
   readonly loading = signal(true);
@@ -116,7 +118,7 @@ export class PeopleComponent {
     } catch (e) {
       this.people.set([]);
       this.totalVisiblePeople.set(0);
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }

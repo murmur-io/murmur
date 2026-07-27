@@ -85,9 +85,12 @@ pub async fn add_reminder(text: String, due_date: Option<String>) -> Result<(), 
     if out.status.success() {
         Ok(())
     } else {
-        Err(AppError::Unavailable(format!(
-            "Could not add to Reminders — grant access in System Settings ▸ Privacy & Security ▸ Reminders. ({})",
-            String::from_utf8_lossy(&out.stderr).trim()
+        Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::REMINDERS_DENIED,
+            format!(
+                "osascript refused: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
         )))
     }
 }
@@ -111,9 +114,12 @@ pub(crate) fn add_reminder_blocking(text: &str, due_date: Option<&str>) -> Resul
     if out.status.success() {
         Ok(())
     } else {
-        Err(AppError::Unavailable(format!(
-            "Could not add to Reminders — grant access in System Settings ▸ Privacy & Security ▸ Reminders. ({})",
-            String::from_utf8_lossy(&out.stderr).trim()
+        Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::REMINDERS_DENIED,
+            format!(
+                "osascript refused: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
         )))
     }
 }

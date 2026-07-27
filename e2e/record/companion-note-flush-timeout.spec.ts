@@ -183,7 +183,14 @@ test.describe("Record — flush deadline preserves companion data", () => {
     await bootWithFlushProvider(page, () => {
       const state = window as unknown as { __updateAttempts: number };
       state.__updateAttempts += 1;
-      return Promise.reject(new Error("Locked: companion note is sealed"));
+      // The REAL wire string of `AppError::Locked(errcode::tag(NOTE_LOCKED, …))`. This fixture
+      // used to read `"Locked: companion note is sealed"` — CAPITAL L, a string the backend never
+      // produces — which is precisely why the editor's `message.includes("Locked")` bug survived:
+      // the test encoded the bug. With the real lowercase, coded string, this case only passes
+      // because the classification is now keyed on `[note-locked]`.
+      return Promise.reject(
+        new Error("locked: [note-locked] unlock the folder to edit this note"),
+      );
     });
     await typeCompanionText(page);
     await page.locator("button.stop-btn").click();

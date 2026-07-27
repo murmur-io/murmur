@@ -15,6 +15,7 @@ import {
 import { IpcService } from "../../../core/ipc.service";
 import type { DocumentPreviewTarget, NoteRecipe } from "../../../core/models";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * A read-only CONTENT PREVIEW for one brain document/note — presented as an
@@ -55,6 +56,7 @@ import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.comp
 export class DocumentPreviewComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /**
    * The document/note to preview; null = the modal is closed (renders nothing).
@@ -235,26 +237,12 @@ export class DocumentPreviewComponent {
       if (this.doc()?.id !== id) {
         return;
       }
-      this.genError.set(this.friendlyGenError(String(e)));
+      this.genError.set(this.errorCopy.humanize(e, "doc-note"));
     } finally {
       if (this.doc()?.id === id) {
         this.generating.set(false);
       }
     }
-  }
-
-  /** Map a raw backend error string to a short, friendly message. */
-  private friendlyGenError(raw: string): string {
-    if (/locked/i.test(raw)) {
-      return "This document is in a locked folder — unlock it first.";
-    }
-    if (/consent|egress|Unavailable/i.test(raw)) {
-      return "Turn on your note provider (Settings) to make a note.";
-    }
-    if (/no extractable text|InvalidArg/i.test(raw)) {
-      return "This document has no text to turn into a note.";
-    }
-    return "Couldn’t make a note from this document. Please try again.";
   }
 
   /** Await the gated read; drop the response if the open doc changed since. */
@@ -269,7 +257,7 @@ export class DocumentPreviewComponent {
       if (this.doc()?.id !== id) {
         return;
       }
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       if (this.doc()?.id === id) {
         this.loading.set(false);

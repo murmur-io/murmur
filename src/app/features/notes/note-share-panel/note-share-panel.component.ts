@@ -22,6 +22,7 @@ import {
   type OrgShareTarget,
 } from "../../detail/org-share-sheet/org-share-sheet.component";
 import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The link-share flow step (Manage always coexists as the list below). */
 type ShareStep = "configure" | "created";
@@ -75,6 +76,7 @@ interface LinkShareRow {
 export class NoteSharePanelComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** THIS note's document id — the shares filter key. */
   readonly noteId = input.required<string>();
@@ -327,8 +329,8 @@ export class NoteSharePanelComponent {
       // Org Brain state (best-effort): the section only appears when in an org.
       void this.refreshOrg(id);
     } catch (e) {
-      this.listError.set(String(e));
-      this.gateError.set(String(e));
+      this.listError.set(this.errorCopy.humanize(e));
+      this.gateError.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }
@@ -397,17 +399,13 @@ export class NoteSharePanelComponent {
       }
     } catch (e) {
       this._biometricFailed.set(true);
-      this.gateError.set(this.friendlyUnlockError(String(e)));
+      // LOCK GATE — see `share-panel.component.ts` for the full rationale. Cancel-vs-failure comes
+      // from the `[touch-id-*]` code, and the raw keychain string no longer reaches the screen.
+      // The gate is unchanged: fail-closed, `_biometricFailed` set, password path still offered.
+      this.gateError.set(this.errorCopy.humanize(e, "note-share"));
     } finally {
       this.unlocking.set(false);
     }
-  }
-
-  private friendlyUnlockError(raw: string): string {
-    if (/cancel/i.test(raw)) {
-      return "Touch ID was cancelled. Use Unlock for sharing to unlock with your password.";
-    }
-    return `Couldn't unlock with Touch ID — ${raw}. Use Unlock for sharing to unlock with your password.`;
   }
 
   // --- CONFIGURE handlers ---------------------------------------------------
@@ -447,7 +445,7 @@ export class NoteSharePanelComponent {
         this.accountStatus.set({ ...s, shareConsented: true });
       }
     } catch (e) {
-      this.createError.set(String(e));
+      this.createError.set(this.errorCopy.humanize(e));
     } finally {
       this.consenting.set(false);
     }
@@ -498,18 +496,12 @@ export class NoteSharePanelComponent {
       await this.refresh();
       this.changed.emit();
     } catch (e) {
-      this.createError.set(this.friendlyCreateError(String(e)));
+      // A `[note-locked]`/`[folder-locked]` create failure means the folder sealed under us — the
+      // "note-share" context says so plainly. Everything else no longer renders raw backend prose.
+      this.createError.set(this.errorCopy.humanize(e, "note-share"));
     } finally {
       this.creating.set(false);
     }
-  }
-
-  /** A `Locked` create failure means the folder sealed under us — say so plainly. */
-  private friendlyCreateError(raw: string): string {
-    if (/Locked/i.test(raw)) {
-      return "This note is locked — unlock its folder to share it.";
-    }
-    return raw;
   }
 
   // --- CREATED handlers -----------------------------------------------------
@@ -575,7 +567,7 @@ export class NoteSharePanelComponent {
       await this.refresh();
       this.changed.emit();
     } catch (e) {
-      this.listError.set(String(e));
+      this.listError.set(this.errorCopy.humanize(e));
       await this.refresh();
     } finally {
       this.revokingId.set(null);
