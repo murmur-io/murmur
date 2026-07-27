@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Refuse to merge harness-written code that was never verified.
+
+WHY THIS EXISTS. On 2026-07-26 a harness task timed out, went `BLOCKED` with an empty
+`results/` directory and no attestation — and its branch was merged to trunk anyway,
+carrying 2,566 lines across 14 files. Nothing noticed, because the attestation lives in
+`.git/agent-harness/`, which never leaves the machine that produced it. Every enforcement
+up to that point depended on the operator remembering.
+
+WHAT IT CHECKS. For a pull request whose head branch is `agent/*` — i.e. a branch the
+harness itself created — at least one commit must carry the receipt trailers that
+`agent-harness commit` writes:
+
+    Harness-Task: <task-id>
+    Harness-Verdict: PASS
+    Harness-Base: <sha>
+    Harness-Diff-Sha256: <sha256>
+    Harness-Attestation-Sha256: <sha256>
+
+An explicitly declared light-lane PR is allowed through: put `Harness-Lane: B` on a line
+of its own in the PR body (or set HARNESS_LANE=B). That makes "no attestation" a RECORDED
+CHOICE rather than an oversight, which is the whole point — the failure being prevented is
+silence, not deliberate bypass.
+
+WHAT IT DOES NOT CHECK. This is presence and consistency, not a cryptographic proof. A
+trailer can be typed by hand. It defends against forgetting; it does not defend against
+forging, and it is not offered as though it did.
+
+Usage:
+    verify-harness-attestation --base <ref> --head <ref> [--branch <name>] [--pr-body-file <path>]
+Exit codes: 0 = satisfied or not applicable, 1 = refused, 2 = usage error.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from typing import List, Optional, Tuple
+
+TRAILER_RE = {
+    "task": re.compile(r"^\s*Harness-Task:\s*(\S+)\s*$", re.MULTILINE),
+    "verdict": re.compile(r"^\s*Harness-Verdict:\s*(\S+)\s*$", re.MULTILINE),
+    "base": re.compile(r"^\s*Harness-Base:\s*([0-9a-f]{40})\s*$", re.MULTILINE),
+    "diff": re.compile(r"^\s*Harness-Diff-Sha256:\s*([0-9a-f]{64})\s*$", re.MULTILINE),
+    "attestation": re.compile(
+        r"^\s*Harness-Attestation-Sha256:\s*([0-9a-f]{64})\s*$", re.MULTILINE
+    ),
+}
+# Anchored at column 0, case-sensitive, and matched only against a body with fenced code
+# blocks and quoted lines stripped. The looser earlier form let the gate NEUTER ITSELF: its
+# own refusal message contained the token on an indented line, so pasting the CI error into
+# the PR description to ask what it meant silently turned a REFUSE into a PASS.
+LANE_B_RE = re.compile(r"^Harness-Lane: B[ \t]*$", re.MULTILINE)
+# Surfaced, not refused: a degraded round still earns PASS from real checks and real
+# independent reviews. The point is that the reviewer of the PR can SEE it.
+DEGRADED_RE = re.compile(r"^\s*Harness-Writer-Degraded:\s*(\S+)\s*$", re.MULTILINE)
+
+
+def git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def is_ancestor(candidate: str, of: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", candidate, of],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def branch_commits(base: str, head: str, base_branch: str) -> Tuple[List[dict], List[dict]]:
+    """Return (commits authored on this branch, illegitimate merges).
+
+    `--first-parent` alone is NOT enough, and an earlier version of this script wrongly
+    claimed it "selects exactly the branch's own work". It selects the first-parent CHAIN,
+    which makes anything reachable only through a merge's SECOND parent invisible: a
+    `git merge --no-ff` of a side branch smuggles unreviewed files into the merged diff
+    while every commit on the chain still carries a valid receipt.
+
+    So merges are inspected rather than skipped. A merge is legitimate only when every
+    non-first parent is contained in the BASE BRANCH — i.e. it is a genuine "bring the
+    branch up to date with trunk" merge, which this repo requires. Any other merge pulls in
+    work this gate never saw, and is reported.
+
+    The comparison must be against the base BRANCH TIP, not the PR's base COMMIT. A
+    catch-up merge brings in commits that are by definition NEWER than the base commit, so
+    testing ancestry against the base commit rejects the very flow this repo depends on —
+    a false positive, which is worse than no gate because it trains the operator to bypass.
+    """
+
+    raw = subprocess.run(
+        ["git", "log", "--first-parent", "--format=%H%x1f%P%x1f%B%x00", f"{base}..{head}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    commits: List[dict] = []
+    bad_merges: List[dict] = []
+    for chunk in raw.split("\x00"):
+        if not chunk.strip():
+            continue
+        sha, parents, message = chunk.lstrip("\n").split("\x1f", 2)
+        parent_list = parents.split()
+        entry = {
+            "sha": sha,
+            "first_parent": parent_list[0] if parent_list else "",
+            "message": message,
+        }
+        if len(parent_list) > 1:
+            # A merge. Legitimate only if everything it brings in is already on the base
+            # branch. `base_branch or base` keeps it working when the branch tip is not
+            # resolvable (a shallow clone, a local run) — degrading to the stricter check
+            # rather than to no check.
+            containment = base_branch or base
+            side = [p for p in parent_list[1:] if not is_ancestor(p, containment)]
+            if side:
+                entry["side_parents"] = side
+                bad_merges.append(entry)
+            continue
+        commits.append(entry)
+    return commits, bad_merges
+
+
+def strip_quoted(body: str) -> str:
+    """Drop fenced code blocks and quoted lines before looking for the opt-out token.
+
+    Someone pasting this gate's output, or quoting it to ask a question, must not thereby
+    grant the exemption. Anything inside ``` fences or after a leading '>' is discussion,
+    not a declaration.
+    """
+
+    out: List[str] = []
+    fenced = False
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fenced = not fenced
+            continue
+        if fenced or stripped.startswith(">"):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def fail(message: str) -> int:
+    print(f"REFUSED: {message}", file=sys.stderr)
+    # Deliberately NOT printing a directly pasteable token: this text ends up in CI output
+    # that gets copied into PR descriptions, and the token was previously its own bypass.
+    print(
+        "\nIf this PR was written WITHOUT the harness on purpose, declare it by adding a\n"
+        "line to the PR DESCRIPTION consisting of the header 'Harness-Lane' followed by a\n"
+        "colon, a space and the letter B — at the start of its own line, outside any code\n"
+        "fence or quote. That records the choice instead of hiding it.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--base", required=True)
+    parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--branch", default=os.environ.get("GITHUB_HEAD_REF", ""))
+    parser.add_argument("--pr-body-file", default="")
+    parser.add_argument(
+        "--base-branch",
+        default="",
+        help="Tip of the branch being merged INTO (e.g. origin/murmur). Catch-up merges are "
+        "judged against this, not against --base, because they legitimately bring in commits "
+        "newer than the PR's base commit.",
+    )
+    args = parser.parse_args(argv)
+
+    base_branch = args.base_branch.strip()
+    if not base_branch:
+        env_base = os.environ.get("GITHUB_BASE_REF", "").strip()
+        for candidate in ([f"origin/{env_base}", env_base] if env_base else []):
+            if (
+                subprocess.run(
+                    ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+                    capture_output=True,
+                ).returncode
+                == 0
+            ):
+                base_branch = candidate
+                break
+
+    branch = (args.branch or "").strip()
+    if not branch.startswith("agent/"):
+        print(f"not a harness branch ({branch or 'unknown'}) — attestation not required")
+        return 0
+
+    body = ""
+    if args.pr_body_file and os.path.exists(args.pr_body_file):
+        with open(args.pr_body_file, "r", encoding="utf-8", errors="replace") as handle:
+            body = handle.read()
+    if (
+        LANE_B_RE.search(strip_quoted(body))
+        or os.environ.get("HARNESS_LANE", "").strip().upper() == "B"
+    ):
+        print("light lane declared (Harness-Lane: B) — attestation not required")
+        return 0
+
+    try:
+        commits, bad_merges = branch_commits(args.base, args.head, base_branch)
+    except subprocess.CalledProcessError as exc:
+        print(f"could not read commits {args.base}..{args.head}: {exc}", file=sys.stderr)
+        return 2
+
+    if bad_merges:
+        listing = "\n".join(
+            f"    {m['sha'][:12]}  merges {', '.join(p[:12] for p in m['side_parents'])}"
+            f"  — {m['message'].strip().splitlines()[0][:56]}"
+            for m in bad_merges
+        )
+        return fail(
+            f"branch '{branch}' merges work that is not on the base ref, so the merged diff "
+            "contains commits this gate never saw:\n"
+            f"{listing}\n"
+            "  Only a catch-up merge FROM the base branch is allowed here."
+        )
+
+    if not commits:
+        print("no branch-authored commits to attest")
+        return 0
+
+    # COVERAGE, NOT PRESENCE. Checking that SOME commit carries a receipt was provably
+    # insufficient: an unattested hand commit rides along beside an attested one, and a
+    # cherry-pick copies a receipt verbatim onto work it never covered. Every commit the
+    # branch authored must carry its OWN receipt, and that receipt's recorded base must be
+    # that commit's own first parent — which is exactly what `agent-harness commit`
+    # produces and what a copied receipt cannot fake.
+    unattested = []
+    receipts = []
+    for commit in commits:
+        found = {name: rx.search(commit["message"]) for name, rx in TRAILER_RE.items()}
+        if not all(found.values()):
+            unattested.append(commit)
+            continue
+        receipt = {name: m.group(1) for name, m in found.items()}
+        receipt["commit"] = commit
+        receipts.append(receipt)
+
+    if unattested:
+        listing = "\n".join(
+            f"    {c['sha'][:12]}  {c['message'].strip().splitlines()[0][:72]}"
+            for c in unattested
+        )
+        return fail(
+            f"branch '{branch}' was created by the harness, but {len(unattested)} of "
+            f"{len(commits)} branch-authored commits carry no Harness-Verdict receipt:\n"
+            f"{listing}\n"
+            "  Each was written outside a PASSED harness task, or committed by hand."
+        )
+
+    for receipt in receipts:
+        commit = receipt["commit"]
+        if receipt["verdict"] != "PASS":
+            return fail(
+                f"commit {commit['sha'][:12]} records verdict "
+                f"{receipt['verdict']}, not PASS"
+            )
+        if receipt["base"] != commit["first_parent"]:
+            return fail(
+                f"commit {commit['sha'][:12]} carries a receipt for base "
+                f"{receipt['base'][:12]}, but its actual parent is "
+                f"{commit['first_parent'][:12]} — the receipt was copied onto work it "
+                "does not cover (cherry-pick, rebase, or a hand-edited trailer)."
+            )
+        # CONTENT, not just lineage. Matching only the parent left `git commit --amend`
+        # wide open: amend after `agent-harness commit` keeps the parent, so arbitrary
+        # unreviewed content rode in under a valid receipt. The recorded hash is over the
+        # attested staged diff, which is recomputable here with the same normalisation
+        # (task_runner.staged_diff: --binary --full-index --no-ext-diff --no-renames).
+        actual = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-renames",
+                commit["first_parent"],
+                commit["sha"],
+                "--",
+            ],
+            capture_output=True,
+            check=True,
+        ).stdout
+        actual_sha = hashlib.sha256(actual).hexdigest()
+        if actual_sha != receipt["diff"]:
+            return fail(
+                f"commit {commit['sha'][:12]} does not match its own receipt: the attested "
+                f"diff is {receipt['diff'][:12]}… but the commit's actual diff hashes to "
+                f"{actual_sha[:12]}…. The commit was amended or rewritten after it was "
+                "attested, so the receipt covers different content than what is merging."
+            )
+
+    for receipt in receipts:
+        degraded = DEGRADED_RE.search(receipt["commit"]["message"])
+        note = f"  [WRITER DEGRADED: {degraded.group(1)}]" if degraded else ""
+        print(
+            f"OK: {receipt['commit']['sha'][:12]} task '{receipt['task']}' PASS "
+            f"(diff {receipt['diff'][:12]}…){note}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
