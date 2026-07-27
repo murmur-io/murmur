@@ -455,10 +455,20 @@ fn is_skipped_heading(trimmed_heading: &str) -> bool {
     const KEYS: &[&str] = &[
         // English
         "my notes",
+        // The provenance sections the enhance-mode prompt now emits for note items the transcript
+        // never covers. They exist PRECISELY to hold unsupported-by-the-recording material, so
+        // flagging their lines `> unverified` would mark every line of a section whose whole purpose
+        // is to be honest about that — noise that trains the reader to ignore the marker where it
+        // matters. NOTE these need their own keys: `starts_with` on the lowercased title does NOT
+        // match "from my notes" via the "my notes" key above.
+        "from my notes",
+        "from attached materials",
         "related prior notes",
         "also discussed",
         // Polish
         "moje notatki",
+        "z moich notatek",
+        "z załączonych materiałów",
         "powiązane notatki",
         "pozostałe",
     ];
@@ -560,6 +570,43 @@ mod tests {
     /// RED-before-GREEN: an action item the transcript never supports gets a following `> unverified`
     /// line, while a SUPPORTED summary sentence stays clean. Reverting `annotate_unverified` to a
     /// no-op drops the marker (RED). The marker here is the PLAIN variant (no overlapping segment).
+    #[test]
+    /// R3/#4 (regression). `## From my notes` is the provenance section the enhance-mode prompt now
+    /// emits for note material the transcript never covered. Flagging its lines `> unverified` would
+    /// mark every line of a section whose entire purpose is to be honest about exactly that — pure
+    /// noise that trains a reader to ignore the marker where it matters.
+    ///
+    /// RED against the previous behavior: `is_skipped_heading` knew only `my notes`, and its
+    /// `starts_with` test does NOT match `from my notes`, so the whole section was flagged.
+    #[test]
+    fn the_provenance_section_is_never_flagged_unverified() {
+        let segments = vec![seg("we shipped the login page this week", None)];
+        for heading in [
+            "## From my notes",
+            "## From attached materials",
+            "## Z moich notatek",
+        ] {
+            let note = format!(
+                "## Summary\n\nThe team shipped the login page.\n\n{heading}\n\n- rename the servers to interfaces\n- a 50 tool limit per interface\n"
+            );
+            let out = annotate_unverified(&note, &segments);
+            assert!(
+                !out.contains("> unverified"),
+                "{heading} must be exempt from the grounding pass; got:\n{out}"
+            );
+        }
+        // Control: the SAME uncovered lines under a meeting-record heading ARE still flagged, so the
+        // exemption is scoped to the provenance section and has not disarmed the pass generally.
+        let under_decisions = annotate_unverified(
+            "## Decisions\n\n- rename the servers to interfaces\n",
+            &segments,
+        );
+        assert!(
+            under_decisions.contains("> unverified"),
+            "the same claim under Decisions must still be flagged; got:\n{under_decisions}"
+        );
+    }
+
     #[test]
     fn unsupported_action_item_gets_unverified() {
         let segments = vec![
