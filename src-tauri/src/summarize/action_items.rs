@@ -183,7 +183,7 @@ mod tests {
         // it is tied to any particular person.
         for name in ["Miles", "Anna Kowalska", "Łukasz", "O'Brien"] {
             for raw in [
-                format!("{name}"),
+                name.to_string(),
                 format!("{name} (others-9)"),
                 format!("others-10 -> {name}"),
                 format!("others-10: {name}"),
