@@ -634,6 +634,29 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// FORGET one ENTITY fact by id — the `facts` twin of [`Db::forget_user_fact`] above.
+    ///
+    /// Until this existed, entity facts were effectively UNCORRECTABLE: the store exposed
+    /// forget/clear for *user* facts only, so the sole way to close a wrong entity fact was for a
+    /// LATER meeting to happen to assert a different object for the same
+    /// `(entity_id, subject, predicate)` key. A junk row nobody would ever restate — the real
+    /// `owner: claude_code` that reached a dossier as a current fact — therefore stayed current
+    /// forever, and kept being reported as truth by every agent reading that dossier.
+    ///
+    /// Same bitemporal contract as the user-fact twin: INVALIDATE by closing the row at `at`, never
+    /// delete, so the history stays on the record and only the CURRENT view changes. Idempotent —
+    /// an already-closed row is untouched. Returns `true` iff this call closed a row.
+    pub fn forget_entity_fact(&self, id: &str, at: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
+                rusqlite::params![id, at],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
     /// CLEAR all user memory: bitemporal-close EVERY currently-open user fact at `at` (invalidate,
     /// never delete — closed history stays for the record). After this the brief regenerates empty and
     /// the audit view is empty. Returns the number of facts closed.
