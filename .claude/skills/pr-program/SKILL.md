@@ -106,24 +106,54 @@ enough to trip it. Init and run back-to-back, and if it fires, re-init rather th
   → empty. `-D warnings` implies `-D clippy::incompatible_msrv` (MSRV 1.77); `is_none_or`(1.82) → `map_or(true, …)`.
 - FE PRs: `npx ng lint && npx ng build` (never `ng test`).
 
-## WHEN THE HARNESS WRITER DIES MID-ROUND (it is usually NOT the code)
+## WHEN THE HARNESS WRITER DIES MID-ROUND — READ THE DURATION FIRST
 
-A writer session can be killed by a **tool-permission rejection**, not a build failure. Observed:
-4 of 68 shell calls refused (two heredocs, a `grep` with an odd pattern, a warnings sweep) — the
-`cargo test` runs in the same session had all SUCCEEDED, and ~1000 lines of good work were already on
-disk. The task lands in `BLOCKED`, which `reap` accepts but `close` does not.
+**The usual cause is the WALL-CLOCK TIMEOUT.** On 2026-07-26 two writers died at
+`duration_ms` 1799668 and 1799683 — the 1800 s budget, to the millisecond, 108 and 181 turns,
+$14.99 and $26.33 forfeited.
 
-**Do not restart from zero.** Salvage:
-1. Inspect the log to find the ACTUAL cause — `logs/round-01-writer-<vendor>.jsonl`, look for the
-   `tool_result` with `is_error` and match its `tool_use_id` back to the `tool_use` block. If it says
-   *"The user doesn't want to proceed with this tool use"*, it was a permission denial, not a defect.
-2. Verify the worktree YOURSELF: targeted `cargo test`, `clippy --lib -D warnings`, `ng lint`,
-   `ng build`. Check the contract's load-bearing invariants by hand (e.g. "the pre-existing tests must
-   be byte-identical" → extract them from base and HEAD and diff).
-3. Finish whatever the writer never reached.
-4. **Then get an INDEPENDENT review anyway** — you are now an author. The harness is blocked, so run
-   the reviewers as a Workflow instead; the principle (the implementer never owns the verdict) is what
-   matters, not the runner.
+**Do not repeat the misdiagnosis this section used to carry.** It previously claimed a
+*tool-permission rejection* killed the writer, because the last tool calls before the wall happened
+to be refusals (heredocs blocked by this repo's own hooks). That is inferring cause from POSITION in
+the log. Permission denials do not end a session — Claude Code feeds the refusal back as stderr and
+the writer continues. Both deaths were the clock.
+
+**Diagnose in this order:**
+1. **`duration_ms` from the last `{"type":"result"}` line** of `logs/round-01-writer-<vendor>.jsonl`.
+   Within a second of the configured budget ⇒ timeout. Nothing else to look for.
+2. `events.jsonl` → the `model-process-exit` event carries `timed_out`, `exit_code` and
+   `terminal_subtype`. (Added 2026-07-27; older tasks predate it and only have the raw log.)
+3. Only then look at tool errors — and remember refusals are a turn TAX, not a cause of death.
+
+**Since 2026-07-27 a timed-out writer no longer forfeits the round:** it yields a
+`<TIMED OUT>` stub, the tree stays staged, and the checks and independent reviews still run. The
+reviewers receive a runner-derived `## Round provenance` warning instructing them to enumerate every
+contract deliverable as delivered/partial/missing, and the attestation plus the commit trailer record
+`Harness-Writer-Degraded: timeout`. **The most likely defect in such a round is OMISSION, which does
+not show up as a fault in the code that IS present** — both salvaged tasks that day were missing
+deliverables, not wrong.
+
+**If a round still lands in a terminal state, salvage rather than restart:**
+1. Verify the worktree YOURSELF: targeted `cargo test`, **`clippy --lib --tests -- -D warnings`**
+   (`--lib` alone misses lints in `#[cfg(test)]` code — that cost a CI cycle on 2026-07-26), `ng lint`,
+   `ng build`. Check the contract's load-bearing invariants by hand.
+2. Finish whatever the writer never reached — check the CONTRACT item by item, not the diff.
+3. **Then get an INDEPENDENT review anyway** — you are now an author. Run the reviewers as a Workflow;
+   the principle (the implementer never owns the verdict) is what matters, not the runner.
+4. Expect the CI attestation gate to REFUSE a hand-committed `agent/*` branch. That is the gate
+   working. Either re-run the task properly or declare `Harness-Lane: B` in the PR description so the
+   choice is recorded.
+
+## NEVER WRITE A THROWAWAY SCRIPT THAT `cd`s AND THEN RUNS `git`
+
+A verification script written during this program **destroyed the operator's primary checkout twice**:
+`mktemp -d` fails under the agent sandbox, `set -u` does NOT catch it (the assignment succeeds with an
+empty value), and **`cd "" || exit 1` SUCCEEDS in bash** — an empty operand is a no-op. Every `git`
+command then ran in the real repo, committing the entire uncommitted WIP onto local `murmur`.
+
+If a script must create a scratch repo: create the directory explicitly under the script's own
+directory, `exit` non-zero if `mkdir`/`cd` fail, and **assert `pwd -P` is not inside a real checkout
+before the first git command**.
 
 ## TELL REVIEWERS THE PROVENANCE — IT CHANGES WHAT THEY FIND
 
