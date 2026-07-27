@@ -227,6 +227,7 @@ fn tool_label(call: &ToolCall) -> &'static str {
     match call {
         ToolCall::SearchMeetings { .. } => "Related meetings",
         ToolCall::SearchSemantic { .. } => "Semantically related",
+        ToolCall::SearchTranscript { .. } => "Transcript matches",
         ToolCall::GetEntityDossier { .. } => "Entity dossier",
         // Brain v3 PR-6 — knowledge diff / decision ledger (explicit tool; label for completeness).
         ToolCall::KnowledgeDiff { .. } => "Knowledge diff",

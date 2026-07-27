@@ -181,6 +181,16 @@ pub enum ToolCall {
     /// Roll up every OPEN action item, optionally filtered by owner.
     GetOpenCommitments { owner: Option<String> },
     /// Assemble the gated structured dossier for one entity (caller must pass a non-empty name/id).
+    /// #9 — LOCATED transcript search: every match keeps its segment index, timestamp and speaker,
+    /// so `search` and `read` finally compose instead of leaving the agent paging blind.
+    SearchTranscript {
+        query: String,
+        /// Restrict to one meeting (`None` = across the visible vault).
+        meeting_id: Option<String>,
+        limit: usize,
+        /// Max located hits ONE meeting may contribute; the reply still discloses its true total.
+        max_per_meeting: usize,
+    },
     GetEntityDossier {
         entity: String,
         /// How much of the note corpus to carry: `none` | `summary` (default) | `full`.
@@ -838,6 +848,29 @@ pub fn execute_tool(
                 }),
                 Ok(items) => Ok(format_commitments(&items)),
                 Err(e) => Err(AppError::Storage(format!("commitments rollup failed: {e}"))),
+            }
+        }
+        ToolCall::SearchTranscript {
+            query,
+            meeting_id,
+            limit,
+            max_per_meeting,
+        } => {
+            // GATED by `search_segments_visible`, which carries the identical visibility predicate
+            // as `search_visible_impl` — a sealed-and-not-session-unlocked meeting contributes
+            // nothing, not even a timestamp.
+            let limit = if *limit == 0 { 20 } else { *limit } as i64;
+            let per = if *max_per_meeting == 0 {
+                5
+            } else {
+                *max_per_meeting
+            } as i64;
+            match db.search_segments_visible(query, meeting_id.as_deref(), limit, per, unlocked) {
+                Err(e) => Err(AppError::Storage(format!("transcript search failed: {e}"))),
+                Ok(hits) if hits.is_empty() => {
+                    Ok(format!("No transcript matches for \"{}\".", query.trim()))
+                }
+                Ok(hits) => Ok(format_segment_hits(&hits)),
             }
         }
         ToolCall::GetEntityDossier {
@@ -2030,6 +2063,54 @@ fn format_compact_transcript(segs: &[crate::transcribe::types::Segment]) -> Stri
         ));
     }
     out.join("\n")
+}
+
+/// Render LOCATED transcript hits, grouped by meeting, each line carrying everything an agent needs
+/// to jump straight to the passage: `@mm:ss`, the segment index, and the speaker.
+///
+/// The per-meeting header discloses `shown of N` so a windowed reply can never be mistaken for the
+/// whole truth — the old single-snippet behavior gave a word occurring 40 times exactly one excerpt
+/// with no hint that 39 more existed.
+fn format_segment_hits(hits: &[crate::storage::models::SegmentHit]) -> String {
+    let mut out = String::new();
+    let mut current: Option<&str> = None;
+    let mut shown_here = 0usize;
+    for h in hits {
+        if current != Some(h.meeting_id.as_str()) {
+            if current.is_some() {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "[meeting:{}] {} — showing {} of {} match(es):\n",
+                h.meeting_id,
+                h.meeting_title,
+                hits.iter()
+                    .filter(|x| x.meeting_id == h.meeting_id)
+                    .count()
+                    .min(h.hit_count as usize),
+                h.hit_count
+            ));
+            current = Some(h.meeting_id.as_str());
+            shown_here = 0;
+        }
+        shown_here += 1;
+        let _ = shown_here;
+        out.push_str(&format!(
+            "- @{} (seg {}, {}s) {}: {}\n",
+            mmss(h.start_s),
+            h.seg_idx,
+            secs(h.start_s),
+            speaker_label(h.speaker.as_deref()),
+            h.text.trim()
+        ));
+    }
+    out
+}
+
+/// `mm:ss` for a human reading the reply; the raw seconds ride alongside for machine seeking.
+fn mmss(v: f64) -> String {
+    let total = v.max(0.0).round() as i64;
+    format!("{:02}:{:02}", total / 60, total % 60)
 }
 
 /// Render a list of search hits (FTS or hybrid) into the tool text payload — one line per meeting.

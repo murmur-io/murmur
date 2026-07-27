@@ -245,6 +245,11 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain", "compact"], "description": "Transcript rendering (default 'structured'). 'compact' merges consecutive same-speaker segments into one line — same words, far less per-segment scaffolding. NOTE each format is a DIFFERENT character space, so offset/maxChars/TOTAL_CHARS only mean anything within the format you asked for." }, "offset": { "type": "number", "description": "Chars to skip into the transcript, in the SELECTED format's char space (default 0)." }, "maxChars": { "type": "number", "description": "Max chars to return from offset (default: a bounded 6000-char window with the total disclosed). Bounds the NOTE section too." }, "includeNote": { "type": "boolean", "description": "Include the AI note (default true). Pass false for transcript only — e.g. you already read the note, or you are paging and only want speech." } }, "required": ["meetingId"] }
         },
         {
+            "name": "search_transcript",
+            "description": "LOCATED full-text search INSIDE meeting transcripts. Unlike search_meetings — which returns one unlocated snippet per meeting — every hit here keeps its position: timestamp, segment index and speaker. Use this the moment you need to find WHERE something was said, then read around it with get_meeting's offset/maxChars. Each meeting's header discloses 'showing X of N match(es)', so you always know whether you are seeing everything. Optionally scope to one meetingId. Sealed-and-locked meetings contribute nothing.",
+            "inputSchema": { "type": "object", "properties": { "query": { "type": "string" }, "meetingId": { "type": "string", "description": "Restrict to one meeting (default: across your whole visible vault)." }, "limit": { "type": "number", "description": "Max located hits overall (default 20)." }, "maxPerMeeting": { "type": "number", "description": "Max hits from any ONE meeting (default 5). The true per-meeting total is disclosed regardless." } }, "required": ["query"] }
+        },
+        {
             "name": "get_document",
             "description": "Get the body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result. The body is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a big document by passing offset + maxChars.",
             "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" }, "offset": { "type": "number", "description": "Chars to skip into the body (default 0)." }, "maxChars": { "type": "number", "description": "Max body chars to return from offset (default: a bounded 6000-char window with the total disclosed)." } }, "required": ["documentId"] }
@@ -389,6 +394,20 @@ fn dispatch_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+        },
+        "search_transcript" => ToolCall::SearchTranscript {
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            meeting_id: args
+                .get("meetingId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty()),
+            limit: mcp_usize_arg(args, "limit"),
+            max_per_meeting: mcp_usize_arg(args, "maxPerMeeting"),
         },
         "get_meeting" => ToolCall::GetMeeting {
             meeting_id: args
@@ -572,10 +591,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eleven_tools() {
+    fn tools_list_has_twelve_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
+        // #9 — the LOCATED transcript search, so search and read compose.
+        assert!(tools.iter().any(|t| t["name"] == "search_transcript"));
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -801,6 +822,78 @@ mod tests {
         assert!(
             out.contains("Budget"),
             "flag-off fallback must still surface the gated keyword hit, got: {out}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// R10/#9 (regression + LOCK GATE). `search_transcript` returns LOCATED hits — timestamp,
+    /// segment index, speaker — and discloses the true per-meeting match count instead of handing
+    /// back one unlocated snippet. A sealed-and-not-session-unlocked meeting contributes NOTHING,
+    /// not even a timestamp, and reappears after unlock.
+    #[test]
+    fn search_transcript_locates_hits_and_is_visibility_gated() {
+        use crate::storage::models::Folder;
+        use crate::transcribe::types::Segment;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed(&db, "open", "Open", "a note", None);
+        seed(&db, "sealed", "Sealed", "a note", Some("f-lock"));
+        let segs = |word: &str| {
+            (0..3)
+                .map(|i| Segment {
+                    idx: i,
+                    start_s: 60.0 * (i as f64 + 1.0),
+                    end_s: 60.0 * (i as f64 + 1.0) + 5.0,
+                    text: format!("we discussed {word} in detail number {i}"),
+                    speaker: Some(if i == 1 { "others" } else { "me" }.to_string()),
+                    confidence: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        db.insert_segments("open", &segs("orphaned")).unwrap();
+        db.insert_segments("sealed", &segs("orphaned")).unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let args = json!({ "query": "orphaned" });
+        let out = dispatch_tool(&db, "search_transcript", &args, &HashSet::new()).unwrap();
+
+        // GATE: the sealed meeting leaks neither its title nor a position.
+        assert!(
+            !out.contains("sealed") && !out.contains("Sealed"),
+            "a sealed-not-unlocked meeting must contribute nothing: {out}"
+        );
+        // LOCATED: timestamp, segment index and speaker all survive.
+        assert!(out.contains("@01:00"), "carries a timestamp: {out}");
+        assert!(out.contains("(seg 0"), "carries the segment index: {out}");
+        assert!(out.contains("Others:"), "carries the speaker: {out}");
+        // DISCLOSED: the agent can tell whether it is seeing everything.
+        assert!(
+            out.contains("of 3 match(es)"),
+            "discloses the true per-meeting match count: {out}"
+        );
+
+        // Unlocking the folder makes the sealed meeting's matches visible.
+        let unlocked: HashSet<String> = ["f-lock".to_string()].into_iter().collect();
+        let after = dispatch_tool(&db, "search_transcript", &args, &unlocked).unwrap();
+        assert!(
+            after.contains("Sealed"),
+            "an unlocked folder's matches become visible: {after}"
+        );
+
+        // An empty query matches NOTHING (never everything) — the R1/da63840 guard.
+        let empty = dispatch_tool(&db, "search_transcript", &json!({ "query": "  " }), &unlocked)
+            .unwrap();
+        assert!(
+            empty.starts_with("No transcript matches"),
+            "empty query must match nothing: {empty}"
         );
         let _ = std::fs::remove_file(&p);
     }

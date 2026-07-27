@@ -608,6 +608,30 @@ pub struct SearchHit {
     pub matched_in: String,
 }
 
+/// One LOCATED transcript match — a `search_meetings` hit that kept its position.
+///
+/// #9 — `search_visible_impl` collapses to `GROUP BY meeting_id` with `MIN(rank)`, and
+/// `search_snippet` then re-finds the text with `LIKE … ORDER BY idx LIMIT 1`, so a query that
+/// matched 40 segments produced exactly ONE ~130-char excerpt with no index, no timestamp, and no
+/// count. After a SUCCESSFUL search an agent still had to page a 116k-char transcript blind, and
+/// could not even tell it was seeing 1 of 40. The asymmetry gave the fix away: document hits in the
+/// same reply already carry `(§section · p.page)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentHit {
+    pub meeting_id: String,
+    pub meeting_title: String,
+    /// Segment ordinal within the meeting (`segments.idx`).
+    pub seg_idx: i64,
+    pub start_s: f64,
+    pub end_s: f64,
+    /// The RAW diarization lane tag (`me` / `others` / `others-N`), rendered by the tool layer.
+    pub speaker: Option<String>,
+    pub text: String,
+    /// Total matching segments in this meeting, so a windowed reply can disclose `shown of N`.
+    pub hit_count: i64,
+}
+
 /// Lightweight metadata for one uploaded document — the FE list DTO. Carries NO text (the text is
 /// gated content surfaced only by `get_document`, never in the list). `created_at` is epoch millis.
 #[derive(Debug, Clone, Serialize, Deserialize)]

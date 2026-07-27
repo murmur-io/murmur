@@ -5817,6 +5817,102 @@ impl Db {
         Ok(hits)
     }
 
+    /// GATED, LOCATED transcript search — the composability half of `search_visible_impl`.
+    ///
+    /// #9 — `search_visible_impl` collapses matches with `GROUP BY meeting_id` + `MIN(rank)`, and
+    /// `search_snippet` then re-finds the text with `LIKE … ORDER BY idx LIMIT 1`. A query matching
+    /// 40 segments therefore yielded ONE ~130-char excerpt carrying no index, no timestamp and no
+    /// count, so a successful search still left the agent paging a 116k-char transcript blind — and
+    /// unable to tell it had seen 1 of 40. This keeps the position instead of discarding it.
+    ///
+    /// LOCK MODEL: raw segment text is sealed content, so this carries the IDENTICAL
+    /// `visibility_clause` predicate as `search_visible_impl` above — keep a meeting iff it has NO
+    /// note rows, OR at least one VISIBLE note row. The predicate is deliberately COPIED verbatim
+    /// rather than re-derived: a second, drifting formulation of the gate is precisely how a leak
+    /// gets introduced. The `fts_segments_au` trigger re-indexing blanked text on seal is
+    /// defense-in-depth BENEATH this clause, never the gate itself.
+    ///
+    /// `max_per_meeting` bounds how many located hits one meeting may contribute; `hit_count`
+    /// reports how many it actually has, so the reply can disclose `shown of N` instead of
+    /// silently truncating.
+    pub fn search_segments_visible(
+        &self,
+        query: &str,
+        meeting_id: Option<&str>,
+        limit: i64,
+        max_per_meeting: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::storage::models::SegmentHit>> {
+        // Preserve the empty/punctuation-only guard: a blank query matches NOTHING (never
+        // everything), exactly as the sibling readers do.
+        let Some(and_expr) = fts_match_query(query.trim()) else {
+            return Ok(Vec::new());
+        };
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let scope = if meeting_id.is_some() {
+            "AND s.meeting_id = ?4"
+        } else {
+            ""
+        };
+        // FTS5 forbids aliasing the virtual table in a MATCH, so the match runs ONCE in a CTE and
+        // both the per-meeting count and the per-meeting rank are derived from it.
+        let sql = format!(
+            "WITH seg_hits(mid, idx, rid) AS ( \
+                 SELECT s.meeting_id, s.idx, s.rowid \
+                   FROM fts_segments \
+                   JOIN segments s ON s.rowid = fts_segments.rowid \
+                  WHERE fts_segments MATCH ?1 AND s.text <> '' \
+             ), \
+             counts(mid, n) AS (SELECT mid, COUNT(*) FROM seg_hits GROUP BY mid) \
+             SELECT s.meeting_id, m.title, s.idx, s.start_s, s.end_s, s.speaker, s.text, c.n \
+               FROM seg_hits h \
+               JOIN segments s ON s.rowid = h.rid \
+               JOIN meetings m ON m.id = s.meeting_id \
+               JOIN counts c ON c.mid = h.mid \
+              WHERE (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                 OR EXISTS ( \
+                      SELECT 1 FROM notes n \
+                       LEFT JOIN folders f ON f.id = n.folder_id \
+                       WHERE n.meeting_id = m.id AND {visible} \
+                    )) \
+                {scope} \
+                AND (SELECT COUNT(*) FROM seg_hits h2 \
+                      WHERE h2.mid = h.mid AND h2.idx < h.idx) < ?3 \
+              ORDER BY m.started_at DESC, s.meeting_id ASC, s.idx ASC \
+              LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(crate::storage::models::SegmentHit {
+                meeting_id: row.get(0)?,
+                meeting_title: row
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "(untitled)".to_string()),
+                seg_idx: row.get(2)?,
+                start_s: row.get(3)?,
+                end_s: row.get(4)?,
+                speaker: row.get(5)?,
+                text: row.get(6)?,
+                hit_count: row.get(7)?,
+            })
+        };
+        let rows = match meeting_id {
+            Some(mid) => stmt
+                .query_map(
+                    rusqlite::params![&and_expr, limit, max_per_meeting, mid],
+                    map_row,
+                )
+                .map_err(map_err)?
+                .collect::<std::result::Result<Vec<_>, _>>(),
+            None => stmt
+                .query_map(rusqlite::params![&and_expr, limit, max_per_meeting], map_row)
+                .map_err(map_err)?
+                .collect::<std::result::Result<Vec<_>, _>>(),
+        };
+        rows.map_err(map_err)
+    }
+
     // `list_meetings_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `meeting_by_title_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
