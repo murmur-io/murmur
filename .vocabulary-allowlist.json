@@ -1,0 +1,89 @@
+{
+  "_comment": [
+    "PERMANENT exemptions. Every entry states WHY, and the reason must survive a hostile",
+    "read — 'it is hard to change' is not a reason. This file is not where debt goes;",
+    "that is .vocabulary-baseline.json, which may only shrink.",
+    "",
+    "The bar: a term is exempt only when the user is BETTER OFF seeing it. Search",
+    "synonyms qualify because a user who knows the jargon must still be able to find the",
+    "control that hides it — removing them would punish exactly the people the old copy",
+    "was written for."
+  ],
+  "entries": [
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "egress",
+      "reason": "Hidden SEARCH SYNONYM, never rendered. Someone who learned the old vocabulary must still be able to type it and land on the control — the plain label is what they see once they arrive."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "GGUF",
+      "reason": "Hidden search synonym, never rendered. Same rationale: searching the checkpoint format must still find the model picker."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "embedding",
+      "reason": "Hidden search synonym, never rendered. Finds the search-index controls for a user who knows the term."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "\\btokens?\\b",
+      "reason": "Hidden search synonym, never rendered. Finds the usage ledger."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "\\bMCP\\b",
+      "reason": "Hidden search synonym, never rendered. MCP is also the literal, correct name of a protocol other apps connect over — a user configuring Claude Desktop needs to find it by that name."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "base URL",
+      "reason": "Hidden search synonym, never rendered. Finds the gateway configuration."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "quantiz",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "sidecar",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "\\bNER\\b",
+      "reason": "Hidden search synonym, never rendered. Finds the name-masking control."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "\\bRAG\\b",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "reranker",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "SQLCipher",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "\\bIPC\\b",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "prefix cache|KV cache",
+      "reason": "Hidden search synonym, never rendered."
+    },
+    {
+      "file": "src/app/features/settings/settings/settings.component.ts",
+      "term": "\\bDEK\\b|\\bKEK\\b|\\bCK\\b",
+      "reason": "Hidden search synonym, never rendered. No key MATERIAL is ever shown; this is only a term someone might search for."
+    }
+  ]
+}
