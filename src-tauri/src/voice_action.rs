@@ -855,7 +855,13 @@ fn rag_answer(
         // The dossier resolves an ENTITY by name — use the literal terms first (most likely the
         // user's actual entity word), then the brain topic.
         for q in &queries {
-            tool_calls.push(ToolCall::GetEntityDossier { entity: q.clone() });
+            // Internal caller — keep the pre-existing full-corpus behavior explicitly.
+            tool_calls.push(ToolCall::GetEntityDossier {
+                entity: q.clone(),
+                note_detail: "full".to_string(),
+                offset: 0,
+                max_chars: 0,
+            });
         }
     }
 
