@@ -640,6 +640,55 @@ pub fn extract_fact_candidates(
 /// Map raw extracted triples to [`FactCandidate`]s: resolve each `entity` name to a known
 /// `entity_id` (case-insensitive), use the canonical entity name as the subject, drop unresolved or
 /// empty triples. Pure + headless-testable (no reasoner needed).
+/// Predicates whose OBJECT is supposed to name a person. EN + PL, matching the extractor prompt's
+/// own examples (`owner`, `role`) and the Polish forms the language-pinned variant emits.
+const PERSON_VALUED_PREDICATES: &[&str] = &[
+    "owner",
+    "assignee",
+    "role",
+    "właściciel",
+    "wlasciciel",
+    "odpowiedzialny",
+    "rola",
+];
+
+/// Tool / provider identifiers that are NEVER a person, and so may never be written as one.
+///
+/// This is not hypothetical. A real vault ended up with the durable, un-forgettable fact
+/// `M1 Advanced Mode · owner: claude_code`, which then surfaced through `get_entity_dossier` as a
+/// CURRENT FACT — so every agent reading that dossier reported a provider id as the product's owner.
+///
+/// The route in is ordinary: `pipeline.rs::fold_manual_notes` folds the user's typed companion-note
+/// text (which routinely contains pasted CLI/agent output) into the markdown the extractor reads,
+/// and `candidates_from_triples` validated only the ENTITY — `predicate` and `object` were taken
+/// verbatim. The guard belongs HERE rather than in the note writer, because
+/// `commands/links.rs::link_meeting_entities` re-feeds stored note markdown to this same extractor,
+/// so any writer-side filter would be bypassed on re-ingest.
+///
+/// Kept deliberately narrow: these are exact ids we KNOW are machinery. A broader "does this look
+/// like a person" heuristic would silently drop legitimate owners who did not attend the meeting
+/// ("Anna owns it, she will pick it up"), and losing a true fact is worse than the junk it prevents.
+fn object_is_never_a_person(object: &str) -> bool {
+    let o = object.trim().to_lowercase();
+    let o = o.strip_prefix('+').unwrap_or(&o).trim();
+    [
+        crate::summarize::PROVIDER_CLAUDE_CODE,
+        crate::summarize::PROVIDER_ANTHROPIC,
+        crate::summarize::PROVIDER_OLLAMA,
+        crate::summarize::PROVIDER_GATEWAY,
+        "claude",
+        "claude code",
+        "chatgpt",
+        "openai",
+        "copilot",
+        "assistant",
+        "ai",
+        "llm",
+        "bot",
+    ]
+    .contains(&o)
+}
+
 fn candidates_from_triples(
     triples: Vec<RawTriple>,
     entities: &[(String, String)],
@@ -650,6 +699,13 @@ fn candidates_from_triples(
         let predicate = t.predicate.trim();
         let object = t.object.trim();
         if ent.is_empty() || predicate.is_empty() || object.is_empty() {
+            continue;
+        }
+        // A person-valued predicate may never take a tool/provider id as its object. Dropping the
+        // CANDIDATE (rather than the whole triple set) keeps every other fact from this note.
+        if PERSON_VALUED_PREDICATES.contains(&predicate.to_lowercase().as_str())
+            && object_is_never_a_person(object)
+        {
             continue;
         }
         let Some((id, name)) = entities
@@ -672,6 +728,93 @@ fn candidates_from_triples(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(entity: &str, predicate: &str, object: &str) -> RawTriple {
+        RawTriple {
+            entity: entity.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+        }
+    }
+
+    /// R4/#17 (regression). A tool/provider id may NEVER be written as a person-valued object.
+    ///
+    /// RED against the previous behavior: `candidates_from_triples` validated only the ENTITY and
+    /// took `predicate`/`object` verbatim, so `(M1 Advanced Mode, owner, claude_code)` became a
+    /// durable fact and surfaced through `get_entity_dossier` as a CURRENT one — every agent
+    /// reading that dossier then reported a provider id as the product's owner.
+    #[test]
+    fn a_provider_id_is_never_accepted_as_an_owner() {
+        let entities = vec![("e1".to_string(), "M1 Advanced Mode".to_string())];
+        for junk in [
+            "claude_code",
+            "Claude Code",
+            "+ claude_code",
+            "anthropic",
+            "ollama",
+            "gateway",
+            "ChatGPT",
+            "assistant",
+        ] {
+            let got =
+                candidates_from_triples(vec![raw("M1 Advanced Mode", "owner", junk)], &entities);
+            assert!(
+                got.is_empty(),
+                "a person-valued predicate must reject the tool id {junk:?}, got {got:?}"
+            );
+        }
+        // Polish predicate forms the language-pinned extractor emits are gated too.
+        assert!(
+            candidates_from_triples(
+                vec![raw("M1 Advanced Mode", "właściciel", "claude_code")],
+                &entities
+            )
+            .is_empty(),
+            "the Polish owner predicate must be gated as well"
+        );
+    }
+
+    /// The guard must stay NARROW. A real person is still accepted, a real person who never spoke
+    /// in the meeting is still accepted (dropping them would silently lose a true fact, which is
+    /// worse than the junk this prevents), and a NON-person predicate may still carry any object —
+    /// `deployed_on: gateway` is a legitimate statement about infrastructure.
+    #[test]
+    fn the_owner_guard_does_not_swallow_legitimate_facts() {
+        let entities = vec![("e1".to_string(), "M1 Advanced Mode".to_string())];
+        for (predicate, object) in [
+            ("owner", "Anna"),
+            ("owner", "Jakub Gawronski"),
+            ("status", "shipped"),
+            // NOT a person-valued predicate ⇒ the blocklist must not apply at all.
+            ("deployed_on", "gateway"),
+            ("runs_on", "ollama"),
+        ] {
+            let got = candidates_from_triples(
+                vec![raw("M1 Advanced Mode", predicate, object)],
+                &entities,
+            );
+            assert_eq!(
+                got.len(),
+                1,
+                "({predicate}, {object}) is legitimate and must survive"
+            );
+        }
+    }
+
+    /// One junk triple must not take the whole note's facts down with it.
+    #[test]
+    fn a_rejected_owner_does_not_drop_the_other_facts() {
+        let entities = vec![("e1".to_string(), "M1 Advanced Mode".to_string())];
+        let got = candidates_from_triples(
+            vec![
+                raw("M1 Advanced Mode", "owner", "claude_code"),
+                raw("M1 Advanced Mode", "status", "in review"),
+            ],
+            &entities,
+        );
+        assert_eq!(got.len(), 1, "the sibling fact survives");
+        assert_eq!(got[0].predicate, "status");
+    }
 
     fn fact(
         id: &str,
