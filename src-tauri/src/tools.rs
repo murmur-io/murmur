@@ -1865,21 +1865,60 @@ fn page_text_disclosed(text: &str, offset: usize, max_chars: usize) -> (String, 
     (body, Some(header))
 }
 
+/// Render one wall-clock offset in seconds at ONE decimal. Upstream offsetting is f64 arithmetic
+/// (`pipeline.rs` `segment.start_s += offset_s`, `audio/merge.rs` `start_s: seg.start_s + offset_s`),
+/// so essentially every offset-shifted segment carries ~16 significant digits — 37 chars per
+/// timestamp pair where 16 suffice, ≈28k wasted chars (≈7k tokens) on a 1h/1355-segment meeting.
+/// A whole second collapses to an integer (`12`, not `12.0`) so short/fixture transcripts render
+/// exactly as before; sub-second precision below 0.1s is below ASR segment resolution anyway.
+fn secs(v: f64) -> String {
+    let r = (v * 10.0).round() / 10.0;
+    if r.fract() == 0.0 {
+        format!("{}", r as i64)
+    } else {
+        format!("{r:.1}")
+    }
+}
+
 /// Feature D — render a meeting's transcript segments as a STRUCTURED, one-line-per-segment block:
 /// `[<start_s>–<end_s>] <Speaker>: <text>`. RAW SECONDS (never MM:SS) so a 2h+ meeting can never
-/// wrap/clip a minutes field. Speaker maps the cheap 2-way stream attribution
-/// (`Segment.speaker`): `Some("me")` → `Me`, `Some("others")` → `Others`, `None`/anything else →
-/// `Unknown`. Empty-text segments are skipped (they carry no content, only silence bounds).
+/// wrap/clip a minutes field, rounded by [`secs`] to one decimal.
+///
+/// Speaker maps the raw `Segment.speaker` tag the SAME way the summarizer does
+/// (`summarize/template.rs`, `summarize/timeline.rs`): `me` → `Me`, plain `others` → `Others`, and a
+/// DIARIZED `others-{N}` (written by `transcribe::diarize::relabel_others` when sherpa-onnx finds
+/// more than one remote speaker) → `Speaker {N+1}`, one label per distinct person. Collapsing those to
+/// `Unknown` — as this renderer used to — meant ENABLING diarization strictly DEGRADED the MCP
+/// transcript while the note/timeline consumers of the same tag read it correctly. An absent tag, an
+/// unknown tag, or a malformed index (`others--1`) stays `Unknown` rather than inventing a
+/// `Speaker 0`. Empty-text segments are skipped (they carry no content, only silence bounds).
 fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> String {
+    use crate::audio::merge::{SPEAKER_ME, SPEAKER_OTHERS};
+    use std::borrow::Cow;
     segs.iter()
         .filter(|s| !s.text.trim().is_empty())
         .map(|s| {
-            let speaker = match s.speaker.as_deref() {
-                Some("me") => "Me",
-                Some("others") => "Others",
-                _ => "Unknown",
+            let speaker: Cow<'static, str> = match s.speaker.as_deref() {
+                Some(SPEAKER_ME) => Cow::Borrowed("Me"),
+                Some(SPEAKER_OTHERS) => Cow::Borrowed("Others"),
+                // Plain `others` is already handled above, so ask the shared parser for the
+                // NUMBERED branch only (`has_numbered: true`). Reject a negative/overflowing index
+                // so a corrupt tag can never render as `Speaker 0` or panic on `n + 1`.
+                Some(tag) => match crate::transcribe::diarize::cluster_index_of_tag(tag, true)
+                    .filter(|n| *n >= 0)
+                    .and_then(|n| n.checked_add(1))
+                {
+                    Some(label_n) => Cow::Owned(format!("Speaker {label_n}")),
+                    None => Cow::Borrowed("Unknown"),
+                },
+                None => Cow::Borrowed("Unknown"),
             };
-            format!("[{}–{}] {speaker}: {}", s.start_s, s.end_s, s.text.trim())
+            format!(
+                "[{}–{}] {speaker}: {}",
+                secs(s.start_s),
+                secs(s.end_s),
+                s.text.trim()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -4587,6 +4626,145 @@ mod tests {
         assert_eq!(
             out, expected,
             "plain format must be byte-identical to the legacy join"
+        );
+    }
+
+    /// R1-A — DIARIZED tags must not collapse to `Unknown`. Murmur ships real N-way diarization
+    /// (`transcribe::diarize::relabel_others` rewrites system-stream segments to `others-{N}`), which
+    /// the summarizer already consumes as DISTINCT people. The MCP renderer must agree: each
+    /// `others-{N}` gets its own `Speaker {N+1}` label, plain `others` stays `Others`, and a
+    /// MALFORMED tag (`others--1`) degrades to `Unknown` rather than leaking a bogus `Speaker 0`.
+    #[test]
+    fn get_meeting_structured_transcript_labels_diarized_speakers() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-diar", "Diarized", "the note", None);
+        db.insert_segments(
+            "m-diar",
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 2.0,
+                    text: "opening".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 4.0,
+                    text: "first guest".into(),
+                    speaker: Some("others-0".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 2,
+                    start_s: 4.0,
+                    end_s: 6.0,
+                    text: "second guest".into(),
+                    speaker: Some("others-1".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 3,
+                    start_s: 6.0,
+                    end_s: 8.0,
+                    text: "undiarized guest".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 4,
+                    start_s: 8.0,
+                    end_s: 10.0,
+                    text: "malformed tag".into(),
+                    speaker: Some("others--1".into()),
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-diar".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 0,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("Unknown: first guest") && !out.contains("Unknown: second guest"),
+            "a diarized others-N tag must NOT render as Unknown: {out}"
+        );
+        assert!(
+            out.contains("Speaker 1: first guest"),
+            "others-0 → Speaker 1: {out}"
+        );
+        assert!(
+            out.contains("Speaker 2: second guest"),
+            "others-1 → Speaker 2 (distinct from others-0): {out}"
+        );
+        assert!(
+            out.contains("Others: undiarized guest"),
+            "plain others still renders as Others: {out}"
+        );
+        assert!(
+            out.contains("Unknown: malformed tag") && !out.contains("Speaker 0"),
+            "a malformed others--1 tag degrades to Unknown, never Speaker 0: {out}"
+        );
+    }
+
+    /// R1-B — timestamps render at ONE decimal, not full f64 precision. Upstream wall-clock
+    /// offsetting (`pipeline.rs` `segment.start_s += offset_s`, `audio/merge.rs`) leaves essentially
+    /// every offset-shifted segment carrying ~16 significant digits, which is pure token waste in the
+    /// MCP payload (~28k wasted chars on a 1h meeting).
+    #[test]
+    fn get_meeting_structured_transcript_rounds_timestamps() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-prec", "Long meeting", "the note", None);
+        db.insert_segments(
+            "m-prec",
+            &[Segment {
+                idx: 0,
+                start_s: 3659.3188999159997,
+                end_s: 3668.198899916,
+                text: "wrapping up".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-prec".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 0,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("[3659.3"),
+            "start must round to one decimal: {out}"
+        );
+        assert!(
+            !out.contains("3659.3188"),
+            "full f64 precision must not reach the payload: {out}"
+        );
+        assert!(
+            out.contains("[3659.3–3668.2]"),
+            "both bounds round to one decimal: {out}"
         );
     }
 
