@@ -1819,7 +1819,21 @@ impl Db {
         if rows_vec.is_empty() {
             if let Some(any_expr) = fts_match_query_any(q) {
                 if any_expr != and_expr {
-                    rows_vec = run(&mut stmt, &any_expr)?;
+                    // #19 — the OR leg needs a RELEVANCE FLOOR. Without one, a six-word question
+                    // matched anything containing ONE of its words: a real query for
+                    // "hybrid mode source of truth Kong Operator" returned two notes titled "Kongo"
+                    // and "Kong test" whose bodies were scraped Murmur UI text. The tool description
+                    // actively nudges an agent here as a fallback, so following the docs produced
+                    // pure noise.
+                    //
+                    // The floor is COVERAGE, not a bm25 constant, deliberately: a bm25 threshold
+                    // would need calibrating against a real vault before anyone could say what it
+                    // means, while "matched at least half the content words" is deterministic,
+                    // explainable, and cannot silently drift.
+                    rows_vec = run(&mut stmt, &any_expr)?
+                        .into_iter()
+                        .filter(|h| passes_or_leg_floor(q, h))
+                        .collect();
                 }
             }
         }
@@ -2084,5 +2098,150 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok(out)
+    }
+}
+
+/// The RELEVANCE FLOOR for the org-search OR-fallback leg (#19).
+///
+/// The AND leg is already precise — every content word had to appear. The OR twin exists so a
+/// slightly-off phrasing still finds something, but on its own it admits a hit that matched exactly
+/// ONE word out of six. With no floor that produced the reported failure: the query
+/// "hybrid mode source of truth Kong Operator" returned notes titled "Kongo" and "Kong test". The
+/// tool description actively nudges an agent here as a fallback, so following the docs yielded pure
+/// noise.
+///
+/// The floor is COVERAGE, not a bm25 constant, deliberately: require the chunk to actually contain
+/// at least HALF the query's content words (minimum two; a one-word query is exempt because there
+/// is nothing to be partial about). Deterministic and explainable — a bm25 threshold would need
+/// calibrating against a real vault before anyone could say what a given value means, and would
+/// then drift silently as the corpus grew.
+pub(crate) fn passes_or_leg_floor(query: &str, hit: &crate::storage::models::OrgChunkHit) -> bool {
+    if is_mostly_interface_text(&hit.snippet) {
+        return false;
+    }
+    let haystack = format!("{} {}", hit.title, hit.snippet).to_lowercase();
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .filter(|t| t.chars().count() >= 3 && !crate::summarize::related_context::is_stopword(t))
+        .collect();
+    if terms.len() <= 1 {
+        return true;
+    }
+    let matched = terms
+        .iter()
+        .filter(|t| haystack.contains(t.as_str()))
+        .count();
+    // HALF, ROUNDED DOWN, never below one. The rounding direction is load-bearing and was found by
+    // an existing test rather than reasoned into: `s2_and_to_or_fallback_recovers_multiword_miss_org`
+    // pins that the two-word query "etykieta parcel" must still recover an item sharing only
+    // "parcel" — a Polish query against an English note, where the domain term is the ONLY word
+    // that can match. Rounding UP would require 2 of 2 and silently destroy that cross-language
+    // recall.
+    //
+    // Proportion is what separates signal from the reported noise: 1 of 2 is 50% and legitimate;
+    // 1 of 6 is 17% and is how "hybrid mode source of truth Kong Operator" reached a note titled
+    // "Kongo". Short queries are already specific; long ones must actually be covered.
+    matched >= (terms.len() / 2).max(1)
+}
+
+/// Whether a chunk is mostly UI chrome rather than authored prose.
+///
+/// The reported noise notes were scraped Murmur INTERFACE text — "Ask Brain to edit…", "Refine",
+/// "Shorten", "Translate", "✕", "↵". That is never prose a colleague wrote, and never an answer.
+fn is_mostly_interface_text(text: &str) -> bool {
+    const UI_TOKENS: &[&str] = &[
+        "ask brain to edit",
+        "refine",
+        "shorten",
+        "translate",
+        "regenerate",
+        "copy to clipboard",
+        "✕",
+        "↵",
+    ];
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lc = t.to_lowercase();
+    let ui_chars: usize = UI_TOKENS
+        .iter()
+        .filter(|tok| lc.contains(*tok))
+        .map(|tok| tok.len())
+        .sum();
+    // More than half the body being known interface strings ⇒ it is a screen, not a note.
+    ui_chars * 2 > t.len()
+}
+
+#[cfg(test)]
+mod or_leg_floor_tests {
+    use super::*;
+    use crate::storage::models::OrgChunkHit;
+
+    fn hit(title: &str, snippet: &str) -> OrgChunkHit {
+        OrgChunkHit {
+            item_id: "i1".into(),
+            author_hint: "colleague".into(),
+            title: title.into(),
+            snippet: snippet.into(),
+            content_sha256: Vec::new(),
+        }
+    }
+
+    /// R16/#19 (regression). The EXACT reported failure: a six-word question matched notes sharing
+    /// ONE word, because the OR-fallback leg had no floor at all.
+    #[test]
+    fn one_shared_word_out_of_six_is_not_a_match() {
+        let q = "hybrid mode source of truth Kong Operator";
+        assert!(
+            !passes_or_leg_floor(q, &hit("Kongo", "a trip report about Kongo")),
+            "matching only the token Kong must not qualify"
+        );
+        assert!(
+            !passes_or_leg_floor(q, &hit("Kong test", "some unrelated scratch note")),
+            "a title-only token overlap must not qualify"
+        );
+        // A genuinely relevant colleague note still passes — the floor must not kill recall.
+        assert!(
+            passes_or_leg_floor(
+                q,
+                &hit(
+                    "Kong Operator design",
+                    "we agreed the Kong Operator is the source of truth in hybrid mode"
+                )
+            ),
+            "a note covering most of the query must still be found"
+        );
+    }
+
+    /// A single-word query is exempt — there is nothing to be partial about.
+    #[test]
+    fn a_one_word_query_is_not_floored() {
+        assert!(passes_or_leg_floor("Konnect", &hit("Konnect", "anything")));
+    }
+
+    /// The floor must NOT destroy the cross-language recall the AND→OR fallback exists for.
+    ///
+    /// `s2_and_to_or_fallback_recovers_multiword_miss_org` pins this at the reader level: a Polish
+    /// query against an English note, where the domain term is the only word that CAN match. One of
+    /// two words is 50% and legitimate; the rejected noise case is one of six, which is 17%. Pinned
+    /// here too so the rounding direction cannot be "simplified" to `div_ceil` later.
+    #[test]
+    fn a_two_word_query_still_matches_on_its_one_shared_domain_term() {
+        assert!(passes_or_leg_floor(
+            "etykieta parcel",
+            &hit("Parcels", "parcel size delivery schedule")
+        ));
+    }
+
+    /// Scraped INTERFACE text is never an answer, however many words it happens to share.
+    #[test]
+    fn scraped_interface_text_is_rejected() {
+        assert!(!passes_or_leg_floor(
+            "hybrid mode source of truth Kong Operator",
+            &hit("Kong test", "Ask Brain to edit… Refine Shorten Translate ✕ ↵")
+        ));
     }
 }
