@@ -73,13 +73,70 @@ fn parse_item_line(line: &str) -> Option<(bool, String)> {
 fn extract_owner(text: &str) -> Option<String> {
     for sep in [" — ", " – ", " - "] {
         if let Some((head, _)) = text.split_once(sep) {
-            let head = head.trim();
+            let head = normalize_owner(head);
             if !head.is_empty() && head.chars().count() <= 40 {
-                return Some(head.to_string());
+                return Some(head);
             }
         }
     }
     None
+}
+
+/// Strip the SCAFFOLDING a diarization tag or a wikilink leaves around an owner name.
+///
+/// The measured symptom: `get_open_commitments(owner="Miles")` returned 4 of the 7 items Miles
+/// actually owns — 57% recall — because the filter is exact equality on the raw string, so
+/// `"Miles (others-9)"` and `"others-10 -> Miles"` never matched `"Miles"`.
+///
+/// The residue is the diarization CLUSTER TAG leaking through the note prompt: the attribution
+/// directive tells the model to "keep the tag label" when it cannot name a speaker, and
+/// [`extract_owner`] then took the head before the em-dash verbatim.
+///
+/// DELIBERATELY CONSERVATIVE — this normalizes SCAFFOLDING ONLY, never identity:
+/// - `(others-N)` and `(me)` are stripped because they are machine tags, but ANY OTHER
+///   parenthetical is KEPT. `me (Ali)` and `me (YuYakob)` are different people in org-shared
+///   notes, and collapsing them to `me` would merge three people's commitments into one rollup —
+///   the opposite of the bug being fixed here.
+/// - matching stays case-insensitive EQUALITY on the normalized form; no fuzzy/prefix matching,
+///   which would start merging distinct people named similarly.
+pub(crate) fn normalize_owner(raw: &str) -> String {
+    let mut s = raw.trim();
+
+    // `others-10 -> Miles` / `others-10: Miles` — the cluster tag prefixes the real name.
+    for sep in ["->", "→", ":"] {
+        if let Some((head, tail)) = s.split_once(sep) {
+            if is_cluster_tag(head.trim()) {
+                s = tail.trim();
+            }
+        }
+    }
+
+    // `[[Miles]]` / `[[Miles|Miles Davis]]` — an Obsidian wikilink around the owner.
+    if let Some(inner) = s.strip_prefix("[[").and_then(|r| r.strip_suffix("]]")) {
+        s = inner.split('|').next().unwrap_or(inner).trim();
+    }
+
+    // Trailing machine tag: `Miles (others-9)`, `Miles (me)`.
+    if let Some(open) = s.rfind('(') {
+        if s.trim_end().ends_with(')') {
+            let inside = s[open + 1..s.trim_end().len() - 1].trim();
+            if is_cluster_tag(inside) || inside.eq_ignore_ascii_case("me") {
+                s = s[..open].trim();
+            }
+        }
+    }
+
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `s` is a raw diarization lane tag (`others`, `others-3`, `me`) rather than a person.
+fn is_cluster_tag(s: &str) -> bool {
+    let s = s.trim().to_lowercase();
+    if s == "me" || s == "others" {
+        return true;
+    }
+    s.strip_prefix("others-")
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// First `YYYY-MM-DD` substring in `s`, char-boundary safe. `pub(crate)` so the action-item RECALL
@@ -113,6 +170,66 @@ fn is_iso_date(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R5/#16 (regression). The three owner spellings a real vault produced for ONE person must
+    /// all normalize to the same key, so an owner filter stops losing 43% of his items.
+    ///
+    /// RED against the previous behavior: `extract_owner` returned the head before the em-dash
+    /// verbatim, and the filter was exact equality, so only the bare `Miles` form ever matched.
+    #[test]
+    fn the_diarization_residue_around_an_owner_is_normalized_away() {
+        // Parameterized over unrelated names (incl. a two-word one and a non-ASCII one) so the
+        // normalization is demonstrably STRUCTURAL — it strips machine scaffolding, and nothing in
+        // it is tied to any particular person.
+        for name in ["Miles", "Anna Kowalska", "Łukasz", "O'Brien"] {
+            for raw in [
+                name.to_string(),
+                format!("{name} (others-9)"),
+                format!("others-10 -> {name}"),
+                format!("others-10: {name}"),
+                format!("[[{name}]]"),
+                format!("[[{name}|{name} Jr]]"),
+                format!("{name}  (me)"),
+                format!("  {name}  "),
+            ] {
+                assert_eq!(
+                    normalize_owner(&raw),
+                    name,
+                    "{raw:?} must normalize to the bare owner name"
+                );
+            }
+        }
+    }
+
+    /// The normalization must stay SCAFFOLDING-ONLY. `me (Ali)` and `me (YuYakob)` are DIFFERENT
+    /// people in org-shared notes; collapsing either to `me` would merge several people's
+    /// commitments into one "what did I promise" rollup — the opposite of the bug being fixed.
+    #[test]
+    fn normalize_owner_never_collapses_distinct_identities() {
+        assert_eq!(normalize_owner("me (Ali)"), "me (Ali)");
+        assert_eq!(normalize_owner("me (YuYakob)"), "me (YuYakob)");
+        assert_ne!(normalize_owner("me (Ali)"), normalize_owner("me (YuYakob)"));
+        // A real name in parentheses is identity, not scaffolding.
+        assert_eq!(normalize_owner("Anna (QA)"), "Anna (QA)");
+    }
+
+    /// The owner survives the round trip through the real parser, not just the helper.
+    #[test]
+    fn extract_owner_strips_the_cluster_tag_end_to_end() {
+        let md = "## Action items\n\
+                  - [ ] Miles — ship the deck\n\
+                  - [ ] Miles (others-9) — review the PRD\n\
+                  - [ ] others-10 -> Miles — file the ticket\n";
+        let owners: Vec<_> = parse_action_items(md)
+            .into_iter()
+            .filter_map(|i| i.owner)
+            .collect();
+        assert_eq!(
+            owners,
+            vec!["Miles", "Miles", "Miles"],
+            "all three spellings resolve to one owner key"
+        );
+    }
 
     #[test]
     fn parses_checklist_lines() {
