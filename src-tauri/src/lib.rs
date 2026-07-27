@@ -210,6 +210,7 @@ pub fn run() {
             commands::delete_document,
             commands::get_user_memory,
             commands::forget_user_fact,
+            commands::forget_entity_fact,
             commands::clear_user_memory,
             commands::import_memories,
             // Re-Truth (the vault heals itself) — supersession review + one-tap stamp + undo.
