@@ -4,7 +4,7 @@
   "default_reviewer": "claude",
   "max_repair_rounds": 2,
   "task_timeout_seconds": 21600,
-  "agent_timeout_seconds": 1800,
+  "agent_timeout_seconds": 3600,
   "writer_timeout_seconds": 5400,
   "reviewer_timeout_seconds": 2400,
   "base_fetch_timeout_seconds": 30,
