@@ -21,6 +21,7 @@ import {
   MurPowerSliderComponent,
   type PowerRung,
 } from "../../../../../design-system/power-slider/power-slider.component";
+import { ErrorCopyService } from "../../../../../core/copy/error-copy.service";
 
 /**
  * The COARSE accuracy / speed rating per ladder rung.
@@ -69,6 +70,7 @@ const RATINGS: Record<string, { accuracy: number; speed: number }> = {
 export class ModelPowerComponent {
   private readonly ipc = inject(IpcService);
   readonly machine = inject(MachineService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The currently chosen size id. The host owns it; this component never writes it. */
   readonly size = input.required<string>();
@@ -286,7 +288,7 @@ export class ModelPowerComponent {
     try {
       await this.ipc.deleteWhisperModel(id);
     } catch (e) {
-      this._deleteError.set(String(e));
+      this._deleteError.set(this.errorCopy.humanize(e));
     } finally {
       this._deleting.set(false);
       // Refresh either way: on success the row must stop claiming it is downloaded,

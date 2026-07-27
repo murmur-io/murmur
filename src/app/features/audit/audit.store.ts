@@ -13,6 +13,7 @@ import type {
   AuditRunSummary,
   AuditSchedule,
 } from "../../core/models";
+import { ErrorCopyService } from "../../core/copy/error-copy.service";
 
 /** Stable render order for the grouped inbox — most consequential kinds first. */
 export const AUDIT_KIND_ORDER: readonly AuditFindingKind[] = [
@@ -48,6 +49,7 @@ export interface AuditKindGroup {
 export class AuditStore {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _findings = signal<AuditFinding[]>([]);
   readonly findings = this._findings.asReadonly();
@@ -117,7 +119,7 @@ export class AuditStore {
       this._findings.set(findings);
       this._error.set(null);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._loading.set(false);
     }

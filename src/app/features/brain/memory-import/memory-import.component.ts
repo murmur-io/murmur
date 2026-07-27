@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { ToastService } from "../../../services/toast.service";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * Brain v2 L2.3 — "Import memories from another assistant": paste a ChatGPT /
@@ -30,6 +31,7 @@ import { ToastService } from "../../../services/toast.service";
 export class MemoryImportComponent {
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** Fires after a successful import with the number of NEW facts added. */
   readonly imported = output<number>();
@@ -64,7 +66,7 @@ export class MemoryImportComponent {
         this.imported.emit(n);
       }
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.importing.set(false);
     }

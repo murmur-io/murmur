@@ -58,6 +58,7 @@ import {
 } from "../note-panel/note-panel.component";
 import { SharePanelComponent } from "../share-panel/share-panel.component";
 import { VerifyPanelComponent } from "../verify-panel/verify-panel.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
@@ -86,6 +87,7 @@ export class DetailComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
   /** Environment (root) injector — hosts the detach-proof root lock effect. */
   private readonly envInjector = inject(EnvironmentInjector);
   private readonly destroyRef = inject(DestroyRef);
@@ -1185,11 +1187,15 @@ export class DetailComponent implements OnInit {
         }
       }
     } catch (e) {
-      // Biometric denied / cancelled, or the unlock errored — stay gated. Surface the REAL backend
-      // error (AppError crosses the IPC as a string): a keychain OSStatus or a "content-key unwrap
-      // failed" tells the user (and a field screenshot tells us) what actually broke — the old
-      // generic apology made signed-build failures undiagnosable.
-      this.toast.danger(`Couldn’t unlock — ${String(e)}`);
+      // Biometric denied / cancelled, or the unlock errored — stay gated.
+      //
+      // This used to render the RAW backend error on purpose, so a field screenshot of a signed
+      // build showed the keychain OSStatus or a "content-key unwrap failed". P3 ends that: the same
+      // channel carries key-material vocabulary (KEK/CK/"mutex poisoned"), and the lock gate is the
+      // last surface that may leak it. A cancel and an auth failure are still told apart — by the
+      // `[touch-id-*]` code under the "unlock" context, not by prose — and the escape hatch below
+      // is unchanged, so a genuinely lost key is still recoverable.
+      this.toast.danger(this.errorCopy.humanize(e, "unlock"));
       // Reveal the reset escape hatch — the key may be genuinely gone (the backend still re-proves
       // non-recoverability before it will discard anything).
       this.unlockFailed.set(true);
@@ -1223,7 +1229,7 @@ export class DetailComponent implements OnInit {
       );
     } catch (e) {
       // Most importantly: the backend REFUSES when the folder is actually recoverable.
-      this.toast.danger(`Couldn’t reset — ${String(e)}`);
+      this.toast.danger(this.errorCopy.because("Couldn’t reset", e));
     } finally {
       this.discarding.set(false);
     }
@@ -1376,7 +1382,7 @@ export class DetailComponent implements OnInit {
       }
       this.flashPin(`Pinned ${result.mmss} — Obsidian link copied`);
     } catch (e) {
-      this.pinError.set("Couldn’t pin: " + String(e));
+      this.pinError.set(this.errorCopy.because("Couldn’t pin", e));
     } finally {
       this.pinning.set(false);
     }
@@ -1447,7 +1453,7 @@ export class DetailComponent implements OnInit {
       this.graph.set(await this.ipc.linkMeetingEntities(id));
     } catch (e) {
       this.graph.set(null);
-      this.graphError.set("Couldn’t connect to graph: " + String(e));
+      this.graphError.set(this.errorCopy.because("Couldn’t connect to graph", e));
     } finally {
       this.linking.set(false);
     }
@@ -1466,7 +1472,7 @@ export class DetailComponent implements OnInit {
       }
       this.msg.set("Done.");
     } catch (e) {
-      this.msg.set("Error: " + String(e));
+      this.msg.set(this.errorCopy.because("Couldn’t rewrite the note", e));
     } finally {
       this.busy.set(false);
     }
@@ -1516,7 +1522,7 @@ export class DetailComponent implements OnInit {
       this.tabsService.setTitle(tabKeyFor("meeting", id), title);
       this.renaming.set(false);
     } catch (e) {
-      this.msg.set("Couldn’t rename: " + String(e));
+      this.msg.set(this.errorCopy.because("Couldn’t rename", e));
     } finally {
       this.savingRename.set(false);
     }
@@ -1547,7 +1553,7 @@ export class DetailComponent implements OnInit {
       await this.ipc.deleteMeeting(id);
       await this.router.navigateByUrl("/library");
     } catch (e) {
-      this.deleteError.set("Couldn’t delete: " + String(e));
+      this.deleteError.set(this.errorCopy.because("Couldn’t delete", e));
       this.deleting.set(false);
     }
   }
@@ -1602,7 +1608,7 @@ export class DetailComponent implements OnInit {
       this.draft.set(this.detail()?.note?.markdown ?? "");
       this.editing.set(false);
     } catch (e) {
-      this.saveError.set("Couldn’t discard added images: " + String(e));
+      this.saveError.set(this.errorCopy.because("Couldn’t discard added images", e));
     } finally {
       this.saving.set(false);
     }
@@ -1656,7 +1662,7 @@ export class DetailComponent implements OnInit {
       this.editing.set(false);
       this.flashSaved();
     } catch (e) {
-      this.saveError.set("Couldn’t save: " + String(e));
+      this.saveError.set(this.errorCopy.because("Couldn’t save", e));
     } finally {
       this.saving.set(false);
     }
@@ -1736,7 +1742,7 @@ export class DetailComponent implements OnInit {
       await this.ipc.setMeetingTags(id, next);
     } catch (e) {
       this.tags.set(previous);
-      this.tagsError.set("Couldn’t save tags: " + String(e));
+      this.tagsError.set(this.errorCopy.because("Couldn’t save tags", e));
     } finally {
       this.tagsBusy.set(false);
     }
@@ -1771,7 +1777,7 @@ export class DetailComponent implements OnInit {
       await navigator.clipboard.writeText(markdown);
       this.flashExport("md-copied");
     } catch (e) {
-      this.exportError.set("Couldn’t copy: " + String(e));
+      this.exportError.set(this.errorCopy.because("Couldn’t copy", e));
     }
   }
 
@@ -1796,7 +1802,7 @@ export class DetailComponent implements OnInit {
         this.flashExport("md-saved");
       }
     } catch (e) {
-      this.exportError.set("Couldn’t save markdown: " + String(e));
+      this.exportError.set(this.errorCopy.because("Couldn’t save markdown", e));
     } finally {
       this.exporting.set(false);
     }
@@ -1823,7 +1829,7 @@ export class DetailComponent implements OnInit {
         this.flashExport("audio-saved");
       }
     } catch (e) {
-      this.exportError.set("Couldn’t save audio: " + String(e));
+      this.exportError.set(this.errorCopy.because("Couldn’t save audio", e));
     } finally {
       this.exporting.set(false);
     }
@@ -1874,16 +1880,19 @@ export class DetailComponent implements OnInit {
    * export; a missing per-stream archive → none was kept; anything else verbatim.
    */
   private masterErrorMessage(stream: "mic" | "sys", error: unknown): string {
-    const raw = String(error);
-    if (/locked/i.test(raw)) {
+    if (this.errorCopy.is(error, "meeting-locked")) {
       return "This meeting is locked — unlock it to export the master.";
     }
-    if (/no master/i.test(raw)) {
+    // "no master for that stream" is an `InvalidArg` with no code (it is not a failure the user
+    // can act on beyond knowing it), and it is the ONE remaining prose test on this path. It reads
+    // an `export.rs` string that has no other consumer; recorded in `errcode.rs`'s prose-coupling
+    // note so a future reword cannot break it silently.
+    if (/no master/i.test(String(error))) {
       return stream === "mic"
         ? "No hi-res mic master was kept for this meeting."
         : "No hi-res system master was kept for this meeting.";
     }
-    return "Couldn’t export the master: " + raw;
+    return this.errorCopy.because("Couldn’t export the master", error);
   }
 
   /**
@@ -1920,7 +1929,7 @@ export class DetailComponent implements OnInit {
       const path = await this.ipc.exportCanvas(id);
       this.flashCanvas(path);
     } catch (e) {
-      this.canvasError.set("Couldn’t export Canvas: " + String(e));
+      this.canvasError.set(this.errorCopy.because("Couldn’t export Canvas", e));
     } finally {
       this.exportingCanvas.set(false);
     }

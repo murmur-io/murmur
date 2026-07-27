@@ -201,11 +201,11 @@
                     hit.meeting.title || "(untitled)"
                   }}</span>
                   <span class="meta">
-                    <span
-                      class="badge"
-                      [class]="matchBadgeClass(hit.matchedIn)"
-                      >{{ matchLabel(hit.matchedIn) }}</span
-                    >
+                    @if (hit.whereMatched) {
+                      <span class="badge" [class]="hit.badgeClass">{{
+                        hit.whereMatched
+                      }}</span>
+                    }
                     <span class="date">{{
                       formatDate(hit.meeting.startedAt)
                     }}</span>

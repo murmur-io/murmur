@@ -69,9 +69,14 @@ test.describe("Note editor — save error handling surfaces the real diagnostic"
     page.on("pageerror", (err) => consoleErrors.push(String(err)));
 
     await mockNotes(page, {
-      // Mirrors `AppError::InvalidArg(format!("no note {id}"))` — the
+      // Mirrors the REAL wire string of
+      // `AppError::InvalidArg(errcode::tag(NOTE_MISSING, format!("no note {id}")))` — the
       // stale-tab-after-delete case. Retrying this can never succeed.
-      save_note_text: () => Promise.reject("invalid argument: no note n1"),
+      //
+      // The `[note-missing]` code is what classifies it (P3); the fixture carries it because the
+      // backend does. Dropping the code here would test a wire format that no longer exists.
+      save_note_text: () =>
+        Promise.reject("invalid argument: [note-missing] no note n1"),
     });
 
     await page.goto("/notes");

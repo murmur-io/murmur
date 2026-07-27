@@ -66,6 +66,7 @@ import {
   type PropertyKind,
   type PropertySchemaField,
 } from "./property-field-types";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The autosave indicator state. */
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -199,6 +200,7 @@ export class NoteEditorComponent {
   private readonly tabsService = inject(TabsService);
   private readonly tabRouteReuse = inject(TabRouteReuseStrategy);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
   /** Environment (root) injector — hosts the detach-proof root lock effect. */
   private readonly envInjector = inject(EnvironmentInjector);
   private readonly destroyRef = inject(DestroyRef);
@@ -310,13 +312,15 @@ export class NoteEditorComponent {
   /** The autosave indicator. */
   readonly saveState = signal<SaveState>("idle");
   /**
-   * The real `AppError` message behind the last failed save (root-cause fix,
-   * 2026-07-15) — surfaced as a tooltip on the "Save failed" pill instead of
-   * being swallowed. `AppError` is `Serialize` and crosses IPC as its display
-   * string (see `.claude/rules/rust-tauri.md` §1), so `String(e)` already IS
-   * the real backend message; the bug was that only a `"Locked"` substring
-   * check ever surfaced ANYTHING to the user — every other rejection (e.g. a
-   * transient storage error) showed a blank, undiagnosable red banner.
+   * What went wrong behind the last failed save — surfaced as a tooltip on the "Save failed" pill
+   * instead of being swallowed (root-cause fix, 2026-07-15: before it, every rejection other than
+   * a lock refusal showed a blank, undiagnosable red banner).
+   *
+   * P3: this is now the sentence `ErrorCopyService` owns, not the raw `AppError` display. The raw
+   * message was chosen deliberately in 2026-07-15 for diagnosability, but the same channel carries
+   * developer vocabulary from ~2100 `AppError` sites, and an autosave tooltip is not the place to
+   * leak it. A recognised failure still says exactly what happened; an unrecognised one says
+   * "Couldn’t save this note. Please try again." rather than nothing.
    */
   readonly saveErrorMessage = signal<string | null>(null);
   /** The tag-input draft. */
@@ -1016,7 +1020,7 @@ export class NoteEditorComponent {
       await this.tabsService.openNote(id, "Untitled", { replaceUrl: true });
     } catch (e) {
       if (seq === this.requestSeq) {
-        this.error.set(String(e));
+        this.error.set(this.errorCopy.humanize(e));
         this.loading.set(false);
       }
     }
@@ -1087,20 +1091,17 @@ export class NoteEditorComponent {
 
   /**
    * A clean, non-technical message for the "couldn't open this note" state.
-   * `get_note` rejects with the raw backend `AppError` string (`"invalid
-   * argument: no note {id}"`) for an unknown id — normally the tab-strip's
-   * `content-deleted` fan-out (`TabsService`) closes a stale tab before this
-   * is ever reached, but a note opened a different way (a stale bookmark, a
-   * link from another surface not going through `TabsService`) can still land
-   * here after a delete, so this stays a friendly fallback rather than the raw
-   * technical string.
+   *
+   * `get_note` rejects with `[note-missing]` (`errcode::NOTE_MISSING`) for an unknown id — normally
+   * the tab-strip's `content-deleted` fan-out (`TabsService`) closes a stale tab before this is
+   * ever reached, but a note opened a different way (a stale bookmark, a link from a surface that
+   * does not go through `TabsService`) can still land here after a delete.
+   *
+   * Folded into `ErrorCopyService` under the "note-load" context — the "no note " prose test is
+   * gone, and the non-matching arm no longer falls through to the raw backend string.
    */
   private friendlyLoadError(e: unknown): string {
-    const msg = String(e);
-    if (/no note /i.test(msg)) {
-      return "This note was deleted.";
-    }
-    return msg;
+    return this.errorCopy.humanize(e, "note-load");
   }
 
   /** Apply a loaded/reconciled doc into the edit signals (no autosave feedback). */
@@ -1322,7 +1323,7 @@ export class NoteEditorComponent {
         } catch (error) {
           if (this.note()?.id === noteId && !this.note()?.locked) {
             this.replacePendingAttachment(id, "");
-            this.toast.danger(String(error));
+            this.toast.danger(this.errorCopy.humanize(error));
           }
         }
       }
@@ -1523,9 +1524,21 @@ export class NoteEditorComponent {
    * `busy_timeout` fix in `Db::open_with_key`, but a retry is still a correct,
    * cheap belt-and-suspenders for whatever transient storage hiccup slips
    * through).
+   *
+   * BUG FIXED HERE (P3). This tested `message.includes("Locked")` — CAPITAL L — while every
+   * producer is lowercase: `AppError`'s `Display` is `#[error("locked: {0}")]` and the note
+   * write-gates in `commands/notes.rs` all go through it. So the lock arm NEVER fired: a save into
+   * a folder that sealed under the user fell into the retry branch, waited out an 800 ms backoff,
+   * failed identically, and only then surfaced. The guard is now the `[note-locked]` /
+   * `[folder-locked]` / `[note-missing]` CODE, which cannot have a casing bug.
    */
-  private isUnretryableSaveError(message: string): boolean {
-    return message.includes("Locked") || message.includes("no note ");
+  private isUnretryableSaveError(e: unknown): boolean {
+    const code = this.errorCopy.codeOf(e);
+    return (
+      code === "note-locked" ||
+      code === "folder-locked" ||
+      code === "note-missing"
+    );
   }
 
   /**
@@ -1574,14 +1587,15 @@ export class NoteEditorComponent {
   }
 
   /**
-   * Shared failure path for both save paths: classify the error, retry ONCE
-   * for a retryable (non-lock, non-missing-row) failure, and only THEN settle
-   * `saveState`/`saveErrorMessage`/toast with the real backend message —
-   * `AppError` is `Serialize` and crosses IPC as its display string (rust-tauri
-   * §1), so `String(e)` already carries the actual diagnostic instead of the
-   * old blanket "Save failed" with nothing behind it. `noteId` scopes the
-   * bounded retry's debounce key so concurrent open note tabs never cancel
+   * Shared failure path for both save paths: classify the error, retry ONCE for a retryable
+   * (non-lock, non-missing-row) failure, and only THEN settle `saveState`/`saveErrorMessage`/toast.
+   * `noteId` scopes the bounded retry's debounce key so concurrent open note tabs never cancel
    * each other's retry (see {@link retryOnce}).
+   *
+   * Classification is by `[code]`, never by prose — see {@link isUnretryableSaveError} for the
+   * casing bug that motivated it. The settled message is the sentence `ErrorCopyService` owns, so
+   * an unrecognised failure reads "Couldn’t save this note. Please try again." instead of a Rust
+   * diagnostic.
    */
   private async handleSaveFailure<T>(
     noteId: string,
@@ -1594,22 +1608,23 @@ export class NoteEditorComponent {
     if (!this.saveResponseStillApplies(noteId)) {
       return false;
     }
-    const message = String(e);
-    if (message.includes("no note ")) {
+    const message = this.errorCopy.humanize(e, "note-save");
+    const code = this.errorCopy.codeOf(e);
+    if (code === "note-missing") {
       // Stale-tab-after-delete: this note id no longer exists server-side —
       // retrying a save against it can never succeed.
       this.saveState.set("error");
       this.saveErrorMessage.set("This note no longer exists.");
-      this.toast.danger("This note no longer exists — it may have been deleted elsewhere.");
+      this.toast.danger(message);
       return false;
     }
-    if (message.includes("Locked")) {
+    if (code === "note-locked" || code === "folder-locked") {
       this.saveState.set("error");
       this.saveErrorMessage.set(message);
       this.toast.danger("This note is locked — unlock its folder to edit.");
       return false;
     }
-    if (!this.isUnretryableSaveError(message)) {
+    if (!this.isUnretryableSaveError(e)) {
       try {
         const result = await this.retryOnce(noteId, retryAttempt);
         if (!this.saveResponseStillApplies(noteId)) {
@@ -1626,7 +1641,9 @@ export class NoteEditorComponent {
           return false;
         }
         this.saveState.set("error");
-        this.saveErrorMessage.set(String(retryError));
+        this.saveErrorMessage.set(
+          this.errorCopy.humanize(retryError, "note-save"),
+        );
         return false;
       }
     }
@@ -2517,7 +2534,7 @@ export class NoteEditorComponent {
       const name = this.noteFolders().find((f) => f.id === folderId)?.name ?? "folder";
       this.toast.success(`Moved to ${name}`);
     } catch (e) {
-      this.toast.danger(`Couldn’t move — ${String(e)}`);
+      this.toast.danger(this.errorCopy.because("Couldn’t move", e));
     }
   }
 
@@ -2542,7 +2559,7 @@ export class NoteEditorComponent {
       this.note.update((cur) => (cur ? { ...cur, exportedPath: path } : cur));
       this.toast.success("Saved to your vault");
     } catch (e) {
-      this.toast.danger(`Couldn’t export — ${String(e)}`);
+      this.toast.danger(this.errorCopy.because("Couldn’t export", e));
     }
   }
 
@@ -2621,7 +2638,7 @@ export class NoteEditorComponent {
       this.toast.success("Note deleted");
       void this.router.navigate(["/notes"]);
     } catch (e) {
-      this.toast.danger(`Couldn’t delete — ${String(e)}`);
+      this.toast.danger(this.errorCopy.because("Couldn’t delete", e));
       this.confirmingDelete.set(false);
     }
   }
@@ -2650,7 +2667,9 @@ export class NoteEditorComponent {
         this.hydrate(fresh);
       }
     } catch (e) {
-      this.toast.danger(`Couldn’t unlock — ${String(e)}`);
+      // "unlock" context: a Touch ID cancel reads "Touch ID was cancelled — try again." and an
+      // unrecognised failure falls back to "Couldn’t unlock. Please try again.".
+      this.toast.danger(this.errorCopy.humanize(e, "unlock"));
     } finally {
       this.unlocking.set(false);
     }
@@ -2820,10 +2839,10 @@ export class NoteEditorComponent {
       void this.notes.loadNotes(null);
       void this.router.navigate(["/notes", id]);
     } catch (e) {
-      // Surface a sealed-folder refusal (`Locked`) plainly, like the main
-      // "New note" action and the share panel — never a bare "couldn't create".
+      // Surface a sealed-folder refusal (`[folder-locked]`) plainly, like the main "New note"
+      // action and the share panel — never a bare "couldn't create".
       this.toast.danger(
-        /locked/i.test(String(e))
+        this.errorCopy.is(e, "folder-locked")
           ? "This folder is locked — unlock it first to add a note."
           : "Couldn’t create the note",
       );

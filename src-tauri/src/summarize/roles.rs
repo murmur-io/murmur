@@ -51,8 +51,14 @@ pub const CONN_OFF: &str = "off";
 pub const CONN_AFM: &str = "apple";
 
 /// Human-facing display name for a connection id — for USER-VISIBLE status lines
-/// (e.g. the pipeline's "Summarizing with …" line). Mirrors the FE connection
-/// labels (`CONNECTION_LABELS` in `settings.store.ts`) so the two never diverge.
+/// (e.g. the pipeline's "Summarizing with …" line).
+///
+/// **DOCUMENTED MIRROR — change both halves in the SAME commit or they drift.** The frontend's
+/// copy of these labels is `CONNECTION_LABELS` in `src/app/core/copy/labels.ts` (it used to live
+/// in `settings.store.ts` AND again in `record.component.ts`; P3 collapsed all three into the one
+/// copy module, which is the only place the FE may name a connection). The `connection_labels_
+/// mirror_the_frontend_copy_module` test below pins the four provider rows.
+///
 /// An unknown id falls back to itself, so a newly-added provider is never blank.
 pub fn connection_display_name(connection: &str) -> &str {
     match connection {
@@ -273,6 +279,28 @@ mod tests {
         assert_ne!(connection_display_name("claude_code"), "claude_code");
         // Unknown id falls back to itself (never blank) so a new provider still shows.
         assert_eq!(connection_display_name("brand_new"), "brand_new");
+    }
+
+    /// The DOCUMENTED MIRROR guard. `src/app/core/copy/labels.ts::CONNECTION_LABELS` carries the
+    /// same four strings; this test is the Rust half of "they change together or they drift".
+    /// A rename that lands here without landing there (or vice versa) makes the pipeline's
+    /// "Summarizing with …" line disagree with the Settings summary for the same connection.
+    #[test]
+    fn connection_labels_mirror_the_frontend_copy_module() {
+        // Keep in lockstep with src/app/core/copy/labels.ts::CONNECTION_LABELS.
+        const FRONTEND_LABELS: &[(&str, &str)] = &[
+            ("claude_code", "Claude Code"),
+            ("anthropic", "Anthropic API"),
+            ("ollama", "Ollama"),
+            ("gateway", "Kong AI Gateway"),
+        ];
+        for (id, label) in FRONTEND_LABELS {
+            assert_eq!(
+                connection_display_name(id),
+                *label,
+                "connection {id} drifted from the frontend copy module"
+            );
+        }
     }
 
     /// OOM DEFERRAL (perf-memory-audit): the exact decision `timeline_generation_on_device` makes —

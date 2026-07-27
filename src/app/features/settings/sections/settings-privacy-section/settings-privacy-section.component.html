@@ -35,52 +35,64 @@
               </div>
             </div>
 
-            <!-- (1) Redaction firewall -->
+            <!--
+              (1) What is removed before text leaves.
+              PROTECTED CLAUSES — pinned by e2e/settings/privacy-honesty.spec.ts:
+                · the enumeration "emails, card numbers and phone numbers";
+                · that Claude Code uploads the transcript to Anthropic too;
+                · that a remote Ollama server counts as cloud;
+                · that only Ollama running on THIS Mac keeps everything here.
+              "Redaction firewall" was a mechanism name. What the user needs is what is removed.
+            -->
             <div class="privacy-section">
               <span class="privacy-section-label text-muted"
-                >Redaction firewall</span
+                >What is removed before text leaves</span
               >
               <p class="text-secondary privacy-note">
                 Emails, card numbers and phone numbers are automatically
-                scrubbed before any text leaves this Mac — that covers the Anthropic
+                removed before any text leaves this Mac — that covers the Anthropic
                 API, Claude Code (the <code>claude</code> CLI uploads your
                 transcript to Anthropic too), a Kong AI Gateway, and a remote Ollama
-                server — then restored in your notes. Only Ollama running on this
-                Mac keeps everything on-device.
+                server — then put back in your notes. Only Ollama running on this
+                Mac keeps everything on this Mac.
               </p>
             </div>
 
-            <!-- (1a) On-device name redaction (Phase D — NER model) -->
+            <!-- (1a) Optional on-device name masking -->
             <div class="privacy-section">
               <span class="privacy-section-label text-muted"
-                >Name redaction</span
+                >Name masking</span
               >
               @if (nerModelPresent() === true) {
                 <p class="text-secondary privacy-note">
-                  An on-device name-redaction model is installed, so people's
-                  NAMES are additionally masked before any redacted text leaves
-                  this Mac (Polish + English), then restored in your notes.
+                  Name masking is on, so people's NAMES are also replaced before
+                  any text leaves this Mac (Polish + English), then put back in
+                  your notes. The model that does it runs on this Mac.
                 </p>
                 <span class="pill is-success ner-pill">
                   <span class="pill-dot"></span>
-                  Name redaction on
+                  Name masking on
                 </span>
               } @else {
-                <!-- HONEST copy: without the model, do NOT claim names are
-                     redacted — only emails / cards / phones are by default. -->
+                <!--
+                  PROTECTED CLAUSE — pinned by privacy-honesty.spec.ts. Without the model, do NOT
+                  claim names are protected. The explicit NEGATIVE ("people's NAMES are not") is
+                  the single most destroyable sentence in this file: it is exactly what a
+                  well-meaning "your data is protected" rewrite deletes.
+                -->
                 <p class="text-secondary privacy-note">
                   By default only emails, card numbers and phone numbers are
-                  redacted — people's NAMES are not. The pattern firewall alone
-                  can't catch names, so they can leave your device alongside the
+                  removed — people's NAMES are not. Pattern matching alone
+                  can't catch names, so they leave this Mac alongside the
                   transcript when you use a cloud provider. Download the optional
-                  on-device name-redaction model to additionally mask names
+                  name-masking model to also replace names
                   (Polish + English) before any text leaves this Mac.
                 </p>
                 @if (downloadingNerModel()) {
                   <div class="dl-progress" role="status">
                     <mur-progress
                       size="md"
-                      ariaLabel="Name-detector model download"
+                      ariaLabel="Name-masking model download"
                       [value]="nerDownloadFrac() * 100"
                     />
                     <span class="dl-progress-label text-muted">
@@ -99,10 +111,10 @@
                     (click)="downloadNerModel()"
                     [disabled]="nerModelPresent() === null"
                   >
-                    Enable name redaction (download model)
+                    Turn on name masking (download model)
                   </button>
                   <span class="text-muted ner-hint">
-                    One time, on-device, no meeting content is sent.
+                    One time. The download itself sends no meeting content.
                   </span>
                 }
                 @if (nerDownloadError(); as nerr) {
@@ -114,12 +126,18 @@
             <!-- (1b) Cloud processing consent (E10) -->
             <div class="privacy-section">
               <span class="privacy-section-label text-muted">Cloud processing</span>
+              <!--
+                PROTECTED CLAUSE — pinned by privacy-honesty.spec.ts. Every cloud provider is named
+                (including the remote-Ollama case, which people assume is local), and the
+                fail-closed promise ("until you allow this once … won't run") is what makes the
+                Allow button meaningful. A shorter version that drops either is a downgrade.
+              -->
               <p class="text-secondary privacy-note">
                 Cloud providers — Claude Code, the Anthropic API, a Kong AI Gateway, or
-                a remote Ollama server — send your (redacted) transcript off this
-                Mac to write each summary. Only Ollama running on this Mac stays
-                fully on-device. Until you allow this once, cloud summaries are
-                turned off and won't run.
+                a remote Ollama server — send your transcript off this Mac to
+                write each summary, with emails, phones and cards removed first.
+                Only Ollama running on this Mac keeps everything here. Until you
+                allow this once, cloud summaries are turned off and won't run.
               </p>
               @if (cloudConsented()) {
                 <span class="pill is-success cloud-consent-pill">
@@ -176,18 +194,33 @@
             <!-- (2) Locked folders (honest encryption boundary) -->
             <div class="privacy-section">
               <span class="privacy-section-label text-muted">Locked folders</span>
+              <!--
+                PROTECTED CLAUSE — pinned by privacy-honesty.spec.ts. Both halves are load-bearing:
+                a locked note LEAVES the vault (Obsidian stops seeing it), and an unlocked one is a
+                plain readable file. "Obsidian vault" and "Markdown" are the RIGHT words for this
+                audience and stay.
+              -->
               <p class="text-secondary privacy-note">
-                Locked folders are encrypted and pulled out of your Obsidian vault;
-                open notes remain plaintext .md files Obsidian can read.
+                Locked folders are encrypted and taken out of your Obsidian vault,
+                so Obsidian can no longer see them. Everything else stays as
+                ordinary Markdown files Obsidian reads normally.
               </p>
             </div>
 
-            <!-- (3) Local MCP server -->
+            <!--
+              (3) The local read-only server for Claude.
+              "MCP" is on the never-show list (glossary.ts). The acronym stays inside the config
+              block below, where it is a literal the user pastes into Claude — that is a filename,
+              not prose. The heading and the sentence say what it DOES.
+            -->
             <div class="privacy-section">
-              <span class="privacy-section-label text-muted">Local MCP server</span>
+              <span class="privacy-section-label text-muted"
+                >Local server for Claude</span
+              >
               <p class="text-secondary privacy-note">
-                Murmur runs a localhost MCP server that exposes your meetings
-                (read-only) to Claude Desktop and Claude Code at
+                Murmur runs a small server on this Mac only — nothing on it is
+                reachable from the internet — that lets Claude Desktop and Claude
+                Code READ your meetings (never write) at
                 <span class="privacy-inline-url">{{ mcpUrl }}</span
                 >.
               </p>
@@ -258,18 +291,18 @@
                   <pre class="mcp-config-block" role="text">{{ mcpConfig() }}</pre>
                 } @else {
                   <p class="mcp-config-error text-secondary" role="alert">
-                    Couldn't read the local server token. Reopen Settings, or
-                    restart Murmur — the config appears here once the token is
-                    available.
+                    Couldn't read the local server's private key. Reopen
+                    Settings, or restart Murmur — the config appears here once
+                    the key is available.
                   </p>
                 }
               </div>
 
               @if (mcpConfig()) {
                 <span class="mcp-hint text-muted">
-                  Add this to your Claude config, then restart Claude. This block
-                  includes a private access token for your local server — keep it
-                  to yourself.
+                  Add this to your Claude config, then restart Claude. It contains
+                  a private key for your local server — anyone who has it can read
+                  your meetings, so keep it to yourself.
                 </span>
               }
             </div>

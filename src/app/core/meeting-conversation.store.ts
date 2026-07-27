@@ -17,6 +17,7 @@ import type {
   WakeDetectedPayload,
   WhisperCard,
 } from "./models";
+import { ErrorCopyService } from "./copy/error-copy.service";
 
 /**
  * One Realtime-Reactions "whisper" contradiction card on the record-screen rail,
@@ -232,6 +233,7 @@ export class MeetingConversationStore {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The ASK BRAIN conversation — thread anchors (oldest → newest), each hosting a thread. */
   private readonly _notes = signal<NoteItem[]>([]);
@@ -980,8 +982,15 @@ export class MeetingConversationStore {
       if (token !== this.companionLoadToken) return;
       // Revert the optimistic accept — the draft never landed in the note.
       this.markTurnAccepted(noteId, agentTurnId, false);
-      if (String(e).includes("Locked")) {
-        this.toast.danger("This meeting's folder is locked — unlock it to add the note.");
+      // Was `String(e).includes("Locked")` — CAPITAL L, while every producer is lowercase
+      // (`AppError`'s `Display` is `#[error("locked: {0}")]`), so this arm never fired and a
+      // sealed-folder refusal read as a generic "try again". Same casing bug as the note editor's
+      // `isUnretryableSaveError`; both now key on the `[code]`, which cannot have one.
+      const code = this.errorCopy.codeOf(e);
+      if (code === "note-locked" || code === "folder-locked") {
+        this.toast.danger(
+          "This meeting's folder is locked — unlock it to add the note.",
+        );
       } else {
         this.toast.danger("Couldn't add to note — try again.");
       }

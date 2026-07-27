@@ -22,6 +22,7 @@ import type {
 import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { SourcesComponent } from "../../../shared/sources/sources.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * A conversation turn as rendered on the Ask page. It mirrors {@link ChatTurn}
@@ -89,6 +90,7 @@ export class AskComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** True while the initial "any meetings?" probe is in flight. */
   readonly loading = signal(true);
@@ -361,7 +363,7 @@ export class AskComponent implements OnInit {
       ]);
     } catch (e) {
       // Keep the user's question in the log so Retry can re-send it.
-      this.error.set("Couldn’t get an answer: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
     } finally {
       // Retire this turn's trace: late tool events for it are dropped.
       this.activeAskId = null;

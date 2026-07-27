@@ -25,6 +25,7 @@ import {
   type FullSceneNode,
 } from "./full-brain-scene.directive";
 import { layoutFullBrain, layoutLayered } from "./full-brain-layout";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The two graph shapes: layered "neural" bands, or organic clustered islands. */
 type LayoutMode = "layers" | "clusters";
@@ -89,6 +90,7 @@ export class FullBrainGraphComponent {
   private readonly router = inject(Router);
   private readonly tabs = inject(TabsService);
   private readonly docPreview = inject(DocumentPreviewService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly scene = viewChild(FullBrainSceneDirective);
 
@@ -363,7 +365,7 @@ export class FullBrainGraphComponent {
             return;
           }
           this.graphData.set(null);
-          this.error.set(String(e));
+          this.error.set(this.errorCopy.humanize(e));
         } finally {
           if (mine === seq) {
             this.loading.set(false);

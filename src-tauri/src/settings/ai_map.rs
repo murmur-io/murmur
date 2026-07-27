@@ -69,7 +69,9 @@ fn role_row(job: &str, title: &str, role: Role, cfg: &AppConfig) -> AiMapRow {
             ..base
         },
         CONN_OFF => AiMapRow {
-            engine: "Retrieval only (no model)".to_string(),
+            // Plain language (P3): "retrieval" is the mechanism, not the outcome. What the user
+            // actually gets is search WITHOUT an AI writing anything — say exactly that.
+            engine: "Search only — no AI writing".to_string(),
             ..base
         },
         CONN_AFM => AiMapRow {
@@ -170,8 +172,15 @@ pub fn ai_map_rows(cfg: &AppConfig) -> Vec<AiMapRow> {
         },
         AiMapRow {
             job: "redaction".to_string(),
-            title: "Name redaction".to_string(),
-            engine: "On-device NER".to_string(),
+            // "NER" (named-entity recognition) is a research acronym, and "redaction" is the
+            // mechanism's name, not the outcome. Both halves of this row now use the ONE
+            // user-facing term (`glossary.ts::GLOSSARY.nameMasking`) that Settings, the AI &
+            // Models privacy strip and the Privacy section already say: name masking.
+            // The `engine` cell names WHAT does the work (the sibling rows say "Whisper", the
+            // search-index model, …) and the row already carries an "On this Mac" pill, so the
+            // engine must not repeat the location.
+            title: "Name masking".to_string(),
+            engine: "Built-in name detector".to_string(),
             model: String::new(),
             on_device: true,
             redacted: false,
@@ -360,7 +369,7 @@ mod tests {
         };
         let rows = ai_map_rows(&cfg);
         let ask = row(&rows, "ask");
-        assert_eq!(ask.engine, "Retrieval only (no model)");
+        assert_eq!(ask.engine, "Search only — no AI writing");
         assert_eq!(ask.model, "");
         assert!(ask.on_device);
         assert!(!ask.redacted);

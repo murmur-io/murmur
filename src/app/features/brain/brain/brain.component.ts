@@ -29,6 +29,7 @@ import { BrainNoteEditorComponent } from "../brain-note-editor/brain-note-editor
 import { BrainSourceCardComponent } from "../brain-source-card/brain-source-card.component";
 import { BriefsComponent } from "../../briefs/briefs/briefs.component";
 import { AuditComponent } from "../../audit/audit/audit.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The hard cap the map applies — kept in sync with BrainMapComponent's MAX_NODES. */
 const MAP_NODE_CAP = 60;
@@ -99,6 +100,7 @@ export class BrainComponent {
   private readonly toast = inject(ToastService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly docPreview = inject(DocumentPreviewService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   // ── "Enable the brain" nudge — shown only when an on-device model is missing ─
   /**
@@ -277,7 +279,7 @@ export class BrainComponent {
 
   /**
    * A short, human progress line for the importing Documents card, e.g.
-   * "Extracting…" or "Embedding 12/40". Null unless an import is running.
+   * "Extracting…" or "Indexing 12/40". Null unless an import is running.
    */
   readonly importProgressLabel = computed<string | null>(() => {
     if (!this.importing()) {
@@ -296,9 +298,10 @@ export class BrainComponent {
       case "chunking":
         return "Chunking…";
       case "embedding":
+        // The backend stage id stays `embedding`; only the label a person reads changes.
         return p.total > 0
-          ? `Embedding ${p.done}/${p.total}`
-          : "Embedding…";
+          ? `Indexing ${p.done}/${p.total}`
+          : "Indexing…";
       case "done":
         return "Finishing…";
       default:
@@ -488,7 +491,7 @@ export class BrainComponent {
         return;
       }
       this.items.set([]);
-      this.listError.set(String(e));
+      this.listError.set(this.errorCopy.humanize(e));
     } finally {
       if (this.selectedFolderId() === folderId) {
         this.listLoading.set(false);
@@ -529,7 +532,7 @@ export class BrainComponent {
       this.graphData.set(await this.ipc.getGraph());
     } catch (e) {
       this.graphData.set(null);
-      this.graphError.set(String(e));
+      this.graphError.set(this.errorCopy.humanize(e));
     } finally {
       this.graphLoading.set(false);
     }
@@ -598,7 +601,7 @@ export class BrainComponent {
       this.docsExpanded.set(true);
       await this.afterMutation();
     } catch (e) {
-      this.toast.danger(this.friendlyImportError(e));
+      this.toast.danger(this.errorCopy.humanize(e, "brain-import"));
     } finally {
       this.importing.set(false);
       this.importProgress.set(null);
@@ -646,7 +649,7 @@ export class BrainComponent {
       this.noteEditorOpen.set(false);
       await this.afterMutation();
     } catch (e) {
-      this.toast.danger(this.friendlyImportError(e));
+      this.toast.danger(this.errorCopy.humanize(e, "brain-import"));
     } finally {
       this.savingNote.set(false);
     }
@@ -663,7 +666,7 @@ export class BrainComponent {
       this.toast.info(`Removed “${doc.name}”.`);
       await this.afterMutation();
     } catch (e) {
-      this.toast.danger(this.friendlyDeleteError(e));
+      this.toast.danger(this.errorCopy.humanize(e, "brain-delete"));
     } finally {
       this.deletingId.set(null);
     }
@@ -689,60 +692,4 @@ export class BrainComponent {
     await this.fetchOverview();
   }
 
-  /**
-   * Map a raw backend error string into a friendly, actionable message. The
-   * backend serializes `AppError` as `to_string()` — so the strings we match
-   * are the `import_document` / `extract` messages, prefixed by the variant tag
-   * (`"locked: …"`, `"invalid argument: …"`). Order matters: the SPECIFIC
-   * extraction failures are checked before the generic "unsupported type" one.
-   */
-  private friendlyImportError(e: unknown): string {
-    const msg = String(e);
-    // Write-gate: a sealed-not-unlocked folder ("locked: …").
-    if (/^locked:|\block/i.test(msg)) {
-      return "That folder is locked — unlock it first to add to the brain.";
-    }
-    // OCR ran but found nothing — a scanned PDF or an image with no readable
-    // text ("no text found in this document, even with OCR" / "no text found
-    // in this image"). Scanned PDFs now OCR automatically, so this is the only
-    // remaining no-text failure.
-    if (/no text found/i.test(msg)) {
-      return "No readable text found in that file, even after OCR.";
-    }
-    // Decompression-bomb guard ("document too large / possible zip bomb") —
-    // NOT an unsupported file type; say what actually stopped the import.
-    if (/zip bomb|document too large/i.test(msg)) {
-      return "That file expands beyond the safe import limit — it can’t be imported.";
-    }
-    // Extraction succeeded but yielded nothing ("this document has no
-    // extractable text") — the type IS supported, the file is just empty of text.
-    if (/no extractable text/i.test(msg)) {
-      return "No extractable text found in that file.";
-    }
-    // Encrypted / password-protected PDF.
-    if (/password-protected|password|encrypted/i.test(msg)) {
-      return "That PDF is password-protected — unlock it and try again.";
-    }
-    // Corrupt / unreadable / malformed file (bad zip, malformed XML, unreadable PDF).
-    if (
-      /could not read|could not open|could not render|not a valid|corrupt|malformed|bad (docx|pptx)/i.test(
-        msg,
-      )
-    ) {
-      return "That file couldn’t be read — it may be corrupt or in an unexpected format.";
-    }
-    // Unsupported extension (allowlist reject) — the catch-all invalid-argument case.
-    if (/unsupported document type|only .*md|invalid argument/i.test(msg)) {
-      return "That file type can’t be imported. Try Markdown, text, PDF, Word, PowerPoint, Excel, or HTML.";
-    }
-    return "Couldn’t add that to the brain. Please try again.";
-  }
-
-  private friendlyDeleteError(e: unknown): string {
-    const msg = String(e);
-    if (/lock/i.test(msg)) {
-      return "That folder is locked — unlock it first to delete its items.";
-    }
-    return "Couldn’t remove that. Please try again.";
-  }
 }

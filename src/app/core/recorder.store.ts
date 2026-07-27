@@ -14,6 +14,7 @@ import { IpcService } from "./ipc.service";
 import type { NoteDto, Stage, StatusPayload } from "./models";
 import { RecordingFlushService } from "./recording-flush.service";
 import { ToastService } from "../services/toast.service";
+import { ErrorCopyService } from "./copy/error-copy.service";
 
 /**
  * Human byte label (binary), matching the Storage settings section's `mb()`:
@@ -35,6 +36,7 @@ export class RecorderStore {
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
   private readonly flushService = inject(RecordingFlushService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _stage = signal<Stage>("idle");
   private readonly _message = signal<string>("");
@@ -46,7 +48,28 @@ export class RecorderStore {
   readonly stage = this._stage.asReadonly();
   readonly message = this._message.asReadonly();
   readonly lastNote = this._lastNote.asReadonly();
-  readonly error = this._error.asReadonly();
+
+  /**
+   * The last failure, as a sentence a person can read.
+   *
+   * `_error` holds the RAW wire string (the `AppError` display, or the terminal `EVENT_STATUS`
+   * message — which `pipeline.rs` builds with the same `to_string()`). It is deliberately private:
+   * ~2100 `AppError` constructions in the Rust crate carry developer vocabulary, so nothing may
+   * render it directly. Behaviour branches read {@link errorCode} instead.
+   */
+  readonly error = computed(() => {
+    const raw = this._error();
+    return raw === null ? null : this.errorCopy.humanize(raw, "recording");
+  });
+
+  /**
+   * The stable `[code]` of the last failure, or `null` for an anonymous one.
+   *
+   * This is what `record.component.ts` asks to decide whether to show the cloud-consent "Allow"
+   * banner — the code, never the prose (see `errcode.rs` for why).
+   */
+  readonly errorCode = computed(() => this.errorCopy.codeOf(this._error()));
+
   readonly meetingId = this._meetingId.asReadonly();
   /** Latest live-transcription caption (best-effort, only during recording). */
   readonly liveCaption = this._liveCaption.asReadonly();

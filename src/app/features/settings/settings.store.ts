@@ -7,6 +7,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import { hostIsLoopback } from "../../core/loopback";
 import { modelSizeLabel } from "../../core/model-bytes";
+// P3: the connection labels used to be declared here AND in `record.component.ts` AND in
+// `summarize/roles.rs` — three copies of four strings. They now live in the ONE copy module, which
+// is the documented mirror of the Rust half.
+import { CONNECTION_LABELS } from "../../core/copy/labels";
 import { MachineService } from "../../services/machine.service";
 import type {
   AiMapRow,
@@ -29,6 +33,7 @@ import type {
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { NOTE_ASSIST_NEW_ACTION_IDS } from "../notes/note-brain-popover/note-assist-catalog";
+import { ErrorCopyService } from "../../core/copy/error-copy.service";
 
 /**
  * The four provider-backed connection ids — the ones `list_models` serves a
@@ -80,14 +85,6 @@ export function looksLikeGgufPath(v: string): boolean {
   );
 }
 
-/** Display names for the connection ids (matches the connection cards). */
-const CONNECTION_LABELS: Readonly<Record<string, string>> = {
-  claude_code: "Claude Code",
-  anthropic: "Anthropic API",
-  ollama: "Ollama",
-  gateway: "Kong AI Gateway",
-};
-
 /**
  * Shared state + IPC orchestration for the Settings page (Stage-1 split of the
  * former settings.component.ts monolith — moved here VERBATIM, no behavior
@@ -109,6 +106,7 @@ export class SettingsStore {
   private readonly fb = inject(FormBuilder);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
   /**
    * The ROOT-held whisper catalog + machine answer (P1). Root-scoped, so the store
    * reads the same cached snapshot the picker paints — never a second copy that can
@@ -301,7 +299,7 @@ export class SettingsStore {
       try {
         void this.save();
       } catch (e) {
-        this._loadError.set("Save failed: " + String(e));
+        this._loadError.set(this.errorCopy.because("Save failed", e));
       }
     });
 
@@ -417,7 +415,7 @@ export class SettingsStore {
       await this.loadNoteTemplates();
       return saved;
     } catch (e) {
-      this._noteTemplateError.set(String(e));
+      this._noteTemplateError.set(this.errorCopy.humanize(e));
       return null;
     } finally {
       this._noteTemplateBusy.set(false);
@@ -436,7 +434,7 @@ export class SettingsStore {
       }
       await this.loadNoteTemplates();
     } catch (e) {
-      this._noteTemplateError.set(String(e));
+      this._noteTemplateError.set(this.errorCopy.humanize(e));
     } finally {
       this._noteTemplateBusy.set(false);
     }
@@ -904,7 +902,9 @@ export class SettingsStore {
           const dest = this.gatewayDestination();
           return {
             connection: "Kong AI Gateway",
-            destination: dest ? dest.host : "your gateway (base URL not set)",
+            destination: dest
+              ? dest.host
+              : "your gateway (server address not set)",
           };
         }
         case "ollama": {
@@ -1633,7 +1633,7 @@ export class SettingsStore {
       // would let the pristine defaults overwrite the user's stored config.
       this.autoSaveReady = true;
     } catch (e) {
-      this._loadError.set(String(e));
+      this._loadError.set(this.errorCopy.humanize(e));
     }
   }
 
@@ -1700,7 +1700,7 @@ export class SettingsStore {
     try {
       this._brainModels.set(await this.ipc.listBrainModels());
     } catch (e) {
-      this._brainError.set(String(e));
+      this._brainError.set(this.errorCopy.humanize(e));
     } finally {
       this._brainModelsLoading.set(false);
     }
@@ -1717,7 +1717,7 @@ export class SettingsStore {
       this.form.markAsDirty(); // user-driven → auto-save
       await this.refreshBrainModels();
     } catch (e) {
-      this._brainError.set(String(e));
+      this._brainError.set(this.errorCopy.humanize(e));
     }
   }
 
@@ -1733,7 +1733,7 @@ export class SettingsStore {
       await this.ipc.downloadBrainModel(id);
       await this.refreshBrainModels();
     } catch (e) {
-      this._brainError.set(String(e));
+      this._brainError.set(this.errorCopy.humanize(e));
     } finally {
       this._brainDownloadingId.set(null);
     }
@@ -1783,7 +1783,7 @@ export class SettingsStore {
     try {
       this._posture.set(await this.ipc.brainPosture());
     } catch (e) {
-      this._postureError.set(String(e));
+      this._postureError.set(this.errorCopy.humanize(e));
     }
     this._retirementNudge.set(
       await this.ipc.brainModelRetirementNudge().catch(() => null),
@@ -1828,7 +1828,7 @@ export class SettingsStore {
         await this.selectNeeded(needed);
         await this.commitPosture(p);
       } catch (e) {
-        this._postureError.set(String(e));
+        this._postureError.set(this.errorCopy.humanize(e));
       } finally {
         this._postureBusy.set(false);
       }
@@ -1887,7 +1887,9 @@ export class SettingsStore {
       await this.commitPosture(p);
     } catch (e) {
       // A cancel is a user action — silent; any real failure surfaces the message.
-      this._postureError.set(this._cancelDownload ? null : String(e));
+      this._postureError.set(
+        this._cancelDownload ? null : this.errorCopy.humanize(e),
+      );
       // Reflect the unchanged backend posture so the card stays honest.
       await this.refreshPosture();
     } finally {
@@ -2002,7 +2004,7 @@ export class SettingsStore {
       await this.syncPostureFormFromBackend();
       await this.refreshPosture();
     } catch (e) {
-      this._postureError.set(String(e));
+      this._postureError.set(this.errorCopy.humanize(e));
     } finally {
       this._enablingBrainLive.set(false);
     }
@@ -2063,7 +2065,7 @@ export class SettingsStore {
       await this.refreshBrainModels();
       await this.refreshPosture();
     } catch (e) {
-      this._brainError.set(String(e));
+      this._brainError.set(this.errorCopy.humanize(e));
     } finally {
       this._applyingRetirement.set(false);
     }
@@ -2112,7 +2114,7 @@ export class SettingsStore {
       await this.ipc.downloadEmbedModel();
       this._embedModelPresent.set(await this.ipc.embedModelPresent());
     } catch (e) {
-      this._embedDownloadError.set(String(e));
+      this._embedDownloadError.set(this.errorCopy.humanize(e));
     } finally {
       this._downloadingEmbedModel.set(false);
     }
@@ -2154,7 +2156,7 @@ export class SettingsStore {
       await this.ipc.downloadNerModel();
       this._nerModelPresent.set(await this.ipc.nerModelPresent());
     } catch (e) {
-      this._nerDownloadError.set(String(e));
+      this._nerDownloadError.set(this.errorCopy.humanize(e));
     } finally {
       this._downloadingNerModel.set(false);
     }
@@ -2176,7 +2178,7 @@ export class SettingsStore {
       // The model could have been (un)installed between the presence probe and now.
       if (res.status === "model_missing") this._embedModelPresent.set(false);
     } catch (e) {
-      this._reindexError.set(String(e));
+      this._reindexError.set(this.errorCopy.humanize(e));
     } finally {
       this._reindexing.set(false);
     }
@@ -2360,7 +2362,7 @@ export class SettingsStore {
       // the MCP config so the copy block never shows a stale token-bearing / tokenless snippet.
       await this.refreshMcpConfig();
     } catch (e) {
-      this._loadError.set("Save failed: " + String(e));
+      this._loadError.set(this.errorCopy.because("Save failed", e));
     }
   }
 
@@ -2424,7 +2426,7 @@ export class SettingsStore {
       this._cloudConsented.set(true);
       await this.refreshProviders();
     } catch (e) {
-      this._consentError.set(String(e));
+      this._consentError.set(this.errorCopy.humanize(e));
     } finally {
       this._consenting.set(false);
     }
@@ -2445,7 +2447,7 @@ export class SettingsStore {
       this._cloudConsented.set(false);
       await this.refreshProviders();
     } catch (e) {
-      this._revokeError.set(String(e));
+      this._revokeError.set(this.errorCopy.humanize(e));
     } finally {
       this._revoking.set(false);
     }
@@ -2502,7 +2504,7 @@ export class SettingsStore {
       this.webKeyControl.setValue("");
       this._hasWebKey.set(await this.ipc.hasWebSearchKey());
     } catch (e) {
-      this._webKeyError.set(String(e));
+      this._webKeyError.set(this.errorCopy.humanize(e));
     } finally {
       this._savingWebKey.set(false);
     }
@@ -2523,7 +2525,7 @@ export class SettingsStore {
       await this.ipc.consentToWebSearch();
       this._webConsented.set(true);
     } catch (e) {
-      this._webConsentError.set(String(e));
+      this._webConsentError.set(this.errorCopy.humanize(e));
     } finally {
       this._webConsenting.set(false);
     }
@@ -2544,7 +2546,7 @@ export class SettingsStore {
       this.jiraTokenControl.setValue("");
       this._hasJiraToken.set(await this.ipc.hasJiraToken());
     } catch (e) {
-      this._jiraTokenError.set(String(e));
+      this._jiraTokenError.set(this.errorCopy.humanize(e));
     } finally {
       this._savingJiraToken.set(false);
     }
@@ -2563,7 +2565,7 @@ export class SettingsStore {
       await this.ipc.consentToJira();
       this._jiraConsented.set(true);
     } catch (e) {
-      this._jiraConsentError.set(String(e));
+      this._jiraConsentError.set(this.errorCopy.humanize(e));
     } finally {
       this._jiraConsenting.set(false);
     }
@@ -2584,7 +2586,7 @@ export class SettingsStore {
       this.slackTokenControl.setValue("");
       this._hasSlackToken.set(await this.ipc.hasSlackToken());
     } catch (e) {
-      this._slackTokenError.set(String(e));
+      this._slackTokenError.set(this.errorCopy.humanize(e));
     } finally {
       this._savingSlackToken.set(false);
     }
@@ -2603,7 +2605,7 @@ export class SettingsStore {
       await this.ipc.consentToSlack();
       this._slackConsented.set(true);
     } catch (e) {
-      this._slackConsentError.set(String(e));
+      this._slackConsentError.set(this.errorCopy.humanize(e));
     } finally {
       this._slackConsenting.set(false);
     }
@@ -2624,7 +2626,7 @@ export class SettingsStore {
       this.notionTokenControl.setValue("");
       this._hasNotionToken.set(await this.ipc.hasNotionToken());
     } catch (e) {
-      this._notionTokenError.set(String(e));
+      this._notionTokenError.set(this.errorCopy.humanize(e));
     } finally {
       this._savingNotionToken.set(false);
     }
@@ -2643,7 +2645,7 @@ export class SettingsStore {
       await this.ipc.consentToNotion();
       this._notionConsented.set(true);
     } catch (e) {
-      this._notionConsentError.set(String(e));
+      this._notionConsentError.set(this.errorCopy.humanize(e));
     } finally {
       this._notionConsenting.set(false);
     }
@@ -2664,7 +2666,7 @@ export class SettingsStore {
       this.clickupTokenControl.setValue("");
       this._hasClickupToken.set(await this.ipc.hasClickupToken());
     } catch (e) {
-      this._clickupTokenError.set(String(e));
+      this._clickupTokenError.set(this.errorCopy.humanize(e));
     } finally {
       this._savingClickupToken.set(false);
     }
@@ -2683,7 +2685,7 @@ export class SettingsStore {
       await this.ipc.consentToClickup();
       this._clickupConsented.set(true);
     } catch (e) {
-      this._clickupConsentError.set(String(e));
+      this._clickupConsentError.set(this.errorCopy.humanize(e));
     } finally {
       this._clickupConsenting.set(false);
     }
@@ -2703,7 +2705,7 @@ export class SettingsStore {
       this.gatewayKeyControl.setValue("");
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey());
     } catch (e) {
-      this._gatewayKeyError.set(String(e));
+      this._gatewayKeyError.set(this.errorCopy.humanize(e));
     }
   }
 
@@ -2717,7 +2719,7 @@ export class SettingsStore {
       await this.ipc.clearGatewayKey();
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey());
     } catch (e) {
-      this._gatewayKeyError.set(String(e));
+      this._gatewayKeyError.set(this.errorCopy.humanize(e));
     }
   }
 
@@ -2736,7 +2738,7 @@ export class SettingsStore {
     } catch (e) {
       // Leave the existing list (may be empty) and show the fallback hint.
       this._gatewayModels.set([]);
-      this._gatewayModelError.set(String(e));
+      this._gatewayModelError.set(this.errorCopy.humanize(e));
     } finally {
       this._gatewayModelsLoading.set(false);
     }
@@ -2828,7 +2830,7 @@ export class SettingsStore {
       this._modelPresent.set(await this.ipc.modelPresent());
       await this.machine.refresh();
     } catch (e) {
-      this._modelDownloadError.set(String(e));
+      this._modelDownloadError.set(this.errorCopy.humanize(e));
     } finally {
       this._downloadingModel.set(false);
     }
@@ -2859,7 +2861,7 @@ export class SettingsStore {
         await this.ipc.parakeetModelsPresent().catch(() => false),
       );
     } catch (e) {
-      this._parakeetDownloadError.set(String(e));
+      this._parakeetDownloadError.set(this.errorCopy.humanize(e));
     } finally {
       this._downloadingParakeet.set(false);
     }

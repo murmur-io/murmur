@@ -7,15 +7,19 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { EgressLedgerStore } from "../../../services/egress-ledger-store.service";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** Selectable rolling-window lengths (in days). */
 const RANGES = [7, 30, 90] as const;
 type Range = (typeof RANGES)[number];
 
 /**
- * "Egress & Usage" panel — shows the content-free local egress ledger:
- * total cloud calls + tokens, per-model bar chart, PII-scrubbed receipt,
- * and recent calls, for a 7/30/90-day rolling window.
+ * "What left this Mac" panel — the content-free local egress ledger: cloud calls, tokens sent,
+ * what the redaction firewall removed, a per-model bar chart, and recent calls, over a 7/30/90-day
+ * rolling window.
+ *
+ * The word "egress" survives only in code (the command, the store, this selector) — it is on the
+ * never-show list in `core/copy/glossary.ts`, so no rendered string uses it.
  *
  * Lives in its own file for a separate per-component style budget.
  * Data arrives from the `get_egress_ledger` Tauri command via
@@ -30,6 +34,7 @@ type Range = (typeof RANGES)[number];
 export class EgressLedgerComponent {
   private readonly ipc = inject(IpcService);
   private readonly store = inject(EgressLedgerStore);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   readonly ranges = RANGES;
 
@@ -83,14 +88,33 @@ export class EgressLedgerComponent {
     }));
   });
 
-  /** Sum of all four PII redaction kinds. */
-  readonly totalPii = computed(() => {
+  /**
+   * How many emails, phone numbers and card numbers the pattern firewall removed.
+   *
+   * NAMES ARE DELIBERATELY EXCLUDED (P3). This used to sum all four kinds under the label "PII
+   * scrubbed", which was wrong twice over: "PII" is an acronym that hides what is actually removed,
+   * and folding names into the same number implies names are always removed — they are NOT. Name
+   * masking only happens once the optional on-device model is downloaded. The tile now says exactly
+   * what it counts, and names get their own honest line in {@link namesMasked}.
+   *
+   * The rule this follows: if you rename a unit, change what it counts.
+   */
+  readonly patternRedactions = computed(() => {
     const r = this._ledger()?.totalRedactions;
     if (!r) {
       return 0;
     }
-    return r.email + r.card + r.phone + r.name;
+    return r.email + r.card + r.phone;
   });
+
+  /**
+   * How many people's names were masked — 0 when the optional on-device name-masking model is not
+   * installed, which is the DEFAULT. Rendered separately so a zero here reads as "names were not
+   * masked", not as "there were no names".
+   */
+  readonly namesMasked = computed(
+    () => this._ledger()?.totalRedactions?.name ?? 0,
+  );
 
   /**
    * The window this effect last fetched for, or `undefined` before the
@@ -144,7 +168,7 @@ export class EgressLedgerComponent {
       this.error.set(null);
     } catch (e) {
       this._ledger.set(null);
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }
