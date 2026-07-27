@@ -61,6 +61,42 @@ env:
   MURMUR_E2E_NO_EGRESS: "1"
 
 jobs:
+  # ── Attestation gate: harness-written code cannot merge unverified. ───────────
+  # Cheap (ubuntu, seconds) and deliberately FIRST: it answers "was this branch's
+  # work ever verified at all", which the expensive lanes below cannot. A harness
+  # task that dies (timeout, 429, a killed session) leaves its branch mergeable and
+  # its attestation stranded in local .git — on 2026-07-26 that put 2,566 unattested
+  # lines on trunk with nobody the wiser. Only `agent/*` branches are in scope; a
+  # deliberate non-harness PR declares `Harness-Lane: B` in its description.
+  attestation:
+    name: attestation gate (harness receipt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history — the receipt's base must be provably an ancestor)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify the harness receipt
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          # --base-branch is the TIP of the branch being merged into. A catch-up merge
+          # legitimately brings in commits newer than the PR's base commit, so judging
+          # merges against BASE_SHA alone rejects the repo's required flow.
+          python3 scripts/verify-harness-attestation \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --branch "$HEAD_REF" \
+            --base-branch "origin/${BASE_REF}" \
+            --pr-body-file "$RUNNER_TEMP/pr-body.md"
+
   # ── Rust lane: control plane + clippy/test/build + supply-chain + audio E2E. ──
   rust:
     name: rust lane (ci.sh rust)
@@ -193,17 +229,26 @@ jobs:
   #    parity)". Runs on Linux (trivial) to avoid a third 10x-billed macOS job. ──
   gate:
     name: gate (full ci.sh — release parity)
-    needs: [rust, web]
+    # `attestation` is in `needs` DELIBERATELY: this job's name is the branch ruleset's
+    # only required context, so a check that is not aggregated here is decorative — it
+    # can go red while the merge button stays green. That is precisely the shape of the
+    # failure it exists to prevent.
+    needs: [attestation, rust, web]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require both lanes green
+      - name: Require the attestation gate and both lanes green
         run: |
-          echo "rust lane: ${{ needs.rust.result }}"
-          echo "web  lane: ${{ needs.web.result }}"
+          echo "attestation: ${{ needs.attestation.result }}"
+          echo "rust lane  : ${{ needs.rust.result }}"
+          echo "web  lane  : ${{ needs.web.result }}"
+          if [ "${{ needs.attestation.result }}" != "success" ]; then
+            echo "::error::harness-written code without a PASS receipt — see the attestation gate"
+            exit 1
+          fi
           if [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.web.result }}" != "success" ]; then
             echo "::error::a ci.sh lane failed — the full gate is RED"
             exit 1
           fi
-          echo "✅ both lanes green — full ci.sh gate satisfied"
+          echo "✅ attestation satisfied and both lanes green — full ci.sh gate satisfied"
