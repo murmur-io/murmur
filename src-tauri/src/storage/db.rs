@@ -6305,8 +6305,11 @@ impl Db {
         unlocked: &HashSet<String>,
         owner: Option<&str>,
     ) -> Result<Vec<Commitment>> {
+        // Normalize BOTH sides of the comparison. Doing it at READ time (not only at ingest) is what
+        // repairs an EXISTING vault: every note already on disk carries the raw
+        // `Miles (others-9)` / `others-10 -> Miles` forms, and re-summarizing them is not an option.
         let owner_lc = owner
-            .map(|o| o.trim().to_lowercase())
+            .map(|o| crate::summarize::action_items::normalize_owner(o).to_lowercase())
             .filter(|o| !o.is_empty());
         let mut out: Vec<Commitment> = Vec::new();
         // GATE 1: only VISIBLE meetings. GATE 2: only the VISIBLE note (None for sealed-not-unlocked).
@@ -6321,7 +6324,9 @@ impl Db {
                 }
                 if let Some(want) = owner_lc.as_deref() {
                     match item.owner.as_deref() {
-                        Some(o) if o.trim().to_lowercase() == want => {}
+                        Some(o)
+                            if crate::summarize::action_items::normalize_owner(o).to_lowercase()
+                                == want => {}
                         _ => continue,
                     }
                 }

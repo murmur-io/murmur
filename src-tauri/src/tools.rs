@@ -1607,11 +1607,20 @@ fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
             if let Some(o) = c.owner.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
                 parts.push(o.to_string());
             }
-            if let Some(d) = c.due_date.as_deref().filter(|d| !d.is_empty()) {
-                parts.push(format!("due {d}"));
+            // An ABSENT due date is stated, not silently omitted. The tool description promises
+            // "owner, due date and source meeting"; on a real vault a date was present on about 1
+            // item in 110, and a silent omission reads as "no deadline was set" rather than
+            // "the note never recorded one".
+            match c.due_date.as_deref().filter(|d| !d.is_empty()) {
+                Some(d) => parts.push(format!("due {d}")),
+                None => parts.push("due —".to_string()),
             }
             parts.push(format!("\"{}\"", c.text.trim()));
-            parts.push(format!("[[{}]]", c.meeting_title));
+            // The wikilink TITLE is for a human; the id is what lets an agent actually navigate to
+            // the meeting (`get_meeting`). `Commitment` already carried `meeting_id` — this just
+            // stopped throwing it away, so "which meeting did I promise that in" is answerable
+            // without a title-to-id search that a duplicate title would make ambiguous anyway.
+            parts.push(format!("[[{}]] [id:{}]", c.meeting_title, c.meeting_id));
             format!("- {}", parts.join(" · "))
         })
         .collect::<Vec<_>>()
