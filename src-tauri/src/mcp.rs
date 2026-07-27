@@ -242,7 +242,7 @@ fn tools_spec() -> Value {
         {
             "name": "get_meeting",
             "description": "Get a meeting's AI note (summary) and transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text. The transcript is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a long transcript by passing offset + maxChars.",
-            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." }, "offset": { "type": "number", "description": "Chars to skip into the transcript (default 0)." }, "maxChars": { "type": "number", "description": "Max transcript chars to return from offset (default: a bounded 6000-char window with the total disclosed)." } }, "required": ["meetingId"] }
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain", "compact"], "description": "Transcript rendering (default 'structured'). 'compact' merges consecutive same-speaker segments into one line — same words, far less per-segment scaffolding. NOTE each format is a DIFFERENT character space, so offset/maxChars/TOTAL_CHARS only mean anything within the format you asked for." }, "offset": { "type": "number", "description": "Chars to skip into the transcript, in the SELECTED format's char space (default 0)." }, "maxChars": { "type": "number", "description": "Max chars to return from offset (default: a bounded 6000-char window with the total disclosed). Bounds the NOTE section too." }, "includeNote": { "type": "boolean", "description": "Include the AI note (default true). Pass false for transcript only — e.g. you already read the note, or you are paging and only want speech." } }, "required": ["meetingId"] }
         },
         {
             "name": "get_document",
@@ -272,7 +272,7 @@ fn tools_spec() -> Value {
         {
             "name": "get_entity_dossier",
             "description": "Assemble a DOSSIER on one person or project across all your meetings: a timeline of mentions, the entity's open commitments, and co-occurring people/projects — each citing its source meeting [[Title]]. Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id. Returns the gated source material for YOU to synthesize the 'state of [[entity]]' (Overview, Timeline, Open commitments, Last said / next step). Sealed-and-locked meetings are excluded.",
-            "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" } }, "required": ["entity"] }
+            "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" }, "noteDetail": { "type": "string", "enum": ["none", "summary", "full"], "description": "How much of the meeting-note corpus to include. Default 'summary' (structured data + a bounded excerpt); 'none' for structured data only; 'full' for the bodies, pageable with offset/maxChars. Every mode discloses NOTES_TOTAL_CHARS so you can budget BEFORE asking for 'full'." }, "offset": { "type": "number", "description": "Chars to skip into the note corpus (noteDetail 'full')." }, "maxChars": { "type": "number", "description": "Max corpus chars to return." } }, "required": ["entity"] }
         },
         {
             "name": "knowledge_diff",
@@ -396,12 +396,12 @@ fn dispatch_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            // Feature D: default to the STRUCTURED transcript. Only the exact literal "plain" selects
-            // the legacy flat join; an absent/other value routes to "structured".
+            // Feature D: default to the STRUCTURED transcript. Only the exact literals "plain" and
+            // "compact" select an alternative; an absent/other value routes to "structured".
             transcript_format: args
                 .get("transcriptFormat")
                 .and_then(Value::as_str)
-                .filter(|f| *f == "plain")
+                .filter(|f| *f == "plain" || *f == "compact")
                 .unwrap_or("structured")
                 .to_string(),
             // Brain v3 audit Fix 2 — bound + DISCLOSE the default MCP window (no paging args → a
@@ -409,6 +409,11 @@ fn dispatch_tool(
             // the client; explicit offset/maxChars are honored verbatim.
             offset: mcp_body_window(args).0,
             max_chars: mcp_body_window(args).1,
+            // Absent ⇒ true, so an existing client's payload is unchanged.
+            include_note: args
+                .get("includeNote")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
         },
         "get_document" => ToolCall::GetDocument {
             document_id: args
@@ -451,6 +456,17 @@ fn dispatch_tool(
             }
             ToolCall::GetEntityDossier {
                 entity: entity.to_string(),
+                // #15 — DEFAULT to `summary`. The dossier was the one body tool with NO bound, so a
+                // raw tools/call returned every mentioning meeting's note in full: measured at
+                // ~37500 chars for a 3-meeting entity, and unpredictable before calling.
+                note_detail: args
+                    .get("noteDetail")
+                    .and_then(Value::as_str)
+                    .filter(|d| matches!(*d, "none" | "summary" | "full"))
+                    .unwrap_or("summary")
+                    .to_string(),
+                offset: mcp_usize_arg(args, "offset"),
+                max_chars: mcp_usize_arg(args, "maxChars"),
             }
         }
         // Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity. Routes through the
@@ -1557,7 +1573,7 @@ mod tests {
             "default must carry a timestamp token: {def}"
         );
         assert!(
-            def.contains("TRANSCRIPT (TOTAL_CHARS:"),
+            def.contains("TRANSCRIPT (format=structured, TOTAL_CHARS:"),
             "the MCP default now discloses the transcript window total: {def}"
         );
 
@@ -1573,7 +1589,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             plain,
-            "NOTE:\nn\n\nTRANSCRIPT (TOTAL_CHARS: 15 (showing 0..15)):\nopening remarks\n[end of content]"
+            "NOTE (TOTAL_CHARS: 1 (showing 0..1)):\nn\n[end of content]\n\nTRANSCRIPT (format=plain, TOTAL_CHARS: 15 (showing 0..15)):\nopening remarks\n[end of content]"
         );
         let _ = std::fs::remove_file(&p);
     }
