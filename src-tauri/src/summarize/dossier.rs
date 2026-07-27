@@ -321,22 +321,67 @@ pub fn render_dossier_user(data: &DossierData, provider_id: &str) -> String {
 /// sections + the citation-tagged note corpus, for the client (Claude Desktop) to synthesize the
 /// four dossier sections locally. NO provider/cloud call is made on this path.
 pub fn format_dossier_client(data: &DossierData) -> String {
-    // A generous but bounded cap so a huge entity can't produce an unbounded MCP payload.
-    let budget = 200_000usize;
-    let overview = format!(
-        "DOSSIER for [[{}]] — {} mentioning meeting(s), {} open commitment(s), {} related entity(ies).\n",
+    format_dossier_client_windowed(data, "full", 0, 0)
+}
+
+/// How much of the note CORPUS a dossier reply carries.
+///
+/// #15 — the dossier was the one body tool with no bound at all. `build_dossier_data` pushes the
+/// WHOLE note markdown of every mentioning meeting into `corpus`, capped only by a 200_000-char
+/// backstop (~50k tokens), while `get_meeting`/`get_document` have had a disclosed 6000-char window
+/// for a while. Measured on a real 3-meeting entity: ~37500 chars (~9400 tokens) in ONE
+/// uncontrollable reply — including a 19.5k note the agent had already been handed three times in
+/// the same session. An entity with 15 meetings would blow the context in a single call, and
+/// nothing in the reply let the agent see that coming.
+///
+/// `summary` is the DEFAULT because the structured half (`render_structured`: current facts, the
+/// mention timeline, commitments, neighbours) is small, deterministic, and is what "state of
+/// [[entity]]" questions actually need — the raw note bodies are the long tail.
+pub fn format_dossier_client_windowed(
+    data: &DossierData,
+    note_detail: &str,
+    offset: usize,
+    max_chars: usize,
+) -> String {
+    // The UN-windowed corpus length is disclosed in EVERY mode, so an agent can budget BEFORE
+    // asking for `full` instead of discovering the size by being flooded with it.
+    let mut out = format!(
+        "DOSSIER for [[{}]] — {} mentioning meeting(s), {} open commitment(s), {} related entity(ies). NOTES_TOTAL_CHARS: {} (noteDetail={note_detail}).\n",
         data.entity.name,
         data.meetings.len(),
         data.commitments.len(),
-        data.neighbors.len()
+        data.neighbors.len(),
+        data.corpus.chars().count(),
     );
-    let mut out = overview;
     out.push('\n');
     out.push_str(&render_structured(data));
-    out.push_str("\nMEETING NOTES (each headed ### [[Title]] · date · id:):\n");
-    let remaining = budget.saturating_sub(out.len());
-    out.push_str(&cap(&data.corpus, remaining));
-    out
+    match note_detail {
+        // Structured data only. The corpus total is still disclosed above.
+        "none" => out,
+        "full" => {
+            out.push_str("\nMEETING NOTES (each headed ### [[Title]] · date · id:):\n");
+            if max_chars == 0 && offset == 0 {
+                // Legacy path: a generous but bounded cap, byte-identical to before.
+                let remaining = 200_000usize.saturating_sub(out.len());
+                out.push_str(&cap(&data.corpus, remaining));
+            } else {
+                let (body, disclosure) =
+                    crate::tools::page_text_disclosed(&data.corpus, offset, max_chars);
+                if let Some(h) = disclosure {
+                    out.push_str(&format!("({h})\n"));
+                }
+                out.push_str(&body);
+            }
+            out
+        }
+        // DEFAULT — one bounded excerpt per meeting instead of every note in full.
+        _ => {
+            out.push_str("\nMEETING NOTE EXCERPTS (noteDetail=summary — pass noteDetail:'full' with offset/maxChars for the bodies):\n");
+            let budget = if max_chars == 0 { 6_000 } else { max_chars };
+            out.push_str(&cap(&data.corpus, budget));
+            out
+        }
+    }
 }
 
 #[cfg(test)]
