@@ -509,6 +509,12 @@ pub struct WhisperRecommendationDto {
     /// FE must say "size unknown", never "free". The two are deliberately NOT collapsed: an id with
     /// no measured size would otherwise promise a free multi-GB transfer.
     pub pending_download_bytes: Option<u64>,
+    /// LIVE-caption readiness (`"ready"` / `"noModel"` / `"modelMissing"` / `"pinnedHeavy"`) — the
+    /// SAME classification `get_config` ships as `AppConfigDto::live_captions`, resolved here over
+    /// the ONE models-dir listing this DTO already took so the picker can offer a REPAIR affordance
+    /// without a second (and possibly disagreeing) probe. P2 (W2) added it because the picker is
+    /// where a user both discovers and fixes "live captions have nothing to run".
+    pub live_captions: String,
     /// The brain posture we would advise on this machine (advice only — it gates nothing).
     pub brain_advice: crate::reason::BrainAdvice,
 }
@@ -608,6 +614,21 @@ fn build_recommendation(
         },
         models,
         pending_download_bytes: pending_download_bytes(cfg, dir, &selected_id, present),
+        // The same classification `live_captions::dto_probe` performs, over the dir this DTO already
+        // listed. `selected_id` — not `cfg.model_size` — is passed on purpose: it is the ALREADY
+        // resolved size, so a blank config cannot send `resolve_in` off to `default_model_size_now()`
+        // to re-list the real models dir (which would break this function's purity and its headless
+        // tests, and could disagree with the listing every other field here was built from).
+        live_captions: super::live_captions::resolve_in(
+            dir,
+            configured,
+            &selected_id,
+            language,
+            &cfg.live_model_pin,
+            cfg.brain_live,
+        )
+        .dto_state()
+        .to_string(),
         selected_id,
         recommended_id: hardware.id.to_string(),
         auto_default_id: auto_default_id.to_string(),
@@ -950,6 +971,131 @@ mod recommendation_tests {
         let d = dto(&cfg, &dir, &[], &apple(64));
         assert!(d.custom_path_override);
         assert_eq!(d.pending_download_bytes, Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2 (W2) — THE WIRE FORMAT, asserted against the fixture the Playwright specs feed to the
+    /// mocked `whisper_recommendation`. Before this test the camelCase payload had never been
+    /// exercised against the backend at all: the FE's `WhisperRecommendationDto` interface was
+    /// hand-written, so a renamed / added / dropped Rust field would have surfaced only as a blank
+    /// area of the model picker in a shipped build.
+    ///
+    /// It compares the KEY SHAPE (top level, `machine`, every `models` row) and the closed
+    /// vocabularies (`reason`, `liveCaptions`, `brainAdvice`, `tier`), NOT the byte figures — the
+    /// figures are already pinned by `catalog`'s own tests, and duplicating them here would make the
+    /// fixture fight the catalog instead of the wire format.
+    #[test]
+    fn whisper_recommendation_wire_format_matches_the_e2e_fixture() {
+        let dir = tmp_dir("wire");
+        // Mirror the fixture's scenario: Sharp + Balanced already on disk. The files are really
+        // written because `resolve_in` / `companion_pending_size_in` read the filesystem, not the
+        // name list.
+        for f in ["ggml-large-v3-turbo-q8_0.bin", "ggml-small.bin"] {
+            std::fs::write(dir.join(f), b"MODEL").unwrap();
+        }
+        let cfg = AppConfig {
+            model_size: SHARP_ID.to_string(),
+            ..AppConfig::default()
+        };
+        let d = build_recommendation(
+            &cfg,
+            &dir,
+            &[
+                "ggml-large-v3-turbo-q8_0.bin".to_string(),
+                "ggml-small.bin".to_string(),
+            ],
+            &apple(64),
+            Some(200 * GIB),
+            Some("auto".to_string()),
+        );
+        let actual = serde_json::to_value(&d).expect("the DTO serializes");
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../e2e/fixtures/whisper-recommendation.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("the e2e fixture is checked in"),
+        )
+        .expect("the e2e fixture is valid JSON");
+
+        // `_`-prefixed keys are documentation for the fixture's human readers.
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut k: Vec<String> = v
+                .as_object()
+                .expect("an object")
+                .keys()
+                .filter(|k| !k.starts_with('_'))
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+
+        assert_eq!(
+            keys(&actual),
+            keys(&fixture),
+            "the e2e fixture must carry EXACTLY the DTO's top-level camelCase keys — update \
+             e2e/fixtures/whisper-recommendation.json (and the FE interface in src/app/core/models.ts)"
+        );
+        assert_eq!(
+            keys(&actual["machine"]),
+            keys(&fixture["machine"]),
+            "machine profile keys drifted"
+        );
+        let actual_row = &actual["models"][0];
+        for row in fixture["models"].as_array().expect("models is an array") {
+            assert_eq!(keys(actual_row), keys(row), "a catalog row's keys drifted");
+        }
+
+        // The closed vocabularies: every fixture value must be one Rust can really emit.
+        let real_reasons: Vec<serde_json::Value> = [
+            RecommendReason::AlreadyDownloaded,
+            RecommendReason::FreshInstallAmpleRam,
+            RecommendReason::NotAppleSilicon,
+            RecommendReason::ArchUnknown,
+            RecommendReason::ModestRam,
+            RecommendReason::RamUnknown,
+            RecommendReason::ExistingInstall,
+        ]
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap())
+        .collect();
+        assert!(
+            real_reasons.contains(&fixture["reason"]),
+            "fixture reason {:?} is not a RecommendReason variant",
+            fixture["reason"]
+        );
+        assert_eq!(
+            actual["reason"], fixture["reason"],
+            "the fixture's scenario (Sharp already on disk) must produce the fixture's reason"
+        );
+        assert_eq!(actual["liveCaptions"], fixture["liveCaptions"]);
+        assert_eq!(actual["brainAdvice"], fixture["brainAdvice"]);
+        assert_eq!(actual["selectedId"], fixture["selectedId"]);
+        assert_eq!(actual["recommendedId"], fixture["recommendedId"]);
+        assert_eq!(actual["autoDefaultId"], fixture["autoDefaultId"]);
+        assert_eq!(actual["modelSizeSource"], fixture["modelSizeSource"]);
+        assert_eq!(actual["pendingDownloadBytes"], fixture["pendingDownloadBytes"]);
+
+        // Every fixture row is a real registry row, and every ladder label is a real tier label.
+        for row in fixture["models"].as_array().unwrap() {
+            let id = row["id"].as_str().expect("an id");
+            assert!(
+                crate::transcribe::catalog::model_by_id(id).is_some(),
+                "fixture row {id} is not in the registry"
+            );
+            if let Some(tier) = row["tier"].as_str() {
+                assert_eq!(
+                    crate::transcribe::catalog::tier_label(id),
+                    Some(tier),
+                    "fixture tier for {id} disagrees with the registry"
+                );
+            }
+        }
+        assert_eq!(
+            fixture["models"].as_array().unwrap().len(),
+            crate::transcribe::catalog::visible().count(),
+            "the fixture must list exactly the VISIBLE catalog (provisional rows stay hidden)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

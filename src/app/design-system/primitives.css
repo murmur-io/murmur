@@ -447,6 +447,61 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
 .menu-item-danger { color: var(--danger); }
 .menu-item-danger:hover:not(:disabled) { background: var(--danger-soft); }
 
+/* --- Range control: the ONE track + thumb ----------------------------------
+   Shared by <mur-slider> (a continuous value) and <mur-power-slider> (discrete
+   rungs). It lives here rather than inside either component so the two can never
+   drift into two different-looking sliders — exactly the drift a design system
+   exists to prevent. Both hosts put `mur-range` on their OWN native
+   `<input type="range">`; the power slider deliberately does NOT wrap
+   mur-slider, because wrapping would mean six passthrough bindings and would put
+   mur-slider's appearance guarantee at the mercy of a caller.
+   The `::-webkit-*` pseudo-elements are the WKWebView/Chromium pair Murmur ships
+   on; they cannot be shared FROM a component stylesheet, because Angular's
+   emulated encapsulation would scope them to one component's attribute. */
+.mur-range {
+  display: block;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.mur-range::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  border: 1px solid var(--border);
+}
+.mur-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7.5px;
+  border-radius: 50%;
+  background: var(--text-on-accent);
+  border: none;
+  box-shadow:
+    0 0 0 1px var(--border-strong),
+    var(--shadow-sm);
+  transition: transform var(--transition-fast);
+}
+.mur-range::-webkit-slider-thumb:hover {
+  transform: scale(1.08);
+}
+.mur-range:focus,
+.mur-range:focus-visible {
+  outline: none;
+}
+.mur-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.mur-range:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* --- Empty / loading wells (shared across list + detail + analytics) -------- */
 .state-card { padding: var(--space-6); }
 .empty-state {

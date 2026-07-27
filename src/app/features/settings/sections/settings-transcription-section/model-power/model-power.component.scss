@@ -1,0 +1,143 @@
+:host {
+  display: block;
+  min-width: 0;
+}
+
+.mp {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.mp-slider {
+  padding: var(--space-2) var(--space-1) 0;
+}
+
+.mp-active {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.mp-active-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.mp-active-name {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.mp-headline {
+  margin: 0;
+  color: var(--text-secondary);
+}
+
+.mp-meters {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.mp-use-rec {
+  align-self: flex-start;
+}
+
+/* Rides the global `.banner` primitive; only the layout is local. */
+.mp-repair {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.mp-tail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mp-tail-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-radius: var(--radius-md);
+  transition: background var(--transition-fast);
+}
+
+.mp-tail-row.is-selected {
+  background: var(--surface-hover);
+}
+
+.mp-tail-pick {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.mp-tail-pick:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.mp-tail-pick:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.mp-tail-pick:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.mp-tail-headline {
+  color: var(--text-primary);
+}
+
+.mp-tail-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+/* The raw checkpoint id, stated plainly rather than hidden behind a marketing name. */
+.mp-tail-id {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.mp-tail-on-disk {
+  color: var(--success);
+}
+
+.mp-tail-confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.mp-danger {
+  color: var(--danger);
+}

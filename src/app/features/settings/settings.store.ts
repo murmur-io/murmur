@@ -6,6 +6,8 @@ import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../core/ipc.service";
 import { hostIsLoopback } from "../../core/loopback";
+import { modelSizeLabel } from "../../core/model-bytes";
+import { MachineService } from "../../services/machine.service";
 import type {
   AiMapRow,
   AppConfigDto,
@@ -107,6 +109,12 @@ export class SettingsStore {
   private readonly fb = inject(FormBuilder);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
+  /**
+   * The ROOT-held whisper catalog + machine answer (P1). Root-scoped, so the store
+   * reads the same cached snapshot the picker paints — never a second copy that can
+   * disagree with it.
+   */
+  private readonly machine = inject(MachineService);
 
   // ── About — product identity + shared update-check state ────────────────
 
@@ -489,9 +497,49 @@ export class SettingsStore {
   /** Release handle for the EVENT_MODEL_DOWNLOAD subscription. */
   private unlistenModelDownload: UnlistenFn | null = null;
 
-  /** Approx download size for the selected quality (shown on the Download button). */
-  private readonly _downloadHint = signal("~3 GB");
-  readonly downloadHint = this._downloadHint.asReadonly();
+  /**
+   * Latched by {@link markModelSizeUserPick} when the user changes the quality in the
+   * picker, consumed by the next `save()`. Without the latch, `modelSizeSource` would
+   * have to be sent on EVERY save — which would relabel an automatically-chosen size
+   * as a deliberate one the moment the user changed something unrelated.
+   */
+  private readonly _modelSizeUserPick = signal(false);
+
+  /** The picker reports a DELIBERATE quality choice; the next save records it. */
+  markModelSizeUserPick(): void {
+    this._modelSizeUserPick.set(true);
+  }
+
+  /**
+   * Live signal of the modelSize form control's value — same `toSignal(valueChanges)`
+   * shape as `_gatewayModelValue` below, so {@link downloadHint} can track the pick
+   * the user just made rather than the one the backend last saved.
+   */
+  private readonly _modelSizeValue = toSignal(
+    this.form.controls.modelSize.valueChanges.pipe(
+      startWith(this.form.controls.modelSize.value),
+    ),
+    { initialValue: "" },
+  );
+
+  /**
+   * Approx download size for the selected quality (shown on the Download button),
+   * read from the RUST CATALOG via {@link MachineService}.
+   *
+   * This used to be a nine-entry hardcoded `hints` map here, mirrored by a SIX-entry
+   * `SIZE_HINTS` in the onboarding wizard and by the `<option>` labels in the
+   * template — three copies that had already diverged. The catalog is now the single
+   * source; a size the catalog states no figure for renders "size unknown", never a
+   * blank that reads as "free" (see `core/model-bytes.ts`).
+   */
+  readonly downloadHint = computed(() => {
+    const size = this._modelSizeValue() || this.machine.selectedId();
+    const row = this.machine.models().find((m) => m.id === size);
+    // No catalog yet (a cold first read, or a failed probe) ⇒ say nothing rather
+    // than invent a figure; the button still works.
+    if (!row) return "";
+    return modelSizeLabel(row.approxDownloadBytes);
+  });
 
   /**
    * OPTIONAL parakeet live-ASR engine model presence + download state (mirrors the Whisper
@@ -1526,7 +1574,9 @@ export class SettingsStore {
       )) {
         void this.ensureModels(conn);
       }
-      this.updateDownloadHint();
+      // The download hint is a `computed` over the Rust catalog now, so nothing to
+      // push here — but the catalog itself has to be READ, and this is the load path.
+      void this.machine.refresh();
       this._inputDevices.set(await this.ipc.listInputDevices().catch(() => []));
       // Speaker voiceprints — the gated management list (best-effort; failure leaves it empty).
       this._voiceprints.set(await this.ipc.listVoiceprints().catch(() => []));
@@ -2187,6 +2237,11 @@ export class SettingsStore {
       })(),
       audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
+      // Only a save that FOLLOWS an explicit pick in the picker claims `"user"`;
+      // `null` is the wire spelling of "absent" and means PRESERVE, so saving the
+      // vault path (or anything else on this form) can never relabel how the model
+      // size got there. The flag is consumed below, once the save resolves.
+      modelSizeSource: this._modelSizeUserPick() ? "user" : null,
       liveAsrEngine: v.liveAsrEngine,
       // Brain-sidecar timeouts (seconds). Coerce to a finite positive number; a blank/invalid value
       // falls back to the default here AND the backend's `dto_to_config` re-defaults a 0 — belt and
@@ -2292,6 +2347,15 @@ export class SettingsStore {
       // re-check presence so the download hint stays honest (was previously done
       // by onModelChoiceChange's direct save, now retired).
       this._modelPresent.set(await this.ipc.modelPresent().catch(() => false));
+      // The `"user"` claim has now been persisted — clear it so the NEXT save (a
+      // vault path, a toggle) goes back to preserving whatever is stored.
+      this._modelSizeUserPick.set(false);
+      // …and re-read the catalog for the SAVED selection: `pendingDownloadBytes`,
+      // every row's `downloaded` flag and the live-caption state all describe what
+      // is stored, not what is typed, so the picker would otherwise keep describing
+      // the previous pick. Refreshed HERE (after the save resolves) rather than on
+      // the change event, which fires before the debounced save has stored anything.
+      await this.machine.refresh();
       // A save may have flipped `mcp_require_token` (or minted the token on first use) — re-fetch
       // the MCP config so the copy block never shows a stale token-bearing / tokenless snippet.
       await this.refreshMcpConfig();
@@ -2697,30 +2761,6 @@ export class SettingsStore {
     }
   }
 
-  /**
-   * React to the language/quality selects. NO direct save() — the select is a
-   * form control, so the debounced auto-save persists it (a direct call here
-   * produced a double save — adversarial-verify finding); save() itself
-   * refreshes the model-present indicator once the new choice is stored.
-   */
-  onModelChoiceChange(): void {
-    this.updateDownloadHint();
-  }
-
-  private updateDownloadHint(): void {
-    const hints: Record<string, string> = {
-      tiny: "~75 MB",
-      base: "~150 MB",
-      small: "~470 MB",
-      "small-q8_0": "~270 MB",
-      medium: "~1.5 GB",
-      "medium-q8_0": "~850 MB",
-      "large-v3-turbo": "~1.6 GB",
-      "large-v3-turbo-q8_0": "~875 MB",
-      "large-v3": "~3 GB",
-    };
-    this._downloadHint.set(hints[this.form.getRawValue().modelSize] ?? "");
-  }
 
   /**
    * Copy the Obsidian URL to the clipboard and briefly confirm.
@@ -2770,7 +2810,14 @@ export class SettingsStore {
     }
   }
 
-  /** Download the model for the chosen language + quality, then re-check presence. */
+  /**
+   * Download the model for the chosen language + quality, then re-check presence.
+   *
+   * A CANCEL resolves normally (`status: "cancelled"`) and must NOT set the error
+   * line — the user asked for it. Presence and the catalog are re-read either way,
+   * because a cancel during the live-caption companion still leaves the batch model
+   * on disk and the UI has to tell the truth about that.
+   */
   async downloadModel(): Promise<void> {
     this._modelDownloadError.set(null);
     this._modelDownloadFrac.set(0);
@@ -2779,10 +2826,25 @@ export class SettingsStore {
       await this.save(); // ensure the chosen language + size are persisted first
       await this.ipc.downloadModel();
       this._modelPresent.set(await this.ipc.modelPresent());
+      await this.machine.refresh();
     } catch (e) {
       this._modelDownloadError.set(String(e));
     } finally {
       this._downloadingModel.set(false);
+    }
+  }
+
+  /**
+   * Cancel the in-flight model download. Best-effort and never surfaced as an error:
+   * the download itself resolves with a "cancelled" outcome, which
+   * {@link downloadModel} already handles.
+   */
+  async cancelModelDownload(): Promise<void> {
+    try {
+      await this.ipc.cancelModelDownload();
+    } catch {
+      // Nothing to cancel (or the command is unavailable) — the download either
+      // finishes or fails on its own; there is nothing useful to tell the user here.
     }
   }
 
