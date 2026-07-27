@@ -1660,6 +1660,80 @@ fn list_user_facts_visible_excludes_sealed_meeting() {
     );
 }
 
+/// R4/#17 (regression). An ENTITY fact must be FORGETTABLE.
+///
+/// Until `forget_entity_fact` existed, the store exposed forget/clear for USER facts only, so the
+/// only way to close a wrong entity fact was for a later meeting to assert a different object for
+/// the same key. A junk row nobody would ever restate — the real `owner: claude_code` that reached
+/// a dossier as a current fact — therefore stayed CURRENT forever.
+///
+/// Same bitemporal contract as the user-fact twin: CLOSE, never delete, and idempotent.
+#[test]
+fn forget_entity_fact_closes_the_row_and_is_idempotent() {
+    use crate::facts::{FactOp, NewFact};
+    use crate::storage::models::EntityKind;
+    let db = file_db("entity-facts-forget");
+    seed_note(&db, "m1", "note", None);
+    // `facts.entity_id` is a real FK — the entity has to exist before a fact can reference it.
+    let entity = db
+        .upsert_entity("M1 Advanced Mode", EntityKind::Project)
+        .unwrap();
+    let new_fact = |predicate: &str, object: &str| {
+        FactOp::Add(NewFact {
+            entity_id: entity.clone(),
+            subject: "M1 Advanced Mode".into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            valid_from: "2026-06-01T00:00:00Z".into(),
+            recorded_at: "2026-06-01T00:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some("m1".into()),
+        })
+    };
+    db.apply_fact_ops(&[new_fact("owner", "claude_code"), new_fact("status", "open")])
+        .unwrap();
+
+    let visible = db.list_facts_visible(&entity, &HashSet::new()).unwrap();
+    assert_eq!(visible.len(), 2, "both facts start current");
+    let junk = visible
+        .iter()
+        .find(|f| f.predicate == "owner")
+        .expect("the junk owner row")
+        .id
+        .clone();
+
+    assert!(
+        db.forget_entity_fact(&junk, "2026-06-02T00:00:00Z").unwrap(),
+        "closed the open junk fact"
+    );
+    assert!(
+        !db.forget_entity_fact(&junk, "2026-06-02T00:00:00Z").unwrap(),
+        "re-forget is a no-op (idempotent)"
+    );
+
+    // `list_facts_visible` deliberately returns the FULL bitemporal ledger (open + closed), because
+    // knowledge_diff needs the history. What must change is which facts are still OPEN — that is
+    // what `dossier::render_structured` filters on (`valid_to.is_none()`) to print CURRENT FACTS,
+    // and therefore what an agent reads as true.
+    let after = db.list_facts_visible(&entity, &HashSet::new()).unwrap();
+    assert_eq!(after.len(), 2, "history is preserved, never deleted");
+    let open: Vec<_> = after.iter().filter(|f| f.valid_to.is_none()).collect();
+    assert_eq!(open.len(), 1, "only one fact is still current");
+    assert_eq!(
+        open[0].predicate, "status",
+        "the SIBLING stays current; the junk owner is no longer a current fact"
+    );
+    let closed = after
+        .iter()
+        .find(|f| f.predicate == "owner")
+        .expect("the owner row still exists as history");
+    assert_eq!(
+        closed.valid_to.as_deref(),
+        Some("2026-06-02T00:00:00Z"),
+        "closed AT the requested instant, not deleted"
+    );
+}
+
 /// FORGET (task C5.iii): forget_user_fact bitemporally CLOSES the row (never deletes) so it drops
 /// out of the gated read; a second forget is a no-op. clear_user_facts closes ALL open facts.
 #[test]
