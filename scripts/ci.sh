@@ -89,6 +89,18 @@ rust_gate() {
   echo "── development agent eval harness: deterministic self-test ──"
   scripts/agent-harness eval selftest
 
+  # ── User-facing vocabulary. WARN mode: it reports, and it FAILS only on a REGRESSION
+  #    above the recorded baseline. The baseline may shrink and never grow, so copy debt
+  #    can only be paid down. P5 of the UX program arms `--strict`, which forbids any
+  #    user-visible jargon at all; arming it before the long-tail rewrite would just
+  #    force a rubber-stamp allowlist, which is the failure mode this design avoids. ──
+  echo "── user-facing vocabulary (warn + regression gate) ──"
+  if command -v node >/dev/null 2>&1; then
+    node scripts/check-vocabulary.mjs
+  else
+    echo "  (skipped — node not on PATH)"
+  fi
+
   echo "── swiftc: system-audio sidecar typecheck ──"
   if command -v swiftc >/dev/null 2>&1; then
     swiftc -typecheck src-tauri/sysaudio/sysaudio.swift \
