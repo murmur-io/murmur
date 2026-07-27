@@ -534,16 +534,26 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
             out.push_str(
                 "\n## The user's own in-meeting notes (SKELETON — build the note around these)\n\
                  The user typed these during the meeting, one item per line, in order. They are \
-                 the strongest signal of what mattered. Requirements:\n\
+                 the strongest signal of what mattered. They may also contain material that was \
+                 NEVER discussed — pasted from a document, an agenda, or a plan. Requirements:\n\
                  - Use them as the outline: cover EVERY item, in the user's order, keeping the \
                  user's wording (fix only obvious typos).\n\
                  - Expand each item with concrete detail from the transcript — decisions, owners, \
                  dates, numbers.\n\
+                 - PROVENANCE (this overrides every other instruction): `## Summary`, \
+                 `## Key points`, `## Decisions`, `## Action items` and `## Risks & open questions` \
+                 record THE MEETING. Put a statement there ONLY if the TRANSCRIPT supports it. A \
+                 note item the transcript never covers — however important it looks — does NOT go \
+                 in those sections.\n\
+                 - Put every such uncovered item under ONE section headed exactly \
+                 `## From my notes`, placed after the meeting sections, keeping the user's wording. \
+                 Omit that section when the transcript covers everything.\n\
+                 - An OPEN QUESTION in a document is not a decision. Never promote one into \
+                 `## Decisions` because the notes stated it as a plan.\n\
                  - After covering every item, add one section headed exactly `## Also discussed` \
                  for significant transcript topics the notes missed; omit it when nothing \
                  significant remains.\n\
-                 - Never invent content that is not grounded in the transcript or these notes.\n\
-                 - Never output a section titled `My notes`.\n\
+                 - Never invent content grounded in neither the transcript nor these notes.\n\
                  - Never repeat a section heading; keep every formatting requirement from the \
                  instructions above (front-matter first, section structure, wikilinks).\n\
                  USER NOTES:\n",
@@ -1397,9 +1407,46 @@ mod tests {
             s.contains("## Also discussed"),
             "instructs the Also discussed section"
         );
+        // R3/#4 — DELIBERATE CHANGE. This used to assert the prompt forbade a notes-derived
+        // section outright ("Never output a section titled `My notes`"). That instruction was the
+        // defect: with no home of its own, note material the transcript never covered had to be
+        // distributed into the meeting sections, and a pasted PRD's open question landed under
+        // `## Decisions` where a reader takes it for a team decision. The section is now REQUIRED
+        // and named, so the forbidding clause is gone on purpose.
         assert!(
-            s.contains("Never output a section titled"),
-            "forbids a My notes section"
+            s.contains("## From my notes"),
+            "gives uncovered note material its own named home"
+        );
+    }
+
+    /// R3/#4 (regression). The enhance-mode block must state a PROVENANCE contract: the
+    /// meeting-record sections carry only transcript-supported statements, and anything from the
+    /// user's notes the transcript never covered goes to its own section instead.
+    ///
+    /// RED against the previous behavior: the old block said "Never invent content that is not
+    /// grounded in the transcript OR THESE NOTES", which explicitly WIDENED the grounding set to
+    /// the pasted document, and named no section to hold uncovered material.
+    #[test]
+    fn enhance_mode_prompt_states_a_provenance_contract() {
+        let mut r = req(None);
+        r.user_notes = Some("rename the servers\n50 tools per interface".to_string());
+        let s = render_user_content(&r);
+        assert!(
+            s.contains("## From my notes"),
+            "names the section that holds uncovered note material"
+        );
+        assert!(
+            s.contains("ONLY if the TRANSCRIPT supports it"),
+            "binds the meeting sections to transcript support"
+        );
+        assert!(
+            s.contains("OPEN QUESTION in a document is not a decision"),
+            "blocks the exact failure that put a PRD open question under Decisions"
+        );
+        // The old wording legitimised the notes as a grounding source for the meeting sections.
+        assert!(
+            !s.contains("grounded in the transcript or these notes"),
+            "must not widen the grounding set for the meeting-record sections"
         );
     }
 
