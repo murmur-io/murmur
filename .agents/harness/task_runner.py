@@ -524,7 +524,25 @@ def _glob_pattern_to_regex(pattern: str) -> str:
 
 
 def _owned_matches_pattern(owned: str, pattern: str) -> bool:
-    return re.match(_glob_pattern_to_regex(pattern), owned) is not None
+    """Does an OWNED path fall under a classification pattern?
+
+    An owned path names a whole SUBTREE, so owning `src/app` must match the pattern
+    `src/app/**` — the task can write anything beneath it. Comparing the bare string
+    against the glob does not: `src/app` has no trailing segment for `**` to consume, so
+    it silently matched NOTHING.
+
+    That silence was the bug. `--owned src/app` (the natural spelling) classified as no
+    risk at all and the task therefore required no UI evidence, while `--owned src/app/`
+    or `--owned src/app/core` classified as `ui` and did. An operator got a weaker gate
+    for writing a shorter path, with nothing reported. Probing the directory form as well
+    makes the two spellings agree.
+    """
+
+    regex = _glob_pattern_to_regex(pattern)
+    if re.match(regex, owned) is not None:
+        return True
+    # Owning a directory owns everything under it: probe the subtree form too.
+    return re.match(regex, owned.rstrip("/") + "/") is not None
 
 
 def classify_risks(
@@ -5250,6 +5268,24 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         failures.append("the FE note-attachment service is not classified lock + ui")
     if any(flag in fe_attachment_risks for flag in ("runtime", "egress", "protocol", "performance", "release")):
         failures.append("the FE note-attachment service leaked an unrelated risk flag")
+    # A DIRECTORY owned path must classify identically however it is spelled. Owning
+    # `src/app` names the whole subtree, so it has to match `src/app/**` exactly as
+    # `src/app/` and `src/app/core` do. It did not: the bare form matched nothing, so a
+    # task spelled the natural way silently required NO ui evidence while the same task
+    # spelled with a trailing slash required all of it. P3 lost its entire Angular gate to
+    # that difference and only a reviewer noticed.
+    for spelling in ("src/app", "src/app/", "src/app/core", "e2e"):
+        if "ui" not in classify_risks([spelling], [], config):
+            failures.append(f"owned path {spelling!r} did not classify as ui")
+    if required_risk_evidence(classify_risks(["src/app"], ["lock"], config), config) != [
+        "rust-lib",
+        "ng-lint",
+        "ng-build",
+        "playwright",
+    ]:
+        failures.append(
+            "a lock-risk task owning src/app must still require the full Angular evidence set"
+        )
     # Fix: a runner-owned environment probe signals BLOCKED via a DEDICATED EXIT CODE (never
     # stdout, which is writer-controlled) and only for its canonical check id — so a stray dev
     # server owning a port reads as "cannot evaluate here", not a code FAIL, while a forged
