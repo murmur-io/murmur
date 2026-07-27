@@ -75,9 +75,10 @@ pub(crate) fn create_note_inner(
 
     // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused.
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to add a note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock this folder to add a note",
+        )));
     }
 
     let title = title.trim();
@@ -215,13 +216,19 @@ pub(crate) async fn suggest_note_title_inner(
     let (folder_id, current, row_updated_at, row_text) = {
         let _lifecycle = lifecycle_guard(state);
         let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
-            return Err(AppError::InvalidArg(format!("no note {note_id}")));
+            return Err(AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::NOTE_MISSING,
+                format!("no note {note_id}"),
+            )));
         };
         if !folder_is_unlocked(state, &folder_id)? {
             return Ok(crate::storage::db::UNTITLED_TITLE.to_string());
         }
         let Some(row) = state.db.get_note_row(note_id)? else {
-            return Err(AppError::InvalidArg(format!("no note {note_id}")));
+            return Err(AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::NOTE_MISSING,
+                format!("no note {note_id}"),
+            )));
         };
         // `NoteRow.title` is Option<String> (NULL-able column) — treat a missing title as "".
         let current = row.title.clone().unwrap_or_default();
@@ -279,7 +286,10 @@ pub(crate) async fn suggest_note_title_inner(
     let _lifecycle = lifecycle_guard(state);
     let Some((current_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)?
     else {
-        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {note_id}"),
+        )));
     };
     if current_folder_id != folder_id || !folder_is_unlocked(state, &current_folder_id)? {
         return Ok(current);
@@ -321,7 +331,10 @@ pub(crate) fn get_note_inner(state: &AppState, id: &str) -> Result<NoteDoc, AppE
 /// resolved from content-free metadata before any title/body/export-path column is selected.
 fn get_note_under_lifecycle_authorized(state: &AppState, id: &str) -> Result<NoteDoc, AppError> {
     let Some((folder_id, created_at, updated_at)) = state.db.note_gate_anchor(id)? else {
-        return Err(AppError::InvalidArg(format!("no note {id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
     };
     if !folder_is_unlocked(state, &folder_id)? {
         return Ok(masked_note_doc(
@@ -332,7 +345,10 @@ fn get_note_under_lifecycle_authorized(state: &AppState, id: &str) -> Result<Not
         ));
     }
     let Some(row) = state.db.get_note_row(id)? else {
-        return Err(AppError::InvalidArg(format!("no note {id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
     };
     let mut doc = note_doc_from_row(&row);
     // Strip any machine-managed `murmur:links` block (retired — it went stale + rendered as raw junk
@@ -440,14 +456,18 @@ pub(crate) fn update_note_doc_inner_with(
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let lifecycle = lifecycle_guard(state);
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
-        return Err(AppError::InvalidArg(format!("no note {id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
     };
     // WRITE-GATE before the content read: refuse editing a sealed-and-not-session-unlocked note
     // without ever loading its title/body/export path.
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this note is locked — unlock its folder to edit it".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::NOTE_LOCKED,
+            "unlock the folder to edit this note",
+        )));
     }
     let title = title.trim();
     let title = if title.is_empty() { "Untitled" } else { title };
@@ -529,12 +549,16 @@ pub(crate) fn save_note_text_inner(
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let _lifecycle = lifecycle_guard(state);
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
-        return Err(AppError::InvalidArg(format!("no note {id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
     };
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this note is locked — unlock its folder to edit it".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::NOTE_LOCKED,
+            "unlock the folder to edit this note",
+        )));
     }
     let title = title.trim();
     let title = if title.is_empty() { "Untitled" } else { title };
@@ -578,27 +602,38 @@ pub(crate) fn move_note_doc_inner(
     // reassign/seal writes so a concurrent lock/relock cannot land mid-move.
     let _lifecycle = lifecycle_guard(state);
     let Some((source_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
-        return Err(AppError::InvalidArg(format!("no note {id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
     };
     // Source gate before the content read: refuse moving a sealed-not-unlocked note without loading
     // its blanked/residual plaintext row merely to discover the governing folder.
     if !folder_is_unlocked(state, &source_folder_id)? {
-        return Err(AppError::Locked(
-            "this note is locked — unlock its folder to move it".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::NOTE_LOCKED,
+            "unlock the folder to move this note",
+        )));
     }
     let Some(row) = state.db.get_note_row(id)? else {
-        return Err(AppError::InvalidArg(format!("no note {id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_MISSING,
+            format!("no note {id}"),
+        )));
     };
     // Target must be a NOTE folder and be unlocked (never land plaintext behind a lock). We do not
     // support sealing-on-move into a locked note-folder in WP0 — refuse (the FE unlocks first).
     if state.db.note_folder_by_id(folder_id)?.is_none() {
-        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_FOLDER_MISSING,
+            format!("no note folder {folder_id}"),
+        )));
     }
     if !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "the target folder is locked — unlock it to move a note there".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock the target folder to move a note there",
+        )));
     }
 
     // Seal alignment (2026-07-10 audit F1, reordered by residual W2 to SEAL-THEN-REASSIGN): the
@@ -740,9 +775,10 @@ pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), 
         return Ok(()); // unknown id → idempotent no-op.
     };
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to delete a note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock this folder to delete a note",
+        )));
     }
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact note
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
@@ -756,9 +792,10 @@ pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), 
         return Ok(());
     };
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to delete a note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock this folder to delete a note",
+        )));
     }
     let Some(row) = state.db.get_note_row(id)? else {
         return Ok(());
@@ -836,7 +873,10 @@ pub(crate) fn get_note_folder_schema_inner(
     folder_id: &str,
 ) -> Result<Vec<PropertySchemaField>, AppError> {
     if state.db.note_folder_by_id(folder_id)?.is_none() {
-        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_FOLDER_MISSING,
+            format!("no note folder {folder_id}"),
+        )));
     }
     // GATE: a locked-and-not-session-unlocked folder's schema is NOT exposed (return empty).
     if !folder_is_unlocked(state, folder_id)? {
@@ -865,14 +905,18 @@ pub(crate) fn set_note_folder_schema_inner(
     fields: Vec<PropertySchemaField>,
 ) -> Result<(), AppError> {
     if state.db.note_folder_by_id(folder_id)?.is_none() {
-        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_FOLDER_MISSING,
+            format!("no note folder {folder_id}"),
+        )));
     }
     // WRITE-GATE (before any validation or write): a sealed-not-unlocked folder is refused so a
     // schema can never be edited behind a lock.
     if !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to edit its properties".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock this folder to edit its properties",
+        )));
     }
     if fields.len() > NOTE_SCHEMA_MAX_FIELDS {
         return Err(AppError::InvalidArg(format!(
@@ -946,7 +990,10 @@ pub(crate) fn list_notes_typed_inner(
     folder_id: &str,
 ) -> Result<Vec<TypedNoteRow>, AppError> {
     if state.db.note_folder_by_id(folder_id)?.is_none() {
-        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::NOTE_FOLDER_MISSING,
+            format!("no note folder {folder_id}"),
+        )));
     }
     let unlocked = unlocked_snapshot(state)?;
     state.db.list_notes_visible_typed(folder_id, &unlocked)

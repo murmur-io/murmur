@@ -30,8 +30,8 @@ use crate::storage::models::{NoteTemplate, NoteTemplateSection};
 /// the next `make_provider(claude_code|anthropic)` is allowed to build. Idempotent.
 ///
 /// The FE calls this from its first-cloud-send confirmation dialog. Until the user confirms, every
-/// cloud summarize/chat returns `AppError::Unavailable("cloud egress not consented …")`, which the
-/// FE detects and surfaces as the consent prompt.
+/// cloud summarize/chat returns `AppError::Unavailable(errcode::tag(errcode::CLOUD_CONSENT, …))`;
+/// the FE matches the `[cloud-consent]` CODE (never the prose) and surfaces the consent prompt.
 #[tauri::command]
 pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
     let mut cache = state

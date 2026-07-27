@@ -1,6 +1,6 @@
 <div class="card panel">
   <div class="panel-head">
-    <h3>Egress &amp; Usage</h3>
+    <h3>What leaves this Mac</h3>
     <!-- 7 / 30 / 90 day segmented toggle -->
     <div class="seg" role="group" aria-label="Window">
       @for (r of ranges; track r) {
@@ -30,22 +30,41 @@
         <span class="eg-tile-label">Cloud calls</span>
         <span class="eg-tile-value">{{ l.totalCalls }}</span>
       </div>
+      <!--
+        The unit stays "Tokens" because that is what `byModel`/`byDay` actually count. Renaming it
+        to "words" without changing the number would be a lie, so it keeps its unit and gains a
+        gloss instead (glossary.ts::tokensGloss).
+      -->
       <div class="eg-tile">
         <span class="eg-tile-label">Tokens sent</span>
         <span class="eg-tile-value">{{ fmtTokens(l.totalTokens) }}</span>
+        <span class="eg-tile-note">roughly ¾ of a word each</span>
       </div>
+      <!--
+        ENUMERATED, not a bare noun: "PII scrubbed" told the user nothing about what is or is not
+        removed. Names are counted separately below because they are only masked when the optional
+        on-device model is installed — folding them in here would imply a protection that is off by
+        default.
+      -->
       <div class="eg-tile">
-        <span class="eg-tile-label">PII scrubbed</span>
-        <span class="eg-tile-value">{{ totalPii() }}</span>
+        <span class="eg-tile-label">Emails, phones and cards removed</span>
+        <span class="eg-tile-value">{{ patternRedactions() }}</span>
+        <span class="eg-tile-note">
+          @if (namesMasked() > 0) {
+            {{ namesMasked() }} name{{ namesMasked() === 1 ? '' : 's' }} masked too
+          } @else {
+            names are not removed unless you turn on name masking
+          }
+        </span>
       </div>
     </div>
 
-    <!-- Tokens by model -->
+    <!-- By model -->
     <div class="eg-section">
-      <h4 class="eg-section-title">Tokens by model</h4>
+      <h4 class="eg-section-title">By model</h4>
       @if (modelBars().length === 0) {
         <p class="empty-state">
-          No cloud calls in this window — everything stayed on-device.
+          No cloud calls in this window — everything stayed on this Mac.
         </p>
       } @else {
         <ul class="eg-bars" aria-label="Tokens by model">
@@ -65,7 +84,7 @@
     <!-- Tokens by day -->
     @if (dayBars().length > 0) {
       <div class="eg-section">
-        <h4 class="eg-section-title">Tokens by day</h4>
+        <h4 class="eg-section-title">By day</h4>
         <ul class="eg-bars" aria-label="Tokens by day">
           @for (d of dayBars(); track d.day) {
             <li class="eg-bar-row">
@@ -83,8 +102,8 @@
     <!-- What left this device -->
     <div class="eg-section">
       <h4 class="eg-section-title">
-        What left this device
-        <span class="eg-section-note">(scrubbed before sending)</span>
+        Removed before sending
+        <span class="eg-section-note">(and restored in your notes)</span>
       </h4>
       <div class="eg-chips">
         <span class="eg-chip">
@@ -110,7 +129,7 @@
     @if (l.recent.length > 0) {
       <div class="eg-section">
         <h4 class="eg-section-title">Recent calls</h4>
-        <ul class="eg-recent" aria-label="Recent egress calls">
+        <ul class="eg-recent" aria-label="Recent cloud calls">
           <!--
             track $index is correct here (not a rule violation): l.recent is a
             read-only snapshot wholesale-replaced by _ledger.set() — rows are

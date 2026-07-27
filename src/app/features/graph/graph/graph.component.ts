@@ -14,6 +14,7 @@ import type { GraphData, GraphNode } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
 import { EntityCardComponent } from "../entity-card/entity-card.component";
 import { EntityDetailComponent } from "../entity-detail/entity-detail.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 type KindFilter = "all" | "person" | "project";
 type SortKey = "mentions" | "name";
@@ -50,6 +51,7 @@ export class GraphComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly route = inject(ActivatedRoute);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /**
    * An optional `?entity=<id>` query param — the entry point the full-brain
@@ -204,7 +206,7 @@ export class GraphComponent {
       }
     } catch (e) {
       this.graphData.set(null);
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }

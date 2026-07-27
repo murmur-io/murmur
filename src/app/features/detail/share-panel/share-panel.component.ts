@@ -28,6 +28,7 @@ import {
   type OrgShareTarget,
 } from "../org-share-sheet/org-share-sheet.component";
 import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The step the in-flow "Share with a person" panel is showing. */
 export type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
@@ -88,6 +89,7 @@ export interface LinkShareRow {
 export class SharePanelComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   // --- Inputs from the shell ------------------------------------------------
   /** THIS meeting's id (null while the detail is loading), the shares filter key. */
@@ -407,8 +409,8 @@ export class SharePanelComponent {
       // the link/person share UI above.
       void this.refreshOrg(id);
     } catch (e) {
-      this.listError.set(String(e));
-      this.gateError.set(String(e));
+      this.listError.set(this.errorCopy.humanize(e));
+      this.gateError.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }
@@ -501,22 +503,19 @@ export class SharePanelComponent {
       }
     } catch (e) {
       this._biometricFailed.set(true);
-      this.gateError.set(this.friendlyUnlockError(String(e)));
+      // LOCK GATE. The copy is owned by `ErrorCopyService` under the "meeting-share" context, which
+      // distinguishes a Touch ID CANCEL from a Touch ID FAILURE by the `[touch-id-*]` code rather
+      // than by regex-matching the word "cancel" in whatever the keychain happened to say.
+      //
+      // The raw backend cause is no longer appended. It used to be, deliberately, so a signed build
+      // could be field-debugged from the screen — but the same string carries keychain OSStatus
+      // internals ("account-session mutex poisoned", "HKDF expand failed"), and a share gate is
+      // exactly the surface where that is least acceptable. The gate itself is UNCHANGED: this
+      // still fails closed, still sets `_biometricFailed`, still offers the password path.
+      this.gateError.set(this.errorCopy.humanize(e, "meeting-share"));
     } finally {
       this.unlocking.set(false);
     }
-  }
-
-  /**
-   * Turn a raw biometric-unlock error into a friendly fall-back message. The raw backend error is
-   * APPENDED (not swallowed) — field debugging of the signed build depends on the real cause
-   * reaching the screen (keychain OSStatus, "no cached account key", …), not a generic apology.
-   */
-  private friendlyUnlockError(raw: string): string {
-    if (/cancel/i.test(raw)) {
-      return "Touch ID was cancelled. Use Unlock for sharing to unlock with your password.";
-    }
-    return `Couldn't unlock with Touch ID — ${raw}. Use Unlock for sharing to unlock with your password.`;
   }
 
   // --- CONFIGURE handlers ---------------------------------------------------
@@ -557,7 +556,7 @@ export class SharePanelComponent {
         this.accountStatus.set({ ...s, shareConsented: true });
       }
     } catch (e) {
-      this.createError.set(String(e));
+      this.createError.set(this.errorCopy.humanize(e));
     } finally {
       this.consenting.set(false);
     }
@@ -608,7 +607,7 @@ export class SharePanelComponent {
       await this.refresh();
       this.changed.emit();
     } catch (e) {
-      this.createError.set(String(e));
+      this.createError.set(this.errorCopy.humanize(e));
     } finally {
       this.creating.set(false);
     }
@@ -678,7 +677,7 @@ export class SharePanelComponent {
       await this.refresh();
       this.changed.emit();
     } catch (e) {
-      this.listError.set(String(e));
+      this.listError.set(this.errorCopy.humanize(e));
       await this.refresh();
     } finally {
       this.revokingId.set(null);
@@ -787,7 +786,7 @@ export class SharePanelComponent {
         await this.sendToUser();
       }
     } catch (e) {
-      this.personError.set(String(e));
+      this.personError.set(this.errorCopy.humanize(e));
     } finally {
       this.personBusy.set(false);
     }
@@ -833,7 +832,7 @@ export class SharePanelComponent {
       await this.ipc.consentToShareEgress();
       await this.sendToUser();
     } catch (e) {
-      this.personError.set(String(e));
+      this.personError.set(this.errorCopy.humanize(e));
     } finally {
       this.personBusy.set(false);
     }
@@ -860,14 +859,16 @@ export class SharePanelComponent {
       await this.refresh();
       this.changed.emit();
     } catch (e) {
-      const msg = String(e);
-      if (/consent/i.test(msg)) {
+      // A missing one-time upload consent is not an error the user should read — it is a STEP.
+      // Matched on the `[share-consent]` code (`errcode::SHARE_CONSENT`), not on the word
+      // "consent" appearing somewhere in a backend sentence.
+      if (this.errorCopy.is(e, "share-consent")) {
         this.verifyMode.set(null);
         this.personOpen.set(true);
         this.personStep.set("consent");
         this.personError.set(null);
       } else {
-        this.personError.set(msg);
+        this.personError.set(this.errorCopy.humanize(e, "meeting-share"));
       }
     }
   }

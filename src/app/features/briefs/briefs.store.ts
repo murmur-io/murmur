@@ -2,6 +2,7 @@ import { DestroyRef, Injectable, inject, signal } from "@angular/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../core/ipc.service";
 import type { BriefRun, BriefSchedule } from "../../core/models";
+import { ErrorCopyService } from "../../core/copy/error-copy.service";
 
 /**
  * Brain v2 L5 — the SCHEDULED-BRIEFS store: schedules (config rows) + the
@@ -20,6 +21,7 @@ import type { BriefRun, BriefSchedule } from "../../core/models";
 export class BriefsStore {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _schedules = signal<BriefSchedule[]>([]);
   readonly schedules = this._schedules.asReadonly();
@@ -64,7 +66,7 @@ export class BriefsStore {
       this._pending.set(pending);
       this._error.set(null);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._loading.set(false);
     }

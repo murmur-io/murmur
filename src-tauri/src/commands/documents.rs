@@ -185,9 +185,10 @@ fn extract_document_text(
     let ext = match ext {
         Some(e) if DOC_ALLOWED_EXTS.contains(&e.as_str()) => e,
         _ => {
-            return Err(AppError::InvalidArg(
-                "unsupported document type — import md, txt, pdf, docx, pptx, xlsx, html, or an image (png/jpg/heic/tiff/bmp/gif)".into(),
-            ))
+            return Err(AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::DOC_UNSUPPORTED,
+                "import md, txt, pdf, docx, pptx, xlsx, html, or an image (png/jpg/heic/tiff/bmp/gif)",
+            )))
         }
     };
 
@@ -197,9 +198,10 @@ fn extract_document_text(
     // ceiling live there — see extract/mod.rs + extract/ooxml.rs). `progress` streams per-page counts.
     let blocks = crate::extract::extract_blocks(p, &ext, progress)?;
     if blocks.is_empty() || blocks.iter().all(|b| b.text.trim().is_empty()) {
-        return Err(AppError::InvalidArg(
-            "this document has no extractable text".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_NO_TEXT,
+            "this document has no extractable text",
+        )));
     }
     let stored = crate::extract::blocks_to_stored_text(&blocks);
 
@@ -238,9 +240,10 @@ pub(crate) fn insert_extracted_document(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
             .contains(folder_id);
         if !session_unlocked {
-            return Err(AppError::Locked(
-                "this folder is locked — unlock it to add to the brain".into(),
-            ));
+            return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::DOC_LOCKED,
+                "unlock this folder to add to the brain",
+            )));
         }
     }
 
@@ -279,9 +282,10 @@ pub(crate) fn import_document_write_gate(
         .folder_by_id(folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
     if folder.locked && !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to add to the brain".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::DOC_LOCKED,
+            "unlock this folder to add to the brain",
+        )));
     }
     Ok(())
 }
@@ -341,9 +345,10 @@ fn ingest_into_folder(
     // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused (never resurrect plaintext at
     // rest behind a lock). One gate for every ingest path.
     if folder.locked && !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to add to the brain".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::DOC_LOCKED,
+            "unlock this folder to add to the brain",
+        )));
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -463,9 +468,10 @@ pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<
         return Ok(()); // unknown id → idempotent no-op.
     };
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to delete a document".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::DOC_LOCKED,
+            "unlock this folder to delete a document",
+        )));
     }
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact source
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
@@ -480,9 +486,10 @@ pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<
         return Ok(());
     };
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to delete a document".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::DOC_LOCKED,
+            "unlock this folder to delete a document",
+        )));
     }
     if state.db.note_gate_anchor(id)?.is_some() {
         let attachment_owner = crate::storage::AttachmentOwner::Document {
@@ -625,16 +632,18 @@ pub(crate) async fn prepare_smart_note(
     // GATE (read + write, one folder): refuse a sealed-and-NOT-session-unlocked folder — the same
     // posture as `import_document`'s write-gate. A blanked (sealed) source has no text to read either.
     if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "this folder is locked — unlock it to make a note from this document".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::DOC_LOCKED,
+            "unlock this folder to make a note from this document",
+        )));
     }
     // Clean display text (strips the PR-2 block-structure markers; md/txt/note rows pass through).
     let display_text = crate::extract::render_display_text(&stored_text);
     if display_text.trim().is_empty() {
-        return Err(AppError::InvalidArg(
-            "this document has no extractable text to turn into a note".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_NO_TEXT,
+            "this document has no extractable text to turn into a note",
+        )));
     }
 
     // The current/last meeting — GATED: a sealed-not-unlocked latest meeting contributes neither its
@@ -749,9 +758,10 @@ pub(crate) fn persist_generated_note(
         // Re-check the gate under the lifecycle guard: a relock racing between `prepare_smart_note`
         // and here must refuse, never land plaintext at rest behind a lock.
         if !folder_is_unlocked(state, &prepared.folder_id)? {
-            return Err(AppError::Locked(
-                "this folder is locked — unlock it to add a note".into(),
-            ));
+            return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::FOLDER_LOCKED,
+                "unlock this folder to add a note",
+            )));
         }
         let locked = state
             .db

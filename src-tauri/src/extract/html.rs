@@ -7,7 +7,9 @@
 use std::path::Path;
 
 use super::ExtractedBlock;
-use crate::error::{AppError, Result};
+// `AppError` is no longer named here: both failure shapes go through the shared constructors in
+// `super` (`unreadable` / `guard_flow_file_size`) so each one carries its `errcode`.
+use crate::error::Result;
 
 /// Wrap width for `html2text` rendering. Wide enough that paragraphs are not aggressively hard-wrapped
 /// (we want readable flow text for embedding/snippets, not a terminal column layout).
@@ -18,17 +20,12 @@ const RENDER_WIDTH: usize = 100;
 /// multi-gigabyte `.html` would otherwise be slurped whole into RAM before any block-level check).
 pub fn extract_html(path: &Path) -> Result<Vec<ExtractedBlock>> {
     // FILE-SIZE SANITY CAP (flow format): reject an oversized file before reading it into memory.
-    let meta = std::fs::metadata(path)
-        .map_err(|e| AppError::InvalidArg(format!("could not read HTML: {e}")))?;
-    if meta.len() > super::MAX_FLOW_FILE_BYTES {
-        return Err(AppError::InvalidArg(
-            "this HTML is too large to import — it exceeds the size limit".into(),
-        ));
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::InvalidArg(format!("could not read HTML: {e}")))?;
+    // Shared with the md/txt path so the rejection carries the same `DOC_TOO_LARGE` code.
+    super::guard_flow_file_size(path, "HTML")?;
+    let bytes =
+        std::fs::read(path).map_err(|e| super::unreadable(format!("could not read HTML: {e}")))?;
     let text = html2text::from_read(bytes.as_slice(), RENDER_WIDTH)
-        .map_err(|e| AppError::InvalidArg(format!("could not render HTML: {e}")))?;
+        .map_err(|e| super::unreadable(format!("could not render HTML: {e}")))?;
     let text = text.trim().to_string();
     if text.is_empty() {
         return Ok(Vec::new());

@@ -287,7 +287,10 @@ pub(crate) async fn share_note_to_link_inner(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         if !cfg.share_egress_consented {
             return Err(AppError::Unavailable(
-                "sharing not consented — confirm the one-time upload notice first".into(),
+                crate::errcode::tag(
+                    crate::errcode::SHARE_CONSENT,
+                    "confirm the one-time upload notice first",
+                ),
             ));
         }
         cfg.share_base_url.clone()
@@ -413,7 +416,10 @@ pub(crate) async fn share_note_to_link_doc_inner(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         if !cfg.share_egress_consented {
             return Err(AppError::Unavailable(
-                "sharing not consented — confirm the one-time upload notice first".into(),
+                crate::errcode::tag(
+                    crate::errcode::SHARE_CONSENT,
+                    "confirm the one-time upload notice first",
+                ),
             ));
         }
         cfg.share_base_url.clone()
@@ -703,7 +709,10 @@ pub(crate) async fn share_note_to_user_inner(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         if !cfg.share_egress_consented {
             return Err(AppError::Unavailable(
-                "sharing not consented — confirm the one-time upload notice first".into(),
+                crate::errcode::tag(
+                    crate::errcode::SHARE_CONSENT,
+                    "confirm the one-time upload notice first",
+                ),
             ));
         }
         cfg.share_base_url.clone()
@@ -3023,7 +3032,10 @@ async fn publish_org_body_with_policy(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         if !cfg.org_egress_consented {
             return Err(AppError::Unavailable(
-                "org sharing not consented — confirm the one-time upload notice first".into(),
+                crate::errcode::tag(
+                    crate::errcode::ORG_CONSENT,
+                    "confirm the one-time upload notice first",
+                ),
             ));
         }
     }
@@ -5793,7 +5805,10 @@ pub(crate) async fn org_update_own_item_inner(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         if !cfg.org_egress_consented {
             return Err(AppError::Unavailable(
-                "org sharing not consented — confirm the one-time upload notice first".into(),
+                crate::errcode::tag(
+                    crate::errcode::ORG_CONSENT,
+                    "confirm the one-time upload notice first",
+                ),
             ));
         }
     }

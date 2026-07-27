@@ -3,25 +3,25 @@
   <div class="use-group">
     <span class="use-group-label text-muted">Search index</span>
 
-    <!-- brain2 RAG — semantic search over your notes (embedding model + reindex) -->
+    <!-- brain2 RAG — semantic search over your notes (search-index model + reindex) -->
     <div class="semantic">
       <label class="toggle-row">
         <span class="toggle-copy">
           <span class="toggle-title">Semantic search (multilingual)</span>
           <span class="text-secondary toggle-sub">
-            Finds notes by meaning + across languages — needs the embedding
-            model.
+            Finds notes by meaning + across languages — needs the
+            search-index model.
           </span>
         </span>
         <mur-toggle formControlName="semanticSearchEnabled" />
       </label>
 
-      <!-- Embedding model: present pill, or a download control with progress -->
+      <!-- Search-index model: present pill, or a download control with progress -->
       <div class="semantic-model-row">
         @if (embedModelPresent() === true) {
           <span class="pill is-success">
             <span class="pill-dot"></span>
-            Embedding model ready ✓
+            Search-index model ready ✓
           </span>
           <span class="text-muted semantic-note">
             Stored on this Mac — used to index + search your notes.
@@ -30,11 +30,11 @@
           @if (downloadingEmbedModel()) {
             <div class="semantic-progress" role="status">
               <mur-progress
-                ariaLabel="Embedding model download"
+                ariaLabel="Search-index model download"
                 [value]="embedDownloadFrac() * 100"
               />
               <span class="semantic-progress-label text-muted">
-                Downloading embedding model… {{ embedPct() }}
+                Downloading the search-index model… {{ embedPct() }}
               </span>
             </div>
           } @else {
@@ -43,7 +43,7 @@
               class="btn btn-primary btn-sm"
               (click)="downloadEmbedModel()"
             >
-              Download embedding model (~470 MB)
+              Download the search-index model (~470 MB)
             </button>
             <span class="text-muted semantic-note">
               One time, on-device — required before semantic search can
@@ -95,7 +95,7 @@
       @if (reindexResult(); as rr) {
         @if (rr.status === "model_missing") {
           <p class="semantic-nudge text-secondary">
-            Download the embedding model above first — semantic search
+            Download the search-index model above first — semantic search
             can't index without it.
           </p>
         } @else {
@@ -119,8 +119,8 @@
         <span class="toggle-copy">
           <span class="toggle-title">Weekly vault audit</span>
           <span class="text-secondary toggle-sub">
-            Runs the deterministic vault audit once a week, on-device, zero
-            egress.
+            Runs the vault audit once a week on this Mac — the same
+            rule-based checks every time, and nothing leaves your Mac.
           </span>
         </span>
         <mur-toggle

@@ -9,6 +9,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import type { ContextHit } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * LIVE-CONTEXT affordance (docs/research/2026-07-06-note-and-brain-architecture.md §3 / §6 / §8-Phase 3).
@@ -37,6 +38,7 @@ import type { ContextHit } from "../../../core/models";
 })
 export class Stage2PanelComponent {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   readonly meetingId = input.required<string>();
   /** Fires after Lane A links / Lane B hits are applied so the parent reloads the note. */
@@ -88,7 +90,7 @@ export class Stage2PanelComponent {
     try {
       this.hits.set(await this.ipc.enrichNoteContext(this.meetingId()));
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.running.set(false);
     }
@@ -117,7 +119,7 @@ export class Stage2PanelComponent {
       this.applied.set(true);
       this.noteChanged.emit();
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.running.set(false);
     }
@@ -144,7 +146,7 @@ export class Stage2PanelComponent {
       this.applied.set(false);
       this.noteChanged.emit();
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.running.set(false);
     }

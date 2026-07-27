@@ -19,6 +19,7 @@ import type {
 } from "../../../core/models";
 import { SourcesComponent } from "../../../shared/sources/sources.component";
 import { EntityNeighborhoodComponent } from "../entity-neighborhood/entity-neighborhood.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The two selectable comparison windows for the decision ledger's `from` bound. */
 type LedgerRange = "90d" | "all";
@@ -59,6 +60,7 @@ interface DiffRowVm {
 export class EntityDetailComponent {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The entity to show detail for; changing it re-loads the panel. */
   readonly entityId = input.required<string>();
@@ -177,7 +179,7 @@ export class EntityDetailComponent {
         return;
       }
       this.detail.set(null);
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       if (this.entityId() === id) {
         this.loading.set(false);

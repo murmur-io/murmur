@@ -15,6 +15,7 @@ import { catchError, debounceTime, from, of, switchMap } from "rxjs";
 import { MurKbdComponent } from "../kbd/kbd.component";
 import { IpcService } from "../../core/ipc.service";
 import type { SearchHit } from "../../core/models";
+import { matchedInLabel } from "../../core/copy/labels";
 
 /** One rendered result row — precomputed so the template calls no methods. */
 interface HitRow {
@@ -86,7 +87,11 @@ export class MurQuickSearchComponent {
         day: "numeric",
       }),
       snippet: h.snippet,
-      matchedIn: h.matchedIn,
+      // The RAW value ("transcript"/"note"/"title") used to render straight into the chip;
+      // `matchedInLabel` is the ONE user-facing phrasing for that concept (P3). It returns "" for
+      // a value it cannot name, and the template then renders NO chip — defaulting an unknown
+      // match to "in the title" would be a confident lie about where the hit came from.
+      matchedIn: matchedInLabel(h.matchedIn),
     })),
   );
 
