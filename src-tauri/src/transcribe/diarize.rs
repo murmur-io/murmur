@@ -166,7 +166,13 @@ fn tag_is_numbered_cluster(tag: &str) -> bool {
 /// `others` → 0 ONLY when the meeting is single-cluster 1:1 — inferred from the tags PRESENT on the
 /// segments (`has_numbered == false`), NOT from the stored-voiceprint set. `me`, an unknown tag, or a
 /// stray plain `others` inside a multi-cluster meeting → None (never a fabricated cluster).
-fn cluster_index_of_tag(tag: &str, has_numbered: bool) -> Option<i64> {
+///
+/// `pub(crate)` so the MCP transcript renderer (`tools.rs::format_structured_transcript`) parses the
+/// tag with the SAME parser the reconciler uses — two consumers of one tag must never disagree. That
+/// caller handles plain `others` itself and passes `has_numbered: true` to get only the numbered
+/// branch. NOTE: the returned index is unvalidated (`others--1` → `Some(-1)`); a caller that turns it
+/// into a user-visible label must range-check it.
+pub(crate) fn cluster_index_of_tag(tag: &str, has_numbered: bool) -> Option<i64> {
     if let Some(rest) = tag
         .strip_prefix(SPEAKER_OTHERS)
         .and_then(|r| r.strip_prefix('-'))
