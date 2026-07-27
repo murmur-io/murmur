@@ -37,13 +37,15 @@
     "egress": ["rust-lib"],
     "protocol": ["rust-lib", "protocol-server"],
     "runtime": ["tauri-boot"],
-    "ui": ["playwright"],
+    "ui": ["ng-lint", "ng-build", "playwright"],
     "performance": ["perf-contracts"]
   },
   "canonical_checks": {
     "rust-lib": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo test --lib -- --test-threads=1)",
     "protocol-server": "(cd ../murmur-server && CARGO_BUILD_JOBS=2 cargo test -p murmur-protocol -- --test-threads=1)",
     "tauri-boot": "scripts/harness-runtime-smoke",
+    "ng-lint": "npx ng lint",
+    "ng-build": "npx ng build",
     "playwright": "npm run test:e2e -- --workers=1",
     "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh"
   },
