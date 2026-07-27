@@ -33,6 +33,15 @@ name: CI
 on:
   pull_request:
     branches: [murmur]
+  # Populate the DEFAULT-BRANCH cache scope after every merge.
+  #
+  # Without this the gate had no `push:` trigger at all, so nothing ever wrote a cache
+  # that `murmur` owned — and since a `pull_request` run can only read its own
+  # `refs/pull/N/merge` scope plus the default branch's, every PR's first run built the
+  # heavy always-compiled ML tree from scratch (942 s vs 478 s warm). One post-merge run
+  # buys that back for every PR that follows it.
+  push:
+    branches: [murmur]
   workflow_dispatch:
   schedule:
     # Mondays 06:00 UTC — a weekly gate run on the default branch (catches
@@ -70,6 +79,10 @@ jobs:
   # deliberate non-harness PR declares `Harness-Lane: B` in its description.
   attestation:
     name: attestation gate (harness receipt)
+    # PR-only: every input it reads (head ref, base sha, description) lives on the
+    # pull_request payload and is empty on a push. On the post-merge cache-warming run
+    # the work has already been gated, so there is nothing left to attest.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -154,6 +167,17 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: ". -> target"
+          # WRITE the cache only from the default branch, READ it everywhere.
+          #
+          # GitHub scopes a cache to the ref that created it, and a `pull_request` run
+          # lives on `refs/pull/N/merge` — so every PR was writing a cache only IT could
+          # ever read, while the `murmur` scope every OTHER PR falls back to stayed empty.
+          # Measured consequence: 10 caches / 10.9 GB, all PR-scoped, ZERO trunk Rust
+          # cache, and a first run of 942 s against 478 s warm.
+          #
+          # With the `push:` trigger below populating the default-branch scope after each
+          # merge, every PR's FIRST run inherits a warm cache instead of building cold.
+          save-if: ${{ github.ref == 'refs/heads/murmur' }}
 
       - name: Install pinned cargo-audit + cargo-deny + cargo-nextest (prebuilt — skips ci.sh's slow cargo install)
         uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2.85.1
@@ -243,8 +267,17 @@ jobs:
           echo "attestation: ${{ needs.attestation.result }}"
           echo "rust lane  : ${{ needs.rust.result }}"
           echo "web  lane  : ${{ needs.web.result }}"
-          if [ "${{ needs.attestation.result }}" != "success" ]; then
-            echo "::error::harness-written code without a PASS receipt — see the attestation gate"
+          # `skipped` is legitimate ONLY on the post-merge cache-warming push, where the
+          # attestation job does not run because there is no pull_request payload to read.
+          # On a pull_request event anything but `success` is a hard failure — a skipped
+          # gate must never read as a satisfied one.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "${{ needs.attestation.result }}" != "success" ]; then
+              echo "::error::harness-written code without a PASS receipt — see the attestation gate"
+              exit 1
+            fi
+          elif [ "${{ needs.attestation.result }}" != "skipped" ]; then
+            echo "::error::attestation job behaved unexpectedly on a non-PR event: ${{ needs.attestation.result }}"
             exit 1
           fi
           if [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.web.result }}" != "success" ]; then
