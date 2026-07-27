@@ -567,10 +567,6 @@ mod tests {
         }
     }
 
-    /// RED-before-GREEN: an action item the transcript never supports gets a following `> unverified`
-    /// line, while a SUPPORTED summary sentence stays clean. Reverting `annotate_unverified` to a
-    /// no-op drops the marker (RED). The marker here is the PLAIN variant (no overlapping segment).
-    #[test]
     /// R3/#4 (regression). `## From my notes` is the provenance section the enhance-mode prompt now
     /// emits for note material the transcript never covered. Flagging its lines `> unverified` would
     /// mark every line of a section whose entire purpose is to be honest about exactly that — pure
@@ -607,6 +603,9 @@ mod tests {
         );
     }
 
+    /// RED-before-GREEN: an action item the transcript never supports gets a following `> unverified`
+    /// line, while a SUPPORTED summary sentence stays clean. Reverting `annotate_unverified` to a
+    /// no-op drops the marker (RED). The marker here is the PLAIN variant (no overlapping segment).
     #[test]
     fn unsupported_action_item_gets_unverified() {
         let segments = vec![
