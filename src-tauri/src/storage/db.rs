@@ -5817,6 +5817,23 @@ impl Db {
         Ok(hits)
     }
 
+    /// Total transcript characters for one meeting — the triage figure `list_recent_meetings` needs
+    /// so an agent can SIZE a meeting without fetching it.
+    ///
+    /// A PK-prefix range scan over `segments`, cheap at the clamped list limit. NOT itself a gate:
+    /// its only caller computes it for rows that already passed `list_meetings_visible`. A sealed
+    /// meeting's segment text is blanked on seal, so even a mistaken call reports ~0 rather than a
+    /// size — but that is defense-in-depth, not the gate.
+    pub fn transcript_chars(&self, meeting_id: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(text)), 0) FROM segments WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_err)
+    }
+
     // `list_meetings_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `meeting_by_title_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.

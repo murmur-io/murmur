@@ -173,6 +173,22 @@ pub enum ToolCall {
     GetOpenCommitments { owner: Option<String> },
     /// Assemble the gated structured dossier for one entity (caller must pass a non-empty name/id).
     GetEntityDossier { entity: String },
+    /// #7 — the entity DISCOVERY surface.
+    ///
+    /// Without it an entity is reachable only by guessing its exact name — and some are not
+    /// reachable at all. `entities_matching_query` filters through `name_matches_query_tokens`,
+    /// which requires the entity's name tokens to appear as a CONTIGUOUS window inside the query,
+    /// and separately drops names shorter than `MIN_ENTITY_NAME_LEN`. An entity recorded as "KO" —
+    /// which is how a real note abbreviated the main subject of a 63-minute meeting — was therefore
+    /// unreachable by name from every one of the tools, by design, permanently.
+    ListEntities {
+        /// Optional filter; empty lists the most-mentioned visible entities.
+        query: Option<String>,
+        limit: usize,
+    },
+    /// #21 — note-folder DISCOVERY. `query_database` needs a folder NAME, and there was no way to
+    /// learn one: a wrong guess and an empty folder were both a dead end.
+    ListNoteFolders,
     /// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what changed between two
     /// instants (`from`/`to` ISO-8601) plus the full chronological supersession ledger. EGRESS-FREE:
     /// reads the entity's facts through the visibility-gated [`Db::list_facts_visible`] inside
@@ -764,23 +780,77 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!(
                     "document outline read failed: {e}"
                 ))),
-                Ok(entries) if entries.is_empty() => Ok(format!(
-                    "No outline for document {id} (it may be locked, absent, or have no headings — \
-                     read it with get_document)."
-                )),
+                // #11 — the dead end. All three stated causes are FALSE for a meeting id, and the
+                // suggested next step (`get_document` on the same id) also fails, so an agent burns
+                // two calls to learn nothing. Redirect — but ONLY from INSIDE this empty arm, never
+                // before the document gate.
+                //
+                // LOCK MODEL, and this is the whole subtlety: the sentinel is DELIBERATELY
+                // indistinguishable between locked / absent / heading-less. Answering "this is a
+                // MEETING" for a SEALED meeting would newly disclose its existence — a leak the
+                // masked-DTO discipline exists to prevent. Hence the conjunction below:
+                // `meeting_is_visible` returns TRUE for a nonexistent id (it has nothing to hide),
+                // so `get_meeting` must confirm the row actually exists, and the visibility check
+                // must pass first. A sealed meeting id therefore falls through to the byte-identical
+                // sentinel, exactly like a random uuid.
+                Ok(entries) if entries.is_empty() => {
+                    let is_visible_meeting = db.meeting_is_visible(id, unlocked).unwrap_or(false)
+                        && db.get_meeting(id).ok().flatten().is_some();
+                    if is_visible_meeting {
+                        Ok(format!(
+                            "{id} is a MEETING, not a document — read it with get_meeting."
+                        ))
+                    } else {
+                        Ok(format!(
+                            "No outline for document {id} (it may be locked, absent, or have no headings — \
+                             read it with get_document)."
+                        ))
+                    }
+                }
                 Ok(entries) => Ok(format_doc_outline(id, &entries)),
             }
         }
         ToolCall::ListRecentMeetings { limit } => {
+            // #20 — TRIAGE. The old line was title/date/status/id only, so an agent choosing which
+            // of 15 meetings to read had to call `get_meeting` on each just to learn its SIZE —
+            // paying the note prefix every time purely to measure. `duration_s` was already being
+            // fetched by this very query and thrown away.
+            //
+            // LOCK MODEL: every added field is metadata about a meeting and rides the SAME
+            // `list_meetings_visible` gate — a sealed-and-not-unlocked meeting yields NO row here,
+            // not a masked one, so nothing is added for it to leak. `transcript_chars` reads the
+            // meeting's own segments, whose text is blanked on seal, and is only ever computed for
+            // a row that already passed the gate.
             match db.list_meetings_visible(*limit, unlocked) {
                 Ok(ms) => Ok(ms
                     .iter()
                     .map(|m| {
+                        let chars = db.transcript_chars(&m.id).unwrap_or(0);
+                        let has_note = db
+                            .get_note_if_visible(&m.id, unlocked)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        // `MeetingStatus` is a bare enum with no reason column, so a bare `Error`
+                        // told a triaging agent nothing about whether anything was salvageable.
+                        // Derive the answer to the question actually being asked.
+                        let status = match (&m.status, chars) {
+                            (crate::storage::models::MeetingStatus::Error, 0) => {
+                                "Error (no transcript)".to_string()
+                            }
+                            (crate::storage::models::MeetingStatus::Error, _) => {
+                                "Error (partial transcript)".to_string()
+                            }
+                            (s, _) => format!("{s:?}"),
+                        };
                         format!(
-                            "- {} · {} · {:?} · id:{}",
+                            "- {} · {} · {} · {} min · {} transcript chars · note: {} · id:{}",
                             m.title.clone().unwrap_or_else(|| "(untitled)".into()),
                             m.started_at,
-                            m.status,
+                            status,
+                            (m.duration_s as f64 / 60.0).round() as i64,
+                            chars,
+                            if has_note { "yes" } else { "no" },
                             m.id
                         )
                     })
@@ -810,14 +880,64 @@ pub fn execute_tool(
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => return Ok(entity_not_found(db, entity, unlocked)),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::summarize::dossier::build_dossier_data(db, &id, unlocked) {
                 Ok(Some(data)) => Ok(crate::summarize::dossier::format_dossier_client(&data)),
-                Ok(None) => Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => Ok(entity_not_found(db, entity, unlocked)),
                 Err(e) => Err(AppError::Storage(format!("dossier build failed: {e}"))),
             }
+        }
+        ToolCall::ListEntities { query, limit } => {
+            // GATED: `list_entities_visible` carries the visibility predicate over
+            // entity_mentions → meetings → notes, so an entity mentioned ONLY in sealed-and-not-
+            // unlocked meetings never appears. Never `list_entities` (ungated).
+            let all = db
+                .list_entities_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("entity list failed: {e}")))?;
+            let limit = if *limit == 0 { 40 } else { *limit };
+            let q = query.as_deref().unwrap_or("").trim().to_lowercase();
+            let mut rows: Vec<_> = all
+                .into_iter()
+                .filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q))
+                .collect();
+            rows.sort_by_key(|e| std::cmp::Reverse(e.mention_count));
+            rows.truncate(limit);
+            if rows.is_empty() {
+                return Ok(match query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                    Some(q) => format!("No visible entities matching \"{q}\"."),
+                    None => "No visible entities.".to_string(),
+                });
+            }
+            Ok(rows
+                .iter()
+                .map(|e| {
+                    format!(
+                        "- {} ({:?}) — {} mention(s) [id:{}]",
+                        e.name, e.kind, e.mention_count, e.id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        ToolCall::ListNoteFolders => {
+            let folders = visible_note_folders(db, unlocked);
+            if folders.is_empty() {
+                return Ok("No visible note folders.".to_string());
+            }
+            Ok(folders
+                .iter()
+                .map(|(f, rows, schema)| {
+                    let cols = if schema.is_empty() {
+                        "(no typed columns)".to_string()
+                    } else {
+                        schema.join(", ")
+                    };
+                    format!("- {} — {rows} row(s) · columns: {cols}", f.name)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         ToolCall::KnowledgeDiff { entity, from, to } => {
             // EGRESS-FREE + GATED: resolve the entity through the SAME gated resolver as the dossier
@@ -827,7 +947,7 @@ pub fn execute_tool(
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => return Ok(entity_not_found(db, entity, unlocked)),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::facts::build_knowledge_diff(db, &id, from, to, unlocked) {
@@ -896,7 +1016,25 @@ pub fn execute_tool(
             // sentinel (never an error) so the model can retry with a different name.
             let target = match db.note_folder_by_name_or_id(folder) {
                 Ok(Some(f)) => f,
-                Ok(None) => return Ok(format!("No note folder named \"{}\".", folder.trim())),
+                // #21 — name the VISIBLE alternatives so a wrong guess is recoverable. A sealed
+                // folder's name must never appear here: this message is the easiest place in the
+                // whole change to regress the gate, which is why it reuses the same gated helper
+                // the lister does rather than reaching for `list_note_folders` directly.
+                Ok(None) => {
+                    let available: Vec<String> = visible_note_folders(db, unlocked)
+                        .into_iter()
+                        .map(|(f, _, _)| f.name)
+                        .collect();
+                    return Ok(if available.is_empty() {
+                        format!("No note folder named \"{}\".", folder.trim())
+                    } else {
+                        format!(
+                            "No note folder named \"{}\". Available: {}.",
+                            folder.trim(),
+                            available.join(", ")
+                        )
+                    });
+                }
                 Err(e) => return Err(AppError::Storage(format!("folder resolve failed: {e}"))),
             };
             // GATE: the typed rows come from `list_notes_visible_typed`, which is built on the gated
@@ -1922,6 +2060,126 @@ fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> S
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The VISIBLE note folders, each with its row count and typed-column schema.
+///
+/// LOCK MODEL — three separate leaks live here, and the ungated `list_note_folders` returns sealed
+/// folders (the same shape as the `list_folders` double-count trap). The folder NAME is one: MCP is
+/// a different trust boundary from the FE, and `query_database` already promises "Sealed-and-locked
+/// note folders are excluded". The ROW COUNT is another: volume/existence metadata about sealed
+/// content. The COLUMN SCHEMA is the third, and `commands/notes.rs::get_note_folder_schema` already
+/// refuses it for a sealed folder, so exposing it here would contradict a shipped gate.
+///
+/// A locked-and-not-session-unlocked folder is therefore dropped entirely, and the row count comes
+/// from the gated `list_notes_visible`.
+#[allow(clippy::type_complexity)]
+fn visible_note_folders(
+    db: &Db,
+    unlocked: &HashSet<String>,
+) -> Vec<(crate::storage::models::NoteFolder, usize, Vec<String>)> {
+    let Ok(folders) = db.list_note_folders() else {
+        return Vec::new();
+    };
+    folders
+        .into_iter()
+        .filter(|f| !f.locked || unlocked.contains(&f.id))
+        .map(|f| {
+            let rows = db
+                .list_notes_visible(Some(&f.id), unlocked)
+                .map(|n| n.len())
+                .unwrap_or(0);
+            let schema = db
+                .get_note_folder_schema(&f.id)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|c| format!("{}:{:?}", c.key, c.kind))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (f, rows, schema)
+        })
+        .collect()
+}
+
+/// The not-found reply for an entity lookup, with a DID-YOU-MEAN list.
+///
+/// #7 — the bare `No visible entity matching "X".` was a dead end: resolution is exact-token
+/// (`name_matches_query_tokens` needs the name's tokens as a contiguous window in the query), so a
+/// near-miss, an abbreviation, or a mangled proper noun ("Connect" for "Konnect") failed silently
+/// with no route forward. A real query for `Kong Operator` — the main subject of a 63-minute
+/// meeting — returned nothing, because the note had recorded it as `KO`.
+///
+/// LOCK MODEL: suggestions come ONLY from `list_entities_visible`. A did-you-mean list assembled
+/// from anything ungated would be an existence ORACLE for sealed content — the entity name itself
+/// is the secret, and it lived only inside encrypted markdown.
+fn entity_not_found(db: &Db, entity: &str, unlocked: &HashSet<String>) -> String {
+    let base = format!("No visible entity matching \"{entity}\".");
+    let Ok(candidates) = db.list_entities_visible(unlocked) else {
+        return base;
+    };
+    let q = entity.trim().to_lowercase();
+    if q.is_empty() {
+        return base;
+    }
+    let mut scored: Vec<(u32, String)> = candidates
+        .iter()
+        .filter_map(|e| {
+            let name = e.name.trim();
+            let n = name.to_lowercase();
+            // 0 = best. Substring either way catches both an abbreviation the user typed and a
+            // longer stored form; the initialism rung catches `KO` ⇄ `Kong Operator`.
+            let score = if n == q {
+                0
+            } else if n.starts_with(&q) || q.starts_with(&n) {
+                1
+            } else if n.contains(&q) || q.contains(&n) || initials(name).eq_ignore_ascii_case(&q) {
+                // The initialism rung shares this score on purpose: `KO` ⇄ `Kong Operator` is
+                // exactly as good a suggestion as a substring hit.
+                2
+            } else if close_enough(&n, &q) {
+                3
+            } else {
+                return None;
+            };
+            Some((score, name.to_string()))
+        })
+        .collect();
+    if scored.is_empty() {
+        return base;
+    }
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.dedup_by(|a, b| a.1 == b.1);
+    let names: Vec<String> = scored.into_iter().take(5).map(|(_, n)| n).collect();
+    format!("{base} Did you mean: {}?", names.join(", "))
+}
+
+/// The initialism of a multi-word name (`Kong Operator` → `KO`), so an abbreviation an LLM wrote
+/// into a note can still find its canonical entity.
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .collect()
+}
+
+/// A cheap bounded edit-distance check (≤ 2 edits) for a typo'd name. Deliberately not a fuzzy
+/// SEARCH — it only widens the SUGGESTION list, never what resolves.
+fn close_enough(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len().abs_diff(b.len()) > 2 || a.len() < 3 || b.len() < 3 {
+        return false;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()] <= 2
 }
 
 /// Render a list of search hits (FTS or hybrid) into the tool text payload — one line per meeting.

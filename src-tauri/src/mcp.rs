@@ -285,6 +285,16 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         },
         {
+            "name": "list_entities",
+            "description": "List the people, projects and topics Murmur knows about, with how many meetings mention each. Use this to DISCOVER the exact name before calling get_entity_dossier or knowledge_diff — entity lookup is exact-name, so a near-miss or an abbreviation silently finds nothing. Optionally filter by a substring. Sealed-and-locked meetings' entities are excluded.",
+            "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "Optional substring filter; omit to list the most-mentioned." }, "limit": { "type": "number", "description": "Max entities (default 40)." } } }
+        },
+        {
+            "name": "list_note_folders",
+            "description": "List your note folders with their row counts and typed columns — the folder NAMES and column keys query_database expects. Call this first instead of guessing a folder name. Sealed-and-locked note folders are excluded entirely.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "query_database",
             "description": "Query the TYPED PROPERTIES of a note-folder's notes as a small database (the folder's Table/Board columns: status, owner, due date, priority, etc.). Give the folder NAME (or id) and a filter: 'key op value' clauses joined by AND / OR, op ∈ = != > < >= <= or 'contains' (e.g. 'status=Done', 'openItems>3', 'owner contains ann', 'status=Open AND priority=High'). Empty filter = every row. Sealed-and-locked note folders are excluded. Use for 'which notes are still open', 'what does Anna own', 'high-priority items' questions over a note-folder's columns.",
             "inputSchema": { "type": "object", "properties": { "folder": { "type": "string" }, "filter": { "type": "string" } }, "required": ["folder"] }
@@ -390,6 +400,15 @@ fn dispatch_tool(
                 .unwrap_or("")
                 .to_string(),
         },
+        "list_entities" => ToolCall::ListEntities {
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty()),
+            limit: mcp_usize_arg(args, "limit"),
+        },
+        "list_note_folders" => ToolCall::ListNoteFolders,
         "get_meeting" => ToolCall::GetMeeting {
             meeting_id: args
                 .get("meetingId")
@@ -556,10 +575,13 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eleven_tools() {
+    fn tools_list_has_thirteen_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
+        // #7 / #21 — the two DISCOVERY tools that stop an agent dead-ending on a guessed name.
+        assert!(tools.iter().any(|t| t["name"] == "list_entities"));
+        assert!(tools.iter().any(|t| t["name"] == "list_note_folders"));
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -785,6 +807,126 @@ mod tests {
         assert!(
             out.contains("Budget"),
             "flag-off fallback must still surface the gated keyword hit, got: {out}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// R12/#11 (regression + LOCK GATE). `get_document_outline` on a MEETING id dead-ended: all
+    /// three stated causes are false for a meeting, and following its advice (`get_document` on the
+    /// same id) fails too, so an agent burned two calls to learn nothing.
+    ///
+    /// The subtle half is the gate. The sentinel is DELIBERATELY indistinguishable between
+    /// locked / absent / heading-less, so answering "this is a MEETING" for a SEALED meeting would
+    /// newly disclose its existence. A sealed meeting id must therefore still get the
+    /// BYTE-IDENTICAL sentinel — exactly like a random uuid.
+    #[test]
+    fn document_outline_redirects_only_for_a_visible_meeting() {
+        use crate::storage::models::Folder;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed(&db, "open-m", "Open Meeting", "a note", None);
+        seed(&db, "sealed-m", "Sealed Meeting", "a note", Some("f-lock"));
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let outline = |id: &str| {
+            dispatch_tool(
+                &db,
+                "get_document_outline",
+                &json!({ "documentId": id }),
+                &HashSet::new(),
+            )
+            .unwrap()
+        };
+
+        // A VISIBLE meeting id → the redirect that ends the dead end.
+        let visible = outline("open-m");
+        assert!(
+            visible.contains("is a MEETING") && visible.contains("get_meeting"),
+            "a visible meeting id must redirect: {visible}"
+        );
+
+        // A SEALED meeting id → byte-identical to the random-uuid sentinel. No "MEETING", no title.
+        let sealed = outline("sealed-m");
+        let absent = outline("f4b1c2d3-0000-4000-8000-000000000000");
+        assert!(
+            !sealed.contains("MEETING") && !sealed.contains("Sealed"),
+            "a sealed meeting id must NOT disclose that it is a meeting: {sealed}"
+        );
+        assert_eq!(
+            sealed.replace("sealed-m", "ID"),
+            absent.replace("f4b1c2d3-0000-4000-8000-000000000000", "ID"),
+            "the sealed reply must be indistinguishable from the absent one"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// R12/#21 + R13/#7 (LOCK GATE). A sealed note folder's NAME, ROW COUNT and COLUMN SCHEMA must
+    /// appear in neither the lister nor the not-found error — the error message being the easiest
+    /// place in the change to regress. And a did-you-mean list is an existence ORACLE unless it is
+    /// built strictly from the gated entity reader.
+    #[test]
+    fn folder_and_entity_discovery_never_name_sealed_things() {
+        use crate::storage::models::NoteFolder;
+        let (db, p) = temp_db();
+        db.insert_note_folder(
+            &NoteFolder {
+                id: "nf-open".to_string(),
+                name: "Roadmap".to_string(),
+                path: "Roadmap".to_string(),
+                parent_id: None,
+                locked: false,
+                unlocked: false,
+                is_root: false,
+                kind: "note".to_string(),
+            },
+            "2026-06-26T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_note_folder(
+            &NoteFolder {
+                id: "nf-sealed".to_string(),
+                name: "SecretSalaries".to_string(),
+                path: "SecretSalaries".to_string(),
+                parent_id: None,
+                locked: true,
+                unlocked: false,
+                is_root: false,
+                kind: "note".to_string(),
+            },
+            "2026-06-26T00:00:00Z",
+        )
+        .unwrap();
+
+        let listed = dispatch_tool(&db, "list_note_folders", &json!({}), &HashSet::new()).unwrap();
+        assert!(listed.contains("Roadmap"), "the open folder is listed: {listed}");
+        assert!(
+            !listed.contains("SecretSalaries"),
+            "a sealed folder's NAME must never be listed: {listed}"
+        );
+
+        // The not-found message names only VISIBLE alternatives.
+        let miss = dispatch_tool(
+            &db,
+            "query_database",
+            &json!({ "folder": "meetings", "filter": "" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            miss.contains("Roadmap"),
+            "a wrong guess must name the visible alternatives: {miss}"
+        );
+        assert!(
+            !miss.contains("SecretSalaries"),
+            "a sealed folder's name must NOT leak through the error message: {miss}"
         );
         let _ = std::fs::remove_file(&p);
     }
