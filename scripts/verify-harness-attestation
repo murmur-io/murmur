@@ -157,7 +157,10 @@ def fail(message: str) -> int:
         "\nIf this PR was written WITHOUT the harness on purpose, declare it by adding a\n"
         "line to the PR DESCRIPTION consisting of the header 'Harness-Lane' followed by a\n"
         "colon, a space and the letter B — at the start of its own line, outside any code\n"
-        "fence or quote. That records the choice instead of hiding it.",
+        "fence or quote — OR, more reliably, put that same line as a TRAILER on any commit\n"
+        "in the branch. The commit route always works; the description route cannot be\n"
+        "applied to an already-failed run, because the event payload froze the body at\n"
+        "trigger time and a re-run replays it.",
         file=sys.stderr,
     )
     return 1
@@ -201,11 +204,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.pr_body_file and os.path.exists(args.pr_body_file):
         with open(args.pr_body_file, "r", encoding="utf-8", errors="replace") as handle:
             body = handle.read()
+    # A COMMIT TRAILER is the reliable declaration route; the PR description is a
+    # convenience that cannot be applied retroactively.
+    #
+    # `github.event.pull_request.body` is frozen at trigger time and a re-run replays the
+    # same payload, so the description route is unusable in exactly the situation it exists
+    # for: the gate refuses, you add the line, you press re-run, and the gate re-reads the
+    # old body. A trailer lives in the pushed history, is visible in the diff, survives
+    # re-runs, and needs no privileged token to read (the repo's config audit forbids a
+    # `GH_TOKEN` expression in `ci.yml`, and rightly so).
+    trailer_declared = False
+    try:
+        raw = subprocess.run(
+            ["git", "log", "--format=%B%x00", f"{args.base}..{args.head}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        trailer_declared = any(
+            LANE_B_RE.search(chunk) for chunk in raw.split("\x00") if chunk.strip()
+        )
+    except subprocess.CalledProcessError:
+        pass
+
     if (
-        LANE_B_RE.search(strip_quoted(body))
+        trailer_declared
+        or LANE_B_RE.search(strip_quoted(body))
         or os.environ.get("HARNESS_LANE", "").strip().upper() == "B"
     ):
-        print("light lane declared (Harness-Lane: B) — attestation not required")
+        where = "commit trailer" if trailer_declared else "PR description"
+        print(f"light lane declared via the {where} — attestation not required")
         return 0
 
     try:
