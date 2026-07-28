@@ -3731,6 +3731,23 @@ def standalone_driver_lane_cases(test: Tests) -> None:
                 "LANE independent-clone wait is visible",
                 "waiting for lane" in blocked.stderr,
             )
+            test.true(
+                "LANE visible wait reports FIFO position and enqueue time",
+                "queue_position=1/1" in blocked.stderr
+                and "queued_since=" in blocked.stderr,
+            )
+            test.equal(
+                "LANE timed-out waiter removes its FIFO ticket",
+                list(
+                    (
+                        driver_root
+                        / legacy.resource_lane.QUEUE_DIRECTORY
+                    ).glob(
+                        f"*{legacy.resource_lane.TICKET_SUFFIX}"
+                    )
+                ),
+                [],
+            )
         finally:
             release_marker.write_text("release\n", encoding="utf-8")
             if holder.poll() is None:
@@ -3751,6 +3768,268 @@ def standalone_driver_lane_cases(test: Tests) -> None:
             released.returncode,
             0,
         )
+
+
+def fifo_lane_cases(test: Tests) -> None:
+    """Mixed lane clients must enter in ticket order and reap dead waiters."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-fifo-lane-") as raw:
+        root = Path(raw)
+        repo = root / "meetnotes"
+        _init_repo(repo)
+        common = Path(
+            _git(
+                repo,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_dirs: Dict[str, Path] = {}
+        for label in ("holder", "older", "newer"):
+            task_dir = (
+                common / "agent-harness" / "v2" / "tasks" / label
+            )
+            task_dir.mkdir(parents=True)
+            task_dirs[label] = task_dir
+        resource_root = legacy.shared_resource_root_for_task(
+            task_dirs["holder"]
+        )
+        queue_root = (
+            resource_root / legacy.resource_lane.QUEUE_DIRECTORY
+        )
+        runner = ROOT / "scripts" / "agent-resource-run"
+        library = str(Path(__file__).resolve().parent)
+
+        holder_code = (
+            "import pathlib,sys,time;"
+            f"sys.path.insert(0,{library!r});"
+            "import task_runner;"
+            "lease=task_runner.acquire_cargo_lane("
+            "pathlib.Path(sys.argv[1]),5,command='fifo-holder');"
+            "print('ready',flush=True);"
+            "marker=pathlib.Path(sys.argv[2]);deadline=time.monotonic()+10;"
+            "\nwhile not marker.exists() and time.monotonic()<deadline:"
+            "\n time.sleep(0.01)"
+            "\ntask_runner.release_cargo_lane(lease)"
+        )
+        task_waiter_code = (
+            "import os,pathlib,sys,time;"
+            f"sys.path.insert(0,{library!r});"
+            "import task_runner;"
+            "lease=task_runner.acquire_cargo_lane("
+            "pathlib.Path(sys.argv[1]),5,command='fifo-'+sys.argv[3]);"
+            "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600);"
+            "os.write(fd,(sys.argv[3]+'\\n').encode());os.close(fd);"
+            "time.sleep(0.05);task_runner.release_cargo_lane(lease)"
+        )
+        append_code = (
+            "import os,sys,time;"
+            "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600);"
+            "os.write(fd,(sys.argv[2]+'\\n').encode());os.close(fd);"
+            "time.sleep(0.05)"
+        )
+
+        def queue_depth() -> int:
+            if not queue_root.is_dir():
+                return 0
+            return len(
+                list(
+                    queue_root.glob(
+                        f"*{legacy.resource_lane.TICKET_SUFFIX}"
+                    )
+                )
+            )
+
+        def wait_for_depth(expected: int) -> bool:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if queue_depth() == expected:
+                    return True
+                time.sleep(0.01)
+            return queue_depth() == expected
+
+        def resource_waiter(order: Path, label: str) -> subprocess.Popen[str]:
+            environment = os.environ.copy()
+            environment["MURMUR_HARNESS_TASK"] = f"fifo-{label}"
+            return subprocess.Popen(
+                [
+                    str(runner),
+                    "--deadline-seconds",
+                    "5",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    append_code,
+                    str(order),
+                    label,
+                ],
+                cwd=str(repo),
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        def task_waiter(order: Path, label: str) -> subprocess.Popen[str]:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    task_waiter_code,
+                    str(task_dirs[label]),
+                    str(order),
+                    label,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        def run_order_case(
+            name: str,
+            older_factory: Any,
+            newer_factory: Any,
+        ) -> None:
+            marker = root / f"release-{name}"
+            order = root / f"order-{name}"
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    holder_code,
+                    str(task_dirs["holder"]),
+                    str(marker),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            older: Optional[subprocess.Popen[str]] = None
+            newer: Optional[subprocess.Popen[str]] = None
+            try:
+                ready = (
+                    holder.stdout.readline().strip()
+                    if holder.stdout
+                    else ""
+                )
+                older = older_factory(order, "older")
+                older_joined = wait_for_depth(1)
+                newer = newer_factory(order, "newer")
+                newer_joined = wait_for_depth(2)
+                marker.write_text("release\n", encoding="utf-8")
+                older_result = older.wait(timeout=5)
+                newer_result = newer.wait(timeout=5)
+                holder_result = holder.wait(timeout=5)
+                test.equal(f"FIFO {name} holder acquired", ready, "ready")
+                test.true(f"FIFO {name} older ticket is visible", older_joined)
+                test.true(f"FIFO {name} newer ticket is visible", newer_joined)
+                test.equal(f"FIFO {name} older exits green", older_result, 0)
+                test.equal(f"FIFO {name} newer exits green", newer_result, 0)
+                test.equal(f"FIFO {name} holder exits green", holder_result, 0)
+                test.equal(
+                    f"FIFO {name} preserves admission order",
+                    order.read_text(encoding="utf-8").splitlines(),
+                    ["older", "newer"],
+                )
+            finally:
+                marker.write_text("release\n", encoding="utf-8")
+                for process in (newer, older, holder):
+                    if process is not None and process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=3)
+
+        run_order_case(
+            "resource-before-harness",
+            resource_waiter,
+            task_waiter,
+        )
+        run_order_case(
+            "harness-before-resource",
+            task_waiter,
+            resource_waiter,
+        )
+
+        marker = root / "release-stale-holder"
+        stale_order = root / "order-stale"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                holder_code,
+                str(task_dirs["holder"]),
+                str(marker),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stale_code = (
+            "import pathlib,sys,time;"
+            f"sys.path.insert(0,{library!r});"
+            "import task_runner;"
+            "root=task_runner.shared_resource_root_for_task("
+            "pathlib.Path(sys.argv[1]));"
+            "ticket=task_runner.resource_lane.join_lane_queue("
+            "root,task='stale',command='killed-waiter');"
+            "print('queued',flush=True);"
+            "\nwhile True:\n time.sleep(1)"
+        )
+        stale: Optional[subprocess.Popen[str]] = None
+        survivor: Optional[subprocess.Popen[str]] = None
+        try:
+            holder_ready = (
+                holder.stdout.readline().strip() if holder.stdout else ""
+            )
+            stale = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    stale_code,
+                    str(task_dirs["older"]),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stale_ready = (
+                stale.stdout.readline().strip() if stale.stdout else ""
+            )
+            survivor = resource_waiter(stale_order, "newer")
+            survivor_joined = wait_for_depth(2)
+            stale.kill()
+            stale.wait(timeout=3)
+            marker.write_text("release\n", encoding="utf-8")
+            survivor_result = survivor.wait(timeout=5)
+            holder_result = holder.wait(timeout=5)
+            test.equal("FIFO stale holder acquired", holder_ready, "ready")
+            test.equal("FIFO stale waiter armed", stale_ready, "queued")
+            test.true(
+                "FIFO live waiter queues behind stale candidate",
+                survivor_joined,
+            )
+            test.equal(
+                "FIFO SIGKILL stale waiter does not block successor",
+                survivor_result,
+                0,
+            )
+            test.equal("FIFO stale holder exits green", holder_result, 0)
+            test.equal(
+                "FIFO successor runs exactly once after stale reap",
+                stale_order.read_text(encoding="utf-8").splitlines(),
+                ["newer"],
+            )
+            test.equal(
+                "FIFO stale ticket is removed",
+                queue_depth(),
+                0,
+            )
+        finally:
+            marker.write_text("release\n", encoding="utf-8")
+            for process in (survivor, stale, holder):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=3)
 
 
 def sherpa_workspace_cache_cases(test: Tests) -> None:
@@ -5517,6 +5796,27 @@ def clean_cases(test: Tests) -> None:
                 "server_revision": None,
             },
         )
+        checks_root = task_dir / "runtime" / "checks"
+        for name in ("cargo-target", "cargo-home", "npm-cache"):
+            disposable = checks_root / name
+            disposable.mkdir(parents=True)
+            (disposable / "cache.bin").write_bytes(b"private cache\n")
+        profile = checks_root / "profiles" / "check.sb"
+        profile.parent.mkdir(parents=True)
+        profile.write_text("(version 1)\n", encoding="utf-8")
+        evidence = task_dir / "attempts" / "evidence.json"
+        evidence.parent.mkdir()
+        evidence.write_text('{"passed":true}\n', encoding="utf-8")
+        shared_cache = (
+            root
+            / ".murmur-agent-tasks"
+            / ".resources"
+            / "target"
+            / "sherpa-onnx-prebuilt"
+            / "archive.tar.bz2"
+        )
+        shared_cache.parent.mkdir(parents=True)
+        shared_cache.write_bytes(b"shared pinned archive\n")
         harness_cli.set_v2_state(task_dir, "OPEN", phase="open")
         previous = Path.cwd()
         try:
@@ -5540,6 +5840,56 @@ def clean_cases(test: Tests) -> None:
             "CLEAN archive preserves untracked dirty bytes",
             _git(repo, "show", f"{archive_ref}:untracked.txt"),
             "dirty untracked",
+        )
+        test.equal(
+            "CLEAN records first-pass disposable runtime removal",
+            state["runtime_removed"],
+            ["cargo-home", "cargo-target", "npm-cache"],
+        )
+        test.true(
+            "CLEAN removes task-private Cargo and npm caches",
+            all(
+                not (checks_root / name).exists()
+                for name in ("cargo-target", "cargo-home", "npm-cache")
+            ),
+        )
+        test.true(
+            "CLEAN preserves attested sandbox profiles",
+            profile.is_file(),
+        )
+        test.true("CLEAN preserves task evidence", evidence.is_file())
+        test.equal(
+            "CLEAN preserves workspace shared pinned cache",
+            shared_cache.read_bytes(),
+            b"shared pinned archive\n",
+        )
+
+        late_cache = checks_root / "cargo-target"
+        late_cache.mkdir()
+        (late_cache / "late.bin").write_bytes(b"late\n")
+        previous = Path.cwd()
+        try:
+            os.chdir(repo)
+            with contextlib.redirect_stdout(io.StringIO()):
+                harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest",
+                        abandon=False,
+                    )
+                )
+        finally:
+            os.chdir(previous)
+        test.true(
+            "CLEAN terminal retry prunes late private runtime",
+            not late_cache.exists(),
+        )
+        test.true(
+            "CLEAN terminal retry still preserves profiles and evidence",
+            profile.is_file() and evidence.is_file(),
+        )
+        test.true(
+            "CLEAN terminal retry preserves shared pinned cache",
+            shared_cache.is_file(),
         )
 
 
@@ -5882,6 +6232,7 @@ def main() -> int:
     readonly_review_wall_timeout_cases(test)
     state_and_lock_cases(test)
     standalone_driver_lane_cases(test)
+    fifo_lane_cases(test)
     sherpa_workspace_cache_cases(test)
     verification_snapshot_cases(test)
     snapshot_node_modules_manifest_cases(test)
