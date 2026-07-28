@@ -7,6 +7,8 @@
   "agent_timeout_seconds": 3600,
   "writer_timeout_seconds": 5400,
   "reviewer_timeout_seconds": 2400,
+  "review_retry_max_delay_seconds": 60,
+  "v2_max_parallel_reviews": 3,
   "base_fetch_timeout_seconds": 30,
   "check_timeout_seconds": 1800,
   "max_diff_bytes_for_review": 500000,
@@ -47,7 +49,12 @@
     "ng-lint": "npx ng lint",
     "ng-build": "npx ng build",
     "playwright": "npm run test:e2e -- --workers=1",
-    "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh"
+    "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh",
+    "harness-python": "python3 -m py_compile .agents/harness/task_runner.py .agents/harness/cli.py .agents/harness/verifier.py .agents/harness/process_guardian.py .agents/harness/config_audit.py .agents/harness/hook_guard.py .agents/harness/resource_policy.py .agents/harness/v2_selftest.py",
+    "harness-v2-selftest": "python3 .agents/harness/v2_selftest.py",
+    "receipt-selftest": "scripts/verify-harness-attestation --selftest",
+    "hook-selftest": "bash .codex/hooks/selftest.sh",
+    "config-audit": "scripts/agent-config-audit --ci"
   },
   "shared_artifacts": {
     "sherpa_onnx": {

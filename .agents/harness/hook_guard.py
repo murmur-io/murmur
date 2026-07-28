@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,17 @@ def _task_runner_module() -> Any:
     except Exception as exc:  # pragma: no cover - exercised as a fail-closed path
         raise GuardFailure(f"cannot load the canonical task runner: {exc}") from exc
     return task_runner
+
+
+def _v2_verifier_module() -> Any:
+    harness_path = str(HARNESS_ROOT)
+    if harness_path not in sys.path:
+        sys.path.insert(0, harness_path)
+    try:
+        import verifier  # type: ignore
+    except Exception as exc:  # pragma: no cover - fail closed
+        raise GuardFailure(f"cannot load the canonical v2 verifier: {exc}") from exc
+    return verifier
 
 
 def _payload_command(payload: Any) -> str:
@@ -283,16 +295,51 @@ def _effective_tokens(tokens: Sequence[str]) -> Tuple[str, ...]:
     return tuple(values)
 
 
+_QUOTED_HEREDOC_RE = re.compile(
+    r"<<(?P<strip>-)?[ \t]*(?P<quote>['\"])(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?P=quote)"
+)
+
+
+def _strip_quoted_heredoc_bodies(command: str) -> str:
+    """Hide literal heredoc payloads while preserving executable shell lines.
+
+    A quoted delimiter disables shell expansion in its body, so Rust doc
+    backticks and ``$()`` there are data. Unquoted heredocs remain visible and
+    fail closed because the shell would execute their substitutions.
+    """
+
+    visible: List[str] = []
+    pending: List[Tuple[str, bool]] = []
+    for line in command.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        newline = line[len(body) :]
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = body.lstrip("\t") if strip_tabs else body
+            if candidate == delimiter:
+                pending.pop(0)
+            visible.append(newline)
+            continue
+        visible.append(line)
+        pending.extend(
+            (match.group("name"), bool(match.group("strip")))
+            for match in _QUOTED_HEREDOC_RE.finditer(body)
+        )
+    return "".join(visible)
+
+
 def _unsupported_execution_indirection(command: str) -> Optional[str]:
     """Fail closed when the hook cannot see the executable command directly."""
 
+    visible_command = _strip_quoted_heredoc_bodies(command)
     single_quoted = False
     double_quoted = False
     escaped = False
     active_shell_indirection = False
     index = 0
-    while index < len(command):
-        character = command[index]
+    while index < len(visible_command):
+        character = visible_command[index]
         if escaped:
             escaped = False
             index += 1
@@ -311,16 +358,16 @@ def _unsupported_execution_indirection(command: str) -> Optional[str]:
             continue
         if not single_quoted and (
             character == "`"
-            or command.startswith("$(", index)
-            or command.startswith("<(", index)
-            or command.startswith(">(", index)
+            or visible_command.startswith("$(", index)
+            or visible_command.startswith("<(", index)
+            or visible_command.startswith(">(", index)
         ):
             active_shell_indirection = True
             break
         index += 1
     if active_shell_indirection:
         return "shell substitution/process indirection is unsupported by the command guard"
-    for simple in _simple_commands(command):
+    for simple in _simple_commands(visible_command):
         raw = list(simple.tokens)
         while raw and _ASSIGNMENT_RE.match(raw[0]):
             raw.pop(0)
@@ -455,6 +502,174 @@ def _push_targets_protected(invocation: GitInvocation) -> bool:
     return False
 
 
+def _v1_terminal_state_is_proven(task_dir: Path) -> bool:
+    """Require the v1 state projection and its latest state event to agree."""
+
+    try:
+        runner = _task_runner_module()
+        state = _load_json(task_dir / "state.json")
+        if not isinstance(state, dict):
+            return False
+        status = state.get("status")
+        updated_at = state.get("updated_at")
+        if (
+            state.get("task_id") != task_dir.name
+            or status not in runner.TERMINAL_STATES
+            or not isinstance(updated_at, str)
+        ):
+            return False
+        runner.parse_timestamp(updated_at, f"{task_dir.name}.updated_at")
+
+        last_state_event: Optional[Dict[str, Any]] = None
+        with (task_dir / "events.jsonl").open(
+            "r", encoding="utf-8", errors="strict"
+        ) as handle:
+            for line in handle:
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise ValueError("v1 event is not an object")
+                if event.get("event") == "state":
+                    last_state_event = event
+        if last_state_event is None:
+            return False
+        event_at = last_state_event.get("at")
+        if not isinstance(event_at, str):
+            return False
+        runner.parse_timestamp(event_at, f"{task_dir.name} state event at")
+        if (
+            last_state_event.get("status") != status
+            or event_at != updated_at
+            or last_state_event.get("round", 0) != state.get("round", 0)
+        ):
+            return False
+        for key in ("phase", "reason"):
+            if key in state and last_state_event.get(key) != state.get(key):
+                return False
+        return True
+    except Exception:
+        # An existing claimed worktree with incomplete lifecycle evidence is
+        # unknown-live. Branch surgery in the primary checkout must fail closed.
+        return False
+
+
+def _v2_terminal_state_is_proven(task_dir: Path) -> bool:
+    """Use the v2 append-only last-state event; state.json is a projection."""
+
+    try:
+        verifier = _v2_verifier_module()
+        last_wrapper: Optional[Dict[str, Any]] = None
+        with (task_dir / "events.jsonl").open(
+            "r", encoding="utf-8", errors="strict"
+        ) as handle:
+            for line in handle:
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise ValueError("v2 event is not an object")
+                if event.get("event") == "state":
+                    if not isinstance(event.get("state"), dict):
+                        raise ValueError("v2 state event payload is malformed")
+                    last_wrapper = event
+
+        state = verifier.last_state_event(task_dir)
+        if last_wrapper is None or state != last_wrapper["state"]:
+            return False
+        updated_at = state.get("updated_at")
+        if (
+            state.get("schema_version") != 2
+            or state.get("task_id") != task_dir.name
+            or state.get("status") not in verifier.V2_STATES
+            or not isinstance(updated_at, str)
+            or last_wrapper.get("at") != updated_at
+        ):
+            return False
+        _task_runner_module().parse_timestamp(
+            updated_at, f"{task_dir.name} v2 state event updated_at"
+        )
+        return state["status"] in verifier.V2_TERMINAL_STATES
+    except Exception:
+        # Missing/malformed authoritative state means unknown-live whenever the
+        # task still claims an existing worktree.
+        return False
+
+
+def _live_harness_task_ids(common: Path) -> List[str]:
+    """Return nonterminal or state-unknown tasks with an existing worktree.
+
+    V2's append-only event is authoritative, so a SIGKILL between its fsync and
+    the state.json projection cannot hide a live task. V1 predates that ordering
+    and is terminal only when state.json and its latest state event agree.
+    """
+
+    result: List[str] = []
+    for generation, root in (
+        ("v1", common / "agent-harness" / "tasks"),
+        ("v2", common / "agent-harness" / "v2" / "tasks"),
+    ):
+        if not root.is_dir():
+            continue
+        for task_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            try:
+                contract = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+                worktree_raw = contract["worktree_path"]
+                if not isinstance(worktree_raw, str) or not worktree_raw:
+                    continue
+                worktree = Path(worktree_raw).resolve()
+            except (
+                OSError,
+                KeyError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                continue
+            if not worktree.exists():
+                continue
+            terminal = (
+                _v1_terminal_state_is_proven(task_dir)
+                if generation == "v1"
+                else _v2_terminal_state_is_proven(task_dir)
+            )
+            if not terminal:
+                result.append(f"{generation}:{task_dir.name}")
+    return result
+
+
+def _primary_branch_surgery_reason(invocation: GitInvocation) -> Optional[str]:
+    if invocation.subcommand not in {
+        "checkout",
+        "switch",
+        "merge",
+        "rebase",
+        "reset",
+        "cherry-pick",
+        "pull",
+    }:
+        return None
+    top_raw = _git_text(
+        invocation.cwd, "rev-parse", "--show-toplevel", check=False
+    )
+    if not top_raw:
+        return None
+    top = Path(top_raw).resolve()
+    if top != _primary_worktree(top):
+        return None
+    common_raw = Path(_git_text(top, "rev-parse", "--git-common-dir"))
+    common = (
+        common_raw.resolve()
+        if common_raw.is_absolute()
+        else (top / common_raw).resolve()
+    )
+    live = _live_harness_task_ids(common)
+    if not live:
+        return None
+    preview = ", ".join(live[:3]) + ("…" if len(live) > 3 else "")
+    return (
+        f"primary-checkout branch surgery is blocked while Harness task(s) "
+        f"are live or state-unknown ({preview}); continue from the isolated task/driver worktree "
+        "and use server-side PR merge"
+    )
+
+
 def _has_option(tokens: Sequence[str], short: str, long: str) -> bool:
     for token in tokens:
         if token == long:
@@ -469,6 +684,9 @@ def _has_option(tokens: Sequence[str], short: str, long: str) -> bool:
 def _block_bash(command: str, process_cwd: Path) -> Optional[str]:
     simples = _simple_commands(command)
     for invocation in _git_invocations(command, process_cwd):
+        surgery_reason = _primary_branch_surgery_reason(invocation)
+        if surgery_reason is not None:
+            return surgery_reason
         if _push_targets_protected(invocation):
             return "direct push to protected trunk murmur/main/master; use a feature branch and PR merge"
 
@@ -592,29 +810,104 @@ def _manifest_worktree(document: Any) -> Optional[Path]:
     return Path(document["worktree_path"]).resolve()
 
 
-def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path]:
-    tasks_root = common / "agent-harness" / "tasks"
-    explicit = os.environ.get("MURMUR_AGENT_TASK_ID", "").strip()
-    if explicit:
-        if not TASK_ID_RE.fullmatch(explicit):
-            raise GuardFailure("MURMUR_AGENT_TASK_ID is invalid")
-        task_dir = tasks_root / explicit
-        document = _load_json(task_dir / "task.json")
-        if _manifest_worktree(document) != repo.resolve():
-            raise GuardFailure("explicit task manifest belongs to a different worktree")
-        return document, task_dir
+def _validate_task_manifest(
+    document: Any, generation: int, manifest: Path
+) -> Dict[str, Any]:
+    if not isinstance(document, dict):
+        raise GuardFailure(f"task manifest is not an object: {manifest}")
+    runner = _task_runner_module()
+    try:
+        if generation == 1:
+            runner.validate_schema(
+                document, runner.load_schema("task"), label="v1 task contract"
+            )
+            if runner.contract_hash(document) != document.get("contract_sha256"):
+                raise GuardFailure("v1 task contract hash is malformed or stale")
+        elif generation == 2:
+            v2 = _v2_verifier_module()
+            v2.validate_hashed_document(
+                document,
+                "v2-task",
+                "contract_sha256",
+                "v2 task contract",
+            )
+        else:
+            raise GuardFailure(f"unknown task generation: {generation}")
+    except GuardFailure:
+        raise
+    except Exception as exc:
+        raise GuardFailure(f"invalid task manifest {manifest}: {exc}") from exc
+    return document
 
-    matches: List[Tuple[Dict[str, Any], Path]] = []
-    if tasks_root.is_dir():
-        for manifest in sorted(tasks_root.glob("*/task.json")):
+
+def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path, int]:
+    v1_root = common / "agent-harness" / "tasks"
+    v2_root = common / "agent-harness" / "v2" / "tasks"
+    explicit_ref = os.environ.get("MURMUR_AGENT_TASK_REF", "").strip()
+    explicit_id = os.environ.get("MURMUR_AGENT_TASK_ID", "").strip()
+    if explicit_ref:
+        match = re.fullmatch(r"(v1|v2):(.+)", explicit_ref)
+        if not match or not TASK_ID_RE.fullmatch(match.group(2)):
+            raise GuardFailure("MURMUR_AGENT_TASK_REF must be v1:<id> or v2:<id>")
+        generation = 1 if match.group(1) == "v1" else 2
+        explicit_id = match.group(2)
+    else:
+        generation = 0
+    if explicit_id:
+        if not TASK_ID_RE.fullmatch(explicit_id):
+            raise GuardFailure("MURMUR_AGENT_TASK_ID is invalid")
+        roots = [(generation, v1_root if generation == 1 else v2_root)] if generation else [
+            (2, v2_root),
+            (1, v1_root),
+        ]
+        found: List[Tuple[Dict[str, Any], Path, int]] = []
+        for candidate_generation, root in roots:
+            manifest = root / explicit_id / "task.json"
+            if manifest.is_file():
+                document = _validate_task_manifest(
+                    _load_json(manifest), candidate_generation, manifest
+                )
+                if _manifest_worktree(document) != repo.resolve():
+                    raise GuardFailure("explicit task manifest belongs to a different worktree")
+                found.append((document, manifest.parent, candidate_generation))
+        if len(found) == 1:
+            return found[0]
+        if not found:
+            raise GuardFailure("explicit task reference does not exist")
+
+    matches: List[Tuple[Dict[str, Any], Path, int]] = []
+    for candidate_generation, root in ((1, v1_root), (2, v2_root)):
+        if not root.is_dir():
+            continue
+        for manifest in sorted(root.glob("*/task.json")):
             try:
-                document = _load_json(manifest)
+                raw = _load_json(manifest)
             except GuardFailure:
+                # A foreign unreadable record is lifecycle debt for `doctor`,
+                # not proof that it claims this worktree. Explicit task refs
+                # still validate and fail closed above.
                 continue
-            if _manifest_worktree(document) == repo.resolve():
-                matches.append((document, manifest.parent))
-    if len(matches) > 1:
+            if _manifest_worktree(raw) != repo.resolve():
+                continue
+            document = _validate_task_manifest(
+                raw, candidate_generation, manifest
+            )
+            matches.append((document, manifest.parent, candidate_generation))
+    if len(matches) > 2:
         raise GuardFailure("multiple task manifests claim this worktree")
+    if len(matches) == 2:
+        v1 = next((item for item in matches if item[2] == 1), None)
+        v2 = next((item for item in matches if item[2] == 2), None)
+        if v1 is None or v2 is None:
+            raise GuardFailure("multiple same-generation task manifests claim this worktree")
+        expected = {
+            "generation": 1,
+            "task_id": v1[0].get("task_id"),
+            "contract_sha256": v1[0].get("contract_sha256"),
+        }
+        if v2[0].get("supersedes") != expected:
+            raise GuardFailure("v1/v2 worktree claim is ambiguous")
+        return v2
     if len(matches) == 1:
         return matches[0]
 
@@ -630,10 +923,10 @@ def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path]:
         except (OSError, json.JSONDecodeError) as exc:
             raise GuardFailure(f"invalid legacy current-task pointer: {exc}") from exc
         if TASK_ID_RE.fullmatch(raw):
-            task_dir = tasks_root / raw
+            task_dir = v1_root / raw
             document = _load_json(task_dir / "task.json")
             if _manifest_worktree(document) == repo.resolve():
-                return document, task_dir
+                return document, task_dir, 1
             raise GuardFailure("legacy current-task pointer belongs to a different worktree")
     raise NoTaskForWorktree(
         "no task manifest matches this worktree; use scripts/agent-harness init/run"
@@ -971,14 +1264,20 @@ def _finish_guard(
         try:
             repo = _repo_for_invocation(commits[0])
             _, common, _, _ = _repo_context(repo)
-            task, task_dir = _resolve_task(repo, common)
-            _validate_attestation(
-                repo,
-                common,
-                task,
-                task_dir,
-                allow_test_adapter=allow_test_adapter,
-            )
+            task, task_dir, generation = _resolve_task(repo, common)
+            if generation == 2:
+                raise GuardFailure(
+                    "Harness v2 owns the durable commit intent and receipt; "
+                    f"use scripts/agent-harness commit {task['task_id']} -m <message>"
+                )
+            else:
+                _validate_attestation(
+                    repo,
+                    common,
+                    task,
+                    task_dir,
+                    allow_test_adapter=allow_test_adapter,
+                )
             return None
         except NoTaskForWorktree:
             return None  # normal mode: no active harness task → allow the commit
@@ -990,9 +1289,125 @@ def _finish_guard(
     return "Definition-of-Done receipt rejected: " + reason
 
 
-def _emit(vendor: str, reason: Optional[str], guard: str) -> int:
+def _guard_refusal_task_dirs(
+    process_cwd: Path, *, include_live_primary_tasks: bool
+) -> List[Path]:
+    """Find task ledgers that should receive a best-effort refusal event."""
+
+    top_raw = _git_text(
+        process_cwd, "rev-parse", "--show-toplevel", check=False
+    )
+    if not top_raw:
+        return []
+    top = Path(top_raw).resolve()
+    common_raw = Path(_git_text(top, "rev-parse", "--git-common-dir"))
+    common = (
+        common_raw.resolve()
+        if common_raw.is_absolute()
+        else (top / common_raw).resolve()
+    )
+    primary = _primary_worktree(top)
+    matches: List[Path] = []
+    for generation, root in (
+        ("v1", common / "agent-harness" / "tasks"),
+        ("v2", common / "agent-harness" / "v2" / "tasks"),
+    ):
+        if not root.is_dir():
+            continue
+        for task_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+            try:
+                task = _load_json(task_dir / "task.json")
+                claimed = _manifest_worktree(task)
+            except Exception:
+                continue
+            if claimed == top:
+                matches.append(task_dir)
+                continue
+            if not include_live_primary_tasks or top != primary:
+                continue
+            if claimed is None or not claimed.exists():
+                continue
+            terminal = (
+                _v1_terminal_state_is_proven(task_dir)
+                if generation == "v1"
+                else _v2_terminal_state_is_proven(task_dir)
+            )
+            if not terminal:
+                matches.append(task_dir)
+    return sorted(set(matches))
+
+
+def _record_guard_refusal(
+    process_cwd: Path, command: str, guard: str, reason: str
+) -> None:
+    """Append diagnostics without ever changing the guard's allow/block result."""
+
+    try:
+        compact = " ".join(command.split())
+        preview = (
+            "<secret-bearing command redacted>"
+            if guard == "secret-scan"
+            else compact[:80]
+        )
+        payload = (
+            json.dumps(
+                {
+                    "at": dt.datetime.now(dt.timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "event": "guard-refusal",
+                    "guard": guard,
+                    "reason": reason,
+                    "command_preview": preview,
+                    "command_sha256": hashlib.sha256(
+                        command.encode("utf-8", "surrogateescape")
+                    ).hexdigest(),
+                    "cwd": str(process_cwd.resolve()),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        for task_dir in _guard_refusal_task_dirs(
+            process_cwd,
+            include_live_primary_tasks=reason.startswith(
+                "primary-checkout branch surgery"
+            ),
+        ):
+            path = task_dir / "events.jsonl"
+            flags = os.O_WRONLY | os.O_APPEND
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    continue
+                if os.write(descriptor, payload) != len(payload):
+                    continue
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except Exception:
+        # Telemetry is never authority and may not weaken or strengthen a
+        # refusal. Doctor can report an unwritable/corrupt task ledger.
+        return
+
+
+def _emit(
+    vendor: str,
+    reason: Optional[str],
+    guard: str,
+    *,
+    command: str = "",
+    process_cwd: Optional[Path] = None,
+) -> int:
     if reason is None:
         return 0
+    _record_guard_refusal(process_cwd or Path.cwd(), command, guard, reason)
     message = f"{guard} refused this command: {reason}"
     if vendor == "codex":
         print(json.dumps({"decision": "block", "reason": message}, separators=(",", ":")))
@@ -1422,6 +1837,134 @@ def _resource_lane_runner_cases(test: _Selftest) -> None:
             "PASS",
         )
 
+        lane_env = {
+            **os.environ,
+            "MURMUR_HARNESS_TASK": "lane-owner",
+        }
+        owner = subprocess.Popen(
+            [
+                str(runner),
+                "--deadline-seconds",
+                "3",
+                "--",
+                "sh",
+                "-c",
+                "sleep 2",
+            ],
+            cwd=str(repo),
+            env=lane_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            common = Path(
+                _run(
+                    [
+                        "git",
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--git-common-dir",
+                    ],
+                    repo,
+                    text=True,
+                ).stdout.strip()
+            )
+            lane_path = (
+                _task_runner_module().shared_resource_root_for_common(common)
+                / "cargo.lock"
+            )
+            owner_seen = False
+            for _attempt in range(50):
+                try:
+                    payload = json.loads(lane_path.read_text(encoding="utf-8"))
+                    owner_seen = payload.get("pid") == owner.pid
+                except (FileNotFoundError, OSError, json.JSONDecodeError):
+                    owner_seen = False
+                if owner_seen:
+                    break
+                time.sleep(0.02)
+            test.result(
+                "resource lane publishes owner before waiters",
+                "PASS" if owner_seen else "FAIL",
+                "PASS",
+            )
+
+            waiter = subprocess.run(
+                [
+                    str(runner),
+                    "--deadline-seconds",
+                    "0.25",
+                    "--heartbeat-seconds",
+                    "0.05",
+                    "--",
+                    "sh",
+                    "-c",
+                    "exit 0",
+                ],
+                cwd=str(repo),
+                env={**os.environ, "MURMUR_HARNESS_TASK": "lane-waiter"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            waiter_stderr = waiter.stderr
+            test.result(
+                "resource runner wait reports owner immediately and heartbeats",
+                "PASS"
+                if (
+                    waiter.returncode == 124
+                    and f"owner_pid={owner.pid}" in waiter_stderr
+                    and "task=lane-owner" in waiter_stderr
+                    and "command=sh -c sleep 2" in waiter_stderr
+                    and waiter_stderr.count("heartbeat=") >= 2
+                )
+                else f"FAIL({waiter.returncode}: {waiter_stderr[-300:]})",
+                "PASS",
+            )
+
+            direct_task = common / "agent-harness" / "v2" / "tasks" / "lane-direct"
+            direct_task.mkdir(parents=True)
+            direct_code = (
+                "import pathlib,sys;"
+                f"sys.path.insert(0,{str((SOURCE_ROOT / '.agents' / 'harness')).__repr__()});"
+                "import task_runner;"
+                "task_runner.acquire_cargo_lane("
+                "pathlib.Path(sys.argv[1]),0.25,"
+                "command='direct-selftest',heartbeat_seconds=0.05)"
+            )
+            direct = subprocess.run(
+                [sys.executable, "-c", direct_code, str(direct_task)],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            test.result(
+                "run_check Cargo lane path reports owner and heartbeats",
+                "PASS"
+                if (
+                    direct.returncode != 0
+                    and f"owner_pid={owner.pid}" in direct.stderr
+                    and "task=lane-owner" in direct.stderr
+                    and "command=sh -c sleep 2" in direct.stderr
+                    and direct.stderr.count("heartbeat=") >= 2
+                )
+                else f"FAIL({direct.returncode}: {direct.stderr[-300:]})",
+                "PASS",
+            )
+        finally:
+            if owner.poll() is None:
+                owner.terminate()
+            try:
+                owner.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                owner.kill()
+                owner.communicate(timeout=2)
+
         fake_bin = Path(temp) / "fake-bin"
         fake_bin.mkdir()
         tool_log = Path(temp) / "tool.log"
@@ -1686,6 +2229,11 @@ def _run_selftest() -> int:
                 ("git global options", "git -c user.name=x -C . --no-pager push origin murmur", "BLOCK"),
                 ("multiline push", "git -c user.name=x \\" + "\n --no-pager push origin master", "BLOCK"),
                 ("feature push", "git push -u origin feature/x", "ALLOW"),
+                (
+                    "catch-up merge then feature push",
+                    "git checkout feature/x && git merge origin/murmur && git push origin feature/x",
+                    "ALLOW",
+                ),
                 ("absolute security", "/usr/bin/security find-identity -v", "BLOCK"),
                 ("sudo security", "sudo /usr/bin/security unlock-keychain login.keychain", "BLOCK"),
                 ("security management text", "pkill security", "ALLOW"),
@@ -1729,7 +2277,284 @@ def _run_selftest() -> int:
                     repo,
                     "ALLOW",
                 )
+                test.expect(
+                    f"{action} permits literal quoted heredoc body",
+                    vendor,
+                    action,
+                    "python3 - <<'PY'\n"
+                    "print(\"Rust `doc` and $(literal) with writer's apostrophe\")\n"
+                    "PY\n",
+                    repo,
+                    "ALLOW",
+                )
+                test.expect(
+                    f"{action} rejects expanding heredoc substitution",
+                    vendor,
+                    action,
+                    "python3 - <<PY\n$(printf git) push origin main\nPY\n",
+                    repo,
+                    "BLOCK",
+                )
 
+            live_worktree = Path(temp) / "live-v2-task"
+            live_worktree.mkdir()
+            live_task = (
+                repo
+                / ".git"
+                / "agent-harness"
+                / "v2"
+                / "tasks"
+                / "primary-isolation"
+            )
+            live_task.mkdir(parents=True)
+            (live_task / "task.json").write_text(
+                json.dumps({"worktree_path": str(live_worktree.resolve())})
+                + "\n",
+                encoding="utf-8",
+            )
+            live_updated_at = "2026-07-28T10:00:00Z"
+            live_state = {
+                "schema_version": 2,
+                "task_id": live_task.name,
+                "status": "OPEN",
+                "updated_at": live_updated_at,
+            }
+            (live_task / "events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "at": live_updated_at,
+                        "event": "state",
+                        "state": live_state,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            test.expect(
+                "SIGKILL ledger-only v2 task blocks primary branch surgery",
+                vendor,
+                "block-bash",
+                "git checkout -b unsafe-primary-move",
+                repo,
+                "BLOCK",
+            )
+            refusal_events = [
+                json.loads(line)
+                for line in (live_task / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            refusal = next(
+                (
+                    event
+                    for event in reversed(refusal_events)
+                    if event.get("event") == "guard-refusal"
+                ),
+                {},
+            )
+            test.result(
+                f"{vendor}: guard refusal is recorded in active task ledger",
+                "RECORDED"
+                if (
+                    refusal.get("guard") == "block-bash"
+                    and refusal.get("command_preview")
+                    == "git checkout -b unsafe-primary-move"
+                    and SHA256_RE.fullmatch(
+                        str(refusal.get("command_sha256", ""))
+                    )
+                )
+                else "MISSING",
+                "RECORDED",
+            )
+            test.expect(
+                "git pull is primary branch surgery",
+                vendor,
+                "block-bash",
+                "git pull --ff-only",
+                repo,
+                "BLOCK",
+            )
+
+            terminal_updated_at = "2026-07-28T10:01:00Z"
+            terminal_state = {
+                **live_state,
+                "status": "CLOSED",
+                "updated_at": terminal_updated_at,
+            }
+            with (live_task / "events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "at": terminal_updated_at,
+                            "event": "state",
+                            "state": terminal_state,
+                        }
+                    )
+                    + "\n"
+                )
+            (live_task / "state.json").write_text(
+                "{malformed projection\n", encoding="utf-8"
+            )
+            test.expect(
+                "authoritative v2 terminal event permits existing task worktree",
+                vendor,
+                "block-bash",
+                "git checkout --detach HEAD",
+                repo,
+                "ALLOW",
+            )
+            (live_task / "events.jsonl").write_text(
+                "{malformed authoritative state\n", encoding="utf-8"
+            )
+            test.expect(
+                "malformed v2 authoritative state is unknown-live",
+                vendor,
+                "block-bash",
+                "git checkout --detach HEAD",
+                repo,
+                "BLOCK",
+            )
+            (live_task / "events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "at": terminal_updated_at,
+                        "event": "state",
+                        "state": terminal_state,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            v1_worktree = Path(temp) / "live-v1-task"
+            v1_worktree.mkdir()
+            v1_task = (
+                repo / ".git" / "agent-harness" / "tasks" / "v1-primary-isolation"
+            )
+            v1_task.mkdir(parents=True)
+            (v1_task / "task.json").write_text(
+                json.dumps({"worktree_path": str(v1_worktree.resolve())}) + "\n",
+                encoding="utf-8",
+            )
+            v1_live_updated_at = "2026-07-28T10:02:00Z"
+            v1_live_state = {
+                "task_id": v1_task.name,
+                "status": "INITIALIZED",
+                "updated_at": v1_live_updated_at,
+                "round": 0,
+                "phase": "init",
+            }
+            (v1_task / "state.json").write_text(
+                json.dumps(v1_live_state) + "\n", encoding="utf-8"
+            )
+            (v1_task / "events.jsonl").write_text(
+                json.dumps(
+                    {
+                        "at": v1_live_updated_at,
+                        "event": "state",
+                        "status": "INITIALIZED",
+                        "round": 0,
+                        "phase": "init",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            test.expect(
+                "live v1 task blocks primary branch surgery",
+                vendor,
+                "block-bash",
+                "git reset --hard HEAD",
+                repo,
+                "BLOCK",
+            )
+
+            v1_terminal_updated_at = "2026-07-28T10:03:00Z"
+            v1_terminal_state = {
+                **v1_live_state,
+                "status": "CLOSED",
+                "updated_at": v1_terminal_updated_at,
+                "phase": "close",
+            }
+            (v1_task / "state.json").write_text(
+                json.dumps(v1_terminal_state) + "\n", encoding="utf-8"
+            )
+            v1_terminal_event = {
+                "at": v1_terminal_updated_at,
+                "event": "state",
+                "status": "CLOSED",
+                "round": 0,
+                "phase": "close",
+            }
+            (v1_task / "events.jsonl").write_text(
+                json.dumps(v1_terminal_event) + "\n",
+                encoding="utf-8",
+            )
+            test.expect(
+                "matching v1 terminal state and event permit existing task worktree",
+                vendor,
+                "block-bash",
+                "git switch --detach HEAD",
+                repo,
+                "ALLOW",
+            )
+            (v1_task / "events.jsonl").write_text(
+                json.dumps({**v1_terminal_event, "status": "REAPED"}) + "\n",
+                encoding="utf-8",
+            )
+            test.expect(
+                "disagreeing v1 terminal state and event are unknown-live",
+                vendor,
+                "block-bash",
+                "git switch --detach HEAD",
+                repo,
+                "BLOCK",
+            )
+            (v1_task / "events.jsonl").write_text(
+                json.dumps(v1_terminal_event) + "\n",
+                encoding="utf-8",
+            )
+            (v1_task / "state.json").write_text(
+                "{malformed state\n", encoding="utf-8"
+            )
+            test.expect(
+                "malformed v1 state with existing claimed worktree is unknown-live",
+                vendor,
+                "block-bash",
+                "git merge feature/nope",
+                repo,
+                "BLOCK",
+            )
+            (v1_task / "state.json").unlink()
+            test.expect(
+                "missing v1 state with existing claimed worktree is unknown-live",
+                vendor,
+                "block-bash",
+                "git merge feature/nope",
+                repo,
+                "BLOCK",
+            )
+
+            driver = Path(temp) / "driver"
+            _run(
+                ["git", "worktree", "add", "--detach", str(driver), "HEAD"],
+                repo,
+            )
+            test.expect(
+                "dedicated driver worktree may move independently",
+                vendor,
+                "block-bash",
+                "git checkout --detach HEAD",
+                driver,
+                "ALLOW",
+            )
+
+        resource_fixture_root = Path(
+            tempfile.mkdtemp(prefix="murmur-hook-resource-command-")
+        )
+        resource_case_cwd = resource_fixture_root / "repo"
+        _init_repo(resource_case_cwd)
         resource_cases = [
             ("direct cargo metadata", "cargo metadata --no-deps", "ALLOW"),
             ("direct Rust test", "cd src-tauri && cargo test --lib", "ALLOW"),
@@ -1825,7 +2650,15 @@ def _run_selftest() -> int:
             ),
         ]
         for label, command, want in resource_cases:
-            test.expect(label, vendor, "block-bash", command, SOURCE_ROOT, want)
+            test.expect(
+                label,
+                vendor,
+                "block-bash",
+                command,
+                resource_case_cwd,
+                want,
+            )
+        shutil.rmtree(resource_fixture_root)
 
         for label, cmd, want in [
             ("gh live $() substitution is heavy", 'gh pr create --title x --body "$(cargo build --release)"', "HEAVY"),
@@ -1947,6 +2780,84 @@ def _run_selftest() -> int:
             extra_env={"MURMUR_AGENT_TASK_ID": "malformed"},
         )
         test.result(f"{vendor}: malformed task manifest", got, "BLOCK")
+        got, _ = test.invoke(
+            vendor,
+            "finish-guard",
+            "git commit -m x",
+            repo,
+        )
+        test.result(
+            f"{vendor}: unrelated unreadable historical manifest does not poison commits",
+            got,
+            "ALLOW",
+        )
+        shutil.rmtree(malformed_dir)
+
+        valid_json_bad_dir = common / "agent-harness" / "v2" / "tasks" / "bad-v2"
+        valid_json_bad_dir.mkdir(parents=True)
+        (valid_json_bad_dir / "task.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "task_id": "bad-v2",
+                    "worktree_path": str(repo.resolve()),
+                    "contract_sha256": "0" * 64,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        got, _ = test.invoke(
+            vendor,
+            "finish-guard",
+            "git commit -m x",
+            repo,
+        )
+        test.result(
+            f"{vendor}: malformed v2 manifest claiming current worktree",
+            got,
+            "BLOCK",
+        )
+        got, _ = test.invoke(
+            vendor,
+            "finish-guard",
+            "git commit -m x",
+            repo,
+            extra_env={"MURMUR_AGENT_TASK_REF": "v2:bad-v2"},
+        )
+        test.result(
+            f"{vendor}: valid JSON malformed v2 hash/schema claim",
+            got,
+            "BLOCK",
+        )
+        shutil.rmtree(valid_json_bad_dir.parent.parent)
+        valid_json_bad_v1 = common / "agent-harness" / "tasks" / "bad-v1"
+        valid_json_bad_v1.mkdir(parents=True)
+        (valid_json_bad_v1 / "task.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": "bad-v1",
+                    "worktree_path": str(repo.resolve()),
+                    "contract_sha256": "0" * 64,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        got, _ = test.invoke(
+            vendor,
+            "finish-guard",
+            "git commit -m x",
+            repo,
+            extra_env={"MURMUR_AGENT_TASK_REF": "v1:bad-v1"},
+        )
+        test.result(
+            f"{vendor}: valid JSON malformed v1 hash/schema claim",
+            got,
+            "BLOCK",
+        )
+        shutil.rmtree(valid_json_bad_v1)
 
         task_dir, task, attestation = _write_receipt(repo, "fresh")
         got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
@@ -2088,6 +2999,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.action == "selftest":
         return _run_selftest()
+    command = ""
+    process_cwd = Path.cwd()
     try:
         command, process_cwd = _read_payload()
         reason = _unsupported_execution_indirection(command)
@@ -2101,7 +3014,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reason = _finish_guard(command, process_cwd)
     except GuardFailure as exc:
         reason = str(exc)
-    return _emit(args.vendor, reason, args.action)
+    return _emit(
+        args.vendor,
+        reason,
+        args.action,
+        command=command,
+        process_cwd=process_cwd,
+    )
 
 
 if __name__ == "__main__":
