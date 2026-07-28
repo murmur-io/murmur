@@ -121,6 +121,26 @@
               </span>
             </label>
 
+            <label class="field">
+              <span class="field-label">Workspace glossary</span>
+              <textarea
+                class="glossary-input"
+                formControlName="glossary"
+                rows="7"
+                maxlength="16384"
+                spellcheck="false"
+                placeholder="Konnect = Connect, Kinect&#10;FastMCP = Fast MCP&#10;Kong Operator = KO"
+              ></textarea>
+              <span class="field-help text-muted">
+                One canonical spelling per line; optional aliases follow an equals
+                sign and commas. Murmur sends at most 64 entries, 8 aliases each and
+                4 KB of structured glossary text. It only corrects exact listed
+                aliases in the local knowledge graph — never substrings. Before a
+                cloud note call, glossary text passes the same email, phone, card and
+                on-device name protection (when installed) as the transcript.
+              </span>
+            </label>
+
             <label class="toggle-row">
               <span class="toggle-copy">
                 <span class="toggle-title">Organize into thematic subfolders</span>
@@ -130,6 +150,20 @@
                 </span>
               </span>
               <mur-toggle formControlName="autoOrganize" />
+            </label>
+
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Flag potentially unsupported claims</span>
+                <span class="text-secondary toggle-sub">
+                  After writing the note, Murmur checks it against this meeting's
+                  transcript and marks lines that may need review. The conservative
+                  thresholds are not yet calibrated, so a marker is not proof that
+                  a claim is true or false. This check runs locally and adds no
+                  cloud request.
+                </span>
+              </span>
+              <mur-toggle formControlName="groundSummary" />
             </label>
           </div>
 </div>

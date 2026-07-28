@@ -2310,6 +2310,10 @@ async fn summarize_and_export(
             None
         },
         live_bullets: live_bullets.clone(),
+        // Deterministic, bounded prompt-only projection of the user-authored workspace glossary.
+        // `None` for absent/blank keeps the pre-feature prompt byte-identical. Cloud dispatch still
+        // goes through this request's one existing RedactingProvider seam.
+        glossary: template::render_glossary_for_prompt(&config.glossary),
     };
 
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
