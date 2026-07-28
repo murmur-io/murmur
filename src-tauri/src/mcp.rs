@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +22,14 @@ use crate::storage::Db;
 
 /// Fixed localhost port for the MCP server.
 pub const MCP_PORT: u16 = 8765;
+/// The production listener has no configurable/wildcard bind. Keeping the literal loopback IP in a
+/// typed socket address prevents DNS, proxy, environment, and config state from widening this
+/// local-only disclosure boundary.
+const MCP_BIND_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+fn mcp_listener_addr() -> SocketAddrV4 {
+    SocketAddrV4::new(MCP_BIND_IP, MCP_PORT)
+}
 
 /// Max request body we will read (E5). The MCP JSON-RPC requests are tiny; cap hard so a
 /// malicious local client can't OOM us with an unbounded body.
@@ -511,8 +519,8 @@ pub fn spawn(app: AppHandle, require_token: bool) {
 }
 
 fn run(app: AppHandle, require_token: bool) {
-    let addr = format!("127.0.0.1:{MCP_PORT}");
-    let listener = match TcpListener::bind(&addr) {
+    let addr = mcp_listener_addr();
+    let listener = match TcpListener::bind(addr) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(target: "mcp", error = %e, "MCP server failed to bind {addr}");
@@ -638,8 +646,23 @@ fn try_acquire_connection(active: &AtomicUsize) -> bool {
 }
 
 fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     app: AppHandle,
+    gate: Arc<McpResponseGate>,
+    expected_token: Option<Arc<String>>,
+    deadline: Instant,
+) {
+    let state = app.state::<AppState>();
+    handle_connection_with_state(stream, state.inner(), gate, expected_token, deadline);
+}
+
+/// Production connection pipeline with the Tauri state lookup factored out. Keeping HTTP parsing,
+/// host/origin/auth checks, JSON-RPC dispatch, visibility revalidation, and the response gate in one
+/// function lets an ephemeral-loopback test exercise the real listener path without constructing a
+/// GUI runtime.
+fn handle_connection_with_state(
+    mut stream: TcpStream,
+    state: &AppState,
     gate: Arc<McpResponseGate>,
     expected_token: Option<Arc<String>>,
     deadline: Instant,
@@ -728,8 +751,7 @@ fn handle_connection(
             return;
         }
     };
-    let state = app.state::<AppState>();
-    let context = RpcContext::from_state(state.inner());
+    let context = RpcContext::from_state(state);
     let reply = handle_rpc(
         &context,
         &request.body,
@@ -741,7 +763,7 @@ fn handle_connection(
     // deadline, discard the result before serialization, visibility admission, or any response
     // write can disclose it.
     match reply_before_deadline(reply, deadline) {
-        Some(reply) => send_rpc_reply(&mut stream, reply, state.inner(), &gate, deadline),
+        Some(reply) => send_rpc_reply(&mut stream, reply, state, &gate, deadline),
         None => {
             let _ = write_http_response(&mut stream, 202, "application/json", b"", None, deadline);
         }
@@ -1582,9 +1604,19 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         },
         {
+            "name": "search_transcript",
+            "description": "Located lexical search inside visible transcript segments. Every hit includes a timestamp, stable stored segment id, speaker and character offsets in the exact structured transcript channel accepted by get_meeting. Counts are computed after channel projection within at most 20 matching meetings.",
+            "inputSchema": { "type": "object", "properties": { "query": { "type": "string" }, "meetingId": { "type": "string", "description": "Optional meeting id scope." }, "limit": { "type": "number", "description": "Maximum hits overall (default 20, max 100)." }, "maxPerMeeting": { "type": "number", "description": "Maximum hits per meeting (default 5, max 20)." }, "channel": { "type": "string", "enum": ["merged", "mic", "system"], "description": "Structured transcript channel whose offsets are returned (default merged)." } }, "required": ["query"] }
+        },
+        {
             "name": "get_meeting",
-            "description": "Get a meeting's AI note (summary) and transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text. The transcript is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a long transcript by passing offset + maxChars.",
-            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain", "compact"], "description": "Transcript rendering (default 'structured'). 'compact' merges consecutive same-speaker segments into one line — same words, far less per-segment scaffolding. NOTE each format is a DIFFERENT character space, so offset/maxChars/TOTAL_CHARS only mean anything within the format you asked for." }, "offset": { "type": "number", "description": "Chars to skip into the transcript, in the SELECTED format's char space (default 0)." }, "maxChars": { "type": "number", "description": "Max chars to return from offset (default: a bounded 6000-char window with the total disclosed). Bounds the NOTE section too." }, "includeNote": { "type": "boolean", "description": "Include the AI note (default true). Pass false for transcript only — e.g. you already read the note, or you are paging and only want speech." } }, "required": ["meetingId"] }
+            "description": "Get a meeting's AI note (summary) and transcript by id. The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>'. The response stamps format and channel because each pair has its own character-offset space. Merged is the canonical stored transcript (ingest removes echoes only when acoustic leak is measured); mic and system expose its stored capture lanes. The transcript is returned as a bounded, disclosed window and can be paged with offset + maxChars.",
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain", "compact"], "description": "Transcript rendering (default structured). Each format is a different character space." }, "channel": { "type": "string", "enum": ["merged", "mic", "system"], "description": "Capture-lane projection (default merged). Keep this equal to the channel from search_transcript or get_meeting_chapters when using their offsets." }, "offset": { "type": "number", "description": "Chars to skip into the transcript, in the selected format and channel coordinate." }, "maxChars": { "type": "number", "description": "Max chars to return from offset (default: a bounded 6000-char window with the total disclosed). Bounds the NOTE section too." }, "includeNote": { "type": "boolean", "description": "Include the AI note (default true). Pass false for transcript only." } }, "required": ["meetingId"] }
+        },
+        {
+            "name": "get_meeting_chapters",
+            "description": "Get the visible timeline topic map for one meeting. Each topic carries a character range in the same structured transcript channel accepted by get_meeting, so a long meeting can be navigated without blind paging.",
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "channel": { "type": "string", "enum": ["merged", "mic", "system"], "description": "Structured transcript channel whose offsets are returned (default merged)." } }, "required": ["meetingId"] }
         },
         {
             "name": "get_document",
@@ -1735,6 +1767,13 @@ fn mcp_body_window(args: &Value) -> (usize, usize) {
     (offset, max_chars)
 }
 
+fn mcp_transcript_channel(
+    args: &Value,
+) -> std::result::Result<crate::tools::TranscriptChannel, ToolError> {
+    crate::tools::TranscriptChannel::parse(args.get("channel").and_then(Value::as_str))
+        .map_err(|err| (-32602, err.to_string()))
+}
+
 fn dispatch_tool(
     db: &Db,
     name: &str,
@@ -1757,6 +1796,29 @@ fn dispatch_tool(
                 .unwrap_or("")
                 .to_string(),
         },
+        "search_transcript" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            ToolCall::SearchTranscript {
+                query: query.to_string(),
+                meeting_id: args
+                    .get("meetingId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                limit: args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize,
+                max_per_meeting: args
+                    .get("maxPerMeeting")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5)
+                    .clamp(1, 20) as usize,
+                channel: mcp_transcript_channel(args)?,
+            }
+        }
         "get_meeting" => ToolCall::GetMeeting {
             meeting_id: args
                 .get("meetingId")
@@ -1771,6 +1833,8 @@ fn dispatch_tool(
                 .filter(|f| *f == "plain" || *f == "compact")
                 .unwrap_or("structured")
                 .to_string(),
+            channel: mcp_transcript_channel(args)?,
+            include_speaker_map: true,
             // Brain v3 audit Fix 2 — bound + DISCLOSE the default MCP window (no paging args → a
             // 6000-char disclosed window, not the whole transcript) so a huge transcript can't flood
             // the client; explicit offset/maxChars are honored verbatim.
@@ -1781,6 +1845,14 @@ fn dispatch_tool(
                 .get("includeNote")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+        },
+        "get_meeting_chapters" => ToolCall::GetMeetingChapters {
+            meeting_id: args
+                .get("meetingId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            channel: mcp_transcript_channel(args)?,
         },
         "get_document" => ToolCall::GetDocument {
             document_id: args
@@ -1957,10 +2029,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eleven_tools() {
+    fn tools_list_has_thirteen_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -1993,6 +2065,14 @@ mod tests {
         assert_eq!(
             outline["inputSchema"]["required"][0], "documentId",
             "the MCP outline tool must advertise the documentId arg (parity with the tool surface)"
+        );
+        assert!(
+            tools.iter().any(|t| t["name"] == "search_transcript"),
+            "located transcript search must be advertised"
+        );
+        assert!(
+            tools.iter().any(|t| t["name"] == "get_meeting_chapters"),
+            "chapter navigation must be advertised"
         );
     }
 
@@ -3041,6 +3121,12 @@ mod tests {
 
     #[test]
     fn host_allow_list_is_loopback_only() {
+        let production_addr = mcp_listener_addr();
+        assert_eq!(*production_addr.ip(), Ipv4Addr::LOCALHOST);
+        assert!(
+            production_addr.ip().is_loopback(),
+            "the production listener address cannot be widened by config or DNS"
+        );
         // E2: only the two exact loopback authorities are accepted.
         assert!(ALLOWED_HOSTS.contains(&"127.0.0.1:8765"));
         assert!(ALLOWED_HOSTS.contains(&"localhost:8765"));
@@ -3171,6 +3257,245 @@ mod tests {
             Value::String(VISIBILITY_RETRY_MESSAGE.into())
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn transcript_navigation_response_gate_discards_search_and_chapters_after_relock() {
+        use crate::storage::models::{Folder, MeetingTimeline, TopicSpan};
+        use crate::transcribe::types::Segment;
+
+        const FOLDER_ID: &str = "f-nav-race";
+        const MEETING_ID: &str = "m-nav-race";
+        const TITLE: &str = "RACE_PRIVATE_TITLE";
+        const SECRET: &str = "race private transcript needle";
+        const ORDINARY_SPEECH: &str = "race private ordinary speaker";
+        const TOPIC: &str = "RACE_PRIVATE_CHAPTER";
+        const ENROLLED_NAME: &str = "RACE_PRIVATE_ENROLLED_NAME";
+
+        let db_path = crate::storage::db::unique_temp_path("murmur-mcp-nav-race", "sqlite");
+        let state = AppState::init_at(&db_path, TEST_DEK).unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: FOLDER_ID.into(),
+                name: "Private navigation race".into(),
+                path: "Private navigation race".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-28T00:00:00Z".into(),
+            })
+            .unwrap();
+        seed(
+            &state.db,
+            MEETING_ID,
+            TITLE,
+            "private note",
+            Some(FOLDER_ID),
+        );
+        state
+            .db
+            .insert_segments(
+                MEETING_ID,
+                &[
+                    Segment {
+                        idx: 17,
+                        start_s: 5.0,
+                        end_s: 8.0,
+                        text: SECRET.into(),
+                        speaker: Some("others-0".into()),
+                        confidence: None,
+                    },
+                    Segment {
+                        idx: 18,
+                        start_s: 9.0,
+                        end_s: 11.0,
+                        text: ORDINARY_SPEECH.into(),
+                        speaker: Some("others".into()),
+                        confidence: None,
+                    },
+                ],
+            )
+            .unwrap();
+        state
+            .db
+            .insert_voiceprint(
+                "vp-nav-race",
+                MEETING_ID,
+                0,
+                Some(ENROLLED_NAME),
+                &[0.1, 0.2],
+                "2026-07-28T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_timeline_data(
+                MEETING_ID,
+                &serde_json::to_string(&MeetingTimeline {
+                    speakers: Vec::new(),
+                    topics: vec![TopicSpan {
+                        label: TOPIC.into(),
+                        start_s: 4.5,
+                        end_s: 11.5,
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        state.db.set_folder_locked(FOLDER_ID, true, None).unwrap();
+        let gate = Arc::new(McpResponseGate::new());
+
+        let cases = [
+            (
+                "search_transcript",
+                json!({
+                    "query": "race private",
+                    "meetingId": MEETING_ID,
+                    "channel": "system"
+                }),
+                SECRET,
+            ),
+            (
+                "get_meeting_chapters",
+                json!({ "meetingId": MEETING_ID, "channel": "system" }),
+                TOPIC,
+            ),
+        ];
+        for (case_index, (name, arguments, materialized_marker)) in cases.into_iter().enumerate() {
+            {
+                let _lifecycle = state
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state
+                    .unlocked_folders
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(FOLDER_ID.into());
+            }
+            let context = RpcContext::from_state(&state);
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 90 + case_index,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            })
+            .to_string();
+            let deadline = Instant::now() + REQUEST_DEADLINE;
+            let reply = handle_rpc(&context, &request, None, None, deadline)
+                .expect("navigation tool must produce a response");
+            match &reply {
+                RpcReply::Content(pending) => {
+                    let text = pending
+                        .outcome
+                        .as_ref()
+                        .unwrap_or_else(|error| panic!("{name} failed before relock: {error:?}"));
+                    assert!(
+                        text.contains(materialized_marker),
+                        "{name} must materialize protected content before the deterministic relock"
+                    );
+                    if name == "search_transcript" {
+                        for expected in [
+                            SECRET,
+                            ORDINARY_SPEECH,
+                            TITLE,
+                            ENROLLED_NAME,
+                            "Speaker 1",
+                            "Others",
+                            "shown=2",
+                            "total=2",
+                            "candidateMeetings",
+                            "seg 17",
+                            "seg 18",
+                            "@00:05",
+                            "@00:09",
+                            "(5.0s)",
+                            "(9.0s)",
+                            "offset ",
+                            "channel=system",
+                        ] {
+                            assert!(
+                                text.contains(expected),
+                                "search race fixture did not materialize {expected:?}: {text}"
+                            );
+                        }
+                    } else {
+                        for expected in [
+                            TOPIC,
+                            ENROLLED_NAME,
+                            "Speaker 1",
+                            "offset ",
+                            "channel=system",
+                        ] {
+                            assert!(
+                                text.contains(expected),
+                                "chapter race fixture did not materialize {expected:?}: {text}"
+                            );
+                        }
+                    }
+                }
+                RpcReply::Immediate(response) => {
+                    panic!("{name} unexpectedly bypassed the response gate: {response}")
+                }
+            }
+
+            {
+                let _lifecycle = state
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.seal_epoch.fetch_add(1, Ordering::SeqCst);
+                state
+                    .unlocked_folders
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(FOLDER_ID);
+            }
+
+            let (mut client, mut server) = tcp_pair();
+            send_rpc_reply(&mut server, reply, &state, &gate, deadline);
+            drop(server);
+            let mut wire = String::new();
+            client.read_to_string(&mut wire).unwrap();
+            let (_, body) = wire.split_once("\r\n\r\n").expect("complete HTTP reply");
+            let response: Value = serde_json::from_str(body).expect("JSON-RPC response");
+            assert_eq!(
+                response["error"]["code"], VISIBILITY_RETRY_CODE,
+                "{name} must fail closed after relock: {response}"
+            );
+            let serialized = response.to_string();
+            for forbidden in [
+                SECRET,
+                ORDINARY_SPEECH,
+                TITLE,
+                TOPIC,
+                ENROLLED_NAME,
+                "Speaker 1",
+                "Others",
+                "shown=",
+                "total=",
+                "counted=",
+                "candidateMeetings",
+                "scanTruncated",
+                "[meeting:m-nav-race]",
+                "seg 17",
+                "seg 18",
+                "@00:05",
+                "@00:09",
+                "(5.0s)",
+                "(9.0s)",
+                "offset",
+                "channel=",
+            ] {
+                assert!(
+                    !serialized.contains(forbidden),
+                    "{name} leaked materialized navigation metadata after relock: {serialized}"
+                );
+            }
+        }
+
+        drop(state);
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]
@@ -3384,6 +3709,226 @@ mod tests {
             "bounded org results exceeded the transport response cap"
         );
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn transcript_navigation_round_trips_through_production_listener_and_session_visibility() {
+        use crate::storage::models::{Folder, MeetingTimeline, TopicSpan};
+        use crate::transcribe::types::Segment;
+
+        const MEETING_ID: &str = "mcp-nav-private";
+        const FOLDER_ID: &str = "mcp-nav-folder";
+        const SECRET: &str = "unique navigation needle";
+
+        let db_path = crate::storage::db::unique_temp_path("murmur-mcp-nav-listener", "sqlite");
+        let state = Arc::new(AppState::init_at(&db_path, TEST_DEK).unwrap());
+        state
+            .db
+            .insert_folder(&Folder {
+                id: FOLDER_ID.into(),
+                name: "Private navigation".into(),
+                path: "Private navigation".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-28T00:00:00Z".into(),
+            })
+            .unwrap();
+        seed(
+            &state.db,
+            MEETING_ID,
+            "Private navigation meeting",
+            "private note",
+            Some(FOLDER_ID),
+        );
+        let segments = vec![
+            Segment {
+                idx: 4,
+                start_s: 2.0,
+                end_s: 3.0,
+                text: "mic lane preface".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            },
+            Segment {
+                idx: 8,
+                start_s: 5.0,
+                end_s: 8.0,
+                text: SECRET.into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            },
+        ];
+        state.db.insert_segments(MEETING_ID, &segments).unwrap();
+        state
+            .db
+            .set_timeline_data(
+                MEETING_ID,
+                &serde_json::to_string(&MeetingTimeline {
+                    speakers: Vec::new(),
+                    topics: vec![TopicSpan {
+                        label: "Navigation topic".into(),
+                        start_s: 4.5,
+                        end_s: 8.5,
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        state.db.set_folder_locked(FOLDER_ID, true, None).unwrap();
+
+        let gate = Arc::new(McpResponseGate::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let rpc_over_production_listener = |name: &str, arguments: Value| -> String {
+            let listener = TcpListener::bind(SocketAddrV4::new(MCP_BIND_IP, 0))
+                .expect("ephemeral production-loopback listener");
+            let mut client =
+                TcpStream::connect(listener.local_addr().unwrap()).expect("loopback client");
+            client
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .expect("client read timeout");
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 73,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            })
+            .to_string();
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            client.write_all(request.as_bytes()).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+
+            let worker_state = Arc::clone(&state);
+            let worker_gate = Arc::clone(&gate);
+            let admission = accept_bounded_connection(
+                &listener,
+                Arc::clone(&active),
+                REQUEST_DEADLINE,
+                move |stream, deadline| {
+                    handle_connection_with_state(
+                        stream,
+                        worker_state.as_ref(),
+                        worker_gate,
+                        None,
+                        deadline,
+                    );
+                },
+                |job| {
+                    job();
+                    Ok(())
+                },
+            )
+            .expect("production listener admission");
+            assert_eq!(admission, ConnectionAdmission::Spawned);
+
+            let mut wire = String::new();
+            client.read_to_string(&mut wire).unwrap();
+            let (headers, body) = wire.split_once("\r\n\r\n").expect("complete HTTP response");
+            assert!(headers.starts_with("HTTP/1.1 200 OK"), "{headers}");
+            let payload: Value = serde_json::from_str(body).expect("JSON-RPC response");
+            payload["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing MCP text content: {payload}"))
+                .to_string()
+        };
+
+        let get_args = json!({
+            "meetingId": MEETING_ID,
+            "transcriptFormat": "structured",
+            "channel": "system",
+            "includeNote": false
+        });
+        let search_args = json!({
+            "query": "navigation needle",
+            "meetingId": MEETING_ID,
+            "channel": "system"
+        });
+        let chapters_args = json!({ "meetingId": MEETING_ID, "channel": "system" });
+
+        let locked_meeting = rpc_over_production_listener("get_meeting", get_args.clone());
+        let locked_search = rpc_over_production_listener("search_transcript", search_args.clone());
+        let locked_chapters =
+            rpc_over_production_listener("get_meeting_chapters", chapters_args.clone());
+        assert_eq!(locked_meeting, format!("No data for meeting {MEETING_ID}."));
+        assert_eq!(
+            locked_search,
+            "No transcript passages match \"navigation needle\"."
+        );
+        assert_eq!(
+            locked_chapters,
+            format!("No chapter map for meeting {MEETING_ID}.")
+        );
+        for masked in [&locked_meeting, &locked_search, &locked_chapters] {
+            assert!(
+                !masked.contains(SECRET) && !masked.contains("Navigation topic"),
+                "sealed content crossed the production connection path: {masked}"
+            );
+        }
+
+        // Mirror the final visibility transition of `unlock_folder`: the folder remains sealed on
+        // disk but becomes readable for this process session.
+        {
+            let _lifecycle = state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .unlocked_folders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(FOLDER_ID.into());
+        }
+        let structured_system = "[5–8] Others: unique navigation needle";
+        let expected_range = format!("offset 0..{}", structured_system.chars().count());
+        let open_meeting = rpc_over_production_listener("get_meeting", get_args.clone());
+        let open_search = rpc_over_production_listener("search_transcript", search_args.clone());
+        let open_chapters =
+            rpc_over_production_listener("get_meeting_chapters", chapters_args.clone());
+        assert!(
+            open_meeting.contains("format=structured, channel=system")
+                && open_meeting.contains(structured_system),
+            "channel-specific get_meeting did not traverse the full connection path: {open_meeting}"
+        );
+        assert!(
+            open_search.contains("channel=system")
+                && open_search.contains(SECRET)
+                && open_search.contains(&expected_range),
+            "search offset did not address the selected production MCP channel: {open_search}"
+        );
+        assert!(
+            open_chapters.contains("channel=system")
+                && open_chapters.contains("Navigation topic")
+                && open_chapters.contains(&expected_range),
+            "chapter offset did not address the selected production MCP channel: {open_chapters}"
+        );
+
+        {
+            let _lifecycle = state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.seal_epoch.fetch_add(1, Ordering::SeqCst);
+            state
+                .unlocked_folders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(FOLDER_ID);
+        }
+        let relocked_search = rpc_over_production_listener("search_transcript", search_args);
+        assert_eq!(
+            relocked_search,
+            "No transcript passages match \"navigation needle\"."
+        );
+        assert!(
+            !relocked_search.contains(SECRET),
+            "relocked transcript leaked through the production listener: {relocked_search}"
+        );
+
+        drop(state);
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -4186,7 +4731,7 @@ mod tests {
             "default must carry a timestamp token: {def}"
         );
         assert!(
-            def.contains("TRANSCRIPT (format=structured, TOTAL_CHARS:"),
+            def.contains("TRANSCRIPT (format=structured, channel=merged, TOTAL_CHARS:"),
             "the MCP default now discloses the transcript window total: {def}"
         );
 
@@ -4202,8 +4747,46 @@ mod tests {
         .unwrap();
         assert_eq!(
             plain,
-            "NOTE (TOTAL_CHARS: 1 (showing 0..1)):\nn\n[end of content]\n\nTRANSCRIPT (format=plain, TOTAL_CHARS: 15 (showing 0..15)):\nopening remarks\n[end of content]"
+            "NOTE (TOTAL_CHARS: 1 (showing 0..1)):\nn\n[end of content]\n\nTRANSCRIPT (format=plain, channel=merged, TOTAL_CHARS: 15 (showing 0..15)):\nopening remarks\n[end of content]"
         );
+        let invalid = dispatch_tool(
+            &db,
+            "get_meeting",
+            &json!({ "meetingId": "mm", "channel": "invented" }),
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid.0, -32602,
+            "invalid channel is a transport arg error"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn mcp_transcript_search_empty_queries_are_successful_zero_hits() {
+        let (db, p) = temp_db();
+        seed(
+            &db,
+            "m-empty-query",
+            "Must stay hidden",
+            "must stay hidden too",
+            None,
+        );
+        for query in ["", " \t\n "] {
+            let out = dispatch_tool(
+                &db,
+                "search_transcript",
+                &json!({ "query": query, "meetingId": "m-empty-query" }),
+                &HashSet::new(),
+            )
+            .expect("MCP empty query must not become a JSON-RPC argument error");
+            assert_eq!(out, "No transcript passages match \"\".");
+            assert!(
+                !out.contains("m-empty-query") && !out.contains("Must stay hidden"),
+                "scoped empty query disclosed meeting existence: {out}"
+            );
+        }
         let _ = std::fs::remove_file(&p);
     }
 
