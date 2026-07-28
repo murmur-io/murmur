@@ -1724,14 +1724,33 @@ def build_check_seatbelt_profile(
     modules = worktree / "node_modules"
     if modules.is_symlink():
         try:
-            read_paths.add(modules.resolve(strict=True))
+            modules_target = modules.resolve(strict=True)
+            if not modules_target.is_dir():
+                raise HarnessError(
+                    "shared node_modules target is not a real directory"
+                )
+            read_paths.add(modules_target)
             # esbuild resolves package metadata from the physical symlink
-            # target and may walk back to the primary checkout manifest.
-            # Permit only those committed metadata files, not the primary tree.
+            # target and may walk back to the manifest beside that target. A
+            # v2 verification snapshot is a self-contained repository, so its
+            # Git primary is the snapshot rather than the checkout that owns
+            # the shared dependency directory. Derive the metadata leaves
+            # from the physical target and permit only real regular files, not
+            # their parent checkout.
             for manifest_name in ("package.json", "package-lock.json"):
-                manifest = primary / manifest_name
-                if manifest.is_file():
-                    read_paths.add(manifest.resolve())
+                manifest = modules_target.parent / manifest_name
+                try:
+                    metadata = manifest.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
+                    metadata.st_mode
+                ):
+                    raise HarnessError(
+                        "shared node_modules manifest is not a real regular "
+                        f"file: {manifest}"
+                    )
+                read_paths.add(manifest.resolve(strict=True))
         except (FileNotFoundError, OSError) as exc:
             raise HarnessError("shared node_modules link became invalid before a check") from exc
     if expose_sherpa_archive:
@@ -3020,7 +3039,24 @@ def invoke_model(
                     if verdict == "BLOCKED"
                     else []
                 )
-                document["probe_requests"] = []
+                # `fake` is reachable only through the explicit selftest
+                # adapter gate. This knob exercises the real typed-probe state
+                # machine without exposing a production reviewer override.
+                fake_probe_id = os.environ.get(
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", ""
+                ).strip()
+                document["probe_requests"] = (
+                    [
+                        {
+                            "probe_id": fake_probe_id,
+                            "rationale": (
+                                "selftest-only typed probe state transition"
+                            ),
+                        }
+                    ]
+                    if fake_probe_id
+                    else []
+                )
         atomic_create_json(result_path, document)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("x", encoding="utf-8") as handle:
