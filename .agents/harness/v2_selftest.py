@@ -1064,6 +1064,201 @@ def verdict_cases(test: Tests) -> None:
     )
 
 
+def probe_precedence_flow_cases(test: Tests) -> None:
+    """Pin review-defect precedence through the real v2 verify transition."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-probe-precedence-") as raw:
+        root = Path(raw)
+        repo = root / "repo"
+        _init_repo(repo)
+        for relative in verifier.protocol_relative_paths(ROOT):
+            source = ROOT / relative
+            destination = repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", "add exact v2 protocol")
+        base = _git(repo, "rev-parse", "HEAD")
+        worktree = root / "task" / "meetnotes"
+        worktree.parent.mkdir()
+        branch = "agent/v2/probe-precedence"
+        _git(
+            repo,
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            str(worktree),
+            base,
+        )
+        common = Path(
+            _git(
+                repo,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_id = "probe-precedence"
+        task_dir = harness_cli.v2_task_dir(common, task_id)
+        task_dir.mkdir(parents=True)
+        contract: Dict[str, Any] = {
+            "schema_version": 2,
+            "task_id": task_id,
+            "description": "prove review defects outrank repeated typed probes",
+            "kind": "docs",
+            "base_sha": base,
+            "contract_sha256": "",
+            "repo_realpath": str(repo.resolve()),
+            "git_common_dir": str(common.resolve()),
+            "worktree_path": str(worktree.resolve()),
+            "branch": branch,
+            "owned_paths": ["owned.txt"],
+            "claims": [],
+            "reviewer": "fake",
+            "expected_change": True,
+            "degraded_provenance": [],
+            "created_at": legacy.utc_now(),
+        }
+        contract["contract_sha256"] = verifier.document_hash(
+            contract, "contract_sha256"
+        )
+        legacy.validate_schema(
+            contract,
+            legacy.load_schema("v2-task"),
+            label="v2 probe precedence contract",
+        )
+        legacy.atomic_write_json(task_dir / "task.json", contract)
+        legacy.atomic_write_json(
+            task_dir / "runtime.json",
+            {
+                "schema_version": 2,
+                "task_root": str(worktree.parent),
+                "shared_node_modules": None,
+                "server_worktree": None,
+                "server_source": str(root / "murmur-server"),
+                "server_revision": None,
+            },
+        )
+        harness_cli.set_v2_state(task_dir, "OPEN", phase="open")
+        owned = worktree / "owned.txt"
+        owned.write_text("base\nprobe precedence\n", encoding="utf-8")
+
+        saved_verdict = os.environ.get("MURMUR_HARNESS_FAKE_REVIEW_VERDICT")
+        saved_probe = os.environ.get(
+            "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+        )
+        os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
+        os.environ[
+            "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+        ] = "harness-python"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                collected = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            state = harness_cli.load_v2_state(task_dir)
+            attempt_dir = task_dir / "attempts" / str(state["attempt_id"])
+            probe_path = attempt_dir / "probes" / "harness-python.json"
+            probe_before = probe_path.read_bytes()
+            probe_mtime_before = probe_path.stat().st_mtime_ns
+            test.equal(
+                "PROBE flow first review collects allowlisted evidence",
+                collected,
+                "NEEDS_EVIDENCE",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                evidence_only = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            test.equal(
+                "PROBE flow PASS plus seen probe stays evidence-only",
+                evidence_only,
+                "NEEDS_EVIDENCE",
+            )
+            test.true(
+                "PROBE flow PASS plus seen probe does not rerun it",
+                probe_path.read_bytes() == probe_before
+                and probe_path.stat().st_mtime_ns == probe_mtime_before,
+            )
+
+            (attempt_dir / "reviews" / "combined.json").unlink()
+            os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "FAIL"
+            with contextlib.redirect_stdout(io.StringIO()):
+                failed = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            test.equal(
+                "PROBE flow FAIL plus seen probe becomes NEEDS_FIX",
+                failed,
+                "NEEDS_FIX",
+            )
+            test.equal(
+                "PROBE flow persists fix state ahead of probe state",
+                harness_cli.load_v2_state(task_dir)["status"],
+                "NEEDS_FIX",
+            )
+            test.true(
+                "PROBE flow FAIL plus seen probe executes nothing again",
+                probe_path.read_bytes() == probe_before
+                and probe_path.stat().st_mtime_ns == probe_mtime_before,
+            )
+
+            # A new exact diff without a probe request must still use the
+            # original evidence/checkpoint path, including a bound evidence
+            # document and the terminal complete phase.
+            owned.write_text(
+                "base\nprobe-free fix evidence path\n", encoding="utf-8"
+            )
+            os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                probe_free_failed = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            probe_free_state = harness_cli.load_v2_state(task_dir)
+            probe_free_evidence = Path(
+                str(probe_free_state["evidence_path"])
+            )
+            test.equal(
+                "PROBE-free FAIL preserves complete evidence transition",
+                (
+                    probe_free_failed,
+                    probe_free_state["status"],
+                    probe_free_state["phase"],
+                    probe_free_state["reason"],
+                    probe_free_evidence.is_file(),
+                ),
+                (
+                    "NEEDS_FIX",
+                    "NEEDS_FIX",
+                    "complete",
+                    "a review has unresolved FAIL/MAJOR/BLOCKER findings",
+                    True,
+                ),
+            )
+        finally:
+            if saved_verdict is None:
+                os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_VERDICT", None)
+            else:
+                os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = saved_verdict
+            if saved_probe is None:
+                os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None)
+            else:
+                os.environ[
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+                ] = saved_probe
+
+
 def retry_cases(test: Tests) -> None:
     calls: List[int] = []
 
@@ -1965,6 +2160,155 @@ def verification_snapshot_cases(test: Tests) -> None:
             not resumed_snapshot.exists()
             and worktree.is_dir()
             and primary.is_dir(),
+        )
+
+
+def snapshot_node_modules_manifest_cases(test: Tests) -> None:
+    """Exercise physical dependency-owner metadata in a standalone snapshot."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-snapshot-node-modules-"
+    ) as raw:
+        root = Path(raw)
+        primary = root / "primary"
+        _init_repo(primary)
+        (primary / ".gitignore").write_text("/node_modules/\n", encoding="utf-8")
+        physical_manifest = primary / "package.json"
+        physical_lock = primary / "package-lock.json"
+        physical_manifest.write_text(
+            '{"name":"snapshot-physical-owner"}\n', encoding="utf-8"
+        )
+        physical_lock.write_text(
+            '{"name":"snapshot-physical-owner","lockfileVersion":3}\n',
+            encoding="utf-8",
+        )
+        dependency = primary / "node_modules" / "fixture" / "package.json"
+        dependency.parent.mkdir(parents=True)
+        dependency.write_text('{"name":"fixture"}\n', encoding="utf-8")
+        _git(primary, "add", ".gitignore", "package.json", "package-lock.json")
+        _git(primary, "commit", "-q", "-m", "add dependency owner manifests")
+        base = _git(primary, "rev-parse", "HEAD")
+        worktree = root / "task" / "meetnotes"
+        worktree.parent.mkdir()
+        _git(
+            primary,
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            str(worktree),
+            base,
+        )
+        (worktree / "owned.txt").write_text(
+            "base\nmanifest snapshot change\n", encoding="utf-8"
+        )
+        common = Path(
+            _git(
+                primary,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_dir = harness_cli.v2_task_dir(
+            common, "snapshot-node-modules-owner"
+        )
+        attempt_dir = task_dir / "attempts" / ("e" * 64)
+        attempt_dir.mkdir(parents=True)
+        contract: Dict[str, Any] = {
+            "task_id": "snapshot-node-modules-owner",
+            "contract_sha256": "c" * 64,
+            "base_sha": base,
+            "repo_realpath": str(primary.resolve()),
+            "worktree_path": str(worktree.resolve()),
+            "owned_paths": ["owned.txt"],
+            "expected_change": True,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        legacy.atomic_write_json(task_dir / "task.json", contract)
+        paths, diff, tree = verifier.snapshot_scoped_diff(
+            worktree, contract, task_dir
+        )
+        plan = {
+            "base_sha": base,
+            "changed_paths": paths,
+            "diff_sha256": legacy.sha256_bytes(diff),
+            "tree_sha": tree,
+            "plan_sha256": "d" * 64,
+        }
+        snapshot = harness_cli._ensure_verification_snapshot(
+            contract, task_dir, plan, attempt_dir
+        )
+        test.equal(
+            "SNAPSHOT dependency link resolves to its physical owner",
+            (snapshot / "node_modules").resolve(strict=True),
+            (primary / "node_modules").resolve(strict=True),
+        )
+        command = (
+            f"{json.dumps(sys.executable)} -c "
+            + json.dumps(
+                "import json,pathlib;"
+                f"p=pathlib.Path({str(physical_manifest)!r});"
+                f"lock=pathlib.Path({str(physical_lock)!r});"
+                "assert json.loads(p.read_text())['name']"
+                "=='snapshot-physical-owner';"
+                "assert json.loads(lock.read_text())['lockfileVersion']==3"
+            )
+        )
+        evidence = legacy.run_check(
+            snapshot,
+            task_dir,
+            {
+                "id": "snapshot-physical-manifests",
+                "command": command,
+                "timeout_seconds": 10,
+            },
+            "snapshot-node-modules-owner",
+        )
+        expected_sandbox_mode = (
+            "inherited"
+            if legacy.inherited_outer_sandbox_is_active()
+            else "direct"
+        )
+        test.equal(
+            "SNAPSHOT Seatbelt reads both physical owner manifests",
+            (evidence["sandbox_mode"], evidence["passed"]),
+            (expected_sandbox_mode, True),
+        )
+        # The profile is emitted even when an outer sandbox is inherited.
+        # Inspect it unconditionally so this scope assertion can never turn
+        # vacuous merely because the selftest itself is sandboxed.
+        profile_text = Path(str(evidence["sandbox_profile_path"])).read_text(
+            encoding="utf-8"
+        )
+        owner_literal = json.dumps(str(primary.resolve()))
+        manifest_literal = json.dumps(str(physical_manifest.resolve()))
+        lock_literal = json.dumps(str(physical_lock.resolve()))
+        test.true(
+            "SNAPSHOT Seatbelt grants manifest leaves, not owner subtree",
+            f"(literal {manifest_literal})" in profile_text
+            and f"(literal {lock_literal})" in profile_text
+            and f"(subpath {owner_literal})" not in profile_text,
+        )
+
+        physical_manifest.unlink()
+        physical_manifest.symlink_to(physical_lock.name)
+        test.raises(
+            "SNAPSHOT rejects a symlinked physical owner manifest",
+            lambda: legacy.run_check(
+                snapshot,
+                task_dir,
+                {
+                    "id": "snapshot-symlinked-manifest",
+                    "command": command,
+                    "timeout_seconds": 10,
+                },
+                "snapshot-node-modules-owner",
+            ),
+            "shared node_modules manifest is not a real regular file",
+        )
+        harness_cli._discard_claimed_verification_snapshot(
+            contract, attempt_dir, snapshot
         )
 
 
@@ -3261,12 +3605,14 @@ def main() -> int:
     profile_cases(test)
     reviewer_tool_guard_cases(test)
     verdict_cases(test)
+    probe_precedence_flow_cases(test)
     retry_cases(test)
     guardian_and_artifact_cases(test)
     readonly_review_wall_timeout_cases(test)
     state_and_lock_cases(test)
     standalone_driver_lane_cases(test)
     verification_snapshot_cases(test)
+    snapshot_node_modules_manifest_cases(test)
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
