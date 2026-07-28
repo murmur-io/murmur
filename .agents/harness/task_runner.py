@@ -55,6 +55,7 @@ REVIEWER_TOOL_DENIAL = {
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RECEIPT_POLICY_VERSION = 2
 TERMINAL_STATES = {"PASSED", "FAILED", "BLOCKED", "COMMITTED", "CLOSED", "REAPED"}
 REAPABLE_STATES = {"FAILED", "BLOCKED", "CLOSED"}
 ABANDONABLE_STATES = {"INITIALIZED", "RUNNING", "CHECKING", "REVIEWING", "REPAIRING"}
@@ -3372,6 +3373,8 @@ def invoke_model(
             "argv": recorded_argv,
             "cwd": str(model_cwd),
             "wall_timeout_seconds": timeout_seconds,
+            "process_duration_ms": process_result["duration_ms"],
+            "process_timed_out": bool(process_result["timed_out"]),
             "budget_usd": budget,
             "removed_env_names": removed_env_names,
             "instructions_sha256": instructions_sha256,
@@ -3427,6 +3430,16 @@ def writer_prompt(contract: Mapping[str, Any], feedback: Sequence[Mapping[str, A
         learning_prompt(contract, role="writer"),
         "\n## Task contract\n```json\n" + json.dumps(contract, indent=2, sort_keys=True) + "\n```",
     ]
+    if contract.get("prepared_input_sha256"):
+        sections.append(
+            "\n## PREPARED_CONTROL_PLANE_READ_ONLY\n"
+            "This protected control-plane candidate was hash-sealed before model "
+            "dispatch. Its staged bytes are immutable. Inspect them read-only and "
+            "do not call editing or write tools. Return status=completed when the "
+            "sealed candidate already satisfies the contract. Return status=blocked "
+            "only for a concrete missing behavior, with its exact location. The "
+            "external runner owns all authoritative checks."
+        )
     if feedback:
         sections.append("\n## Authoritative feedback from the previous round\n```json\n" + json.dumps(feedback, indent=2) + "\n```")
     return "\n".join(sections)
@@ -3935,12 +3948,20 @@ def create_attestation(
                 "round": index + 1,
                 "label": run["label"],
                 "vendor": run["vendor"],
+                "cli_version": run["cli_version"],
+                "model": run["model"],
                 "session_id": run["session_id"],
                 "degraded": run.get("degraded"),
                 "timed_out": bool(run.get("timed_out")),
                 "duration_ms": run.get("duration_ms"),
+                "result_path": run["result_path"],
                 "artifact_sha256": run["artifact_sha256"],
+                "invocation_path": run["invocation_path"],
+                "invocation_sha256": run["invocation_sha256"],
+                "prompt_sha256": run["prompt_sha256"],
+                "log_path": run["log"],
                 "log_sha256": run["log_sha256"],
+                "created_at": run["created_at"],
             }
             for index, run in enumerate(writer_runs)
         ],
@@ -4089,6 +4110,11 @@ def run_task(
     contract: Dict[str, Any], task_dir: Path, *, allow_test_adapter: bool = False
 ) -> str:
     assert_v1_not_imported(task_dir)
+    if contract.get("receipt_policy_version") != RECEIPT_POLICY_VERSION:
+        raise HarnessError(
+            "legacy task contracts are read-only; import the diff or create a "
+            "new lineage-bound task before running"
+        )
     assert_external_v1_control_plane(
         contract, allow_test_adapter=allow_test_adapter
     )
@@ -4598,6 +4624,10 @@ def verify_model_invocation(
     expected_path: Path,
     instructions_sha256: str,
     prompt_sha256: Optional[str] = None,
+    require_cwd_binding: bool,
+    expected_writer_cwd: Optional[Path] = None,
+    expected_process_duration_ms: Optional[int] = None,
+    expected_process_timed_out: Optional[bool] = None,
 ) -> dt.datetime:
     invocation_path = evidence_file(task_dir, invocation_path_raw, expected_path, f"{label} invocation")
     if sha256_file(invocation_path) != invocation_sha256:
@@ -4633,17 +4663,40 @@ def verify_model_invocation(
         raise HarnessError(f"{label} invocation argv is missing")
     if Path(argv[0]).name != vendor:
         raise HarnessError(f"{label} invocation executable does not match vendor {vendor}")
-    invocation_cwd = invocation.get("cwd")
-    if not isinstance(invocation_cwd, str) or not Path(invocation_cwd).is_absolute():
-        raise HarnessError(f"{label} invocation cwd is missing or not absolute")
-    if role == "reviewer" and Path(invocation_cwd) != reviewer_execution_cwd():
-        raise HarnessError(f"{label} reviewer did not run from the isolated cwd")
+    if "cwd" not in invocation:
+        if require_cwd_binding:
+            raise HarnessError(f"{label} invocation cwd is missing")
+    else:
+        invocation_cwd = invocation.get("cwd")
+        if not isinstance(invocation_cwd, str) or not Path(invocation_cwd).is_absolute():
+            raise HarnessError(f"{label} invocation cwd is not absolute")
+        if role == "reviewer" and Path(invocation_cwd) != reviewer_execution_cwd():
+            raise HarnessError(f"{label} reviewer did not run from the isolated cwd")
+        if (
+            role == "writer"
+            and require_cwd_binding
+            and expected_writer_cwd is not None
+            and Path(invocation_cwd) != expected_writer_cwd.resolve()
+        ):
+            raise HarnessError(f"{label} writer did not run from the task worktree")
     timeout = invocation.get("wall_timeout_seconds")
     if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
         raise HarnessError(f"{label} invocation timeout is invalid")
     removed = invocation.get("removed_env_names")
     if not isinstance(removed, list) or any(not isinstance(name, str) for name in removed):
         raise HarnessError(f"{label} invocation environment audit is malformed")
+    if (
+        expected_process_duration_ms is not None
+        and invocation.get("process_duration_ms")
+        != expected_process_duration_ms
+    ):
+        raise HarnessError(f"{label} invocation duration differs from process evidence")
+    if (
+        expected_process_timed_out is not None
+        and invocation.get("process_timed_out")
+        is not expected_process_timed_out
+    ):
+        raise HarnessError(f"{label} invocation timeout differs from process evidence")
     return parse_timestamp(invocation.get("created_at"), f"{label}.invocation.created_at")
 
 
@@ -4673,6 +4726,12 @@ def verify_attestation(
         if not condition:
             failures.append(message)
 
+    receipt_policy_version = contract.get("receipt_policy_version")
+    modern_receipt = receipt_policy_version == RECEIPT_POLICY_VERSION
+    require(
+        receipt_policy_version in (None, RECEIPT_POLICY_VERSION),
+        "unsupported task receipt policy version",
+    )
     if contract_hash(contract) != contract.get("contract_sha256"):
         failures.append("task contract hash is stale")
     disk_contract = load_json(task_dir / "task.json")
@@ -4777,6 +4836,11 @@ def verify_attestation(
         require(isinstance(writer.get(field), str) and bool(writer.get(field)), f"writer {field} provenance is empty")
     provenance_version = attestation.get("provenance_schema_version")
     writer_attempts = attestation.get("writer_attempts", [])
+    if modern_receipt:
+        require(
+            provenance_version == RECEIPT_POLICY_VERSION,
+            "modern attestation is missing provenance schema version 2",
+        )
     if provenance_version is None:
         # Compatibility path for already-earned v1 receipts. They predate the
         # aggregate writer-attempt fields and are surfaced conservatively by
@@ -4803,14 +4867,239 @@ def verify_attestation(
                 and attempt.get("label") == f"round-{index + 1:02d}-writer",
                 f"writer_attempts round {index + 1} provenance is malformed",
             )
+            if not isinstance(attempt, dict):
+                continue
+            require(
+                attempt.get("vendor") == contract["writer"],
+                f"writer_attempts round {index + 1} vendor differs from the task contract",
+            )
+            require(
+                isinstance(attempt.get("session_id"), str)
+                and bool(attempt.get("session_id")),
+                f"writer_attempts round {index + 1} session provenance is empty",
+            )
+            if modern_receipt:
+                for text_field in ("cli_version", "model"):
+                    require(
+                        isinstance(attempt.get(text_field), str)
+                        and bool(attempt.get(text_field)),
+                        f"writer_attempts round {index + 1} {text_field} provenance is empty",
+                    )
+            require(
+                attempt.get("degraded")
+                in {None, "timeout", "unparseable-report"},
+                f"writer_attempts round {index + 1} degraded provenance is invalid",
+            )
+            require(
+                isinstance(attempt.get("timed_out"), bool),
+                f"writer_attempts round {index + 1} timeout provenance is invalid",
+            )
+            duration_ms = attempt.get("duration_ms")
+            require(
+                duration_ms is None
+                or (
+                    isinstance(duration_ms, int)
+                    and not isinstance(duration_ms, bool)
+                    and duration_ms >= 0
+                ),
+                f"writer_attempts round {index + 1} duration provenance is invalid",
+            )
+            if modern_receipt:
+                require(
+                    isinstance(duration_ms, int)
+                    and not isinstance(duration_ms, bool)
+                    and duration_ms >= 0,
+                    f"writer_attempts round {index + 1} duration provenance is missing",
+                )
+            hash_fields = ["artifact_sha256", "log_sha256"]
+            if modern_receipt:
+                hash_fields.extend(
+                    ("invocation_sha256", "prompt_sha256")
+                )
+            for hash_field in hash_fields:
+                hash_value = attempt.get(hash_field)
+                require(
+                    isinstance(hash_value, str)
+                    and SHA256_RE.fullmatch(hash_value) is not None,
+                    f"writer_attempts round {index + 1} {hash_field} is invalid",
+                )
+            if attempt.get("timed_out"):
+                require(
+                    attempt.get("degraded") == "timeout",
+                    f"writer_attempts round {index + 1} timeout is not marked degraded",
+                )
+            if attempt.get("degraded") == "timeout":
+                require(
+                    attempt.get("timed_out") is True,
+                    f"writer_attempts round {index + 1} timeout degradation is inconsistent",
+                )
+            if modern_receipt:
+                attempt_label = f"round-{index + 1:02d}-writer"
+                attempt_vendor = attempt.get("vendor")
+                attempt_session = attempt.get("session_id")
+                attempt_model = attempt.get("model")
+                attempt_cli_version = attempt.get("cli_version")
+                if not all(
+                    isinstance(value, str) and bool(value)
+                    for value in (
+                        attempt_vendor,
+                        attempt_session,
+                        attempt_model,
+                        attempt_cli_version,
+                    )
+                ):
+                    continue
+                result_expected = (
+                    task_dir
+                    / "results"
+                    / f"{attempt_label}-{attempt_vendor}.json"
+                )
+                invocation_expected = (
+                    task_dir
+                    / "results"
+                    / f"{attempt_label}-{attempt_vendor}-invocation.json"
+                )
+                log_expected = (
+                    task_dir
+                    / "logs"
+                    / f"{attempt_label}-{attempt_vendor}.jsonl"
+                )
+                try:
+                    result_path = evidence_file(
+                        task_dir,
+                        attempt.get("result_path"),
+                        result_expected,
+                        f"{attempt_label} result",
+                    )
+                    require(
+                        sha256_file(result_path)
+                        == attempt.get("artifact_sha256"),
+                        f"writer_attempts round {index + 1} result artifact changed",
+                    )
+                    attempt_result = load_json(result_path)
+                    validate_schema(
+                        attempt_result,
+                        load_schema("model-result"),
+                        label=f"{attempt_label} result",
+                    )
+                    require(
+                        attempt_result.get("status") == "completed",
+                        f"writer_attempts round {index + 1} did not complete",
+                    )
+                    invocation_time = verify_model_invocation(
+                        task_dir,
+                        vendor=attempt_vendor,
+                        role="writer",
+                        label=attempt_label,
+                        session_id=attempt_session,
+                        model=attempt_model,
+                        cli_version=attempt_cli_version,
+                        invocation_path_raw=attempt.get("invocation_path"),
+                        invocation_sha256=attempt.get(
+                            "invocation_sha256"
+                        ),
+                        expected_path=invocation_expected,
+                        instructions_sha256=contract[
+                            "instructions_sha256"
+                        ],
+                        prompt_sha256=attempt.get("prompt_sha256"),
+                        require_cwd_binding=True,
+                        expected_writer_cwd=worktree,
+                        expected_process_duration_ms=duration_ms,
+                        expected_process_timed_out=attempt.get(
+                            "timed_out"
+                        ),
+                    )
+                    attempt_time = parse_timestamp(
+                        attempt.get("created_at"),
+                        f"writer_attempts[{index}].created_at",
+                    )
+                    require(
+                        attempt_time == invocation_time,
+                        f"writer_attempts round {index + 1} timestamp differs from invocation metadata",
+                    )
+                    log_path = evidence_file(
+                        task_dir,
+                        attempt.get("log_path"),
+                        log_expected,
+                        f"{attempt_label} log",
+                    )
+                    execution_ids = {
+                        _artifact_execution_id(
+                            result_path,
+                            result_expected,
+                        ),
+                        _artifact_execution_id(
+                            Path(str(attempt.get("invocation_path"))),
+                            invocation_expected,
+                        ),
+                        _artifact_execution_id(
+                            log_path,
+                            log_expected,
+                        ),
+                    }
+                    require(
+                        len(execution_ids) == 1,
+                        f"writer_attempts round {index + 1} artifacts come from different executions",
+                    )
+                    require(
+                        sha256_file(log_path)
+                        == attempt.get("log_sha256"),
+                        f"writer_attempts round {index + 1} log changed",
+                    )
+                    if attempt_vendor != "fake":
+                        log_metadata = extract_model_metadata(
+                            log_path,
+                            attempt_vendor,
+                            attempt_session,
+                        )
+                        require(
+                            log_metadata["session_id"]
+                            == attempt_session,
+                            f"writer_attempts round {index + 1} session differs from the model log",
+                        )
+                        require(
+                            log_metadata["model"] == attempt_model,
+                            f"writer_attempts round {index + 1} model differs from the model log",
+                        )
+                    require(
+                        task_created
+                        <= attempt_time
+                        <= receipt_created,
+                        f"writer_attempts round {index + 1} timestamp is outside the task lifetime",
+                    )
+                except HarnessError as exc:
+                    failures.append(str(exc))
         if writer_attempts:
             latest_attempt = writer_attempts[-1]
             require(
-                latest_attempt.get("session_id") == writer.get("session_id")
+                latest_attempt.get("vendor") == writer.get("vendor")
+                and latest_attempt.get("session_id") == writer.get("session_id")
                 and latest_attempt.get("artifact_sha256") == writer.get("artifact_sha256")
                 and latest_attempt.get("log_sha256") == writer.get("log_sha256"),
                 "final writer summary differs from writer_attempts",
             )
+            if modern_receipt:
+                require(
+                    latest_attempt.get("cli_version")
+                    == writer.get("cli_version")
+                    and latest_attempt.get("model") == writer.get("model")
+                    and latest_attempt.get("degraded")
+                    == writer.get("degraded")
+                    and bool(latest_attempt.get("timed_out"))
+                    == bool(writer.get("timed_out"))
+                    and latest_attempt.get("duration_ms")
+                    == writer.get("duration_ms")
+                    and latest_attempt.get("result_path")
+                    == writer.get("result_path")
+                    and latest_attempt.get("invocation_path")
+                    == writer.get("invocation_path")
+                    and latest_attempt.get("invocation_sha256")
+                    == writer.get("invocation_sha256")
+                    and latest_attempt.get("log_path")
+                    == writer.get("log_path"),
+                    "final writer summary differs from writer_attempts",
+                )
         expected_degraded = [
             {
                 "round": attempt.get("round"),
@@ -4848,6 +5137,8 @@ def verify_attestation(
                 invocation_sha256=writer.get("invocation_sha256"),
                 expected_path=writer_invocation_expected,
                 instructions_sha256=contract["instructions_sha256"],
+                require_cwd_binding=modern_receipt,
+                expected_writer_cwd=worktree,
             )
             writer_time = parse_timestamp(writer.get("created_at"), "writer.created_at")
             require(writer_time == invocation_time, "writer timestamp differs from invocation metadata")
@@ -5034,10 +5325,11 @@ def verify_attestation(
                 validate_schema(result, load_schema("review"), label=f"review {kind} result")
                 require(result.get("verdict") == "PASS", f"review {kind} result artifact is not PASS")
                 artifact_findings = result.get("findings", [])
-                require(
-                    review.get("findings") == artifact_findings,
-                    f"review {kind} findings summary differs from its result artifact",
-                )
+                if modern_receipt or "findings" in review:
+                    require(
+                        review.get("findings") == artifact_findings,
+                        f"review {kind} findings summary differs from its result artifact",
+                    )
                 require(
                     not any(
                         isinstance(finding, Mapping)
@@ -5058,6 +5350,7 @@ def verify_attestation(
                     invocation_sha256=review.get("invocation_sha256"),
                     expected_path=invocation_expected,
                     instructions_sha256=contract["instructions_sha256"],
+                    require_cwd_binding=modern_receipt,
                 )
                 log_path = evidence_file(task_dir, review.get("log_path"), log_expected, f"review {kind} log")
                 execution_ids = {
@@ -5266,6 +5559,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     created_at = utc_now()
     contract: Dict[str, Any] = {
         "schema_version": 1,
+        "receipt_policy_version": RECEIPT_POLICY_VERSION,
         "task_id": args.task_id,
         "description": prompt,
         "kind": args.kind,
@@ -6831,6 +7125,37 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             cmd_init(args)
             contract, task_dir, _ = load_task_from_current_repo("selftest-pass", repo)
             worktree = Path(contract["worktree_path"])
+            if contract.get("receipt_policy_version") != RECEIPT_POLICY_VERSION:
+                failures.append("new v1 task was not bound to receipt policy 2")
+            unfinished_legacy_contract = copy.deepcopy(contract)
+            unfinished_legacy_contract.pop("receipt_policy_version", None)
+            unfinished_legacy_contract["contract_sha256"] = contract_hash(
+                unfinished_legacy_contract
+            )
+            unfinished_events_before = (
+                task_dir / "events.jsonl"
+            ).read_bytes()
+            try:
+                run_task(
+                    unfinished_legacy_contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+                failures.append("unfinished markerless legacy task was allowed to run")
+            except HarnessError as exc:
+                if "legacy task contracts are read-only" not in str(exc):
+                    failures.append(
+                        "unfinished markerless legacy task returned an unclear error"
+                    )
+            if (
+                load_json(task_dir / "state.json").get("status")
+                != "INITIALIZED"
+                or (task_dir / "events.jsonl").read_bytes()
+                != unfinished_events_before
+            ):
+                failures.append(
+                    "markerless legacy run refusal mutated lifecycle evidence"
+                )
             shared_modules = worktree / "node_modules"
             if not shared_modules.is_symlink() or shared_modules.resolve() != (repo / "node_modules").resolve():
                 failures.append("isolated worktree did not safely share ignored node_modules")
@@ -6918,6 +7243,13 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             ):
                 failures.append(
                     "prepared harness seal did not rebind and receipt the instruction migration"
+                )
+            if (
+                "PREPARED_CONTROL_PLANE_READ_ONLY"
+                not in writer_prompt(sealed_contract, [])
+            ):
+                failures.append(
+                    "prepared harness writer prompt did not forbid edits to sealed bytes"
                 )
             sealed_skill = (
                 prepared_worktree
@@ -7042,6 +7374,157 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 )
             verify_attestation(contract, task_dir, allow_test_adapter=True)
             original_attestation = load_json(task_dir / "attestation.json")
+            if (
+                original_attestation.get("provenance_schema_version")
+                != RECEIPT_POLICY_VERSION
+            ):
+                failures.append("new v1 attestation omitted provenance schema 2")
+
+            def expect_receipt_rejection(
+                candidate: Mapping[str, Any],
+                *,
+                label: str,
+                message_fragment: str,
+            ) -> None:
+                atomic_write_json(task_dir / "attestation.json", candidate)
+                try:
+                    verify_attestation(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                    failures.append(f"canonical verifier accepted {label}")
+                except HarnessError as exc:
+                    if message_fragment not in str(exc):
+                        failures.append(
+                            f"{label} failed for an unrelated reason"
+                        )
+                finally:
+                    atomic_write_json(
+                        task_dir / "attestation.json",
+                        original_attestation,
+                    )
+
+            stripped_modern_attestation = copy.deepcopy(original_attestation)
+            for field in (
+                "provenance_schema_version",
+                "writer_attempts",
+                "degraded_provenance",
+            ):
+                stripped_modern_attestation.pop(field, None)
+            expect_receipt_rejection(
+                stripped_modern_attestation,
+                label="modern receipt with stripped provenance fields",
+                message_fragment="modern attestation is missing provenance schema version 2",
+            )
+
+            rewritten_attempt_attestation = copy.deepcopy(
+                original_attestation
+            )
+            rewritten_attempt_attestation["writer_attempts"][0][
+                "vendor"
+            ] = "claude"
+            expect_receipt_rejection(
+                rewritten_attempt_attestation,
+                label="modern receipt with rewritten per-round writer vendor",
+                message_fragment="vendor differs from the task contract",
+            )
+
+            missing_findings_attestation = copy.deepcopy(original_attestation)
+            missing_findings_attestation["reviews"][0].pop("findings", None)
+            expect_receipt_rejection(
+                missing_findings_attestation,
+                label="modern receipt with a missing review findings summary",
+                message_fragment="findings summary differs",
+            )
+
+            mismatched_findings_attestation = copy.deepcopy(original_attestation)
+            mismatched_findings_attestation["reviews"][0]["findings"] = [
+                {
+                    "severity": "INFO",
+                    "file": "owned.txt",
+                    "evidence": "forged receipt-only finding",
+                    "required_fix": "",
+                }
+            ]
+            expect_receipt_rejection(
+                mismatched_findings_attestation,
+                label="modern receipt with a mismatched review findings summary",
+                message_fragment="findings summary differs",
+            )
+
+            writer_invocation_path = Path(
+                original_attestation["writer"]["invocation_path"]
+            )
+            original_writer_invocation = load_json(writer_invocation_path)
+            missing_cwd_invocation = copy.deepcopy(original_writer_invocation)
+            missing_cwd_invocation.pop("cwd", None)
+            atomic_write_json(writer_invocation_path, missing_cwd_invocation)
+            missing_cwd_attestation = copy.deepcopy(original_attestation)
+            missing_cwd_attestation["writer"]["invocation_sha256"] = sha256_file(
+                writer_invocation_path
+            )
+            try:
+                expect_receipt_rejection(
+                    missing_cwd_attestation,
+                    label="modern receipt with a missing writer cwd binding",
+                    message_fragment="invocation cwd is missing",
+                )
+            finally:
+                atomic_write_json(
+                    writer_invocation_path,
+                    original_writer_invocation,
+                )
+
+            wrong_writer_cwd_invocation = copy.deepcopy(
+                original_writer_invocation
+            )
+            wrong_writer_cwd_invocation["cwd"] = "/"
+            atomic_write_json(
+                writer_invocation_path,
+                wrong_writer_cwd_invocation,
+            )
+            wrong_writer_cwd_attestation = copy.deepcopy(
+                original_attestation
+            )
+            wrong_writer_cwd_attestation["writer"][
+                "invocation_sha256"
+            ] = sha256_file(writer_invocation_path)
+            try:
+                expect_receipt_rejection(
+                    wrong_writer_cwd_attestation,
+                    label="writer invocation rebound outside the task worktree",
+                    message_fragment="writer did not run from the task worktree",
+                )
+            finally:
+                atomic_write_json(
+                    writer_invocation_path,
+                    original_writer_invocation,
+                )
+
+            reviewer_invocation_path = Path(
+                original_attestation["reviews"][0]["invocation_path"]
+            )
+            original_reviewer_invocation = load_json(reviewer_invocation_path)
+            mutable_cwd_invocation = copy.deepcopy(original_reviewer_invocation)
+            mutable_cwd_invocation["cwd"] = str(worktree)
+            atomic_write_json(reviewer_invocation_path, mutable_cwd_invocation)
+            mutable_cwd_attestation = copy.deepcopy(original_attestation)
+            mutable_cwd_attestation["reviews"][0][
+                "invocation_sha256"
+            ] = sha256_file(reviewer_invocation_path)
+            try:
+                expect_receipt_rejection(
+                    mutable_cwd_attestation,
+                    label="reviewer invocation rebound to a mutable task cwd",
+                    message_fragment="reviewer did not run from the isolated cwd",
+                )
+            finally:
+                atomic_write_json(
+                    reviewer_invocation_path,
+                    original_reviewer_invocation,
+                )
+
             reused_session_attestation = copy.deepcopy(original_attestation)
             for review in reused_session_attestation["reviews"]:
                 review["reviewer"]["session_id"] = reused_session_attestation["writer"]["session_id"]
@@ -7054,37 +7537,273 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             finally:
                 atomic_write_json(task_dir / "attestation.json", original_attestation)
 
-            severe_attestation = copy.deepcopy(original_attestation)
-            severe_review = severe_attestation["reviews"][0]
-            severe_result_path = Path(severe_review["result_path"])
+            severe_result_path = Path(
+                original_attestation["reviews"][0]["result_path"]
+            )
             original_review_result = load_json(severe_result_path)
-            severe_result = copy.deepcopy(original_review_result)
-            severe_result["verdict"] = "PASS"
-            severe_result["findings"] = [
-                {
-                    "severity": "MAJOR",
-                    "file": "owned.txt",
-                    "evidence": "forged PASS still contains a major defect",
-                    "required_fix": "repair it",
-                }
-            ]
-            atomic_write_json(severe_result_path, severe_result)
-            severe_review["artifact_sha256"] = sha256_file(severe_result_path)
-            severe_review["findings"] = severe_result["findings"]
-            atomic_write_json(task_dir / "attestation.json", severe_attestation)
-            try:
-                verify_attestation(contract, task_dir, allow_test_adapter=True)
-                failures.append(
-                    "canonical verifier accepted forged PASS plus MAJOR finding"
+            for severity in ("MAJOR", "BLOCKER"):
+                severe_attestation = copy.deepcopy(original_attestation)
+                severe_review = severe_attestation["reviews"][0]
+                severe_result = copy.deepcopy(original_review_result)
+                severe_result["verdict"] = "PASS"
+                severe_result["findings"] = [
+                    {
+                        "severity": severity,
+                        "file": "owned.txt",
+                        "evidence": (
+                            "forged PASS still contains an unresolved "
+                            f"{severity.lower()} defect"
+                        ),
+                        "required_fix": "repair it",
+                    }
+                ]
+                atomic_write_json(severe_result_path, severe_result)
+                severe_review["artifact_sha256"] = sha256_file(
+                    severe_result_path
                 )
-            except HarnessError as exc:
-                if "MAJOR/BLOCKER" not in str(exc):
-                    failures.append(
-                        "forged PASS plus MAJOR failed for an unrelated reason"
+                severe_review["findings"] = severe_result["findings"]
+                atomic_write_json(
+                    task_dir / "attestation.json",
+                    severe_attestation,
+                )
+                try:
+                    verify_attestation(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
                     )
+                    failures.append(
+                        "canonical verifier accepted forged PASS plus "
+                        f"{severity} finding"
+                    )
+                except HarnessError as exc:
+                    if "MAJOR/BLOCKER" not in str(exc):
+                        failures.append(
+                            f"forged PASS plus {severity} failed for an "
+                            "unrelated reason"
+                        )
+                finally:
+                    atomic_write_json(
+                        severe_result_path,
+                        original_review_result,
+                    )
+                    atomic_write_json(
+                        task_dir / "attestation.json",
+                        original_attestation,
+                    )
+
+            # Historical v1 receipts were honestly earned before policy 2 and
+            # therefore have no contract marker, provenance aggregate, review
+            # findings summary, or invocation cwd. This fixture declares that
+            # old field set directly (including the created_at of the archived
+            # harness-v2-engine2 receipt); it is not made by deleting a marker
+            # from the on-disk modern contract. A deliberate rewrite of every
+            # runner-owned contract/receipt byte is outside this consistency
+            # receipt's threat model and would require signing, which the
+            # harness intentionally does not claim.
+            original_contract_artifact = load_json(task_dir / "task.json")
+            original_invocations: Dict[Path, Dict[str, Any]] = {}
+            legacy_contract = {
+                key: copy.deepcopy(contract[key])
+                for key in (
+                    "schema_version",
+                    "task_id",
+                    "description",
+                    "kind",
+                    "base_sha",
+                    "contract_sha256",
+                    "instructions_sha256",
+                    "dependency_revisions",
+                    "repo_realpath",
+                    "git_common_dir",
+                    "worktree_path",
+                    "branch",
+                    "owned_paths",
+                    "risk_flags",
+                    "writer",
+                    "reviewer",
+                    "max_repair_rounds",
+                    "checks",
+                    "final_checks",
+                    "expected_change",
+                    "created_at",
+                )
+            }
+            legacy_contract["created_at"] = "2026-07-28T02:26:48Z"
+            legacy_contract["contract_sha256"] = contract_hash(legacy_contract)
+            legacy_attestation = {
+                key: copy.deepcopy(original_attestation[key])
+                for key in (
+                    "schema_version",
+                    "task_id",
+                    "contract_sha256",
+                    "instructions_sha256",
+                    "dependency_revisions",
+                    "base_sha",
+                    "head_sha",
+                    "tree_sha",
+                    "staged_diff_sha256",
+                    "repo_realpath",
+                    "worktree_path",
+                    "risk_flags",
+                    "writer",
+                    "reviewer",
+                    "rounds",
+                    "checks",
+                    "reviews",
+                    "verdict",
+                    "created_at",
+                )
+            }
+            legacy_attestation["contract_sha256"] = legacy_contract[
+                "contract_sha256"
+            ]
+            invocation_summaries = [
+                legacy_attestation["writer"],
+                *legacy_attestation["reviews"],
+            ]
+            try:
+                for summary in invocation_summaries:
+                    invocation_path = Path(summary["invocation_path"])
+                    invocation_document = load_json(invocation_path)
+                    original_invocations[invocation_path] = invocation_document
+                    legacy_invocation = copy.deepcopy(invocation_document)
+                    legacy_invocation.pop("cwd", None)
+                    atomic_write_json(invocation_path, legacy_invocation)
+                    summary["invocation_sha256"] = sha256_file(invocation_path)
+                historical_review_result = copy.deepcopy(
+                    original_review_result
+                )
+                historical_review_result["verdict"] = "PASS"
+                historical_review_result["findings"] = []
+                atomic_write_json(
+                    severe_result_path,
+                    historical_review_result,
+                )
+                legacy_attestation["reviews"][0][
+                    "artifact_sha256"
+                ] = sha256_file(severe_result_path)
+                for review in legacy_attestation["reviews"]:
+                    review.pop("findings", None)
+                atomic_write_json(task_dir / "task.json", legacy_contract)
+                atomic_write_json(
+                    task_dir / "attestation.json",
+                    legacy_attestation,
+                )
+                try:
+                    verify_attestation(
+                        legacy_contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                except HarnessError as exc:
+                    failures.append(
+                        "genuine historical-shape markerless receipt was "
+                        f"rejected: {exc}"
+                    )
+                severe_legacy_result = copy.deepcopy(
+                    historical_review_result
+                )
+                severe_legacy_result["findings"] = [
+                    {
+                        "severity": "MAJOR",
+                        "file": "owned.txt",
+                        "evidence": (
+                            "legacy PASS must not launder a severe finding"
+                        ),
+                        "required_fix": "reject the receipt",
+                    }
+                ]
+                atomic_write_json(
+                    severe_result_path,
+                    severe_legacy_result,
+                )
+                severe_legacy_attestation = copy.deepcopy(
+                    legacy_attestation
+                )
+                severe_legacy_attestation["reviews"][0][
+                    "artifact_sha256"
+                ] = sha256_file(severe_result_path)
+                atomic_write_json(
+                    task_dir / "attestation.json",
+                    severe_legacy_attestation,
+                )
+                try:
+                    verify_attestation(
+                        legacy_contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                    failures.append(
+                        "legacy receipt accepted unresolved MAJOR finding"
+                    )
+                except HarnessError as exc:
+                    if "unresolved MAJOR/BLOCKER" not in str(exc):
+                        failures.append(
+                            "legacy severe finding failed for an unrelated "
+                            "reason"
+                        )
+                atomic_write_json(
+                    severe_result_path,
+                    historical_review_result,
+                )
+                atomic_write_json(
+                    task_dir / "attestation.json",
+                    legacy_attestation,
+                )
+                invalid_legacy_invocation = load_json(
+                    writer_invocation_path
+                )
+                invalid_legacy_invocation["cwd"] = None
+                atomic_write_json(
+                    writer_invocation_path,
+                    invalid_legacy_invocation,
+                )
+                invalid_legacy_attestation = copy.deepcopy(
+                    legacy_attestation
+                )
+                invalid_legacy_attestation["writer"][
+                    "invocation_sha256"
+                ] = sha256_file(writer_invocation_path)
+                atomic_write_json(
+                    task_dir / "attestation.json",
+                    invalid_legacy_attestation,
+                )
+                try:
+                    verify_attestation(
+                        legacy_contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                    failures.append(
+                        "legacy receipt accepted an explicitly null cwd"
+                    )
+                except HarnessError as exc:
+                    if "invocation cwd is not absolute" not in str(exc):
+                        failures.append(
+                            "legacy explicit-null cwd failed for an unrelated "
+                            "reason"
+                        )
             finally:
-                atomic_write_json(severe_result_path, original_review_result)
-                atomic_write_json(task_dir / "attestation.json", original_attestation)
+                for invocation_path, invocation_document in (
+                    original_invocations.items()
+                ):
+                    atomic_write_json(
+                        invocation_path,
+                        invocation_document,
+                    )
+                atomic_write_json(
+                    severe_result_path,
+                    original_review_result,
+                )
+                atomic_write_json(
+                    task_dir / "task.json",
+                    original_contract_artifact,
+                )
+                atomic_write_json(
+                    task_dir / "attestation.json",
+                    original_attestation,
+                )
 
             synthetic_rounds = copy.deepcopy(original_attestation)
             clean_attempt = copy.deepcopy(synthetic_rounds["writer_attempts"][-1])
@@ -7476,6 +8195,42 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             if repair_state.get("round") != 2:
                 failures.append("repair task did not record exactly two writer rounds")
             verify_attestation(repair_contract, repair_dir, allow_test_adapter=True)
+            repair_attestation = load_json(
+                repair_dir / "attestation.json"
+            )
+            for field, forged_value in (
+                ("session_id", "fake-forged-earlier-round"),
+                ("artifact_sha256", "0" * 64),
+                ("log_sha256", "1" * 64),
+                ("duration_ms", 999_999),
+            ):
+                rewritten_earlier_attempt = copy.deepcopy(
+                    repair_attestation
+                )
+                rewritten_earlier_attempt["writer_attempts"][0][
+                    field
+                ] = forged_value
+                atomic_write_json(
+                    repair_dir / "attestation.json",
+                    rewritten_earlier_attempt,
+                )
+                try:
+                    verify_attestation(
+                        repair_contract,
+                        repair_dir,
+                        allow_test_adapter=True,
+                    )
+                    failures.append(
+                        "canonical verifier accepted rewritten earlier "
+                        f"writer {field}"
+                    )
+                except HarnessError:
+                    pass
+                finally:
+                    atomic_write_json(
+                        repair_dir / "attestation.json",
+                        repair_attestation,
+                    )
             cmd_commit(
                 argparse.Namespace(
                     task_id="selftest-repair",
@@ -7776,12 +8531,16 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             # invokes Cargo, but inherits the exact lock descriptor through the sandbox process.
             lane_runtime = _check_runtime_paths(scope_dir)
             lane_ready = lane_runtime["tmp"] / "lane-inheritance-ready"
+            lane_release = lane_runtime["tmp"] / "lane-inheritance-release"
             lane_ready.unlink(missing_ok=True)
+            lane_release.unlink(missing_ok=True)
             lane_probe = (
-                "import os,pathlib,signal,time; "
+                "import itertools,os,pathlib,signal,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 f"pathlib.Path({str(lane_ready)!r}).write_text(str(os.getpgrp())); "
-                "time.sleep(30)"
+                "next(index for index in itertools.count() "
+                f"if pathlib.Path({str(lane_release)!r}).exists() "
+                "or (time.sleep(0.05) and False))"
             )
             lane_driver_code = (
                 "import pathlib; from task_runner import run_check; "
@@ -7824,14 +8583,14 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                     finally:
                         release_cargo_lane(acquired_while_child_alive)
             finally:
+                lane_release.touch()
                 if lane_driver.poll() is None:
-                    os.kill(lane_driver.pid, signal.SIGKILL)
-                    lane_driver.wait(timeout=3)
-                if lane_check_pgid > 1 and lane_check_pgid != os.getpgrp():
                     try:
-                        os.killpg(lane_check_pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                        lane_driver.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        lane_driver.kill()
+                        lane_driver.wait(timeout=3)
+                if lane_check_pgid > 1:
                     lane_exit_deadline = time.monotonic() + 2.0
                     while _process_group_alive(lane_check_pgid) and time.monotonic() < lane_exit_deadline:
                         time.sleep(0.05)
@@ -7977,8 +8736,18 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             if not loopback_check["passed"]:
                 failures.append("loopback-only sandbox blocked a local runtime check")
 
+            outside_release_path = Path(temp_name) / "outside-signal.release"
             outside_process = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(30)"],
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import itertools,pathlib,time; "
+                        "next(index for index in itertools.count() "
+                        f"if pathlib.Path({str(outside_release_path)!r}).exists() "
+                        "or (time.sleep(0.05) and False))"
+                    ),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -8000,8 +8769,13 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 ):
                     failures.append("check sandbox signalled a process outside its own sandbox")
             finally:
+                outside_release_path.touch()
                 if outside_process.poll() is None:
-                    _terminate_process(outside_process)
+                    try:
+                        outside_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        outside_process.kill()
+                        outside_process.wait(timeout=3)
 
             timeout_result = run_logged_process(
                 [sys.executable, "-c", "import time; time.sleep(5)"],
@@ -8016,10 +8790,11 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             # old cleanup returned as soon as the leader was reaped and orphaned the child under
             # pid 1 — exactly how an interrupted Cargo check left rustc consuming GBs of RAM.
             stubborn_pid_path = Path(temp_name) / "stubborn-grandchild.pid"
+            stubborn_release_path = Path(temp_name) / "stubborn-grandchild.release"
             stubborn_child = (
-                "import signal,time; "
+                "import pathlib,signal,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "time.sleep(30)"
+                f"\nwhile not pathlib.Path({str(stubborn_release_path)!r}).exists():\n time.sleep(0.05)"
             )
             stubborn_parent = (
                 "import pathlib,subprocess,sys,time; "
@@ -8039,26 +8814,30 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 time.sleep(0.05)
             if not stubborn_result["timed_out"] or _pid_is_alive(stubborn_pid):
                 failures.append("managed timeout orphaned a TERM-ignoring grandchild")
-                try:
-                    os.kill(stubborn_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            stubborn_release_path.touch()
+            stubborn_release_deadline = time.monotonic() + 1.0
+            while (
+                _pid_is_alive(stubborn_pid)
+                and time.monotonic() < stubborn_release_deadline
+            ):
+                time.sleep(0.05)
 
             # Ctrl-C reaches the harness driver, not its start_new_session child. Prove that the
             # resulting KeyboardInterrupt still drains the complete managed group.
             cancel_leader_path = Path(temp_name) / "cancel-leader.pid"
             cancel_grandchild_path = Path(temp_name) / "cancel-grandchild.pid"
+            cancel_release_path = Path(temp_name) / "cancel.release"
             cancel_grandchild = (
                 "import os,pathlib,signal,time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 f"pathlib.Path({str(cancel_grandchild_path)!r}).write_text(str(os.getpid())); "
-                "time.sleep(30)"
+                f"\nwhile not pathlib.Path({str(cancel_release_path)!r}).exists():\n time.sleep(0.05)"
             )
             cancel_managed = (
                 "import os,pathlib,subprocess,sys,time; "
                 f"pathlib.Path({str(cancel_leader_path)!r}).write_text(str(os.getpid())); "
                 f"subprocess.Popen([sys.executable,'-c',{cancel_grandchild!r}]); "
-                "time.sleep(30)"
+                f"\nwhile not pathlib.Path({str(cancel_release_path)!r}).exists():\n time.sleep(0.05)"
             )
             cancel_driver = (
                 "import pathlib,sys; "
@@ -8105,13 +8884,13 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                     if _pid_is_alive(cancel_leader_pid) or _pid_is_alive(cancel_grandchild_pid):
                         failures.append("managed SIGINT orphaned its child process group")
             finally:
+                cancel_release_path.touch()
                 if cancel_process.poll() is None:
-                    _terminate_process(cancel_process)
-                if cancel_leader_pid > 1 and cancel_leader_pid != os.getpgrp():
                     try:
-                        os.killpg(cancel_leader_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                        cancel_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        cancel_process.kill()
+                        cancel_process.wait(timeout=3)
 
             # A cancellation can also arrive AFTER the managed leader exits, while the driver is
             # already escalating a TERM-ignoring descendant. That cleanup window must be
@@ -8123,11 +8902,12 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 signal_label = signal.Signals(cleanup_signum).name.lower()
                 cleanup_leader_path = Path(temp_name) / f"cleanup-{signal_label}-leader.pid"
                 cleanup_grandchild_path = Path(temp_name) / f"cleanup-{signal_label}-grandchild.pid"
+                cleanup_release_path = Path(temp_name) / f"cleanup-{signal_label}.release"
                 cleanup_grandchild = (
                     "import os,pathlib,signal,time; "
                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                     f"pathlib.Path({str(cleanup_grandchild_path)!r}).write_text(str(os.getpid())); "
-                    "time.sleep(30)"
+                    f"\nwhile not pathlib.Path({str(cleanup_release_path)!r}).exists():\n time.sleep(0.05)"
                 )
                 cleanup_leader = (
                     "import os,pathlib,subprocess,sys,time; "
@@ -8200,13 +8980,13 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                                 f"managed {signal_label} interrupted cleanup orphaned a grandchild"
                             )
                 finally:
+                    cleanup_release_path.touch()
                     if cleanup_driver_process.poll() is None:
-                        _terminate_process(cleanup_driver_process)
-                    if cleanup_leader_pid > 1 and cleanup_leader_pid != os.getpgrp():
                         try:
-                            os.killpg(cleanup_leader_pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                            cleanup_driver_process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            cleanup_driver_process.kill()
+                            cleanup_driver_process.wait(timeout=3)
             os.environ["MURMUR_SELFTEST_SECRET_TOKEN"] = "must-not-cross-model-boundary"
             try:
                 clean_env, removed_names = sanitized_model_environment("0" * 64, "codex")
