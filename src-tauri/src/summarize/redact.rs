@@ -2809,15 +2809,9 @@ mod tests {
             let user = format!("User {label} contact user@corp.example.");
 
             let error = match surface {
-                Surface::Complete => match block_on(provider.complete_with_meta(&system, &user)) {
-                    Ok(_) => None,
-                    Err(error) => Some(error),
-                },
+                Surface::Complete => block_on(provider.complete_with_meta(&system, &user)).err(),
                 Surface::CompleteJson => {
-                    match block_on(provider.complete_json_with_meta(&system, &user, &schema)) {
-                        Ok(_) => None,
-                        Err(error) => Some(error),
-                    }
+                    block_on(provider.complete_json_with_meta(&system, &user, &schema)).err()
                 }
             };
             assert_eq!(
