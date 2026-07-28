@@ -1056,6 +1056,30 @@ def aggregate_verdict(
     return "PASSED", "all planned checks and reviews passed"
 
 
+def aggregate_review_outcomes(
+    reviews: Sequence[Mapping[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Derive the receipt-level review summary from the bound review records."""
+
+    return {
+        "findings": [
+            {"review": review["kind"], **finding}
+            for review in reviews
+            for finding in review.get("result", {}).get("findings", [])
+        ],
+        "proof_gaps": [
+            {"review": review["kind"], **gap}
+            for review in reviews
+            for gap in review.get("result", {}).get("proof_gaps", [])
+        ],
+        "probe_requests": [
+            {"review": review["kind"], **probe}
+            for review in reviews
+            for probe in review.get("result", {}).get("probe_requests", [])
+        ],
+    }
+
+
 def build_evidence(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1064,21 +1088,7 @@ def build_evidence(
     probes: Sequence[Mapping[str, Any]],
     reviews: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    findings = [
-        {"review": review["kind"], **finding}
-        for review in reviews
-        for finding in review.get("result", {}).get("findings", [])
-    ]
-    proof_gaps = [
-        {"review": review["kind"], **gap}
-        for review in reviews
-        for gap in review.get("result", {}).get("proof_gaps", [])
-    ]
-    probe_requests = [
-        {"review": review["kind"], **probe}
-        for review in reviews
-        for probe in review.get("result", {}).get("probe_requests", [])
-    ]
+    review_outcomes = aggregate_review_outcomes(reviews)
     verdict, reason = aggregate_verdict(checks, reviews)
     evidence: Dict[str, Any] = {
         "schema_version": 2,
@@ -1093,9 +1103,7 @@ def build_evidence(
         "checks": [dict(item) for item in checks],
         "probes": [dict(item) for item in probes],
         "reviews": [dict(item) for item in reviews],
-        "findings": findings,
-        "proof_gaps": proof_gaps,
-        "probe_requests": probe_requests,
+        **review_outcomes,
         "degraded_provenance": list(contract.get("degraded_provenance", [])),
         "telemetry": {
             "resource_wait_ms": sum(
@@ -1592,12 +1600,6 @@ def verify_v2_evidence(
             raise legacy.HarnessError(f"v2 evidence {key} is stale")
     if evidence.get("verdict") != "PASSED":
         raise legacy.HarnessError("v2 evidence verdict is not PASSED")
-    if evidence.get("findings") and any(
-        item.get("severity") in SEVERE_FINDINGS for item in evidence["findings"]
-    ):
-        raise legacy.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
-    if evidence.get("proof_gaps") or evidence.get("probe_requests"):
-        raise legacy.HarnessError("v2 PASS contains unresolved proof gaps")
 
     check_records = evidence.get("checks", [])
     if [item.get("id") for item in check_records] != [
@@ -1753,7 +1755,19 @@ def verify_v2_evidence(
             raise legacy.HarnessError(
                 f"v2 review {declared['kind']} result summary changed"
             )
-        if review_result_state(result) != "PASSED":
+        result_state = review_result_state(result)
+        if result_state != "PASSED":
+            if any(
+                finding.get("severity") in SEVERE_FINDINGS
+                for finding in result.get("findings", [])
+            ):
+                raise legacy.HarnessError(
+                    "v2 PASS contains unresolved MAJOR/BLOCKER findings"
+                )
+            if result.get("proof_gaps") or result.get("probe_requests"):
+                raise legacy.HarnessError(
+                    "v2 PASS contains unresolved proof gaps"
+                )
             raise legacy.HarnessError(
                 f"v2 review {declared['kind']} is not an admissible PASS"
             )
@@ -1793,6 +1807,7 @@ def verify_v2_evidence(
             ),
             instructions_sha256=plan["protocol_sha256"],
             prompt_sha256=str(record["prompt_sha256"]),
+            require_cwd_binding=True,
         )
         review_time = legacy.parse_timestamp(
             record.get("created_at"), f"v2 review {declared['kind']}.created_at"
@@ -1813,4 +1828,16 @@ def verify_v2_evidence(
                 raise legacy.HarnessError(
                     f"v2 review {declared['kind']} model differs from real model log"
                 )
+    expected_review_outcomes = aggregate_review_outcomes(review_records)
+    for field, expected in expected_review_outcomes.items():
+        if evidence.get(field) != expected:
+            raise legacy.HarnessError(
+                f"v2 evidence {field} differs from its bound review records"
+            )
+    if evidence.get("findings") and any(
+        item.get("severity") in SEVERE_FINDINGS for item in evidence["findings"]
+    ):
+        raise legacy.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
+    if evidence.get("proof_gaps") or evidence.get("probe_requests"):
+        raise legacy.HarnessError("v2 PASS contains unresolved proof gaps")
     return evidence

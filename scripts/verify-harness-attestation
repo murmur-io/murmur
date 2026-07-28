@@ -1,108 +1,240 @@
 #!/usr/bin/env python3
-"""Refuse to merge harness-written code that was never verified.
+"""Verify exact per-commit Harness v1/v2 receipts on a pull-request branch.
 
-WHY THIS EXISTS. On 2026-07-26 a harness task timed out, went `BLOCKED` with an empty
-`results/` directory and no attestation — and its branch was merged to trunk anyway,
-carrying 2,566 lines across 14 files. Nothing noticed, because the attestation lives in
-`.git/agent-harness/`, which never leaves the machine that produced it. Every enforcement
-up to that point depended on the operator remembering.
-
-WHAT IT CHECKS. For a pull request whose head branch is `agent/*` — i.e. a branch the
-harness itself created — at least one commit must carry the receipt trailers that
-`agent-harness commit` writes:
-
-    Harness-Task: <task-id>
-    Harness-Verdict: PASS
-    Harness-Base: <sha>
-    Harness-Diff-Sha256: <sha256>
-    Harness-Attestation-Sha256: <sha256>
-
-An explicitly declared light-lane PR is allowed through: put `Harness-Lane: B` on a line
-of its own in the PR body (or set HARNESS_LANE=B). That makes "no attestation" a RECORDED
-CHOICE rather than an oversight, which is the whole point — the failure being prevented is
-silence, not deliberate bypass.
-
-WHAT IT DOES NOT CHECK. This is presence and consistency, not a cryptographic proof. A
-trailer can be typed by hand. It defends against forgetting; it does not defend against
-forging, and it is not offered as though it did.
-
-Usage:
-    verify-harness-attestation --base <ref> --head <ref> [--branch <name>] [--pr-body-file <path>]
-Exit codes: 0 = satisfied or not applicable, 1 = refused, 2 = usage error.
+Unversioned receipts are legacy v1.  Version 2 requires an exact evidence hash
+and an equal transitional Attestation alias.  Every branch-authored non-merge
+commit is covered; clean catch-up merges from the base branch remain supported
+only when their tree equals Git's deterministic merge result.  Receipt policy
+is monotonic: v1 may upgrade to v2, but v2 may not downgrade to v1 or Lane B;
+the ``agent/v2/*`` namespace requires v2 throughout.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import List, Optional, Tuple
+import tempfile
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
-TRAILER_RE = {
-    "task": re.compile(r"^\s*Harness-Task:\s*(\S+)\s*$", re.MULTILINE),
-    "verdict": re.compile(r"^\s*Harness-Verdict:\s*(\S+)\s*$", re.MULTILINE),
-    "base": re.compile(r"^\s*Harness-Base:\s*([0-9a-f]{40})\s*$", re.MULTILINE),
-    "diff": re.compile(r"^\s*Harness-Diff-Sha256:\s*([0-9a-f]{64})\s*$", re.MULTILINE),
-    "attestation": re.compile(
-        r"^\s*Harness-Attestation-Sha256:\s*([0-9a-f]{64})\s*$", re.MULTILINE
-    ),
+
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+TASK_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+RECOGNIZED = {
+    "Harness-Version",
+    "Harness-Task",
+    "Harness-Verdict",
+    "Harness-Base",
+    "Harness-Diff-Sha256",
+    "Harness-Evidence-Sha256",
+    "Harness-Attestation-Sha256",
+    "Harness-Writer-Degraded",
+    "Harness-Lane",
 }
-# Anchored at column 0, case-sensitive, and matched only against a body with fenced code
-# blocks and quoted lines stripped. The looser earlier form let the gate NEUTER ITSELF: its
-# own refusal message contained the token on an indented line, so pasting the CI error into
-# the PR description to ask what it meant silently turned a REFUSE into a PASS.
-LANE_B_RE = re.compile(r"^Harness-Lane: B[ \t]*$", re.MULTILINE)
-# Surfaced, not refused: a degraded round still earns PASS from real checks and real
-# independent reviews. The point is that the reviewer of the PR can SEE it.
-DEGRADED_RE = re.compile(r"^\s*Harness-Writer-Degraded:\s*(\S+)\s*$", re.MULTILINE)
+RECEIPT_KEYS = RECOGNIZED - {"Harness-Lane", "Harness-Writer-Degraded"}
+TRAILER_LINE = re.compile(r"^(Harness-[A-Za-z0-9-]+):[ \t]*(.*?)[ \t]*$")
+HARNESS_LIKE_LINE = re.compile(
+    r"^\s*(Harness-[A-Za-z0-9-]+)\s*:", re.IGNORECASE
+)
+LANE_B_LINE = re.compile(r"^Harness-Lane:[ \t]+B[ \t]*$", re.MULTILINE)
 
 
-def git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True
-    ).stdout.strip()
+class ReceiptError(RuntimeError):
+    pass
 
 
-def is_ancestor(candidate: str, of: str) -> bool:
+def git(*args: str, cwd: Optional[Path] = None, check: bool = True) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        raise ReceiptError(
+            f"git {' '.join(args)} failed: {completed.stderr.strip()}"
+        )
+    return completed.stdout.strip()
+
+
+def git_bytes(*args: str, cwd: Optional[Path] = None) -> bytes:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ReceiptError(
+            f"git {' '.join(args)} failed: "
+            + completed.stderr.decode("utf-8", "replace").strip()
+        )
+    return completed.stdout
+
+
+def is_ancestor(candidate: str, target: str, *, cwd: Optional[Path] = None) -> bool:
     return (
         subprocess.run(
-            ["git", "merge-base", "--is-ancestor", candidate, of],
+            ["git", "merge-base", "--is-ancestor", candidate, target],
+            cwd=str(cwd) if cwd else None,
             capture_output=True,
         ).returncode
         == 0
     )
 
 
-def branch_commits(base: str, head: str, base_branch: str) -> Tuple[List[dict], List[dict]]:
-    """Return (commits authored on this branch, illegitimate merges).
+def strip_discussion(body: str) -> str:
+    """Remove quoted/fenced/HTML-comment discussion before parsing declarations."""
 
-    `--first-parent` alone is NOT enough, and an earlier version of this script wrongly
-    claimed it "selects exactly the branch's own work". It selects the first-parent CHAIN,
-    which makes anything reachable only through a merge's SECOND parent invisible: a
-    `git merge --no-ff` of a side branch smuggles unreviewed files into the merged diff
-    while every commit on the chain still carries a valid receipt.
+    out: List[str] = []
+    fenced = False
+    in_comment = False
+    for raw in body.splitlines():
+        line = html.unescape(raw)
+        if "<!--" in line:
+            before, _, rest = line.partition("<!--")
+            line = before
+            in_comment = True
+            if "-->" in rest:
+                _, _, after = rest.partition("-->")
+                line += after
+                in_comment = False
+        elif in_comment:
+            if "-->" in line:
+                _, _, line = line.partition("-->")
+                in_comment = False
+            else:
+                continue
+        stripped = line.lstrip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        if fenced or stripped.startswith(">"):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
-    So merges are inspected rather than skipped. A merge is legitimate only when every
-    non-first parent is contained in the BASE BRANCH — i.e. it is a genuine "bring the
-    branch up to date with trunk" merge, which this repo requires. Any other merge pulls in
-    work this gate never saw, and is reported.
 
-    The comparison must be against the base BRANCH TIP, not the PR's base COMMIT. A
-    catch-up merge brings in commits that are by definition NEWER than the base commit, so
-    testing ancestry against the base commit rejects the very flow this repo depends on —
-    a false positive, which is worse than no gate because it trains the operator to bypass.
-    """
+def trailer_values(message: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    counts: Dict[str, int] = {}
+    unknown: List[str] = []
+    malformed: List[str] = []
+    for line in message.splitlines():
+        match = TRAILER_LINE.fullmatch(line)
+        if not match:
+            harness_like = HARNESS_LIKE_LINE.match(line)
+            if harness_like is not None:
+                malformed.append(harness_like.group(1))
+            continue
+        key, value = match.groups()
+        if key not in RECOGNIZED:
+            unknown.append(key)
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        values[key] = value
+    duplicates = sorted(key for key, count in counts.items() if count != 1)
+    if duplicates:
+        raise ReceiptError(
+            "duplicate recognized receipt trailers: " + ", ".join(duplicates)
+        )
+    if malformed:
+        raise ReceiptError(
+            "malformed Harness receipt trailers: "
+            + ", ".join(sorted(set(malformed), key=str.lower))
+        )
+    if unknown and any(key in values for key in RECEIPT_KEYS):
+        raise ReceiptError(
+            "unknown Harness receipt trailers: " + ", ".join(sorted(set(unknown)))
+        )
+    return values
 
-    raw = subprocess.run(
-        ["git", "log", "--first-parent", "--format=%H%x1f%P%x1f%B%x00", f"{base}..{head}"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    commits: List[dict] = []
-    bad_merges: List[dict] = []
+
+def parse_receipt(message: str) -> Optional[Dict[str, str]]:
+    values = trailer_values(message)
+    present = RECEIPT_KEYS & set(values)
+    if not present:
+        return None
+    if "Harness-Lane" in values:
+        raise ReceiptError(
+            "Harness-Lane cannot coexist with a Harness receipt"
+        )
+    version = values.get("Harness-Version")
+    if version is None:
+        if "Harness-Evidence-Sha256" in values:
+            raise ReceiptError("unversioned v1 receipt contains v2 Evidence trailer")
+        required = {
+            "Harness-Task",
+            "Harness-Verdict",
+            "Harness-Base",
+            "Harness-Diff-Sha256",
+            "Harness-Attestation-Sha256",
+        }
+        generation = "1"
+    elif version == "2":
+        required = {
+            "Harness-Version",
+            "Harness-Task",
+            "Harness-Verdict",
+            "Harness-Base",
+            "Harness-Diff-Sha256",
+            "Harness-Evidence-Sha256",
+            "Harness-Attestation-Sha256",
+        }
+        generation = "2"
+    else:
+        raise ReceiptError(f"unknown Harness-Version: {version!r}")
+    missing = sorted(required - set(values))
+    if missing:
+        raise ReceiptError("partial receipt; missing: " + ", ".join(missing))
+    if values["Harness-Verdict"] != "PASS":
+        raise ReceiptError("Harness-Verdict is not PASS")
+    if not TASK_ID.fullmatch(values["Harness-Task"]):
+        raise ReceiptError("Harness-Task is malformed")
+    if not HEX40.fullmatch(values["Harness-Base"]):
+        raise ReceiptError("Harness-Base is malformed")
+    if not HEX64.fullmatch(values["Harness-Diff-Sha256"]):
+        raise ReceiptError("Harness-Diff-Sha256 is malformed")
+    if not HEX64.fullmatch(values["Harness-Attestation-Sha256"]):
+        raise ReceiptError("Harness-Attestation-Sha256 is malformed")
+    if generation == "2":
+        evidence = values["Harness-Evidence-Sha256"]
+        if not HEX64.fullmatch(evidence):
+            raise ReceiptError("Harness-Evidence-Sha256 is malformed")
+        if values["Harness-Attestation-Sha256"] != evidence:
+            raise ReceiptError("v2 Attestation alias must equal Evidence hash")
+    return {
+        "generation": generation,
+        "task": values["Harness-Task"],
+        "verdict": values["Harness-Verdict"],
+        "base": values["Harness-Base"],
+        "diff": values["Harness-Diff-Sha256"],
+        "evidence": values.get(
+            "Harness-Evidence-Sha256",
+            values["Harness-Attestation-Sha256"],
+        ),
+        "degraded": values.get("Harness-Writer-Degraded", ""),
+    }
+
+
+def branch_entries(
+    base: str, head: str, base_branch: str
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    raw = git(
+        "log",
+        "--first-parent",
+        "--format=%H%x1f%P%x1f%B%x00",
+        f"{base}..{head}",
+    )
+    commits: List[Dict[str, str]] = []
+    merges: List[Dict[str, str]] = []
     for chunk in raw.split("\x00"):
         if not chunk.strip():
             continue
@@ -114,232 +246,661 @@ def branch_commits(base: str, head: str, base_branch: str) -> Tuple[List[dict], 
             "message": message,
         }
         if len(parent_list) > 1:
-            # A merge. Legitimate only if everything it brings in is already on the base
-            # branch. `base_branch or base` keeps it working when the branch tip is not
-            # resolvable (a shallow clone, a local run) — degrading to the stricter check
-            # rather than to no check.
+            if len(parent_list) != 2:
+                raise ReceiptError(f"octopus merge {sha[:12]} is unsupported")
+            side = parent_list[1]
             containment = base_branch or base
-            side = [p for p in parent_list[1:] if not is_ancestor(p, containment)]
-            if side:
-                entry["side_parents"] = side
-                bad_merges.append(entry)
-            continue
-        commits.append(entry)
-    return commits, bad_merges
+            if not is_ancestor(side, containment):
+                raise ReceiptError(
+                    f"merge {sha[:12]} brings a side parent not on the base branch"
+                )
+            entry["side_parent"] = side
+            merges.append(entry)
+        else:
+            commits.append(entry)
+    return commits, merges
 
 
-def strip_quoted(body: str) -> str:
-    """Drop fenced code blocks and quoted lines before looking for the opt-out token.
-
-    Someone pasting this gate's output, or quoting it to ask a question, must not thereby
-    grant the exemption. Anything inside ``` fences or after a leading '>' is discussion,
-    not a declaration.
-    """
-
-    out: List[str] = []
-    fenced = False
-    for line in body.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            fenced = not fenced
-            continue
-        if fenced or stripped.startswith(">"):
-            continue
-        out.append(line)
-    return "\n".join(out)
+def verify_clean_catchup_merges(merges: Sequence[Mapping[str, str]]) -> None:
+    for merge in merges:
+        completed = subprocess.run(
+            [
+                "git",
+                "merge-tree",
+                "--write-tree",
+                "--no-messages",
+                merge["first_parent"],
+                merge["side_parent"],
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ReceiptError(
+                f"catch-up merge {merge['sha'][:12]} had conflicts/manual resolution; "
+                "re-verify the resulting diff"
+            )
+        expected_tree = completed.stdout.strip().splitlines()[0]
+        actual_tree = git("rev-parse", f"{merge['sha']}^{{tree}}")
+        if expected_tree != actual_tree:
+            raise ReceiptError(
+                f"catch-up merge {merge['sha'][:12]} contains unreceipted resolution content"
+            )
 
 
 def fail(message: str) -> int:
     print(f"REFUSED: {message}", file=sys.stderr)
-    # Deliberately NOT printing a directly pasteable token: this text ends up in CI output
-    # that gets copied into PR descriptions, and the token was previously its own bypass.
     print(
-        "\nIf this PR was written WITHOUT the harness on purpose, declare it by adding a\n"
-        "line to the PR DESCRIPTION consisting of the header 'Harness-Lane' followed by a\n"
-        "colon, a space and the letter B — at the start of its own line, outside any code\n"
-        "fence or quote — OR, more reliably, put that same line as a TRAILER on any commit\n"
-        "in the branch. The commit route always works; the description route cannot be\n"
-        "applied to an already-failed run, because the event payload froze the body at\n"
-        "trigger time and a re-run replays it.",
+        "For a deliberate pre-receipt light lane, add a new commit trailer "
+        "using the Harness-Lane key with value B. Editing the PR body and "
+        "re-running an existing workflow may replay the frozen event payload; "
+        "push a new commit instead.",
         file=sys.stderr,
     )
     return 1
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--base", required=True)
-    parser.add_argument("--head", default="HEAD")
-    parser.add_argument("--branch", default=os.environ.get("GITHUB_HEAD_REF", ""))
-    parser.add_argument("--pr-body-file", default="")
-    parser.add_argument(
-        "--base-branch",
-        default="",
-        help="Tip of the branch being merged INTO (e.g. origin/murmur). Catch-up merges are "
-        "judged against this, not against --base, because they legitimately bring in commits "
-        "newer than the PR's base commit.",
+def surface_degraded(commit: str, task: str, degraded: str) -> None:
+    message = (
+        f"Harness task {task} commit {commit[:12]} carries degraded writer "
+        f"provenance: {degraded}"
     )
-    args = parser.parse_args(argv)
+    print(f"::warning::{message}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if summary:
+        try:
+            with Path(summary).open("a", encoding="utf-8") as handle:
+                handle.write(f"- WARNING: {message}\n")
+        except OSError as exc:
+            print(
+                f"could not append degraded provenance to step summary: {exc}",
+                file=sys.stderr,
+            )
 
-    base_branch = args.base_branch.strip()
-    if not base_branch:
-        env_base = os.environ.get("GITHUB_BASE_REF", "").strip()
-        for candidate in ([f"origin/{env_base}", env_base] if env_base else []):
-            if (
-                subprocess.run(
-                    ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
-                    capture_output=True,
-                ).returncode
-                == 0
-            ):
-                base_branch = candidate
-                break
 
+def resolve_base_branch(raw: str) -> str:
+    if raw:
+        return raw
+    env_base = os.environ.get("GITHUB_BASE_REF", "").strip()
+    for candidate in ([f"origin/{env_base}", env_base] if env_base else []):
+        if git("rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}", check=False):
+            return candidate
+    return ""
+
+
+def verify_range(args: argparse.Namespace) -> int:
     branch = (args.branch or "").strip()
-    if not branch.startswith("agent/"):
+    body = ""
+    if args.pr_body_file and Path(args.pr_body_file).is_file():
+        body = Path(args.pr_body_file).read_text(encoding="utf-8", errors="replace")
+    # Scope and Lane-B policy must be derived only from branch-authored
+    # non-merge commits. A full base..head walk also visits base-branch commits
+    # introduced by a clean catch-up merge; a receipt on trunk must never turn
+    # an ordinary fix/* branch into a receipted lifecycle.
+    messages = git(
+        "log",
+        "--first-parent",
+        "--no-merges",
+        "--format=%B%x00",
+        f"{args.base}..{args.head}",
+    )
+    chunks = [item for item in messages.split("\x00") if item.strip()]
+    # A branch that has entered a receipted lifecycle may move from legacy v1
+    # to v2, but it must never downgrade back to Lane B.  In particular,
+    # agent/v2/* is a reserved branch namespace: accepting an opt-out there
+    # would let an unattested follow-up commit erase the meaning of the v2
+    # branch and its earlier exact-diff receipt.
+    has_receipt = any(
+        any(
+            match is not None
+            and match.group(1).lower()
+            not in {"harness-lane", "harness-writer-degraded"}
+            for match in (
+                HARNESS_LIKE_LINE.match(line)
+                for line in chunk.splitlines()
+            )
+        )
+        for chunk in chunks
+    )
+    trailer_lane = any(
+        LANE_B_LINE.search(strip_discussion(chunk)) for chunk in chunks
+    )
+    lane_declared = (
+        trailer_lane
+        or LANE_B_LINE.search(strip_discussion(body))
+        or os.environ.get("HARNESS_LANE", "").strip().upper() == "B"
+    )
+    reserved_v2_branch = branch.startswith("agent/v2/")
+    if lane_declared and (reserved_v2_branch or has_receipt):
+        return fail(
+            "Lane B cannot downgrade an agent/v2 branch or a history that "
+            "already contains Harness receipts"
+        )
+    if lane_declared:
+        print("light lane explicitly declared — attestation not required")
+        return 0
+
+    # A renamed/copied agent branch still contains harness receipts.  Once a
+    # receipt appears, enforce coverage regardless of the current branch name.
+    if not branch.startswith("agent/") and not has_receipt:
         print(f"not a harness branch ({branch or 'unknown'}) — attestation not required")
         return 0
-
-    body = ""
-    if args.pr_body_file and os.path.exists(args.pr_body_file):
-        with open(args.pr_body_file, "r", encoding="utf-8", errors="replace") as handle:
-            body = handle.read()
-    # A COMMIT TRAILER is the reliable declaration route; the PR description is a
-    # convenience that cannot be applied retroactively.
-    #
-    # `github.event.pull_request.body` is frozen at trigger time and a re-run replays the
-    # same payload, so the description route is unusable in exactly the situation it exists
-    # for: the gate refuses, you add the line, you press re-run, and the gate re-reads the
-    # old body. A trailer lives in the pushed history, is visible in the diff, survives
-    # re-runs, and needs no privileged token to read (the repo's config audit forbids a
-    # `GH_TOKEN` expression in `ci.yml`, and rightly so).
-    trailer_declared = False
     try:
-        raw = subprocess.run(
-            ["git", "log", "--format=%B%x00", f"{args.base}..{args.head}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        trailer_declared = any(
-            LANE_B_RE.search(chunk) for chunk in raw.split("\x00") if chunk.strip()
+        commits, merges = branch_entries(
+            args.base, args.head, resolve_base_branch(args.base_branch)
         )
-    except subprocess.CalledProcessError:
-        pass
-
-    if (
-        trailer_declared
-        or LANE_B_RE.search(strip_quoted(body))
-        or os.environ.get("HARNESS_LANE", "").strip().upper() == "B"
-    ):
-        where = "commit trailer" if trailer_declared else "PR description"
-        print(f"light lane declared via the {where} — attestation not required")
-        return 0
-
-    try:
-        commits, bad_merges = branch_commits(args.base, args.head, base_branch)
-    except subprocess.CalledProcessError as exc:
-        print(f"could not read commits {args.base}..{args.head}: {exc}", file=sys.stderr)
-        return 2
-
-    if bad_merges:
-        listing = "\n".join(
-            f"    {m['sha'][:12]}  merges {', '.join(p[:12] for p in m['side_parents'])}"
-            f"  — {m['message'].strip().splitlines()[0][:56]}"
-            for m in bad_merges
-        )
-        return fail(
-            f"branch '{branch}' merges work that is not on the base ref, so the merged diff "
-            "contains commits this gate never saw:\n"
-            f"{listing}\n"
-            "  Only a catch-up merge FROM the base branch is allowed here."
-        )
-
+        verify_clean_catchup_merges(merges)
+    except ReceiptError as exc:
+        return fail(str(exc))
     if not commits:
+        if merges:
+            print("clean catch-up merge only — no branch-authored content")
+            return 0
         print("no branch-authored commits to attest")
         return 0
-
-    # COVERAGE, NOT PRESENCE. Checking that SOME commit carries a receipt was provably
-    # insufficient: an unattested hand commit rides along beside an attested one, and a
-    # cherry-pick copies a receipt verbatim onto work it never covered. Every commit the
-    # branch authored must carry its OWN receipt, and that receipt's recorded base must be
-    # that commit's own first parent — which is exactly what `agent-harness commit`
-    # produces and what a copied receipt cannot fake.
-    unattested = []
-    receipts = []
+    parsed: List[Tuple[Mapping[str, str], Dict[str, str]]] = []
     for commit in commits:
-        found = {name: rx.search(commit["message"]) for name, rx in TRAILER_RE.items()}
-        if not all(found.values()):
-            unattested.append(commit)
-            continue
-        receipt = {name: m.group(1) for name, m in found.items()}
-        receipt["commit"] = commit
-        receipts.append(receipt)
-
-    if unattested:
-        listing = "\n".join(
-            f"    {c['sha'][:12]}  {c['message'].strip().splitlines()[0][:72]}"
-            for c in unattested
-        )
-        return fail(
-            f"branch '{branch}' was created by the harness, but {len(unattested)} of "
-            f"{len(commits)} branch-authored commits carry no Harness-Verdict receipt:\n"
-            f"{listing}\n"
-            "  Each was written outside a PASSED harness task, or committed by hand."
-        )
-
-    for receipt in receipts:
-        commit = receipt["commit"]
-        if receipt["verdict"] != "PASS":
+        try:
+            receipt = parse_receipt(commit["message"])
+        except ReceiptError as exc:
+            return fail(f"commit {commit['sha'][:12]}: {exc}")
+        if receipt is None:
             return fail(
-                f"commit {commit['sha'][:12]} records verdict "
-                f"{receipt['verdict']}, not PASS"
+                f"commit {commit['sha'][:12]} has no complete Harness receipt"
             )
         if receipt["base"] != commit["first_parent"]:
             return fail(
-                f"commit {commit['sha'][:12]} carries a receipt for base "
-                f"{receipt['base'][:12]}, but its actual parent is "
-                f"{commit['first_parent'][:12]} — the receipt was copied onto work it "
-                "does not cover (cherry-pick, rebase, or a hand-edited trailer)."
+                f"commit {commit['sha'][:12]} receipt Base is not its actual parent"
             )
-        # CONTENT, not just lineage. Matching only the parent left `git commit --amend`
-        # wide open: amend after `agent-harness commit` keeps the parent, so arbitrary
-        # unreviewed content rode in under a valid receipt. The recorded hash is over the
-        # attested staged diff, which is recomputable here with the same normalisation
-        # (task_runner.staged_diff: --binary --full-index --no-ext-diff --no-renames).
-        actual = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--binary",
-                "--full-index",
-                "--no-ext-diff",
-                "--no-renames",
-                commit["first_parent"],
-                commit["sha"],
-                "--",
-            ],
-            capture_output=True,
-            check=True,
-        ).stdout
+        actual = git_bytes(
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            commit["first_parent"],
+            commit["sha"],
+            "--",
+        )
         actual_sha = hashlib.sha256(actual).hexdigest()
-        if actual_sha != receipt["diff"]:
+        if receipt["diff"] != actual_sha:
             return fail(
-                f"commit {commit['sha'][:12]} does not match its own receipt: the attested "
-                f"diff is {receipt['diff'][:12]}… but the commit's actual diff hashes to "
-                f"{actual_sha[:12]}…. The commit was amended or rewritten after it was "
-                "attested, so the receipt covers different content than what is merging."
+                f"commit {commit['sha'][:12]} actual diff {actual_sha[:12]}… "
+                f"does not match receipt {receipt['diff'][:12]}…"
+            )
+        parsed.append((commit, receipt))
+
+    if reserved_v2_branch:
+        legacy = [
+            commit["sha"][:12]
+            for commit, receipt in parsed
+            if receipt["generation"] != "2"
+        ]
+        if legacy:
+            return fail(
+                "agent/v2 branches require v2 receipts on every authored commit; "
+                "legacy v1 receipt found on " + ", ".join(legacy)
             )
 
-    for receipt in receipts:
-        degraded = DEGRADED_RE.search(receipt["commit"]["message"])
-        note = f"  [WRITER DEGRADED: {degraded.group(1)}]" if degraded else ""
+    seen_v2 = False
+    for commit, receipt in reversed(parsed):
+        if receipt["generation"] == "2":
+            seen_v2 = True
+        elif seen_v2:
+            return fail(
+                f"commit {commit['sha'][:12]} downgrades a v2 receipt history "
+                "back to legacy v1"
+            )
+
+    for commit, receipt in parsed:
+        note = (
+            f" [WRITER DEGRADED: {receipt['degraded']}]"
+            if receipt["degraded"]
+            else ""
+        )
+        if receipt["degraded"]:
+            surface_degraded(
+                commit["sha"], receipt["task"], receipt["degraded"]
+            )
         print(
-            f"OK: {receipt['commit']['sha'][:12]} task '{receipt['task']}' PASS "
-            f"(diff {receipt['diff'][:12]}…){note}"
+            f"OK: {commit['sha'][:12]} v{receipt['generation']} task "
+            f"'{receipt['task']}' PASS (diff {receipt['diff'][:12]}…){note}"
         )
     return 0
 
 
+def _run_verify(
+    script: Path,
+    repo: Path,
+    base: str,
+    head: str,
+    *,
+    branch: str = "agent/selftest",
+    base_branch: str = "",
+) -> int:
+    return subprocess.run(
+        [
+            str(script),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--branch",
+            branch,
+            *(["--base-branch", base_branch] if base_branch else []),
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode
+
+
+def _commit(
+    repo: Path,
+    subject: str,
+    task: str,
+    *,
+    version: Optional[str],
+    extra: Sequence[str] = (),
+) -> str:
+    serial = len(git("rev-list", "--all", cwd=repo).splitlines())
+    (repo / "payload.txt").write_text(f"{subject}-{serial}\n", encoding="utf-8")
+    git("add", "payload.txt", cwd=repo)
+    parent = git("rev-parse", "HEAD", cwd=repo)
+    diff = git_bytes(
+        "diff",
+        "--cached",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-renames",
+        "--",
+        cwd=repo,
+    )
+    digest = hashlib.sha256(diff).hexdigest()
+    evidence = hashlib.sha256(f"{task}-{serial}".encode()).hexdigest()
+    trailers: List[str] = []
+    if version is not None:
+        trailers.append(f"Harness-Version: {version}")
+    trailers.extend(
+        [
+            f"Harness-Task: {task}",
+            "Harness-Verdict: PASS",
+            f"Harness-Base: {parent}",
+            f"Harness-Diff-Sha256: {digest}",
+        ]
+    )
+    if version == "2":
+        trailers.append(f"Harness-Evidence-Sha256: {evidence}")
+    trailers.append(f"Harness-Attestation-Sha256: {evidence}")
+    trailers.extend(extra)
+    git("commit", "-m", subject, "-m", "\n".join(trailers), cwd=repo)
+    return git("rev-parse", "HEAD", cwd=repo)
+
+
+def selftest() -> int:
+    script = Path(__file__).resolve()
+    failures: List[str] = []
+    count = 0
+
+    def expect(label: str, actual: int, wanted: int) -> None:
+        nonlocal count
+        count += 1
+        marker = "PASS" if actual == wanted else "FAIL"
+        print(f"  [{marker}] {label}: exit {actual}")
+        if actual != wanted:
+            failures.append(f"{label}: expected {wanted}, found {actual}")
+
+    with tempfile.TemporaryDirectory(prefix="murmur-receipt-selftest-") as raw:
+        root = Path(raw)
+
+        def fresh(name: str) -> Tuple[Path, str]:
+            repo = root / name
+            repo.mkdir()
+            git("init", "-q", "-b", "murmur", cwd=repo)
+            git("config", "user.name", "QueaT", cwd=repo)
+            git("config", "user.email", "kgm004a@gmail.com", cwd=repo)
+            (repo / "payload.txt").write_text("base\n", encoding="utf-8")
+            git("add", "payload.txt", cwd=repo)
+            git("commit", "-q", "-m", "base", cwd=repo)
+            return repo, git("rev-parse", "HEAD", cwd=repo)
+
+        repo, base = fresh("v1")
+        head = _commit(repo, "v1", "receipt-v1", version=None)
+        expect("legacy unversioned v1", _run_verify(script, repo, base, head), 0)
+
+        repo, base = fresh("v2")
+        head = _commit(repo, "v2", "receipt-v2", version="2")
+        expect("strict v2", _run_verify(script, repo, base, head), 0)
+
+        repo, base = fresh("mixed")
+        _commit(repo, "v1", "mixed-v1", version=None)
+        head = _commit(repo, "v2", "mixed-v2", version="2")
+        expect("mixed v1 then v2 branch", _run_verify(script, repo, base, head), 0)
+
+        repo, base = fresh("downgrade")
+        _commit(repo, "v2", "downgrade-v2", version="2")
+        head = _commit(repo, "v1", "downgrade-v1", version=None)
+        expect(
+            "v2 receipt downgrade rejected",
+            _run_verify(script, repo, base, head),
+            1,
+        )
+
+        repo, base = fresh("reserved-v1")
+        head = _commit(repo, "v1", "reserved-v1", version=None)
+        expect(
+            "agent/v2 rejects legacy v1 receipt",
+            _run_verify(
+                script,
+                repo,
+                base,
+                head,
+                branch="agent/v2/reserved-v1",
+            ),
+            1,
+        )
+
+        repo, base = fresh("lane-b")
+        (repo / "payload.txt").write_text("light lane\n", encoding="utf-8")
+        git("add", "payload.txt", cwd=repo)
+        git("commit", "-m", "light lane", "-m", "Harness-Lane: B", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "ordinary agent branch accepts explicit Lane B",
+            _run_verify(script, repo, base, head, branch="agent/light"),
+            0,
+        )
+
+        repo, base = fresh("reserved-lane-b")
+        (repo / "payload.txt").write_text("reserved lane\n", encoding="utf-8")
+        git("add", "payload.txt", cwd=repo)
+        git("commit", "-m", "reserved lane", "-m", "Harness-Lane: B", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "agent/v2 rejects Lane B downgrade",
+            _run_verify(
+                script,
+                repo,
+                base,
+                head,
+                branch="agent/v2/reserved-lane",
+            ),
+            1,
+        )
+
+        repo, base = fresh("receipted-lane-b")
+        head = _commit(
+            repo,
+            "v2 plus lane",
+            "receipted-lane",
+            version="2",
+            extra=["Harness-Lane: B"],
+        )
+        expect(
+            "receipted history rejects Lane B downgrade",
+            _run_verify(script, repo, base, head),
+            1,
+        )
+
+        repo, base = fresh("hybrid")
+        head = _commit(
+            repo,
+            "hybrid",
+            "hybrid",
+            version=None,
+            extra=["Harness-Evidence-Sha256: " + "a" * 64],
+        )
+        expect("hybrid receipt rejected", _run_verify(script, repo, base, head), 1)
+
+        repo, base = fresh("duplicate")
+        head = _commit(
+            repo,
+            "duplicate",
+            "duplicate",
+            version="2",
+            extra=["Harness-Task: duplicate-again"],
+        )
+        expect("duplicate recognized trailer rejected", _run_verify(script, repo, base, head), 1)
+
+        repo, base = fresh("unknown")
+        head = _commit(repo, "unknown", "unknown", version="9")
+        expect("unknown version rejected", _run_verify(script, repo, base, head), 1)
+
+        repo, base = fresh("malformed")
+        head = _commit(
+            repo,
+            "malformed",
+            "malformed",
+            version="2",
+            extra=[" harness-task: shadow"],
+        )
+        expect(
+            "malformed Harness-like trailer rejected",
+            _run_verify(script, repo, base, head),
+            1,
+        )
+
+        repo, base = fresh("alias")
+        head = _commit(
+            repo,
+            "alias",
+            "alias",
+            version="2",
+            extra=["Harness-Attestation-Sha256: " + "b" * 64],
+        )
+        expect("duplicate/bad alias rejected", _run_verify(script, repo, base, head), 1)
+
+        repo, base = fresh("manual")
+        _commit(repo, "good", "manual-good", version="2")
+        (repo / "extra.txt").write_text("manual\n", encoding="utf-8")
+        git("add", "extra.txt", cwd=repo)
+        git("commit", "-m", "manual unattested", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect("extra unattested commit rejected", _run_verify(script, repo, base, head), 1)
+
+        repo, base = fresh("amended")
+        _commit(repo, "before amend", "amended", version="2")
+        (repo / "payload.txt").write_text("changed after receipt\n", encoding="utf-8")
+        git("add", "payload.txt", cwd=repo)
+        git("commit", "--amend", "--no-edit", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "amended bytes with stale receipt rejected",
+            _run_verify(script, repo, base, head),
+            1,
+        )
+
+        repo, base = fresh("cherry-pick")
+        git("checkout", "-q", "-b", "agent/source", cwd=repo)
+        source_commit = _commit(repo, "source", "cherry", version="2")
+        git("checkout", "-q", "murmur", cwd=repo)
+        (repo / "base.txt").write_text("advance\n", encoding="utf-8")
+        git("add", "base.txt", cwd=repo)
+        git("commit", "-q", "-m", "advance", cwd=repo)
+        advanced = git("rev-parse", "HEAD", cwd=repo)
+        git("checkout", "-q", "-b", "agent/cherry", cwd=repo)
+        git("cherry-pick", source_commit, cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "cherry-picked receipt with another parent rejected",
+            _run_verify(script, repo, advanced, head),
+            1,
+        )
+
+        repo, base = fresh("fenced-lane")
+        (repo / "payload.txt").write_text("unattested\n", encoding="utf-8")
+        git("add", "payload.txt", cwd=repo)
+        git(
+            "commit",
+            "-m",
+            "unattested",
+            "-m",
+            "```\nHarness-Lane: B\n```\n> Harness-Lane: B",
+            cwd=repo,
+        )
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "fenced and quoted Lane B paste is ignored",
+            _run_verify(script, repo, base, head),
+            1,
+        )
+
+        repo, base = fresh("rename")
+        head = _commit(repo, "renamed", "rename", version="2")
+        expect(
+            "renamed harness branch still enforced",
+            _run_verify(script, repo, base, head, branch="fix/renamed"),
+            0,
+        )
+
+        repo, base = fresh("ordinary-catchup-over-receipt")
+        git("checkout", "-q", "-b", "fix/catchup-over-receipt", cwd=repo)
+        (repo / "feature.txt").write_text("ordinary feature\n", encoding="utf-8")
+        git("add", "feature.txt", cwd=repo)
+        git("commit", "-q", "-m", "ordinary feature", cwd=repo)
+        git("checkout", "-q", "murmur", cwd=repo)
+        _commit(repo, "receipted base advance", "base-receipt", version="2")
+        base_tip = git("rev-parse", "HEAD", cwd=repo)
+        git("checkout", "-q", "fix/catchup-over-receipt", cwd=repo)
+        git("merge", "--no-ff", "-m", "catch up receipted base", "murmur", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "ordinary branch ignores receipts introduced only by catch-up",
+            _run_verify(
+                script,
+                repo,
+                base,
+                head,
+                branch="fix/catchup-over-receipt",
+                base_branch=base_tip,
+            ),
+            0,
+        )
+
+        repo, base = fresh("lane-b-catchup-over-receipt")
+        git("checkout", "-q", "-b", "agent/light-catchup", cwd=repo)
+        (repo / "light.txt").write_text("light lane\n", encoding="utf-8")
+        git("add", "light.txt", cwd=repo)
+        git("commit", "-q", "-m", "light lane", "-m", "Harness-Lane: B", cwd=repo)
+        git("checkout", "-q", "murmur", cwd=repo)
+        _commit(repo, "receipted base advance", "lane-base-receipt", version="2")
+        base_tip = git("rev-parse", "HEAD", cwd=repo)
+        git("checkout", "-q", "agent/light-catchup", cwd=repo)
+        git("merge", "--no-ff", "-m", "catch up receipted base", "murmur", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "Lane B ignores receipts introduced only by catch-up",
+            _run_verify(
+                script,
+                repo,
+                base,
+                head,
+                branch="agent/light-catchup",
+                base_branch=base_tip,
+            ),
+            0,
+        )
+
+        repo, base = fresh("catchup")
+        git("checkout", "-q", "-b", "agent/catchup", cwd=repo)
+        _commit(repo, "feature", "catchup", version="2")
+        git("checkout", "-q", "murmur", cwd=repo)
+        (repo / "base.txt").write_text("new base\n", encoding="utf-8")
+        git("add", "base.txt", cwd=repo)
+        git("commit", "-q", "-m", "base advance", cwd=repo)
+        base_tip = git("rev-parse", "HEAD", cwd=repo)
+        git("checkout", "-q", "agent/catchup", cwd=repo)
+        git("merge", "--no-ff", "-m", "catch up", "murmur", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "clean catch-up merge preserved",
+            _run_verify(
+                script, repo, base, head, branch="agent/catchup", base_branch=base_tip
+            ),
+            0,
+        )
+
+        repo, base = fresh("merge-smuggle")
+        git("checkout", "-q", "-b", "agent/smuggle", cwd=repo)
+        _commit(repo, "feature", "smuggle", version="2")
+        git("checkout", "-q", "murmur", cwd=repo)
+        (repo / "base.txt").write_text("new base\n", encoding="utf-8")
+        git("add", "base.txt", cwd=repo)
+        git("commit", "-q", "-m", "base advance", cwd=repo)
+        base_tip = git("rev-parse", "HEAD", cwd=repo)
+        git("checkout", "-q", "agent/smuggle", cwd=repo)
+        git("merge", "--no-ff", "--no-commit", "murmur", cwd=repo)
+        (repo / "smuggled.txt").write_text("unreceipted\n", encoding="utf-8")
+        git("add", "smuggled.txt", cwd=repo)
+        git("commit", "-q", "-m", "catch up with smuggle", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "catch-up merge resolution smuggle rejected",
+            _run_verify(
+                script, repo, base, head, branch="agent/smuggle", base_branch=base_tip
+            ),
+            1,
+        )
+
+        repo, base = fresh("side-merge")
+        git("checkout", "-q", "-b", "agent/side-merge", cwd=repo)
+        _commit(repo, "feature", "side-merge", version="2")
+        git("checkout", "-q", "-b", "untrusted-side", base, cwd=repo)
+        (repo / "side.txt").write_text("side\n", encoding="utf-8")
+        git("add", "side.txt", cwd=repo)
+        git("commit", "-q", "-m", "untrusted side", cwd=repo)
+        git("checkout", "-q", "agent/side-merge", cwd=repo)
+        git("merge", "--no-ff", "-m", "side merge", "untrusted-side", cwd=repo)
+        head = git("rev-parse", "HEAD", cwd=repo)
+        expect(
+            "side-parent merge outside base branch rejected",
+            _run_verify(
+                script,
+                repo,
+                base,
+                head,
+                branch="agent/side-merge",
+                base_branch="murmur",
+            ),
+            1,
+        )
+
+    if failures:
+        print("receipt selftest: FAIL")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print(f"receipt selftest: PASS ({count} cases)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--base")
+    parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--branch", default=os.environ.get("GITHUB_HEAD_REF", ""))
+    parser.add_argument("--pr-body-file", default="")
+    parser.add_argument("--base-branch", default="")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.selftest:
+        return selftest()
+    if not args.base:
+        print("--base is required outside --selftest", file=sys.stderr)
+        return 2
+    try:
+        return verify_range(args)
+    except (ReceiptError, OSError) as exc:
+        print(f"receipt verifier error: {exc}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
