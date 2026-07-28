@@ -1,6 +1,6 @@
 ---
 name: ship-feature
-description: The agentic feature-shipping discipline for Murmur (Tauri 2.11 Rust core + Angular 22 zoneless). Scope → (Workflow) plan → build backend and/or FE under the project conventions → ADVERSARIAL verify (an adversarial-verifier pass, plus a lock-security review when the change touches the lock/crypto/visibility path) → gates green (cargo test --lib, ng lint, ng build, scripts/ci.sh) → QueaT commit → PR to the `murmur` trunk. Use whenever the user wants to build, implement, add, or ship a feature/fix in Murmur end-to-end. Encodes the verify-before-trust discipline that caught 7 bugs.
+description: Ship a Murmur feature through scope, isolated implementation, fresh adversarial and required security review, project gates, a QueaT commit, and a PR to `murmur`. Use the Harness v2 shadow candidate only for risky, multi-step, or explicitly requested work; ordinary low-risk fixes keep the normal isolated-worktree route.
 ---
 
 # /ship-feature — ship a Murmur feature end-to-end
@@ -29,29 +29,49 @@ builder and whether the lock-security review is mandatory:
   `screenshare.rs`, `storage/migration.rs`, the unlock/seal/visibility path,
   or content-read gating ⇒ the **lock-security review is MANDATORY** in stage 4.
 
-### 2. Create the executable task contract
+### 2. Choose the smallest honest route
+
+The harness is opt-in. A small docs/chore/mechanical/low-risk fix uses a normal
+isolated feature worktree, fresh independent review, the relevant project gates,
+and a normal QueaT commit. Do not add a Harness receipt merely because this
+skill was invoked.
+
+Use the Harness v2 shadow candidate for lock/crypto/egress/protocol work,
+multi-step changes, or when the operator explicitly requests the receipt. V2
+must not own protected control-plane paths; those still require the v1
+`--kind harness` plus `seal-prepared` bootstrap.
+
+### 2a. Create the v2 executable task contract when that route applies
 For a multi-part change, write a short plan: the exact files/symbols, the IPC seam (new Tauri
 command name + the `ipc.service.ts` call), data shape (`core/models.ts` ↔ Rust DTO), and the
-verification you'll demand. Every mutation task is initialized through `scripts/agent-harness init`:
-give it explicit owned paths, risk flags and deterministic checks. The harness creates the worktree;
-never point a writer at the shared primary checkout. Then run `scripts/agent-harness run <task-id>`.
-Unless the user explicitly chooses otherwise, the checked-in harness policy selects **Claude as
-writer and Codex as reviewer**; do not silently reverse that pair in the orchestration prompt.
-It owns the writer → checks → fresh spec review → fresh adversarial/risk review → bounded repair
-state machine. Keep the contract honest about what a dev run *can't* prove (Touch ID / lock-at-rest /
-screen-share need a signed build — see `/tauri-dev`).
+behavioral outcomes and invariants the implementation must satisfy. Do not put
+imperative check commands or requests to report command output in the contract:
+the derived plan is the sole executable evidence profile. Open Harness v2 with
+explicit owned paths and only real runtime or performance claims:
+
+```bash
+scripts/agent-harness open <task-id> --kind <bug|feature|refactor> \
+  --prompt "<scope and acceptance criteria>" \
+  --owned <path> [--owned <path> ...] \
+  [--claim <runtime|performance>] [--reviewer <codex|claude>]
+```
+
+Run this from a dedicated standalone driver clone, not the shared primary
+checkout or a linked driver worktree. The harness creates and prints the
+isolated worktree. Assign exactly one implementer to that worktree, then use
+that worktree's own runner. V2 does not dispatch a writer or repair code.
+The current exact diff derives canonical checks and actual lock/egress/protocol reviews, so do not
+substitute caller-selected risk labels or weaker commands. Keep the contract honest about what a
+dev run cannot prove (Touch ID / lock-at-rest / screen-share need a signed build).
 
 ### 3. Build — to the project conventions (non-negotiable)
-Dispatch the work to the matching builder role (today only `murmur-researcher` exists as a
-standing agent; the builder/verifier roles below are dispatched as task subagents — give each
-the conventions explicitly). Iterate with `/tauri-dev` (`MURMUR_DEV_DEK` recipe,
-`cargo test --lib` loop).
+Dispatch implementation to the matching custom role (`rust-tauri-dev` and/or
+`angular-zoneless-dev`) and keep the verifier in a fresh, separate session.
+Iterate with `/tauri-dev` (`MURMUR_DEV_DEK` recipe, `cargo test --lib` loop).
 
-**Prior lessons are executable input.** The harness deterministically selects and prepends the
-role-relevant curated `## Recurring patterns` from canonical `.codex/learnings/`, bounds the
-injected bytes, and includes the full canonical learnings tree in `instructions_sha256`. Do not
-manually duplicate that block in a harness task. For a read-only subagent dispatched outside the
-harness, prepend the relevant curated section explicitly.
+**Prior lessons are executable input.** Read the binding `.codex/rules/` file for each surface
+before editing and apply relevant curated `## Recurring patterns` from `.codex/learnings/`.
+Harness v2 verifies the resulting diff; it does not inject implementation context or repair it.
 
 **Rust / Tauri rules:**
 - `AppError` + `Result` everywhere (`error.rs`); new commands registered in the
@@ -87,18 +107,24 @@ explicit user approval.** Banned:
 constructor injection.
 
 ### 4. ADVERSARIAL verify (the part that caught 7 bugs)
-The author does **not** self-certify. Verify in **two sequential passes** (a spec review before a
-code review catches "built the wrong thing" before code-quality noise buries it):
+The author does **not** self-certify. On the v2 route, inspect the plan and run
+the verifier:
 
-**4a — Spec review (fast):** does the diff implement what stage-1 scope / stage-2 plan actually
-asked for? Nothing missing, nothing extra, the IPC seam and data shape as agreed. Only after this
-signs off does the code/adversarial pass begin.
+```bash
+scripts/agent-harness plan <task-id>
+scripts/agent-harness verify <task-id>
+scripts/agent-harness resume <task-id> # when paused/interrupted/evidence was added
+```
 
-**4b — Adversarial-verifier pass** over the diff whose job is to make it FAIL:
+The fresh combined reviewer checks both scope/spec fidelity and adversarial correctness. Its job is
+to make the exact diff FAIL:
 - For each load-bearing claim ("it locks", "it's gated", "the migration is safe", "the signal
   updates"), ask **"what would make this false?"** and try it.
-- Exercise the real seam, not mocks: run it under `/tauri-dev`, drive the IPC command, read
-  `/tmp/murmur-dev.log` for panics/aborts, confirm the FE signal actually re-renders.
+- Demand evidence from the real seam, not merely mocks. The v2 reviewer itself
+  is tool-free: it receives the immutable runner-built bundle and has no
+  filesystem or shell access. It may request only a typed runner-owned probe.
+  Live `/tauri-dev`, IPC, log, or browser evidence is produced outside that
+  reviewer session and named honestly.
 - Check the **negative**: a locked/sealed meeting leaks nothing through detail, segments,
   timeline, audio, OR MCP; an additive migration leaves existing rows intact.
 - **If the change touches lock/crypto/visibility (stage 1), run the lock-security review TOO**
@@ -106,52 +132,85 @@ signs off does the code/adversarial pass begin.
   every read path is visibility-gated, keychain ACL / `com.meetnotes.app` continuity
   untouched, no DEK/KEK/plaintext in logs, biometric gate not bypassed outside the dev hatch.
 
-A verifier finding sends it BACK to stage 3. Do not advance on the author's say-so.
+A verifier finding sends it BACK to stage 3; rerun `verify` on the new exact diff. Do not advance
+on the author's say-so. Actual lock/egress/protocol paths add the corresponding cross-vendor
+specialist automatically.
 
-**The runner records the verdict; reviewers do not write their own PASS files.** The canonical
-attestation lives under the shared Git common directory at
-`.git/agent-harness/tasks/<task>/attestation.json`. It binds the contract/instruction/base/tree/staged
-diff hashes, CLI/model identity, every command exit/log hash and each fresh review. The commit hook
-recomputes the staged diff and automatic risk classification; any edit, missing review or failed
-check invalidates PASS.
+For a bug fix, require a focused regression test and the green language suite.
+Do not demand a prose reconstruction of historical RED from the writer. Empirical
+RED is required only when a runner-owned artifact actually performed and
+recorded that proof.
 
-### 5. Gates green
-```bash
-scripts/agent-resource-run --chdir src-tauri -- cargo test --lib
-npx ng lint
-scripts/agent-resource-run -- npx ng build
-scripts/agent-resource-run -- bash scripts/ci.sh
-```
-`scripts/ci.sh` must end `✅ CI: all gates green`. (Reminder: `clippy --all-targets` belongs
-in `ci.sh`, NOT the inner loop — see `/tauri-dev`.)
+On the normal low-risk route, dispatch a fresh read-only adversarial verifier
+outside the author session and retain its concrete verdict in the PR handoff.
+
+**The runner records the verdict; reviewers do not write their own PASS files.** V2 evidence lives
+under `.git/agent-harness/v2/tasks/<task>/attempts/<attempt>/evidence.json`. It binds contract,
+base, exact binary diff/tree, plan, protocol, check/probe artifacts, reviewer invocation metadata,
+findings and telemetry. Any edit or protocol drift invalidates PASS. A reviewer may request only a
+typed allowlisted probe; arbitrary shell access is forbidden.
+
+### 5. Selected gates green; integration stays remote
+
+On the v2 route, do not manually rerun checks that the exact-diff plan already
+recorded. A changed diff gets a new plan and `verify`; an unchanged PASS proceeds
+to commit and PR.
+
+On the normal low-risk route, run each relevant local gate once:
+
+- Rust source: `scripts/agent-resource-run --chdir src-tauri -- cargo test --lib`.
+- Angular source: `npx ng lint` and
+  `scripts/agent-resource-run -- npx ng build`.
+- Behavioral UI work: the relevant Playwright smoke.
+
+The full `scripts/ci.sh` is the GitHub PR/release-parity integration gate, not a
+second local repair-loop pass. Run it locally only when the operator explicitly
+asks or as release preflight. (`clippy --all-targets` belongs inside `ci.sh`,
+never the inner loop.)
 
 ### 5b. Extract the lesson (close the loop)
 If verification caught anything real — or the run confirmed a non-obvious approach that worked —
-append ONE `## Run journal` entry to the relevant `.claude/learnings/<agent>.md` (or run
+append ONE `## Run journal` entry to the relevant `.codex/learnings/<agent>.md` (or run
 `/learn <agent>: <lesson>`), citing the artifact that revealed it. Periodically `/curate-learnings`
 promotes repeat offenders into `## Recurring patterns`. This is what makes "every bug a permanent
 lesson" instead of a re-paid one.
 
 ### 6. Commit as QueaT
 ```bash
-# Commit through the runner — never from the shared checkout.
+# V2 route: commit through the runner; its durable intent survives a crash.
 scripts/agent-harness status <task-id>
-scripts/agent-harness verify-attestation <task-id>
 scripts/agent-harness commit <task-id> -m "<type>(<scope>): <subject>"
-git -C ../.murmur-agent-tasks/<task-id>/meetnotes log -1 --format='%an <%ae>'
+git -C ../.murmur-agent-tasks/v2/<task-id>/meetnotes log -1 --format='%an <%ae>'
 # MUST be QueaT <kgm004a@gmail.com>
 ```
-Never use `git add -A` in a shared repository. **No `Co-Authored-By: Claude` / no Claude trailers.** Conventional-commit style
+Never use `git add -A` in a shared repository. **No AI co-author trailers.** Conventional-commit style
 (`feat`/`fix`/`chore(scope)`), matching the existing log.
+
+For the normal low-risk route, stage only the explicit owned files and create a
+normal QueaT commit without Harness trailers. Use a conventional `fix/<slug>`,
+`feat/<slug>`, or `chore/<slug>` branch so the remote `agent/*` receipt gate does
+not mistake it for a harness task. If an operator deliberately keeps a
+non-harness commit on an `agent/*` branch, the PR description must declare the
+explicit Lane-B handoff on its own line:
+
+```text
+Harness-Lane: B
+```
+
+Lane B is valid only before any receipt exists on an ordinary non-v2
+`agent/*` branch. Never use it on `agent/v2/*`, after a v1/v2 receipt, or to
+paper over a failed receipt check; repair or re-verify the receipted lifecycle
+instead.
 
 ### 7. PR to the `murmur` trunk (never direct push)
 ```bash
-git -C ../.murmur-agent-tasks/<task-id>/meetnotes push -u origin agent/<task-id>
-gh pr create -R murmur-io/murmur --base murmur --head agent/<task-id> \
+git -C ../.murmur-agent-tasks/v2/<task-id>/meetnotes push -u origin agent/v2/<task-id>
+gh pr create -R murmur-io/murmur --base murmur --head agent/v2/<task-id> \
   --title "<type>(<scope>): <subject>" --body "<what + how verified>"
 
-# From the primary checkout after the exact task commit exists (before or after PR merge):
-scripts/agent-harness close <task-id>
+# Keep the task/worktree through push, PR creation, and CI. After the PR merges
+# (or the operator explicitly accepts an archived handoff), clean it:
+scripts/agent-harness clean <task-id>
 ```
 `gh` active account MUST be `JakubGawr`. Base is `murmur` (the trunk) via PR — direct
 `git push origin murmur` is blocked by the environment guard. If this feature is a release,
@@ -165,7 +224,7 @@ hand off to **`/release-murmur`**.
 - **Conventions are binding** — the Rust (AppError/Result, additive migrations,
   verify-before-destroy, gated reads, crash-safe FFI) and Angular-zoneless (signals/`@if`/
   `toSignal`/no-`setTimeout`/no-new-deps) rules above are non-negotiable.
-- **Identity interlocks:** commit author=QueaT (no Claude trailers), gh=JakubGawr, PR base
+- **Identity interlocks:** commit author=QueaT (no AI trailers), gh=JakubGawr, PR base
   =`murmur`, `com.meetnotes.app` immutable.
 - **Honest about the signed-build boundary.** A dev run cannot prove Touch ID / lock-at-rest /
   screen-share — say so; only a Developer-ID build verifies them (`/release-murmur`).

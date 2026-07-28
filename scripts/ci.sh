@@ -44,16 +44,24 @@ cleanup_swift_src_tests() {
 }
 
 rust_gate() {
-  # ── Remote merge enforcement is the first, cheapest gate. Local runs exercise the evaluator
-  #    deterministically. GitHub Actions lends either the ordinary PR token or the dedicated
-  #    privileged monitoring credential only to the matching audit command. Copy then immediately
-  #    drop all exported token names before executing repo code. Privileged mode has no fallback:
-  #    a missing dedicated credential is an explicit gate failure. PRs attest only merge scope;
-  #    admin-only controls are MONITOR_ONLY and checked by trusted schedule/manual runs. ──
-  echo "── development agent remote enforcement audit ──"
+  # Quarantine workflow credentials before executing any repository command.
+  # These shell locals are not exported; only the selected audit subprocess
+  # receives GH_TOKEN below.
   remote_audit_token="${MURMUR_REMOTE_AUDIT_TOKEN:-}"
   public_audit_token="${MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN:-}"
   unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN GH_TOKEN GITHUB_TOKEN
+
+  # The merge receipt parser is security-sensitive and cheap. Exercise real
+  # temporary Git histories before any network audit or product build.
+  echo "── harness receipt gate: temp-git self-test ──"
+  scripts/verify-harness-attestation --selftest
+
+  # ── Remote merge enforcement is the first network-aware gate. Local runs exercise the evaluator
+  #    deterministically. GitHub Actions lends either the ordinary PR token or the dedicated
+  #    privileged monitoring credential only to the matching audit command. Privileged mode has no fallback:
+  #    a missing dedicated credential is an explicit gate failure. PRs attest only merge scope;
+  #    admin-only controls are MONITOR_ONLY and checked by trusted schedule/manual runs. ──
+  echo "── development agent remote enforcement audit ──"
   if [ "${MURMUR_CI_LIVE_REMOTE_AUDIT:-0}" = "1" ]; then
     if [ -z "$remote_audit_token" ]; then
       echo "remote audit: MURMUR_REMOTE_AUDIT_TOKEN is required for privileged monitoring" >&2
