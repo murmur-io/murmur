@@ -57,6 +57,33 @@ ALLOWED_PROBES = {
 MAX_PROBE_EXECUTIONS_PER_ID = 2
 DEFAULT_REVIEW_STREAM_BYTES = 2_048
 NPM_LOCK_REVIEW_STREAM_BYTES = 65_536
+SPECIALIST_TEST_FOCUS_LINES_PER_TERM = 12
+SPECIALIST_TEST_FOCUS_BYTES = 32_768
+SPECIALIST_TEST_FOCUS_TERMS = {
+    "lock-security": (
+        "lock",
+        "unlock",
+        "seal",
+        "visibility",
+        "org",
+        "member",
+        "context",
+        "tombstone",
+        "revok",
+    ),
+    "egress-security": (
+        "egress",
+        "consent",
+        "redact",
+        "provider",
+        "ollama",
+        "anthropic",
+        "gateway",
+        "remote",
+        "loopback",
+        "ledger",
+    ),
+}
 TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 PROTOCOL_FILES = (
     "AGENTS.md",
@@ -898,6 +925,8 @@ def _bounded_stream_summary(
     expected_hash: Any,
     label: str,
     limit: int,
+    *,
+    test_focus_terms: Sequence[str] = (),
 ) -> Dict[str, Any]:
     path = _artifact_inside(task_dir, raw_path, expected_hash, label)
     size = path.stat().st_size
@@ -917,13 +946,84 @@ def _bounded_stream_summary(
             f"\n... <{omitted} evidence bytes omitted> ...\n".encode("utf-8")
         ) + suffix
         truncated = True
-    return {
+    summary = {
         "sha256": expected_hash,
         "bytes": size,
         "truncated": truncated,
         "excerpt_included": True,
         "excerpt": excerpt.decode("utf-8", "replace"),
     }
+    if test_focus_terms:
+        normalized_terms = tuple(
+            dict.fromkeys(term.strip().lower() for term in test_focus_terms if term.strip())
+        )
+        per_term_total = {term: 0 for term in normalized_terms}
+        per_term_lines: Dict[str, List[str]] = {
+            term: [] for term in normalized_terms
+        }
+        focused_bytes = 0
+        matching_lines_total = 0
+        test_outcome = re.compile(
+            r"^test .+ \.\.\. (?:ok|FAILED|ignored)$"
+        )
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\r\n")
+                if not test_outcome.fullmatch(line):
+                    continue
+                lowered = line.lower()
+                matched = tuple(
+                    term for term in normalized_terms if term in lowered
+                )
+                if not matched:
+                    continue
+                matching_lines_total += 1
+                for term in matched:
+                    per_term_total[term] += 1
+                    bucket = per_term_lines[term]
+                    if len(bucket) >= SPECIALIST_TEST_FOCUS_LINES_PER_TERM:
+                        continue
+                    if bucket:
+                        entry = "\n" + line
+                    else:
+                        separator = "\n" if any(per_term_lines.values()) else ""
+                        entry = f"{separator}[{term}]\n{line}"
+                    encoded_size = len(entry.encode("utf-8"))
+                    if (
+                        focused_bytes + encoded_size
+                        > SPECIALIST_TEST_FOCUS_BYTES
+                    ):
+                        continue
+                    bucket.append(line)
+                    focused_bytes += encoded_size
+        focused_sections = [
+            f"[{term}]\n" + "\n".join(per_term_lines[term])
+            for term in normalized_terms
+            if per_term_lines[term]
+        ]
+        focused_excerpt = "\n".join(focused_sections)
+        per_term_included = {
+            term: len(per_term_lines[term]) for term in normalized_terms
+        }
+        unique_lines = {
+            line for lines in per_term_lines.values() for line in lines
+        }
+        summary["focused_test_inventory"] = {
+            "source_sha256": expected_hash,
+            "terms": list(normalized_terms),
+            "matching_lines_total": matching_lines_total,
+            "included_lines": len(unique_lines),
+            "included_occurrences": sum(per_term_included.values()),
+            "included_bytes": len(focused_excerpt.encode("utf-8")),
+            "truncated": any(
+                per_term_total[term] > per_term_included[term]
+                for term in normalized_terms
+            ),
+            "per_term_total": per_term_total,
+            "per_term_included": per_term_included,
+            "excerpt": focused_excerpt,
+        }
+    return summary
 
 
 def _review_evidence_summary(
@@ -931,6 +1031,7 @@ def _review_evidence_summary(
     task_dir: Path,
     *,
     channel: str,
+    review_kind: str,
 ) -> Dict[str, Any]:
     evidence = item.get("evidence", item)
     if not isinstance(evidence, Mapping):
@@ -944,6 +1045,11 @@ def _review_evidence_summary(
         NPM_LOCK_REVIEW_STREAM_BYTES
         if check_id == "npm-lock"
         else DEFAULT_REVIEW_STREAM_BYTES
+    )
+    test_focus_terms = (
+        SPECIALIST_TEST_FOCUS_TERMS.get(review_kind, ())
+        if check_id in {"rust-lib", "protocol-server"}
+        else ()
     )
     request_contexts = []
     for context in item.get("request_contexts", []):
@@ -979,6 +1085,7 @@ def _review_evidence_summary(
             evidence.get("stdout_sha256"),
             f"review-visible {check_id} stdout",
             limit,
+            test_focus_terms=test_focus_terms,
         ),
         "stderr": _bounded_stream_summary(
             task_dir,
@@ -1011,12 +1118,12 @@ def combined_review_prompt(
         policy = legacy.read_prompt(kind + "-reviewer")
     check_summary = [
         _review_evidence_summary(
-            item, task_dir, channel="planned-check"
+            item, task_dir, channel="planned-check", review_kind=kind
         )
         for item in checks
     ] + [
         _review_evidence_summary(
-            item, task_dir, channel="reviewer-probe"
+            item, task_dir, channel="reviewer-probe", review_kind=kind
         )
         for item in probes
     ]
