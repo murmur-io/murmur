@@ -876,6 +876,35 @@ def _validate_verification_snapshot(
         raise legacy.HarnessError(
             "v2 verification snapshot unexpectedly shares mutable Git metadata"
         )
+    alternates = common / "objects" / "info" / "alternates"
+    try:
+        alternates_metadata = alternates.lstat()
+    except FileNotFoundError:
+        alternates_metadata = None
+    except OSError as exc:
+        raise legacy.HarnessError(
+            "cannot inspect v2 verification snapshot object alternates"
+        ) from exc
+    if alternates_metadata is not None:
+        if (
+            stat.S_ISLNK(alternates_metadata.st_mode)
+            or not stat.S_ISREG(alternates_metadata.st_mode)
+        ):
+            raise legacy.HarnessError(
+                "v2 verification snapshot object alternates must be absent "
+                "or empty"
+            )
+        try:
+            nonempty_alternates = bool(alternates.read_bytes())
+        except OSError as exc:
+            raise legacy.HarnessError(
+                "cannot inspect v2 verification snapshot object alternates"
+            ) from exc
+        if nonempty_alternates:
+            raise legacy.HarnessError(
+                "v2 verification snapshot object alternates must be absent "
+                "or empty"
+            )
     if (
         Path(legacy.git(snapshot, "rev-parse", "--show-toplevel")).resolve()
         != snapshot.resolve()
@@ -916,11 +945,11 @@ def _ensure_verification_snapshot(
     plan: Mapping[str, Any],
     attempt_dir: Path,
 ) -> Path:
-    """Materialize the exact planned tree in a runner-owned standalone clone.
+    """Materialize the exact planned tree in a runner-owned standalone repo.
 
     Checks and reviewers never read the concurrently editable developer
-    worktree.  The standalone clone keeps its own index/HEAD while borrowing
-    immutable objects from the primary repository.
+    worktree.  The snapshot keeps its own index, HEAD, and object database so
+    deterministic Seatbelt checks need no read access to the primary repo.
     """
 
     snapshot = _verification_snapshot_path(contract, attempt_dir)
@@ -963,18 +992,58 @@ def _ensure_verification_snapshot(
     if not primary.is_dir() or primary.is_symlink():
         raise legacy.HarnessError("v2 primary repository is missing or unsafe")
     try:
+        local_snapshot_ref = "refs/agent-harness/v2/source"
         legacy.run_capture(
             [
                 "git",
-                "clone",
+                "init",
                 "--quiet",
-                "--shared",
-                "--no-checkout",
-                str(primary),
+                "--no-template",
+                "--object-format=sha1",
                 str(snapshot),
             ],
             snapshot.parent,
         )
+        legacy.run_capture(
+            [
+                "git",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--depth=2",
+                "--no-write-fetch-head",
+                str(primary),
+                f"{snapshot_ref}:{local_snapshot_ref}",
+            ],
+            snapshot,
+        )
+        fetched_commit = legacy.git(
+            snapshot,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{local_snapshot_ref}^{{commit}}",
+        )
+        if fetched_commit != snapshot_commit:
+            raise legacy.HarnessError(
+                "v2 verification snapshot fetched a stale anchor"
+            )
+        if (
+            legacy.git(
+                snapshot, "rev-parse", f"{fetched_commit}^{{tree}}"
+            )
+            != plan["tree_sha"]
+        ):
+            raise legacy.HarnessError(
+                "v2 verification snapshot fetched a stale tree"
+            )
+        fetched_parents = legacy.git(
+            snapshot, "show", "-s", "--format=%P", fetched_commit
+        ).split()
+        if fetched_parents != [plan["base_sha"]]:
+            raise legacy.HarnessError(
+                "v2 verification snapshot fetched a stale parent"
+            )
         legacy.run_capture(
             ["git", "checkout", "--quiet", "--detach", plan["base_sha"]],
             snapshot,
