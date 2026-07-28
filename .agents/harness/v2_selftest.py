@@ -743,6 +743,15 @@ def profile_cases(test: Tests) -> None:
         harness_python_result.returncode,
         0,
     )
+    canonical_v2_selftest = legacy.load_config()["canonical_checks"][
+        "harness-v2-selftest"
+    ]
+    test.true(
+        "PROFILE canonical v2 selftest inherits the outer sandbox",
+        legacy.command_is_inherited_sandbox_meta_check(
+            canonical_v2_selftest
+        ),
+    )
 
 
 def reviewer_tool_guard_cases(test: Tests) -> None:
@@ -1813,6 +1822,149 @@ def standalone_driver_lane_cases(test: Tests) -> None:
             "LANE independent clone proceeds after release",
             released.returncode,
             0,
+        )
+
+
+def verification_snapshot_cases(test: Tests) -> None:
+    """A check snapshot must resolve Git objects inside its own Seatbelt scope."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-snapshot-") as raw:
+        root = Path(raw)
+        primary = root / "primary"
+        base = _init_repo(primary)
+        worktree = root / "task" / "meetnotes"
+        worktree.parent.mkdir()
+        _git(
+            primary,
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            str(worktree),
+            base,
+        )
+        (worktree / "owned.txt").write_text(
+            "base\nsnapshot change\n", encoding="utf-8"
+        )
+        common = Path(
+            _git(
+                primary,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_id = "snapshot-self-contained"
+        task_dir = harness_cli.v2_task_dir(common, task_id)
+        attempt_dir = task_dir / "attempts" / ("b" * 64)
+        attempt_dir.mkdir(parents=True)
+        contract: Dict[str, Any] = {
+            "task_id": task_id,
+            "contract_sha256": "c" * 64,
+            "base_sha": base,
+            "repo_realpath": str(primary.resolve()),
+            "worktree_path": str(worktree.resolve()),
+            "owned_paths": ["owned.txt"],
+            "expected_change": True,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        legacy.atomic_write_json(task_dir / "task.json", contract)
+        paths, diff, tree = verifier.snapshot_scoped_diff(
+            worktree, contract, task_dir
+        )
+        plan = {
+            "base_sha": base,
+            "changed_paths": paths,
+            "diff_sha256": legacy.sha256_bytes(diff),
+            "tree_sha": tree,
+            "plan_sha256": "d" * 64,
+        }
+
+        def has_no_object_alternates(repository: Path) -> bool:
+            alternates = (
+                repository / ".git" / "objects" / "info" / "alternates"
+            )
+            try:
+                metadata = alternates.lstat()
+            except FileNotFoundError:
+                return True
+            return (
+                stat.S_ISREG(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and alternates.read_bytes() == b""
+            )
+
+        snapshot = harness_cli._ensure_verification_snapshot(
+            contract, task_dir, plan, attempt_dir
+        )
+        alternates = snapshot / ".git" / "objects" / "info" / "alternates"
+        test.true(
+            "SNAPSHOT has no nonempty object alternates dependency",
+            has_no_object_alternates(snapshot),
+        )
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(
+            str(primary / ".git" / "objects") + "\n", encoding="utf-8"
+        )
+        resumed_snapshot = harness_cli._ensure_verification_snapshot(
+            contract, task_dir, plan, attempt_dir
+        )
+        test.true(
+            "SNAPSHOT resume reconstructs a claimed repo with object alternates",
+            resumed_snapshot == snapshot
+            and has_no_object_alternates(resumed_snapshot),
+        )
+        resumed_paths, resumed_diff, resumed_tree = verifier.snapshot_scoped_diff(
+            resumed_snapshot, contract, task_dir
+        )
+        test.equal(
+            "SNAPSHOT resume preserves the exact base, diff, and tree",
+            (
+                _git(resumed_snapshot, "rev-parse", "HEAD"),
+                resumed_paths,
+                legacy.sha256_bytes(resumed_diff),
+                resumed_tree,
+            ),
+            (
+                plan["base_sha"],
+                plan["changed_paths"],
+                plan["diff_sha256"],
+                plan["tree_sha"],
+            ),
+        )
+
+        base_tree = _git(primary, "rev-parse", f"{base}^{{tree}}")
+        evidence = legacy.run_check(
+            resumed_snapshot,
+            task_dir,
+            {
+                "id": "snapshot-head-tree",
+                "command": (
+                    "test \"$(git rev-parse 'HEAD^{tree}')\" = "
+                    f"'{base_tree}'"
+                ),
+                "timeout_seconds": 10,
+            },
+            "snapshot-self-contained",
+        )
+        expected_sandbox_mode = (
+            "inherited"
+            if legacy.inherited_outer_sandbox_is_active()
+            else "direct"
+        )
+        test.equal(
+            "SNAPSHOT runner-owned Seatbelt check resolves HEAD^{tree}",
+            (evidence["sandbox_mode"], evidence["passed"]),
+            (expected_sandbox_mode, True),
+        )
+        harness_cli._discard_claimed_verification_snapshot(
+            contract, attempt_dir, resumed_snapshot
+        )
+        test.true(
+            "SNAPSHOT cleanup removes only the claimed verification repo",
+            not resumed_snapshot.exists()
+            and worktree.is_dir()
+            and primary.is_dir(),
         )
 
 
@@ -3114,6 +3266,7 @@ def main() -> int:
     readonly_review_wall_timeout_cases(test)
     state_and_lock_cases(test)
     standalone_driver_lane_cases(test)
+    verification_snapshot_cases(test)
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
