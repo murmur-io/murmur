@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run one agent-owned command inside Murmur's repo-global resource lane.
+"""Run one agent-owned command inside Murmur's workspace-global resource lane.
 
-The lane is a kernel flock stored in git's common directory, so linked worktrees
-serialize with one another and a killed supervisor cannot leave a stale lock.
-The command runs in a fresh process group that this supervisor alone owns.
+The lane is a kernel flock under the shared Murmur task root. Linked worktrees,
+the user's primary checkout, and the standalone harness driver clone therefore
+serialize with one another. A killed supervisor cannot leave a stale lock. The
+command runs in a fresh process group that this supervisor alone owns.
 """
 
 import argparse
@@ -60,6 +61,12 @@ def parse_args(argv):
         metavar="PATH",
         help="run the child in PATH after resolving the repo-global lane",
     )
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=positive_seconds,
+        default=os.environ.get("MURMUR_AGENT_LANE_HEARTBEAT_SECONDS", "30"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.command[:1] == ["--"]:
@@ -86,8 +93,47 @@ def git_common_dir(start_dir):
     return common.resolve()
 
 
+def primary_worktree(start_dir):
+    common = git_common_dir(start_dir)
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(common),
+            "worktree",
+            "list",
+            "--porcelain",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "cannot resolve repository primary for shared resources: "
+            + result.stderr.strip()
+        )
+    first = next(
+        (
+            line[len("worktree ") :].strip()
+            for line in result.stdout.splitlines()
+            if line.startswith("worktree ")
+        ),
+        "",
+    )
+    if not first:
+        raise RuntimeError("cannot resolve a primary worktree for shared resources")
+    return Path(first).resolve()
+
+
 def lane_file_path(start_dir):
-    return git_common_dir(start_dir) / "murmur-agent-resource-lane.lock"
+    return (
+        primary_worktree(start_dir).parent
+        / ".murmur-agent-tasks"
+        / ".resources"
+        / "cargo.lock"
+    )
 
 
 def exit_code(returncode):
@@ -220,7 +266,51 @@ class ProcessGroupSupervisor:
             time.sleep(min(POLL_SECONDS, remaining))
 
 
-def acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
+def lane_owner(lane_handle):
+    try:
+        lane_handle.seek(0)
+        raw = lane_handle.read().strip()
+        document = json.loads(raw) if raw else {}
+    except (OSError, json.JSONDecodeError):
+        document = {}
+    if not isinstance(document, dict):
+        document = {}
+    return {
+        "owner_pid": document.get("pid", document.get("guardian_pid", "unknown")),
+        "task": document.get("task", document.get("task_id", "unknown")),
+        "command": document.get("command", "unknown"),
+        "since": document.get(
+            "since",
+            document.get("acquired_at", document.get("acquired_epoch", "unknown")),
+        ),
+    }
+
+
+def print_lane_wait(lane_handle):
+    owner = lane_owner(lane_handle)
+    print(
+        "agent-resource-run: waiting for lane "
+        "owner_pid={owner_pid} task={task} command={command} since={since} "
+        "heartbeat={heartbeat}".format(
+            **owner,
+            heartbeat=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def acquire_lane(
+    lane_handle,
+    lane_path,
+    supervisor,
+    absolute_deadline,
+    *,
+    task,
+    command,
+    heartbeat_seconds,
+):
+    next_heartbeat = None
     while True:
         if supervisor.signal_received is not None:
             return False
@@ -233,6 +323,9 @@ def acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
                     "pid": os.getpid(),
                     "cwd": str(Path.cwd()),
                     "acquired_epoch": int(time.time()),
+                    "task": task,
+                    "command": command,
+                    "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 },
                 lane_handle,
                 sort_keys=True,
@@ -245,7 +338,12 @@ def acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
             if error.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
 
-        remaining = absolute_deadline - time.monotonic()
+        now = time.monotonic()
+        if next_heartbeat is None or now >= next_heartbeat:
+            print_lane_wait(lane_handle)
+            next_heartbeat = now + heartbeat_seconds
+
+        remaining = absolute_deadline - now
         if remaining <= 0:
             owner = ""
             try:
@@ -261,7 +359,8 @@ def acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
                 file=sys.stderr,
             )
             return False
-        time.sleep(min(POLL_SECONDS, remaining))
+        until_heartbeat = max(0.0, next_heartbeat - time.monotonic())
+        time.sleep(min(POLL_SECONDS, remaining, until_heartbeat or POLL_SECONDS))
 
 
 def survivor_lock_guard(supervisor, lane_fd):
@@ -355,7 +454,22 @@ def main(argv):
 
     try:
         with lane_path.open("a+", encoding="utf-8") as lane_handle:
-            if not acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
+            task = os.environ.get(
+                "MURMUR_HARNESS_TASK",
+                os.environ.get("MURMUR_AGENT_TASK_ID", "operator"),
+            )
+            command = " ".join(args.command)
+            if len(command) > 240:
+                command = command[:237] + "..."
+            if not acquire_lane(
+                lane_handle,
+                lane_path,
+                supervisor,
+                absolute_deadline,
+                task=task,
+                command=command,
+                heartbeat_seconds=args.heartbeat_seconds,
+            ):
                 if supervisor.signal_received is not None:
                     return 128 + supervisor.signal_received
                 return TIMEOUT_EXIT

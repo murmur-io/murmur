@@ -21,6 +21,7 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -38,6 +39,19 @@ HARNESS_ROOT = Path(__file__).resolve().parent
 SCHEMAS_DIR = HARNESS_ROOT / "schemas"
 PROMPTS_DIR = HARNESS_ROOT / "prompts"
 CONFIG_PATH = HARNESS_ROOT / "config.json"
+PROCESS_GUARDIAN_PATH = HARNESS_ROOT / "process_guardian.py"
+REVIEWER_CWD = Path("/var/empty")
+REVIEWER_TOOL_DENIAL = {
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            "Harness reviewers have no local tools. Review the supplied "
+            "immutable diff and evidence, or return a schema-allowlisted "
+            "typed probe request."
+        ),
+    }
+}
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -73,12 +87,157 @@ class HarnessError(RuntimeError):
         self.exit_code = exit_code
 
 
+class ManagedProcessTimeout(HarnessError):
+    """Typed model-process wall timeout with runner-owned guardian evidence."""
+
+    def __init__(
+        self,
+        label: str,
+        timeout_seconds: float,
+        process_result: Mapping[str, Any],
+    ) -> None:
+        self.label = label
+        self.timeout_seconds = float(timeout_seconds)
+        self.process_result = dict(process_result)
+        self.timed_out = True
+        log_path = str(process_result.get("log") or "unknown")
+        guardian_path = str(process_result.get("guardian_path") or "unknown")
+        super().__init__(
+            f"{label} wall timeout after {self.timeout_seconds:g}s "
+            f"(exit_code={process_result.get('exit_code')}, "
+            f"duration_ms={process_result.get('duration_ms')}, "
+            f"log={log_path}, guardian={guardian_path})",
+            exit_code=124,
+        )
+
+
 class HarnessCancellation(BaseException):
     """Catchable SIGTERM/SIGHUP so managed child groups are drained first."""
 
     def __init__(self, signum: int) -> None:
         super().__init__(signum)
         self.signum = signum
+
+
+def reviewer_tool_guard_command() -> str:
+    """Return a deny-all hook whose executable state is entirely in argv."""
+    denial_json = json.dumps(
+        REVIEWER_TOOL_DENIAL,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "/usr/bin/printf '%s\\n' " + shlex.quote(denial_json)
+
+
+def reviewer_execution_cwd() -> Path:
+    """Resolve a root-owned, non-writable cwd with no project configuration."""
+    try:
+        resolved = REVIEWER_CWD.resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise HarnessError(f"reviewer cwd is unavailable: {REVIEWER_CWD}") from exc
+    for component in (resolved, *resolved.parents):
+        info = component.stat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise HarnessError(f"reviewer cwd ancestor is not a directory: {component}")
+        if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise HarnessError(
+                f"reviewer cwd ancestor is mutable by the invoking user: {component}"
+            )
+    return resolved
+
+
+def reviewer_model_environment(
+    environment: Mapping[str, str],
+    *,
+    vendor: str,
+    cwd: Path,
+) -> Dict[str, str]:
+    """Remove mutable shell startup state from a verifier-only model process."""
+    isolated = dict(environment)
+    isolated["SHELL"] = "/bin/sh"
+    if vendor == "codex":
+        original_home = isolated.get("HOME")
+        if "CODEX_HOME" not in isolated:
+            if not original_home:
+                raise HarnessError("Codex reviewer has no HOME or CODEX_HOME for auth")
+            isolated["CODEX_HOME"] = str(Path(original_home) / ".codex")
+        isolated["HOME"] = str(cwd)
+    return isolated
+
+
+def reviewer_tool_activity(log_path: Path, vendor: str) -> List[str]:
+    """Return model tool events that make a verifier-only review inadmissible."""
+    activity: List[str] = []
+    claude_init_seen = False
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if vendor == "codex":
+                event_type = event.get("type")
+                if isinstance(event_type, str) and event_type.startswith("item."):
+                    item = event.get("item")
+                    item_type = item.get("type") if isinstance(item, dict) else None
+                    # A verifier-only Codex process may stream prose/reasoning, but
+                    # every executable, hosted, file-mutating, or future unknown item
+                    # is inadmissible. The closed allowlist makes new CLI tool shapes
+                    # fail closed instead of silently bypassing this audit.
+                    if item_type not in {"agent_message", "reasoning"}:
+                        activity.append(
+                            f"line {line_number}: {item_type or 'malformed-item'}"
+                        )
+                elif isinstance(event_type, str) and (
+                    "tool" in event_type
+                    or "command" in event_type
+                    or "file_change" in event_type
+                ):
+                    activity.append(f"line {line_number}: {event_type}")
+            elif vendor == "claude" and event.get("type") == "system":
+                if event.get("subtype") != "init":
+                    continue
+                claude_init_seen = True
+                tools = event.get("tools")
+                mcp_servers = event.get("mcp_servers")
+                if tools != ["StructuredOutput"]:
+                    activity.append(
+                        f"line {line_number}: unexpected-tools:{tools!r}"
+                    )
+                if mcp_servers != []:
+                    activity.append(
+                        f"line {line_number}: unexpected-mcp:{mcp_servers!r}"
+                    )
+            elif vendor == "claude" and event.get("type") == "assistant":
+                message = event.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        # Claude Code implements --json-schema by exposing one
+                        # non-executing response channel named StructuredOutput.
+                        # It is the only admissible tool-shaped block; Read, Bash,
+                        # WebSearch, MCP, Task, and every future name still fail.
+                        if block.get("name") == "StructuredOutput":
+                            continue
+                        activity.append(
+                            f"line {line_number}: tool_use:{block.get('name', 'unknown')}"
+                        )
+    if vendor == "claude" and not claude_init_seen:
+        activity.append("missing Claude init telemetry")
+    return activity
+
+
+def assert_reviewer_used_no_tools(log_path: Path, vendor: str) -> None:
+    activity = reviewer_tool_activity(log_path, vendor)
+    if activity:
+        raise HarnessError(
+            "reviewer-only model used a local or hosted tool; evidence is "
+            "inadmissible: " + ", ".join(activity[:8])
+        )
 
 
 class TaskRunLock:
@@ -111,6 +270,22 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _new_execution_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _execution_artifact_path(base_path: Path, execution_id: str) -> Path:
+    """Insert one canonical UUID before a base artifact's final suffix."""
+
+    try:
+        parsed = uuid.UUID(execution_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise HarnessError(f"invalid managed-process execution id: {execution_id!r}") from exc
+    if str(parsed) != execution_id:
+        raise HarnessError(f"managed-process execution id is not canonical: {execution_id!r}")
+    return base_path.with_name(f"{base_path.stem}-{execution_id}{base_path.suffix}")
 
 
 def load_json(path: Path) -> Any:
@@ -154,6 +329,41 @@ def atomic_write_bytes(path: Path, value: bytes) -> None:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
+
+
+def atomic_create_bytes(path: Path, value: bytes) -> None:
+    """Atomically create an immutable artifact, failing instead of replacing."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp_name, path)
+        except FileExistsError as exc:
+            raise HarnessError(f"refusing to overwrite prior execution artifact: {path}") from exc
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_create_json(path: Path, value: Any) -> None:
+    atomic_create_bytes(
+        path,
+        (
+            json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8"),
+    )
 
 
 def append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
@@ -594,7 +804,9 @@ def validate_canonical_checks(
     for check_id, check in by_id.items():
         if check_id in canonical and check.get("command") != canonical[check_id]:
             raise HarnessError(
-                f"canonical check {check_id} command differs from the runner-owned profile"
+                f"canonical check {check_id} command differs from the runner-owned profile. "
+                f"Expected exactly: {canonical[check_id]!r}. If the check is selected by "
+                "an inferred risk, omit that --check entirely; the harness adds it."
             )
     for check_id in required_risk_evidence(risk_flags, config):
         expected = canonical.get(check_id)
@@ -658,7 +870,15 @@ def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
     # use, not a hypothetical copy from the base commit.
     source_repo = HARNESS_ROOT.parent.parent
     harness_files = [CONFIG_PATH, Path(__file__).resolve()]
-    for name in ("hook_guard.py", "config_audit.py", "eval_runner.py"):
+    for name in (
+        "cli.py",
+        "verifier.py",
+        "hook_guard.py",
+        "config_audit.py",
+        "eval_runner.py",
+        "resource_policy.py",
+        "remote-policy.json",
+    ):
         candidate = HARNESS_ROOT / name
         if candidate.is_file():
             harness_files.append(candidate)
@@ -667,7 +887,14 @@ def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
     checks_dir = HARNESS_ROOT / "checks"
     if checks_dir.is_dir():
         harness_files.extend(sorted(path for path in checks_dir.rglob("*") if path.is_file()))
-    for name in ("agent-harness", "agent-config-audit", "agent-remote-audit"):
+    for name in (
+        "agent-harness",
+        "agent-resource-run",
+        "agent-config-audit",
+        "agent-remote-audit",
+        "verify-harness-attestation",
+        "ci.sh",
+    ):
         wrapper = source_repo / "scripts" / name
         if wrapper.is_file():
             harness_files.append(wrapper)
@@ -1306,13 +1533,9 @@ def command_needs_sherpa_archive(command: str, worktree: Optional[Path] = None) 
             "scripts/e2e-core.sh",
             "scripts/e2e-mix.sh",
             "scripts/harness-runtime-smoke",
-            # A harness check SCRIPT compiles the tree from inside itself, so the marker never
-            # appears in the command string the runner matches on. `perf-contracts.sh` runs
-            # `cd src-tauri && cargo test --lib …`, but its command is only
-            # `bash .agents/harness/checks/perf-contracts.sh` — so without this marker the pinned
-            # archive stayed unexposed and the network-isolated build tried to DOWNLOAD
-            # sherpa-onnx, which can never succeed under `network_mode: none`. Match the checks
-            # directory so any future check script inherits the offline archive too.
+            # A runner-owned check script can compile Rust without exposing
+            # `src-tauri` in its command string. Match the checks directory so
+            # the pinned offline sherpa archive is available to those scripts.
             ".agents/harness/checks/",
             "npm run dev",
             "npm run tauri",
@@ -1695,7 +1918,132 @@ def _release_owned_directory_lock(lock: Optional[Path]) -> None:
         pass
 
 
-def acquire_cargo_lane(task_dir: Path, timeout_seconds: float) -> Any:
+def git_common_for_task_dir(task_dir: Path) -> Path:
+    """Resolve the Git common directory for v1 or nested v2 task evidence."""
+
+    resolved = task_dir.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if candidate.name == "agent-harness":
+            return candidate.parent
+    raise HarnessError(f"task evidence is outside agent-harness: {task_dir}")
+
+
+def shared_resource_root_for_common(git_common_dir: Path) -> Path:
+    """Return the Murmur workspace-wide resource root.
+
+    A dedicated harness driver is intentionally a standalone clone, so its
+    Git common directory differs from the user's primary checkout.  A lock
+    stored in either ``.git`` would therefore serialize only half the machine.
+    Every Murmur checkout kept under the same workspace parent instead shares
+    the narrowly-scoped sibling ``.murmur-agent-tasks/.resources`` directory.
+    """
+
+    completed = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(git_common_dir),
+            "worktree",
+            "list",
+            "--porcelain",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise HarnessError(
+            "cannot resolve the repository primary for shared resources: "
+            + completed.stderr.strip()
+        )
+    first = next(
+        (
+            line.removeprefix("worktree ").strip()
+            for line in completed.stdout.splitlines()
+            if line.startswith("worktree ")
+        ),
+        "",
+    )
+    if not first:
+        raise HarnessError("cannot resolve a primary worktree for shared resources")
+    primary = Path(first).resolve()
+    return primary.parent / ".murmur-agent-tasks" / ".resources"
+
+
+def shared_resource_root_for_task(task_dir: Path) -> Path:
+    return shared_resource_root_for_common(git_common_for_task_dir(task_dir))
+
+
+def assert_v1_not_imported(task_dir: Path) -> None:
+    """Refuse v1 mutation after an exact v2 import adopted its worktree."""
+
+    common = git_common_for_task_dir(task_dir)
+    candidate = (
+        common
+        / "agent-harness"
+        / "v2"
+        / "tasks"
+        / task_dir.name
+        / "task.json"
+    )
+    if not candidate.exists():
+        return
+    imported = load_json(candidate)
+    if imported.get("schema_version") != 2:
+        raise HarnessError("a malformed v2 claim shadows this v1 task")
+    source = load_json(task_dir / "task.json")
+    expected = {
+        "generation": 1,
+        "task_id": source["task_id"],
+        "contract_sha256": source["contract_sha256"],
+    }
+    if imported.get("supersedes") != expected:
+        raise HarnessError("an ambiguous v2 claim collides with this v1 task")
+    raise HarnessError(
+        "v1 task was imported into Harness v2; use v2 plan/verify/resume/clean"
+    )
+
+
+def _cargo_lane_owner(lock_handle: Any) -> Dict[str, Any]:
+    try:
+        lock_handle.seek(0)
+        raw = lock_handle.read().strip()
+        document = json.loads(raw) if raw else {}
+    except (OSError, json.JSONDecodeError):
+        document = {}
+    if not isinstance(document, dict):
+        document = {}
+    return {
+        "owner_pid": document.get("pid", "unknown"),
+        "task": document.get("task", document.get("task_id", "unknown")),
+        "command": document.get("command", "unknown"),
+        "since": document.get(
+            "since", document.get("acquired_at", "unknown")
+        ),
+    }
+
+
+def _print_cargo_lane_wait(lock_handle: Any) -> None:
+    owner = _cargo_lane_owner(lock_handle)
+    print(
+        "agent-harness: waiting for Cargo lane "
+        "owner_pid={owner_pid} task={task} command={command} since={since} "
+        "heartbeat={heartbeat}".format(
+            **owner,
+            heartbeat=utc_now(),
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def acquire_cargo_lane(
+    task_dir: Path,
+    timeout_seconds: float,
+    *,
+    command: str = "unknown",
+    heartbeat_seconds: float = 5.0,
+) -> Any:
     """Acquire the one cross-task Rust build lane.
 
     This is a kernel advisory lock, not a PID-file lock: normal exit, cancellation,
@@ -1703,30 +2051,49 @@ def acquire_cargo_lane(task_dir: Path, timeout_seconds: float) -> Any:
     small JSON payload is diagnostic only and never used to infer ownership.
     """
 
-    # Share the exact kernel lane used by scripts/agent-resource-run. The task
-    # store is <git-common>/agent-harness/tasks/<id>, so three parents resolve
-    # the linked-worktree common Git directory. Separate lock files here would
-    # let a harness Cargo check overlap an operator/agent build in another WT.
-    git_common_dir = task_dir.parent.parent.parent
-    lock_path = git_common_dir / "murmur-agent-resource-lane.lock"
+    # Share the exact kernel lane used by scripts/agent-resource-run across v1,
+    # v2, the operator checkout and the standalone driver clone.
+    resource_root = shared_resource_root_for_task(task_dir)
+    resource_root.mkdir(parents=True, exist_ok=True)
+    lock_path = resource_root / "cargo.lock"
     lock_handle = lock_path.open("a+", encoding="utf-8")
     deadline = time.monotonic() + timeout_seconds
+    next_heartbeat: Optional[float] = None
     try:
         while True:
             try:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise HarnessError("timed out waiting for the shared Cargo build lane")
-                time.sleep(0.1)
+                now = time.monotonic()
+                if next_heartbeat is None or now >= next_heartbeat:
+                    _print_cargo_lane_wait(lock_handle)
+                    next_heartbeat = now + max(0.01, heartbeat_seconds)
+                if now >= deadline:
+                    owner = _cargo_lane_owner(lock_handle)
+                    raise HarnessError(
+                        "timed out waiting for the shared Cargo build lane "
+                        "owner_pid={owner_pid} task={task} command={command} "
+                        "since={since}".format(**owner)
+                    )
+                time.sleep(
+                    min(
+                        0.1,
+                        max(0.0, deadline - now),
+                        max(0.01, next_heartbeat - now),
+                    )
+                )
         lock_handle.seek(0)
         lock_handle.truncate()
         json.dump(
             {
                 "pid": os.getpid(),
+                "cwd": str(Path.cwd()),
                 "task_id": task_dir.name,
+                "task": task_dir.name,
+                "command": command,
                 "acquired_at": utc_now(),
+                "since": utc_now(),
             },
             lock_handle,
             sort_keys=True,
@@ -1752,7 +2119,7 @@ def release_cargo_lane(lock_handle: Optional[Any]) -> None:
 def acquire_playwright_port(task_dir: Path, timeout_seconds: float) -> Tuple[Path, int]:
     """Reserve a task-private loopback port across concurrent harness runs."""
 
-    locks_root = task_dir.parent.parent / "playwright-ports"
+    locks_root = shared_resource_root_for_task(task_dir) / "playwright-ports"
     locks_root.mkdir(parents=True, exist_ok=True)
     port_floor = 42000
     port_count = 20000
@@ -1802,6 +2169,145 @@ def acquire_playwright_port(task_dir: Path, timeout_seconds: float) -> Tuple[Pat
     raise HarnessError("timed out reserving a task-private Playwright port")
 
 
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write to managed child stdin")
+        view = view[written:]
+
+
+def run_guarded_process(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+    stdout_handle: Any,
+    stderr_handle: Any,
+    result_path: Path,
+    stdin_bytes: Optional[bytes] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherited_fds: Sequence[int] = (),
+    term_grace_seconds: float = 3.0,
+) -> Dict[str, Any]:
+    """Run through an out-of-process parent-death guardian.
+
+    If this runner is SIGKILLed, the liveness pipe closes in the guardian. The
+    guardian then terminates the exact new-session child group before releasing
+    inherited resource-lane descriptors.
+    """
+
+    if not PROCESS_GUARDIAN_PATH.is_file():
+        raise HarnessError(f"process guardian is missing: {PROCESS_GUARDIAN_PATH}")
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise HarnessError(
+            f"refusing to overwrite prior guardian artifact: {result_path}"
+        )
+    parent_read, parent_write = os.pipe()
+    stdin_read: Optional[int] = None
+    stdin_write: Optional[int] = None
+    if stdin_bytes is not None:
+        stdin_read, stdin_write = os.pipe()
+    pass_fds = [parent_read, *inherited_fds]
+    if stdin_read is not None:
+        pass_fds.append(stdin_read)
+    command = [
+        sys.executable,
+        str(PROCESS_GUARDIAN_PATH),
+        "--parent-fd",
+        str(parent_read),
+        "--result",
+        str(result_path),
+        "--cwd",
+        str(cwd),
+        "--timeout-seconds",
+        str(float(timeout_seconds)),
+        "--term-grace-seconds",
+        str(float(term_grace_seconds)),
+    ]
+    if stdin_read is not None:
+        command.extend(["--stdin-fd", str(stdin_read)])
+    for descriptor in inherited_fds:
+        command.extend(["--pass-fd", str(descriptor)])
+    command.extend(["--", *list(argv)])
+    guardian: Optional[subprocess.Popen[Any]] = None
+    try:
+        guardian = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=dict(env) if env else None,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+            pass_fds=tuple(pass_fds),
+        )
+        os.close(parent_read)
+        parent_read = -1
+        if stdin_read is not None:
+            os.close(stdin_read)
+            stdin_read = None
+        if stdin_write is not None:
+            try:
+                _write_all(stdin_write, stdin_bytes or b"")
+            finally:
+                os.close(stdin_write)
+                stdin_write = None
+        try:
+            guardian.wait(
+                timeout=float(timeout_seconds) + max(0.0, term_grace_seconds) + 10.0
+            )
+        except subprocess.TimeoutExpired:
+            _terminate_process(guardian)
+        if guardian.returncode is None:
+            guardian.wait()
+        if not result_path.is_file():
+            raise HarnessError(
+                "managed child guardian exited without a durable result"
+            )
+        result = load_json(result_path)
+        if result.get("parent_lost"):
+            raise HarnessError("managed child observed an unexpected parent death")
+        if result.get("error"):
+            raise HarnessError(f"managed child guardian failed: {result['error']}")
+        if guardian.returncode != 0:
+            raise HarnessError(
+                f"managed child guardian exited {guardian.returncode}"
+            )
+        if not isinstance(result.get("exit_code"), int):
+            raise HarnessError("managed child result has no exit code")
+        result["guardian_path"] = str(result_path)
+        result["guardian_sha256"] = sha256_file(result_path)
+        return result
+    except BaseException:
+        # Closing this descriptor is the parent-death signal. Give the guardian
+        # time to reap its owned group before escalating against the guardian.
+        try:
+            os.close(parent_write)
+        except OSError:
+            pass
+        parent_write = -1
+        if guardian is not None and guardian.poll() is None:
+            try:
+                guardian.wait(timeout=max(0.0, term_grace_seconds) + 5.0)
+            except subprocess.TimeoutExpired:
+                _terminate_process(guardian)
+        raise
+    finally:
+        for descriptor in (parent_read, parent_write, stdin_read, stdin_write):
+            if descriptor is not None and descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
 def run_logged_process(
     argv: Sequence[str],
     *,
@@ -1810,39 +2316,40 @@ def run_logged_process(
     log_path: Path,
     stdin_bytes: Optional[bytes] = None,
     env: Optional[Mapping[str, str]] = None,
+    execution_id: Optional[str] = None,
+    term_grace_seconds: float = 3.0,
 ) -> Dict[str, Any]:
+    execution_id = execution_id or _new_execution_id()
+    log_path = _execution_artifact_path(log_path, execution_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    timed_out = False
-    process: Optional[subprocess.Popen] = None
-    with log_path.open("wb") as log_handle:
-        try:
-            process = subprocess.Popen(
-                list(argv),
-                cwd=str(cwd),
-                env=dict(env) if env else None,
-                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            timed_out = _wait_managed_process(
-                process,
-                timeout_seconds,
-                stdin_bytes=stdin_bytes,
-            )
-        finally:
-            if process is not None and _process_group_alive(_owned_process_group_id(process)):
-                _terminate_process(process)
-    if process is None:
-        raise HarnessError("managed process did not start")
+    with log_path.open("xb") as log_handle:
+        guarded = run_guarded_process(
+            argv,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            stdout_handle=log_handle,
+            stderr_handle=subprocess.STDOUT,
+            result_path=log_path.with_suffix(log_path.suffix + ".guardian.json"),
+            stdin_bytes=stdin_bytes,
+            env=env,
+            term_grace_seconds=term_grace_seconds,
+        )
     duration_ms = int((time.monotonic() - started) * 1000)
     return {
-        "exit_code": process.returncode,
-        "timed_out": timed_out,
+        "exit_code": guarded["exit_code"],
+        "leader_exit_code": guarded.get("leader_exit_code"),
+        "leader_exited_with_live_group": bool(
+            guarded.get("leader_exited_with_live_group")
+        ),
+        "termination_reason": guarded.get("termination_reason"),
+        "timed_out": bool(guarded.get("timed_out")),
         "duration_ms": duration_ms,
+        "execution_id": execution_id,
         "log": str(log_path),
         "log_sha256": sha256_file(log_path),
+        "guardian_path": guarded["guardian_path"],
+        "guardian_sha256": guarded["guardian_sha256"],
     }
 
 
@@ -1898,9 +2405,20 @@ def _probe_blocked_reason(stdout_path: Path) -> Optional[str]:
 
 def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     safe_phase = re.sub(r"[^a-z0-9._-]+", "-", phase.lower())
-    log_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.log"
-    stdout_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.stdout.log"
-    stderr_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.stderr.log"
+    execution_id = _new_execution_id()
+    log_path = _execution_artifact_path(
+        task_dir / "logs" / f"{safe_phase}-{check['id']}.log",
+        execution_id,
+    )
+    stdout_path = log_path.with_suffix(".stdout.log")
+    stderr_path = log_path.with_suffix(".stderr.log")
+    guardian_result_path = _execution_artifact_path(
+        task_dir
+        / "runtime"
+        / "guardians"
+        / f"{safe_phase}-{check['id']}.json",
+        execution_id,
+    )
     uses_playwright = command_uses_playwright(str(check["command"]))
     needs_loopback = command_needs_loopback(str(check["command"]))
     needs_sherpa = command_needs_sherpa_archive(str(check["command"]), worktree)
@@ -1908,17 +2426,28 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
     started_at = utc_now()
     deadline = started + float(check["timeout_seconds"])
     timed_out = False
+    exit_code: Optional[int] = None
+    guardian_path: Optional[str] = None
+    guardian_sha256: Optional[str] = None
+    resource_wait_ms = 0
     cargo_lane: Optional[Any] = None
     playwright_lock: Optional[Path] = None
     playwright_port: Optional[int] = None
-    process: Optional[subprocess.Popen] = None
     inherited_sandbox = inherited_outer_sandbox_is_active()
     try:
         if command_uses_cargo_lane(str(check["command"])):
             remaining_for_cargo = deadline - time.monotonic()
             if remaining_for_cargo <= 0:
                 raise HarnessError(f"check {check['id']} exhausted its deadline before the Cargo lane")
-            cargo_lane = acquire_cargo_lane(task_dir, remaining_for_cargo)
+            resource_wait_started = time.monotonic()
+            cargo_lane = acquire_cargo_lane(
+                task_dir,
+                remaining_for_cargo,
+                command=str(check["command"]),
+            )
+            resource_wait_ms = int(
+                (time.monotonic() - resource_wait_started) * 1000
+            )
         if uses_playwright:
             remaining_for_port = deadline - time.monotonic()
             if remaining_for_port <= 0:
@@ -1941,56 +2470,76 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
             network_mode=network_mode,
             expose_sherpa_archive=needs_sherpa,
         )
-        profile_path = runtime["profiles"] / f"{safe_phase}-{check['id']}.sb"
-        atomic_write_bytes(profile_path, profile.encode("utf-8"))
+        profile_path = _execution_artifact_path(
+            runtime["profiles"] / f"{safe_phase}-{check['id']}.sb",
+            execution_id,
+        )
+        atomic_create_bytes(profile_path, profile.encode("utf-8"))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise HarnessError(f"check {check['id']} exhausted its deadline before process start")
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+        with stdout_path.open("xb") as stdout_handle, stderr_path.open("xb") as stderr_handle:
             check_argv = (
                 ["/bin/zsh", "-f", "-c", str(check["command"])]
                 if inherited_sandbox
                 else sandboxed_check_argv(profile, str(check["command"]))
             )
-            process = subprocess.Popen(
+            guarded = run_guarded_process(
                 check_argv,
-                cwd=str(worktree),
+                cwd=worktree,
+                timeout_seconds=remaining,
+                stdout_handle=stdout_handle,
+                stderr_handle=stderr_handle,
+                result_path=guardian_result_path,
                 env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                start_new_session=True,
-                pass_fds=(cargo_lane.fileno(),) if cargo_lane is not None else (),
+                inherited_fds=(
+                    (cargo_lane.fileno(),) if cargo_lane is not None else ()
+                ),
             )
-            timed_out = _wait_managed_process(process, remaining)
+            exit_code = int(guarded["exit_code"])
+            timed_out = bool(guarded.get("timed_out"))
+            guardian_path = str(guarded["guardian_path"])
+            guardian_sha256 = str(guarded["guardian_sha256"])
+            leader_exit_code = guarded.get("leader_exit_code")
+            leader_exited_with_live_group = bool(
+                guarded.get("leader_exited_with_live_group")
+            )
+            termination_reason = guarded.get("termination_reason")
     finally:
         try:
-            if process is not None and _process_group_alive(_owned_process_group_id(process)):
-                _terminate_process(process)
+            _release_owned_directory_lock(playwright_lock)
         finally:
-            try:
-                _release_owned_directory_lock(playwright_lock)
-            finally:
-                release_cargo_lane(cargo_lane)
-    if process is None:
+            release_cargo_lane(cargo_lane)
+    if exit_code is None or guardian_path is None or guardian_sha256 is None:
         raise HarnessError(f"check {check['id']} did not start")
     duration_ms = int((time.monotonic() - started) * 1000)
-    with log_path.open("wb") as combined:
-        combined.write(b"=== stdout ===\n")
-        combined.write(stdout_path.read_bytes())
-        combined.write(b"\n=== stderr ===\n")
-        combined.write(stderr_path.read_bytes())
+    combined = (
+        b"=== stdout ===\n"
+        + stdout_path.read_bytes()
+        + b"\n=== stderr ===\n"
+        + stderr_path.read_bytes()
+    )
+    atomic_create_bytes(log_path, combined)
     result = {
-        "exit_code": process.returncode,
+        "exit_code": exit_code,
+        "leader_exit_code": leader_exit_code,
+        "leader_exited_with_live_group": leader_exited_with_live_group,
+        "termination_reason": termination_reason,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
+        "resource_wait_ms": resource_wait_ms,
+        "execution_id": execution_id,
         "log_path": str(log_path),
         "log_sha256": sha256_file(log_path),
+        "stdout_path": str(stdout_path),
         "stdout_sha256": sha256_file(stdout_path),
+        "stderr_path": str(stderr_path),
         "stderr_sha256": sha256_file(stderr_path),
         "sandbox_profile_path": str(profile_path),
         "sandbox_profile_sha256": sha256_file(profile_path),
+        "guardian_path": guardian_path,
+        "guardian_sha256": guardian_sha256,
         "sandbox_mode": "inherited" if inherited_sandbox else "direct",
         "environment_keys_sha256": sha256_bytes(canonical_json(sorted(environment))),
         "environment_sha256": sha256_bytes(canonical_json(environment)),
@@ -2022,12 +2571,23 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
             "id": evidence["id"],
             "phase": phase,
             "exit_code": evidence["exit_code"],
+            "leader_exit_code": evidence["leader_exit_code"],
+            "leader_exited_with_live_group": evidence[
+                "leader_exited_with_live_group"
+            ],
+            "termination_reason": evidence["termination_reason"],
             "timed_out": evidence["timed_out"],
             "duration_ms": evidence["duration_ms"],
+            "resource_wait_ms": evidence["resource_wait_ms"],
             "passed": evidence["passed"],
             "outcome": evidence["outcome"],
             "blocked_reason": evidence["blocked_reason"],
+            "execution_id": evidence["execution_id"],
             "log_path": evidence["log_path"],
+            "stdout_path": evidence["stdout_path"],
+            "stderr_path": evidence["stderr_path"],
+            "guardian_path": evidence["guardian_path"],
+            "sandbox_profile_path": evidence["sandbox_profile_path"],
             "network_mode": evidence["network_mode"],
             "sandbox_mode": evidence["sandbox_mode"],
             "created_at": evidence["created_at"],
@@ -2044,6 +2604,33 @@ def command_version(command: str) -> Optional[str]:
     text = f"{completed.stdout}\n{completed.stderr}"
     match = re.search(r"\d+(?:\.\d+){1,3}", text)
     return match.group(0) if match else text.strip().splitlines()[0]
+
+
+def runtime_preflight(repo: Path) -> Dict[str, Any]:
+    """Fail before worktree/model work when exclusive runtime ownership is blocked."""
+
+    script = HARNESS_ROOT.parent.parent / "scripts" / "harness-runtime-smoke"
+    completed = run_capture(
+        [str(script), "--preflight"],
+        repo,
+        check=False,
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError as exc:
+        raise HarnessError(
+            "runtime preflight returned malformed evidence: "
+            + (completed.stderr.strip() or completed.stdout.strip())
+        ) from exc
+    if completed.returncode != 0 or payload.get("verdict") != "PASS":
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        raise HarnessError(
+            "runtime preflight blocked before task setup: "
+            + str(reason or completed.stderr.strip() or f"exit {completed.returncode}"),
+            exit_code=3 if completed.returncode == 3 else 1,
+        )
+    return payload
 
 
 def sanitized_model_environment(instructions_sha256: str, vendor: str) -> Tuple[Dict[str, str], List[str]]:
@@ -2194,11 +2781,35 @@ def _degraded_writer_document(vendor: str, subtype: str) -> Dict[str, Any]:
     }
 
 
-def extract_model_metadata(log_path: Path, vendor: str, fallback_session: str) -> Dict[str, str]:
-    """Best-effort extraction from vendor JSONL, with explicit non-empty fallbacks."""
+def extract_model_metadata(
+    log_path: Path, vendor: str, fallback_session: str
+) -> Dict[str, Any]:
+    """Best-effort identity and usage extraction from vendor JSONL.
+
+    Model CLIs do not expose one stable cross-vendor envelope, so keep this
+    deliberately tolerant and retain the last typed value encountered.  The
+    runner records the result for successful *and failed* invocations; metrics
+    therefore do not need to re-parse multi-megabyte raw logs later.
+    """
 
     session_id = fallback_session
     model = "unspecified"
+    total_cost_usd: Optional[float] = None
+    num_turns: Optional[int] = None
+    usage: Optional[Mapping[str, Any]] = None
+    terminal_reason: Optional[str] = None
+    http_status: Optional[int] = None
+    retry_after_seconds: Optional[float] = None
+
+    def walk(value: Any) -> Iterable[Tuple[str, Any]]:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                yield str(key), child
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
+
     try:
         with log_path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -2222,9 +2833,106 @@ def extract_model_metadata(log_path: Path, vendor: str, fallback_session: str) -
                     message = event.get("message")
                     if isinstance(message, dict) and isinstance(message.get("model"), str):
                         model = message["model"]
+                for key, value in walk(event):
+                    lowered = key.lower()
+                    if lowered in {"total_cost_usd", "cost_usd"}:
+                        try:
+                            total_cost_usd = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif lowered in {"num_turns", "turns"}:
+                        try:
+                            num_turns = int(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif lowered == "usage" and isinstance(value, Mapping):
+                        usage = dict(value)
+                    elif lowered in {
+                        "terminal_reason",
+                        "stop_reason",
+                        "subtype",
+                    } and isinstance(value, str):
+                        terminal_reason = value
+                    elif lowered in {
+                        "api_error_status",
+                        "status_code",
+                        "http_status",
+                    }:
+                        try:
+                            http_status = int(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif lowered in {"retry_after", "retry_after_seconds"}:
+                        try:
+                            retry_after_seconds = max(0.0, float(value))
+                        except (TypeError, ValueError):
+                            pass
     except OSError:
         pass
-    return {"session_id": session_id, "model": model}
+    return {
+        "session_id": session_id,
+        "model": model,
+        "total_cost_usd": total_cost_usd,
+        "num_turns": num_turns,
+        "usage": usage,
+        "terminal_reason": terminal_reason,
+        "http_status": http_status,
+        "retry_after_seconds": retry_after_seconds,
+    }
+
+
+def _record_model_process_exit(
+    task_dir: Path,
+    *,
+    label: str,
+    role: str,
+    vendor: str,
+    timeout_seconds: int,
+    process_result: Mapping[str, Any],
+    result_path: Path,
+    invocation_path: Path,
+    terminal_subtype: Optional[str],
+) -> None:
+    """Persist the exact per-execution process artifacts before any error raises."""
+
+    log_path = Path(str(process_result.get("log", "")))
+    telemetry = extract_model_metadata(
+        log_path,
+        vendor,
+        str(process_result.get("execution_id") or label),
+    )
+    append_jsonl(
+        task_dir / "events.jsonl",
+        {
+            "at": utc_now(),
+            "event": "model-process-exit",
+            "label": label,
+            "role": role,
+            "vendor": vendor,
+            "exit_code": process_result.get("exit_code"),
+            "leader_exit_code": process_result.get("leader_exit_code"),
+            "leader_exited_with_live_group": bool(
+                process_result.get("leader_exited_with_live_group")
+            ),
+            "termination_reason": process_result.get("termination_reason"),
+            "timed_out": bool(process_result.get("timed_out")),
+            "duration_ms": process_result.get("duration_ms"),
+            "wall_timeout_seconds": timeout_seconds,
+            "terminal_subtype": terminal_subtype,
+            "execution_id": process_result.get("execution_id"),
+            "log_path": process_result.get("log"),
+            "log_sha256": process_result.get("log_sha256"),
+            "guardian_path": process_result.get("guardian_path"),
+            "guardian_sha256": process_result.get("guardian_sha256"),
+            "result_path": str(result_path),
+            "invocation_path": str(invocation_path),
+            "total_cost_usd": telemetry.get("total_cost_usd"),
+            "num_turns": telemetry.get("num_turns"),
+            "usage": telemetry.get("usage"),
+            "http_status": telemetry.get("http_status"),
+            "retry_after_seconds": telemetry.get("retry_after_seconds"),
+        },
+    )
 
 
 def invoke_model(
@@ -2243,14 +2951,22 @@ def invoke_model(
 
     schema_path = SCHEMAS_DIR / f"{schema_name}.schema.json"
     schema = load_schema(schema_name)
-    log_path = task_dir / "logs" / f"{label}-{vendor}.jsonl"
-    result_path = task_dir / "results" / f"{label}-{vendor}.json"
-    invocation_path = task_dir / "results" / f"{label}-{vendor}-invocation.json"
+    invocation_id = _new_execution_id()
+    log_base_path = task_dir / "logs" / f"{label}-{vendor}.jsonl"
+    log_path = _execution_artifact_path(log_base_path, invocation_id)
+    result_path = _execution_artifact_path(
+        task_dir / "results" / f"{label}-{vendor}.json",
+        invocation_id,
+    )
+    invocation_path = _execution_artifact_path(
+        task_dir / "results" / f"{label}-{vendor}-invocation.json",
+        invocation_id,
+    )
     result_path.parent.mkdir(parents=True, exist_ok=True)
-    invocation_id = str(uuid.uuid4())
     recorded_argv: List[str] = [vendor, "fake"]
     budget: Optional[str] = None
     removed_env_names: List[str] = []
+    model_cwd = reviewer_execution_cwd() if role == "reviewer" else worktree
     # RUNNER-OWNED record of an abnormal round. It must not come from the model's own
     # self-report: a killed writer cannot be trusted to describe its own death, and a
     # self-report is not delivered to reviewers anyway. `None` = a clean round.
@@ -2268,7 +2984,14 @@ def invoke_model(
         else:
             verdict = verdict_override or os.environ.get("MURMUR_HARNESS_FAKE_REVIEW_VERDICT", "PASS")
             findings: List[Dict[str, str]] = []
-            if verdict != "PASS":
+            # A v2 BLOCKED verdict represents a proof/evidence gap.  Giving it
+            # a synthetic BLOCKER finding would classify the same result as a
+            # code defect (NEEDS_FIX) before the verdict can classify it as
+            # resumable NEEDS_EVIDENCE.  Keep legacy fake reviews unchanged,
+            # but make the v2 adapter model the real state distinction.
+            if verdict != "PASS" and not (
+                schema_name == "v2-review" and verdict == "BLOCKED"
+            ):
                 findings.append(
                     {
                         "severity": "MAJOR" if verdict == "FAIL" else "BLOCKER",
@@ -2283,13 +3006,30 @@ def invoke_model(
                 "requirements_covered": ["selftest"],
                 "findings": findings,
             }
-        atomic_write_json(result_path, document)
+            if schema_name == "v2-review":
+                document["proof_gaps"] = (
+                    [
+                        {
+                            "claim": "synthetic selftest evidence",
+                            "evidence_missing": "synthetic proof",
+                            "how_to_prove": "resume with a fresh reviewer result",
+                        }
+                    ]
+                    if verdict == "BLOCKED"
+                    else []
+                )
+                document["probe_requests"] = []
+        atomic_create_json(result_path, document)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"type": "fake", "result": document}) + "\n", encoding="utf-8")
+        with log_path.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps({"type": "fake", "result": document}) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         process_result = {
             "exit_code": 0,
             "timed_out": False,
             "duration_ms": 0,
+            "execution_id": invocation_id,
             "log": str(log_path),
             "log_sha256": sha256_file(log_path),
         }
@@ -2331,6 +3071,21 @@ def invoke_model(
             *(json.dumps(path) + '="deny"' for path in denied_host_paths),
         ]
         filesystem_profile = "{" + ",".join(filesystem_entries) + "}"
+        reviewer_guard_config: Optional[str] = None
+        if role == "reviewer":
+            # Keep the deny decision inside this already-running runner's
+            # immutable argv. Pointing Codex at a script in the live worktree
+            # creates an A->B->A replacement race: another process can swap
+            # the hook during review, allow a tool, then restore the original
+            # bytes before any final integrity comparison. /usr/bin/printf is
+            # SIP-protected on macOS and the static JSON never reads hook
+            # input, so there is no mutable runtime hook surface.
+            guard_command = reviewer_tool_guard_command()
+            reviewer_guard_config = (
+                '[{matcher="*",hooks=[{type="command",command='
+                + json.dumps(guard_command)
+                + ',timeout=5,statusMessage="Blocking reviewer tool access"}]}]'
+            )
         argv = [
             executable,
             "exec",
@@ -2344,28 +3099,79 @@ def invoke_model(
             "--config",
             f'default_permissions="{permission_profile}"',
             "--cd",
-            str(worktree),
+            str(model_cwd),
             "--output-schema",
             str(schema_path),
             "--output-last-message",
             str(result_path),
             "--json",
         ]
+        if reviewer_guard_config is not None:
+            # Codex has no Claude-style --tools allowlist. A read-only sandbox
+            # still permits read commands such as /bin/pwd, so the
+            # protocol-bound wildcard PreToolUse hook is the actual reviewer
+            # capability boundary.
+            argv.extend(
+                [
+                    "--skip-git-repo-check",
+                    "--ignore-rules",
+                    "--dangerously-bypass-hook-trust",
+                    "--enable",
+                    "hooks",
+                    "--config",
+                    f"hooks.PreToolUse={reviewer_guard_config}",
+                    "--config",
+                    'approval_policy="never"',
+                    "--config",
+                    'web_search="disabled"',
+                    "--config",
+                    "features.apps=false",
+                    "--config",
+                    "features.plugins=false",
+                    "--config",
+                    "features.multi_agent=false",
+                ]
+            )
         model_override = os.environ.get("MURMUR_HARNESS_CODEX_MODEL")
         if model_override:
             argv.extend(["--model", model_override])
         argv.append("-")
         environment, removed_env_names = sanitized_model_environment(instructions_sha256, vendor)
+        if role == "reviewer":
+            environment = reviewer_model_environment(
+                environment,
+                vendor=vendor,
+                cwd=model_cwd,
+            )
         recorded_argv = list(argv)
         process_result = run_logged_process(
             argv,
-            cwd=worktree,
+            cwd=model_cwd,
             timeout_seconds=timeout_seconds,
-            log_path=log_path,
+            log_path=log_base_path,
             stdin_bytes=prompt.encode("utf-8"),
             env=environment,
+            execution_id=invocation_id,
         )
-        if process_result["exit_code"] != 0 or process_result["timed_out"]:
+        log_path = Path(str(process_result["log"]))
+        _record_model_process_exit(
+            task_dir,
+            label=label,
+            role=role,
+            vendor=vendor,
+            timeout_seconds=timeout_seconds,
+            process_result=process_result,
+            result_path=result_path,
+            invocation_path=invocation_path,
+            terminal_subtype=None,
+        )
+        if process_result["timed_out"]:
+            raise ManagedProcessTimeout(
+                f"Codex {label}",
+                timeout_seconds,
+                process_result,
+            )
+        if process_result["exit_code"] != 0:
             raise HarnessError(f"Codex {label} failed; inspect {log_path}")
         document = load_json(result_path)
     elif vendor == "claude":
@@ -2376,7 +3182,7 @@ def invoke_model(
         if role == "writer":
             tools = "Read,Grep,Glob,Edit,Write,Bash"
         else:
-            tools = "Read,Grep,Glob"
+            tools = ""
         permission_mode = "dontAsk"
         denied_read_paths = [
             "~/.ssh/**",
@@ -2399,6 +3205,13 @@ def invoke_model(
                 "sandbox": {
                     "enabled": True,
                     "failIfUnavailable": True,
+                    # Project settings enable sandboxed Bash for ordinary
+                    # development sessions. A reviewer must not inherit that
+                    # scalar: --allowedTools controls approval, not tool
+                    # availability. The explicit --tools list below is the
+                    # capability boundary; this setting closes the project
+                    # auto-approval path as defense in depth.
+                    "autoAllowBashIfSandboxed": False,
                     "allowUnsandboxedCommands": False,
                     "network": {"deniedDomains": ["*"]},
                     "filesystem": {"denyRead": denied_read_paths},
@@ -2420,6 +3233,8 @@ def invoke_model(
             sandbox_settings,
             "--mcp-config",
             '{"mcpServers":{}}',
+            "--tools",
+            tools,
             "--allowedTools",
             tools,
             "--permission-mode",
@@ -2427,9 +3242,6 @@ def invoke_model(
             "--json-schema",
             schema_text,
         ]
-        sibling_server = worktree.parent / "murmur-server"
-        if role == "reviewer" and sibling_server.is_dir():
-            argv.extend(["--add-dir", str(sibling_server)])
         model_override = os.environ.get("MURMUR_HARNESS_CLAUDE_MODEL")
         if model_override:
             argv.extend(["--model", model_override])
@@ -2438,15 +3250,23 @@ def invoke_model(
             argv.extend(["--max-budget-usd", budget])
         argv.append("-")
         environment, removed_env_names = sanitized_model_environment(instructions_sha256, vendor)
+        if role == "reviewer":
+            environment = reviewer_model_environment(
+                environment,
+                vendor=vendor,
+                cwd=model_cwd,
+            )
         recorded_argv = list(argv)
         process_result = run_logged_process(
             argv,
-            cwd=worktree,
+            cwd=model_cwd,
             timeout_seconds=timeout_seconds,
-            log_path=log_path,
+            log_path=log_base_path,
             stdin_bytes=prompt.encode("utf-8"),
             env=environment,
+            execution_id=invocation_id,
         )
+        log_path = Path(str(process_result["log"]))
         # RECORD THE PROCESS OUTCOME BEFORE ANY BRANCH CAN RAISE.
         #
         # The `model-invocation` event below is appended only on the SUCCESS path, so every
@@ -2455,24 +3275,20 @@ def invoke_model(
         # misdiagnosed as a permission rejection: with no recorded exit reason, the only
         # evidence left was the position of the last tool call in the log. Emitting here
         # makes every future failure self-diagnosing.
-        append_jsonl(
-            task_dir / "events.jsonl",
-            {
-                "at": utc_now(),
-                "event": "model-process-exit",
-                "label": label,
-                "role": role,
-                "vendor": vendor,
-                "exit_code": process_result["exit_code"],
-                "timed_out": process_result["timed_out"],
-                "duration_ms": process_result["duration_ms"],
-                "wall_timeout_seconds": timeout_seconds,
-                "terminal_subtype": _claude_terminal_subtype(log_path),
-                "log_path": str(log_path),
-            },
+        terminal_subtype = _claude_terminal_subtype(log_path)
+        _record_model_process_exit(
+            task_dir,
+            label=label,
+            role=role,
+            vendor=vendor,
+            timeout_seconds=timeout_seconds,
+            process_result=process_result,
+            result_path=result_path,
+            invocation_path=invocation_path,
+            terminal_subtype=terminal_subtype,
         )
         if process_result["exit_code"] != 0 or process_result["timed_out"]:
-            subtype = None if process_result["timed_out"] else _claude_terminal_subtype(log_path)
+            subtype = None if process_result["timed_out"] else terminal_subtype
             if role == "writer" and process_result["timed_out"]:
                 # A TIMED-OUT WRITER IS RECOVERED, NOT DISCARDED.
                 #
@@ -2515,21 +3331,38 @@ def invoke_model(
                         "reason": "writer structured-output retries exhausted; proceeding on the staged tree",
                     },
                 )
+            elif process_result["timed_out"]:
+                raise ManagedProcessTimeout(
+                    f"Claude {label}",
+                    timeout_seconds,
+                    process_result,
+                )
             else:
                 raise HarnessError(f"Claude {label} failed; inspect {log_path}")
         else:
             document = _extract_claude_result(log_path)
-        atomic_write_json(result_path, document)
+        atomic_create_json(result_path, document)
     else:
         raise HarnessError(f"unsupported model adapter: {vendor}")
 
+    if role == "reviewer" and vendor != "fake":
+        assert_reviewer_used_no_tools(log_path, vendor)
     validate_schema(document, schema, label=f"{label} result")
     metadata = extract_model_metadata(log_path, vendor, invocation_id)
     resolved_session = f"fake-{invocation_id}" if vendor == "fake" else metadata["session_id"]
     resolved_model = "fake" if vendor == "fake" else metadata["model"]
     resolved_cli_version = "fake" if vendor == "fake" else (command_version(vendor) or "unknown")
     invocation_created_at = utc_now()
-    atomic_write_json(
+    prompt_sha256 = sha256_bytes(prompt.encode("utf-8"))
+    telemetry = {
+        "total_cost_usd": metadata.get("total_cost_usd"),
+        "num_turns": metadata.get("num_turns"),
+        "usage": metadata.get("usage"),
+        "terminal_reason": metadata.get("terminal_reason"),
+        "http_status": metadata.get("http_status"),
+        "retry_after_seconds": metadata.get("retry_after_seconds"),
+    }
+    atomic_create_json(
         invocation_path,
         {
             "invocation_id": invocation_id,
@@ -2537,13 +3370,16 @@ def invoke_model(
             "role": role,
             "label": label,
             "argv": recorded_argv,
+            "cwd": str(model_cwd),
             "wall_timeout_seconds": timeout_seconds,
             "budget_usd": budget,
             "removed_env_names": removed_env_names,
             "instructions_sha256": instructions_sha256,
+            "prompt_sha256": prompt_sha256,
             "session_id": resolved_session,
             "model": resolved_model,
             "cli_version": resolved_cli_version,
+            "telemetry": telemetry,
             "created_at": invocation_created_at,
         },
     )
@@ -2559,6 +3395,9 @@ def invoke_model(
             "exit_code": process_result["exit_code"],
             "timed_out": process_result["timed_out"],
             "duration_ms": process_result["duration_ms"],
+            "total_cost_usd": telemetry["total_cost_usd"],
+            "num_turns": telemetry["num_turns"],
+            "usage": telemetry["usage"],
             "result_path": str(result_path),
         },
     )
@@ -2575,6 +3414,8 @@ def invoke_model(
         "artifact_sha256": sha256_file(result_path),
         "invocation_path": str(invocation_path),
         "invocation_sha256": sha256_file(invocation_path),
+        "prompt_sha256": prompt_sha256,
+        "telemetry": telemetry,
         "created_at": invocation_created_at,
         **process_result,
     }
@@ -2702,6 +3543,77 @@ def protected_owned_paths(
         for path in contract.get("owned_paths", [])
         if any(path_overlaps(path, guard) for guard in protected)
     )
+
+
+def assert_external_v1_control_plane(
+    contract: Mapping[str, Any], *, allow_test_adapter: bool = False
+) -> None:
+    """Protected v1 bootstraps must be judged by base-pinned external bytes.
+
+    A task worktree changing the harness cannot execute its own verifier.  The
+    caller must use the canonical primary checkout, and every executable v1
+    control-plane byte there must still equal the task's committed base.
+    """
+
+    if not protected_owned_paths(contract) or allow_test_adapter:
+        return
+    source_repo = HARNESS_ROOT.parent.parent.resolve()
+    canonical_repo = Path(str(contract.get("repo_realpath", ""))).resolve()
+    if source_repo != canonical_repo:
+        raise HarnessError(
+            "protected v1 task must be run by the external primary-checkout "
+            "agent-harness, never by candidate worktree code"
+        )
+    base_sha = str(contract.get("base_sha", ""))
+    if not SHA1_RE.fullmatch(base_sha):
+        raise HarnessError("protected v1 task base SHA is malformed")
+    if (
+        run_capture(
+            ["git", "cat-file", "-e", f"{base_sha}^{{commit}}"],
+            source_repo,
+            check=False,
+        ).returncode
+        != 0
+    ):
+        raise HarnessError("protected v1 task base commit is unavailable")
+    trusted_paths = (
+        ".agents/harness",
+        "scripts/agent-harness",
+        "scripts/agent-resource-run",
+        "scripts/harness-runtime-smoke.py",
+        "scripts/verify-harness-attestation",
+    )
+    if (
+        run_capture(
+            ["git", "diff", "--quiet", base_sha, "--", *trusted_paths],
+            source_repo,
+            check=False,
+        ).returncode
+        != 0
+    ):
+        raise HarnessError(
+            "external v1 control-plane bytes differ from the task base"
+        )
+    untracked = git_bytes(
+        source_repo,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        *trusted_paths,
+    )
+    if untracked:
+        raise HarnessError(
+            "external v1 control plane contains untracked executable bytes"
+        )
+    runner = Path(__file__).resolve()
+    try:
+        runner.relative_to(source_repo)
+    except ValueError as exc:
+        raise HarnessError(
+            "executing v1 runner is outside the canonical repository"
+        ) from exc
 
 
 def verify_prepared_control_plane(
@@ -2977,6 +3889,7 @@ def create_attestation(
             "log_path": review["log"],
             "log_sha256": review["log_sha256"],
             "staged_diff_sha256": review["staged_diff_sha256"],
+            "findings": list(review["result"].get("findings", [])),
             "created_at": review["created_at"],
         }
         for review in reviews
@@ -2994,6 +3907,7 @@ def create_attestation(
         "repo_realpath": contract["repo_realpath"],
         "worktree_path": str(worktree.resolve()),
         "risk_flags": contract["risk_flags"],
+        "provenance_schema_version": 2,
         "writer": {
             "vendor": contract["writer"],
             "cli_version": latest_writer["cli_version"],
@@ -3016,6 +3930,30 @@ def create_attestation(
             "timed_out": bool(latest_writer.get("timed_out")),
             "duration_ms": latest_writer.get("duration_ms"),
         },
+        "writer_attempts": [
+            {
+                "round": index + 1,
+                "label": run["label"],
+                "vendor": run["vendor"],
+                "session_id": run["session_id"],
+                "degraded": run.get("degraded"),
+                "timed_out": bool(run.get("timed_out")),
+                "duration_ms": run.get("duration_ms"),
+                "artifact_sha256": run["artifact_sha256"],
+                "log_sha256": run["log_sha256"],
+            }
+            for index, run in enumerate(writer_runs)
+        ],
+        "degraded_provenance": [
+            {
+                "round": index + 1,
+                "label": run["label"],
+                "degraded": run.get("degraded"),
+                "timed_out": bool(run.get("timed_out")),
+            }
+            for index, run in enumerate(writer_runs)
+            if run.get("degraded") or run.get("timed_out")
+        ],
         "reviewer": {
             "vendor": contract["reviewer"],
             "cli_version": reviews[-1]["cli_version"],
@@ -3150,6 +4088,10 @@ def prune_task_runtime(task_dir: Path) -> List[str]:
 def run_task(
     contract: Dict[str, Any], task_dir: Path, *, allow_test_adapter: bool = False
 ) -> str:
+    assert_v1_not_imported(task_dir)
+    assert_external_v1_control_plane(
+        contract, allow_test_adapter=allow_test_adapter
+    )
     config = load_config()
     validate_model_vendors(contract, allow_test_adapter=allow_test_adapter)
     validate_canonical_checks(
@@ -3438,10 +4380,15 @@ def run_task(
                 ):
                     raise HarnessError(f"{review_name} review changed the worktree; read-only review violated")
                 verdict = model_review["result"]["verdict"]
+                severe_findings = [
+                    finding
+                    for finding in model_review["result"].get("findings", [])
+                    if finding.get("severity") in {"MAJOR", "BLOCKER"}
+                ]
                 if verdict == "BLOCKED":
                     review_blocked = True
                     break
-                if verdict == "FAIL":
+                if verdict == "FAIL" or severe_findings:
                     review_failed = True
                     break
 
@@ -3457,7 +4404,14 @@ def run_task(
                     [
                         {
                             "id": review["kind"],
-                            "verdict": review["result"]["verdict"],
+                            "verdict": (
+                                "FAIL"
+                                if any(
+                                    finding.get("severity") in {"MAJOR", "BLOCKER"}
+                                    for finding in review["result"].get("findings", [])
+                                )
+                                else review["result"]["verdict"]
+                            ),
                         }
                         for review in reviews_this_round
                         if review["result"]["verdict"] != "PASS"
@@ -3466,11 +4420,22 @@ def run_task(
                 feedback = [
                     {
                         "source": review["name"],
-                        "verdict": review["result"]["verdict"],
+                        "verdict": (
+                            "FAIL"
+                            if any(
+                                finding.get("severity") in {"MAJOR", "BLOCKER"}
+                                for finding in review["result"].get("findings", [])
+                            )
+                            else review["result"]["verdict"]
+                        ),
                         "findings": review["result"]["findings"],
                     }
                     for review in reviews_this_round
                     if review["result"]["verdict"] != "PASS"
+                    or any(
+                        finding.get("severity") in {"MAJOR", "BLOCKER"}
+                        for finding in review["result"].get("findings", [])
+                    )
                 ]
                 if latest_failure_signature == previous_failure_signature:
                     set_state(
@@ -3568,11 +4533,41 @@ def parse_timestamp(raw: Any, label: str) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def _artifact_execution_id(path: Path, expected: Path) -> Optional[str]:
+    """Return a UUID suffix for a dynamic artifact, or ``None`` for legacy exact paths."""
+
+    if path == expected:
+        return None
+    if path.parent != expected.parent or path.suffix != expected.suffix:
+        return None
+    prefix = expected.stem + "-"
+    if not path.stem.startswith(prefix):
+        return None
+    candidate = path.stem[len(prefix) :]
+    try:
+        parsed = uuid.UUID(candidate)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if str(parsed) != candidate:
+        return None
+    return candidate
+
+
 def evidence_file(task_dir: Path, raw: Any, expected: Path, label: str) -> Path:
     if not isinstance(raw, str) or not raw or "\x00" in raw:
         raise HarnessError(f"{label} path is malformed")
     path = Path(raw)
-    if not path.is_absolute() or path != expected:
+    execution_id = _artifact_execution_id(path, expected)
+    canonical_expected = (
+        _execution_artifact_path(expected, execution_id)
+        if execution_id is not None
+        else expected
+    )
+    if (
+        not path.is_absolute()
+        or (path != expected and execution_id is None)
+        or path != canonical_expected
+    ):
         raise HarnessError(f"{label} path is not the exact runner-owned artifact")
     try:
         resolved = path.resolve(strict=True)
@@ -3580,7 +4575,11 @@ def evidence_file(task_dir: Path, raw: Any, expected: Path, label: str) -> Path:
         metadata = path.lstat()
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HarnessError(f"{label} is missing or outside the task evidence store") from exc
-    if resolved != expected.resolve() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+    if (
+        resolved != canonical_expected.resolve()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
         raise HarnessError(f"{label} must be a single-link regular file inside the task evidence store")
     return path
 
@@ -3598,6 +4597,7 @@ def verify_model_invocation(
     invocation_sha256: Any,
     expected_path: Path,
     instructions_sha256: str,
+    prompt_sha256: Optional[str] = None,
 ) -> dt.datetime:
     invocation_path = evidence_file(task_dir, invocation_path_raw, expected_path, f"{label} invocation")
     if sha256_file(invocation_path) != invocation_sha256:
@@ -3614,9 +4614,18 @@ def verify_model_invocation(
     ):
         if invocation.get(key) != expected:
             raise HarnessError(f"{label} invocation {key} is not bound to the attested run")
+    if prompt_sha256 is not None and invocation.get("prompt_sha256") != prompt_sha256:
+        raise HarnessError(
+            f"{label} invocation prompt_sha256 is not bound to the attested run"
+        )
     invocation_id = invocation.get("invocation_id")
     if not isinstance(invocation_id, str) or not invocation_id:
         raise HarnessError(f"{label} invocation id is missing")
+    path_execution_id = _artifact_execution_id(invocation_path, expected_path)
+    if path_execution_id is not None and invocation_id != path_execution_id:
+        raise HarnessError(
+            f"{label} invocation id does not match its execution artifact path"
+        )
     if vendor == "fake" and session_id != f"fake-{invocation_id}":
         raise HarnessError(f"{label} fake session is not bound to its invocation id")
     argv = invocation.get("argv")
@@ -3624,6 +4633,11 @@ def verify_model_invocation(
         raise HarnessError(f"{label} invocation argv is missing")
     if Path(argv[0]).name != vendor:
         raise HarnessError(f"{label} invocation executable does not match vendor {vendor}")
+    invocation_cwd = invocation.get("cwd")
+    if not isinstance(invocation_cwd, str) or not Path(invocation_cwd).is_absolute():
+        raise HarnessError(f"{label} invocation cwd is missing or not absolute")
+    if role == "reviewer" and Path(invocation_cwd) != reviewer_execution_cwd():
+        raise HarnessError(f"{label} reviewer did not run from the isolated cwd")
     timeout = invocation.get("wall_timeout_seconds")
     if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
         raise HarnessError(f"{label} invocation timeout is invalid")
@@ -3639,6 +4653,9 @@ def verify_attestation(
     """Canonical fail-closed verifier used by verify, guard, and commit."""
 
     validate_schema(dict(contract), load_schema("task"), label="task contract")
+    assert_external_v1_control_plane(
+        contract, allow_test_adapter=allow_test_adapter
+    )
     validate_model_vendors(contract, allow_test_adapter=allow_test_adapter)
     attestation_path = task_dir / "attestation.json"
     attestation = load_json(attestation_path)
@@ -3758,6 +4775,57 @@ def verify_attestation(
     require(isinstance(writer_session, str) and bool(writer_session), "writer session provenance is empty")
     for field in ("cli_version", "model"):
         require(isinstance(writer.get(field), str) and bool(writer.get(field)), f"writer {field} provenance is empty")
+    provenance_version = attestation.get("provenance_schema_version")
+    writer_attempts = attestation.get("writer_attempts", [])
+    if provenance_version is None:
+        # Compatibility path for already-earned v1 receipts. They predate the
+        # aggregate writer-attempt fields and are surfaced conservatively by
+        # attestation_degraded_labels() when more than one round contributed.
+        require(
+            "writer_attempts" not in attestation
+            and "degraded_provenance" not in attestation,
+            "legacy attestation mixes old and new provenance fields",
+        )
+        writer_attempts = []
+    else:
+        require(
+            provenance_version == 2,
+            "unsupported attestation provenance schema version",
+        )
+        require(
+            isinstance(writer_attempts, list) and len(writer_attempts) == rounds,
+            "writer_attempts must contain every bounded writer round",
+        )
+        for index, attempt in enumerate(writer_attempts):
+            require(
+                isinstance(attempt, dict)
+                and attempt.get("round") == index + 1
+                and attempt.get("label") == f"round-{index + 1:02d}-writer",
+                f"writer_attempts round {index + 1} provenance is malformed",
+            )
+        if writer_attempts:
+            latest_attempt = writer_attempts[-1]
+            require(
+                latest_attempt.get("session_id") == writer.get("session_id")
+                and latest_attempt.get("artifact_sha256") == writer.get("artifact_sha256")
+                and latest_attempt.get("log_sha256") == writer.get("log_sha256"),
+                "final writer summary differs from writer_attempts",
+            )
+        expected_degraded = [
+            {
+                "round": attempt.get("round"),
+                "label": attempt.get("label"),
+                "degraded": attempt.get("degraded"),
+                "timed_out": bool(attempt.get("timed_out")),
+            }
+            for attempt in writer_attempts
+            if isinstance(attempt, dict)
+            and (attempt.get("degraded") or attempt.get("timed_out"))
+        ]
+        require(
+            attestation.get("degraded_provenance") == expected_degraded,
+            "degraded_provenance does not aggregate every degraded writer round",
+        )
     if isinstance(writer_session, str) and isinstance(writer_vendor, str):
         writer_result_expected = task_dir / "results" / f"{writer_label}-{writer_vendor}.json"
         writer_invocation_expected = task_dir / "results" / f"{writer_label}-{writer_vendor}-invocation.json"
@@ -3784,6 +4852,18 @@ def verify_attestation(
             writer_time = parse_timestamp(writer.get("created_at"), "writer.created_at")
             require(writer_time == invocation_time, "writer timestamp differs from invocation metadata")
             writer_log = evidence_file(task_dir, writer.get("log_path"), writer_log_expected, "writer log")
+            execution_ids = {
+                _artifact_execution_id(writer_result_path, writer_result_expected),
+                _artifact_execution_id(
+                    Path(str(writer.get("invocation_path"))),
+                    writer_invocation_expected,
+                ),
+                _artifact_execution_id(writer_log, writer_log_expected),
+            }
+            require(
+                len(execution_ids) == 1,
+                "writer artifacts come from different executions",
+            )
             require(sha256_file(writer_log) == writer.get("log_sha256"), "writer log changed")
             if writer_vendor != "fake":
                 log_metadata = extract_model_metadata(writer_log, writer_vendor, writer_session)
@@ -3824,14 +4904,28 @@ def verify_attestation(
             log_path = evidence_file(task_dir, check.get("log_path"), expected_log, f"check {check_id} log")
             stdout_path = evidence_file(
                 task_dir,
-                str(expected_log.with_suffix(".stdout.log")),
-                expected_log.with_suffix(".stdout.log"),
+                str(log_path.with_suffix(".stdout.log")),
+                (
+                    _execution_artifact_path(
+                        expected_log,
+                        _artifact_execution_id(log_path, expected_log),
+                    ).with_suffix(".stdout.log")
+                    if _artifact_execution_id(log_path, expected_log) is not None
+                    else expected_log.with_suffix(".stdout.log")
+                ),
                 f"check {check_id} stdout",
             )
             stderr_path = evidence_file(
                 task_dir,
-                str(expected_log.with_suffix(".stderr.log")),
-                expected_log.with_suffix(".stderr.log"),
+                str(log_path.with_suffix(".stderr.log")),
+                (
+                    _execution_artifact_path(
+                        expected_log,
+                        _artifact_execution_id(log_path, expected_log),
+                    ).with_suffix(".stderr.log")
+                    if _artifact_execution_id(log_path, expected_log) is not None
+                    else expected_log.with_suffix(".stderr.log")
+                ),
                 f"check {check_id} stderr",
             )
             profile_path = evidence_file(
@@ -3839,6 +4933,14 @@ def verify_attestation(
                 check.get("sandbox_profile_path"),
                 expected_profile,
                 f"check {check_id} sandbox profile",
+            )
+            log_execution_id = _artifact_execution_id(log_path, expected_log)
+            profile_execution_id = _artifact_execution_id(
+                profile_path, expected_profile
+            )
+            require(
+                log_execution_id == profile_execution_id,
+                f"check {check_id} artifacts come from different executions",
             )
             require(sha256_file(log_path) == check.get("log_sha256"), f"check {check_id} combined log changed")
             require(sha256_file(stdout_path) == check.get("stdout_sha256"), f"check {check_id} stdout changed")
@@ -3931,6 +5033,19 @@ def verify_attestation(
                 result = load_json(result_path)
                 validate_schema(result, load_schema("review"), label=f"review {kind} result")
                 require(result.get("verdict") == "PASS", f"review {kind} result artifact is not PASS")
+                artifact_findings = result.get("findings", [])
+                require(
+                    review.get("findings") == artifact_findings,
+                    f"review {kind} findings summary differs from its result artifact",
+                )
+                require(
+                    not any(
+                        isinstance(finding, Mapping)
+                        and finding.get("severity") in {"MAJOR", "BLOCKER"}
+                        for finding in artifact_findings
+                    ),
+                    f"review {kind} PASS contains unresolved MAJOR/BLOCKER findings",
+                )
                 invocation_time = verify_model_invocation(
                     task_dir,
                     vendor=vendor,
@@ -3945,6 +5060,18 @@ def verify_attestation(
                     instructions_sha256=contract["instructions_sha256"],
                 )
                 log_path = evidence_file(task_dir, review.get("log_path"), log_expected, f"review {kind} log")
+                execution_ids = {
+                    _artifact_execution_id(result_path, result_expected),
+                    _artifact_execution_id(
+                        Path(str(review.get("invocation_path"))),
+                        invocation_expected,
+                    ),
+                    _artifact_execution_id(log_path, log_expected),
+                }
+                require(
+                    len(execution_ids) == 1,
+                    f"review {kind} artifacts come from different executions",
+                )
                 require(sha256_file(log_path) == review.get("log_sha256"), f"review {kind} log changed")
                 if vendor != "fake":
                     log_metadata = extract_model_metadata(log_path, vendor, session)
@@ -3982,8 +5109,20 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not TASK_ID_RE.fullmatch(args.task_id):
         raise HarnessError("task id must match [a-z0-9][a-z0-9._-]{1,63}")
     config = load_config()
+    prompt = getattr(args, "prompt", None)
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file:
+        try:
+            prompt = Path(prompt_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise HarnessError(f"cannot read prompt file {prompt_file}: {exc}") from exc
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HarnessError("init requires a non-empty --prompt or --prompt-file")
+    prompt = prompt.strip()
     task_dir = task_dir_for(common, args.task_id)
-    if task_dir.exists():
+    if task_dir.exists() or (
+        common / "agent-harness" / "v2" / "tasks" / args.task_id
+    ).exists():
         raise HarnessError(f"task already exists: {args.task_id}")
 
     owned = sorted(set(normalize_owned_path(path) for path in args.owned))
@@ -4073,6 +5212,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     checks = [parse_check(raw, timeout) for raw in args.check]
     final_checks = [parse_check(raw, timeout) for raw in args.final_check]
     risks = classify_risks(owned, args.risk, config)
+    if "runtime" in risks:
+        runtime_preflight(primary)
     reviewer, reviewer_escalated = escalate_reviewer_for_risk(
         writer,
         reviewer,
@@ -4095,6 +5236,23 @@ def cmd_init(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     add_missing_canonical_risk_checks(checks, risks, timeout, config)
+    if any(path_overlaps(path, "src-tauri/src") for path in owned):
+        rust_command = canonical_check_commands(config).get("rust-lib")
+        if not rust_command:
+            raise HarnessError("canonical rust-lib command is missing")
+        existing_rust = next(
+            (check for check in checks if check.get("id") == "rust-lib"), None
+        )
+        if existing_rust is None:
+            checks.append(
+                {
+                    "id": "rust-lib",
+                    "command": rust_command,
+                    "timeout_seconds": timeout,
+                }
+            )
+        elif existing_rust.get("command") != rust_command:
+            raise HarnessError("rust-lib is runner-owned and must use its canonical command")
     if not checks:
         raise HarnessError(
             "every task requires at least one deterministic pre-review check; "
@@ -4109,7 +5267,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     contract: Dict[str, Any] = {
         "schema_version": 1,
         "task_id": args.task_id,
-        "description": args.prompt,
+        "description": prompt,
         "kind": args.kind,
         "base_sha": base_sha,
         "contract_sha256": "",
@@ -4226,8 +5384,13 @@ def cmd_seal_prepared(args: argparse.Namespace) -> int:
     """Seal a prepared control-plane bootstrap before any model dispatch."""
 
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
+    assert_v1_not_imported(task_dir)
     if contract.get("kind") != "harness":
         raise HarnessError("seal-prepared is restricted to kind=harness tasks")
+    assert_external_v1_control_plane(
+        contract,
+        allow_test_adapter=bool(getattr(args, "_allow_test_adapter", False)),
+    )
     state = load_json(task_dir / "state.json")
     if state.get("status") != "INITIALIZED" or state.get("phase") != "init":
         raise HarnessError("seal-prepared requires a fresh INITIALIZED task")
@@ -4330,13 +5493,29 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
     state = load_json(task_dir / "state.json")
-    result = {"contract": contract, "state": state}
+    lock_path = task_dir / "run.lock"
+    lock_live = task_run_lock_blocks_reap(task_dir)
+    lock_liveness = "LIVE" if lock_live else ("STALE" if lock_path.exists() else "ABSENT")
+    effective_status = state["status"]
+    if state["status"] in {"RUNNING", "CHECKING", "REVIEWING", "REPAIRING"} and not lock_live:
+        effective_status = "STALE"
+    result = {
+        "generation": 1,
+        "contract": contract,
+        "state": state,
+        "effective_status": effective_status,
+        "lock": {"liveness": lock_liveness},
+    }
     if (task_dir / "attestation.json").exists():
         result["attestation"] = load_json(task_dir / "attestation.json")
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
-        print(f"{contract['task_id']}: {state['status']} (round {state.get('round', 0)})")
+        print(
+            f"{contract['task_id']}: {effective_status} "
+            f"(stored {state['status']}, round {state.get('round', 0)}, "
+            f"lock {lock_liveness})"
+        )
         print(f"worktree: {contract['worktree_path']}")
         if state.get("reason"):
             print(f"reason: {state['reason']}")
@@ -4393,6 +5572,7 @@ def cmd_guard_commit(args: argparse.Namespace) -> int:
         validate_schema(contract, load_schema("task"), label="task contract")
         if contract_hash(contract) != contract.get("contract_sha256"):
             raise HarnessError("task contract hash mismatch")
+    assert_v1_not_imported(task_dir)
     verify_attestation(
         contract,
         task_dir,
@@ -4480,6 +5660,7 @@ def verify_committed_task(contract: Mapping[str, Any], task_dir: Path) -> Dict[s
 
 def cmd_commit(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
+    assert_v1_not_imported(task_dir)
     state = load_json(task_dir / "state.json")
     if state.get("status") != "PASSED":
         raise HarnessError(f"only a PASSED task can be committed; current status is {state.get('status')}")
@@ -4539,9 +5720,11 @@ def cmd_commit(args: argparse.Namespace) -> int:
     # the independent reviews — but the receipt must SAY SO. Publishing a degraded round
     # under a trailer identical to a clean one is exactly the false confidence this receipt
     # exists to prevent.
-    writer_degraded = (attestation.get("writer") or {}).get("degraded")
-    if writer_degraded:
-        trailer_lines.insert(2, f"Harness-Writer-Degraded: {writer_degraded}")
+    degraded_labels = attestation_degraded_labels(attestation)
+    if degraded_labels:
+        trailer_lines.insert(
+            2, "Harness-Writer-Degraded: " + ",".join(degraded_labels)
+        )
     trailers = "\n".join(trailer_lines)
     message = f"{message}\n\n{trailers}"
     commit_argv = ["git", "commit"]
@@ -4599,6 +5782,31 @@ def cmd_commit(args: argparse.Namespace) -> int:
     if not getattr(args, "quiet", False):
         print(json.dumps({"task_id": contract["task_id"], "status": "COMMITTED", "commit_sha": commit_sha}, indent=2))
     return 0
+
+
+def attestation_degraded_labels(attestation: Mapping[str, Any]) -> List[str]:
+    labels = {
+        str(item.get("degraded") or ("timeout" if item.get("timed_out") else "degraded"))
+        for item in attestation.get("degraded_provenance", [])
+        if isinstance(item, Mapping)
+        and (item.get("degraded") or item.get("timed_out"))
+    }
+    writer = attestation.get("writer", {})
+    if isinstance(writer, Mapping) and (
+        writer.get("degraded") or writer.get("timed_out")
+    ):
+        labels.add(
+            str(
+                writer.get("degraded")
+                or ("timeout" if writer.get("timed_out") else "degraded")
+            )
+        )
+    if (
+        attestation.get("provenance_schema_version") is None
+        and int(attestation.get("rounds", 0) or 0) > 1
+    ):
+        labels.add("legacy-provenance-unknown")
+    return sorted(labels)
 
 
 def task_archive_ref(contract: Mapping[str, Any]) -> str:
@@ -4772,6 +5980,7 @@ def task_worktree_is_untouched(contract: Mapping[str, Any]) -> bool:
 
 def cmd_reap(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
+    assert_v1_not_imported(task_dir)
     lock = acquire_run_lock(
         task_dir, stale_before=getattr(args, "stale_before", None)
     )
@@ -4902,6 +6111,10 @@ def gc_candidates(
     if not tasks_root.is_dir():
         return candidates, prune_only
     for task_dir in sorted(path for path in tasks_root.iterdir() if path.is_dir()):
+        if (tasks_root.parent / "v2" / "tasks" / task_dir.name / "task.json").exists():
+            # import-v1 transfers lifecycle ownership without mutating v1
+            # evidence; legacy GC must leave both its worktree and artifacts.
+            continue
         state_path = task_dir / "state.json"
         contract_path = task_dir / "task.json"
         if not state_path.is_file() or not contract_path.is_file():
@@ -4972,6 +6185,7 @@ def cmd_gc(args: argparse.Namespace) -> int:
 
 def cmd_close(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
+    assert_v1_not_imported(task_dir)
     state = load_json(task_dir / "state.json")
     verify_committed_task(contract, task_dir)
     worktree = Path(contract["worktree_path"])
@@ -5197,6 +6411,158 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         finally:
             os.environ.pop(OUTER_SANDBOX_ENV, None)
     config = load_config()
+    try:
+        isolated_cwd = reviewer_execution_cwd()
+        codex_environment = reviewer_model_environment(
+            {"HOME": "/Users/selftest", "PATH": "/usr/bin:/bin"},
+            vendor="codex",
+            cwd=isolated_cwd,
+        )
+        if codex_environment.get("SHELL") != "/bin/sh":
+            failures.append("Codex reviewer shell was not pinned to /bin/sh")
+        if codex_environment.get("HOME") != str(isolated_cwd):
+            failures.append("Codex reviewer HOME was not isolated")
+        if codex_environment.get("CODEX_HOME") != "/Users/selftest/.codex":
+            failures.append("Codex reviewer auth home was not preserved explicitly")
+        if "reviewer_tool_guard.py" in reviewer_tool_guard_command():
+            failures.append("reviewer deny hook still depends on a mutable helper file")
+    except HarnessError as exc:
+        failures.append(f"reviewer execution isolation failed: {exc}")
+    with tempfile.TemporaryDirectory(prefix="murmur-reviewer-tools-") as raw:
+        fixture_dir = Path(raw)
+
+        def tool_fixture(name: str, events: Sequence[Mapping[str, Any]]) -> Path:
+            path = fixture_dir / name
+            path.write_text(
+                "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            return path
+
+        claude_schema_only = tool_fixture(
+            "claude-schema-only.jsonl",
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "tools": ["StructuredOutput"],
+                    "mcp_servers": [],
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "StructuredOutput",
+                                "input": {"verdict": "PASS"},
+                            }
+                        ]
+                    },
+                },
+            ],
+        )
+        if reviewer_tool_activity(claude_schema_only, "claude"):
+            failures.append("Claude StructuredOutput response was treated as tool execution")
+
+        claude_bash = tool_fixture(
+            "claude-bash.jsonl",
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "tools": ["StructuredOutput"],
+                    "mcp_servers": [],
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "pwd"}}
+                        ]
+                    },
+                },
+            ],
+        )
+        if not reviewer_tool_activity(claude_bash, "claude"):
+            failures.append("Claude Bash tool use was not rejected")
+
+        claude_extra_surface = tool_fixture(
+            "claude-extra-surface.jsonl",
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "tools": ["StructuredOutput", "Read"],
+                    "mcp_servers": [{"name": "unexpected"}],
+                }
+            ],
+        )
+        if len(reviewer_tool_activity(claude_extra_surface, "claude")) != 2:
+            failures.append("Claude init tool and MCP surfaces did not fail closed")
+
+        codex_prose = tool_fixture(
+            "codex-prose.jsonl",
+            [
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "PASS"},
+                }
+            ],
+        )
+        if reviewer_tool_activity(codex_prose, "codex"):
+            failures.append("Codex prose response was treated as tool execution")
+
+        for label, item_type in (
+            ("command", "command_execution"),
+            ("unknown", "dynamic_tool_call"),
+        ):
+            codex_tool = tool_fixture(
+                f"codex-{label}.jsonl",
+                [
+                    {
+                        "type": "item.started",
+                        "item": {"type": item_type},
+                    }
+                ],
+            )
+            if not reviewer_tool_activity(codex_tool, "codex"):
+                failures.append(f"Codex {item_type} event did not fail closed")
+    with tempfile.TemporaryDirectory(prefix="murmur-model-telemetry-") as raw:
+        telemetry_log = Path(raw) / "claude.jsonl"
+        telemetry_log.write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "session_id": "telemetry-session",
+                    "model": "telemetry-model",
+                    "total_cost_usd": 1.25,
+                    "num_turns": 7,
+                    "usage": {"input_tokens": 11, "output_tokens": 13},
+                    "api_error_status": 429,
+                    "retry_after_seconds": 2,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        telemetry = extract_model_metadata(
+            telemetry_log, "claude", "telemetry-fallback"
+        )
+        expected_telemetry = {
+            "session_id": "telemetry-session",
+            "model": "telemetry-model",
+            "total_cost_usd": 1.25,
+            "num_turns": 7,
+            "usage": {"input_tokens": 11, "output_tokens": 13},
+            "terminal_reason": None,
+            "http_status": 429,
+            "retry_after_seconds": 2.0,
+        }
+        if telemetry != expected_telemetry:
+            failures.append(
+                "model terminal cost/turn/usage metadata was not retained"
+            )
     instruction_labels = {label for label, _path in instruction_paths(Path.cwd())}
     if "scripts/agent-remote-audit.py" not in instruction_labels:
         failures.append("remote-audit implementation is absent from the instruction hash")
@@ -5534,6 +6900,7 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 argparse.Namespace(
                     task_id="selftest-prepared-harness",
                     quiet=True,
+                    _allow_test_adapter=True,
                 )
             )
             sealed_contract, prepared_dir, _ = load_task_from_current_repo(
@@ -5686,6 +7053,74 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 pass
             finally:
                 atomic_write_json(task_dir / "attestation.json", original_attestation)
+
+            severe_attestation = copy.deepcopy(original_attestation)
+            severe_review = severe_attestation["reviews"][0]
+            severe_result_path = Path(severe_review["result_path"])
+            original_review_result = load_json(severe_result_path)
+            severe_result = copy.deepcopy(original_review_result)
+            severe_result["verdict"] = "PASS"
+            severe_result["findings"] = [
+                {
+                    "severity": "MAJOR",
+                    "file": "owned.txt",
+                    "evidence": "forged PASS still contains a major defect",
+                    "required_fix": "repair it",
+                }
+            ]
+            atomic_write_json(severe_result_path, severe_result)
+            severe_review["artifact_sha256"] = sha256_file(severe_result_path)
+            severe_review["findings"] = severe_result["findings"]
+            atomic_write_json(task_dir / "attestation.json", severe_attestation)
+            try:
+                verify_attestation(contract, task_dir, allow_test_adapter=True)
+                failures.append(
+                    "canonical verifier accepted forged PASS plus MAJOR finding"
+                )
+            except HarnessError as exc:
+                if "MAJOR/BLOCKER" not in str(exc):
+                    failures.append(
+                        "forged PASS plus MAJOR failed for an unrelated reason"
+                    )
+            finally:
+                atomic_write_json(severe_result_path, original_review_result)
+                atomic_write_json(task_dir / "attestation.json", original_attestation)
+
+            synthetic_rounds = copy.deepcopy(original_attestation)
+            clean_attempt = copy.deepcopy(synthetic_rounds["writer_attempts"][-1])
+            clean_attempt.update(
+                {
+                    "round": 2,
+                    "label": "round-02-writer",
+                    "degraded": None,
+                    "timed_out": False,
+                }
+            )
+            degraded_attempt = copy.deepcopy(clean_attempt)
+            degraded_attempt.update(
+                {
+                    "round": 1,
+                    "label": "round-01-writer",
+                    "degraded": "timeout",
+                    "timed_out": True,
+                }
+            )
+            synthetic_rounds["writer_attempts"] = [
+                degraded_attempt,
+                clean_attempt,
+            ]
+            synthetic_rounds["degraded_provenance"] = [
+                {
+                    "round": 1,
+                    "label": "round-01-writer",
+                    "degraded": "timeout",
+                    "timed_out": True,
+                }
+            ]
+            if attestation_degraded_labels(synthetic_rounds) != ["timeout"]:
+                failures.append(
+                    "round-1 degraded plus round-2 clean lost published provenance"
+                )
 
             # Deterministic TCB mutation campaign: every security-relevant
             # single-field change must turn an accepted receipt into DENY.
@@ -6343,7 +7778,8 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             lane_ready = lane_runtime["tmp"] / "lane-inheritance-ready"
             lane_ready.unlink(missing_ok=True)
             lane_probe = (
-                "import os,pathlib,time; "
+                "import os,pathlib,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 f"pathlib.Path({str(lane_ready)!r}).write_text(str(os.getpgrp())); "
                 "time.sleep(30)"
             )
@@ -6905,7 +8341,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep a same-vendor reviewer even on lock/egress/protocol risk "
         "(default: auto-escalate the reviewer to the opposite vendor)",
     )
-    init_parser.add_argument("--prompt", required=True)
+    prompt_group = init_parser.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt")
+    prompt_group.add_argument("--prompt-file")
     init_parser.add_argument("--owned", action="append", required=True, metavar="PATH")
     init_parser.add_argument(
         "--risk",
@@ -6916,7 +8354,13 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--check", action="append", default=[], metavar="ID::COMMAND")
     init_parser.add_argument("--final-check", action="append", default=[], metavar="ID::COMMAND")
     init_parser.add_argument("--max-repair-rounds", type=int, default=2, choices=range(0, 6))
-    init_parser.add_argument("--base", help="committed base ref (default: HEAD)")
+    init_parser.add_argument(
+        "--base",
+        help=(
+            "committed base ref (default: fetched origin/murmur; loud fallback "
+            "to local HEAD only when the remote base is unavailable)"
+        ),
+    )
     init_parser.add_argument("--branch", help="task branch (default: agent/<task-id>)")
     expected = init_parser.add_mutually_exclusive_group()
     expected.add_argument("--expected-change", dest="expected_change", action="store_true", default=True)

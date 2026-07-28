@@ -57,6 +57,11 @@
     },
     "writer": { "enum": ["codex", "claude", "fake"] },
     "reviewer": { "enum": ["codex", "claude", "fake"] },
+    "verification_profile": {
+      "type": "string",
+      "enum": ["full"],
+      "description": "Legacy pre-v2 contract field retained for read/close compatibility."
+    },
     "max_repair_rounds": { "type": "integer", "minimum": 0, "maximum": 5 },
     "checks": { "$ref": "#/$defs/checks" },
     "final_checks": { "$ref": "#/$defs/checks" },
