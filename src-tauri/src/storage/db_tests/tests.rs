@@ -11295,6 +11295,204 @@ fn s2_and_to_or_fallback_recovers_multiword_miss_org() {
     );
 }
 
+/// ORG SEARCH RELEVANCE FLOOR: the OR fallback is allowed only when at least
+/// `ceil(unique_content_terms / 2)` exact FTS tokens match ONE chunk. This uses a real, file-backed
+/// SQLCipher handle (the production `Db::open_with_key` path), not a Rust substring approximation.
+/// It pins the two reported coverage boundaries, duplicate-query-term resistance, exact-token
+/// matching (`Kong` != `Kongo`), the SQL-construction term bound, and the existing two-term
+/// cross-language fallback.
+#[test]
+fn org_fts_or_fallback_requires_ceil_half_exact_unique_content_terms() {
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let path = unique_temp_path("murmur-org-fts-coverage", "sqlite");
+    let _ = std::fs::remove_file(&path);
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    seed_org_state(&db, "org-1");
+
+    let ingest = |item_id: &str, title: &str, body: &str, tag: u8| {
+        db.upsert_org_item(
+            item_id,
+            "org-1",
+            u64::from(tag),
+            "anna",
+            title,
+            body,
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(tag),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    };
+
+    // Six unique content terms => threshold 3. One exact token is noise; three is signal.
+    ingest("six-one", "One of six", "Kong travel diary", 1);
+    ingest(
+        "six-three",
+        "Three of six",
+        "hybrid source operator decision",
+        2,
+    );
+    // A second matching chunk for the same item must not duplicate the returned item.
+    db.lock()
+        .execute(
+            "INSERT INTO org_chunks (item_id, chunk_idx, text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["six-three", 99_i64, "hybrid source operator follow-up"],
+        )
+        .unwrap();
+    // A prefix/substring is not an exact unicode61 token match for `kong`.
+    ingest("six-kongo", "Kongo is different", "Kongo travel diary", 3);
+    let six = db
+        .search_org_chunks_fts("hybrid mode source truth kong operator", 10)
+        .unwrap();
+    let six_ids: Vec<&str> = six.iter().map(|hit| hit.item_id.as_str()).collect();
+    assert_eq!(
+        six_ids,
+        vec!["six-three"],
+        "1/6 and Kongo-prefix noise must be rejected while 3/6 survives: {six_ids:?}"
+    );
+
+    // Result bounds stay hard after SQL coverage qualification and per-item dedup.
+    ingest(
+        "six-three-b",
+        "Another three of six",
+        "mode truth operator decision",
+        7,
+    );
+    let bounded = db
+        .search_org_chunks_fts("hybrid mode source truth kong operator", 1)
+        .unwrap();
+    assert_eq!(
+        bounded.len(),
+        1,
+        "the requested result bound must stay hard"
+    );
+
+    // Three unique content terms => threshold 2.
+    ingest("three-one", "One of three", "violet memo", 4);
+    ingest("three-two", "Two of three", "violet ember memo", 5);
+    let three = db.search_org_chunks_fts("violet quartz ember", 10).unwrap();
+    let three_ids: Vec<&str> = three.iter().map(|hit| hit.item_id.as_str()).collect();
+    assert_eq!(
+        three_ids,
+        vec!["three-two"],
+        "1/3 must be rejected while 2/3 survives: {three_ids:?}"
+    );
+
+    // Repeating `violet` cannot turn one matched token into multiple coverage votes.
+    let duplicate = db
+        .search_org_chunks_fts("violet violet quartz ember", 10)
+        .unwrap();
+    let duplicate_ids: Vec<&str> = duplicate.iter().map(|hit| hit.item_id.as_str()).collect();
+    assert_eq!(
+        duplicate_ids,
+        vec!["three-two"],
+        "duplicate query terms must neither inflate coverage nor the threshold: {duplicate_ids:?}"
+    );
+
+    // One-term exact token sanity: `Kong` must not match `Kongo`.
+    let kong = db.search_org_chunks_fts("kong", 10).unwrap();
+    let kong_ids: Vec<&str> = kong.iter().map(|hit| hit.item_id.as_str()).collect();
+    assert_eq!(kong_ids, vec!["six-one"], "Kong != Kongo: {kong_ids:?}");
+
+    // Existing cross-language AND→OR recovery remains: 2 terms => ceil(2/2) = 1.
+    ingest(
+        "parcel-fallback",
+        "Parcel fallback",
+        "parcel size delivery schedule",
+        6,
+    );
+    let fallback = db.search_org_chunks_fts("etykieta parcel", 10).unwrap();
+    assert!(
+        fallback.iter().any(|hit| hit.item_id == "parcel-fallback"),
+        "the existing two-term fallback must still recover a one-token domain match"
+    );
+
+    // Fallback SQL construction is bounded independently of the full strict expression. A query
+    // with 65 unique content terms uses its first bounded 32 fallback terms; matching 16 of those
+    // reaches ceil(32 / 2) without SQLite prepare-limit errors.
+    let first_half = (0..16)
+        .map(|index| format!("term{index:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    ingest("bounded-query", "Bounded query", &first_half, 8);
+    let overlong_query = (0..65)
+        .map(|index| format!("term{index:03}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let overlong = db.search_org_chunks_fts(&overlong_query, 10).unwrap();
+    assert!(
+        overlong.iter().any(|hit| hit.item_id == "bounded-query"),
+        "overlong query must use a bounded term list for fallback SQL: {overlong:?}"
+    );
+
+    // The strict phase remains the full original query: once a row matching all 65 terms exists,
+    // strict AND returns it and the fallback must not also admit a row matching only the first 16.
+    ingest("strict-full-query", "Strict full query", &overlong_query, 11);
+    let strict_overlong = db.search_org_chunks_fts(&overlong_query, 10).unwrap();
+    let strict_ids = strict_overlong
+        .iter()
+        .map(|hit| hit.item_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        strict_ids,
+        vec!["strict-full-query"],
+        "full strict AND must not truncate to the fallback term cap: {strict_ids:?}"
+    );
+
+    // Unicode lowercase expansion and unicode61 diacritic folding must agree with the coverage
+    // list. `İİİ`/`iii` and precomposed/decomposed `résumé`/`resume` are each one logical FTS token,
+    // never multiple votes.
+    let unicode_terms = {
+        let conn = db.lock();
+        fts_unicode61_content_terms(
+            &conn,
+            "İİİ iii résumé resume re\u{301}sume\u{301} quartz ember",
+            32,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        unicode_terms,
+        vec!["iii", "resume", "quartz", "ember"],
+        "canonical terms must use SQLite unicode61 single-token identity"
+    );
+    ingest("unicode-i", "Unicode I", "iii memo", 9);
+    let unicode_i = db
+        .search_org_chunks_fts("İİİ iii quartz ember", 10)
+        .unwrap();
+    assert!(
+        unicode_i.iter().all(|hit| hit.item_id != "unicode-i"),
+        "equivalent lowercase-expanding terms must count once, not satisfy 2/3: {unicode_i:?}"
+    );
+    ingest("unicode-accent", "Unicode accent", "resume memo", 10);
+    let unicode_accent = db
+        .search_org_chunks_fts("résumé resume quartz ember", 10)
+        .unwrap();
+    assert!(
+        unicode_accent
+            .iter()
+            .all(|hit| hit.item_id != "unicode-accent"),
+        "unicode61-equivalent diacritic terms must count once, not satisfy 2/3: {unicode_accent:?}"
+    );
+    let unicode_decomposed = db
+        .search_org_chunks_fts("résumé re\u{301}sume\u{301} quartz ember", 10)
+        .unwrap();
+    assert!(
+        unicode_decomposed
+            .iter()
+            .all(|hit| hit.item_id != "unicode-accent"),
+        "decomposed and precomposed unicode61-equivalent terms must count once, not satisfy 2/3: \
+         {unicode_decomposed:?}"
+    );
+
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
 /// S2 Test D (precision preserved — the QA "No meetings match" guard): a query whose content words
 /// appear in NONE of the corpus notes stays EMPTY even after the OR fallback (no shared content
 /// word ⇒ the OR built from the query's own content words matches nothing).
