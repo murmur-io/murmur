@@ -811,6 +811,25 @@ def profile_cases(test: Tests) -> None:
             canonical_v2_selftest
         ),
     )
+    test.equal(
+        "PROFILE npm-lock check does not request the Sherpa archive",
+        legacy.command_needs_sherpa_archive(
+            "python3 -B .agents/harness/checks/npm-lock-evidence.py"
+        ),
+        False,
+    )
+    test.true(
+        "PROFILE performance contracts request the Sherpa archive",
+        legacy.command_needs_sherpa_archive(
+            "bash .agents/harness/checks/perf-contracts.sh"
+        ),
+    )
+    test.true(
+        "PROFILE client Rust checks request the Sherpa archive",
+        legacy.command_needs_sherpa_archive(
+            "(cd src-tauri && cargo test --lib)"
+        ),
+    )
     review_schema = legacy.load_schema("v2-review")
     schema_probe_ids = set(
         review_schema["properties"]["probe_requests"]["items"]["properties"][
