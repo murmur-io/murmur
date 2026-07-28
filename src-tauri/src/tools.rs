@@ -181,6 +181,10 @@ pub enum ToolCall {
     /// Roll up every OPEN action item, optionally filtered by owner.
     GetOpenCommitments { owner: Option<String> },
     /// Assemble the gated structured dossier for one entity (caller must pass a non-empty name/id).
+    /// #8 — the CHAPTER map. The app computes topic spans (`summarize::timeline`) and persists them;
+    /// the desktop UI renders them as a chapter list. None of the tools exposed them, so an agent
+    /// navigated a 116k-char transcript blind even though the map already existed.
+    GetMeetingChapters { meeting_id: String },
     GetEntityDossier {
         entity: String,
         /// How much of the note corpus to carry: `none` | `summary` (default) | `full`.
@@ -839,6 +843,29 @@ pub fn execute_tool(
                 Ok(items) => Ok(format_commitments(&items)),
                 Err(e) => Err(AppError::Storage(format!("commitments rollup failed: {e}"))),
             }
+        }
+        ToolCall::GetMeetingChapters { meeting_id } => {
+            let mid = meeting_id.as_str();
+            // GATED by `get_timeline_data_visible`. A sealed-and-not-unlocked meeting returns the
+            // SAME masking sentinel shape as `get_meeting`, so a topic label — which is LLM-derived
+            // content — can never leak, and locked is indistinguishable from absent.
+            let Ok(Some(raw)) = db.get_timeline_data_visible(mid, unlocked) else {
+                // AVAILABILITY HONESTY: `commands::get_timeline` is read-only cached-or-empty and
+                // never GENERATES (generation moved behind an explicit action for on-device
+                // providers, per the OOM fix). So "no chapters" usually means "not generated yet",
+                // NOT "this meeting has no structure" — say so rather than implying the latter.
+                return Ok(format!(
+                    "No chapter map for meeting {mid}. It may not have been generated yet (chapters \
+                     are built with the meeting timeline, not during recording), or the meeting may \
+                     be locked or absent. The transcript is still readable with get_meeting."
+                ));
+            };
+            let Ok(timeline) = serde_json::from_str::<crate::storage::models::MeetingTimeline>(&raw)
+            else {
+                return Ok(format!("No chapter map for meeting {mid}."));
+            };
+            let segs = db.get_segments(mid).unwrap_or_default();
+            Ok(format_chapters(&timeline, &segs))
         }
         ToolCall::GetEntityDossier {
             entity,
@@ -1957,6 +1984,79 @@ fn secs(v: f64) -> String {
 /// Map a raw `Segment.speaker` tag to the display name a rendered transcript shows. Extracted so
 /// the structured and compact renderers cannot drift apart on speaker naming — a second, diverging
 /// copy of this mapping is exactly what let `others-N` render as `Unknown` in the first place.
+/// Render the chapter map, mapping each topic span to its CHAR OFFSET in the structured transcript.
+///
+/// The offset is what makes this actionable rather than decorative: an agent reads a chapter title,
+/// then passes the matching `offset`/`maxChars` straight to `get_meeting` and lands on that section
+/// instead of paging a 116k-char transcript blind.
+///
+/// Offsets are computed by prefix-summing the SAME per-segment rendering `format_structured_transcript`
+/// produces, so they address the `structured` char space exactly — the one the tool defaults to.
+fn format_chapters(
+    timeline: &crate::storage::models::MeetingTimeline,
+    segs: &[crate::transcribe::types::Segment],
+) -> String {
+    if timeline.topics.is_empty() {
+        return "No chapters recorded for this meeting.".to_string();
+    }
+    // Prefix-sum the rendered length of each non-empty segment, mirroring the renderer's own
+    // filter and its "\n" join, so an offset here is byte-for-byte the offset get_meeting expects.
+    let rendered: Vec<(f64, f64, usize, usize)> = {
+        let mut acc = 0usize;
+        let mut out = Vec::new();
+        for s in segs.iter().filter(|s| !s.text.trim().is_empty()) {
+            let line = format!(
+                "[{}–{}] {}: {}",
+                secs(s.start_s),
+                secs(s.end_s),
+                speaker_label(s.speaker.as_deref()),
+                s.text.trim()
+            );
+            let len = line.chars().count();
+            out.push((s.start_s, s.end_s, acc, acc + len));
+            acc += len + 1; // the join's newline
+        }
+        out
+    };
+
+    let mut out = String::from(
+        "CHAPTERS (offsets address the 'structured' transcript — pass them to get_meeting as offset/maxChars):\n",
+    );
+    for (i, t) in timeline.topics.iter().enumerate() {
+        // First and last segment OVERLAPPING the span; a chapter with no overlapping segment
+        // (a hallucinated or out-of-range span) reports no offsets rather than a wrong one.
+        let overlap: Vec<&(f64, f64, usize, usize)> = rendered
+            .iter()
+            .filter(|(a, b, _, _)| *b > t.start_s && *a < t.end_s)
+            .collect();
+        let span = match (overlap.first(), overlap.last()) {
+            (Some(f), Some(l)) => {
+                let (start, end) = (f.2, l.3);
+                format!(
+                    " · offset {start}..{end} ({} chars)",
+                    end.saturating_sub(start)
+                )
+            }
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "- [{}] {} — {}–{}{}\n",
+            i,
+            t.label.trim(),
+            mmss(t.start_s),
+            mmss(t.end_s),
+            span
+        ));
+    }
+    out
+}
+
+/// `mm:ss` for a human reading the reply; raw seconds ride alongside for machine seeking.
+fn mmss(v: f64) -> String {
+    let total = v.max(0.0).round() as i64;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
 fn speaker_label(tag: Option<&str>) -> std::borrow::Cow<'static, str> {
     use crate::audio::merge::{SPEAKER_ME, SPEAKER_OTHERS};
     use std::borrow::Cow;

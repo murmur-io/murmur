@@ -245,6 +245,11 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain", "compact"], "description": "Transcript rendering (default 'structured'). 'compact' merges consecutive same-speaker segments into one line — same words, far less per-segment scaffolding. NOTE each format is a DIFFERENT character space, so offset/maxChars/TOTAL_CHARS only mean anything within the format you asked for." }, "offset": { "type": "number", "description": "Chars to skip into the transcript, in the SELECTED format's char space (default 0)." }, "maxChars": { "type": "number", "description": "Max chars to return from offset (default: a bounded 6000-char window with the total disclosed). Bounds the NOTE section too." }, "includeNote": { "type": "boolean", "description": "Include the AI note (default true). Pass false for transcript only — e.g. you already read the note, or you are paging and only want speech." } }, "required": ["meetingId"] }
         },
         {
+            "name": "get_meeting_chapters",
+            "description": "The CHAPTER MAP of one meeting: each topic span with its title, start/end time, and the CHARACTER OFFSET range it occupies in the structured transcript. Read this BEFORE paging a long meeting — take the chapter you want and pass its offset/maxChars straight to get_meeting instead of scanning blindly. Chapters are built with the meeting timeline (not during recording), so a meeting may legitimately have none yet. Sealed-and-locked meetings return no map.",
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" } }, "required": ["meetingId"] }
+        },
+        {
             "name": "get_document",
             "description": "Get the body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result. The body is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a big document by passing offset + maxChars.",
             "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" }, "offset": { "type": "number", "description": "Chars to skip into the body (default 0)." }, "maxChars": { "type": "number", "description": "Max body chars to return from offset (default: a bounded 6000-char window with the total disclosed)." } }, "required": ["documentId"] }
@@ -386,6 +391,13 @@ fn dispatch_tool(
         "search_semantic" => ToolCall::SearchSemantic {
             query: args
                 .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
+        "get_meeting_chapters" => ToolCall::GetMeetingChapters {
+            meeting_id: args
+                .get("meetingId")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
@@ -572,10 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eleven_tools() {
+    fn tools_list_has_twelve_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
+        // #8 — the chapter map the app already computes but never exposed.
+        assert!(tools.iter().any(|t| t["name"] == "get_meeting_chapters"));
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -801,6 +815,67 @@ mod tests {
         assert!(
             out.contains("Budget"),
             "flag-off fallback must still surface the gated keyword hit, got: {out}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// R9/#8 (regression + LOCK GATE). The chapter map reaches MCP with usable char offsets, and a
+    /// sealed-and-not-unlocked meeting leaks NO topic label.
+    ///
+    /// Topic labels are LLM-derived note CONTENT, so this is a new content read path. Relying on
+    /// `timelines.data` being blanked while sealed would be exactly the mistake the masked-DTO
+    /// discipline warns about — the gate is what makes it safe.
+    #[test]
+    fn meeting_chapters_carry_offsets_and_are_visibility_gated() {
+        use crate::storage::models::Folder;
+        use crate::transcribe::types::Segment;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        seed(&db, "open", "Open", "a note", None);
+        seed(&db, "sealed", "Sealed", "a note", Some("f-lock"));
+        let segs = vec![
+            Segment { idx: 0, start_s: 0.0, end_s: 10.0, text: "kickoff talk".into(), speaker: Some("me".into()), confidence: None },
+            Segment { idx: 1, start_s: 60.0, end_s: 70.0, text: "the deep dive".into(), speaker: Some("others".into()), confidence: None },
+        ];
+        let timeline = r#"{"speakers":[],"topics":[
+            {"label":"Kickoff","start_s":0.0,"end_s":30.0},
+            {"label":"SECRET Deep Dive","start_s":55.0,"end_s":90.0}]}"#;
+        for mid in ["open", "sealed"] {
+            db.insert_segments(mid, &segs).unwrap();
+            db.set_timeline_data(mid, timeline).unwrap();
+        }
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let open = dispatch_tool(
+            &db,
+            "get_meeting_chapters",
+            &json!({ "meetingId": "open" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(open.contains("Kickoff"), "chapter titles surface: {open}");
+        assert!(open.contains("offset 0.."), "with a usable char offset: {open}");
+        assert!(open.contains("01:30"), "and a human timestamp: {open}");
+
+        // GATE: the sealed meeting must leak no label at all.
+        let sealed = dispatch_tool(
+            &db,
+            "get_meeting_chapters",
+            &json!({ "meetingId": "sealed" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            !sealed.contains("SECRET") && !sealed.contains("Kickoff"),
+            "a sealed meeting must leak no topic label: {sealed}"
         );
         let _ = std::fs::remove_file(&p);
     }

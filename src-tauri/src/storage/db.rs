@@ -5011,6 +5011,24 @@ impl Db {
 
     // ── timelines (AI-derived speaker + topic spans; JSON blob per meeting) ──────
 
+    /// GATED read of a meeting's timeline JSON — the chapter/topic map (#8).
+    ///
+    /// LOCK MODEL: topic LABELS and speaker names are LLM-derived note CONTENT, so this is a new
+    /// content read path and must be gated, not merely rely on `timelines.data` being blanked while
+    /// sealed. Relying on blanking alone is exactly the mistake the masked-DTO comment in
+    /// `get_meeting_detail` warns about. `get_timeline_data` below is the RAW, UNGATED reader —
+    /// never call it from `execute_tool`.
+    pub fn get_timeline_data_visible(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        if !self.meeting_is_visible(meeting_id, unlocked)? {
+            return Ok(None);
+        }
+        self.get_timeline_data(meeting_id)
+    }
+
     pub fn get_timeline_data(&self, meeting_id: &str) -> Result<Option<String>> {
         let conn = self.lock();
         conn.query_row(
