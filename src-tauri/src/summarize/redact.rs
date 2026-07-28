@@ -7,11 +7,12 @@
 //!
 //! Field coverage (the firewall's egress contract — kept in sync with the doc-comment on
 //! [`RedactingProvider::summarize_with_meta`]): EVERY `SummarizeRequest` field that reaches the
-//! inner provider is scrubbed there before egress — `transcript` / `related_context` / `user_notes`
-//! (regex + NER), `template` / `meta.title_hint` (regex), and `vault_titles` (FILTERED: any title
-//! the firewall would alter is dropped, since a masked wikilink target is useless). Only the
-//! non-PII format flags (`meta.date_iso`, `meta.language`, `meta.duration_s`) pass verbatim. A new
-//! string field is caught by `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
+//! inner provider is scrubbed there before egress — `transcript` / `related_context` /
+//! `user_notes` / `live_bullets` / `glossary` / `template` / `meta.title_hint` use one shared
+//! regex map and one global NER batch; `vault_titles` are FILTERED when the firewall would alter
+//! them (a masked wikilink target is useless). Only the non-PII format flags (`meta.date_iso`,
+//! `meta.language`, `meta.duration_s`) pass verbatim. A new string field is caught by
+//! `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -526,8 +527,214 @@ fn count_redactions(map: &HashMap<String, String>, name_count: usize) -> Redacti
     counts
 }
 
-/// Provider decorator: redacts PII from inputs, restores it in outputs, and records a
-/// content-free egress audit entry per call.
+/// Run the NER layer ONCE for all fields of one provider call. Real NER token numbering starts at
+/// `NAME_1` per invocation, so redacting fields separately can assign the same token to different
+/// names and restore the wrong person. A deterministic boundary keeps field identity without
+/// influencing token numbering; if a redactor alters it, fail closed before egress.
+type RedactedNameBatch = (Vec<Option<String>>, Vec<(String, String)>);
+
+fn redact_names_batch(
+    names: &dyn NameRedactor,
+    fields: Vec<Option<String>>,
+) -> Result<RedactedNameBatch> {
+    let present: Vec<&String> = fields.iter().filter_map(Option::as_ref).collect();
+    if present.is_empty() {
+        return Ok((fields, Vec::new()));
+    }
+
+    let boundary = (0_u16..=u16::MAX)
+        .map(|nonce| format!("\u{241e}MURMUR_NAME_FIELD_{nonce}\u{241f}"))
+        .find(|candidate| present.iter().all(|field| !field.contains(candidate)))
+        .ok_or_else(|| {
+            AppError::Summarize("unable to allocate a safe name-redaction boundary".into())
+        })?;
+    let joined = present
+        .iter()
+        .map(|field| field.as_str())
+        .collect::<Vec<_>>()
+        .join(&boundary);
+
+    let (redacted, pairs) = names.redact_names(&joined);
+    let pieces: Vec<String> = redacted.split(&boundary).map(str::to_string).collect();
+    if pieces.len() != present.len() {
+        return Err(AppError::Summarize(
+            "name redactor altered the field boundary; cloud dispatch refused".into(),
+        ));
+    }
+
+    let mut token_names: HashMap<&str, &str> = HashMap::new();
+    for (token, name) in &pairs {
+        if joined.contains(token) {
+            return Err(AppError::Summarize(
+                "prompt contained a reserved name-redaction token; cloud dispatch refused".into(),
+            ));
+        }
+        if let Some(existing) = token_names.insert(token.as_str(), name.as_str()) {
+            if existing != name {
+                return Err(AppError::Summarize(
+                    "name redactor emitted a colliding restore token; cloud dispatch refused"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let mut pieces = pieces.into_iter();
+    let restored_shape = fields
+        .into_iter()
+        .map(|field| field.map(|_| pieces.next().unwrap_or_default()))
+        .collect();
+    Ok((restored_shape, pairs))
+}
+
+/// Exhaustive rendering class for every provider the redaction wrapper is allowed to dispatch.
+///
+/// This deliberately has no catch-all variant. A newly added cloud provider cannot silently inherit
+/// another provider's prompt-byte accounting; it must be classified here before it can dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderEgressClass {
+    SplitSystemUser,
+    Ollama,
+}
+
+fn provider_egress_class(provider_id: &str) -> Result<ProviderEgressClass> {
+    match provider_id {
+        crate::summarize::PROVIDER_CLAUDE_CODE
+        | crate::summarize::PROVIDER_ANTHROPIC
+        | crate::summarize::PROVIDER_GATEWAY => Ok(ProviderEgressClass::SplitSystemUser),
+        crate::summarize::PROVIDER_OLLAMA => Ok(ProviderEgressClass::Ollama),
+        _ => Err(AppError::InvalidArg(
+            "cloud provider has no registered egress rendering class; dispatch refused".into(),
+        )),
+    }
+}
+
+/// Render the exact two byte streams the wrapped provider sends for a note summary. Anthropic,
+/// Gateway, and Claude Code use a system/user split; remote Ollama sends the same combined prompt
+/// its provider implementation builds with `render_prompt`.
+fn rendered_summarize_egress(
+    class: ProviderEgressClass,
+    req: &SummarizeRequest,
+) -> (String, String) {
+    match class {
+        ProviderEgressClass::Ollama => (
+            String::new(),
+            crate::summarize::template::render_prompt(req),
+        ),
+        ProviderEgressClass::SplitSystemUser => {
+            let system = if req.template.trim().is_empty() {
+                crate::summarize::template::default_template()
+            } else {
+                req.template.clone()
+            };
+            let user = crate::summarize::template::render_user_content(req);
+            (system, user)
+        }
+    }
+}
+
+/// Return the exact two text fields sent by a raw completion.
+///
+/// Unlike note summarization, Ollama completion does **not** concatenate the channels:
+/// `OllamaProvider::complete` serializes them as distinct `/api/generate` JSON fields
+/// (`system` and `prompt`). Keeping this provider-class match explicit prevents summary rendering
+/// semantics from being incorrectly reused for completion receipts.
+fn rendered_complete_egress<'a>(
+    class: ProviderEgressClass,
+    system: &'a str,
+    user: &'a str,
+) -> (&'a str, &'a str) {
+    match class {
+        ProviderEgressClass::SplitSystemUser => (system, user),
+        ProviderEgressClass::Ollama => {
+            crate::summarize::ollama::completion_prompt_parts(system, user)
+        }
+    }
+}
+
+/// Turn a provider failure into the only diagnostic that may cross the firewall back to callers.
+///
+/// Provider errors can embed response bodies, reflected prompts, URLs, or SDK debug output. The
+/// application logs propagated errors in several outer lifecycle paths, so returning the original
+/// value would make the ledger content-free while still leaking through ordinary diagnostics. Keep
+/// only the typed failure category; the exact call outcome remains in the `summarize_error` receipt.
+fn ollama_http_status(error: &AppError) -> Option<u16> {
+    let AppError::Summarize(message) = error else {
+        return None;
+    };
+    let suffix = message.strip_prefix("Ollama API returned HTTP ")?;
+    let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+    let status = digits.parse::<u16>().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
+fn content_free_dispatch_error(provider_id: &str, error: &AppError) -> AppError {
+    if provider_id == crate::summarize::PROVIDER_OLLAMA {
+        if let Some(status) = ollama_http_status(error) {
+            return AppError::Summarize(format!(
+                "remote Ollama returned HTTP {status}; response details omitted"
+            ));
+        }
+        if matches!(
+            error,
+            AppError::Summarize(message)
+                if message.starts_with("failed to parse Ollama response")
+        ) {
+            return AppError::Summarize(
+                "remote Ollama returned a malformed response; details omitted".into(),
+            );
+        }
+        if matches!(
+            error,
+            AppError::Summarize(message)
+                if message.starts_with("Ollama response contained no text")
+        ) {
+            return AppError::Summarize(
+                "remote Ollama returned an empty response; details omitted".into(),
+            );
+        }
+    }
+
+    match error {
+        AppError::Auth(_) => AppError::Auth(
+            "cloud provider authentication failed after protected dispatch; details omitted".into(),
+        ),
+        AppError::Unavailable(_) => AppError::Unavailable(
+            "cloud provider was unavailable after protected dispatch; details omitted".into(),
+        ),
+        AppError::Summarize(_) => AppError::Summarize(
+            "cloud provider response failed after protected dispatch; details omitted".into(),
+        ),
+        _ => AppError::Summarize(
+            "cloud provider dispatch failed after protected dispatch; details omitted".into(),
+        ),
+    }
+}
+
+/// Count only placeholders that are present in the exact rendered prompt streams. Fields retained
+/// on `SummarizeRequest` but not rendered today (for example `related_context`) and filtered vault
+/// titles therefore cannot inflate the privacy receipt.
+fn count_rendered_redactions(
+    map: &HashMap<String, String>,
+    name_pairs: &[(String, String)],
+    system: &str,
+    user: &str,
+) -> RedactionCounts {
+    let mut rendered_map = HashMap::new();
+    for (token, original) in map {
+        if system.contains(token) || user.contains(token) {
+            rendered_map.insert(token.clone(), original.clone());
+        }
+    }
+    let rendered_names = name_pairs
+        .iter()
+        .filter(|(token, _)| system.contains(token) || user.contains(token))
+        .count();
+    count_redactions(&rendered_map, rendered_names)
+}
+
+/// Provider decorator: redacts PII from inputs, restores it in outputs, and records one
+/// content-free egress audit entry per provider dispatch, including failed summary responses.
 ///
 /// Two layers, both restored in the reply: the always-on regex scrubbers (emails/cards/phones,
 /// via [`redact`]/[`restore`]) and the [`NameRedactor`] seam. The name layer defaults to
@@ -535,8 +742,9 @@ fn count_redactions(map: &HashMap<String, String>, name_count: usize) -> Redacti
 /// installed via [`with_name_redactor`](RedactingProvider::with_name_redactor).
 ///
 /// The egress audit sink defaults to [`NoopEgressSink`] in `new`/`with_name_redactor`, preserving
-/// byte-identical behaviour for all existing callers and tests. `with_name_redactor_and_sink` is
-/// the full constructor used by `make_provider` to wire the live `DbEgressSink`.
+/// byte-identical behaviour for callers that expose a registered provider identity.
+/// `with_name_redactor_and_sink` is the full constructor used by `make_provider` to wire the live
+/// `DbEgressSink`; unknown or mismatched identities fail closed before dispatch.
 pub struct RedactingProvider {
     inner: Arc<dyn SummarizerProvider>,
     names: Arc<dyn NameRedactor>,
@@ -555,9 +763,23 @@ pub struct RedactingProvider {
 }
 
 impl RedactingProvider {
+    /// Validate both the configured audit identity and the inner provider identity before any
+    /// content preparation, egress lease, or provider dispatch. This closes two fail-open shapes:
+    /// an unknown provider inheriting split-prompt accounting, and a configured id that does not
+    /// describe the inner provider whose bytes actually leave the device.
+    fn validated_egress_class(&self) -> Result<ProviderEgressClass> {
+        let class = provider_egress_class(&self.provider_id)?;
+        if self.provider_id != self.inner.id() {
+            return Err(AppError::InvalidArg(
+                "redaction wrapper provider identity mismatch; dispatch refused".into(),
+            ));
+        }
+        Ok(class)
+    }
+
     /// Wrap `inner` with the regex firewall and the DEFAULT (no-op) name redactor and NO-OP sink.
-    /// Name egress and audit logging are unchanged — this is the back-compat constructor; all
-    /// existing callers and tests are unaffected.
+    /// Name egress and audit logging are unchanged. Content calls still require the inner to expose
+    /// one of the registered cloud-provider ids so prompt accounting cannot fail open.
     pub fn new(inner: Arc<dyn SummarizerProvider>) -> Self {
         Self {
             provider_id: inner.id().to_string(),
@@ -573,7 +795,7 @@ impl RedactingProvider {
 
     /// Wrap `inner` with the regex firewall and an EXPLICIT name redactor (Phase 3b drop-in /
     /// tests). The name layer scrubs before egress and restores in the reply, alongside the regex
-    /// layer. Sink defaults to no-op — back-compat for all existing call sites.
+    /// layer. Sink defaults to no-op for registered-provider call sites.
     pub fn with_name_redactor(
         inner: Arc<dyn SummarizerProvider>,
         names: Arc<dyn NameRedactor>,
@@ -593,10 +815,12 @@ impl RedactingProvider {
     /// Full constructor used by `make_provider`: regex firewall + name redactor + egress sink.
     ///
     /// - `sink` receives one content-free [`EgressEntry`] per call (counts + meta, NO content).
+    /// - `provider_id` must be a registered cloud provider and match `inner.id()`; every content
+    ///   operation checks this before dispatch.
     /// - `provider_id` / `destination` / `model_requested` are forwarded into every entry.
     ///
-    /// Existing tests and callers that use `new`/`with_name_redactor` are byte-identical —
-    /// only `make_provider` wires the live `DbEgressSink` through this path.
+    /// Existing registered-provider callers that use `new`/`with_name_redactor` remain
+    /// byte-identical; only `make_provider` wires the live `DbEgressSink` through this path.
     pub fn with_name_redactor_and_sink(
         inner: Arc<dyn SummarizerProvider>,
         names: Arc<dyn NameRedactor>,
@@ -689,11 +913,10 @@ impl SummarizerProvider for RedactingProvider {
     ///
     /// FIREWALL CONTRACT — every `SummarizeRequest` field that EGRESSES to the inner (cloud)
     /// provider is scrubbed here before the `req.clone()` is forwarded. The classification:
-    /// - `transcript`, `related_context`, `user_notes`, `live_bullets` — full firewall: regex
-    ///   (email/card/phone) via the shared map + the NER name layer, tokens restored in the reply.
-    /// - `template` (rides the SYSTEM prompt) and `meta.title_hint` (rides `render_user_content`) —
-    ///   regex layer via the shared map, tokens restored in the reply (defense-in-depth; low-risk
-    ///   instruction/label strings).
+    /// - `transcript`, `related_context`, `user_notes`, `live_bullets`, `glossary`, `template`,
+    ///   and `meta.title_hint` — full firewall: one shared regex map followed by ONE coherent NER
+    ///   batch for the entire call, so per-call `NAME_n` numbering cannot collide across fields.
+    ///   Both token layers are restored in the reply.
     /// - `vault_titles` (the `[[wikilink]]` target list embedded in `render_user_content`, incl.
     ///   auto-created `[[Person Name]].md` pages) — FILTERED: any title the firewall would alter
     ///   is DROPPED before egress (design B — see the inline rationale below). With NO NER model
@@ -704,41 +927,29 @@ impl SummarizerProvider for RedactingProvider {
     ///   as a PHONE and garble the note). Any NEW string field MUST be classified here and is
     ///   caught by `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
     async fn summarize_with_meta(&self, req: &SummarizeRequest) -> Result<(String, CallMeta)> {
-        // Shared regex map across the transcript AND the Phase-4 `related_context` so a value
-        // redacted in either restores consistently in the reply. With `related_context = None`
-        // (the default + flag-OFF case) the map is built from the transcript alone, exactly as the
-        // old `redact(&req.transcript)` did — egress stays byte-identical.
+        let egress_class = self.validated_egress_class()?;
+
+        // One regex map for every PII-bearing field in the request, followed below by one global
+        // name-redactor batch. A repeated value therefore receives one stable token everywhere.
         let mut map = HashMap::new();
         let mut rev = HashMap::new();
         let red_transcript = redact_into(&req.transcript, &mut map, &mut rev);
-        // The related-context corpus EGRESSES to the provider in the prompt — scrub it through the
-        // SAME firewall as the transcript so emails/cards/phones never leave un-redacted.
         let red_related = req
             .related_context
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
-        // ENHANCE-MY-NOTES: the typed notes ride the prompt in enhance mode — scrub them
-        // through the SAME shared map as the transcript so a value redacted anywhere
-        // restores consistently in the reply.
         let red_notes = req
             .user_notes
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
-        // Brain v2 L4: the running live bullets ride the prompt as the "Live notes (auto)"
-        // section — scrub them through the SAME shared map as the transcript they were derived
-        // from, so a value redacted anywhere restores consistently in the reply.
         let red_bullets = req
             .live_bullets
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
-        // DEFENSE-IN-DEPTH — the note-format `template` rides the prompt as the SYSTEM message
-        // (anthropic/gateway/claude_code providers) and `meta.title_hint` rides
-        // `render_user_content`; both previously egressed VERBATIM inside `req.clone()`. Scrub them
-        // through the SAME shared regex map so any email/card/phone is tokenized before egress and
-        // restored in the reply. (Regex layer only, per the firewall's honest-scope note — these are
-        // low-risk instruction/label strings, not meeting-body text.) The production case (a clean
-        // built-in template, `title_hint = None`) is byte-identical: `redact_into` leaves PII-free
-        // text untouched and adds no map entry.
+        let red_glossary = req
+            .glossary
+            .as_ref()
+            .map(|c| redact_into(c, &mut map, &mut rev));
         let red_template = redact_into(&req.template, &mut map, &mut rev);
         let red_title_hint = req
             .meta
@@ -760,47 +971,64 @@ impl SummarizerProvider for RedactingProvider {
         //     `restore_names` could then resolve a wikilink to the WRONG person's page. Filtering
         //     sidesteps that entirely and gives a hard guarantee: no title the firewall flags reaches
         //     the provider.
-        // The predicate uses standalone `redact` + the active name layer purely as DETECTORS (their
-        // scrubbed output is discarded — no title tokens enter the shared restore map). A clean vault
-        // (no PII in any title) is byte-identical: every title survives the filter unchanged.
+        // Regex-detectable PII titles are filtered before the shared NER batch. The remaining titles
+        // join that ONE batch as detectors; any title whose output changes is dropped.
         //
         // P0.1 (Brain v2) — the NO-NER fallback: when the active name layer is the no-op (no NER
         // model on this install), the NER detector below flags NOTHING, so an auto-created
         // `[[Anna Kowalska]].md` person page would egress verbatim. The conservative SYNTACTIC
         // detector `title_looks_like_person_name` covers that gap — active ONLY under the no-op, so
         // model-present installs keep the unchanged NER behavior.
-        let titles = req.vault_titles.clone();
-        let (red_transcript, red_related, red_notes, red_bullets, name_pairs, red_titles) = self
+        let titles: Vec<String> = req
+            .vault_titles
+            .iter()
+            .filter(|title| redact(title.as_str()).0 == title.as_str())
+            .cloned()
+            .collect();
+        let (
+            red_transcript,
+            red_related,
+            red_notes,
+            red_bullets,
+            red_glossary,
+            red_template,
+            red_title_hint,
+            name_pairs,
+            red_titles,
+        ) = self
             .run_name_redactor(move |names| {
-                let (red_transcript, mut name_pairs) = names.redact_names(&red_transcript);
-                let red_related = red_related.map(|c| {
-                    let (c2, more) = names.redact_names(&c);
-                    name_pairs.extend(more);
-                    c2
-                });
-                let red_notes = red_notes.map(|c| {
-                    let (c2, more) = names.redact_names(&c);
-                    name_pairs.extend(more);
-                    c2
-                });
-                let red_bullets = red_bullets.map(|c| {
-                    let (c2, more) = names.redact_names(&c);
-                    name_pairs.extend(more);
-                    c2
-                });
+                let mut fields = vec![
+                    Some(red_transcript),
+                    red_related,
+                    red_notes,
+                    red_bullets,
+                    red_glossary,
+                    Some(red_template),
+                    red_title_hint,
+                ];
+                fields.extend(titles.iter().cloned().map(Some));
+                let (fields, name_pairs) = redact_names_batch(names, fields)?;
+                let mut fields = fields.into_iter();
+                let red_transcript = fields.next().flatten().unwrap_or_default();
+                let red_related = fields.next().flatten();
+                let red_notes = fields.next().flatten();
+                let red_bullets = fields.next().flatten();
+                let red_glossary = fields.next().flatten();
+                let red_template = fields.next().flatten().unwrap_or_default();
+                let red_title_hint = fields.next().flatten();
                 let noop_ner = names.is_noop();
                 let red_titles = titles
                     .into_iter()
-                    .filter(|title| {
-                        let (regex_scrubbed, _) = redact(title);
-                        if regex_scrubbed.as_str() != title {
-                            return false;
+                    .zip(fields)
+                    .filter_map(|(original, redacted)| {
+                        let redacted = redacted.unwrap_or_default();
+                        if (noop_ner && title_looks_like_person_name(&original))
+                            || redacted != original
+                        {
+                            None
+                        } else {
+                            Some(original)
                         }
-                        if noop_ner && title_looks_like_person_name(title) {
-                            return false;
-                        }
-                        let (name_scrubbed, name_hits) = names.redact_names(title);
-                        name_scrubbed.as_str() == title && name_hits.is_empty()
                     })
                     .collect();
                 Ok((
@@ -808,25 +1036,27 @@ impl SummarizerProvider for RedactingProvider {
                     red_related,
                     red_notes,
                     red_bullets,
+                    red_glossary,
+                    red_template,
+                    red_title_hint,
                     name_pairs,
                     red_titles,
                 ))
             })
             .await?;
 
-        // Byte sizes of the REDACTED content (sizes, never the text itself).
-        let user_bytes = red_transcript.len()
-            + red_related.as_ref().map(|c| c.len()).unwrap_or(0)
-            + red_notes.as_ref().map(|c| c.len()).unwrap_or(0)
-            + red_bullets.as_ref().map(|c| c.len()).unwrap_or(0);
         let mut r = req.clone();
         r.transcript = red_transcript;
         r.related_context = red_related;
         r.user_notes = red_notes;
         r.live_bullets = red_bullets;
+        r.glossary = red_glossary;
         r.template = red_template;
         r.meta.title_hint = red_title_hint;
         r.vault_titles = red_titles;
+        let (rendered_system, rendered_user) = rendered_summarize_egress(egress_class, &r);
+        let system_bytes = rendered_system.len();
+        let user_bytes = rendered_user.len();
         if self.recording_token.is_none()
             && self.ner_heavy.is_some()
             && !self.names.is_noop()
@@ -842,12 +1072,35 @@ impl SummarizerProvider for RedactingProvider {
         // wins and no network call starts.
         let _egress_lease =
             crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
-        let (out, meta) = self.inner.summarize_with_meta(&r).await?;
+        // Count only tokens present in the exact rendered bytes handed to the provider. Compute
+        // this BEFORE dispatch so a failed HTTP response, malformed body, or empty provider reply
+        // still leaves one truthful, content-free receipt for the bytes that were attempted.
+        let redactions =
+            count_rendered_redactions(&map, &name_pairs, &rendered_system, &rendered_user);
+        let (out, meta) = match self.inner.summarize_with_meta(&r).await {
+            Ok(result) => result,
+            Err(error) => {
+                // The error text may contain a remote response body (or even reflected content), so
+                // never put it in the ledger OR propagate it to an outer caller that may log it.
+                // The static call kind is the audit outcome; the returned error preserves only a
+                // typed, content-free category.
+                self.sink.record(EgressEntry {
+                    provider_id: self.provider_id.clone(),
+                    destination: self.destination.clone(),
+                    model_requested: self.model_requested.clone(),
+                    call_kind: "summarize_error",
+                    meta: CallMeta::default(),
+                    redactions: redactions.clone(),
+                    system_bytes,
+                    user_bytes,
+                    meeting_id: None,
+                });
+                return Err(content_free_dispatch_error(&self.provider_id, &error));
+            }
+        };
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
         let out = restore(&out, &map);
-        // Count PII placeholders by prefix in the redaction map + name pairs length.
-        let redactions = count_redactions(&map, name_pairs.len());
         self.sink.record(EgressEntry {
             provider_id: self.provider_id.clone(),
             destination: self.destination.clone(),
@@ -855,7 +1108,7 @@ impl SummarizerProvider for RedactingProvider {
             call_kind: "summarize",
             meta: meta.clone(),
             redactions: redactions.clone(),
-            system_bytes: 0, // summarize has no separate system prompt
+            system_bytes,
             user_bytes,
             meeting_id: None,
         });
@@ -870,22 +1123,22 @@ impl SummarizerProvider for RedactingProvider {
 
     /// Redact inputs, call inner provider (capturing `CallMeta`), restore outputs, record egress.
     async fn complete_with_meta(&self, system: &str, user: &str) -> Result<(String, CallMeta)> {
+        let egress_class = self.validated_egress_class()?;
+
         // Shared map so a value redacted in either prompt restores consistently.
         let mut map = HashMap::new();
         let mut rev = HashMap::new();
         let rsys = redact_into(system, &mut map, &mut rev);
         let ruser = redact_into(user, &mut map, &mut rev);
-        // Byte sizes of the REDACTED content (sizes, never the text itself).
-        let system_bytes = rsys.len();
-        let user_bytes = ruser.len();
-        // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
-        // the same name to the same token across both prompts, so the merged pairs restore cleanly.
+        // One coherent NER batch across both channels prevents NAME_n collisions when the same
+        // implementation restarts numbering per call.
         let noop_ner = self.names.is_noop();
         let (rsys, ruser, name_pairs) = self
             .run_name_redactor(move |names| {
-                let (rsys, mut name_pairs) = names.redact_names(&rsys);
-                let (ruser, more) = names.redact_names(&ruser);
-                name_pairs.extend(more);
+                let (mut fields, name_pairs) =
+                    redact_names_batch(names, vec![Some(rsys), Some(ruser)])?;
+                let rsys = fields.remove(0).unwrap_or_default();
+                let ruser = fields.remove(0).unwrap_or_default();
                 Ok((rsys, ruser, name_pairs))
             })
             .await?;
@@ -901,6 +1154,13 @@ impl SummarizerProvider for RedactingProvider {
         } else {
             (rsys, ruser)
         };
+        // Measure the exact final provider fields, after both NER and the no-NER title fallback.
+        // Remote Ollama sends these as separate `system` and `prompt` JSON values; only its
+        // summarize surface uses one combined prompt.
+        let (rendered_system, rendered_user) =
+            rendered_complete_egress(egress_class, &rsys, &ruser);
+        let system_bytes = rendered_system.len();
+        let user_bytes = rendered_user.len();
         if self.recording_token.is_none()
             && self.ner_heavy.is_some()
             && !noop_ner
@@ -912,13 +1172,31 @@ impl SummarizerProvider for RedactingProvider {
         }
         // NER/model work is complete. Never hold a local-model lease across the cloud await; hold
         // only the affine egress lease across the actual provider future.
+        // Compute this before dispatch: even a provider failure must leave one content-free receipt
+        // bound to the exact scrubbed bytes that were attempted.
+        let redactions =
+            count_rendered_redactions(&map, &name_pairs, rendered_system, rendered_user);
         let _egress_lease =
             crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
-        let (out, meta) = self.inner.complete_with_meta(&rsys, &ruser).await?;
+        let (out, meta) = match self.inner.complete_with_meta(&rsys, &ruser).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.sink.record(EgressEntry {
+                    provider_id: self.provider_id.clone(),
+                    destination: self.destination.clone(),
+                    model_requested: self.model_requested.clone(),
+                    call_kind: "complete_error",
+                    meta: CallMeta::default(),
+                    redactions: redactions.clone(),
+                    system_bytes,
+                    user_bytes,
+                    meeting_id: None,
+                });
+                return Err(content_free_dispatch_error(&self.provider_id, &error));
+            }
+        };
         let out = restore_names(&out, &name_pairs);
         let out = restore(&out, &map);
-        // Count PII placeholders by prefix in the redaction map + name pairs length.
-        let redactions = count_redactions(&map, name_pairs.len());
         self.sink.record(EgressEntry {
             provider_id: self.provider_id.clone(),
             destination: self.destination.clone(),
@@ -949,22 +1227,21 @@ impl SummarizerProvider for RedactingProvider {
         user: &str,
         schema: &Value,
     ) -> Result<(Value, CallMeta)> {
+        let egress_class = self.validated_egress_class()?;
+
         // Shared map so a value redacted in either prompt restores consistently in the reply.
         let mut map = HashMap::new();
         let mut rev = HashMap::new();
         let rsys = redact_into(system, &mut map, &mut rev);
         let ruser = redact_into(user, &mut map, &mut rev);
-        // Byte sizes of the REDACTED content (sizes, never the text itself).
-        let system_bytes = rsys.len();
-        let user_bytes = ruser.len();
-        // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
-        // the same name to the same token across both prompts, so the merged pairs restore cleanly.
+        // One coherent NER batch across both channels, identical to `complete_with_meta`.
         let noop_ner = self.names.is_noop();
         let (rsys, ruser, name_pairs) = self
             .run_name_redactor(move |names| {
-                let (rsys, mut name_pairs) = names.redact_names(&rsys);
-                let (ruser, more) = names.redact_names(&ruser);
-                name_pairs.extend(more);
+                let (mut fields, name_pairs) =
+                    redact_names_batch(names, vec![Some(rsys), Some(ruser)])?;
+                let rsys = fields.remove(0).unwrap_or_default();
+                let ruser = fields.remove(0).unwrap_or_default();
                 Ok((rsys, ruser, name_pairs))
             })
             .await?;
@@ -978,6 +1255,17 @@ impl SummarizerProvider for RedactingProvider {
         } else {
             (rsys, ruser)
         };
+        // Gateway sends `system` as-is and carries the schema in response_format. Every provider
+        // on the trait default appends the schema instruction to the actual system prompt.
+        let rendered_system = if self.inner.supports_native_json() {
+            rsys.clone()
+        } else {
+            crate::summarize::provider::default_json_system_prompt(&rsys, schema)
+        };
+        let (rendered_system, rendered_user) =
+            rendered_complete_egress(egress_class, &rendered_system, &ruser);
+        let system_bytes = rendered_system.len();
+        let user_bytes = rendered_user.len();
         if self.recording_token.is_none()
             && self.ner_heavy.is_some()
             && !noop_ner
@@ -989,12 +1277,32 @@ impl SummarizerProvider for RedactingProvider {
         }
         // Forward to the INNER's own complete_json_with_meta — dispatches to the gateway's native
         // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
+        // Count before dispatch so the error receipt remains exact even when no response meta exists.
+        let redactions =
+            count_rendered_redactions(&map, &name_pairs, rendered_system, rendered_user);
         let _egress_lease =
             crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
-        let (value, meta) = self
+        let (value, meta) = match self
             .inner
             .complete_json_with_meta(&rsys, &ruser, schema)
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.sink.record(EgressEntry {
+                    provider_id: self.provider_id.clone(),
+                    destination: self.destination.clone(),
+                    model_requested: self.model_requested.clone(),
+                    call_kind: "complete_json_error",
+                    meta: CallMeta::default(),
+                    redactions: redactions.clone(),
+                    system_bytes,
+                    user_bytes,
+                    meeting_id: None,
+                });
+                return Err(content_free_dispatch_error(&self.provider_id, &error));
+            }
+        };
         // Restore PII in the returned Value via a JSON string round-trip. The ⟪TOKEN⟫ placeholders
         // are embedded verbatim in the JSON string values, so serialization preserves them and
         // the regex replacements find them correctly.
@@ -1011,7 +1319,6 @@ impl SummarizerProvider for RedactingProvider {
         })?;
         // Record a content-free audit entry with the REAL meta so timeline/graph calls
         // show actual token usage in the egress ledger (not the former CallMeta::default()).
-        let redactions = count_redactions(&map, name_pairs.len());
         self.sink.record(EgressEntry {
             provider_id: self.provider_id.clone(),
             destination: self.destination.clone(),
@@ -1078,6 +1385,30 @@ mod tests {
         }
     }
 
+    /// Mimics the real redactor's per-invocation numbering: the first name in EACH call is
+    /// `NAME_1`. Separate field calls would therefore collide; one batch yields NAME_1 + NAME_2.
+    struct ResettingNumberNameRedactor(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl NameRedactor for ResettingNumberNameRedactor {
+        fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
+            use std::sync::atomic::Ordering;
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut hits: Vec<(usize, &str)> = ["Anna Kowalska", "Bob Smith"]
+                .into_iter()
+                .filter_map(|name| text.find(name).map(|offset| (offset, name)))
+                .collect();
+            hits.sort_by_key(|(offset, _)| *offset);
+            let mut out = text.to_string();
+            let mut pairs = Vec::new();
+            for (idx, (_, name)) in hits.into_iter().enumerate() {
+                let token = format!("\u{27ea}NAME_{}\u{27eb}", idx + 1);
+                out = out.replace(name, &token);
+                pairs.push((token, name.to_string()));
+            }
+            (out, pairs)
+        }
+    }
+
     /// Inner provider that ECHOES the text it received, so a test can assert (a) the scrubbed text
     /// is what actually reached the provider and (b) the reply is de-tokenized on the way back.
     struct EchoProvider;
@@ -1085,7 +1416,7 @@ mod tests {
     #[async_trait]
     impl SummarizerProvider for EchoProvider {
         fn id(&self) -> &str {
-            "echo"
+            crate::summarize::PROVIDER_ANTHROPIC
         }
         async fn availability(&self) -> Availability {
             Availability::Available
@@ -1095,6 +1426,32 @@ mod tests {
         }
         async fn complete(&self, system: &str, user: &str) -> Result<String> {
             Ok(format!("{system}\n---\n{user}"))
+        }
+    }
+
+    struct DispatchCounterProvider {
+        provider_id: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SummarizerProvider for DispatchCounterProvider {
+        fn id(&self) -> &str {
+            self.provider_id
+        }
+
+        async fn availability(&self) -> Availability {
+            Availability::Available
+        }
+
+        async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(String::new())
+        }
+
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(String::new())
         }
     }
 
@@ -1122,6 +1479,56 @@ mod tests {
         ModelLifecycleTestGuard { _serial: serial }
     }
 
+    static PROXY_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Temporarily route reqwest's system HTTP proxy to a controlled loopback listener.
+    ///
+    /// The production factory must receive a genuinely remote-classified URL, while the regression
+    /// must never use external DNS/network. Environment mutation is serialized and restored on
+    /// every exit path, including panic unwinding.
+    struct ScopedProxyEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ScopedProxyEnv {
+        fn install(proxy_url: &str) -> Self {
+            const KEYS: [&str; 6] = [
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let lock = PROXY_ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
+            for key in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+                std::env::set_var(key, proxy_url);
+            }
+            for key in ["NO_PROXY", "no_proxy"] {
+                std::env::remove_var(key);
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for ScopedProxyEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     fn sample_req(transcript: &str) -> SummarizeRequest {
         use crate::summarize::provider::MeetingMeta;
         SummarizeRequest {
@@ -1137,7 +1544,110 @@ mod tests {
             related_context: None,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         }
+    }
+
+    #[test]
+    fn unknown_provider_class_refuses_before_dispatch() {
+        let _lifecycle = model_lifecycle_test_guard();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RedactingProvider::with_name_redactor_and_sink(
+            Arc::new(DispatchCounterProvider {
+                provider_id: "future-cloud-provider",
+                calls: calls.clone(),
+            }),
+            Arc::new(NoopNameRedactor),
+            Arc::new(CaptureEgressSink(entries.clone())),
+            "future-cloud-provider".to_string(),
+            "future.example".to_string(),
+            "future-model".to_string(),
+        );
+
+        let error =
+            block_on(provider.summarize_with_meta(&sample_req("must-not-dispatch@corp.example")))
+                .expect_err("an unclassified provider must fail closed");
+        assert!(matches!(error, AppError::InvalidArg(_)), "{error:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unknown provider must be rejected before inner dispatch"
+        );
+        assert!(
+            entries.lock().unwrap().is_empty(),
+            "a refused pre-dispatch call is not an egress event"
+        );
+    }
+
+    #[test]
+    fn configured_and_inner_provider_id_mismatch_refuses_before_dispatch() {
+        let _lifecycle = model_lifecycle_test_guard();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RedactingProvider::with_name_redactor_and_sink(
+            Arc::new(DispatchCounterProvider {
+                provider_id: crate::summarize::PROVIDER_ANTHROPIC,
+                calls: calls.clone(),
+            }),
+            Arc::new(NoopNameRedactor),
+            Arc::new(CaptureEgressSink(entries.clone())),
+            crate::summarize::PROVIDER_OLLAMA.to_string(),
+            "remote-ollama.example".to_string(),
+            "remote-model".to_string(),
+        );
+
+        let error =
+            block_on(provider.summarize_with_meta(&sample_req("must-not-dispatch@corp.example")))
+                .expect_err("a configured/inner provider mismatch must fail closed");
+        assert!(matches!(error, AppError::InvalidArg(_)), "{error:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider identity mismatch must be rejected before inner dispatch"
+        );
+        assert!(
+            entries.lock().unwrap().is_empty(),
+            "a refused pre-dispatch call is not an egress event"
+        );
+    }
+
+    #[test]
+    fn remote_glossary_provider_requires_factory_consent_before_dispatch() {
+        let _lifecycle = model_lifecycle_test_guard();
+        let config = crate::settings::AppConfig {
+            ollama_base_url: "https://remote-ollama.example".to_string(),
+            cloud_egress_consented: false,
+            ..crate::settings::AppConfig::default()
+        };
+        let mut request = sample_req("consent-gate-prompt@corp.example");
+        request.glossary =
+            Some("- {\"canonical\":\"Murmur\",\"aliases\":[\"MeetNotes\"]}\n".to_string());
+
+        let error = crate::summarize::make_provider(
+            crate::summarize::PROVIDER_OLLAMA,
+            &config,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .map(|_| ())
+        .expect_err("remote Ollama must not even be constructed without cloud consent");
+        assert!(matches!(error, AppError::Unavailable(_)), "{error:?}");
+        assert!(
+            error.to_string().contains(crate::errcode::CLOUD_CONSENT),
+            "the factory must fail at the explicit consent seam: {error}"
+        );
+        assert!(
+            request
+                .glossary
+                .as_deref()
+                .unwrap()
+                .contains("\"canonical\":\"Murmur\""),
+            "the fixture proves a real glossary-bearing request was pending when construction failed"
+        );
     }
 
     #[test]
@@ -1160,7 +1670,7 @@ mod tests {
         #[async_trait]
         impl SummarizerProvider for CaptureProvider {
             fn id(&self) -> &str {
-                "capture"
+                crate::summarize::PROVIDER_ANTHROPIC
             }
             async fn availability(&self) -> Availability {
                 Availability::Available
@@ -1208,7 +1718,7 @@ mod tests {
         #[async_trait]
         impl SummarizerProvider for CaptureProvider {
             fn id(&self) -> &str {
-                "capture"
+                crate::summarize::PROVIDER_ANTHROPIC
             }
             async fn availability(&self) -> Availability {
                 Availability::Available
@@ -1235,6 +1745,65 @@ mod tests {
         assert!(sent.contains("\u{27ea}NAME_1\u{27eb}"));
         // ...but the caller still gets the real names back.
         assert!(out.contains("Anna Kowalska") && out.contains("Bob Smith"));
+    }
+
+    #[test]
+    fn summarize_redacts_all_fields_in_one_collision_free_name_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _lifecycle = model_lifecycle_test_guard();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(std::sync::Mutex::new(None));
+
+        struct CaptureGlossaryEcho(Arc<std::sync::Mutex<Option<SummarizeRequest>>>);
+        #[async_trait]
+        impl SummarizerProvider for CaptureGlossaryEcho {
+            fn id(&self) -> &str {
+                "anthropic"
+            }
+            async fn availability(&self) -> Availability {
+                Availability::Available
+            }
+            async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+                *self.0.lock().unwrap() = Some(req.clone());
+                Ok(format!(
+                    "{}\n{}",
+                    req.transcript,
+                    req.glossary.as_deref().unwrap_or("")
+                ))
+            }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let provider = RedactingProvider::with_name_redactor(
+            Arc::new(CaptureGlossaryEcho(captured.clone())),
+            Arc::new(ResettingNumberNameRedactor(calls.clone())),
+        );
+        let mut req = sample_req("Anna Kowalska owns the rollout.");
+        req.glossary = Some("- canonical: Bob Smith\n".to_string());
+        let restored = block_on(provider.summarize(&req)).unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "all request fields must share one NER invocation"
+        );
+        let sent = captured.lock().unwrap().clone().unwrap();
+        assert!(sent.transcript.contains("\u{27ea}NAME_1\u{27eb}"));
+        assert!(
+            sent.glossary
+                .as_deref()
+                .unwrap()
+                .contains("\u{27ea}NAME_2\u{27eb}"),
+            "a second field must not restart at NAME_1"
+        );
+        assert!(!sent.transcript.contains("Anna Kowalska"));
+        assert!(!sent.glossary.unwrap().contains("Bob Smith"));
+        assert!(restored.contains("Anna Kowalska"));
+        assert!(restored.contains("Bob Smith"));
+        assert!(!restored.contains("NAME_"));
     }
 
     /// TIER 0 PII (lock-security): a real NAME that occupies a `(speaker)` tag rides `req.transcript`
@@ -1277,7 +1846,7 @@ mod tests {
         #[async_trait]
         impl SummarizerProvider for CaptureProvider {
             fn id(&self) -> &str {
-                "capture"
+                crate::summarize::PROVIDER_ANTHROPIC
             }
             async fn availability(&self) -> Availability {
                 Availability::Available
@@ -1363,7 +1932,7 @@ mod tests {
             #[async_trait]
             impl SummarizerProvider for CaptureProvider {
                 fn id(&self) -> &str {
-                    "capture"
+                    crate::summarize::PROVIDER_ANTHROPIC
                 }
                 async fn availability(&self) -> Availability {
                     Availability::Available
@@ -1413,7 +1982,7 @@ mod tests {
             Arc::new(EchoProvider),
             Arc::new(FixtureNameRedactor),
             Arc::new(NoopEgressSink),
-            "echo".into(),
+            crate::summarize::PROVIDER_ANTHROPIC.into(),
             "test".into(),
             "m".into(),
             heavy.clone(),
@@ -1436,7 +2005,7 @@ mod tests {
             Arc::new(EchoProvider),
             Arc::new(FixtureNameRedactor),
             Arc::new(NoopEgressSink),
-            "echo".into(),
+            crate::summarize::PROVIDER_ANTHROPIC.into(),
             "test".into(),
             "m".into(),
             heavy,
@@ -1469,7 +2038,7 @@ mod tests {
     #[async_trait]
     impl SummarizerProvider for EchoMetaProvider {
         fn id(&self) -> &str {
-            "echo-meta"
+            crate::summarize::PROVIDER_ANTHROPIC
         }
         async fn availability(&self) -> Availability {
             Availability::Available
@@ -1577,6 +2146,774 @@ mod tests {
         );
     }
 
+    /// A provider can fail only after it accepted the scrubbed prompt bytes. Both completion
+    /// surfaces must therefore write exactly one error receipt before returning a content-free
+    /// diagnostic; success-only ledger writes would silently lose evidence of real egress.
+    #[test]
+    fn failed_complete_surfaces_record_exact_content_free_receipts() {
+        let _lifecycle = model_lifecycle_test_guard();
+
+        struct FailingCompletionProvider;
+
+        #[async_trait]
+        impl SummarizerProvider for FailingCompletionProvider {
+            fn id(&self) -> &str {
+                crate::summarize::PROVIDER_ANTHROPIC
+            }
+
+            async fn availability(&self) -> Availability {
+                Availability::Available
+            }
+
+            async fn summarize(&self, _req: &SummarizeRequest) -> Result<String> {
+                Ok(String::new())
+            }
+
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Err(AppError::Summarize("provider-response-body-secret".into()))
+            }
+
+            async fn complete_json_with_meta(
+                &self,
+                _system: &str,
+                _user: &str,
+                _schema: &serde_json::Value,
+            ) -> Result<(serde_json::Value, CallMeta)> {
+                Err(AppError::Summarize(
+                    "provider-json-response-body-secret".into(),
+                ))
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RedactingProvider::with_name_redactor_and_sink(
+            Arc::new(FailingCompletionProvider),
+            Arc::new(NoopNameRedactor),
+            Arc::new(CaptureEgressSink(captured.clone())),
+            crate::summarize::PROVIDER_ANTHROPIC.to_string(),
+            "api.anthropic.com".to_string(),
+            "test-model".to_string(),
+        );
+        let system = "System contact system@corp.example.";
+        let user = "Bounded user prompt.";
+        let (redacted_system, redaction_map) = redact(system);
+
+        let complete_error = block_on(provider.complete_with_meta(system, user))
+            .expect_err("the fixture provider must fail after dispatch");
+        let complete_diagnostic = format!("{complete_error:?} / {complete_error}");
+        assert!(
+            !complete_diagnostic.contains("provider-response-body-secret"),
+            "{complete_diagnostic}"
+        );
+        assert!(
+            complete_diagnostic.contains("details omitted"),
+            "{complete_diagnostic}"
+        );
+        {
+            let entries = captured.lock().unwrap();
+            assert_eq!(entries.len(), 1, "one failed complete, one receipt");
+            let entry = &entries[0];
+            assert_eq!(entry.call_kind, "complete_error");
+            assert_eq!(entry.meta, CallMeta::default());
+            assert_eq!(entry.system_bytes, redacted_system.len());
+            assert_eq!(entry.user_bytes, user.len());
+            assert_eq!(entry.redactions, count_redactions(&redaction_map, 0));
+            let debug = format!("{entry:?}");
+            assert!(!debug.contains(system), "{debug}");
+            assert!(!debug.contains("provider-response-body-secret"), "{debug}");
+        }
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}}
+        });
+        let json_error = block_on(provider.complete_json_with_meta(system, user, &schema))
+            .expect_err("the JSON fixture provider must fail after dispatch");
+        let json_diagnostic = format!("{json_error:?} / {json_error}");
+        assert!(
+            !json_diagnostic.contains("provider-json-response-body-secret"),
+            "{json_diagnostic}"
+        );
+        assert!(
+            json_diagnostic.contains("details omitted"),
+            "{json_diagnostic}"
+        );
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 2, "two failed dispatches, two receipts");
+        let entry = &entries[1];
+        assert_eq!(entry.call_kind, "complete_json_error");
+        assert_eq!(entry.meta, CallMeta::default());
+        assert_eq!(
+            entry.system_bytes,
+            crate::summarize::provider::default_json_system_prompt(&redacted_system, &schema).len()
+        );
+        assert_eq!(entry.user_bytes, user.len());
+        assert_eq!(entry.redactions, count_redactions(&redaction_map, 0));
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains(system), "{debug}");
+        assert!(
+            !debug.contains("provider-json-response-body-secret"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn summarize_receipt_measures_exact_rendered_prompts_and_visible_redactions() {
+        let _lifecycle = model_lifecycle_test_guard();
+        let sent = Arc::new(std::sync::Mutex::new(None));
+        let entries = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct CaptureSummaryMeta(Arc<std::sync::Mutex<Option<SummarizeRequest>>>);
+        #[async_trait]
+        impl SummarizerProvider for CaptureSummaryMeta {
+            fn id(&self) -> &str {
+                "anthropic"
+            }
+            async fn availability(&self) -> Availability {
+                Availability::Available
+            }
+            async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+                Ok(req.transcript.clone())
+            }
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn summarize_with_meta(
+                &self,
+                req: &SummarizeRequest,
+            ) -> Result<(String, CallMeta)> {
+                *self.0.lock().unwrap() = Some(req.clone());
+                Ok((req.transcript.clone(), CallMeta::default()))
+            }
+        }
+
+        let provider = RedactingProvider::with_name_redactor_and_sink(
+            Arc::new(CaptureSummaryMeta(sent.clone())),
+            Arc::new(NoopNameRedactor),
+            Arc::new(CaptureEgressSink(entries.clone())),
+            "anthropic".to_string(),
+            "api.anthropic.com".to_string(),
+            "test-model".to_string(),
+        );
+        let mut req = sample_req("Ping transcript@corp.example.");
+        req.template = "System contact system@corp.example.".to_string();
+        req.glossary = Some("- canonical: glossary@corp.example; aliases: Glossary\n".to_string());
+        // Retained on the request but intentionally NOT rendered in the Stage-1 prompt.
+        req.related_context = Some("hidden@corp.example".to_string());
+        // Filtered entirely, so it must neither egress nor inflate the rendered-redaction count.
+        req.vault_titles = vec!["Offer title@corp.example".to_string()];
+
+        let (_, meta) = block_on(provider.summarize_with_meta(&req)).unwrap();
+        let sent = sent.lock().unwrap().clone().unwrap();
+        let expected_system = sent.template.clone();
+        let expected_user = crate::summarize::template::render_user_content(&sent);
+        let entries = entries.lock().unwrap();
+        let entry = entries.first().expect("one summarize receipt");
+
+        assert_eq!(entry.system_bytes, expected_system.len());
+        assert_eq!(entry.user_bytes, expected_user.len());
+        assert!(
+            entry.user_bytes > sent.transcript.len(),
+            "receipt measures the rendered metadata/glossary/transcript prompt, not raw fields"
+        );
+        assert_eq!(
+            entry.redactions.email, 3,
+            "system + transcript + glossary egress; hidden related context and dropped title do not"
+        );
+        assert_eq!(meta.redactions.as_ref(), Some(&entry.redactions));
+        for pii in [
+            "system@corp.example",
+            "transcript@corp.example",
+            "glossary@corp.example",
+            "hidden@corp.example",
+            "title@corp.example",
+        ] {
+            assert!(
+                !format!("{expected_system}\n{expected_user}").contains(pii),
+                "{pii} must not appear in the exact rendered egress"
+            );
+        }
+    }
+
+    /// Remote Ollama is cloud egress but uses one combined `/api/generate` prompt rather than the
+    /// system/user split used by Anthropic, Gateway, and Claude Code. The content-free receipt must
+    /// therefore bind its byte count and scrub count to that exact combined prompt.
+    #[test]
+    fn remote_ollama_receipt_binds_exact_combined_prompt() {
+        let _lifecycle = model_lifecycle_test_guard();
+        let sent = Arc::new(std::sync::Mutex::new(None));
+        let entries = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        struct CaptureRemoteOllama(Arc<std::sync::Mutex<Option<SummarizeRequest>>>);
+        #[async_trait]
+        impl SummarizerProvider for CaptureRemoteOllama {
+            fn id(&self) -> &str {
+                crate::summarize::PROVIDER_OLLAMA
+            }
+
+            async fn availability(&self) -> Availability {
+                Availability::Available
+            }
+
+            async fn summarize(&self, req: &SummarizeRequest) -> Result<String> {
+                Ok(req.transcript.clone())
+            }
+
+            async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+                Ok(String::new())
+            }
+
+            async fn summarize_with_meta(
+                &self,
+                req: &SummarizeRequest,
+            ) -> Result<(String, CallMeta)> {
+                *self.0.lock().unwrap() = Some(req.clone());
+                Ok((req.transcript.clone(), CallMeta::default()))
+            }
+        }
+
+        let provider = RedactingProvider::with_name_redactor_and_sink(
+            Arc::new(CaptureRemoteOllama(sent.clone())),
+            Arc::new(NoopNameRedactor),
+            Arc::new(CaptureEgressSink(entries.clone())),
+            crate::summarize::PROVIDER_OLLAMA.to_string(),
+            "ollama.example".to_string(),
+            "remote-test-model".to_string(),
+        );
+        let mut req = sample_req("Ping transcript@corp.example.");
+        req.template = "System contact system@corp.example.".to_string();
+        req.glossary = Some("- canonical: glossary@corp.example; aliases: Glossary\n".to_string());
+        req.related_context = Some("hidden@corp.example".to_string());
+        req.vault_titles = vec!["Offer title@corp.example".to_string()];
+
+        let (_, meta) = block_on(provider.summarize_with_meta(&req)).unwrap();
+        let sent = sent.lock().unwrap().clone().expect("inner was called");
+        let combined = crate::summarize::template::render_prompt(&sent);
+        let entries = entries.lock().unwrap();
+        let entry = entries.first().expect("one remote Ollama receipt");
+
+        assert_eq!(entries.len(), 1, "one receipt for one remote Ollama call");
+        assert_eq!(entry.provider_id, crate::summarize::PROVIDER_OLLAMA);
+        assert_eq!(entry.destination, "ollama.example");
+        assert_eq!(entry.call_kind, "summarize");
+        assert_eq!(
+            entry.system_bytes, 0,
+            "Ollama has no separate system channel"
+        );
+        assert_eq!(
+            entry.user_bytes,
+            combined.len(),
+            "receipt bytes must equal the exact combined prompt sent by OllamaProvider"
+        );
+        assert!(combined.contains("System contact"));
+        assert!(combined.contains("WORKSPACE GLOSSARY"));
+        assert!(combined.contains("Ping "));
+        assert_eq!(
+            entry.redactions.email, 3,
+            "combined template + transcript + glossary egress; hidden context and dropped title do not"
+        );
+        assert_eq!(meta.redactions.as_ref(), Some(&entry.redactions));
+        for pii in [
+            "system@corp.example",
+            "transcript@corp.example",
+            "glossary@corp.example",
+            "hidden@corp.example",
+            "title@corp.example",
+        ] {
+            assert!(
+                !combined.contains(pii),
+                "{pii} must not appear in the exact combined remote Ollama egress"
+            );
+        }
+    }
+
+    /// RED-before-GREEN through the PRODUCTION egress seam: once the remote Ollama server has
+    /// received the combined prompt, an HTTP failure, malformed body, or empty completion must
+    /// still produce exactly one durable, content-free error receipt. This deliberately uses
+    /// `make_provider` with consent enabled plus the real `DbEgressSink`; constructing the wrapper
+    /// or an in-memory capture sink directly would not prove the production factory wiring.
+    /// Before the fix, the `?` on the inner provider result returned before `sink.record`, leaving
+    /// no evidence that bytes had left the device.
+    #[test]
+    fn remote_ollama_failures_record_one_exact_content_free_error_receipt() {
+        use std::io::{Read, Write};
+
+        let _lifecycle = model_lifecycle_test_guard();
+        let db = Arc::new(
+            crate::storage::Db::open_with_key(
+                std::path::Path::new(":memory:"),
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+        crate::summarize::egress_log::set_egress_sink(Arc::new(
+            crate::summarize::egress_log::DbEgressSink::new(db.clone()),
+        ));
+        let cases: [(&str, &str, &str, &[u8]); 3] = [
+            (
+                "http-status",
+                "503 Service Unavailable",
+                "provider-http-body-secret",
+                br#"{"error":"provider-http-body-secret"}"#,
+            ),
+            (
+                "malformed-body",
+                "200 OK",
+                "provider-malformed-body-secret",
+                b"provider-malformed-body-secret",
+            ),
+            (
+                "empty-completion",
+                "200 OK",
+                "provider-empty-body-secret",
+                br#"{"response":"   ","diagnostic":"provider-empty-body-secret"}"#,
+            ),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (case, status, body_sentinel, response_body) in cases {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let addr = listener.local_addr().unwrap();
+                let status = status.to_string();
+                let response_body = response_body.to_vec();
+                let server = std::thread::spawn(move || {
+                    let started = std::time::Instant::now();
+                    let (mut socket, _) = loop {
+                        match listener.accept() {
+                            Ok(accepted) => break accepted,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && started.elapsed() < std::time::Duration::from_secs(10) =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("controlled Ollama fixture did not connect: {error}"),
+                        }
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let read = socket.read(&mut buf).unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        let Some(header_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_len = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_len {
+                            break;
+                        }
+                    }
+                    write!(
+                        socket,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    )
+                    .unwrap();
+                    socket.write_all(&response_body).unwrap();
+                    String::from_utf8(request).unwrap()
+                });
+
+                // The production target stays genuinely remote-classified. Reqwest reaches it only
+                // through this case's scoped, loopback-only HTTP proxy, so the test uses neither
+                // external DNS nor network and does not need a test-only classification bypass.
+                let model = format!("factory-integration-{case}");
+                let config = crate::settings::AppConfig {
+                    ollama_base_url: "http://ollama.remote.invalid".to_string(),
+                    ollama_model: model.clone(),
+                    cloud_egress_consented: true,
+                    ..crate::settings::AppConfig::default()
+                };
+                assert!(
+                    crate::summarize::egress_is_cloud(crate::summarize::PROVIDER_OLLAMA, &config),
+                    "{case}: fixture URL must traverse the production remote-Ollama branch"
+                );
+                let _proxy =
+                    ScopedProxyEnv::install(&format!("http://127.0.0.1:{}", addr.port()));
+                let provider = crate::summarize::make_provider(
+                    crate::summarize::PROVIDER_OLLAMA,
+                    &config,
+                    &Arc::new(tokio::sync::Semaphore::new(1)),
+                )
+                .unwrap();
+                let prompt_sentinel = format!("{case}-prompt@corp.example");
+                let mut req = sample_req(&format!("Ping {prompt_sentinel}."));
+                req.template = "System contact system@corp.example.".to_string();
+                req.glossary =
+                    Some("- canonical: glossary@corp.example; aliases: Glossary\n".to_string());
+                req.related_context = Some("hidden@corp.example".to_string());
+                req.vault_titles = vec!["Offer title@corp.example".to_string()];
+
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    provider.summarize_with_meta(&req),
+                )
+                .await
+                .expect("the controlled remote-Ollama fixture must respond within 10 seconds")
+                .expect_err("each fixture must fail after the request was accepted");
+                let request = server.join().unwrap();
+                let sent_body = request.split("\r\n\r\n").nth(1).expect("HTTP request body");
+                let sent: serde_json::Value = serde_json::from_str(sent_body).unwrap();
+                let combined = sent
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("Ollama combined prompt");
+
+                let rows = {
+                    let conn = db.lock();
+                    let mut statement = conn
+                        .prepare(
+                            "SELECT provider_id, destination, model_requested, call_kind, model_served,
+                                    prompt_tokens, completion_tokens, total_tokens, cached_tokens,
+                                    redactions_email, redactions_card, redactions_phone, redactions_name,
+                                    system_bytes, user_bytes, meeting_id
+                               FROM egress_log
+                              WHERE model_requested = ?1",
+                        )
+                        .unwrap();
+                    statement
+                        .query_map(rusqlite::params![model], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                                row.get::<_, Option<i64>>(7)?,
+                                row.get::<_, Option<i64>>(8)?,
+                                row.get::<_, i64>(9)?,
+                                row.get::<_, i64>(10)?,
+                                row.get::<_, i64>(11)?,
+                                row.get::<_, i64>(12)?,
+                                row.get::<_, i64>(13)?,
+                                row.get::<_, i64>(14)?,
+                                row.get::<_, Option<String>>(15)?,
+                            ))
+                        })
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap()
+                };
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "{case}: one failed production dispatch must yield exactly one durable receipt"
+                );
+                let entry = &rows[0];
+                assert_eq!(entry.0, crate::summarize::PROVIDER_OLLAMA, "{case}");
+                assert_eq!(entry.2, model, "{case}");
+                assert_eq!(entry.3, "summarize_error", "{case}");
+                assert_eq!(
+                    (&entry.4, entry.5, entry.6, entry.7, entry.8),
+                    (&None, None, None, None, None),
+                    "{case}: a failed response has no provider metadata"
+                );
+                assert_eq!(entry.13, 0, "{case}");
+                assert_eq!(
+                    entry.14,
+                    combined.len() as i64,
+                    "{case}: receipt must measure the exact combined prompt actually sent"
+                );
+                assert_eq!(entry.9, 3, "{case}");
+                assert_eq!((entry.10, entry.11, entry.12), (0, 0, 0), "{case}");
+                assert_eq!(entry.1, "ollama.remote.invalid", "{case}");
+                assert!(entry.15.is_none(), "{case}");
+                let durable_text_fields = format!(
+                    "{} {} {} {} {:?} {:?}",
+                    entry.0, entry.1, entry.2, entry.3, entry.4, entry.15
+                );
+
+                for secret in [
+                    "system@corp.example",
+                    "glossary@corp.example",
+                    "hidden@corp.example",
+                    "title@corp.example",
+                    prompt_sentinel.as_str(),
+                    body_sentinel,
+                ] {
+                    assert!(
+                        !durable_text_fields.contains(secret),
+                        "{case}: durable receipt must stay content-free"
+                    );
+                    assert!(
+                        !combined.contains(secret),
+                        "{case}: exact remote prompt must be redacted"
+                    );
+                }
+                // Outer pipeline/command paths log propagated errors with `%error`. This is the exact
+                // Display boundary they observe: it must retain only a typed/category/status diagnostic,
+                // never the untrusted provider body or any prompt field.
+                let caller_log = format!("summarize failed: {error}");
+                for secret in [prompt_sentinel.as_str(), body_sentinel] {
+                    assert!(
+                        !error.to_string().contains(secret),
+                        "{case}: returned diagnostic must be content-free"
+                    );
+                    assert!(
+                        !format!("{error:?}").contains(secret),
+                        "{case}: Debug diagnostic must be content-free"
+                    );
+                    assert!(
+                        !caller_log.contains(secret),
+                        "{case}: caller logging boundary must be content-free"
+                    );
+                }
+                match case {
+                    "http-status" => assert!(caller_log.contains("HTTP 503"), "{caller_log}"),
+                    "malformed-body" => assert!(caller_log.contains("malformed"), "{caller_log}"),
+                    "empty-completion" => assert!(caller_log.contains("empty"), "{caller_log}"),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    caller_log.contains("details omitted"),
+                    "{case}: diagnostic must make suppression explicit"
+                );
+            }
+        });
+    }
+
+    /// Ollama has two different production renderings at `/api/generate`: summaries use one
+    /// locally combined `prompt`, while raw completions use distinct JSON `system` and `prompt`
+    /// fields. Bind both completion receipt surfaces to the fields observed at the real HTTP
+    /// boundary on success and failure; inventing a combined completion stream would make the
+    /// audit row disagree with the request Murmur actually sent.
+    #[test]
+    fn ollama_completion_receipts_match_exact_generate_fields_on_success_and_failure() {
+        use std::io::{Read, Write};
+
+        #[derive(Clone, Copy)]
+        enum Surface {
+            Complete,
+            CompleteJson,
+        }
+
+        fn start_generate_fixture(
+            status: &str,
+            response_body: &[u8],
+        ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let status = status.to_string();
+            let response_body = response_body.to_vec();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let read = socket.read(&mut buf).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                )
+                .unwrap();
+                socket.write_all(&response_body).unwrap();
+                let body = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|offset| &request[offset + 4..])
+                    .expect("HTTP request body");
+                serde_json::from_slice(body).unwrap()
+            });
+            (format!("http://{addr}"), server)
+        }
+
+        let _lifecycle = model_lifecycle_test_guard();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"]
+        });
+        let cases = [
+            ("complete-success", Surface::Complete, true),
+            ("complete-failure", Surface::Complete, false),
+            ("json-success", Surface::CompleteJson, true),
+            ("json-failure", Surface::CompleteJson, false),
+        ];
+
+        for (label, surface, succeeds) in cases {
+            let response_body: &[u8] = match (surface, succeeds) {
+                (Surface::Complete, true) => br#"{"response":"ok"}"#,
+                (Surface::CompleteJson, true) => br#"{"response":"{\"answer\":\"ok\"}"}"#,
+                (_, false) => br#"{"error":"provider-response-body-secret"}"#,
+            };
+            let status = if succeeds {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            };
+            let (base_url, server) = start_generate_fixture(status, response_body);
+            let entries = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = RedactingProvider::with_name_redactor_and_sink(
+                Arc::new(crate::summarize::ollama::OllamaProvider::new(
+                    base_url,
+                    format!("boundary-{label}"),
+                )),
+                Arc::new(NoopNameRedactor),
+                Arc::new(CaptureEgressSink(entries.clone())),
+                crate::summarize::PROVIDER_OLLAMA.to_string(),
+                "controlled-loopback-fixture".to_string(),
+                format!("boundary-{label}"),
+            );
+            let system = format!("System {label} contact system@corp.example.");
+            let user = format!("User {label} contact user@corp.example.");
+
+            let error = match surface {
+                Surface::Complete => block_on(provider.complete_with_meta(&system, &user)).err(),
+                Surface::CompleteJson => {
+                    block_on(provider.complete_json_with_meta(&system, &user, &schema)).err()
+                }
+            };
+            assert_eq!(
+                error.is_none(),
+                succeeds,
+                "{label}: fixture outcome must match the case"
+            );
+
+            let sent = server.join().unwrap();
+            let sent_system = sent
+                .get("system")
+                .and_then(serde_json::Value::as_str)
+                .expect("completion system field");
+            let sent_prompt = sent
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .expect("completion prompt field");
+            assert_eq!(
+                sent.get("stream"),
+                Some(&serde_json::Value::Bool(false)),
+                "{label}"
+            );
+            assert_eq!(
+                sent.get("keep_alive"),
+                Some(&serde_json::json!(0)),
+                "{label}"
+            );
+            assert!(
+                !sent_system.contains("system@corp.example")
+                    && !sent_prompt.contains("user@corp.example"),
+                "{label}: exact HTTP fields must be redacted"
+            );
+            match surface {
+                Surface::Complete => assert!(
+                    !sent_system.contains("Respond with ONLY"),
+                    "{label}: free-text completion must not gain a JSON instruction"
+                ),
+                Surface::CompleteJson => assert!(
+                    sent_system.contains("Respond with ONLY a single JSON object"),
+                    "{label}: JSON fallback schema instruction belongs in the system field"
+                ),
+            }
+
+            let entries = entries.lock().unwrap();
+            assert_eq!(entries.len(), 1, "{label}: one dispatch, one receipt");
+            let entry = &entries[0];
+            assert_eq!(
+                entry.call_kind,
+                match (surface, succeeds) {
+                    (Surface::Complete, true) => "complete",
+                    (Surface::Complete, false) => "complete_error",
+                    (Surface::CompleteJson, true) => "complete_json",
+                    (Surface::CompleteJson, false) => "complete_json_error",
+                },
+                "{label}"
+            );
+            assert_eq!(
+                entry.system_bytes,
+                sent_system.len(),
+                "{label}: system_bytes must equal the actual JSON system field"
+            );
+            assert_eq!(
+                entry.user_bytes,
+                sent_prompt.len(),
+                "{label}: user_bytes must equal the actual JSON prompt field"
+            );
+            assert_eq!(
+                entry.redactions.email, 2,
+                "{label}: both exact HTTP fields contain one scrubbed email"
+            );
+            assert_eq!(
+                (
+                    entry.redactions.card,
+                    entry.redactions.phone,
+                    entry.redactions.name
+                ),
+                (0, 0, 0),
+                "{label}"
+            );
+            let receipt_debug = format!("{entry:?}");
+            for secret in [
+                "system@corp.example",
+                "user@corp.example",
+                "provider-response-body-secret",
+            ] {
+                assert!(
+                    !receipt_debug.contains(secret),
+                    "{label}: receipt must remain content-free"
+                );
+            }
+            if let Some(error) = error {
+                let diagnostic = format!("{error:?} / {error}");
+                assert!(diagnostic.contains("HTTP 503"), "{label}: {diagnostic}");
+                assert!(
+                    diagnostic.contains("details omitted")
+                        && !diagnostic.contains("provider-response-body-secret"),
+                    "{label}: {diagnostic}"
+                );
+            }
+        }
+    }
+
     /// Tier 4c (v1.1) — RED-before-GREEN: `summarize_with_meta` must SURFACE the firewall's scrub
     /// count to the CALLER via `CallMeta.redactions`, so the per-note privacy receipt reports a
     /// REAL number equal to what actually left the device redacted. RED on the pre-change code
@@ -1655,7 +2992,7 @@ mod tests {
         #[async_trait]
         impl SummarizerProvider for RecordingJsonProvider {
             fn id(&self) -> &str {
-                "recording-json"
+                crate::summarize::PROVIDER_GATEWAY
             }
             async fn availability(&self) -> Availability {
                 Availability::Available
@@ -1791,7 +3128,7 @@ mod tests {
     #[async_trait]
     impl SummarizerProvider for CapturingInner {
         fn id(&self) -> &str {
-            "capture-full"
+            crate::summarize::PROVIDER_ANTHROPIC
         }
         async fn availability(&self) -> Availability {
             Availability::Available
@@ -2116,6 +3453,7 @@ mod tests {
             related_context: Some("s-related@leak.example".to_string()), // SCRUBBED (regex + NER)
             user_notes: Some("s-notes@leak.example".to_string()),        // SCRUBBED (regex + NER)
             live_bullets: Some("s-bullets@leak.example".to_string()),    // SCRUBBED (regex + NER)
+            glossary: Some("- canonical: s-glossary@leak.example; aliases: Alias".to_string()), // SCRUBBED (regex + NER)
         };
         let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
         let provider = RedactingProvider::new(inner.clone());
@@ -2130,6 +3468,7 @@ mod tests {
             "s-related@leak.example",
             "s-notes@leak.example",
             "s-bullets@leak.example",
+            "s-glossary@leak.example",
         ] {
             assert!(
                 !egress.contains(sentinel),

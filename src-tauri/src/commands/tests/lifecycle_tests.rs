@@ -10078,6 +10078,52 @@
         );
     }
 
+    /// Glossary updates are omission-safe across the Rust IPC boundary. This is intentionally an
+    /// `Option<String>` on `AppConfigDto`: an older/partial client that omits `glossary` preserves
+    /// the live value, while an explicit empty string clears and a non-empty value replaces it.
+    #[test]
+    fn glossary_dto_distinguishes_omitted_empty_and_value() {
+        let current = AppConfig {
+            glossary: "Konnect = Connect".to_string(),
+            ..Default::default()
+        };
+
+        let out = config_to_dto(&current);
+        assert_eq!(
+            out.glossary.as_deref(),
+            Some("Konnect = Connect"),
+            "get_config must carry the stored glossary to Settings"
+        );
+
+        let mut old_client_json = serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
+        old_client_json
+            .as_object_mut()
+            .unwrap()
+            .remove("glossary");
+        let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
+        assert_eq!(
+            dto_to_config(omitted, &current).glossary,
+            "Konnect = Connect",
+            "omission must preserve the live value"
+        );
+
+        let mut clear = config_to_dto(&current);
+        clear.glossary = Some(String::new());
+        assert_eq!(
+            dto_to_config(clear, &current).glossary,
+            "",
+            "Some(empty) is an intentional clear"
+        );
+
+        let mut set = config_to_dto(&current);
+        set.glossary = Some("FastMCP = Fast MCP".to_string());
+        assert_eq!(
+            dto_to_config(set, &current).glossary,
+            "FastMCP = Fast MCP",
+            "Some(value) replaces the live value"
+        );
+    }
+
     /// Proactive brain P1 — the mute toggle round-trips through the settings DTO: `config_to_dto`
     /// carries it OUT (the FE reads `proactiveHintsEnabled`) and `dto_to_config` takes it IN (the
     /// FE sets it), so Settings can actually mute the backend scanner.
@@ -12392,6 +12438,78 @@
             state.config.lock().unwrap().gateway_base_url,
             "https://gw.example.com/v1",
             "valid URL must be persisted and visible in the in-memory config cache"
+        );
+    }
+
+    #[test]
+    fn save_config_inner_preserves_omitted_glossary_and_accepts_explicit_clear() {
+        let state = build_state("cfg-glossary-omission");
+        {
+            let mut current = state.config.lock().unwrap();
+            current.glossary = "Konnect = Connect".to_string();
+            current.save(&state.db).unwrap();
+        }
+
+        let mut old_client_json =
+            serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
+        old_client_json
+            .as_object_mut()
+            .unwrap()
+            .remove("glossary");
+        let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
+        save_config_inner(&state, omitted).unwrap();
+        assert_eq!(state.config.lock().unwrap().glossary, "Konnect = Connect");
+        assert_eq!(
+            AppConfig::load(&state.db).unwrap().glossary,
+            "Konnect = Connect",
+            "an older client save must preserve the durable glossary"
+        );
+
+        let mut clear = config_to_dto(&state.config.lock().unwrap());
+        clear.glossary = Some(String::new());
+        save_config_inner(&state, clear).unwrap();
+        assert_eq!(state.config.lock().unwrap().glossary, "");
+        assert_eq!(
+            AppConfig::load(&state.db).unwrap().glossary,
+            "",
+            "an explicit empty value must clear cache and storage"
+        );
+    }
+
+    #[test]
+    fn save_config_inner_preserves_omitted_analysis_and_voiceprint_choices() {
+        let state = build_state("cfg-analysis-omission");
+        {
+            let mut current = state.config.lock().unwrap();
+            current.diarize_others = false;
+            current.ground_summary = false;
+            current.voiceprint_enabled = true;
+            current.save(&state.db).unwrap();
+        }
+
+        let mut old_client_json =
+            serde_json::to_value(config_to_dto(&state.config.lock().unwrap())).unwrap();
+        let object = old_client_json.as_object_mut().unwrap();
+        object.remove("diarizeOthers");
+        object.remove("groundSummary");
+        object.remove("voiceprintEnabled");
+        let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
+
+        save_config_inner(&state, omitted).unwrap();
+        let cached = state.config.lock().unwrap().clone();
+        assert!(!cached.diarize_others);
+        assert!(!cached.ground_summary);
+        assert!(
+            cached.voiceprint_enabled,
+            "an older client save must not revoke an explicit voiceprint opt-in"
+        );
+
+        let durable = AppConfig::load(&state.db).unwrap();
+        assert!(!durable.diarize_others);
+        assert!(!durable.ground_summary);
+        assert!(
+            durable.voiceprint_enabled,
+            "omitted DTO fields must preserve all three durable choices"
         );
     }
 
