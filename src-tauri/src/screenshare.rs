@@ -180,8 +180,8 @@ fn captured_on_main(app: &AppHandle) -> bool {
 /// React to a share-start rising edge: relock everything + emit the UI event.
 fn on_capture_started(app: &AppHandle) {
     let state = app.state::<AppState>();
-    // relock_all_inner takes &AppState; State derefs to it.
-    let secured = match crate::commands::relock_all_inner(&state) {
+    // The wrapper shuts down active MCP content sockets before it waits on the lock lifecycle.
+    let secured = match crate::commands::relock_all_with_visibility_gate(app, state.inner()) {
         Ok(()) => true,
         Err(e) => {
             tracing::error!(
