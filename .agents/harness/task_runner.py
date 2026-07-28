@@ -52,6 +52,10 @@ REVIEWER_TOOL_DENIAL = {
         ),
     }
 }
+CODEX_HOOK_TRUST_WARNING = (
+    "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run "
+    "without review for this invocation."
+)
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -184,6 +188,12 @@ def reviewer_tool_activity(log_path: Path, vendor: str) -> List[str]:
                 if isinstance(event_type, str) and event_type.startswith("item."):
                     item = event.get("item")
                     item_type = item.get("type") if isinstance(item, dict) else None
+                    if (
+                        event_type == "item.completed"
+                        and item_type == "error"
+                        and item.get("message") == CODEX_HOOK_TRUST_WARNING
+                    ):
+                        continue
                     # A verifier-only Codex process may stream prose/reasoning, but
                     # every executable, hosted, file-mutating, or future unknown item
                     # is inadmissible. The closed allowlist makes new CLI tool shapes
@@ -6843,6 +6853,42 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         )
         if reviewer_tool_activity(codex_prose, "codex"):
             failures.append("Codex prose response was treated as tool execution")
+
+        codex_hook_warning = tool_fixture(
+            "codex-hook-warning.jsonl",
+            [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "error",
+                        "message": CODEX_HOOK_TRUST_WARNING,
+                    },
+                },
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "PASS"},
+                },
+            ],
+        )
+        if reviewer_tool_activity(codex_hook_warning, "codex"):
+            failures.append(
+                "Codex exact hook-trust warning was treated as tool execution"
+            )
+
+        codex_unknown_error = tool_fixture(
+            "codex-unknown-error.jsonl",
+            [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "error",
+                        "message": "different reviewer error",
+                    },
+                }
+            ],
+        )
+        if not reviewer_tool_activity(codex_unknown_error, "codex"):
+            failures.append("Codex arbitrary error did not fail closed")
 
         for label, item_type in (
             ("command", "command_execution"),
