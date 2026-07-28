@@ -42,6 +42,7 @@ SEVERE_FINDINGS = {"MAJOR", "BLOCKER"}
 ALLOWED_PROBES = {
     "rust-lib",
     "protocol-server",
+    "npm-lock",
     "tauri-boot",
     "ng-lint",
     "ng-build",
@@ -53,6 +54,9 @@ ALLOWED_PROBES = {
     "hook-selftest",
     "config-audit",
 }
+MAX_PROBE_EXECUTIONS_PER_ID = 2
+DEFAULT_REVIEW_STREAM_BYTES = 2_048
+NPM_LOCK_REVIEW_STREAM_BYTES = 65_536
 TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 PROTOCOL_FILES = (
     "AGENTS.md",
@@ -158,8 +162,43 @@ def load_v2_state(task_dir: Path) -> Dict[str, Any]:
     projected_time = legacy.parse_timestamp(
         projected["updated_at"], "v2 state projection updated_at"
     )
-    if projected_time > event_time:
-        raise legacy.HarnessError("v2 state projection is newer than its event ledger")
+    event_revision = event_state.get("state_revision")
+    projected_revision = projected.get("state_revision")
+    for label, revision in (
+        ("event", event_revision),
+        ("projection", projected_revision),
+    ):
+        if revision is not None and (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 1
+        ):
+            raise legacy.HarnessError(
+                f"v2 state {label} revision is malformed"
+            )
+    if event_revision is not None:
+        if projected_revision is not None:
+            if projected_revision > event_revision:
+                raise legacy.HarnessError(
+                    "v2 state projection is newer than its event ledger"
+                )
+            if (
+                projected_revision == event_revision
+                and projected != event_state
+            ):
+                raise legacy.HarnessError(
+                    "v2 state projection conflicts at the same revision"
+                )
+    elif projected_revision is not None:
+        raise legacy.HarnessError(
+            "v2 revised state projection has a legacy event ledger"
+        )
+    elif projected_time > event_time or (
+        projected_time == event_time and projected != event_state
+    ):
+        raise legacy.HarnessError(
+            "v2 state projection is newer than or conflicts with its event ledger"
+        )
     if projected != event_state:
         legacy.atomic_write_json(state_path, event_state)
     return event_state
@@ -370,6 +409,10 @@ def _angular_surface(paths: Sequence[str]) -> bool:
     return any(_matches(path, patterns) for path in paths)
 
 
+def _package_lock_surface(paths: Sequence[str]) -> bool:
+    return any(path in {"package.json", "package-lock.json"} for path in paths)
+
+
 def _ui_behavior_surface(paths: Sequence[str]) -> bool:
     for path in paths:
         if path.startswith("e2e/") or path == "playwright.config.ts":
@@ -439,6 +482,8 @@ def derive_profile(
 
     if _rust_surface(paths):
         require("rust-lib")
+    if _package_lock_surface(paths):
+        require("npm-lock")
     if _angular_surface(paths):
         require("ng-lint")
         require("ng-build")
@@ -492,6 +537,29 @@ def canonical_check(
         "command": command,
         "timeout_seconds": int(config.get("check_timeout_seconds", 1800)),
     }
+
+
+def allowed_probe_ids(plan: Mapping[str, Any]) -> List[str]:
+    """Return the only probes meaningful for this exact derived plan.
+
+    The static schema is a protocol vocabulary, not authority to execute every
+    check for every task.  A missing claim/profile must be amended explicitly;
+    an unrelated globally-green command can never stand in for missing proof.
+    """
+
+    checks = plan.get("checks", [])
+    if not isinstance(checks, list):
+        raise legacy.HarnessError("v2 plan checks are malformed")
+    result: List[str] = []
+    for check in checks:
+        if not isinstance(check, Mapping):
+            raise legacy.HarnessError("v2 plan check is malformed")
+        check_id = check.get("id")
+        if not isinstance(check_id, str) or check_id not in ALLOWED_PROBES:
+            raise legacy.HarnessError("v2 plan contains a non-canonical probe id")
+        if check_id not in result:
+            result.append(check_id)
+    return result
 
 
 def probe_evidence_hash(records: Sequence[Mapping[str, Any]]) -> str:
@@ -824,6 +892,105 @@ def review_result_state(result: Mapping[str, Any]) -> str:
     return "PASSED"
 
 
+def _bounded_stream_summary(
+    task_dir: Path,
+    raw_path: Any,
+    expected_hash: Any,
+    label: str,
+    limit: int,
+) -> Dict[str, Any]:
+    path = _artifact_inside(task_dir, raw_path, expected_hash, label)
+    size = path.stat().st_size
+    if size <= limit:
+        with path.open("rb") as handle:
+            excerpt = handle.read(limit + 1)
+        truncated = False
+    else:
+        head = limit // 2
+        tail = limit - head
+        omitted = size - limit
+        with path.open("rb") as handle:
+            prefix = handle.read(head)
+            handle.seek(-tail, os.SEEK_END)
+            suffix = handle.read(tail)
+        excerpt = prefix + (
+            f"\n... <{omitted} evidence bytes omitted> ...\n".encode("utf-8")
+        ) + suffix
+        truncated = True
+    return {
+        "sha256": expected_hash,
+        "bytes": size,
+        "truncated": truncated,
+        "excerpt_included": True,
+        "excerpt": excerpt.decode("utf-8", "replace"),
+    }
+
+
+def _review_evidence_summary(
+    item: Mapping[str, Any],
+    task_dir: Path,
+    *,
+    channel: str,
+) -> Dict[str, Any]:
+    evidence = item.get("evidence", item)
+    if not isinstance(evidence, Mapping):
+        raise legacy.HarnessError("v2 review check evidence is malformed")
+    check_id = item.get("id")
+    if channel not in {"planned-check", "reviewer-probe"}:
+        raise legacy.HarnessError(
+            f"invalid review evidence channel: {channel}"
+        )
+    limit = (
+        NPM_LOCK_REVIEW_STREAM_BYTES
+        if check_id == "npm-lock"
+        else DEFAULT_REVIEW_STREAM_BYTES
+    )
+    request_contexts = []
+    for context in item.get("request_contexts", []):
+        if not isinstance(context, Mapping):
+            raise legacy.HarnessError("v2 probe request context is malformed")
+        request_contexts.append(
+            {
+                key: context.get(key)
+                for key in (
+                    "review_kind",
+                    "review_vendor",
+                    "review_result_sha256",
+                    "review_prompt_sha256",
+                    "rationale",
+                    "proof_gaps",
+                    "context_sha256",
+                )
+            }
+        )
+    return {
+        "id": check_id,
+        "source": channel,
+        "command": item.get("command", evidence.get("command")),
+        "passed": evidence.get("passed"),
+        "outcome": evidence.get("outcome"),
+        "exit_code": evidence.get("exit_code"),
+        "duration_ms": evidence.get("duration_ms"),
+        "resource_wait_ms": evidence.get("resource_wait_ms", 0),
+        "log_sha256": evidence.get("log_sha256"),
+        "stdout": _bounded_stream_summary(
+            task_dir,
+            evidence.get("stdout_path"),
+            evidence.get("stdout_sha256"),
+            f"review-visible {check_id} stdout",
+            limit,
+        ),
+        "stderr": _bounded_stream_summary(
+            task_dir,
+            evidence.get("stderr_path"),
+            evidence.get("stderr_sha256"),
+            f"review-visible {check_id} stderr",
+            limit,
+        ),
+        "request_contexts": request_contexts,
+    }
+
+
 def combined_review_prompt(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -831,7 +998,9 @@ def combined_review_prompt(
     checks: Sequence[Mapping[str, Any]],
     kind: str,
     worktree: Path,
+    task_dir: Path,
     *,
+    probes: Sequence[Mapping[str, Any]] = (),
     policy_text: Optional[str] = None,
 ) -> str:
     if policy_text is not None:
@@ -840,20 +1009,18 @@ def combined_review_prompt(
         policy = legacy.read_prompt("combined-reviewer")
     else:
         policy = legacy.read_prompt(kind + "-reviewer")
-    check_summary = []
-    for item in checks:
-        evidence = item.get("evidence", item)
-        check_summary.append(
-            {
-                "id": item.get("id"),
-                "passed": evidence.get("passed"),
-                "outcome": evidence.get("outcome"),
-                "exit_code": evidence.get("exit_code"),
-                "duration_ms": evidence.get("duration_ms"),
-                "resource_wait_ms": evidence.get("resource_wait_ms", 0),
-                "log_sha256": evidence.get("log_sha256"),
-            }
+    check_summary = [
+        _review_evidence_summary(
+            item, task_dir, channel="planned-check"
         )
+        for item in checks
+    ] + [
+        _review_evidence_summary(
+            item, task_dir, channel="reviewer-probe"
+        )
+        for item in probes
+    ]
+    eligible_probes = allowed_probe_ids(plan)
     return (
         f"{policy}\n\n"
         "## Exact v2 task\n"
@@ -865,15 +1032,21 @@ def combined_review_prompt(
         f"Diff SHA-256: {plan['diff_sha256']}\n"
         f"Plan SHA-256: {plan['plan_sha256']}\n"
         f"Protocol SHA-256: {plan['protocol_sha256']}\n"
-        f"Check evidence: {json.dumps(check_summary, sort_keys=True)}\n"
+        "Check and probe evidence (commands, hashes, bounded output, and any "
+        "source proof gaps): "
+        f"{json.dumps(check_summary, sort_keys=True)}\n"
+        f"Context-eligible probe IDs: {json.dumps(eligible_probes)}\n"
         "Pinned server checkout required: "
         f"{'yes' if plan.get('server_required') else 'no'}\n\n"
         "## Exact diff\n"
         f"{diff.decode('utf-8', 'replace')}\n\n"
         "Return every finding and every missing proof. PASS is forbidden when a "
         "MAJOR/BLOCKER remains. If an empirical proof is missing, use proof_gaps "
-        "and optionally a typed probe_requests entry from the schema allowlist; "
-        "never ask for or attempt arbitrary shell access."
+        "and optionally a typed probe_requests entry from the context-eligible "
+        "IDs above; never ask for or attempt arbitrary shell access. A prior "
+        "proof gap may disappear only when the exact shown probe command and "
+        "output address its recorded rationale; a green but unrelated command "
+        "is not evidence."
     )
 
 
@@ -882,11 +1055,13 @@ def invoke_readonly_review(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
     worktree: Path,
+    task_dir: Path,
     attempt_dir: Path,
     diff: bytes,
     checks: Sequence[Mapping[str, Any]],
     review: Mapping[str, str],
     probe_evidence_sha256: str,
+    probes: Sequence[Mapping[str, Any]] = (),
     allow_test_adapter: bool = False,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, Any]:
@@ -901,7 +1076,14 @@ def invoke_readonly_review(
     retry_records.mkdir(parents=True, exist_ok=True)
     before = legacy.workspace_fingerprint(worktree)
     prompt = combined_review_prompt(
-        contract, plan, diff, checks, kind, worktree
+        contract,
+        plan,
+        diff,
+        checks,
+        kind,
+        worktree,
+        task_dir,
+        probes=probes,
     )
     prompt_sha256 = legacy.sha256_bytes(prompt.encode("utf-8"))
 
@@ -984,11 +1166,9 @@ def invoke_readonly_review(
     legacy.validate_schema(
         result, legacy.load_schema("v2-review"), label=f"{kind} v2 review"
     )
-    for request in result.get("probe_requests", []):
-        if request.get("probe_id") not in ALLOWED_PROBES:
-            raise legacy.HarnessError(
-                f"review requested non-allowlisted probe: {request.get('probe_id')}"
-            )
+    # invoke_model creates every result/invocation/log with a fresh UUID and
+    # exclusive-create semantics.  The per-kind review checkpoint may advance
+    # on resume, but these source artifacts remain immutable for probe binding.
     record = {
         "schema_version": 2,
         **evidence_binding(plan),
@@ -1040,6 +1220,58 @@ def check_record(
         "evidence": dict(evidence),
         "created_at": legacy.utc_now(),
     }
+
+
+def canonical_probe_request_contexts(
+    contexts: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Deduplicate and order bound probe requests in one canonical way."""
+
+    unique = {
+        str(context.get("context_sha256")): copy.deepcopy(dict(context))
+        for context in contexts
+    }
+    return sorted(
+        unique.values(),
+        key=lambda item: (
+            str(item.get("review_kind")),
+            str(item.get("review_vendor")),
+            str(item.get("context_sha256")),
+        ),
+    )
+
+
+def probe_request_contexts(
+    reviews: Sequence[Mapping[str, Any]], probe_id: str
+) -> List[Dict[str, Any]]:
+    """Bind a probe to the exact review claim that requested it."""
+
+    contexts: Dict[str, Dict[str, Any]] = {}
+    for review in reviews:
+        result = review.get("result", {})
+        if not isinstance(result, Mapping):
+            raise legacy.HarnessError("v2 source review result is malformed")
+        proof_gaps = copy.deepcopy(list(result.get("proof_gaps", [])))
+        for request in result.get("probe_requests", []):
+            if not isinstance(request, Mapping) or request.get("probe_id") != probe_id:
+                continue
+            context: Dict[str, Any] = {
+                "probe_id": probe_id,
+                "review_kind": review.get("kind"),
+                "review_vendor": review.get("vendor"),
+                "review_result_path": review.get("result_path"),
+                "review_result_sha256": review.get("result_sha256"),
+                "review_prompt_sha256": review.get("prompt_sha256"),
+                "rationale": request.get("rationale"),
+                "proof_gaps": proof_gaps,
+                "source_review": copy.deepcopy(dict(review)),
+                "context_sha256": "",
+            }
+            context["context_sha256"] = document_hash(
+                context, "context_sha256"
+            )
+            contexts[context["context_sha256"]] = context
+    return canonical_probe_request_contexts(list(contexts.values()))
 
 
 def aggregate_verdict(
@@ -1094,7 +1326,7 @@ def build_evidence(
     reviews: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     review_outcomes = aggregate_review_outcomes(reviews)
-    verdict, reason = aggregate_verdict(checks, reviews)
+    verdict, reason = aggregate_verdict([*checks, *probes], reviews)
     evidence: Dict[str, Any] = {
         "schema_version": 2,
         "task_id": contract["task_id"],
@@ -1181,6 +1413,18 @@ def validate_check_checkpoint(
         raise legacy.HarnessError("v2 check result id changed")
     if result.get("command") != declared.get("command"):
         raise legacy.HarnessError("v2 check result command changed")
+    expected_bound_environment = (
+        {"MURMUR_HARNESS_BASE_SHA": str(plan["base_sha"])}
+        if declared.get("id") == "npm-lock"
+        else {}
+    )
+    if (
+        result.get("bound_environment", {})
+        != expected_bound_environment
+    ):
+        raise legacy.HarnessError(
+            "v2 check runner-bound environment changed"
+        )
     log_path = _artifact_inside(
         task_dir,
         result.get("log_path"),
@@ -1223,6 +1467,172 @@ def validate_check_checkpoint(
         )
 
 
+def validate_probe_checkpoint(
+    record: Mapping[str, Any],
+    declared: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    task_dir: Path,
+    *,
+    allow_test_adapter: bool = False,
+    review_schema: Optional[Mapping[str, Any]] = None,
+) -> None:
+    validate_check_checkpoint(record, declared, plan, task_dir)
+    probe_id = record.get("id")
+    if probe_id not in allowed_probe_ids(plan):
+        raise legacy.HarnessError(
+            f"v2 probe {probe_id} is outside the exact plan"
+        )
+    if record.get("source") != "reviewer-probe":
+        raise legacy.HarnessError("v2 probe has no reviewer-probe provenance")
+    execution_number = record.get("execution_number", 1)
+    if (
+        isinstance(execution_number, bool)
+        or not isinstance(execution_number, int)
+        or execution_number < 1
+        or execution_number > MAX_PROBE_EXECUTIONS_PER_ID
+    ):
+        raise legacy.HarnessError(
+            "v2 probe execution number is malformed or exceeds its bound"
+        )
+    contexts = record.get("request_contexts")
+    if not isinstance(contexts, list) or not contexts:
+        raise legacy.HarnessError("v2 probe request provenance is missing")
+    required_keys = {
+        "probe_id",
+        "review_kind",
+        "review_vendor",
+        "review_result_path",
+        "review_result_sha256",
+        "review_prompt_sha256",
+        "rationale",
+        "proof_gaps",
+        "source_review",
+        "context_sha256",
+    }
+    expected_reviews = {
+        (item.get("kind"), item.get("vendor"))
+        for item in plan.get("reviews", [])
+        if isinstance(item, Mapping)
+    }
+    seen: set[str] = set()
+    for context in contexts:
+        if not isinstance(context, Mapping) or set(context) != required_keys:
+            raise legacy.HarnessError("v2 probe request context is malformed")
+        if context.get("probe_id") != probe_id:
+            raise legacy.HarnessError("v2 probe request context id changed")
+        if (
+            context.get("review_kind"),
+            context.get("review_vendor"),
+        ) not in expected_reviews:
+            raise legacy.HarnessError(
+                "v2 probe request context review is outside the plan"
+            )
+        context_hash = context.get("context_sha256")
+        if (
+            not isinstance(context_hash, str)
+            or context_hash in seen
+            or context_hash != document_hash(context, "context_sha256")
+        ):
+            raise legacy.HarnessError(
+                "v2 probe request context hash is stale or duplicated"
+            )
+        seen.add(context_hash)
+        if not isinstance(context.get("rationale"), str):
+            raise legacy.HarnessError("v2 probe request rationale is malformed")
+        proof_gaps = context.get("proof_gaps")
+        if not isinstance(proof_gaps, list):
+            raise legacy.HarnessError("v2 probe source proof gaps are malformed")
+        source_review = context.get("source_review")
+        if not isinstance(source_review, Mapping):
+            raise legacy.HarnessError(
+                "v2 probe source review checkpoint is malformed"
+            )
+        source_fields = {
+            "review_kind": "kind",
+            "review_vendor": "vendor",
+            "review_result_path": "result_path",
+            "review_result_sha256": "result_sha256",
+            "review_prompt_sha256": "prompt_sha256",
+        }
+        for context_key, review_key in source_fields.items():
+            if context.get(context_key) != source_review.get(review_key):
+                raise legacy.HarnessError(
+                    "v2 probe source review checkpoint metadata changed"
+                )
+        source_result_summary = source_review.get("result")
+        if not isinstance(source_result_summary, Mapping):
+            raise legacy.HarnessError(
+                "v2 probe source review result summary is malformed"
+            )
+        if source_result_summary.get("proof_gaps") != proof_gaps:
+            raise legacy.HarnessError(
+                "v2 probe source proof gaps differ from its checkpoint"
+            )
+        expected_request = {
+            "probe_id": probe_id,
+            "rationale": context.get("rationale"),
+        }
+        if expected_request not in source_result_summary.get(
+            "probe_requests", []
+        ):
+            raise legacy.HarnessError(
+                "v2 probe request differs from its source review checkpoint"
+            )
+        source_declarations = [
+            item
+            for item in plan.get("reviews", [])
+            if isinstance(item, Mapping)
+            and item.get("kind") == context.get("review_kind")
+            and item.get("vendor") == context.get("review_vendor")
+        ]
+        if len(source_declarations) != 1:
+            raise legacy.HarnessError(
+                "v2 probe source review is not uniquely declared in the plan"
+            )
+        prompt_hash = context.get("review_prompt_sha256")
+        if not isinstance(prompt_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", prompt_hash
+        ):
+            raise legacy.HarnessError(
+                "v2 probe source review prompt hash is malformed"
+            )
+        validate_review_checkpoint(
+            source_review,
+            source_declarations[0],
+            plan,
+            task_dir,
+            expected_prompt_sha256=prompt_hash,
+            allow_test_adapter=allow_test_adapter,
+            review_schema=review_schema,
+        )
+        source_path = _artifact_inside(
+            task_dir,
+            context.get("review_result_path"),
+            context.get("review_result_sha256"),
+            f"probe {probe_id} source review result",
+        )
+        source_result = legacy.load_json(source_path)
+        legacy.validate_schema(
+            source_result,
+            (
+                dict(review_schema)
+                if review_schema is not None
+                else legacy.load_schema("v2-review")
+            ),
+            label=f"probe {probe_id} source review",
+        )
+        if source_result.get("proof_gaps") != proof_gaps:
+            raise legacy.HarnessError(
+                "v2 probe source proof gaps differ from the review artifact"
+            )
+        if expected_request not in source_result.get("probe_requests", []):
+            raise legacy.HarnessError(
+                "v2 probe request differs from the source review artifact"
+            )
+    if list(contexts) != canonical_probe_request_contexts(contexts):
+        raise legacy.HarnessError("v2 probe request contexts are not canonical")
+
+
 def validate_review_checkpoint(
     record: Mapping[str, Any],
     declared: Mapping[str, Any],
@@ -1247,6 +1657,15 @@ def validate_review_checkpoint(
     vendor = record.get("vendor")
     if not isinstance(label, str) or not isinstance(vendor, str):
         raise legacy.HarnessError("v2 review checkpoint label/vendor is malformed")
+    safe_kind = re.sub(
+        r"[^a-z0-9._-]+", "-", str(declared.get("kind", "")).lower()
+    )
+    if re.fullmatch(
+        rf"review-{re.escape(safe_kind)}-try-[12]", label
+    ) is None:
+        raise legacy.HarnessError(
+            "v2 review checkpoint label does not match review kind"
+        )
     raw_invocation_path = Path(str(record.get("invocation_path", "")))
     run_dir = raw_invocation_path.parent.parent
     expected_result = run_dir / "results" / f"{label}-{vendor}.json"
@@ -1644,15 +2063,25 @@ def verify_v2_evidence(
 
     probe_records = evidence.get("probes", [])
     probe_ids: set = set()
+    eligible_probe_ids = set(allowed_probe_ids(plan))
     for record in probe_records:
         probe_id = record.get("id")
-        if probe_id not in ALLOWED_PROBES or probe_id in probe_ids:
-            raise legacy.HarnessError("v2 probe evidence has a duplicate/non-allowlisted id")
+        if probe_id not in eligible_probe_ids or probe_id in probe_ids:
+            raise legacy.HarnessError(
+                "v2 probe evidence has a duplicate/id outside the exact plan"
+            )
         probe_ids.add(probe_id)
         if not binding_matches(record, plan):
             raise legacy.HarnessError(f"v2 probe {probe_id} binding is stale")
         declared = canonical_check(str(probe_id), profile_config)
-        validate_check_checkpoint(record, declared, plan, task_dir)
+        validate_probe_checkpoint(
+            record,
+            declared,
+            plan,
+            task_dir,
+            allow_test_adapter=allow_test_adapter,
+            review_schema=attested_schemas.get("v2-review"),
+        )
         result = record.get("evidence", {})
         if not result.get("passed") or result.get("exit_code") != 0:
             raise legacy.HarnessError(f"v2 probe {probe_id} is not green")
@@ -1719,9 +2148,11 @@ def verify_v2_evidence(
             contract,
             plan,
             diff,
-            [*check_records, *probe_records],
+            check_records,
             str(declared["kind"]),
             worktree,
+            task_dir,
+            probes=probe_records,
             policy_text=policy_text,
         )
         validate_review_checkpoint(
