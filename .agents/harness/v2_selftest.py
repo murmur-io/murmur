@@ -1463,6 +1463,200 @@ def verdict_cases(test: Tests) -> None:
     )
 
 
+def focused_review_evidence_cases(test: Tests) -> None:
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-focused-evidence-") as raw:
+        task_dir = Path(raw)
+        logs = task_dir / "logs"
+        logs.mkdir()
+        padding = "x" * (verifier.DEFAULT_REVIEW_STREAM_BYTES + 128)
+        lock_lines = [
+            "test tools::tests::org_read_requires_member ... ok",
+            "test storage::tests::context_disabled_hides_org_item ... ok",
+            "test storage::tests::tombstone_removes_org_item ... ok",
+            "test mcp::tests::revocation_stops_locked_tail ... ok",
+        ]
+        egress_lines = [
+            "test summarize::tests::remote_ollama_requires_consent ... ok",
+            "test summarize::tests::egress_ledger_is_content_free ... ok",
+        ]
+        nonmatching = "test unrelated::tests::middle_secret_sentinel ... ok"
+        stdout = logs / "rust.stdout.log"
+        stdout.write_text(
+            "HEAD\n"
+            + padding
+            + "\n"
+            + nonmatching
+            + "\n"
+            + "\n".join(lock_lines + egress_lines)
+            + "\n"
+            + padding
+            + "\nTAIL\n",
+            encoding="utf-8",
+        )
+        stderr = logs / "rust.stderr.log"
+        stderr.write_text("", encoding="utf-8")
+
+        def item_for(path: Path) -> Dict[str, Any]:
+            return {
+                "id": "rust-lib",
+                "command": "cargo test --lib",
+                "evidence": {
+                    "passed": True,
+                    "outcome": "PASS",
+                    "exit_code": 0,
+                    "duration_ms": 1,
+                    "resource_wait_ms": 0,
+                    "log_sha256": "0" * 64,
+                    "stdout_path": str(path),
+                    "stdout_sha256": legacy.sha256_file(path),
+                    "stderr_path": str(stderr),
+                    "stderr_sha256": legacy.sha256_file(stderr),
+                },
+            }
+
+        item = item_for(stdout)
+        lock_summary = verifier._review_evidence_summary(
+            item,
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )
+        lock_inventory = lock_summary["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE surfaces security tests from truncated middle",
+            all(line in lock_inventory["excerpt"] for line in lock_lines)
+            and all(line not in lock_summary["stdout"]["excerpt"] for line in lock_lines),
+        )
+        test.true(
+            "FOCUSED EVIDENCE omits nonmatching middle output",
+            nonmatching not in lock_inventory["excerpt"]
+            and nonmatching not in lock_summary["stdout"]["excerpt"],
+        )
+        egress_inventory = verifier._review_evidence_summary(
+            item,
+            task_dir,
+            channel="reviewer-probe",
+            review_kind="egress-security",
+        )["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE is specialist-specific",
+            all(line in egress_inventory["excerpt"] for line in egress_lines)
+            and lock_lines[0] not in egress_inventory["excerpt"],
+        )
+
+        many = logs / "many.stdout.log"
+        many.write_text(
+            "".join(
+                f"test org::tests::case_{index:04d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM + 20
+                )
+            ),
+            encoding="utf-8",
+        )
+        bounded = verifier._review_evidence_summary(
+            item_for(many),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        test.equal(
+            "FOCUSED EVIDENCE bounds each term deterministically",
+            (
+                bounded["included_lines"],
+                bounded["matching_lines_total"],
+                bounded["truncated"],
+            ),
+            (
+                verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM,
+                verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM + 20,
+                True,
+            ),
+        )
+
+        overlapping = logs / "overlapping.stdout.log"
+        overlapping.write_text(
+            "".join(
+                f"test org::tests::org_only_{index:04d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+                )
+            )
+            + "".join(
+                f"test org::member::tests::overlap_{index:04d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM + 4
+                )
+            ),
+            encoding="utf-8",
+        )
+        overlapping_inventory = verifier._review_evidence_summary(
+            item_for(overlapping),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE overlapping terms retain independent hard caps",
+            overlapping_inventory["per_term_included"]["org"]
+            == verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+            and overlapping_inventory["per_term_included"]["member"]
+            == verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+            and all(
+                count <= verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+                for count in overlapping_inventory["per_term_included"].values()
+            ),
+        )
+
+        byte_pressure = logs / "byte-pressure.stdout.log"
+        long_name = "z" * 4_000
+        byte_pressure.write_text(
+            "".join(
+                f"test org::tests::{long_name}_{index:02d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+                )
+            ),
+            encoding="utf-8",
+        )
+        first_byte_summary = verifier._review_evidence_summary(
+            item_for(byte_pressure),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        second_byte_summary = verifier._review_evidence_summary(
+            item_for(byte_pressure),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE byte pressure is bounded complete and deterministic",
+            first_byte_summary["matching_lines_total"]
+            == verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+            and first_byte_summary["included_lines"]
+            < first_byte_summary["matching_lines_total"]
+            and first_byte_summary["included_bytes"]
+            <= verifier.SPECIALIST_TEST_FOCUS_BYTES
+            and first_byte_summary["truncated"]
+            and first_byte_summary == second_byte_summary,
+        )
+
+        corrupt_item = item_for(stdout)
+        corrupt_item["evidence"]["stdout_sha256"] = "f" * 64
+        test.raises(
+            "FOCUSED EVIDENCE remains bound to raw artifact hash",
+            lambda: verifier._review_evidence_summary(
+                corrupt_item,
+                task_dir,
+                channel="planned-check",
+                review_kind="lock-security",
+            ),
+            "hash changed",
+        )
+
+
 def probe_precedence_flow_cases(test: Tests) -> None:
     """Pin review-defect precedence through the real v2 verify transition."""
 
@@ -1710,6 +1904,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         forged_ng_build,
                         task_dir,
                         channel="planned-check",
+                        review_kind="combined",
                     )["source"],
                     "PLANNED_NG_BUILD_STREAM" in forged_channel_prompt,
                 ),
@@ -6227,6 +6422,7 @@ def main() -> int:
     npm_lock_evidence_cases(test)
     reviewer_tool_guard_cases(test)
     verdict_cases(test)
+    focused_review_evidence_cases(test)
     retry_cases(test)
     guardian_and_artifact_cases(test)
     readonly_review_wall_timeout_cases(test)
