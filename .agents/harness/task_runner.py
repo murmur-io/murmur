@@ -2434,6 +2434,23 @@ def _probe_blocked_reason(stdout_path: Path) -> Optional[str]:
     return None
 
 
+def check_process_diagnostic(evidence: Mapping[str, Any]) -> str:
+    """Render the process facts needed to distinguish a red check from infra loss."""
+    return json.dumps(
+        {
+            key: evidence.get(key)
+            for key in (
+                "exit_code",
+                "timed_out",
+                "duration_ms",
+                "termination_reason",
+                "guardian_path",
+            )
+        },
+        sort_keys=True,
+    )
+
+
 def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     safe_phase = re.sub(r"[^a-z0-9._-]+", "-", phase.lower())
     execution_id = _new_execution_id()
@@ -6734,6 +6751,15 @@ def _selftest_init_args(task_id: str, prompt: str, expected_change: bool) -> arg
 def cmd_selftest(_args: argparse.Namespace) -> int:
     failures: List[str] = []
     inherited_meta_selftest = False
+    diagnostic_fixture = {
+        "exit_code": 124,
+        "timed_out": True,
+        "duration_ms": 15_001,
+        "termination_reason": "timeout",
+        "guardian_path": "/tmp/guardian.json",
+    }
+    if json.loads(check_process_diagnostic(diagnostic_fixture)) != diagnostic_fixture:
+        failures.append("check failure diagnostic omitted process evidence")
     if os.environ.get(OUTER_SANDBOX_ENV) == "1":
         try:
             inherited_meta_selftest = inherited_outer_sandbox_is_active()
@@ -8476,7 +8502,10 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                         f"{json.dumps(sys.executable)} -c "
                         f"{json.dumps('exec(' + repr(ancestor_probe) + ')')}"
                     ),
-                    "timeout_seconds": 5,
+                    # This probe traverses every physical ancestor of the shared
+                    # node_modules tree. It uses no Cargo lane, but 5 seconds was
+                    # too tight under concurrent CI/selftest filesystem load.
+                    "timeout_seconds": 15,
                 },
                 "selftest",
             )
@@ -8486,6 +8515,8 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 )
                 failures.append(
                     "check sandbox denied literal ancestor traversal for shared node_modules: "
+                    + check_process_diagnostic(ancestor_check)
+                    + " "
                     + ancestor_log[-1200:].replace("\n", " ")
                 )
 
