@@ -5,6 +5,9 @@
     "MURMUR_AUTOFMT": "0"
   },
   "permissions": {
+    "additionalDirectories": [
+      "../.murmur-agent-tasks"
+    ],
     "deny": [
       "Read(~/.ssh/**)",
       "Read(~/.aws/**)",
@@ -28,6 +31,15 @@
     "failIfUnavailable": true,
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowWrite": [
+        "../.murmur-agent-tasks"
+      ],
+      "denyWrite": [
+        "../meetnotes/.git",
+        "../murmur-server/.git"
+      ]
+    },
     "network": {
       "allowLocalBinding": true
     }
