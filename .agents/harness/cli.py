@@ -590,6 +590,9 @@ def cmd_open(args: argparse.Namespace) -> int:
         "owned_paths": owned,
         "claims": claims,
         "reviewer": reviewer,
+        "allow_same_vendor_high_risk": bool(
+            getattr(args, "allow_same_vendor_high_risk", False)
+        ),
         "expected_change": bool(args.expected_change),
         "degraded_provenance": [],
         "created_at": legacy.utc_now(),
@@ -2265,6 +2268,9 @@ def _cmd_import_v1_locked(args: argparse.Namespace) -> int:
         "owned_paths": list(source["owned_paths"]),
         "claims": sorted(set(args.claim or [])),
         "reviewer": reviewer,
+        "allow_same_vendor_high_risk": bool(
+            getattr(args, "allow_same_vendor_high_risk", False)
+        ),
         "expected_change": bool(source["expected_change"]),
         "degraded_provenance": _legacy_degraded_provenance(source_dir),
         "supersedes": expected_supersedes,
@@ -3873,6 +3879,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--claim", action="append", choices=["runtime", "performance"], default=[]
     )
     open_parser.add_argument("--reviewer", choices=["codex", "claude"])
+    open_parser.add_argument(
+        "--allow-same-vendor-high-risk",
+        action="store_true",
+        help=(
+            "bind an explicit exception that assigns sensitive specialist reviews "
+            "to the selected reviewer vendor; default remains cross-vendor"
+        ),
+    )
     open_parser.add_argument("--base")
     open_parser.add_argument("--branch")
     open_parser.set_defaults(expected_change=True)
@@ -3924,6 +3938,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--claim", action="append", choices=["runtime", "performance"], default=[]
     )
     import_parser.add_argument("--reviewer", choices=["codex", "claude"])
+    import_parser.add_argument(
+        "--allow-same-vendor-high-risk",
+        action="store_true",
+        help=(
+            "bind an explicit exception that assigns sensitive specialist reviews "
+            "to the selected reviewer vendor; default remains cross-vendor"
+        ),
+    )
     import_parser.set_defaults(handler=cmd_import_v1)
     clean_parser = subparsers.add_parser(
         "clean", help="archive every visible byte, then close or abandon a v2 task"
