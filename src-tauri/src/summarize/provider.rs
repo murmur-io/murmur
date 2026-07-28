@@ -53,6 +53,9 @@ pub struct SummarizeRequest {
     /// this string EGRESSES to the provider in the prompt — `RedactingProvider` MUST scrub it
     /// alongside the transcript (summarize/redact.rs) before egress.
     pub live_bullets: Option<String>,
+    /// R14/#18 — the workspace DOMAIN GLOSSARY, verbatim from settings. Absent/blank renders a
+    /// byte-identical prompt, so an install without one is unchanged.
+    pub glossary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +286,7 @@ mod tests {
             related_context: None,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         };
         let (text, meta) = p.summarize_with_meta(&req).await.unwrap();
         assert_eq!(text, "note body");

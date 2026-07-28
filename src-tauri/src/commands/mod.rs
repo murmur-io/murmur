@@ -592,6 +592,9 @@ pub struct AppConfigDto {
     #[serde(default)]
     pub note_assist_actions_off: Vec<String>,
     pub note_language: String,
+    /// R14/#18 — workspace domain glossary (canonical spellings + aliases), user-authored.
+    #[serde(default)]
+    pub glossary: String,
     /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
     /// payload — an omitted flag must FAIL CLOSED (require a token), never silently disable MCP
     /// auth. Was `#[serde(default)]` (=false), which let a partial save flip the token requirement
@@ -4926,6 +4929,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_assist_enhance: c.note_assist_enhance,
         note_assist_actions_off: c.note_assist_actions_off.clone(),
         note_language: c.note_language.clone(),
+        glossary: c.glossary.clone(),
         mcp_require_token: c.mcp_require_token,
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
@@ -5094,6 +5098,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         } else {
             d.note_language
         },
+        glossary: d.glossary,
         mcp_require_token: d.mcp_require_token,
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,

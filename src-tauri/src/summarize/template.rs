@@ -509,6 +509,23 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
         out.push_str(&format!("- language: {lang}\n"));
     }
 
+    // R14/#18 — CANONICAL SPELLINGS, before the titles and the transcript so the model has them in
+    // hand while reading mangled ASR. This is the half of the glossary that actually protects the
+    // knowledge layer: ASR mangling would be survivable if it stayed in the transcript, but the
+    // NOTE inherits it ("Connect" for "Konnect", "Fast MCP" for "FastMCP"), and entities are
+    // extracted from the note's text — so one mis-transcription becomes a DURABLE entity row that
+    // no later meeting will ever merge back.
+    if let Some(glossary) = req.glossary.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        out.push_str(
+            "\nCANONICAL SPELLINGS (this workspace's own terms; the transcript may mis-hear them)\n\
+             The speech-to-text has not seen these names before and often mangles them. When a \
+             transcript word is clearly one of these, WRITE THE CANONICAL SPELLING BELOW — do not \
+             copy the mangled form, and do not invent a term that is not listed.\n",
+        );
+        out.push_str(glossary);
+        out.push('\n');
+    }
+
     out.push_str("\nEXISTING NOTE TITLES (valid [[wikilink]] targets — link only these):\n");
     if req.vault_titles.is_empty() {
         out.push_str("(none)\n");
@@ -1275,7 +1292,47 @@ mod tests {
             related_context: related,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         }
+    }
+
+    /// R14/#18 (regression). The workspace glossary reaches the note prompt as CANONICAL
+    /// SPELLINGS, and an install without one renders a BYTE-IDENTICAL prompt.
+    ///
+    /// This is the half of the glossary that protects the knowledge layer. ASR mangling would be
+    /// survivable if it stayed in the transcript, but the NOTE inherits it ("Connect" for
+    /// "Konnect", "Fast MCP" for "FastMCP"), and entities are extracted from the note's text — so
+    /// one mis-transcription becomes a durable entity row no later meeting merges back.
+    #[test]
+    fn the_glossary_reaches_the_prompt_and_is_absent_when_unset() {
+        let base = render_user_content(&req(None));
+        assert!(
+            !base.contains("CANONICAL SPELLINGS"),
+            "no glossary ⇒ the prompt is unchanged: {base}"
+        );
+
+        let mut r = req(None);
+        r.glossary = Some("Konnect = Kanak, Kinect\nFastMCP\nKong Operator = KO".to_string());
+        let with = render_user_content(&r);
+        assert!(with.contains("CANONICAL SPELLINGS"), "{with}");
+        assert!(with.contains("Konnect = Kanak, Kinect"), "verbatim terms: {with}");
+        assert!(
+            with.contains("WRITE THE CANONICAL SPELLING"),
+            "instructs the model to prefer the canonical form: {with}"
+        );
+        assert!(
+            with.contains("do not invent a term that is not listed"),
+            "and forbids inventing terms outside the list: {with}"
+        );
+        // The glossary must precede the transcript, so the model holds it while reading mangled ASR.
+        let g = with.find("CANONICAL SPELLINGS").unwrap();
+        let t = with.find("\nTRANSCRIPT").unwrap();
+        assert!(g < t, "glossary before transcript");
+
+        // A blank glossary is treated as no glossary — byte-identical, not an empty section.
+        let mut blank = req(None);
+        blank.glossary = Some("   \n  ".to_string());
+        assert_eq!(render_user_content(&blank), base);
     }
 
     /// No-regression proof: with `related_context = None` (the default + flag-OFF case) the rendered

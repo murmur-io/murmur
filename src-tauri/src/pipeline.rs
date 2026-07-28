@@ -2310,6 +2310,9 @@ async fn summarize_and_export(
             None
         },
         live_bullets: live_bullets.clone(),
+        // R14/#18 — the workspace glossary. Plain user-authored config, never derived from sealed
+        // content, so it is safe to carry into the prompt whatever is locked.
+        glossary: Some(config.glossary.clone()).filter(|g| !g.trim().is_empty()),
     };
 
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;

@@ -872,6 +872,7 @@ mod tests {
             related_context: None,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         };
         let res =
             tokio::time::timeout(std::time::Duration::from_secs(10), provider.summarize(&req))

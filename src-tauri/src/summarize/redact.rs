@@ -727,6 +727,16 @@ impl SummarizerProvider for RedactingProvider {
         // Brain v2 L4: the running live bullets ride the prompt as the "Live notes (auto)"
         // section — scrub them through the SAME shared map as the transcript they were derived
         // from, so a value redacted anywhere restores consistently in the reply.
+        // R14/#18: the workspace GLOSSARY rides the prompt as CANONICAL SPELLINGS and therefore
+        // egresses. It is user-authored config rather than meeting content, but it is exactly the
+        // place someone writes a colleague's name to fix a mis-transcription ("Danny", not "Dani"),
+        // so it gets the SAME firewall as everything else — through the shared map, so a value
+        // redacted anywhere restores consistently. Product terms (Konnect, FastMCP) are not PII and
+        // survive; a person's name does not, which is the correct trade for the privacy promise.
+        let red_glossary = req
+            .glossary
+            .as_ref()
+            .map(|c| redact_into(c, &mut map, &mut rev));
         let red_bullets = req
             .live_bullets
             .as_ref()
@@ -824,6 +834,7 @@ impl SummarizerProvider for RedactingProvider {
         r.related_context = red_related;
         r.user_notes = red_notes;
         r.live_bullets = red_bullets;
+        r.glossary = red_glossary;
         r.template = red_template;
         r.meta.title_hint = red_title_hint;
         r.vault_titles = red_titles;
@@ -1137,6 +1148,7 @@ mod tests {
             related_context: None,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         }
     }
 
@@ -2116,6 +2128,10 @@ mod tests {
             related_context: Some("s-related@leak.example".to_string()), // SCRUBBED (regex + NER)
             user_notes: Some("s-notes@leak.example".to_string()),        // SCRUBBED (regex + NER)
             live_bullets: Some("s-bullets@leak.example".to_string()),    // SCRUBBED (regex + NER)
+            // R14/#18 — user-authored config rather than meeting content, but it is exactly where
+            // someone writes a colleague's name to fix a mis-transcription, and it EGRESSES in the
+            // prompt as CANONICAL SPELLINGS. So: SCRUBBED, like everything else that leaves.
+            glossary: Some("s-glossary@leak.example".to_string()), // SCRUBBED (regex + NER)
         };
         let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
         let provider = RedactingProvider::new(inner.clone());
@@ -2130,6 +2146,7 @@ mod tests {
             "s-related@leak.example",
             "s-notes@leak.example",
             "s-bullets@leak.example",
+            "s-glossary@leak.example",
         ] {
             assert!(
                 !egress.contains(sentinel),
