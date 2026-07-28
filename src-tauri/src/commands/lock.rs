@@ -43,10 +43,43 @@ pub fn lock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
-    lock_folder_inner(state.inner(), folder_id)?;
+    // Initial sealing revokes content just as a session relock does. Shut down every registered
+    // MCP content socket BEFORE waiting on the lifecycle mutex, otherwise a slow reader can keep
+    // receiving a pre-lock payload after the command has made the folder private.
+    let mcp_revocation = crate::mcp::begin_visibility_revocation(
+        &app,
+        crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+    );
+    lock_folder_with_visibility_revocation(state.inner(), &folder_id, mcp_revocation)?;
     // The seal purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
+}
+
+/// Run the initial seal under an already-closed MCP response gate. Reopen admission only once the
+/// folder is durably marked locked and absent from the session unlock set. If sealing fails before
+/// that logical transition, dropping the incomplete revocation deliberately leaves the gate closed.
+pub(crate) fn lock_folder_with_visibility_revocation(
+    state: &AppState,
+    folder_id: &str,
+    mcp_revocation: crate::mcp::VisibilityRevocation,
+) -> Result<(), AppError> {
+    let result = lock_folder_inner(state, folder_id.to_string());
+    let logically_revoked = state
+        .db
+        .folder_by_id(folder_id)
+        .ok()
+        .flatten()
+        .is_some_and(|folder| folder.locked)
+        && state
+            .unlocked_folders
+            .lock()
+            .map(|folders| !folders.contains(folder_id))
+            .unwrap_or(false);
+    if logically_revoked {
+        crate::mcp::finish_visibility_revocation(mcp_revocation);
+    }
+    result
 }
 
 /// Inner of [`lock_folder`] taking `&AppState` (so the lifecycle stress test can drive it without a
@@ -616,6 +649,12 @@ pub fn relock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
+    // Cancel response admission and shutdown active content sockets BEFORE waiting on lifecycle.
+    // A slow MCP reader can therefore never delay the privacy transition.
+    let mcp_revocation = crate::mcp::begin_visibility_revocation(
+        &app,
+        crate::mcp::VisibilityRevokingEntrypoint::RelockFolder,
+    );
     // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
     // `remove_lock` is mid-restoring).
     let _lifecycle = lifecycle_guard(state.inner());
@@ -639,6 +678,9 @@ pub fn relock_folder(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.remove(&folder_id);
     }
+    // Epoch + session membership now authoritatively hide this folder. New MCP responses may be
+    // admitted against that post-revocation snapshot while physical cleanup continues.
+    crate::mcp::finish_visibility_revocation(mcp_revocation);
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
@@ -668,12 +710,41 @@ pub fn relock_folder(
 /// Stage E, and exposed as a command). Re-blanks the plaintext markdown of every sealed note.
 #[tauri::command]
 pub fn relock_all(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
-    relock_all_inner(&state)?;
+    relock_all_with_visibility_gate(&app, state.inner())?;
     // The relock-all purged ALL pending audit findings — ping the FE inbox (count-only). The
     // off-thread `relock_all_inner` callers emit from their own handles (screen-share) or are
     // app teardown (window-close/exit — nothing left to notify).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
+}
+
+/// App-facing relock-all wrapper. Every production entrypoint (manual command, screen-share,
+/// window close, app exit) uses this wrapper so response shutdown always precedes lifecycle
+/// acquisition. Tests that exercise only the storage state machine may continue to call
+/// [`relock_all_inner`] directly without constructing a Tauri runtime.
+pub(crate) fn relock_all_with_visibility_gate(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(), AppError> {
+    let mcp_revocation = crate::mcp::begin_visibility_revocation(
+        app,
+        crate::mcp::VisibilityRevokingEntrypoint::RelockAll,
+    );
+    let prior_epoch = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let result = relock_all_inner(state);
+    // `relock_all_inner` deliberately keeps logical revocation even when a later vault/DB cleanup
+    // fails. Reopen only if the epoch advanced and the unlock authority is observably empty.
+    let logically_revoked = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst)
+        != prior_epoch
+        && state
+            .unlocked_folders
+            .lock()
+            .map(|folders| folders.is_empty())
+            .unwrap_or(false);
+    if logically_revoked {
+        crate::mcp::finish_visibility_revocation(mcp_revocation);
+    }
+    result
 }
 
 /// Inner relock-all usable without a command boundary (Stage E screen-share watcher, window-close,
