@@ -45,6 +45,7 @@
   "canonical_checks": {
     "rust-lib": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo test --lib -- --test-threads=1)",
     "protocol-server": "(cd ../murmur-server && CARGO_BUILD_JOBS=2 cargo test -p murmur-protocol -- --test-threads=1)",
+    "npm-lock": "python3 -B .agents/harness/checks/npm-lock-evidence.py",
     "tauri-boot": "scripts/harness-runtime-smoke",
     "ng-lint": "npx ng lint",
     "ng-build": "npx ng build",
