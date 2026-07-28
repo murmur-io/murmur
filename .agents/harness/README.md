@@ -1,217 +1,313 @@
-# Murmur development agent harness
+# Murmur development harness
 
-This is the vendor-neutral control plane around Claude Code and Codex. It is separate from Murmur's in-product AI evals.
+The harness is Murmur's vendor-neutral verification control plane. It is
+separate from the application's AI features and model evaluations.
 
-The runner owns the lifecycle:
+Harness v2 is a Phase-1 shadow candidate. It is deliberately thin and
+verifier-only, but it does not become the repository default until historical
+defect replay and real-task shadow budgets pass:
 
 ```text
-contract -> isolated worktree -> writer -> deterministic checks -> final checks
-         -> fresh spec review -> fresh adversarial review
-         -> risk review(s) -> bounded repair (re-runs checks + final checks first)
-         -> hash-bound PASS attestation
+open -> edit isolated worktree -> plan exact diff -> verify/resume
+     -> exact PASS evidence -> commit -> push/PR/CI/merge -> clean
 ```
 
-The model never decides that the task is complete. `PASS` belongs to the runner and is valid only for the exact contract, base commit, worktree, staged binary diff, checks, and independent reviews recorded in the attestation. Any later edit invalidates it.
+There is no harness-owned writer and no automatic repair loop in v2. The
+developer or delegated implementation agent edits the isolated worktree. The
+runner owns only isolation, deterministic evidence, fresh tool-free reviews,
+receipt verification, the exact commit, and cleanup. The implementer never
+owns the verdict.
 
-`instructions_sha256` is deterministic: sort the active instruction paths (`AGENTS.md`, `CLAUDE.md`, both clients' rules/agent adapters, canonical `.codex/learnings`, and the harness config/prompts/schemas), then hash each UTF-8 path, a NUL byte, its raw contents, and another NUL byte. Changing instructions creates a new harness variant and invalidates an older task receipt. Each dispatch receives a bounded, role-relevant extract of canonical `## Recurring patterns`; journal history is not injected.
+Legacy v1 remains executable for existing tasks and is the only supported
+bootstrap for protected harness/control-plane changes. Its `init`, `run`,
+`seal-prepared`, `verify-attestation`, `close`, `reap`, `gc`, and `eval`
+commands dispatch unchanged to `task_runner.py`.
 
-## Daily use
+## Shadow-candidate v2 workflow
 
-Create an isolated task:
+Run multi-task orchestration from a dedicated, long-lived **standalone driver
+clone**, not the user's primary checkout and not a linked worktree. The
+standalone `.git` is the driver's isolation boundary: Claude may create task
+worktrees without receiving write access to the user's primary `.git`. Create
+it once with ordinary Git:
 
 ```bash
-scripts/agent-harness init attachment-loss \
+git fetch origin murmur
+git clone --local --no-hardlinks --no-checkout . ../.murmur-agent-driver
+git -C ../.murmur-agent-driver remote set-url origin https://github.com/murmur-io/murmur.git
+git -C ../.murmur-agent-driver fetch origin murmur
+git -C ../.murmur-agent-driver switch --detach origin/murmur
+cd ../.murmur-agent-driver
+```
+
+Do not replace this with `git worktree add`: a linked driver stores its Git
+metadata in the user's primary checkout, outside Claude's project sandbox.
+The checked-in Claude policy grants only the sibling
+`../.murmur-agent-tasks` root needed for task worktrees. Cargo/full-CI and
+runtime-port reservations live under that same narrow root, so the standalone
+driver and the user's primary checkout still share one visible resource lane.
+
+Open a candidate task from that driver:
+
+```bash
+scripts/agent-harness open attachment-loss \
   --kind bug \
   --prompt "Fix attachment loss after closing a note" \
   --owned src-tauri/src/storage/attachment_store.rs \
   --owned src-tauri/src/commands/attachments.rs \
-  --owned src-tauri/src/commands/tests/attachment_tests.rs \
-  --risk lock \
-  --final-check 'ci::MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh'
+  --owned src-tauri/src/commands/tests/attachment_tests.rs
+```
 
-scripts/agent-harness run attachment-loss
+`open` starts from a committed base, creates
+`../.murmur-agent-tasks/v2/<task-id>/meetnotes`, and prints the exact worktree.
+The primary checkout's dirty bytes are never copied. Edit only the printed
+worktree and stay inside the declared `--owned` paths. After opening, invoke the
+task worktree's own `scripts/agent-harness`; the runner refuses a caller whose
+executable protocol differs from the task-pinned protocol.
+
+Plan and verify from the isolated task worktree:
+
+```bash
+scripts/agent-harness plan attachment-loss
+scripts/agent-harness verify attachment-loss
 scripts/agent-harness status attachment-loss
 ```
 
-The writer/reviewer pair is configurable per task via `--agent` (writer) and `--reviewer`
-(reviewer); both default to `config.json` `default_writer` / `default_reviewer` (shipped:
-`claude` / `claude`). Any pair of real vendors is allowed, including same-vendor
-(`claude/claude`, `codex/codex`) — the reviewer is always a fresh, independent session with no
-writer context, so same-vendor is a procedurally independent adversarial review (though not
-model-family-diverse). High-risk paths (`lock`/`egress`/`protocol`) auto-escalate a same-vendor
-reviewer to the opposite vendor unless you pass `--allow-same-vendor-high-risk`. The `fake`
-adapter is not accepted by public `init`, verification, hooks, or commit; it exists only behind the
-in-process deterministic selftest interface.
-
-`init` always starts from a committed `base_sha`; it never copies dirty changes from the primary checkout.
-
-In normal conversation you do not have to type that contract yourself. A request such as
-"fix attachment loss and ship it" activates the `ship-feature` workflow; the agent translates
-the request into `init`, reports the owned paths and checks, and runs the same state machine. The
-CLI remains available when you want an explicit/reproducible experiment or want to choose which
-vendor writes and which vendor reviews.
-
-Each task mirrors the real sibling-repository layout under one isolated root:
-
-```text
-../.murmur-agent-tasks/<task-id>/
-├── meetnotes/       # branch agent/<task-id>; this is where the writer may edit
-└── murmur-server/   # detached, clean, read-only-by-contract revision from .murmur-server-revision
-```
-
-The primary checkout and the operator's dirty `../murmur-server` checkout are never copied into
-the trial. Manifests, logs, model streams, diffs, results, and attestations live under the shared
-Git common directory at `.git/agent-harness/`.
-
-UI checks receive a runner-owned `MURMUR_E2E_PORT` reservation for their full lifetime. The
-Playwright config propagates that one value to its worker processes and refuses server reuse, so a
-test cannot silently attach to another task's Angular server.
-
-Every deterministic check also runs under a fail-closed macOS Seatbelt profile. It receives a
-fixed allowlist environment (no ambient tokens/DEKs), can write only the isolated worktree and
-explicit task-private runtime/cache leaves, and has no Internet access. The profile starts from
-macOS's `allow default` capability baseline and then imposes explicit file/network/process/secret
-denials; it is strong file/network containment, not a pure capability allowlist. Contracts, logs,
-reviews, and attestations remain parent-**writable** only; checks may read runner inputs needed for
-reproducibility but cannot create or alter evidence.
-The machine's Cargo registry, advisory database, tool binaries, Rustup toolchains, and the
-checksum-verified sherpa-onnx prebuilt archive are exposed read-only; offline Cargo writes and
-build artifacts stay inside that one task. Native resolvers may enumerate only the literal ancestor
-directories needed to reach an allowed leaf such as shared `node_modules`; those ancestors do not
-gain subtree read access.
-Playwright, native runtime probes, and Rust test commands get loopback TCP only because the
-existing Rust suite owns ephemeral local HTTP listeners; ordinary build/lint checks remain
-network-denied. The profile, complete sanitized
-environment (keys and values), stdout/stderr and combined log are hash-bound into the attestation.
-If `sandbox-exec` is absent,
-the task is `BLOCKED`; checks never fall back to an unsandboxed shell.
-
-The default loop permits two repair rounds and has a two-hour task-wide deadline in addition to
-per-process timeouts. Two consecutive repair rounds with the same staged diff and the same
-failing-check/review signature stop as `BLOCKED/no progress`. Any terminal task stays terminal;
-an abandoned nonterminal run lands `BLOCKED/interrupted` instead of silently receiving a fresh
-repair budget. Retrying requires a new contract. A failed or
-blocked run emits a content-free `learning-candidate.json` for explicit human curation; it never
-edits binding learnings automatically. Disposable task caches are pruned immediately after
-`FAILED`/`BLOCKED`, while small sandbox profiles and all logs/evidence remain.
-
-Risk evidence is runner-owned. Path classification automatically injects byte-exact canonical
-commands from `config.json`; a caller cannot satisfy a lock or egress requirement with a label such
-as `rust-lib::true`. Performance-sensitive paths add `perf-contracts`, which checks bounded audio,
-spill, inference-lane and thermal lifecycle invariants. Noisy wall-clock/RSS/Metal measurements are
-deliberately not PR gates; use the signed-Mac `scripts/measure-recording-ram.sh` protocol for them.
-
-After `PASSED`, commit the exact attested index from the isolated worktree, then close it:
+`plan` is optional but useful for inspection. `verify` always rebuilds the plan
+from the current exact binary diff before using evidence. If infrastructure
+pauses or a typed probe is collected, continue with:
 
 ```bash
-scripts/agent-harness status attachment-loss   # prints the exact worktree path
-scripts/agent-harness verify-attestation attachment-loss
+scripts/agent-harness resume attachment-loss
+```
+
+Completed green checks for the same attempt are reused byte-for-byte.
+Timed-out or environmentally blocked checks rerun. Any diff, tree, plan, or
+protocol change creates a different attempt and invalidates stale evidence.
+
+The task description is a behavioral acceptance contract. It names outcomes
+and invariants, not commands for the writer to run or report. The plan derived
+from the actual changed paths is the sole executable check profile.
+
+After `PASSED`, commit, push, and create the PR. Keep the task worktree until
+the PR has merged or the operator explicitly accepts an archived handoff:
+
+```bash
 scripts/agent-harness commit attachment-loss \
   -m "fix(attachments): preserve files when closing a note"
-git -C ../.murmur-agent-tasks/attachment-loss/meetnotes \
-  push -u origin agent/attachment-loss
-scripts/agent-harness close attachment-loss
+git -C ../.murmur-agent-tasks/v2/attachment-loss/meetnotes \
+  push -u origin agent/v2/attachment-loss
+gh pr create -R murmur-io/murmur --base murmur \
+  --head agent/v2/attachment-loss \
+  --title "fix(attachments): preserve files when closing a note" \
+  --body "What changed and how the exact diff was verified"
+# After the PR merges:
+scripts/agent-harness clean attachment-loss
 ```
 
-`commit` re-verifies the receipt, requires the QueaT identity, rejects AI co-author trailers, and
-creates one commit from exactly the attested index (an explicit empty commit for a valid
-`--no-expected-change` task). `verify-attestation` and the defense-in-depth
-commit hook fail after any post-review edit. If a manual commit is ever needed, use
-`git -C <printed-worktree> commit ...` so the hook can resolve the task explicitly. `close` is
-deliberately strict: only the runner's `COMMITTED` state is accepted; the commit receipt must match
-the exact HEAD, sole parent, tree, message, timestamps, and QueaT author/committer. It then removes
-only the two task worktrees, stores the exact task tip under `refs/agent-harness/archive/`, removes
-the local task branch, prunes disposable caches, and preserves the evidence.
+`commit` stages only the declared scope, re-verifies the exact PASS evidence,
+requires `QueaT <kgm004a@gmail.com>`, rejects receipt/co-author injection, and
+writes one commit with v2 receipt trailers. A durable intent makes the command
+resumable if the process dies after `git commit` but before the receipt/state
+write: rerunning the exact message finalizes the existing commit and never
+creates another one.
 
-Changing the executable control-plane itself has one explicit bootstrap because `init` normally
-freezes the auto-loaded instruction fingerprint before the writer runs. For a `--kind harness`
-task only, an operator may copy a prepared patch into the new isolated worktree and run
-`scripts/agent-harness seal-prepared <task-id>` **before any model or check**. The command requires
-an actually changed protected path, stages the exact owned bytes, refuses dependency-pin changes,
-rebinds the instruction fingerprint once, and writes `prepared.json`. From that point the new
-instructions are immutable again and the ordinary writer, checks, fresh independent reviews,
-attestation, commit, and close lifecycle is mandatory. Feature/product tasks cannot use this path.
+`clean` verifies a clean committed task, archives the exact tip, then removes
+only its isolated worktree and branch. An uncommitted task requires
+`clean --abandon`; before removal it archives every Git-visible tracked and
+untracked byte through a private index.
 
-Failed or blocked tasks can be cleaned without losing their work:
+## Plans are derived, not claimed
+
+The changed path set selects canonical commands from `config.json`; callers
+cannot replace them with weaker commands:
+
+- Rust source or manifests: `cargo test --lib`.
+- Angular source: lint and production build; behavior `.ts`/`.html` also gets
+  Playwright.
+- Sharing protocol or `.murmur-server-revision`: client Rust plus the pinned
+  sibling `murmur-protocol` test.
+- Harness/control-plane changes are refused by v2. During shadow they use the
+  externally anchored v1 `--kind harness` plus `seal-prepared` workflow.
+- Runtime and performance checks: only explicit `--claim runtime` or
+  `--claim performance`.
+- Actual lock, egress, and protocol paths: the combined review plus the
+  corresponding cross-vendor security specialist.
+
+The protocol hash includes the runner, canonical checks, prompts, schemas,
+wrappers, receipt verifier, hooks, config audit, runtime smoke implementation,
+and CI wiring. Changing any of those invalidates prior plan evidence.
+
+V2 refuses every path protected by `config.json`, including its own runner,
+hooks, schemas, CI, rules, and skills. A task may not weaken the code that
+judges it.
+
+Reviews run in fresh tool-free model sessions, at most three in parallel. Each
+receives only the runner-built immutable diff/evidence bundle and has no
+filesystem or shell tools. A transient reviewer failure gets one bounded retry
+with both attempts recorded. A review may request only a typed, allowlisted
+probe; the runner executes the canonical command, records it, and requires a
+fresh review bound to that probe evidence. `PASS` is rejected when any
+MAJOR/BLOCKER, proof gap, or unresolved probe remains.
+
+## Crash and contention behavior
+
+The append-only state event is authoritative; `state.json` is a repairable
+projection. Runner checkpoints are written atomically before progress advances.
+`resume` therefore recovers from SIGKILL without repeating green evidence.
+
+Plan, verify/resume, commit/guard, and clean mutations are serialized by one
+task lock. Cargo and full-CI work share one workspace resource lane under
+`../.murmur-agent-tasks/.resources`, across the primary checkout, linked task
+worktrees, and the standalone driver clone:
 
 ```bash
-scripts/agent-harness reap attachment-loss
-scripts/agent-harness gc --older-than-hours 168 --dry-run
-scripts/agent-harness gc --older-than-hours 168
+scripts/agent-resource-run --chdir src-tauri -- cargo test --lib
+scripts/agent-resource-run -- bash scripts/ci.sh
+scripts/agent-dev-run -- npm run dev
 ```
 
-`reap` first writes every Git-visible tracked and untracked task byte to a hidden Git archive ref
-(ignored dependency caches remain disposable), then removes
-only the contract-bound client/server worktrees and local task branch. It refuses dirty sibling
-server worktrees. `gc` applies the same operation to old `FAILED`/`BLOCKED`/legacy `CLOSED`
-tasks and to stale abandoned `INITIALIZED`/`RUNNING`/`CHECKING`/`REVIEWING`/`REPAIRING`
-tasks only after the age cutoff and only when no live task-run lock exists. The locked reaper
-revalidates both conditions before converting an abandoned task to `BLOCKED/interrupted`.
-When an older runner already lost/removed a task worktree, `gc` cannot invent a code
-snapshot; it preserves the existing evidence/state and prunes only disposable runtime caches.
-`--dry-run` lists reap and runtime-only targets separately.
+The lane publishes owner PID, task, command, start time, and heartbeat
+immediately. Waiters report that owner immediately and then heartbeat; there is
+no silent 30-second wait. Long-lived dev supervision stays outside the lane and
+wraps only its child Cargo/rustc processes.
 
-For a change that claims native boot behavior, add the exclusive runtime evidence before review:
+Runtime claims run `scripts/harness-runtime-smoke` as a preflight before an
+expensive reviewer dispatch. It uses isolated ports/home/process groups and
+separate warm/cold budgets. A headless smoke still does not prove Touch ID,
+ScreenCaptureKit/TCC, real capture, notarization, or signed-build behavior.
+
+## Evidence and receipts
+
+V2 task artifacts live under:
+
+```text
+.git/agent-harness/v2/tasks/<task-id>/
+├── task.json
+├── events.jsonl
+├── state.json
+├── attempts/<attempt-id>/
+│   ├── plan.json
+│   ├── protocol.json
+│   ├── diff.patch
+│   ├── checks/
+│   ├── probes/
+│   ├── reviews/
+│   └── evidence.json
+├── commit-intent.json
+└── commit.json
+```
+
+The local evidence verifier binds the contract, base, exact binary diff, tree, plan, protocol,
+checks, probes, fresh reviewer invocation metadata/logs, findings, telemetry,
+and degradation provenance. The remote
+`scripts/verify-harness-attestation` cannot reconstruct private local evidence;
+it recomputes the commit parent and exact diff and checks strict v1/v2 trailer
+consistency rather than accepting trailer presence alone.
+
+Remote receipt policy is monotonic. `agent/v2/*` is reserved: every
+branch-authored non-merge commit there requires a v2 receipt. A receipted
+history may upgrade v1 -> v2, but it may never downgrade v2 -> v1 or return to
+`Harness-Lane: B`. Lane B is only a deliberate pre-receipt opt-out on an
+ordinary non-v2 `agent/*` branch. Renaming a branch does not escape receipt
+coverage once its history contains one.
+
+The receipt verifier's deterministic selftest builds real temporary Git
+histories for v1, v2, mixed ancestry, merge topology, duplicates, aliases,
+unknown versions, amendments, cherry-picks, renamed files, unattested commits,
+catch-up smuggling, reserved v2 branches, Lane-B conflicts, and downgrade
+attempts. CI runs this suite before expensive builds, on both `pull_request`
+and `merge_group`.
+
+Remote policy auditing has two deliberately separate scopes. Pull-request
+runs lend GitHub's ordinary read-only token only to
+`scripts/agent-remote-audit --public` and may report `PASS_MERGE_SCOPE`: every
+merge-blocking rule visible to that token passed, while admin-only controls
+remain explicitly `MONITOR_ONLY`. A `merge_group` run executes the
+deterministic evaluator selftest and receipt gate, but no live GitHub audit.
+Privileged monitoring runs only on `schedule` or `workflow_dispatch` at
+`refs/heads/murmur`, using `MURMUR_REMOTE_AUDIT_TOKEN`. The audit script is
+repository code and necessarily receives the selected token; `scripts/ci.sh`
+clears every token variable immediately afterward, before later repository
+checks. The expected split is declared in
+`.agents/harness/remote-policy.json`.
+
+## V1 compatibility and import
+
+Finish a valid v1 `PASSED`/`COMMITTED` task in v1. To adopt a nonterminal v1
+task without rerunning its writer:
 
 ```bash
---check 'tauri-boot::scripts/harness-runtime-smoke'
+scripts/agent-harness import-v1 <task-id>
 ```
 
-The smoke uses an isolated temporary home and terminates only the process group it created. If the installed app or another dev task owns `:1420`/`:8765`, it returns `BLOCKED`; it never kills or reuses that process. Touch ID, ScreenCaptureKit/TCC, notarization and real capture still require recorded signed-Mac evidence.
+Import is byte-preserving and idempotent. It records the source contract and
+degraded provenance, reconstructs a missing worktree only from exact archived
+Git evidence, and never fabricates PASS. If exact bytes cannot be recovered,
+the imported task becomes history-only `NEEDS_EVIDENCE`. Adopting a prior v1
+PASS requires explicit `--invalidate-pass`.
 
-## Agent evaluations
+While v1 remains the bootstrap for protected control-plane paths, its checks
+still run in fail-closed macOS Seatbelt profiles; Playwright receives a
+runner-reserved `MURMUR_E2E_PORT`. Writer/reviewer vendors remain selectable
+with `--agent`/`--reviewer`, and lock/egress/protocol work escalates a
+same-vendor reviewer unless explicitly overridden. `reap` archives the exact
+bytes of terminal failed/blocked/closed work before removing its worktree;
+`gc` applies that lifecycle to stale tasks.
+
+Historical markerless v1 receipts retain their original, narrower provenance
+field set so honestly earned archives remain verifiable. New v1 contracts are
+policy-2 and cannot run through that path. This is a consistency receipt, not
+a signature: deliberately rewriting both runner-owned contract and receipt
+artifacts is outside its stated threat model.
+
+## Operational telemetry
+
+The append-only ledgers for both generations can be rolled up without parsing
+multi-megabyte raw model logs:
 
 ```bash
-scripts/agent-harness eval list
-scripts/agent-harness eval run --suite smoke --agent codex --trials 1
-scripts/agent-harness eval run --suite smoke --agent claude --trials 1
-scripts/agent-harness eval report <run-id>
+scripts/agent-harness metrics
+scripts/agent-harness metrics --limit 50 --json
 ```
 
-Eval trials use disposable history-free snapshots. Hidden graders remain outside the writer's workspace. A normal trial is single-shot; repair rounds are an explicit, separately reported mode. The report includes pass-at-1, any-pass-at-k, all-pass-at-k, duration, failures, scope violations, and harness/infra errors.
+`--limit` selects the most recently active task generations by their latest
+valid event timestamp. The report includes task/status counts, model
+invocations, observed cost and turns, model/check/review durations with
+nearest-rank p50/p90, retries, timeouts, and malformed-ledger counts. Every
+optional total is paired with coverage (`available`, `missing`, `invalid`);
+missing historical telemetry is never imputed as zero. A successful
+`model-process-exit` plus its matching `model-invocation` is counted once, while
+each bounded retry remains a separate invocation.
 
-Only deterministic harness/eval selftests belong in blocking PR CI. Live Codex/Claude capability
-trials are manual or scheduled until a pinned task/configuration has a reviewed reference solution
-and repeated near-100% reliability; one stochastic trial must never red-bar a product PR.
-
-## Enforcement
-
-- Claude/Codex hooks are fast defense-in-depth and call one canonical implementation.
-- The canonical commit hook verifies the exact staged diff against the task attestation.
-- `scripts/agent-config-audit` and `scripts/agent-harness selftest` run at the start of `scripts/ci.sh`.
-- GitHub required checks remain the authoritative remote merge boundary; local hooks are bypassable by design.
-
-Audit that boundary without mutating GitHub:
+## Control-plane verification
 
 ```bash
-scripts/agent-remote-audit
+python3 .agents/harness/v2_selftest.py
+python3 .agents/harness/metrics_selftest.py
+scripts/verify-harness-attestation --selftest
+bash .codex/hooks/selftest.sh
+scripts/agent-config-audit --ci
+scripts/agent-harness selftest --ci
 ```
 
-The repository policy is versioned in `remote-policy.json`. Its merge scope requires an active
-ruleset that actually applies to `murmur`, requires the exact GitHub Actions check
-`gate (full ci.sh — release parity)` with strict-up-to-date checks, resolves every review thread,
-and blocks deletion/non-fast-forward updates. The privileged monitoring scope separately requires
-no bypass actors plus secret scanning and push protection.
-The approval count is deliberately **zero** while Murmur has one operator: requiring the PR author
-to obtain an independent approval would deadlock, not add separation. The no-bypass ruleset plus
-the exact CI status is the honest enforceable boundary.
+`selftest` runs both generations. `doctor` audits dependencies, both schema
+families, stale state/lock projections, ghost tasks, orphan worktrees, and
+cleanup debt. Local selftests prove the control plane's deterministic behavior;
+they do not certify application behavior or remote branch enforcement.
 
-CI runs a live read-only audit first. Pull requests lend only their ordinary, least-privilege
-GitHub Actions token and may return `PASS_MERGE_SCOPE` only when every merge-scope control passes.
-The three admin-only controls are labeled `MONITOR_ONLY`;
-that verdict explicitly does not attest them for the PR. Trusted schedule/dispatch runs require
-the privileged audit with the repository-scoped `MURMUR_REMOTE_AUDIT_TOKEN`; a missing or
-under-scoped secret fails closed and never falls back to the narrower PR scope. The secret is never
-exposed to pull-request code. A token exists only in the `ci.sh` step and is unset immediately
-after the audit, before any other repository command. Local runs execute the deterministic
-evaluator selftest unless `MURMUR_CI_PUBLIC_REMOTE_AUDIT=1` or privileged
-`MURMUR_CI_LIVE_REMOTE_AUDIT=1` is set. A remote FAIL means the development loop is locally
-functional but the audited enforcement scope is incomplete; this audit never mutates GitHub.
+Hooks are fast defense-in-depth. GitHub's required `gate (full ci.sh — release
+parity)` remains the remote merge boundary. Push, PR creation, merge, signing,
+notarization, and publication remain operator-owned actions.
 
-Control-plane tasks declare the harness and hook meta-selftests as hash-bound checks. Their nested
-fake checks inherit the already-applied outer no-network Seatbelt because macOS refuses a second
-`sandbox_apply`. Inherited mode is accepted only for fake/selftest receipts and only after
-`sandbox_check` proves the current process is kernel-sandboxed; a forged host environment marker
-fails closed. Production task checks always record `sandbox_mode: direct`.
+## Program continuity and cutover
 
-No production vault, MeetingNotes database, Keychain item, live microphone, ScreenCaptureKit session, or real cloud provider belongs in an automated trial. Signed-build-only behavior stays an explicit human/runtime gate.
+The verifier schedules one task only. For a Claude multi-PR session, set a
+session-scoped `/goal` that requires the next manifest action within 60 seconds
+after the prior task reaches a stable state. Do not add a repository-wide Stop
+hook or put a program queue inside the receipt state machine.
+
+V2 remains a candidate until shadow evidence includes the historical MAJOR
+corpus, at least ten representative real tasks, the declared kill/429/timeout/
+occupied-port/lane/trunk faults, and measured p50/p90 budgets. Only a later
+cutover change may call it the default or retire v1's writer/repair topology.

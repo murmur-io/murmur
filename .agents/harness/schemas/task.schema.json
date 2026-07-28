@@ -29,6 +29,10 @@
   ],
   "properties": {
     "schema_version": { "const": 1 },
+    "receipt_policy_version": {
+      "const": 2,
+      "description": "Optional only so historical markerless v1 contracts remain verifiable; every new contract is bound to policy 2."
+    },
     "task_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$" },
     "description": { "type": "string", "minLength": 1 },
     "kind": { "enum": ["bug", "feature", "refactor", "docs", "harness"] },
