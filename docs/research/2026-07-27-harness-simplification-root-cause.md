@@ -2,19 +2,35 @@
 # Research: Harness root cause and simplification
 
 > **Implementation update — 2026-07-28.** The recommended verifier-only
-> architecture is now on `murmur`: PR #496 landed the v2 engine, PR #499
-> activated the generation-aware CLI and resumable evidence lifecycle, and PR
-> #501 made verification snapshots self-contained under Seatbelt. Guarded
-> receipts, the base-revision CI verifier, `merge_group` wiring, doctor/metrics,
-> lossless cleanup, and the sherpa archive fix from PR #478 are all merged. A
-> real interrupted/resumed docs task preserved its exact diff, recovered a stale
-> lock, reached `NEEDS_FIX` instead of a terminal loss, and exposed the snapshot
-> bug subsequently fixed by #501. V2 remains opt-in while the broader real-task
-> and high-risk shadow budgets below are incomplete; v1 remains only for
-> existing tasks and externally anchored changes to protected control-plane
-> paths. The diagnosis below is the decision record, not current operator
-> instructions. Current commands live in `.agents/harness/README.md` and
-> `.agents/skills/harness/SKILL.md`.
+> architecture is now on `murmur`. PR #496 landed the v2 engine; #499 activated
+> the generation-aware CLI and resumable evidence lifecycle; #501 made
+> verification snapshots self-contained under Seatbelt; #513 made the shared
+> Cargo lane FIFO, visible, and garbage-collected; #515 made focused
+> security-regression evidence available to reviewers; and #516 bound unchanged
+> source context at sensitive egress seams into the immutable review input.
+> Guarded exact-diff receipts, base-revision CI verification, `merge_group`
+> wiring, doctor/metrics, lossless cleanup, and the sherpa archive fix from #478
+> are all merged.
+>
+> The resulting operator loop is deliberately small:
+> `open -> edit normally -> plan/verify -> commit -> clean`. There is no model
+> writer or automatic repair loop inside v2. `NEEDS_FIX` and `NEEDS_EVIDENCE`
+> preserve the same task worktree and make the next exact diff a fresh,
+> reviewable attempt. Real trials have now exercised an interrupted/resumed docs
+> task, a full-stack settings/glossary task, and a high-risk MCP visibility and
+> transport task. They preserved bytes across failed evidence, showed queue
+> owner/PID/position instead of a silent lane wait, ran specialist reviews
+> concurrently, and found substantive defects without discarding the
+> implementation.
+>
+> One measured performance cost remains: each fresh exact-diff attempt gets a
+> new absolute verification-snapshot path, which invalidates part of Cargo's
+> path-sensitive fingerprinting even when the task target is retained. This is
+> an optimization follow-up, not a trust or resumability failure. V2 stays
+> opt-in; v1 remains only for existing tasks and externally anchored changes to
+> protected control-plane paths. The diagnosis below is the decision record, not
+> current operator instructions. Current commands live in
+> `.agents/harness/README.md` and `.agents/skills/harness/SKILL.md`.
 
 ## TL;DR / Verdict
 
