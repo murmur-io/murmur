@@ -50,7 +50,7 @@
     "ng-build": "npx ng build",
     "playwright": "npm run test:e2e -- --workers=1",
     "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh",
-    "harness-python": "python3 -m py_compile .agents/harness/task_runner.py .agents/harness/cli.py .agents/harness/verifier.py .agents/harness/process_guardian.py .agents/harness/config_audit.py .agents/harness/hook_guard.py .agents/harness/resource_policy.py .agents/harness/v2_selftest.py",
+    "harness-python": "python3 -B -c 'import ast, importlib, pathlib, sys; names=(\"task_runner\",\"cli\",\"verifier\",\"process_guardian\",\"config_audit\",\"hook_guard\",\"resource_policy\",\"v2_selftest\",\"v2_fault_selftest\",\"metrics\",\"metrics_selftest\"); root=pathlib.Path(\".agents/harness\"); [ast.parse((root / (name + \".py\")).read_text(encoding=\"utf-8\"), filename=str(root / (name + \".py\"))) for name in names]; sys.path.insert(0, str(root)); [importlib.import_module(name) for name in names]'",
     "harness-v2-selftest": "python3 .agents/harness/v2_selftest.py",
     "receipt-selftest": "scripts/verify-harness-attestation --selftest",
     "hook-selftest": "bash .codex/hooks/selftest.sh",
