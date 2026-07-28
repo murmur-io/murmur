@@ -1545,10 +1545,11 @@ def command_needs_sherpa_archive(command: str, worktree: Optional[Path] = None) 
             "scripts/e2e-core.sh",
             "scripts/e2e-mix.sh",
             "scripts/harness-runtime-smoke",
-            # A runner-owned check script can compile Rust without exposing
-            # `src-tauri` in its command string. Match the checks directory so
-            # the pinned offline sherpa archive is available to those scripts.
-            ".agents/harness/checks/",
+            # The performance-contract script compiles Rust without exposing
+            # `src-tauri` in its command string. Match that capability
+            # explicitly; other runner-owned checks (for example npm-lock)
+            # must not inherit the heavyweight Sherpa input.
+            ".agents/harness/checks/perf-contracts.sh",
             "npm run dev",
             "npm run tauri",
             "npx tauri",
