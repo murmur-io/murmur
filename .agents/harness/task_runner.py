@@ -1306,6 +1306,14 @@ def command_needs_sherpa_archive(command: str, worktree: Optional[Path] = None) 
             "scripts/e2e-core.sh",
             "scripts/e2e-mix.sh",
             "scripts/harness-runtime-smoke",
+            # A harness check SCRIPT compiles the tree from inside itself, so the marker never
+            # appears in the command string the runner matches on. `perf-contracts.sh` runs
+            # `cd src-tauri && cargo test --lib …`, but its command is only
+            # `bash .agents/harness/checks/perf-contracts.sh` — so without this marker the pinned
+            # archive stayed unexposed and the network-isolated build tried to DOWNLOAD
+            # sherpa-onnx, which can never succeed under `network_mode: none`. Match the checks
+            # directory so any future check script inherits the offline archive too.
+            ".agents/harness/checks/",
             "npm run dev",
             "npm run tauri",
             "npx tauri",
