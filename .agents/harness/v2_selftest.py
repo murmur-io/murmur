@@ -3753,6 +3753,161 @@ def standalone_driver_lane_cases(test: Tests) -> None:
         )
 
 
+def sherpa_workspace_cache_cases(test: Tests) -> None:
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-sherpa-cache-") as raw:
+        root = Path(raw)
+        primary, driver, _base = _standalone_driver(root)
+        snapshot = root / ".murmur-agent-tasks" / "v2" / "sherpa-test" / "verify"
+        snapshot.parent.mkdir(parents=True)
+        _git(
+            driver,
+            "clone",
+            "-q",
+            "--local",
+            "--no-hardlinks",
+            str(driver),
+            str(snapshot),
+        )
+        common = Path(
+            _git(
+                driver,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_dir = common / "agent-harness" / "v2" / "tasks" / "sherpa-test"
+        task_dir.mkdir(parents=True)
+        task_worktree = (
+            root
+            / ".murmur-agent-tasks"
+            / "v2"
+            / "sherpa-test"
+            / "meetnotes"
+        )
+        legacy.atomic_write_json(
+            task_dir / "task.json",
+            {
+                "task_id": "sherpa-test",
+                "worktree_path": str(task_worktree),
+            },
+        )
+
+        fixture = b"checksum-pinned-sherpa-fixture\n"
+        fixture_sha = hashlib.sha256(fixture).hexdigest()
+        machine = legacy.platform.machine().lower()
+        architecture = {
+            "aarch64": "arm64",
+            "arm64": "arm64",
+            "x86_64": "x86_64",
+        }[machine]
+        filename = f"sherpa-{architecture}.tar.bz2"
+        legacy_directory = primary / "target" / "sherpa-onnx-prebuilt"
+        legacy_directory.mkdir(parents=True)
+        legacy_candidate = legacy_directory / filename
+        legacy_candidate.write_bytes(fixture)
+        config = copy.deepcopy(legacy.load_config())
+        config["shared_artifacts"]["sherpa_onnx"] = {
+            "directory": "target/sherpa-onnx-prebuilt",
+            "archives": {
+                architecture: {
+                    "filename": filename,
+                    "sha256": fixture_sha,
+                }
+            },
+        }
+        original_load_config = legacy.load_config
+        try:
+            legacy.load_config = lambda: copy.deepcopy(config)
+            resolved, actual_sha = legacy.verified_sherpa_archive(
+                snapshot,
+                task_dir=task_dir,
+            )
+            shared_directory = (
+                root
+                / ".murmur-agent-tasks"
+                / ".resources"
+                / "target"
+                / "sherpa-onnx-prebuilt"
+            )
+            shared_candidate = shared_directory / filename
+            test.equal(
+                "SHERPA isolated snapshot resolves workspace shared cache",
+                resolved,
+                shared_directory.resolve(),
+            )
+            test.equal(
+                "SHERPA promoted archive remains checksum-bound",
+                actual_sha,
+                fixture_sha,
+            )
+            test.equal(
+                "SHERPA runner promotes the verified legacy archive byte-identically",
+                shared_candidate.read_bytes(),
+                fixture,
+            )
+            test.true(
+                "SHERPA snapshot requires no manual archive seed",
+                not (
+                    snapshot
+                    / "target"
+                    / "sherpa-onnx-prebuilt"
+                    / filename
+                ).exists(),
+            )
+            shared_candidate.write_bytes(b"corrupt\n")
+            test.raises(
+                "SHERPA corrupt shared cache fails closed despite valid legacy source",
+                lambda: legacy.verified_sherpa_archive(
+                    snapshot,
+                    task_dir=task_dir,
+                ),
+                "checksum mismatch",
+            )
+            shared_candidate.unlink()
+            shared_candidate.symlink_to(legacy_candidate)
+            test.raises(
+                "SHERPA symlinked shared archive fails closed",
+                lambda: legacy.verified_sherpa_archive(
+                    snapshot,
+                    task_dir=task_dir,
+                ),
+                "not a regular file",
+            )
+            shared_candidate.unlink()
+            shared_directory.rmdir()
+            shared_directory.symlink_to(legacy_directory, target_is_directory=True)
+            test.raises(
+                "SHERPA symlinked shared cache directory fails closed",
+                lambda: legacy.verified_sherpa_archive(
+                    snapshot,
+                    task_dir=task_dir,
+                ),
+                "cache directory is symlinked",
+            )
+            shared_directory.unlink()
+            shared_directory.mkdir()
+            legacy_candidate.unlink()
+            snapshot_candidate = (
+                snapshot
+                / "target"
+                / "sherpa-onnx-prebuilt"
+                / filename
+            )
+            snapshot_candidate.parent.mkdir(parents=True)
+            snapshot_candidate.write_bytes(fixture)
+            test.raises(
+                "SHERPA never promotes a manually seeded verification snapshot",
+                lambda: legacy.verified_sherpa_archive(
+                    snapshot,
+                    task_dir=task_dir,
+                ),
+                "workspace shared cache",
+            )
+        finally:
+            legacy.load_config = original_load_config
+
+
 def verification_snapshot_cases(test: Tests) -> None:
     """A check snapshot must resolve Git objects inside its own Seatbelt scope."""
 
@@ -5401,6 +5556,7 @@ def main() -> int:
     readonly_review_wall_timeout_cases(test)
     state_and_lock_cases(test)
     standalone_driver_lane_cases(test)
+    sherpa_workspace_cache_cases(test)
     verification_snapshot_cases(test)
     snapshot_node_modules_manifest_cases(test)
     checkpoint_cases(test)
