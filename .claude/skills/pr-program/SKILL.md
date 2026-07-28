@@ -1,201 +1,132 @@
 ---
 name: pr-program
 description: >-
-  Run a MULTI-PR program (audit remediation, God-file split, a batch refactor, a fix-all-findings
-  sweep) on Murmur without freezing the Mac. The RAM-safe SEQUENTIAL, CI-gated cadence + the
-  pre-push checklist + worktree hygiene + verifier-recovery discipline — proven driving a 12-PR
-  program clean. Use whenever the work is "many PRs, one theme" and you'd otherwise be tempted to
-  fan out parallel builders (which freezes this 64GB Mac). NOT for a single feature (that's
-  /ship-feature); this is the orchestration LAYER that runs many ship-feature-shaped PRs in series.
+  Run a multi-PR Murmur program through verifier-only Harness v2: one local
+  mutation at a time, exact-diff verification, remote CI, durable continuity,
+  and lossless cleanup.
 ---
 
-# /pr-program — run a many-PR program sequentially, CI-gated, without freezing the Mac
+# /pr-program
 
-This is the **orchestration playbook** for a program of PRs (10, 20, 40 of them). `/ship-feature` is
-one PR's build→verify loop; this skill is the loop AROUND it: how to sequence many, keep the machine
-alive, and let CI be the real gate. It encodes the hard-won discipline from the brain-v3 audit-fix
-program (12 PRs, 2 real bugs caught by review, zero shipped regressions) and the day the Mac froze.
+Harness verifies one task. The program queue remains an orchestrator concern.
+V2 has no writer and no repair loop: an implementation agent edits the isolated
+worktree, while the runner alone owns checks, reviews, evidence, and PASS.
 
-## THE RAM LAW (the thing that actually bites)
+## Program rules
 
-Murmur's app test binary statically links the ML tree (candle/whisper/onnx); ONE `cargo test --lib`
-link is a ~15-20 GB transient. **Several at once — multiple builder/verifier agents each running
-their own cargo on the shared `CARGO_TARGET_DIR`, plus your own runs — pin the macOS memory
-compressor and freeze the whole UI** (swap stays 0; it's compression, not pageout). After
-`pkill cargo rustc` the machine is instantly ~95% free — proving it's transient build peaks, not a
-leak. Root cause + fix: `docs/research/2026-07-18-build-ram-freeze.md`.
+- Use the dedicated standalone `.murmur-agent-driver`; never the primary
+  checkout or a linked driver worktree.
+- Keep at most one task locally editing or verifying. Parallelize only read-only
+  mapping and research.
+- Cargo and full CI always use the shared resource lane.
+- Keep a simple dependency-ordered manifest outside the harness.
+- Establish a session `/goal`: after every stable outcome, execute the next
+  manifest action within 60 seconds. Saying "I will start the next task" is not
+  progress.
+- Default to finishing and merging one PR before opening its dependent task.
 
-**Rules, non-negotiable:**
-1. **Exactly ONE `cargo` process machine-wide, ever.** One builder OR one verifier OR one of your
-   runs — never two. Verifiers do their RED-reverts as SINGLE targeted tests, or run read-only
-   (lock-security is mostly static). Never dispatch two cargo-running agents at once.
-2. **Never run the full 1900-test suite locally.** Iterate + verify with TARGETED filters
-   (`cargo test --lib links` = full compile, catches build errors, runs only that module). **CI (the
-   GitHub macOS runner) runs the full `ci.sh` gate — remotely, at 0 local RAM.** Push → let CI gate.
-3. **`CARGO_BUILD_JOBS=2 … -j2`.** And ensure `[profile.dev.package."*"] debug = false` is in the
-   workspace `Cargo.toml` (it slashes dependency-debuginfo link RAM — land it as PR-0 of any program
-   if missing).
-4. **Read-only fan-out is the ONLY safe parallelism.** A MAPPING phase (agents reading files to
-   categorize by domain, no cargo) can be a Workflow. The EXECUTION (move code + compile) is serial.
-   Do NOT reach for a parallel-cargo Workflow.
-
-## THE CADENCE (per PR)
-
-```
-worktree off fresh origin/murmur (light profile present)
-  → builder (ONE local cargo): writes code, iterates on TARGETED tests,
-    runs `cargo clippy --lib -- -D warnings` (link-free CI-parity), greps the diff for MSRV items
-  → verify: adversarial-verifier (+ lock-security-reviewer if the change touches seal/gate/visibility)
-    — dispatched so only ONE runs cargo (lock-security static/no-cargo alongside adversarial's targeted RED-reverts)
-  → apply any FAIL findings, re-prove RED via Edit (NEVER git-checkout an uncommitted tree), narrow re-review of the delta
-  → QueaT commit (no Claude trailers; no backticks / no "clippy --all-targets" literal in the message — block-bash refuses it)
-  → rebase onto fresh origin/murmur (merge-skew), re-grep MSRV
-  → push → PR to murmur → CI (remote, full ci.sh)
-  → overlap: start the NEXT builder while this PR's CI runs (still ONE local cargo)
-  → CI green → squash-merge → remove the worktree → next
-```
-
-Order PRs by dependency (shared-file PRs serialize; disjoint ones can overlap build↔CI). Base each PR
-on the LATEST trunk; if two touch the same file, the second rebases + resolves (usually a clean
-union — e.g. two additive blocks in `detail.component.ts`).
-
-## ALWAYS `--base origin/murmur` (2026-07-26 — the single biggest time sink found so far)
-
-`scripts/agent-harness init` defaults `--base` to **HEAD, i.e. your LOCAL `murmur`** — which goes
-stale the moment any PR merges (yours or someone else's). Two failures, both observed in one program:
-
-1. **Every PR's CI ran TWICE.** A branch cut from stale trunk is refused at merge
-   ("Required status check … is expected" = *branch not up to date*), so you merge `origin/murmur` in,
-   push, and pay a second full CI cycle. ~26 min per PR, and it looked like "CI is slow".
-2. **A PR was created WITHOUT its dependency's work in it.** P2's worktree came up with no
-   `machine.service.ts` and no `catalog.rs` because local trunk predated P1's merge — the writer would
-   have spent a full round building on a foundation that was not there.
-
-**The rule:** `git fetch origin murmur -q` then `init … --base origin/murmur`. Verify before running:
-`ls <worktree>/<a file the previous PR added>`. And `git merge --ff-only origin/murmur` on the local
-trunk periodically so the working checkout doesn't drift either.
-
-## CLEANING UP A FAILED `init` TOUCHES **TWO** REPOS
-
-The harness pairs a `meetnotes` worktree with a `../murmur-server` worktree. `rm -rf` on the task dir
-leaves BOTH registrations dangling, and the next `init` dies with *"missing but already registered
-worktree"* — pointing at `murmur-server`, which is the confusing part. Full cleanup:
+## Before each task
 
 ```bash
-rm -rf ../.murmur-agent-tasks/<task-id> .git/agent-harness/tasks/<task-id>
-git worktree prune && git -C ../murmur-server worktree prune
-git branch -D agent/<task-id>
+cd ../.murmur-agent-driver
+git fetch origin murmur
+git switch --detach origin/murmur
+scripts/agent-harness doctor
 ```
 
-## THE INSTRUCTIONS HASH COVERS `.agents/harness/*`, NOT JUST `CLAUDE.md`
+If fetch fails or `open` warns that it is falling back to local HEAD, stop. Do
+not knowingly start a program task from a stale base.
 
-`run` refuses with *"active agent instructions changed after init"* if anything in the hashed
-instruction set moves between `init` and `run` — and that set includes `.agents/harness/config.json`
-and `task_runner.py`. Uncommitted local edits there (a teammate's in-progress harness improvement) are
-enough to trip it. Init and run back-to-back, and if it fires, re-init rather than hunting for the diff.
+The contract describes observable behavior and invariants only. Do not demand
+commands or self-reported evidence. Mention only files or specifications
+available in the committed base, or include the necessary requirement directly.
 
-## THE PRE-PUSH CHECKLIST (each catches a real CI-cycle-waster)
+## Per-PR lifecycle
 
-- `cargo test --lib <targeted>` green (NOT the full suite). **This is not advice, it is arithmetic:**
-  the full suite is ~170 s, and running it 5× "to be sure" burned ~14 min of a program's wall clock
-  while CI was going to run it anyway. Filter locally; the full gate is CI's job.
-- **`cargo clippy --lib -- -D warnings` clean** — link-free, ~15s. Catches the `dead_code` class that
-  `cargo test` AND `clippy --lib --tests` MASK (a const/fn used only in `#[cfg(test)]` is "unused" in
-  CI's lib-only build; often the feature is inert too). Ate a CI cycle when skipped.
-- **MSRV grep**: `git diff origin/murmur -- src-tauri | grep '^+' | grep -oE 'is_none_or|LazyLock|split_at_checked|take_if'`
-  → empty. `-D warnings` implies `-D clippy::incompatible_msrv` (MSRV 1.77); `is_none_or`(1.82) → `map_or(true, …)`.
-- FE PRs: `npx ng lint && npx ng build` (never `ng test`).
+```bash
+scripts/agent-harness open <task-id> \
+  --kind <bug|feature|refactor|docs> \
+  --prompt "<behavior and invariants>" \
+  --owned <path> [--owned <path> ...] \
+  [--claim runtime] [--claim performance] \
+  [--reviewer codex|claude]
+```
 
-## WHEN THE HARNESS WRITER DIES MID-ROUND — READ THE DURATION FIRST
+Edit only the printed task worktree and declared scope. Then, from that
+worktree:
 
-**The usual cause is the WALL-CLOCK TIMEOUT.** On 2026-07-26 two writers died at
-`duration_ms` 1799668 and 1799683 — the 1800 s budget, to the millisecond, 108 and 181 turns,
-$14.99 and $26.33 forfeited.
+```bash
+scripts/agent-harness plan <task-id>
+scripts/agent-harness verify <task-id>
+scripts/agent-harness status <task-id>
+```
 
-**Do not repeat the misdiagnosis this section used to carry.** It previously claimed a
-*tool-permission rejection* killed the writer, because the last tool calls before the wall happened
-to be refusals (heredocs blocked by this repo's own hooks). That is inferring cause from POSITION in
-the log. Permission denials do not end a session — Claude Code feeds the refusal back as stderr and
-the writer continues. Both deaths were the clock.
+The derived plan is the executable evidence profile. Never compensate for a
+missing canonical check by putting a command in prose.
 
-**Diagnose in this order:**
-1. **`duration_ms` from the last `{"type":"result"}` line** of `logs/round-01-writer-<vendor>.jsonl`.
-   Within a second of the configured budget ⇒ timeout. Nothing else to look for.
-2. `events.jsonl` → the `model-process-exit` event carries `timed_out`, `exit_code` and
-   `terminal_subtype`. (Added 2026-07-27; older tasks predate it and only have the raw log.)
-3. Only then look at tool errors — and remember refusals are a turn TAX, not a cause of death.
+The reviewer is tool-free. When deterministic evidence is missing, it may
+request only an allowlisted canonical typed probe ID. The runner executes an
+accepted probe against the same immutable verification snapshot and binds its
+result to the next review. The operator never supplies or pastes an arbitrary
+command. `--claim runtime` and `--claim performance` add planned checks to the
+evidence profile; a claim is not itself a probe.
 
-**Since 2026-07-27 a timed-out writer no longer forfeits the round:** it yields a
-`<TIMED OUT>` stub, the tree stays staged, and the checks and independent reviews still run. The
-reviewers receive a runner-derived `## Round provenance` warning instructing them to enumerate every
-contract deliverable as delivered/partial/missing, and the attestation plus the commit trailer record
-`Harness-Writer-Degraded: timeout`. **The most likely defect in such a round is OMISSION, which does
-not show up as a fault in the code that IS present** — both salvaged tasks that day were missing
-deliverables, not wrong.
+State handling:
 
-**If a round still lands in a terminal state, salvage rather than restart:**
-1. Verify the worktree YOURSELF: targeted `cargo test`, **`clippy --lib --tests -- -D warnings`**
-   (`--lib` alone misses lints in `#[cfg(test)]` code — that cost a CI cycle on 2026-07-26), `ng lint`,
-   `ng build`. Check the contract's load-bearing invariants by hand.
-2. Finish whatever the writer never reached — check the CONTRACT item by item, not the diff.
-3. **Then get an INDEPENDENT review anyway** — you are now an author. Run the reviewers as a Workflow;
-   the principle (the implementer never owns the verdict) is what matters, not the runner.
-4. Expect the CI attestation gate to REFUSE a hand-committed `agent/*` branch. That is the gate
-   working. Either re-run the task properly or declare `Harness-Lane: B` in the PR description so the
-   choice is recorded.
+- `NEEDS_FIX`: repair the worktree, then run `verify`; the changed diff creates
+  a fresh attempt.
+- `NEEDS_EVIDENCE`, `PAUSED_RETRYABLE`, `INTERRUPTED`, or `STALE`: run
+  `resume`; completed green checkpoints are reused.
+- `PASSED`: do not edit the diff; commit it through the harness.
 
-## NEVER WRITE A THROWAWAY SCRIPT THAT `cd`s AND THEN RUNS `git`
+```bash
+scripts/agent-harness commit <task-id> \
+  -m "<type>(<scope>): <subject>"
+git push -u origin agent/v2/<task-id>
+gh pr create -R murmur-io/murmur --base murmur \
+  --head agent/v2/<task-id>
+```
 
-A verification script written during this program **destroyed the operator's primary checkout twice**:
-`mktemp -d` fails under the agent sandbox, `set -u` does NOT catch it (the assignment succeeds with an
-empty value), and **`cd "" || exit 1` SUCCEEDS in bash** — an empty operand is a no-op. Every `git`
-command then ran in the real repo, committing the entire uncommitted WIP onto local `murmur`.
+Wait for required CI, then merge through the PR. Never rebase or amend the
+attested task commit. If trunk moved, only a conflict-free automatic merge of
+`origin/murmur` may ride after it; conflicts require a fresh task and receipt.
 
-If a script must create a scratch repo: create the directory explicitly under the script's own
-directory, `exit` non-zero if `mkdir`/`cd` fail, and **assert `pwd -P` is not inside a real checkout
-before the first git command**.
+After merge:
 
-## TELL REVIEWERS THE PROVENANCE — IT CHANGES WHAT THEY FIND
+```bash
+scripts/agent-harness clean <task-id>
+```
 
-When part of a diff was written by the orchestrator, or salvaged, or hand-patched, **say so in the
-review prompt and tell them to treat those parts with MORE suspicion, not less.** This is not
-politeness; it is targeting. Doing it produced a same-round catch of a missing stale-result guard in
-orchestrator-written Angular — the exact class the repo's own rules call out, in the exact file the
-reviewer had been told to distrust. A reviewer given a diff with no provenance spreads attention
-evenly over code that does not deserve it evenly.
+For abandonment:
 
-Corollary: **fold fixes into ONE round.** Review → fix → re-review ran ~21 min sequentially; asking
-reviewers for exact patches alongside findings collapses that to one pass.
+```bash
+scripts/agent-harness clean <task-id> --abandon
+```
 
-## VERIFIER DISCIPLINE (this is where the real bugs hide)
+`clean --abandon` archives tracked and untracked bytes. Never manually delete a
+task directory or branch.
 
-- **A green `cargo test` proves neither no-deadlock nor no-leak when no test hits the path.** Two real
-  bugs shipped green this program: an Accept SELF-DEADLOCK (guard held across a callee that re-takes
-  it — no test hit a SUCCESSFUL accept) and a seal-time title LEAK (no test hit the marker's `url`
-  field shape nor the canonicalized src-direction). Hunt untested happy-paths + every data SHAPE.
-- **RED-reverts use the Edit tool or `git stash`, NEVER `git checkout <file>` on an uncommitted PR**
-  (it reverts the WHOLE PR to trunk — a verifier nuked a 1300-line uncommitted PR this way). Restore
-  byte-identical + prove `git diff --stat` matches before reporting.
-- **Prove a RED test is actually RED** — neuter the fix hunk, confirm the test FAILS, restore. A
-  mislabeled regression (row inserted the wrong direction) passes on the old code and pins nothing.
-- Each verifier writes its verdict JSON to `.claude/tmp/<task>/`. Under session churn (model/effort
-  switches), agents die silently — trust the FILESYSTEM (git status/diff, the verdict JSONs, a dead
-  verifier's scratch probe tests you can run yourself), not chat. Respawn fresh; don't nudge a wedged
-  agent forever. SHUT DOWN each agent the moment you've consumed its verdict (idle-spam re-fires you).
+## End of program
 
-## WORKTREE HYGIENE (the user's RAM is finite)
+```bash
+scripts/agent-harness doctor
+scripts/agent-harness metrics --limit 50
+```
 
-- One worktree per in-flight PR; **remove it the instant the PR merges** (`git worktree remove
-  --force` skips the slow untracked scan; then `git worktree prune`).
-- Reuse a freed worktree for the next PR (`git checkout --detach origin/murmur && git checkout -b …`)
-  — node_modules stays warm.
-- Periodically prune the stale `.claude/worktrees/agent-*` / `wf_*` auto-worktrees from past
-  sessions (they inflate `git worktree` + eat disk). Before removing a NAMED sibling, check it has no
-  unmerged committed work another session needs (`git -C <wt> log origin/murmur..HEAD`).
+Require every manifest row to be merged or explicitly archived, no open task
+worktrees, a clean doctor result, and remote `murmur` containing every accepted
+PR.
 
-## IDENTITY / GATES (inherited, non-negotiable)
+## Protected control-plane exception
 
-Commits authored ONLY by `QueaT <kgm004a@gmail.com>`, no Claude trailers; `gh` = `JakubGawr`; never
-direct-push to `murmur` (PR only); `com.meetnotes.app` immutable. The full `scripts/ci.sh` (clippy
-`-D warnings` + tests + `ng lint` + `ng build` + headless E2E) is the release-parity gate — run by CI
-on every PR, so you don't run it locally.
+Harness v2 refuses to certify its own protected harness, hook, rule, skill, and
+learnings surfaces. Those changes use the separate externally anchored v1
+bootstrap with `--kind harness` and `seal-prepared`; this exception must never
+be used to bypass v2 for ordinary product work.
+
+## Do not resurrect v1 habits
+
+Do not use manual worktrees, `init/run`, custom `--check`, inferred `--risk`,
+manual reviewer workflows, receipt trailers, `rm -rf`, or local rebase of an
+attested commit. Protected control-plane changes are the sole bootstrap
+exception described above.
