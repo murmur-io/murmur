@@ -354,10 +354,11 @@ fn ollama_recovery_key(base_url: &str, model: &str) -> String {
 /// Parse only after the owned generation task has dropped its model lease.
 fn parse_generate_response(raw: RawGenerateResponse) -> crate::error::Result<String> {
     if !raw.status.is_success() {
+        // The response body is untrusted provider content and may reflect prompt bytes. This error
+        // crosses into callers that can log it, so retain only the content-free HTTP status.
         return Err(AppError::Summarize(format!(
-            "Ollama API returned {}: {}",
-            raw.status,
-            String::from_utf8_lossy(&raw.body).trim()
+            "Ollama API returned HTTP {}; response body omitted",
+            raw.status.as_u16()
         )));
     }
     let parsed: GenerateResponse = serde_json::from_slice(&raw.body)
@@ -394,6 +395,15 @@ fn generate_body(model: &str, prompt: &str, system: Option<&str>) -> serde_json:
             "keep_alive": 0,
         }),
     }
+}
+
+/// Exact text-field mapping used by raw `/api/generate` completions.
+///
+/// Ollama accepts the instruction and user content as distinct JSON fields. The egress ledger
+/// shares this helper so its `system_bytes` / `user_bytes` accounting cannot drift from the
+/// production request body.
+pub(crate) fn completion_prompt_parts<'a>(system: &'a str, user: &'a str) -> (&'a str, &'a str) {
+    (system, user)
 }
 
 fn loopback_ollama_base_url(base_url: &str) -> Option<String> {
@@ -544,7 +554,8 @@ impl SummarizerProvider for OllamaProvider {
 
     async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
         // Own prompt strings/body before admission; no formatting or parsing pins residency.
-        let body = generate_body(&self.model, user, Some(system));
+        let (system, prompt) = completion_prompt_parts(system, user);
+        let body = generate_body(&self.model, prompt, Some(system));
         Ok(parse_generate_response(self.generate_owned(body).await?)?
             .trim()
             .to_string())
@@ -554,6 +565,19 @@ impl SummarizerProvider for OllamaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_http_error_keeps_status_but_omits_untrusted_body() {
+        let error = parse_generate_response(RawGenerateResponse {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body: br#"{"error":"provider-body-secret"}"#.to_vec(),
+        })
+        .expect_err("non-success Ollama status must fail");
+        let diagnostic = format!("{error:?} / {error}");
+        assert!(diagnostic.contains("HTTP 503"), "{diagnostic}");
+        assert!(!diagnostic.contains("provider-body-secret"), "{diagnostic}");
+        assert!(diagnostic.contains("body omitted"), "{diagnostic}");
+    }
 
     #[test]
     fn every_generate_body_requests_immediate_model_unload() {
@@ -872,6 +896,7 @@ mod tests {
             related_context: None,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         };
         let res =
             tokio::time::timeout(std::time::Duration::from_secs(10), provider.summarize(&req))

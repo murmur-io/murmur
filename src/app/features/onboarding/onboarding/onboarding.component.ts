@@ -677,7 +677,8 @@ export class OnboardingComponent implements OnInit {
       captureSystemAudio: base?.captureSystemAudio ?? true,
       vadEnabled: base?.vadEnabled ?? true,
       keepHiresMasters: base?.keepHiresMasters ?? false,
-      diarizeOthers: base?.diarizeOthers ?? false,
+      // Mirrors backend default diarize_others = true. Voiceprints remain a separate opt-in.
+      diarizeOthers: base?.diarizeOthers ?? true,
       voiceprintEnabled: base?.voiceprintEnabled ?? false,
       aecEnabled: base?.aecEnabled ?? false,
       postAecEnabled: base?.postAecEnabled ?? false,
@@ -707,6 +708,8 @@ export class OnboardingComponent implements OnInit {
       notesMode: base?.notesMode ?? "enhance",
       autoOrganize: base?.autoOrganize ?? false,
       noteLanguage: base?.noteLanguage ?? "auto",
+      // Preserve the Settings-owned choice; a truly missing historical field follows the backend.
+      groundSummary: base?.groundSummary ?? true,
       // Stage E security flags — read the current values from the snapshot and send
       // them back unchanged so onboarding never resets them (the backend's serde
       // defaults would otherwise clobber mcpRequireToken / cloudEgressConsented to

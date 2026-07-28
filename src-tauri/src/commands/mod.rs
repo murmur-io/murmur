@@ -533,10 +533,15 @@ pub struct AppConfigDto {
     pub vad_enabled: bool,
     #[serde(default)]
     pub keep_hires_masters: bool,
+    /// Omission means PRESERVE the stored value so an older/partial client cannot reset an
+    /// explicit opt-out. `get_config` always returns `Some`, while either explicit boolean remains
+    /// a real user choice.
     #[serde(default)]
-    pub diarize_others: bool,
+    pub diarize_others: Option<bool>,
+    /// Voice biometrics are an independent opt-in. Omission must preserve an existing enrollment
+    /// choice rather than silently revoking it during an older/partial settings save.
     #[serde(default)]
-    pub voiceprint_enabled: bool,
+    pub voiceprint_enabled: Option<bool>,
     #[serde(default)]
     pub aec_enabled: bool,
     #[serde(default = "default_true")]
@@ -592,6 +597,15 @@ pub struct AppConfigDto {
     #[serde(default)]
     pub note_assist_actions_off: Vec<String>,
     pub note_language: String,
+    /// On-device post-generation support marker. Settable from Settings. The thresholds are not
+    /// calibrated, so the marker is a review cue rather than proof. Omission means PRESERVE the
+    /// stored value; an explicit `false` remains a durable opt-out.
+    #[serde(default)]
+    pub ground_summary: Option<bool>,
+    /// Workspace glossary update. Omission means PRESERVE the stored value so an older or partial
+    /// client cannot erase it; `Some("")` is an explicit clear.
+    #[serde(default)]
+    pub glossary: Option<String>,
     /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
     /// payload — an omitted flag must FAIL CLOSED (require a token), never silently disable MCP
     /// auth. Was `#[serde(default)]` (=false), which let a partial save flip the token requirement
@@ -3853,6 +3867,9 @@ pub(crate) async fn build_and_persist_entities(
     let entities_started = std::time::Instant::now();
     let payload =
         crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
+    // The glossary never enters this existing graph-provider call. Canonicalize its response
+    // locally, before the first DB entity/mention, fact reference, or vault-stub write.
+    let payload = crate::summarize::graph::canonicalize_with_glossary(payload, &config.glossary);
     tracing::info!(
         target: "perf",
         stage = "extract_entities",
@@ -4905,8 +4922,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         capture_system_audio: c.capture_system_audio,
         vad_enabled: c.vad_enabled,
         keep_hires_masters: c.keep_hires_masters,
-        diarize_others: c.diarize_others,
-        voiceprint_enabled: c.voiceprint_enabled,
+        diarize_others: Some(c.diarize_others),
+        voiceprint_enabled: Some(c.voiceprint_enabled),
         aec_enabled: c.aec_enabled,
         post_aec_enabled: c.post_aec_enabled,
         audio_storage_limit_gb: c.audio_storage_limit_gb,
@@ -4926,6 +4943,8 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_assist_enhance: c.note_assist_enhance,
         note_assist_actions_off: c.note_assist_actions_off.clone(),
         note_language: c.note_language.clone(),
+        ground_summary: Some(c.ground_summary),
+        glossary: Some(c.glossary.clone()),
         mcp_require_token: c.mcp_require_token,
         lock_require_biometric: c.lock_require_biometric,
         relock_on_screenshare: c.relock_on_screenshare,
@@ -5019,8 +5038,8 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         capture_system_audio: d.capture_system_audio,
         vad_enabled: d.vad_enabled,
         keep_hires_masters: d.keep_hires_masters,
-        diarize_others: d.diarize_others,
-        voiceprint_enabled: d.voiceprint_enabled,
+        diarize_others: d.diarize_others.unwrap_or(current.diarize_others),
+        voiceprint_enabled: d.voiceprint_enabled.unwrap_or(current.voiceprint_enabled),
         aec_enabled: d.aec_enabled,
         post_aec_enabled: d.post_aec_enabled,
         // Recording-storage cap + auto-prune ARE settable from the DTO (the Storage UI owns them).
@@ -5094,6 +5113,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         } else {
             d.note_language
         },
+        ground_summary: d.ground_summary.unwrap_or(current.ground_summary),
+        // Omission-safe update semantics: clients predating the glossary preserve the live value,
+        // while an explicit empty string intentionally clears it.
+        glossary: d.glossary.unwrap_or_else(|| current.glossary.clone()),
         mcp_require_token: d.mcp_require_token,
         lock_require_biometric: d.lock_require_biometric,
         relock_on_screenshare: d.relock_on_screenshare,
@@ -5223,11 +5246,6 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // toggle yet) — PRESERVE the live value so a settings save can neither enable nor clear it;
         // it round-trips through the dedicated K_MEMORY_CONSOLIDATION_ENABLED load/save keys.
         memory_consolidation_enabled: current.memory_consolidation_enabled,
-        // Tier 3b (B) grounding: NOT yet carried on the settings DTO (the FE toggle is a follow-up),
-        // so PRESERVE the live value here — a normal settings save can neither enable nor clear it,
-        // and it round-trips through the dedicated K_GROUND_SUMMARY load/save keys. Mirrors the
-        // preserve-only discipline used for consent + embedder id.
-        ground_summary: current.ground_summary,
         // Brain v2 L3: the grammar-constraint gate, the JIT-Ask flag, and the loop-compaction
         // flag are NOT carried on the settings DTO (no FE toggles yet) — PRESERVE the live values
         // so a settings save can neither enable nor clear them; each round-trips through its
@@ -9603,5 +9621,64 @@ mod connector_dto_tests {
             !out.clickup_consented,
             "a settings save must NEVER grant ClickUp egress consent"
         );
+    }
+}
+
+// ─── diarization + grounding settings DTO contract ────────────────────────────────────────────
+#[cfg(test)]
+mod analysis_defaults_dto_tests {
+    use super::*;
+
+    #[test]
+    fn config_to_dto_exposes_the_real_defaults_without_enabling_voiceprints() {
+        let dto = config_to_dto(&AppConfig::default());
+        assert_eq!(dto.diarize_others, Some(true));
+        assert_eq!(dto.ground_summary, Some(true));
+        assert!(
+            dto.voiceprint_enabled == Some(false),
+            "default analysis aids must not opt users into voice biometrics"
+        );
+    }
+
+    #[test]
+    fn omitted_dto_flags_preserve_explicit_stored_choices() {
+        let current = AppConfig {
+            diarize_others: false,
+            ground_summary: false,
+            voiceprint_enabled: true,
+            ..AppConfig::default()
+        };
+        let mut json = serde_json::to_value(config_to_dto(&current)).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("diarizeOthers");
+        object.remove("groundSummary");
+        object.remove("voiceprintEnabled");
+
+        let dto: AppConfigDto = serde_json::from_value(json).unwrap();
+        assert_eq!(dto.diarize_others, None);
+        assert_eq!(dto.ground_summary, None);
+        assert_eq!(dto.voiceprint_enabled, None);
+
+        let out = dto_to_config(dto, &current);
+        assert!(!out.diarize_others);
+        assert!(!out.ground_summary);
+        assert!(
+            out.voiceprint_enabled,
+            "an omitted voiceprint flag must not revoke an explicit opt-in"
+        );
+    }
+
+    #[test]
+    fn explicit_dto_choices_apply() {
+        let current = AppConfig::default();
+        let mut dto = config_to_dto(&current);
+        dto.diarize_others = Some(false);
+        dto.ground_summary = Some(false);
+        dto.voiceprint_enabled = Some(true);
+
+        let out = dto_to_config(dto, &current);
+        assert!(!out.diarize_others);
+        assert!(!out.ground_summary);
+        assert!(out.voiceprint_enabled);
     }
 }

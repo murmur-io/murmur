@@ -123,7 +123,10 @@ pub struct AppConfig {
     /// 16 kHz playback mix. Default OFF — on, it roughly doubles audio disk use per recording.
     pub keep_hires_masters: bool,
     /// Run N-way speaker diarization on the system ("others") stream to label remote speakers
-    /// (others-0/1/2). Default OFF; requires system-audio capture + downloads ~40 MB of models.
+    /// (others-0/1/2). Default ON; requires system-audio capture + downloads ~40 MB of models.
+    /// Existing configs that predate the field inherit the same ON default; a stored `false`
+    /// remains an explicit opt-out.
+    #[serde(default = "default_true")]
     pub diarize_others: bool,
     /// Capture a per-cluster VOICE BIOMETRIC (speaker embedding) for the diarized "others" clusters,
     /// stored on-device (SQLCipher, folder-lock-sealed, NEVER egressed) so a remote speaker can later
@@ -250,6 +253,14 @@ pub struct AppConfig {
     pub note_assist_actions_off: Vec<String>,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
+    /// Workspace glossary used to keep domain names stable in generated notes. Each non-empty line
+    /// is either `Canonical` or `Canonical = alias, alias`. This is user-authored prompt content:
+    /// the pipeline bounds and structures it before use, and the cloud path applies the same
+    /// regex + on-device name-redaction firewall as every other prompt field.
+    ///
+    /// `serde(default)` keeps configs written before this field existed loadable.
+    #[serde(default)]
+    pub glossary: String,
     /// Require an `Authorization: Bearer <token>` on EVERY MCP method (E3) — including
     /// initialize / tools/list / ping, not just tools/call. Default ON (fail-closed): an
     /// unauthenticated localhost process must not be able to even enumerate the meeting tools.
@@ -534,13 +545,11 @@ pub struct AppConfig {
     /// by this meeting's OWN transcript segments with a non-destructive `> unverified` blockquote
     /// (`> unverified (low audio confidence)` when the best-overlapping segments were acoustically
     /// shaky). NON-DESTRUCTIVE: the original line stays byte-identical (action-item parsing is
-    /// unaffected); it only APPENDS a marker. Default OFF / OPT-IN (`#[serde(default)]` ⇒ `false`):
-    /// the overlap thresholds are UNCALIBRATED placeholders, so an over-flag would `> unverified` a
-    /// legitimately-abstractive sentence and degrade the note 100% of users read — it must stay opt-in
-    /// until a gold-label precision/recall pass on real data justifies flipping the default. PRESERVE-
-    /// ONLY on the settings DTO for now (the FE toggle is a follow-up) — a normal settings save neither
-    /// grants nor clears it; it round-trips through the load/save keys.
-    #[serde(default)]
+    /// unaffected); it only APPENDS a marker. The overlap thresholds remain UNCALIBRATED, so a
+    /// marker is a conservative review cue, never proof that a sentence is true or false. Default
+    /// ON, but user-disableable in Settings. Existing configs that predate the field inherit the
+    /// same ON default; a stored `false` stays OFF.
+    #[serde(default = "default_true")]
     pub ground_summary: bool,
     /// Brain v2 L3 — gate for the TINY-schema grammar constraint on the on-device structured
     /// decode (`GenOptions::use_grammar_constraint` → mistralrs `Constraint::JsonSchema`, schemas
@@ -663,7 +672,7 @@ impl Default for AppConfig {
             capture_system_audio: true,
             vad_enabled: true,
             keep_hires_masters: false,
-            diarize_others: false,
+            diarize_others: true,
             voiceprint_enabled: false,
             aec_enabled: false,
             post_aec_enabled: false,
@@ -689,6 +698,7 @@ impl Default for AppConfig {
             note_assist_actions_off: Vec::new(),
             auto_organize: false,
             note_language: "auto".to_string(),
+            glossary: String::new(),
             mcp_require_token: true,
             lock_require_biometric: true,
             relock_on_screenshare: true,
@@ -730,7 +740,7 @@ impl Default for AppConfig {
             proactive_hints_enabled: true,
             user_memory_enabled: true,
             memory_consolidation_enabled: true,
-            ground_summary: false,
+            ground_summary: true,
             brain_heavy_grammar_enabled: false,
             ask_jit_retrieval: false,
             loop_transcript_compaction: true,
@@ -787,6 +797,7 @@ const K_NOTE_ASSIST_ENHANCE: &str = "note_assist_enhance";
 const K_NOTE_ASSIST_ACTIONS_OFF: &str = "note_assist_actions_off";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
+const K_GLOSSARY: &str = "glossary";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
 const K_LOCK_REQUIRE_BIOMETRIC: &str = "lock_require_biometric";
 const K_RELOCK_ON_SCREENSHARE: &str = "relock_on_screenshare";
@@ -839,10 +850,9 @@ const K_ROLE_ASK_EFFORT: &str = "role_ask_effort";
 /// ACTION-ITEM RECALL NET (opt-in) — see [`action_item_recall_net_enabled`]. Deliberately a
 /// STANDALONE settings row rather than an `AppConfig` field: `commands::dto_to_config` builds
 /// `AppConfig` as an EXHAUSTIVE struct literal, so a new field would have to be threaded through
-/// that file too. Keeping the flag as its own key gives the SAME semantics as the preserve-only
-/// `ground_summary` discipline for free — a normal settings save neither grants nor clears it
-/// (`AppConfig::save` never writes this key), and it round-trips durably. Promoting it to a real
-/// `AppConfig` field + a Settings toggle is the follow-up, alongside `ground_summary`'s.
+/// that file too. Keeping the flag as its own key makes it preserve-only: a normal settings save
+/// neither grants nor clears it (`AppConfig::save` never writes this key), and it round-trips
+/// durably. Promoting it to a real `AppConfig` field + Settings toggle is a separate follow-up.
 const K_ACTION_ITEM_RECALL_NET: &str = "action_item_recall_net";
 /// P1 — WHO chose the current `model_size`: `"auto"` (Murmur's recommendation) or `"user"` (a
 /// deliberate pick). STANDALONE rows for the same reason as [`K_ACTION_ITEM_RECALL_NET`]: an
@@ -1003,6 +1013,9 @@ impl AppConfig {
             if !v.is_empty() {
                 cfg.note_language = v;
             }
+        }
+        if let Some(v) = db.get_setting(K_GLOSSARY)? {
+            cfg.glossary = v;
         }
         if let Some(v) = db.get_setting(K_MCP_REQUIRE_TOKEN)? {
             cfg.mcp_require_token = v == "true";
@@ -1303,6 +1316,7 @@ impl AppConfig {
             &serde_json::to_string(&self.note_assist_actions_off).unwrap_or_else(|_| "[]".into()),
         )?;
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
+        db.set_setting(K_GLOSSARY, &self.glossary)?;
         db.set_setting(
             K_MCP_REQUIRE_TOKEN,
             if self.mcp_require_token {
@@ -1725,11 +1739,11 @@ fn opt(value: Option<String>) -> Option<String> {
 /// ACTION-ITEM RECALL NET — is the opt-in transcript cue scan
 /// ([`crate::summarize::recall_net::append_possible_missed_items`]) enabled?
 ///
-/// Default OFF / OPT-IN, mirroring `ground_summary`: a lexical cue scan is deliberately
-/// LOW-PRECISION, so an always-on version would append noisy "Possible missed items" quotes to the
-/// note 100% of users read. It must stay opt-in until the cue list + overlap thresholds are
-/// calibrated against real meetings. OFF is BYTE-IDENTICAL to the previous pipeline (the scan never
-/// runs and the meeting's segments are not even fetched).
+/// Default OFF / OPT-IN: this feature APPENDS candidate quotes to the note, unlike grounding's
+/// non-destructive review markers. Its lexical cue scan is deliberately LOW-PRECISION, so an
+/// always-on version would add noisy "Possible missed items" to the note 100% of users read. It
+/// must stay opt-in until calibrated against real meetings. OFF is BYTE-IDENTICAL to the previous
+/// pipeline (the scan never runs and the meeting's segments are not even fetched).
 ///
 /// FAIL-CLOSED: an absent key, any value other than `"true"`, or a DB read error all read as OFF —
 /// a storage hiccup can never silently switch a note-content feature on.
@@ -2403,38 +2417,36 @@ mod tests {
         assert!(AppConfig::load(&db).unwrap().vault_audit_weekly_enabled);
     }
 
-    /// Tier 3b (B): `ground_summary` defaults OFF / opt-in (empty DB ⇒ false, thresholds uncalibrated),
-    /// and both an explicit ON and an explicit OFF round-trip through save/load — so an opt-IN persists
-    /// across reload despite the default-false.
+    /// The two analysis aids default ON on a fresh settings DB, while explicit opt-outs remain
+    /// durable. `voiceprint_enabled` is deliberately outside this pair and stays OFF by default.
     #[test]
-    fn ground_summary_defaults_off_and_round_trips_both_ways() {
+    fn diarization_and_grounding_default_on_and_round_trip_opt_outs() {
         let db = temp_db();
-        // Empty DB (no stored key) ⇒ the default (OFF / opt-in until calibrated).
+        let fresh = AppConfig::load(&db).unwrap();
+        assert!(fresh.diarize_others, "diarization defaults ON");
+        assert!(fresh.ground_summary, "grounding defaults ON");
         assert!(
-            !AppConfig::load(&db).unwrap().ground_summary,
-            "ground_summary must default OFF on a fresh DB (opt-in until calibrated)"
+            !fresh.voiceprint_enabled,
+            "the privacy-sensitive voiceprint feature stays OFF"
         );
 
-        // Explicit ON persists (a maintainer/user opt-in).
         AppConfig {
-            ground_summary: true,
-            ..Default::default()
-        }
-        .save(&db)
-        .unwrap();
-        assert!(
-            AppConfig::load(&db).unwrap().ground_summary,
-            "an explicit ground_summary opt-in must persist"
-        );
-
-        // Explicit OFF persists.
-        AppConfig {
+            diarize_others: false,
             ground_summary: false,
             ..Default::default()
         }
         .save(&db)
         .unwrap();
-        assert!(!AppConfig::load(&db).unwrap().ground_summary);
+        let opted_out = AppConfig::load(&db).unwrap();
+        assert!(
+            !opted_out.diarize_others,
+            "an explicit diarization opt-out persists"
+        );
+        assert!(
+            !opted_out.ground_summary,
+            "an explicit grounding opt-out persists"
+        );
+        assert!(!opted_out.voiceprint_enabled);
     }
 
     /// ACTION-ITEM RECALL NET: defaults OFF / opt-in on a fresh DB (the cue scan is low-precision
@@ -2473,25 +2485,22 @@ mod tests {
         );
     }
 
-    /// A config payload that OMITS `ground_summary` (persisted before the field existed) deserializes
-    /// it as `false` via `#[serde(default)]` — matching `AppConfig::default` (opt-in until calibrated).
+    /// Historical JSON that predates the two fields gets the same values as `AppConfig::default`.
+    /// This catches the bool-serde trap where plain `#[serde(default)]` would silently yield false.
     #[test]
-    fn missing_ground_summary_deserializes_off() {
-        // A minimal payload carrying only the no-serde-default fields; `ground_summary` is omitted.
-        let json = r#"{
-            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
-            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
-            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
-            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
-            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
-            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
-            "cloudEgressConsented":false
-        }"#;
-        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+    fn missing_diarization_and_grounding_match_struct_defaults() {
+        let expected = AppConfig::default();
+        let mut json = serde_json::to_value(&expected).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("diarizeOthers");
+        object.remove("groundSummary");
+
+        let cfg: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.diarize_others, expected.diarize_others);
+        assert_eq!(cfg.ground_summary, expected.ground_summary);
         assert!(
-            !cfg.ground_summary,
-            "serde default for ground_summary must be false (opt-in)"
+            !cfg.voiceprint_enabled,
+            "omitting analysis flags must never enable voiceprints"
         );
     }
 
@@ -2832,6 +2841,7 @@ mod tests {
             provider_id: "ollama".to_string(),
             vault_path: Some("/vault".to_string()),
             language: Some("en".to_string()),
+            glossary: "Konnect = Connect, Kinect\nFastMCP".to_string(),
             ..Default::default()
         };
         cfg.save(&db).unwrap();
@@ -2840,6 +2850,39 @@ mod tests {
         assert_eq!(loaded.provider_id, "ollama");
         assert_eq!(loaded.vault_path.as_deref(), Some("/vault"));
         assert_eq!(loaded.language.as_deref(), Some("en"));
+        assert_eq!(
+            loaded.glossary, "Konnect = Connect, Kinect\nFastMCP",
+            "the user-authored glossary must round-trip byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn glossary_defaults_empty_and_explicit_clear_round_trips() {
+        let db = temp_db();
+        assert_eq!(AppConfig::load(&db).unwrap().glossary, "");
+
+        AppConfig {
+            glossary: "Kong Operator = Kong, KO".to_string(),
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
+        assert_eq!(
+            AppConfig::load(&db).unwrap().glossary,
+            "Kong Operator = Kong, KO"
+        );
+
+        AppConfig {
+            glossary: String::new(),
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
+        assert_eq!(
+            AppConfig::load(&db).unwrap().glossary,
+            "",
+            "an explicit empty value clears the stored glossary"
+        );
     }
 
     #[test]
