@@ -156,7 +156,8 @@ export class SettingsStore {
     captureSystemAudio: false,
     vadEnabled: true,
     keepHiresMasters: false,
-    diarizeOthers: false,
+    // Local analysis default ON; voiceprints remain an independent privacy opt-in.
+    diarizeOthers: true,
     // Speaker voiceprints — cross-meeting on-device re-identification. Opt-in, default off.
     voiceprintEnabled: false,
     aecEnabled: false,
@@ -181,6 +182,10 @@ export class SettingsStore {
     notesMode: "enhance",
     autoOrganize: false,
     noteLanguage: "auto",
+    groundSummary: true,
+    // Workspace glossary is a larger text field: commit on blur so auto-save never writes every
+    // intermediate keystroke. Empty is intentional and clears the backend value.
+    glossary: this.fb.nonNullable.control("", { updateOn: "blur" }),
     // Phase H — brain / in-meeting voice assistant.
     brainBackend: "cloud" as BrainBackend,
     realtimeReactions: false,
@@ -1488,7 +1493,8 @@ export class SettingsStore {
         captureSystemAudio: cfg.captureSystemAudio ?? true,
         vadEnabled: cfg.vadEnabled ?? true,
         keepHiresMasters: cfg.keepHiresMasters ?? false,
-        diarizeOthers: cfg.diarizeOthers ?? false,
+        // Mirrors backend default diarize_others = true; explicit false is preserved by ??.
+        diarizeOthers: cfg.diarizeOthers ?? true,
         voiceprintEnabled: cfg.voiceprintEnabled ?? false,
         aecEnabled: cfg.aecEnabled ?? false,
         // Mirrors backend default post_aec_enabled = false (settings/config.rs, AppConfig::default).
@@ -1509,6 +1515,9 @@ export class SettingsStore {
         notesMode: cfg.notesMode ?? "enhance",
         autoOrganize: cfg.autoOrganize ?? false,
         noteLanguage: cfg.noteLanguage ?? "auto",
+        // Mirrors backend default ground_summary = true; explicit false remains OFF.
+        groundSummary: cfg.groundSummary ?? true,
+        glossary: cfg.glossary ?? "",
         brainBackend: cfg.brainBackend ?? "cloud",
         realtimeReactions: cfg.realtimeReactions ?? false,
         proactiveHintsEnabled: cfg.proactiveHintsEnabled ?? true,
@@ -2257,6 +2266,10 @@ export class SettingsStore {
       notesMode: v.notesMode,
       autoOrganize: v.autoOrganize,
       noteLanguage: v.noteLanguage,
+      groundSummary: v.groundSummary,
+      // Always explicit from Settings: empty clears. Other/older clients can omit the optional
+      // wire key and the Rust merge preserves the stored value.
+      glossary: v.glossary,
       // Phase H — brain / in-meeting voice assistant.
       brainBackend: v.brainBackend,
       realtimeReactions: v.realtimeReactions,
