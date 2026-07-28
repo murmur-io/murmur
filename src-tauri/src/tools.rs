@@ -686,6 +686,13 @@ pub fn execute_tool(
                         .unwrap_or_default();
                     let note = db.get_note_if_visible(mid, unlocked).ok().flatten();
                     let segs = db.get_segments(mid).unwrap_or_default();
+                    // R1b/#2 — the SPEAKER MAP. `Speaker 3` is a different label space from the
+                    // note and the timeline, which resolve a cluster to a REAL NAME once a
+                    // voiceprint is enrolled. Without this header the same person reads as
+                    // "Speaker 3" over MCP and "Anna" in the note, and an agent has no way to tell
+                    // they are one person. GATED: `list_voiceprints_visible` carries the same
+                    // visibility predicate as every other content read; a label is a person's name.
+                    let speaker_map = speaker_map_header(db, mid, &segs, unlocked);
                     // Feature D: DEFAULT to the STRUCTURED per-segment transcript (speaker + raw-second
                     // timestamps). `transcript_format == "plain"` keeps the LEGACY byte-identical flat
                     // space-join for backward compatibility; every other value (incl. absent/default,
@@ -745,9 +752,11 @@ pub fn execute_tool(
                                 Some(h) => format!("NOTE ({h}):\n{body}"),
                                 None => format!("NOTE:\n{body}"),
                             };
-                            Ok(format!("{title_line}{note_section}\n\n{transcript_section}"))
+                            Ok(format!(
+                                "{title_line}{note_section}\n\n{speaker_map}{transcript_section}"
+                            ))
                         }
-                        _ => Ok(format!("{title_line}{transcript_section}")),
+                        _ => Ok(format!("{title_line}{speaker_map}{transcript_section}")),
                     }
                 }
             }
@@ -1957,6 +1966,58 @@ fn secs(v: f64) -> String {
 /// Map a raw `Segment.speaker` tag to the display name a rendered transcript shows. Extracted so
 /// the structured and compact renderers cannot drift apart on speaker naming — a second, diverging
 /// copy of this mapping is exactly what let `others-N` render as `Unknown` in the first place.
+/// The `SPEAKERS:` header mapping each rendered speaker label to the real name a voiceprint
+/// enrollment resolved it to — empty when nothing is enrolled (#2's `speakerMap` ask).
+///
+/// Murmur ships N-way diarization, so a transcript can say `Speaker 3`. The note and the timeline,
+/// however, resolve that same cluster to a REAL NAME once the user enrolls a voiceprint
+/// (`diarize::reconcile_speakers` exists precisely to bridge the two key spaces). Without this
+/// header the same person reads as `Speaker 3` over MCP and `Anna` in the note, and an agent
+/// correlating the two surfaces has no way to know they are one person.
+///
+/// LOCK MODEL: a voiceprint LABEL is a person's name — content. It is read through the GATED
+/// `list_voiceprints_visible`, and only from inside `get_meeting`'s already-passed
+/// `meeting_is_visible` arm, so a sealed meeting contributes no names.
+fn speaker_map_header(
+    db: &Db,
+    meeting_id: &str,
+    segs: &[crate::transcribe::types::Segment],
+    unlocked: &HashSet<String>,
+) -> String {
+    let Ok(prints) = db.list_voiceprints_visible(unlocked) else {
+        return String::new();
+    };
+    let mut named: Vec<(String, String)> = prints
+        .into_iter()
+        .filter(|v| v.meeting_id == meeting_id)
+        .filter_map(|v| {
+            let label = v.label.as_deref().map(str::trim).filter(|l| !l.is_empty())?;
+            // The renderer shows a 1-based label; the store keys by 0-based cluster index.
+            let n = v.cluster_index.checked_add(1)?;
+            Some((format!("Speaker {n}"), label.to_string()))
+        })
+        .collect();
+    // Only claim a mapping for a speaker that actually appears in what is about to be rendered.
+    let rendered: std::collections::HashSet<String> = segs
+        .iter()
+        .map(|s| speaker_label(s.speaker.as_deref()).into_owned())
+        .collect();
+    named.retain(|(rendered_label, _)| rendered.contains(rendered_label));
+    if named.is_empty() {
+        return String::new();
+    }
+    named.sort();
+    named.dedup();
+    format!(
+        "SPEAKERS (enrolled voiceprints; unlisted speakers are unidentified):\n{}\n\n",
+        named
+            .iter()
+            .map(|(l, name)| format!("- {l} = {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 fn speaker_label(tag: Option<&str>) -> std::borrow::Cow<'static, str> {
     use crate::audio::merge::{SPEAKER_ME, SPEAKER_OTHERS};
     use std::borrow::Cow;
@@ -5452,6 +5513,53 @@ mod tests {
         );
         // #10 — the format is stamped so the offset space is self-describing.
         assert!(out.contains("format=compact"), "format stamped: {out}");
+    }
+
+    /// R1b/#2 (regression). An enrolled voiceprint's real NAME must reach the MCP transcript, so
+    /// `Speaker 2` and the note's "Anna" are visibly the same person.
+    ///
+    /// RED against the previous behavior: the transcript rendered `Speaker N` and nothing else, a
+    /// different label space from the note and timeline, with no way for an agent to correlate them.
+    #[test]
+    fn get_meeting_maps_enrolled_speakers_to_their_names() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-spk", "Call", "the note", None);
+        db.insert_segments(
+            "m-spk",
+            &[
+                Segment { idx: 0, start_s: 1.0, end_s: 2.0, text: "hello there".into(), speaker: Some("others-1".into()), confidence: None },
+                Segment { idx: 1, start_s: 2.0, end_s: 3.0, text: "hi back".into(), speaker: Some("me".into()), confidence: None },
+            ],
+        )
+        .unwrap();
+        // Cluster 1 is enrolled as Anna; cluster 7 is enrolled but never speaks in this meeting.
+        db.insert_voiceprint("vp1", "m-spk", 1, Some("Anna"), &[0.1, 0.2], "2026-07-01T00:00:00Z")
+            .unwrap();
+        db.insert_voiceprint("vp2", "m-spk", 7, Some("Ghost"), &[0.3, 0.4], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-spk".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("- Speaker 2 = Anna"),
+            "the enrolled name must reach the transcript (0-based cluster 1 renders as Speaker 2): {out}"
+        );
+        assert!(
+            !out.contains("Ghost"),
+            "a speaker who never speaks in THIS meeting must not be claimed: {out}"
+        );
     }
 
     /// E1 (RED-before-GREEN) — `get_meeting` emits the NOTE section only on the FIRST window
