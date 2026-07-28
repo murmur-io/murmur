@@ -45,6 +45,7 @@
       "items": { "enum": ["runtime", "performance"] }
     },
     "reviewer": { "enum": ["codex", "claude", "fake"] },
+    "allow_same_vendor_high_risk": { "type": "boolean" },
     "expected_change": { "const": true },
     "degraded_provenance": {
       "type": "array",

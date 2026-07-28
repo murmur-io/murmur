@@ -415,6 +415,7 @@ def derive_profile(
     config: Mapping[str, Any],
     *,
     reviewer: str,
+    allow_same_vendor_high_risk: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], List[str]]:
     """Return checks, reviews and actual sensitive risks for an exact path set.
 
@@ -467,12 +468,13 @@ def derive_profile(
     opposite = {"claude": "codex", "codex": "claude", "fake": "fake"}.get(reviewer)
     if opposite is None:
         raise legacy.HarnessError(f"unsupported v2 reviewer: {reviewer}")
+    specialist_vendor = reviewer if allow_same_vendor_high_risk else opposite
     mapping = config.get("risk_reviews", {})
     for risk in risks:
         kind = mapping.get(risk) if isinstance(mapping, Mapping) else None
         if not isinstance(kind, str):
             raise legacy.HarnessError(f"no specialist review configured for {risk}")
-        reviews.append({"kind": kind, "vendor": opposite})
+        reviews.append({"kind": kind, "vendor": specialist_vendor})
     return checks, reviews, risks
 
 
@@ -514,6 +516,9 @@ def build_plan(
         list(contract.get("claims", [])),
         config,
         reviewer=str(contract["reviewer"]),
+        allow_same_vendor_high_risk=bool(
+            contract.get("allow_same_vendor_high_risk", False)
+        ),
     )
     head_sha = legacy.git(worktree, "rev-parse", "HEAD")
     plan: Dict[str, Any] = {
@@ -1559,6 +1564,9 @@ def verify_v2_evidence(
         list(contract.get("claims", [])),
         profile_config,
         reviewer=str(contract["reviewer"]),
+        allow_same_vendor_high_risk=bool(
+            contract.get("allow_same_vendor_high_risk", False)
+        ),
     )
     if plan.get("checks") != expected_checks:
         raise legacy.HarnessError("v2 plan check profile is stale")

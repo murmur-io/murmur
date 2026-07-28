@@ -163,6 +163,7 @@ def _open_args(task_id: str, base: str, branch: str) -> argparse.Namespace:
         owned=["owned.txt"],
         claim=[],
         reviewer="codex",
+        allow_same_vendor_high_risk=False,
         base=base,
         branch=branch,
         kind="harness",
@@ -417,6 +418,18 @@ def standalone_driver_open_cases(test: Tests) -> None:
             str(worktree.resolve()),
         )
         test.equal(
+            "OPEN binds the default cross-vendor policy",
+            contract["allow_same_vendor_high_risk"],
+            False,
+        )
+        tampered_contract = dict(contract)
+        tampered_contract["allow_same_vendor_high_risk"] = True
+        test.true(
+            "OPEN same-vendor policy is contract-hash-bound",
+            verifier.document_hash(tampered_contract, "contract_sha256")
+            != contract["contract_sha256"],
+        )
+        test.equal(
             "OPEN runtime records exact safe task root",
             runtime["task_root"],
             str(task_root.resolve()),
@@ -426,6 +439,22 @@ def standalone_driver_open_cases(test: Tests) -> None:
             "OPEN leaves standalone driver HEAD detached",
             _git(driver, "branch", "--show-current"),
             "",
+        )
+        exception_task_id = "standalone-same-vendor"
+        exception_args = _open_args(
+            exception_task_id,
+            base,
+            f"agent/v2/{exception_task_id}",
+        )
+        exception_args.allow_same_vendor_high_risk = True
+        _invoke_open(driver, exception_args)
+        exception_contract = legacy.load_json(
+            harness_cli.v2_task_dir(common, exception_task_id) / "task.json"
+        )
+        test.equal(
+            "OPEN binds an explicit same-vendor high-risk exception",
+            exception_contract["allow_same_vendor_high_risk"],
+            True,
         )
 
     with tempfile.TemporaryDirectory(prefix="murmur-v2-driver-linked-") as raw:
@@ -709,6 +738,29 @@ def profile_cases(test: Tests) -> None:
         "PROFILE lock adds specialist",
         reviews,
         ["combined", "lock-security"],
+    )
+    _checks, default_reviews, _risks = verifier.derive_profile(
+        ["src-tauri/src/storage/meeting_store.rs"],
+        [],
+        legacy.load_config(),
+        reviewer="codex",
+    )
+    test.equal(
+        "PROFILE Codex lock defaults to cross-vendor specialist",
+        [review["vendor"] for review in default_reviews],
+        ["codex", "claude"],
+    )
+    _checks, same_vendor_reviews, _risks = verifier.derive_profile(
+        ["src-tauri/src/storage/meeting_store.rs"],
+        [],
+        legacy.load_config(),
+        reviewer="codex",
+        allow_same_vendor_high_risk=True,
+    )
+    test.equal(
+        "PROFILE explicit Codex lock exception keeps both reviews on Codex",
+        [review["vendor"] for review in same_vendor_reviews],
+        ["codex", "codex"],
     )
 
     checks, _, _ = _profile([".agents/harness/cli.py"])
@@ -3337,6 +3389,7 @@ def import_cases(test: Tests) -> None:
             invalidate_pass=False,
             claim=[],
             reviewer="fake",
+            allow_same_vendor_high_risk=True,
         )
         previous_cwd = Path.cwd()
         previous_selftest = os.environ.get("MURMUR_HARNESS_SELFTEST")
@@ -3347,6 +3400,19 @@ def import_cases(test: Tests) -> None:
                 harness_cli.cmd_import_v1(args)
             target_dir = harness_cli.v2_task_dir(common, task_id)
             imported = legacy.load_json(target_dir / "imports" / "v1.json")
+            imported_contract = legacy.load_json(target_dir / "task.json")
+            test.equal(
+                "IMPORT binds an explicit same-vendor high-risk exception",
+                imported_contract["allow_same_vendor_high_risk"],
+                True,
+            )
+            tampered_import = dict(imported_contract)
+            tampered_import["allow_same_vendor_high_risk"] = False
+            test.true(
+                "IMPORT same-vendor policy is contract-hash-bound",
+                verifier.document_hash(tampered_import, "contract_sha256")
+                != imported_contract["contract_sha256"],
+            )
             test.equal(
                 "IMPORT ghost state has no fabricated state hash",
                 imported["source_state_sha256"],
@@ -3453,6 +3519,19 @@ def plan_and_probe_cases(test: Tests) -> None:
         b"angular diff",
         tree,
         legacy.load_config(),
+    )
+    legacy_sensitive, _bundle = verifier.build_plan(
+        contract,
+        ROOT,
+        ["src-tauri/src/storage/meeting_store.rs"],
+        b"legacy sensitive diff",
+        tree,
+        legacy.load_config(),
+    )
+    test.equal(
+        "PLAN contract without same-vendor field retains cross-vendor semantics",
+        [review["vendor"] for review in legacy_sensitive["reviews"]],
+        ["claude", "codex"],
     )
     test.equal(
         "PLAN identical diff has stable plan hash",
