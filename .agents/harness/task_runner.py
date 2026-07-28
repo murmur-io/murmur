@@ -34,6 +34,8 @@ import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import resource_lane
+
 
 HARNESS_ROOT = Path(__file__).resolve().parent
 SCHEMAS_DIR = HARNESS_ROOT / "schemas"
@@ -2167,13 +2169,20 @@ def _cargo_lane_owner(lock_handle: Any) -> Dict[str, Any]:
     }
 
 
-def _print_cargo_lane_wait(lock_handle: Any) -> None:
+def _print_cargo_lane_wait(
+    lock_handle: Any,
+    queue_status: Mapping[str, Any],
+) -> None:
     owner = _cargo_lane_owner(lock_handle)
     print(
         "agent-harness: waiting for Cargo lane "
         "owner_pid={owner_pid} task={task} command={command} since={since} "
+        "queue_position={queue_position}/{queue_depth} queued_since={queued_since} "
         "heartbeat={heartbeat}".format(
             **owner,
+            queue_position=queue_status["position"],
+            queue_depth=queue_status["depth"],
+            queued_since=queue_status["queued_at"],
             heartbeat=utc_now(),
         ),
         file=sys.stderr,
@@ -2200,33 +2209,51 @@ def acquire_cargo_lane(
     resource_root = shared_resource_root_for_task(task_dir)
     resource_root.mkdir(parents=True, exist_ok=True)
     lock_path = resource_root / "cargo.lock"
+    ticket = resource_lane.join_lane_queue(
+        resource_root,
+        task=task_dir.name,
+        command=command,
+    )
     lock_handle = lock_path.open("a+", encoding="utf-8")
     deadline = time.monotonic() + timeout_seconds
     next_heartbeat: Optional[float] = None
     try:
         while True:
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                now = time.monotonic()
-                if next_heartbeat is None or now >= next_heartbeat:
-                    _print_cargo_lane_wait(lock_handle)
-                    next_heartbeat = now + max(0.01, heartbeat_seconds)
-                if now >= deadline:
-                    owner = _cargo_lane_owner(lock_handle)
-                    raise HarnessError(
-                        "timed out waiting for the shared Cargo build lane "
-                        "owner_pid={owner_pid} task={task} command={command} "
-                        "since={since}".format(**owner)
+            queue_status = resource_lane.lane_queue_status(ticket)
+            acquired = False
+            if queue_status["position"] == 1:
+                try:
+                    fcntl.flock(
+                        lock_handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
                     )
-                time.sleep(
-                    min(
-                        0.1,
-                        max(0.0, deadline - now),
-                        max(0.01, next_heartbeat - now),
+                    acquired = True
+                except BlockingIOError:
+                    pass
+            if acquired:
+                break
+            now = time.monotonic()
+            if next_heartbeat is None or now >= next_heartbeat:
+                _print_cargo_lane_wait(lock_handle, queue_status)
+                next_heartbeat = now + max(0.01, heartbeat_seconds)
+            if now >= deadline:
+                owner = _cargo_lane_owner(lock_handle)
+                raise HarnessError(
+                    "timed out waiting for the shared Cargo build lane "
+                    "owner_pid={owner_pid} task={task} command={command} "
+                    "since={since} queue_position={position}/{depth} "
+                    "queued_since={queued_at}".format(
+                        **owner,
+                        **queue_status,
                     )
                 )
+            time.sleep(
+                min(
+                    0.1,
+                    max(0.0, deadline - now),
+                    max(0.01, next_heartbeat - now),
+                )
+            )
         lock_handle.seek(0)
         lock_handle.truncate()
         json.dump(
@@ -2244,8 +2271,10 @@ def acquire_cargo_lane(
         )
         lock_handle.write("\n")
         lock_handle.flush()
+        resource_lane.leave_lane_queue(ticket)
         return lock_handle
     except BaseException:
+        resource_lane.leave_lane_queue(ticket)
         lock_handle.close()
         raise
 

@@ -3966,9 +3966,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
     try:
         state = load_v2_state(task_dir)
         if state.get("status") in verifier.V2_TERMINAL_STATES:
+            removed = legacy.prune_task_runtime(task_dir)
+            runtime_note = (
+                f"; pruned runtime: {', '.join(removed)}"
+                if removed
+                else ""
+            )
             print(
                 f"{contract['task_id']}: {state['status']} "
-                "(cleanup already complete)"
+                f"(cleanup already complete{runtime_note})"
             )
             return 0
         worktree = Path(str(contract["worktree_path"]))
@@ -4034,6 +4040,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 intent_sha256=intent["intent_sha256"],
             )
         _execute_clean_intent(contract, task_dir, intent)
+        removed = legacy.prune_task_runtime(task_dir)
         final = str(intent["final_status"])
         set_v2_state(
             task_dir,
@@ -4044,6 +4051,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
             tree_sha=intent["tree_sha"],
             previous_status=intent["previous_status"],
             clean_intent_sha256=intent["intent_sha256"],
+            runtime_removed=removed,
         )
     finally:
         release_v2_run_lock(lock)
