@@ -77,6 +77,127 @@ def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+_HEREDOC_START = re.compile(
+    r"<<(?P<tabs>-)?\s*(?:'(?P<single>[^']+)'|\"(?P<double>[^\"]+)\"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def _blank_shell_arithmetic(source: str) -> str:
+    """Blank arithmetic expansions/commands before looking for heredocs."""
+
+    chars = list(source)
+    single = False
+    double = False
+    escaped = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not single:
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not double:
+            single = not single
+            index += 1
+            continue
+        if char == '"' and not single:
+            double = not double
+            index += 1
+            continue
+
+        expansion = not single and source.startswith("$((", index)
+        command = not single and not double and source.startswith("((", index)
+        if not expansion and not command:
+            index += 1
+            continue
+
+        start = index
+        cursor = index + (3 if expansion else 2)
+        depth = 2
+        arithmetic_escaped = False
+        while cursor < len(source) and depth:
+            arithmetic_char = source[cursor]
+            if arithmetic_escaped:
+                arithmetic_escaped = False
+            elif arithmetic_char == "\\":
+                arithmetic_escaped = True
+            elif arithmetic_char == "(":
+                depth += 1
+            elif arithmetic_char == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            index += 1
+            continue
+        chars[start:cursor] = " " * (cursor - start)
+        index = cursor
+    return "".join(chars)
+
+
+def _strip_shell_comment(line: str) -> str:
+    """Remove a real shell comment while preserving quoted hash characters."""
+
+    single = False
+    double = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not single:
+            escaped = True
+            continue
+        if char == "'" and not double:
+            single = not single
+            continue
+        if char == '"' and not single:
+            double = not double
+            continue
+        if (
+            char == "#"
+            and not single
+            and not double
+            and (index == 0 or line[index - 1].isspace())
+        ):
+            return line[:index]
+    return line
+
+
+def _shell_executable_statements(source: str) -> List[Tuple[int, str]]:
+    """Return executable shell lines, excluding comments and heredoc bodies."""
+
+    statements: List[Tuple[int, str]] = []
+    heredocs: List[Tuple[str, bool]] = []
+    offset = 0
+    for line in source.splitlines(keepends=True):
+        if heredocs:
+            delimiter, strip_tabs = heredocs[0]
+            candidate = line.rstrip("\r\n")
+            if strip_tabs:
+                candidate = candidate.lstrip("\t")
+            if candidate == delimiter:
+                heredocs.pop(0)
+            offset += len(line)
+            continue
+
+        code = _strip_shell_comment(line).strip()
+        if code:
+            statements.append((offset, code))
+            for match in _HEREDOC_START.finditer(_blank_shell_arithmetic(code)):
+                delimiter = (
+                    match.group("single")
+                    or match.group("double")
+                    or match.group("bare")
+                )
+                heredocs.append((delimiter, bool(match.group("tabs"))))
+        offset += len(line)
+    return statements
+
+
 @dataclass
 class Audit:
     errors: List[str] = field(default_factory=list)
@@ -433,6 +554,39 @@ def _codex_permission_profiles(audit: Audit) -> None:
         "task runner selects and inlines Codex writer/reviewer permission profiles",
         "task runner must select and inline the Codex permission profile per role",
     )
+    audit.require(
+        re.search(
+            r'"--tools",\s*tools,\s*"--allowedTools",\s*tools,',
+            runner_text,
+        )
+        is not None
+        and '"autoAllowBashIfSandboxed": False' in runner_text
+        and re.search(
+            r'if role == "writer":\s*'
+            r'tools = "Read,Grep,Glob,Edit,Write,Bash"\s*'
+            r'else:\s*tools = ""',
+            runner_text,
+        )
+        is not None
+        and "reviewer_execution_cwd() if role == \"reviewer\" else worktree"
+        in runner_text,
+        "Claude reviewer has an empty tool surface and isolated non-project cwd",
+        "Claude reviewer must pass empty --tools/--allowedTools values, override "
+        "project sandbox Bash auto-approval, and run outside the project tree",
+    )
+    audit.require(
+        "REVIEWER_TOOL_DENIAL" in runner_text
+        and '"/usr/bin/printf \'%s\\\\n\' "' in runner_text
+        and 'f"hooks.PreToolUse={reviewer_guard_config}"' in runner_text
+        and '"--dangerously-bypass-hook-trust"' in runner_text
+        and "'web_search=\"disabled\"'" in runner_text
+        and '"features.apps=false"' in runner_text
+        and '"features.plugins=false"' in runner_text
+        and '"features.multi_agent=false"' in runner_text,
+        "Codex reviewer has a runner-owned deny-all tool boundary",
+        "Codex reviewer must deny every local tool with the protocol-bound "
+        "PreToolUse guard and disable hosted/networked tool surfaces",
+    )
 
 
 def _eval_adapter_security(audit: Audit) -> None:
@@ -622,10 +776,15 @@ def _remote_workflow_contract(audit: Audit) -> None:
         audit.error(f"cannot read remote-audit workflow contract: {exc}")
         return
 
-    dedicated_mapping = re.findall(
-        r"(?m)^\s+MURMUR_REMOTE_AUDIT_TOKEN:\s*"
-        r"\$\{\{\s*secrets\.MURMUR_REMOTE_AUDIT_TOKEN\s*\}\}\s*$",
-        workflow_text,
+    dedicated_mapping = [
+        line.strip()
+        for line in workflow_text.splitlines()
+        if line.lstrip().startswith("MURMUR_REMOTE_AUDIT_TOKEN:")
+    ]
+    expected_privileged_mapping = (
+        "MURMUR_REMOTE_AUDIT_TOKEN: ${{ ((github.event_name == 'schedule' || "
+        "github.event_name == 'workflow_dispatch') && github.ref == "
+        "'refs/heads/murmur') && secrets.MURMUR_REMOTE_AUDIT_TOKEN || '' }}"
     )
     public_mapping = re.findall(
         r"(?m)^\s+MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN:\s*"
@@ -633,9 +792,11 @@ def _remote_workflow_contract(audit: Audit) -> None:
         workflow_text,
     )
     audit.require(
-        len(dedicated_mapping) == 1,
-        "privileged remote audit receives exactly the dedicated secret",
-        "ci.yml must pass MURMUR_REMOTE_AUDIT_TOKEN directly from its same-named secret",
+        dedicated_mapping == [expected_privileged_mapping]
+        and workflow_text.count("secrets.MURMUR_REMOTE_AUDIT_TOKEN") == 1,
+        "privileged remote audit secret is scoped to trusted default-branch monitoring",
+        "ci.yml must expose MURMUR_REMOTE_AUDIT_TOKEN exactly once and only to "
+        "schedule/workflow_dispatch runs on refs/heads/murmur",
     )
     audit.require(
         len(public_mapping) == 1,
@@ -709,6 +870,275 @@ def _headless_e2e_no_egress_contract(audit: Audit) -> None:
     )
 
 
+def _harness_v2_contract(audit: Audit) -> None:
+    required = (
+        ".agents/harness/cli.py",
+        ".agents/harness/verifier.py",
+        ".agents/harness/v2_selftest.py",
+        ".agents/harness/v2_fault_selftest.py",
+        ".agents/harness/metrics_selftest.py",
+        ".agents/harness/prompts/combined-reviewer.md",
+        ".agents/harness/schemas/v2-task.schema.json",
+        ".agents/harness/schemas/v2-plan.schema.json",
+        ".agents/harness/schemas/v2-review.schema.json",
+        ".agents/harness/schemas/v2-evidence.schema.json",
+        ".agents/harness/schemas/v2-commit-intent.schema.json",
+        ".agents/harness/schemas/v2-commit.schema.json",
+    )
+    audit.require(
+        all((ROOT / path).is_file() for path in required),
+        "Harness v2 dispatcher, verifier, prompt, selftest, and schemas exist",
+        "Harness v2 executable/schema surface is incomplete",
+    )
+    config = _load_json(ROOT / ".agents" / "harness" / "config.json", audit)
+    canonical = config.get("canonical_checks", {}) if isinstance(config, dict) else {}
+    required_checks = {
+        "harness-python",
+        "harness-v2-selftest",
+        "receipt-selftest",
+        "hook-selftest",
+        "config-audit",
+    }
+    audit.require(
+        isinstance(canonical, dict)
+        and required_checks.issubset(canonical)
+        and config.get("v2_max_parallel_reviews") == 3
+        and isinstance(config.get("review_retry_max_delay_seconds"), int),
+        "Harness v2 concurrency, retry, and control-plane checks are pinned",
+        "Harness v2 config must pin max 3 reviews, retry delay, and all self-check ids",
+    )
+    try:
+        wrapper = (ROOT / "scripts" / "agent-harness").read_text(encoding="utf-8")
+        dispatcher = (ROOT / ".agents" / "harness" / "cli.py").read_text(
+            encoding="utf-8"
+        )
+        ci = (ROOT / "scripts" / "ci.sh").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        receipt_gate = (
+            ROOT / "scripts" / "verify-harness-attestation"
+        ).read_text(encoding="utf-8")
+        finish_guard = (ROOT / ".agents" / "harness" / "hook_guard.py").read_text(
+            encoding="utf-8"
+        )
+    except OSError as exc:
+        audit.error(f"cannot read Harness v2 wrapper/CI contract: {exc}")
+        return
+    audit.require(
+        ".agents/harness/cli.py" in wrapper,
+        "agent-harness wrapper dispatches through the generation-aware v2 CLI",
+        "scripts/agent-harness must execute .agents/harness/cli.py",
+    )
+    audit.require(
+        all(
+            f'"{script}"' in dispatcher
+            for script in (
+                "v2_selftest.py",
+                "v2_fault_selftest.py",
+                "metrics_selftest.py",
+            )
+        ),
+        "generation-aware selftest aggregates legacy, v2, fault, and metrics suites",
+        "Harness v2 CLI selftest must retain all deterministic sub-suites",
+    )
+    audit.require(
+        "scripts/verify-harness-attestation --selftest" in ci
+        and ci.index("scripts/verify-harness-attestation --selftest")
+        < ci.index("scripts/agent-config-audit --ci"),
+        "strict temp-git receipt selftest runs before expensive CI work",
+        "scripts/ci.sh must run receipt --selftest before config/product gates",
+    )
+    token_capture = 'remote_audit_token="${MURMUR_REMOTE_AUDIT_TOKEN:-}"'
+    public_token_capture = (
+        'public_audit_token="${MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN:-}"'
+    )
+    token_scrub = (
+        "unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN "
+        "GH_TOKEN GITHUB_TOKEN"
+    )
+    receipt_selftest = "scripts/verify-harness-attestation --selftest"
+
+    def token_quarantine_contract(candidate: str) -> bool:
+        positions: Dict[str, List[int]] = {
+            statement: []
+            for statement in (
+                token_capture,
+                public_token_capture,
+                token_scrub,
+                receipt_selftest,
+            )
+        }
+        for offset, statement in _shell_executable_statements(candidate):
+            if statement in positions:
+                positions[statement].append(offset)
+        return (
+            all(len(found) == 1 for found in positions.values())
+            and positions[token_capture][0] < positions[token_scrub][0]
+            and positions[public_token_capture][0] < positions[token_scrub][0]
+            and positions[token_scrub][0] < positions[receipt_selftest][0]
+        )
+
+    comment_spoof = ci.replace(
+        f"  {token_scrub}",
+        f"  # {token_scrub}",
+        1,
+    ).replace(
+        f"  {receipt_selftest}",
+        f"  {receipt_selftest}\n"
+        "  unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN\n"
+        "  unset GH_TOKEN GITHUB_TOKEN",
+        1,
+    )
+    heredoc_spoof = ci.replace(
+        f"  {token_scrub}",
+        "  cat <<'TOKEN_SCRUB'\n"
+        f"{token_scrub}\n"
+        "TOKEN_SCRUB",
+        1,
+    ).replace(
+        f"  {receipt_selftest}",
+        f"  {receipt_selftest}\n"
+        "  unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN\n"
+        "  unset GH_TOKEN GITHUB_TOKEN",
+        1,
+    )
+    arithmetic_shift = ci.replace(
+        f"  {token_scrub}",
+        "  shifted=$((offset << shift))\n"
+        f"  {token_scrub}",
+        1,
+    )
+    audit.require(
+        token_quarantine_contract(arithmetic_shift),
+        "CI quarantine parser distinguishes arithmetic shifts from heredocs",
+        "scripts/ci.sh token quarantine parser must not treat shell arithmetic "
+        "left shift as a heredoc opener",
+    )
+    audit.require(
+        token_quarantine_contract(ci)
+        and not token_quarantine_contract(comment_spoof)
+        and not token_quarantine_contract(heredoc_spoof),
+        "CI quarantines audit tokens before any repository command",
+        "scripts/ci.sh must copy audit credentials into unexported locals, unset "
+        "all exported token names with executable shell statements, and only "
+        "then run the receipt selftest; comments and heredocs are not evidence",
+    )
+    monotonic_receipt_markers = (
+        "Lane B cannot downgrade an agent/v2 branch",
+        "agent/v2 branches require v2 receipts on every authored commit",
+        "downgrades a v2 receipt history",
+        "v2 receipt downgrade rejected",
+        "agent/v2 rejects legacy v1 receipt",
+        "ordinary agent branch accepts explicit Lane B",
+        "agent/v2 rejects Lane B downgrade",
+        "receipted history rejects Lane B downgrade",
+    )
+    audit.require(
+        all(marker in receipt_gate for marker in monotonic_receipt_markers),
+        "receipt policy is monotonic from Lane B/v1 into v2 and selftests the downgrade boundary",
+        "verify-harness-attestation must reserve agent/v2, reject Lane B after receipts, "
+        "reject v2-to-v1 downgrade, and retain RED selftests for each boundary",
+    )
+    rust_lane = re.compile(
+        r"(?m)^\s+run:\s+bash scripts/ci\.sh rust\s*$"
+    )
+    web_lane = re.compile(
+        r"(?m)^\s+run:\s+bash scripts/ci\.sh web\s*$"
+    )
+
+    def thin_lane_contract(candidate: str) -> bool:
+        return (
+            re.search(r"(?m)^\s+merge_group:\s*$", candidate) is not None
+            and len(rust_lane.findall(candidate)) == 1
+            and len(web_lane.findall(candidate)) == 1
+        )
+
+    duplicate_rust_lane = workflow + "\n        run: bash scripts/ci.sh rust\n"
+    duplicate_web_lane = workflow + "\n        run: bash scripts/ci.sh web\n"
+    audit.require(
+        thin_lane_contract(workflow)
+        and not thin_lane_contract(duplicate_rust_lane)
+        and not thin_lane_contract(duplicate_web_lane),
+        "GitHub merge queue remains a thin ci.sh wrapper",
+        "ci.yml must trigger merge_group and contain exactly one real run step "
+        "for each scripts/ci.sh lane; duplicate-step mutations must fail",
+    )
+    base_checkout = re.compile(
+        r"(?m)^\s+ref:\s*\$\{\{\s*github\.event\.pull_request\.base\.sha\s*\}\}\s*$"
+    )
+    trusted_extract = re.compile(
+        r'(?m)^\s+git show "\$BASE_SHA:scripts/verify-harness-attestation" '
+        r'> "\$TRUSTED_VERIFIER"\s*$'
+    )
+    trusted_exec = re.compile(
+        r'(?m)^\s+python3 "\$TRUSTED_VERIFIER"\s+\\\s*$'
+    )
+    candidate_exec = re.compile(
+        r"(?m)^\s+python3\s+(?:\./)?scripts/verify-harness-attestation(?:\s+\\)?\s*$"
+    )
+    pr_only_receipt = re.compile(
+        r"(?m)^\s+if:\s*github\.event_name\s*==\s*'pull_request'\s*$"
+    )
+
+    def trusted_receipt_anchor(text: str) -> bool:
+        return (
+            len(base_checkout.findall(text)) == 1
+            and len(trusted_extract.findall(text)) == 1
+            and len(trusted_exec.findall(text)) == 1
+            and candidate_exec.search(text) is None
+            and 'git cat-file -e "${BASE_SHA}^{commit}"' in text
+            and 'git cat-file -e "${HEAD_SHA}^{commit}"' in text
+            and 'test -s "$TRUSTED_VERIFIER"' in text
+        )
+
+    candidate_execution_mutation = workflow.replace(
+        'python3 "$TRUSTED_VERIFIER"',
+        "python3 scripts/verify-harness-attestation",
+        1,
+    )
+    head_extraction_mutation = workflow.replace(
+        "$BASE_SHA:scripts/verify-harness-attestation",
+        "$HEAD_SHA:scripts/verify-harness-attestation",
+        1,
+    )
+    audit.require(
+        trusted_receipt_anchor(workflow)
+        and not trusted_receipt_anchor(candidate_execution_mutation)
+        and not trusted_receipt_anchor(head_extraction_mutation),
+        "GitHub receipt gate executes only the verifier extracted from the exact PR base SHA",
+        "ci.yml must checkout pull_request.base.sha, extract the receipt verifier from "
+        "that commit, fail closed on missing blobs, and never execute the candidate copy",
+    )
+    audit.require(
+        len(pr_only_receipt.findall(workflow)) == 1
+        and re.search(r"(?m)^\s+merge_group:\s*$", workflow) is not None
+        and re.search(
+            r"(?m)^\s+types:\s*\[\s*checks_requested\s*\]\s*$",
+            workflow,
+        )
+        is not None
+        and "needs: [attestation, rust, web]" in workflow
+        and "if: always()" in workflow
+        and '[ "${{ github.event_name }}" = "pull_request" ]' in workflow
+        and '${{ needs.attestation.result }}" != "success"' in workflow
+        and '${{ needs.attestation.result }}" != "skipped"' in workflow,
+        "PR receipts stay PR-payload-bound while merge queue runs aggregate safely",
+        "the receipt job must remain pull_request-only; the aggregate must require "
+        "receipt success on PRs, allow only the expected skip elsewhere, and include "
+        "both full CI lanes on checks_requested merge groups",
+    )
+    audit.require(
+        "_v2_verifier_module" in finish_guard
+        and "validate_hashed_document" in finish_guard
+        and "supersedes" in finish_guard
+        and "Harness v2 owns the durable commit intent and receipt" in finish_guard,
+        "finish guard resolves v1/v2 manifests, exact import collisions, and delegates v2 commits",
+        "finish guard must validate v2 manifests, fail closed on ambiguous supersedes "
+        "bindings, and delegate durable v2 commits to agent-harness",
+    )
+
+
 def run_audit() -> Audit:
     audit = Audit()
     documents = _json_audit(audit)
@@ -721,6 +1151,7 @@ def run_audit() -> Audit:
     _semantic_lint(audit)
     _remote_workflow_contract(audit)
     _headless_e2e_no_egress_contract(audit)
+    _harness_v2_contract(audit)
     return audit
 
 
