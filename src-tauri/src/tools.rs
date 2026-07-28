@@ -1480,7 +1480,7 @@ pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Resu
     }
     let hits = search_org_brain_hits(db, config, query)?;
     if hits.is_empty() {
-        return Ok(format!("No org-brain results for \"{q}\"."));
+        return Ok("No org-brain results.".to_string());
     }
     Ok(neutralize_murmur_fences(&format_org_hits(&hits)))
 }
@@ -4286,6 +4286,10 @@ mod tests {
             semantic_search_enabled: false,
             ..AppConfig::default()
         };
+        assert!(
+            !cfg.org_egress_consented,
+            "fixture must prove publish consent is not the joined member's read gate"
+        );
 
         let hits = search_org_brain_hits(&db, &cfg, "nebula pricing rollout").unwrap();
         assert!(
@@ -4387,6 +4391,148 @@ mod tests {
         assert!(
             out.contains("Launch plan"),
             "MCP org_search must find the item: {out}"
+        );
+    }
+
+    /// ORG SEARCH FLOOR THROUGH THE REAL TOOL SEAM: `execute_tool` with semantic
+    /// retrieval disabled must use only the SQL/FTS leg, surface a 3/6 exact-token hit, reject 1/6
+    /// and `Kongo` substring noise, and return the normal no-results sentinel when the only candidate
+    /// covers 1/3 terms. `tmp_db()` is file-backed SQLCipher via `Db::open_with_key`.
+    #[test]
+    fn mcp_org_search_lexical_floor_rejects_noise_without_semantic() {
+        let db = tmp_db();
+        seed_org(&db);
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        ingest_org(
+            &db,
+            "it-signal",
+            "erin",
+            "Signal",
+            "hybrid source operator decision",
+            &[31u8; 32],
+        );
+        ingest_org(
+            &db,
+            "it-one",
+            "mallory",
+            "One-token noise",
+            "Kong travel diary",
+            &[32u8; 32],
+        );
+        ingest_org(
+            &db,
+            "it-prefix",
+            "mallory",
+            "Substring noise",
+            "Kongo travel diary",
+            &[33u8; 32],
+        );
+
+        let out = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid mode source truth kong operator".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Signal") && out.contains("[org · erin]"),
+            "the lexical 3/6 hit must surface with provenance: {out}"
+        );
+        assert!(
+            !out.contains("One-token noise") && !out.contains("Substring noise"),
+            "1/6 and Kong/Kongo substring noise must not reach tool output: {out}"
+        );
+
+        ingest_org(
+            &db,
+            "it-three-one",
+            "mallory",
+            "One of three",
+            "violet memo",
+            &[34u8; 32],
+        );
+        let no_results = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "violet quartz ember".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            no_results.starts_with("No org-brain results"),
+            "a lexical 1/3-only corpus must return the normal no-results sentinel: {no_results}"
+        );
+
+        // The per-instance context gate applies at the final rendered tool sink.
+        db.set_org_context_enabled("org-1", false).unwrap();
+        let disabled = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid source operator".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            disabled.starts_with("No org-brain results")
+                && !disabled.contains("Signal")
+                && !disabled.contains("hybrid source operator"),
+            "disabled org content must not reach the tool sink: {disabled}"
+        );
+        db.set_org_context_enabled("org-1", true).unwrap();
+
+        // Tombstoning purges the matching chunk and the SQL predicate remains defense-in-depth.
+        db.tombstone_org_item("it-signal").unwrap();
+        let tombstoned = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid source operator".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            tombstoned.starts_with("No org-brain results")
+                && !tombstoned.contains("Signal")
+                && !tombstoned.contains("hybrid source operator"),
+            "tombstoned org content must not reach the tool sink: {tombstoned}"
+        );
+
+        // Membership is the local ORG_READ authorization boundary. A stale replica without
+        // `org_state` is invisible even though the matching plaintext row still exists.
+        let departed = tmp_db();
+        ingest_org(
+            &departed,
+            "it-departed",
+            "mallory",
+            "Departed secret",
+            "hybrid source operator",
+            &[35u8; 32],
+        );
+        let departed_out = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid source operator".into(),
+            },
+            &departed,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            departed_out.starts_with("No org-brain results")
+                && !departed_out.contains("Departed secret")
+                && !departed_out.contains("hybrid source operator"),
+            "non-member replica content must not reach the tool sink: {departed_out}"
         );
     }
 
