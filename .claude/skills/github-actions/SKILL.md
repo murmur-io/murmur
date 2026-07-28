@@ -21,16 +21,20 @@ Murmur's cloud CI is one file: `.github/workflows/ci.yml`, a **thin wrapper arou
 
 ```bash
 # lightweight tag → the ref sha IS the commit:
-gh api repos/actions/checkout/git/refs/tags/v4.2.2 --jq '.object.sha'
+gh api repos/actions/checkout/git/refs/tags/v7.0.1 --jq '.object.sha'
 # annotated tag (.object.type == "tag") → deref to the COMMIT sha:
 gh api repos/Swatinem/rust-cache/git/refs/tags/v2.7.5 --jq '.object.sha'      # -> tag object sha
 gh api repos/Swatinem/rust-cache/git/tags/<that-sha> --jq '.object.sha'       # -> commit sha (pin THIS)
 ```
 
 Pin the **commit** sha, comment the version. Currently pinned in `ci.yml`:
-`actions/checkout@…11bd719 # v4.2.2`, `actions/setup-node@…39370e3 # v4.1.0`,
+`actions/checkout@…3d3c42e # v7.0.1`, `actions/setup-node@…39370e3 # v4.1.0`,
 `Swatinem/rust-cache@…c193711 # v2.9.1`, `taiki-e/install-action@…678b06b # v2.44.60`,
 `actions/cache@…55cc834 # v6.1.0`.
+
+`actions/checkout` v7 runs on Node 24 and requires runner v2.327.1 or later.
+GitHub-hosted runners satisfy this; self-hosted runners must be upgraded before
+adopting the pin.
 
 **Cache-service deprecation (bitten 2026-07-05):** GitHub killed the legacy cache
 backend — `actions/cache` < v4.2 and `Swatinem/rust-cache` < v2.7.8 are AUTO-FAILED

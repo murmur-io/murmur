@@ -102,7 +102,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout the PR base revision (full history)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Never execute the receipt verifier from candidate PR bytes. The
           # candidate is fetched below only as inert Git objects to be judged.
@@ -174,7 +174,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # src-tauri/Cargo.toml has a PATH dependency on the murmur-protocol crate in
       # the (private) sibling repo: ../../murmur-server/crates/murmur-protocol.
@@ -282,7 +282,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node (version from .nvmrc — Angular 22 needs >= 24.15)
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
