@@ -19,6 +19,7 @@ pub mod graph;
 /// transcript segments. Pure, on-device, zero-egress; annotates unsupported summary units with a
 /// non-destructive `> unverified` marker.
 pub mod grounding;
+pub mod note_sections;
 pub mod local;
 pub mod meta;
 /// The REAL on-device PERSON-name NER redactor (Phase D). ALWAYS compiled; the real impl is selected

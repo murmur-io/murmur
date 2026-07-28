@@ -880,7 +880,27 @@ pub fn execute_tool(
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::facts::build_knowledge_diff(db, &id, from, to, unlocked) {
-                Ok(kd) => Ok(format_knowledge_diff(entity, &kd)),
+                Ok(kd) => {
+                    // R6/#6 — the note's OWN `## Decisions` / `## Risks` bullets, which the triple
+                    // extractor could never produce (a decision is a sentence, not a short
+                    // attribute) and which is why a 5-decision note reported "0 total decisions".
+                    // GATED: `list_note_decisions_visible` carries the same visibility predicate as
+                    // `list_facts_visible`, over the meetings this diff already resolved.
+                    let meeting_ids: Vec<String> = kd
+                        .ledger
+                        .iter()
+                        .chain(kd.diff.changed.iter())
+                        .chain(kd.diff.added.iter())
+                        .chain(kd.diff.removed.iter())
+                        .filter_map(|c| c.source_meeting_id.clone())
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let recorded = db
+                        .list_note_decisions_visible(&meeting_ids, unlocked)
+                        .unwrap_or_default();
+                    Ok(format_knowledge_diff(entity, &kd, &recorded))
+                }
                 Err(e) => Err(AppError::Storage(format!("knowledge diff failed: {e}"))),
             }
         }
@@ -1516,7 +1536,11 @@ fn format_org_hits(hits: &[crate::storage::models::OrgChunkHit]) -> String {
 /// `<subject> · <predicate>: <old> → <new>` (or `+ <new>` / `- <old>`), with the effective date and
 /// the `source:<meetingId>` provenance so the client can cite. No entity/predicate/object is logged —
 /// this is the RETURNED payload, not a log line.
-fn format_knowledge_diff(entity: &str, kd: &crate::facts::EntityKnowledgeDiff) -> String {
+fn format_knowledge_diff(
+    entity: &str,
+    kd: &crate::facts::EntityKnowledgeDiff,
+    recorded: &[(String, String, String)],
+) -> String {
     fn line(c: &crate::facts::FactStateChange) -> String {
         let val = match (&c.old_object, &c.new_object) {
             (Some(o), Some(n)) => format!("{o} → {n}"),
@@ -1535,15 +1559,23 @@ fn format_knowledge_diff(entity: &str, kd: &crate::facts::EntityKnowledgeDiff) -
         )
     }
     let d = &kd.diff;
+    // R6/#6 — the count used to be `kd.ledger.len()` ALONE, i.e. supersessions of extracted
+    // attribute triples. A note carrying five written decisions therefore reported "0 total
+    // decision(s) on record", which reads as "this project has made no decisions" rather than
+    // "this registry never looked at the Decisions section". Report both, named for what they are.
+    let decisions = recorded.iter().filter(|(_, k, _)| k == "decision").count();
+    let risks = recorded.iter().filter(|(_, k, _)| k == "risk").count();
     let mut out = format!(
-        "KNOWLEDGE DIFF for \"{}\" — {} vs {}: {} changed, {} added, {} removed; {} total decision(s) on record.\n",
+        "KNOWLEDGE DIFF for \"{}\" — {} vs {}: {} changed, {} added, {} removed; {} attribute supersession(s), {} recorded decision(s), {} open risk(s).\n",
         entity,
         kd.from,
         kd.to,
         d.changed.len(),
         d.added.len(),
         d.removed.len(),
-        kd.ledger.len()
+        kd.ledger.len(),
+        decisions,
+        risks
     );
     let mut section = |title: &str, rows: &[crate::facts::FactStateChange]| {
         if !rows.is_empty() {
@@ -1558,7 +1590,29 @@ fn format_knowledge_diff(entity: &str, kd: &crate::facts::EntityKnowledgeDiff) -
     section("ADDED", &d.added);
     section("REMOVED", &d.removed);
     section("DECISION LEDGER (oldest → newest)", &kd.ledger);
-    if d.changed.is_empty() && d.added.is_empty() && d.removed.is_empty() && kd.ledger.is_empty() {
+    // The decisions the note actually WROTE, as opposed to attribute supersessions inferred from it.
+    for (title, want) in [
+        ("RECORDED DECISIONS (from the note)", "decision"),
+        ("OPEN RISKS & QUESTIONS (from the note)", "risk"),
+    ] {
+        let rows: Vec<&String> = recorded
+            .iter()
+            .filter(|(_, k, _)| k == want)
+            .map(|(_, _, text)| text)
+            .collect();
+        if !rows.is_empty() {
+            out.push_str(&format!("\n{title}:\n"));
+            for text in rows {
+                out.push_str(&format!("- {text}\n"));
+            }
+        }
+    }
+    if d.changed.is_empty()
+        && d.added.is_empty()
+        && d.removed.is_empty()
+        && kd.ledger.is_empty()
+        && recorded.is_empty()
+    {
         out.push_str("\nNo tracked facts in this window.\n");
     }
     out

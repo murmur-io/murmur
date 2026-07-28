@@ -619,6 +619,101 @@ impl Db {
         Ok(())
     }
 
+    /// Replace this meeting's parsed DECISION / RISK bullets (R6/#6).
+    ///
+    /// Replace-not-append, keyed on `meeting_id`, so re-summarizing a meeting cannot accumulate
+    /// duplicate decisions — the note is the source of truth and this table mirrors it.
+    pub fn replace_note_decisions(
+        &self,
+        meeting_id: &str,
+        bullets: &[crate::summarize::note_sections::LabeledBullet],
+        recorded_at: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM note_decisions WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        for b in bullets {
+            tx.execute(
+                "INSERT INTO note_decisions (id, meeting_id, kind, text, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    meeting_id,
+                    b.kind,
+                    b.text,
+                    recorded_at
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED read of the decision/risk rows for a set of meetings.
+    ///
+    /// LOCK MODEL: a decision bullet is note CONTENT, so this carries the same `visibility_clause`
+    /// predicate as `list_facts_visible` — keep a meeting iff it has NO note rows, OR at least one
+    /// VISIBLE note row. Purge-on-seal (below) is defense-in-depth BENEATH this gate, not the gate.
+    pub fn list_note_decisions_visible(
+        &self,
+        meeting_ids: &[String],
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<(String, String, String)>> {
+        if meeting_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let placeholders = (1..=meeting_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT d.meeting_id, d.kind, d.text \
+               FROM note_decisions d \
+               JOIN meetings m ON m.id = d.meeting_id \
+              WHERE d.meeting_id IN ({placeholders}) \
+                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                 OR EXISTS ( \
+                      SELECT 1 FROM notes n \
+                       LEFT JOIN folders f ON f.id = n.folder_id \
+                       WHERE n.meeting_id = m.id AND {visible} \
+                    )) \
+              ORDER BY d.kind ASC, d.rowid ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(meeting_ids.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Seal-time purge of the decision rows, called from the SAME atomic tx as `purge_facts_tx`.
+    pub(crate) fn purge_note_decisions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM note_decisions WHERE meeting_id = ?1",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
     /// FORGET one user fact by id (bitemporal INVALIDATE, never a silent delete): close the row at
     /// `at` if it is still open. Idempotent (a already-closed row is untouched). History is preserved
     /// — the fact simply stops being current, so it drops out of `list_user_facts_visible` and the

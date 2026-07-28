@@ -550,6 +550,9 @@ impl Db {
             // re-diarized voiceprints) survived the relock at rest. Same purge-on-seal contract,
             // same meeting scope, same atomic unit as the plaintext re-blank above.
             Self::purge_facts_tx(&tx, &meeting_ids)?;
+            // R6/#6: the RELOCK path must purge decisions too — rows re-derived during a session
+            // unlock would otherwise survive the relock at rest (the exact 2026-07-10 F5 class).
+            Self::purge_note_decisions_tx(&tx, &meeting_ids)?;
             Self::purge_user_facts_tx(&tx, &meeting_ids)?;
             Self::purge_assistant_interactions_tx(&tx, &meeting_ids)?;
             Self::purge_speaker_voiceprints_tx(&tx, &meeting_ids)?;

@@ -129,6 +129,19 @@ pub(crate) fn persist_facts_for_meeting(
     recording_model_token: Option<&crate::perf::RecordingSessionToken>,
     visibility: &MeetingContentSnapshot,
 ) -> Result<(), AppError> {
+    // R6/#6 — mirror the note's `## Decisions` / `## Risks & open questions` bullets into their own
+    // table BEFORE the entity gate below. This is a DETERMINISTIC parse of text the model was
+    // already instructed to write, so unlike the LLM triple extraction it works with no model at
+    // all — and it must not be skipped just because this meeting produced no entities.
+    let bullets = crate::summarize::note_sections::parse_labeled_bullets(markdown);
+    if !bullets.is_empty() {
+        let at = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = state.db.replace_note_decisions(meeting_id, &bullets, &at) {
+            // Best-effort, exactly like the extraction below: a decisions hiccup must NEVER block
+            // the note pipeline. Content-free logging (a count only).
+            tracing::warn!(target: "facts", count = bullets.len(), error = %e, "note decisions not persisted");
+        }
+    }
     if entity_refs.is_empty() {
         return Ok(());
     }

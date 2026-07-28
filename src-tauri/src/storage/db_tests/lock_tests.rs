@@ -1660,6 +1660,65 @@ fn list_user_facts_visible_excludes_sealed_meeting() {
     );
 }
 
+/// R6/#6 (regression + LOCK GATE). The note's `## Decisions` bullets become first-class rows — and
+/// they carry the SAME purge-on-seal + visibility-gate contract as `facts`.
+///
+/// A decision bullet is note CONTENT. If it were merely stored and read back, sealing the folder
+/// would leave it readable at rest and queryable through knowledge_diff — a straight sealed-content
+/// leak. Both halves are asserted here: the gated read hides it, and the seal tx deletes it.
+#[test]
+fn note_decisions_are_gated_and_purged_on_seal() {
+    use crate::summarize::note_sections::LabeledBullet;
+    let db = file_db("note-decisions-lock");
+    seed_folder(&db, "f-lock", "Secret");
+    seed_note(&db, "open", "## Decisions\n- open decision\n", None);
+    seed_note(&db, "sealed", "## Decisions\n- secret decision\n", Some("f-lock"));
+    let bullet = |t: &str| LabeledBullet {
+        kind: "decision",
+        text: t.to_string(),
+    };
+    db.replace_note_decisions("open", &[bullet("open decision")], "2026-07-01T00:00:00Z")
+        .unwrap();
+    db.replace_note_decisions("sealed", &[bullet("secret decision")], "2026-07-01T00:00:00Z")
+        .unwrap();
+
+    let ids = vec!["open".to_string(), "sealed".to_string()];
+    // Both visible while the folder is open.
+    assert_eq!(
+        db.list_note_decisions_visible(&ids, &HashSet::new())
+            .unwrap()
+            .len(),
+        2
+    );
+
+    db.set_folder_locked("f-lock", true, None).unwrap();
+
+    // GATE: the sealed meeting's decision text must not come back.
+    let after = db
+        .list_note_decisions_visible(&ids, &HashSet::new())
+        .unwrap();
+    assert_eq!(after.len(), 1, "only the open meeting's decision: {after:?}");
+    assert!(
+        !after.iter().any(|(_, _, t)| t.contains("secret")),
+        "a sealed decision must never surface: {after:?}"
+    );
+
+    // PURGE-ON-SEAL: not merely hidden — GONE from the table at rest, so even a future ungated
+    // reader cannot find it. `set_folder_locked` above only flips the flag; the derived-content
+    // purge is the seal transaction itself, which is what `lock_folder` runs.
+    db.purge_chunks_for_meetings(&["sealed".to_string()]).unwrap();
+    let unlocked: HashSet<String> = ["f-lock".to_string()].into_iter().collect();
+    let even_unlocked = db.list_note_decisions_visible(&ids, &unlocked).unwrap();
+    assert!(
+        !even_unlocked.iter().any(|(_, _, t)| t.contains("secret")),
+        "the sealed row must be purged by the seal tx, so unlocking cannot resurrect it: {even_unlocked:?}"
+    );
+    assert!(
+        even_unlocked.iter().any(|(_, _, t)| t.contains("open")),
+        "the OPEN meeting's decision must survive the purge of an unrelated meeting"
+    );
+}
+
 /// R4/#17 (regression). An ENTITY fact must be FORGETTABLE.
 ///
 /// Until `forget_entity_fact` existed, the store exposed forget/clear for USER facts only, so the

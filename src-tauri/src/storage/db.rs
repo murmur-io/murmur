@@ -539,6 +539,22 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity_id);
              CREATE INDEX IF NOT EXISTS idx_facts_meeting ON facts(meeting_id);
+             -- R6/#6 — the note's `## Decisions` / `## Risks & open questions` bullets as
+             -- FIRST-CLASS rows. Deliberately a SEPARATE table rather than more `facts` rows: a
+             -- decision is a SENTENCE, and routing free text through `reconcile_facts` would mint
+             -- a spurious supersession on every re-wording under the same (subject, predicate) key,
+             -- fabricating bitemporal history. It also keeps the `status`/`owner` key space clean.
+             -- `meeting_id` is the provenance + gating + purge anchor, exactly like `facts`:
+             -- PURGED on seal in the same atomic tx and visibility-gated on every read.
+             CREATE TABLE IF NOT EXISTS note_decisions (
+               id TEXT PRIMARY KEY,
+               meeting_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               text TEXT NOT NULL,
+               recorded_at TEXT NOT NULL,
+               FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_note_decisions_meeting ON note_decisions(meeting_id);
              -- CROSS-MEETING USER MEMORY (Phase 3). The SAME bitemporal shape as `facts`
              -- (subject·predicate·object with valid_from/valid_to — invalidate-not-delete via
              -- reconcile) but USER-SCOPED, not entity-scoped: these are durable facts/preferences/
@@ -3016,6 +3032,9 @@ impl Db {
         // drop them in the SAME seal tx so a sealed meeting contributes no fact — same purge-on-seal
         // contract as corrections / chunks / assistant interactions.
         Self::purge_facts_tx(&tx, meeting_ids)?;
+        // R6/#6: parsed DECISION / RISK bullets are derived note content anchored to the meeting;
+        // drop them in the SAME seal tx under the identical purge-on-seal contract as `facts`.
+        Self::purge_note_decisions_tx(&tx, meeting_ids)?;
         // Phase 3 CROSS-MEETING USER MEMORY: user-scoped facts are DERIVED content tied to the source
         // meeting (plaintext at rest); drop them in the SAME seal tx so a sealed meeting contributes
         // no user memory — identical purge-on-seal contract as `facts` above. The injected brief is
