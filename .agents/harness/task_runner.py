@@ -75,6 +75,7 @@ OUTER_SANDBOX_ENV = "MURMUR_HARNESS_OUTER_SANDBOX"
 INHERITED_SANDBOX_META_CHECKS = frozenset(
     (
         "scripts/agent-harness selftest --ci",
+        "python3 .agents/harness/v2_selftest.py",
         "bash .codex/hooks/selftest.sh",
     )
 )
