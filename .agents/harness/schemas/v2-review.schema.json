@@ -57,6 +57,7 @@
             "enum": [
               "rust-lib",
               "protocol-server",
+              "npm-lock",
               "tauri-boot",
               "ng-lint",
               "ng-build",

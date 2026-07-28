@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import cli as harness_cli
 import task_runner as legacy
@@ -669,6 +669,13 @@ def profile_cases(test: Tests) -> None:
         ["ng-lint", "ng-build"],
     )
 
+    checks, _, _ = _profile(["package.json", "package-lock.json"])
+    test.equal(
+        "PROFILE package manifests run lock evidence before Angular gates",
+        checks,
+        ["npm-lock", "ng-lint", "ng-build"],
+    )
+
     checks, _, _ = _profile(
         ["src-tauri/src/lib.rs", "src/app/core/ipc.service.ts"]
     )
@@ -804,6 +811,327 @@ def profile_cases(test: Tests) -> None:
             canonical_v2_selftest
         ),
     )
+    review_schema = legacy.load_schema("v2-review")
+    schema_probe_ids = set(
+        review_schema["properties"]["probe_requests"]["items"]["properties"][
+            "probe_id"
+        ]["enum"]
+    )
+    test.equal(
+        "PROFILE static probe vocabulary matches executable canonical ids",
+        schema_probe_ids,
+        verifier.ALLOWED_PROBES,
+    )
+    test.equal(
+        "PROFILE every static probe id has exactly one canonical command",
+        set(legacy.load_config()["canonical_checks"]),
+        verifier.ALLOWED_PROBES,
+    )
+
+
+def npm_lock_evidence_cases(test: Tests) -> None:
+    script = ROOT / ".agents" / "harness" / "checks" / "npm-lock-evidence.py"
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-npm-lock-valid-") as raw:
+        repo = Path(raw) / "repo"
+        _init_repo(repo)
+        manifest = legacy.load_json(ROOT / "package.json")
+        lock = legacy.load_json(ROOT / "package-lock.json")
+        lock["version"] = manifest["version"]
+        lock["packages"][""]["version"] = manifest["version"]
+        manifest["optionalDependencies"] = {"nanoid": "^3.3.15"}
+        manifest["peerDependencies"] = {"postcss": "^8.5.13"}
+        manifest["peerDependenciesMeta"] = {
+            "postcss": {"optional": False}
+        }
+        lock["packages"][""]["optionalDependencies"] = dict(
+            manifest["optionalDependencies"]
+        )
+        lock["packages"][""]["peerDependencies"] = dict(
+            manifest["peerDependencies"]
+        )
+        lock["packages"][""]["peerDependenciesMeta"] = copy.deepcopy(
+            manifest["peerDependenciesMeta"]
+        )
+        legacy.atomic_write_json(repo / "package.json", manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        _git(repo, "add", "package.json", "package-lock.json")
+        _git(repo, "commit", "-q", "-m", "add coherent package fixture")
+        base_sha = _git(repo, "rev-parse", "HEAD")
+        before = legacy.git_bytes(repo, "status", "--porcelain", "-z")
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "MURMUR_HARNESS_BASE_SHA": base_sha,
+            },
+            check=False,
+        )
+        after = legacy.git_bytes(repo, "status", "--porcelain", "-z")
+        try:
+            evidence = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            evidence = {}
+        test.equal(
+            "NPM-LOCK coherent repository evidence is read-only and green",
+            (completed.returncode, after == before),
+            (0, True),
+        )
+        direct_names = {
+            name
+            for key in (
+                "dependencies",
+                "devDependencies",
+                "optionalDependencies",
+                "peerDependencies",
+            )
+            for name in evidence.get("direct", {}).get(key, {})
+        }
+        versions = evidence.get("versions_by_name", {})
+        test.true(
+            "NPM-LOCK evidence covers every direct logical version",
+            bool(direct_names)
+            and direct_names.issubset(set(versions))
+            and all(versions.get(name) for name in direct_names),
+        )
+        test.true(
+            "NPM-LOCK evidence covers optional and peer dependency classes",
+            {
+                "nanoid",
+                "postcss",
+            }.issubset(direct_names)
+            and evidence.get("direct", {}).get("peerDependenciesMeta")
+            == {"postcss": {"optional": False}},
+        )
+        test.true(
+            "NPM-LOCK evidence remains compact and names its offline mode",
+            len(completed.stdout) <= 65_536
+            and evidence.get("mode") == "offline-package-lock-only",
+        )
+
+        committed_manifest = copy.deepcopy(manifest)
+        committed_lock = copy.deepcopy(lock)
+        committed_manifest["dependencies"] = {
+            **committed_manifest.get("dependencies", {}),
+            "base-binding-fixture": "1.0.0",
+        }
+        committed_lock["packages"][""]["dependencies"] = dict(
+            committed_manifest["dependencies"]
+        )
+        committed_lock["packages"]["node_modules/base-binding-fixture"] = {
+            "version": "1.0.0"
+        }
+        legacy.atomic_write_json(repo / "package.json", committed_manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", committed_lock)
+        _git(repo, "add", "package.json", "package-lock.json")
+        _git(repo, "commit", "-q", "-m", "commit task dependency change")
+        committed_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "MURMUR_HARNESS_BASE_SHA": base_sha,
+            },
+            check=False,
+        )
+        try:
+            committed_evidence = json.loads(committed_run.stdout)
+        except json.JSONDecodeError:
+            committed_evidence = {}
+        changed_names = {
+            row.get("name")
+            for row in committed_evidence.get("changed_lock_entries", [])
+        }
+        test.true(
+            "NPM-LOCK committed task diff remains bound to immutable base",
+            committed_run.returncode == 0
+            and committed_evidence.get("base_sha") == base_sha
+            and "base-binding-fixture" in changed_names
+            and committed_evidence.get("base_package_json_sha256")
+            == hashlib.sha256(
+                legacy.git_bytes(repo, "show", f"{base_sha}:package.json")
+            ).hexdigest(),
+        )
+
+        removed_manifest = copy.deepcopy(committed_manifest)
+        removed_lock = copy.deepcopy(committed_lock)
+        removed_manifest["dependencies"].pop("rxjs")
+        removed_lock["packages"][""]["dependencies"].pop("rxjs")
+        rxjs_package_before = copy.deepcopy(
+            lock["packages"]["node_modules/rxjs"]
+        )
+        test.equal(
+            "NPM-LOCK removed direct fixture keeps package entry unchanged",
+            removed_lock["packages"]["node_modules/rxjs"],
+            rxjs_package_before,
+        )
+        legacy.atomic_write_json(repo / "package.json", removed_manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", removed_lock)
+        removed_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "MURMUR_HARNESS_BASE_SHA": base_sha,
+            },
+            check=False,
+        )
+        try:
+            removed_evidence = json.loads(removed_run.stdout)
+        except json.JSONDecodeError:
+            removed_evidence = {}
+        test.true(
+            "NPM-LOCK removed direct still reports transitive versions",
+            removed_run.returncode == 0
+            and "rxjs"
+            in removed_evidence.get(
+                "changed_manifest_dependency_names", []
+            )
+            and bool(
+                removed_evidence.get("versions_by_name", {}).get("rxjs")
+            ),
+        )
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-npm-lock-") as raw:
+        repo = Path(raw) / "repo"
+        _init_repo(repo)
+        manifest = {
+            "name": "fixture",
+            "version": "1.0.0",
+            "dependencies": {"example": "1.0.0"},
+            "devDependencies": {},
+            "scripts": {},
+        }
+        lock = {
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "version": "1.0.0",
+                    "dependencies": {"example": "1.0.0"},
+                    "devDependencies": {},
+                }
+            },
+        }
+        legacy.atomic_write_json(repo / "package.json", manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        _git(repo, "add", "package.json", "package-lock.json")
+        _git(repo, "commit", "-q", "-m", "add package fixture")
+        base_sha = _git(repo, "rev-parse", "HEAD")
+        bound_environment = {
+            **os.environ,
+            "MURMUR_HARNESS_BASE_SHA": base_sha,
+        }
+
+        duplicate = (
+            '{"name":"fixture","version":"1.0.0","version":"2.0.0",'
+            '"dependencies":{"example":"1.0.0"},"devDependencies":{},'
+            '"scripts":{}}\n'
+        )
+        (repo / "package.json").write_text(duplicate, encoding="utf-8")
+        duplicate_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=bound_environment,
+            check=False,
+        )
+        test.true(
+            "NPM-LOCK duplicate JSON keys fail closed",
+            duplicate_run.returncode != 0
+            and b"duplicate JSON key" in duplicate_run.stderr,
+        )
+
+        legacy.atomic_write_json(repo / "package.json", manifest)
+        broken_lock = copy.deepcopy(lock)
+        broken_lock["packages"][""]["dependencies"] = {}
+        legacy.atomic_write_json(repo / "package-lock.json", broken_lock)
+        mismatch_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=bound_environment,
+            check=False,
+        )
+        test.true(
+            "NPM-LOCK manifest/root mismatch fails before npm execution",
+            mismatch_run.returncode != 0
+            and b"lock root dependencies differ" in mismatch_run.stderr,
+        )
+
+        optional_manifest = copy.deepcopy(manifest)
+        optional_manifest["optionalDependencies"] = {
+            "optional-example": "1.0.0"
+        }
+        legacy.atomic_write_json(repo / "package.json", optional_manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        optional_mismatch_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=bound_environment,
+            check=False,
+        )
+        test.true(
+            "NPM-LOCK optional dependency mismatch fails closed",
+            optional_mismatch_run.returncode != 0
+            and b"lock root optionalDependencies differ"
+            in optional_mismatch_run.stderr,
+        )
+
+        peer_manifest = copy.deepcopy(manifest)
+        peer_manifest["peerDependencies"] = {"peer-example": "1.0.0"}
+        peer_manifest["peerDependenciesMeta"] = {
+            "peer-example": {"optional": True}
+        }
+        legacy.atomic_write_json(repo / "package.json", peer_manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        peer_mismatch_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=bound_environment,
+            check=False,
+        )
+        test.true(
+            "NPM-LOCK peer dependency mismatch fails closed",
+            peer_mismatch_run.returncode != 0
+            and b"lock root peerDependencies differ"
+            in peer_mismatch_run.stderr,
+        )
+
+        peer_lock = copy.deepcopy(lock)
+        peer_lock["packages"][""]["peerDependencies"] = {
+            "peer-example": "1.0.0"
+        }
+        legacy.atomic_write_json(repo / "package.json", peer_manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", peer_lock)
+        peer_meta_mismatch_run = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=bound_environment,
+            check=False,
+        )
+        test.true(
+            "NPM-LOCK peer dependency metadata mismatch fails closed",
+            peer_meta_mismatch_run.returncode != 0
+            and b"lock root peerDependenciesMeta differ"
+            in peer_meta_mismatch_run.stderr,
+        )
 
 
 def reviewer_tool_guard_cases(test: Tests) -> None:
@@ -1128,6 +1456,33 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             destination = repo / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+        owned_relative = "src/design-tokens/probe-precedence.scss"
+        owned_base = repo / owned_relative
+        owned_base.parent.mkdir(parents=True, exist_ok=True)
+        owned_base.write_text("/* base */\n", encoding="utf-8")
+        package_manifest = {
+            "name": "probe-precedence-fixture",
+            "version": "1.0.0",
+            "scripts": {},
+            "dependencies": {},
+            "devDependencies": {},
+        }
+        package_lock = {
+            "name": "probe-precedence-fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": True,
+            "packages": {
+                "": {
+                    "name": "probe-precedence-fixture",
+                    "version": "1.0.0",
+                    "dependencies": {},
+                    "devDependencies": {},
+                }
+            },
+        }
+        legacy.atomic_write_json(repo / "package.json", package_manifest)
+        legacy.atomic_write_json(repo / "package-lock.json", package_lock)
         _git(repo, "add", ".")
         _git(repo, "commit", "-q", "-m", "add exact v2 protocol")
         base = _git(repo, "rev-parse", "HEAD")
@@ -1166,7 +1521,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             "git_common_dir": str(common.resolve()),
             "worktree_path": str(worktree.resolve()),
             "branch": branch,
-            "owned_paths": ["owned.txt"],
+            "owned_paths": [owned_relative],
             "claims": [],
             "reviewer": "fake",
             "expected_change": True,
@@ -1194,17 +1549,37 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             },
         )
         harness_cli.set_v2_state(task_dir, "OPEN", phase="open")
-        owned = worktree / "owned.txt"
-        owned.write_text("base\nprobe precedence\n", encoding="utf-8")
+        owned = worktree / owned_relative
+        owned.write_text(
+            "/* base */\n/* probe precedence */\n", encoding="utf-8"
+        )
 
         saved_verdict = os.environ.get("MURMUR_HARNESS_FAKE_REVIEW_VERDICT")
         saved_probe = os.environ.get(
             "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
         )
+        saved_probe_rationale = os.environ.get(
+            "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE"
+        )
+        saved_proof_gaps = os.environ.get(
+            "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON"
+        )
+        original_load_config = legacy.load_config
+        selftest_config = copy.deepcopy(original_load_config())
+        selftest_config["canonical_checks"]["ng-lint"] = (
+            "python3 -c 'print(\"PLANNED_\" + \"NG_LINT_STREAM\")'"
+        )
+        selftest_config["canonical_checks"]["ng-build"] = (
+            "python3 -c 'print(\"PLANNED_\" + \"NG_BUILD_STREAM\")'"
+        )
+        selftest_config["canonical_checks"]["npm-lock"] = (
+            "python3 -c 'print(\"PLANNED_\" + \"NPM_LOCK_STREAM\")'"
+        )
+        legacy.load_config = lambda: copy.deepcopy(selftest_config)
         os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
         os.environ[
             "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
-        ] = "harness-python"
+        ] = "ng-lint"
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 collected = harness_cli.verify_task(
@@ -1214,7 +1589,9 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 )
             state = harness_cli.load_v2_state(task_dir)
             attempt_dir = task_dir / "attempts" / str(state["attempt_id"])
-            probe_path = attempt_dir / "probes" / "harness-python.json"
+            plan = legacy.load_json(attempt_dir / "plan.json")
+            probe_path = attempt_dir / "probes" / "ng-lint.json"
+            probe_record = legacy.load_json(probe_path)
             probe_before = probe_path.read_bytes()
             probe_mtime_before = probe_path.stat().st_mtime_ns
             test.equal(
@@ -1222,7 +1599,189 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 collected,
                 "NEEDS_EVIDENCE",
             )
+            verifier.validate_probe_checkpoint(
+                probe_record,
+                verifier.canonical_check("ng-lint", legacy.load_config()),
+                plan,
+                task_dir,
+                allow_test_adapter=True,
+            )
+            test.equal(
+                "PROBE flow binds reviewer rationale to fresh execution",
+                (
+                    probe_record["source"],
+                    probe_record["request_contexts"][0]["rationale"],
+                ),
+                (
+                    "reviewer-probe",
+                    "selftest-only typed probe state transition",
+                ),
+            )
+            combined_context = copy.deepcopy(
+                probe_record["request_contexts"][0]
+            )
+            combined_context["review_kind"] = "combined"
+            combined_context["context_sha256"] = "f" * 64
+            specialist_context = copy.deepcopy(combined_context)
+            specialist_context["review_kind"] = "specialist"
+            specialist_context["context_sha256"] = "0" * 64
+            test.equal(
+                "PROBE multi-review contexts use validator canonical order",
+                [
+                    item["review_kind"]
+                    for item in verifier.canonical_probe_request_contexts(
+                        [specialist_context, combined_context]
+                    )
+                ],
+                ["combined", "specialist"],
+            )
+            check_records = [
+                legacy.load_json(path)
+                for path in sorted((attempt_dir / "checks").glob("*.json"))
+            ]
+            bound_prompt = verifier.combined_review_prompt(
+                contract,
+                plan,
+                verifier.snapshot_scoped_diff(
+                    worktree, contract, task_dir
+                )[1],
+                [*check_records, probe_record],
+                "combined",
+                worktree,
+                task_dir,
+                probes=[probe_record],
+            )
+            test.true(
+                "PROBE resume prompt exposes exact command output and rationale",
+                "PLANNED_NG_LINT_STREAM" in bound_prompt
+                and "selftest-only typed probe state transition" in bound_prompt
+                and json.dumps(probe_record["command"])[1:-1]
+                in bound_prompt,
+            )
+            test.true(
+                "PROBE every planned check exposes a bounded excerpt",
+                "PLANNED_NG_BUILD_STREAM" in bound_prompt
+                and '"excerpt_included": true' in bound_prompt,
+            )
+            forged_channel_checks = copy.deepcopy(check_records)
+            for item in forged_channel_checks:
+                if item["id"] == "ng-build":
+                    item["source"] = "reviewer-probe"
+            forged_channel_prompt = verifier.combined_review_prompt(
+                contract,
+                plan,
+                verifier.snapshot_scoped_diff(
+                    worktree, contract, task_dir
+                )[1],
+                forged_channel_checks,
+                "combined",
+                worktree,
+                task_dir,
+                probes=[probe_record],
+            )
+            forged_ng_build = next(
+                item
+                for item in forged_channel_checks
+                if item["id"] == "ng-build"
+            )
+            test.equal(
+                "PROBE record field cannot forge the stream channel",
+                (
+                    verifier._review_evidence_summary(
+                        forged_ng_build,
+                        task_dir,
+                        channel="planned-check",
+                    )["source"],
+                    "PLANNED_NG_BUILD_STREAM" in forged_channel_prompt,
+                ),
+                ("planned-check", True),
+            )
+            provenance_free = copy.deepcopy(probe_record)
+            provenance_free.pop("source")
+            provenance_free.pop("request_contexts")
+            test.raises(
+                "PROBE provenance-free legacy token fails closed",
+                lambda: verifier.validate_probe_checkpoint(
+                    provenance_free,
+                    verifier.canonical_check(
+                        "ng-lint", legacy.load_config()
+                    ),
+                    plan,
+                    task_dir,
+                    allow_test_adapter=True,
+                ),
+                "provenance",
+            )
+            corrupt_stream = copy.deepcopy(probe_record)
+            corrupt_stream["evidence"]["stdout_sha256"] = "f" * 64
+            test.raises(
+                "PROBE changed output hash fails before fresh review",
+                lambda: verifier.validate_probe_checkpoint(
+                    corrupt_stream,
+                    verifier.canonical_check(
+                        "ng-lint", legacy.load_config()
+                    ),
+                    plan,
+                    task_dir,
+                    allow_test_adapter=True,
+                ),
+                "hash changed",
+            )
+            forged_source = copy.deepcopy(probe_record)
+            forged_context = forged_source["request_contexts"][0]
+            forged_context["review_prompt_sha256"] = "f" * 64
+            forged_context["source_review"]["prompt_sha256"] = "f" * 64
+            forged_context["context_sha256"] = verifier.document_hash(
+                forged_context, "context_sha256"
+            )
+            test.raises(
+                "PROBE recomputed context cannot substitute source review",
+                lambda: verifier.validate_probe_checkpoint(
+                    forged_source,
+                    verifier.canonical_check(
+                        "ng-lint", legacy.load_config()
+                    ),
+                    plan,
+                    task_dir,
+                    allow_test_adapter=True,
+                ),
+                "prompt hash changed",
+            )
 
+            legacy_probe_record = copy.deepcopy(probe_record)
+            legacy_probe_record.pop("execution_number")
+            legacy.atomic_write_json(probe_path, legacy_probe_record)
+            verifier.validate_probe_checkpoint(
+                legacy_probe_record,
+                verifier.canonical_check(
+                    "ng-lint", legacy.load_config()
+                ),
+                plan,
+                task_dir,
+                allow_test_adapter=True,
+            )
+            test.true(
+                "PROBE pre-cap checkpoint remains resume-compatible",
+                "execution_number" not in legacy_probe_record,
+            )
+            probe_before = probe_path.read_bytes()
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE"
+            ] = "changed rationale requires fresh empirical evidence"
+            proof_gap_a = {
+                "claim": "alpha",
+                "evidence_missing": "alpha evidence",
+                "how_to_prove": "run the planned probe",
+            }
+            proof_gap_b = {
+                "claim": "beta",
+                "evidence_missing": "beta evidence",
+                "how_to_prove": "run the planned probe",
+            }
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON"
+            ] = json.dumps([proof_gap_a, proof_gap_b])
+            first_probe_execution = probe_record["evidence"]["execution_id"]
             with contextlib.redirect_stdout(io.StringIO()):
                 evidence_only = harness_cli.verify_task(
                     contract,
@@ -1230,14 +1789,82 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     allow_test_adapter=True,
                 )
             test.equal(
-                "PROBE flow PASS plus seen probe stays evidence-only",
+                "PROBE flow changed request context stays evidence-only",
                 evidence_only,
                 "NEEDS_EVIDENCE",
             )
+            refreshed_probe = legacy.load_json(probe_path)
             test.true(
-                "PROBE flow PASS plus seen probe does not rerun it",
+                "PROBE rephrased request reuses one diff-bound execution",
+                refreshed_probe["evidence"]["execution_id"]
+                == first_probe_execution
+                and refreshed_probe["request_contexts"][0]["rationale"]
+                == "selftest-only typed probe state transition",
+            )
+            test.equal(
+                "PROBE green execution remains single-shot",
+                refreshed_probe["execution_number"],
+                1,
+            )
+            test.equal(
+                "PROBE execution event is append-only and numbered",
+                [
+                    event["execution_number"]
+                    for event in [
+                        json.loads(line)
+                        for line in (task_dir / "events.jsonl").read_text(
+                            encoding="utf-8"
+                        ).splitlines()
+                    ]
+                    if event.get("event") == "probe-checkpoint"
+                    and event.get("attempt_id") == attempt_dir.name
+                    and event.get("probe_id") == "ng-lint"
+                ],
+                [1],
+            )
+            probe_before = probe_path.read_bytes()
+            probe_mtime_before = probe_path.stat().st_mtime_ns
+
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON"
+            ] = json.dumps([proof_gap_b, proof_gap_a, proof_gap_a])
+            with contextlib.redirect_stdout(io.StringIO()):
+                repeated_request = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            test.equal(
+                "PROBE repeated request stays evidence-only",
+                repeated_request,
+                "NEEDS_EVIDENCE",
+            )
+            test.true(
+                "PROBE repeated request cannot create a rerun loop",
                 probe_path.read_bytes() == probe_before
                 and probe_path.stat().st_mtime_ns == probe_mtime_before,
+            )
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE"
+            ] = "third semantic request must stop at the hard cap"
+            with contextlib.redirect_stdout(io.StringIO()):
+                capped_request = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            test.equal(
+                "PROBE third rephrasing stops at NEEDS_EVIDENCE",
+                capped_request,
+                "NEEDS_EVIDENCE",
+            )
+            test.true(
+                "PROBE single-shot rule prevents adversarial rationale loop",
+                probe_path.read_bytes() == probe_before
+                and probe_path.stat().st_mtime_ns == probe_mtime_before,
+            )
+            os.environ.pop(
+                "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON", None
             )
 
             (attempt_dir / "reviews" / "combined.json").unlink()
@@ -1268,7 +1895,8 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             # original evidence/checkpoint path, including a bound evidence
             # document and the terminal complete phase.
             owned.write_text(
-                "base\nprobe-free fix evidence path\n", encoding="utf-8"
+                "/* base */\n/* probe-free fix evidence path */\n",
+                encoding="utf-8",
             )
             os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -1298,7 +1926,1010 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     True,
                 ),
             )
+
+            # Reproduce the observed laundering attempt: a package/Angular
+            # reviewer asks for the globally-known but unrelated config audit.
+            # The result is rejected before the broker can execute it.
+            owned.write_text(
+                "/* base */\n/* reject unrelated config audit */\n",
+                encoding="utf-8",
+            )
+            os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+            ] = "config-audit"
+            with contextlib.redirect_stdout(io.StringIO()):
+                unrelated = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            unrelated_state = harness_cli.load_v2_state(task_dir)
+            unrelated_attempt = (
+                task_dir / "attempts" / str(unrelated_state["attempt_id"])
+            )
+            test.equal(
+                "PROBE unrelated config audit stays evidence-only",
+                (unrelated, unrelated_state["status"]),
+                ("NEEDS_EVIDENCE", "NEEDS_EVIDENCE"),
+            )
+            test.true(
+                "PROBE unrelated config audit executes no green token",
+                not (unrelated_attempt / "probes" / "config-audit.json").exists(),
+            )
+            unrelated_review_path = (
+                unrelated_attempt / "reviews" / "combined.json"
+            )
+            test.equal(
+                "PROBE fresh invalid request is durably checkpointed",
+                (
+                    unrelated_review_path.is_file(),
+                    legacy.load_json(unrelated_review_path)["result"][
+                        "probe_requests"
+                    ][0]["probe_id"],
+                    unrelated_state["reason"],
+                ),
+                (
+                    True,
+                    "config-audit",
+                    (
+                        "review requested probes outside the exact plan; "
+                        "no command was executed: config-audit"
+                    ),
+                ),
+            )
+
+            # Faithfully replay the production incident through verify_task:
+            # only package.json/package-lock.json change, the exact profile
+            # schedules npm-lock + Angular checks, and a reviewer requests the
+            # globally-known but plan-ineligible config-audit token.
+            package_worktree = root / "package-task" / "meetnotes"
+            package_worktree.parent.mkdir()
+            package_branch = "agent/v2/package-probe-precedence"
+            _git(
+                repo,
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                package_branch,
+                str(package_worktree),
+                base,
+            )
+            package_task_id = "package-probe-precedence"
+            package_task_dir = harness_cli.v2_task_dir(
+                common, package_task_id
+            )
+            package_task_dir.mkdir(parents=True)
+            package_contract: Dict[str, Any] = {
+                **contract,
+                "task_id": package_task_id,
+                "description": (
+                    "replay package-only unrelated-probe laundering"
+                ),
+                "contract_sha256": "",
+                "worktree_path": str(package_worktree.resolve()),
+                "branch": package_branch,
+                "owned_paths": ["package.json", "package-lock.json"],
+                "created_at": legacy.utc_now(),
+            }
+            package_contract["contract_sha256"] = verifier.document_hash(
+                package_contract, "contract_sha256"
+            )
+            legacy.validate_schema(
+                package_contract,
+                legacy.load_schema("v2-task"),
+                label="v2 package probe precedence contract",
+            )
+            legacy.atomic_write_json(
+                package_task_dir / "task.json", package_contract
+            )
+            legacy.atomic_write_json(
+                package_task_dir / "runtime.json",
+                {
+                    "schema_version": 2,
+                    "task_root": str(package_worktree.parent),
+                    "shared_node_modules": None,
+                    "server_worktree": None,
+                    "server_source": str(root / "murmur-server"),
+                    "server_revision": None,
+                },
+            )
+            harness_cli.set_v2_state(
+                package_task_dir, "OPEN", phase="open"
+            )
+            package_manifest["version"] = "1.0.1"
+            package_lock["version"] = "1.0.1"
+            package_lock["packages"][""]["version"] = "1.0.1"
+            legacy.atomic_write_json(
+                package_worktree / "package.json", package_manifest
+            )
+            legacy.atomic_write_json(
+                package_worktree / "package-lock.json", package_lock
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                package_unrelated = harness_cli.verify_task(
+                    package_contract,
+                    package_task_dir,
+                    allow_test_adapter=True,
+                )
+            package_state = harness_cli.load_v2_state(package_task_dir)
+            package_attempt = (
+                package_task_dir
+                / "attempts"
+                / str(package_state["attempt_id"])
+            )
+            package_plan = legacy.load_json(
+                package_attempt / "plan.json"
+            )
+            test.equal(
+                "PROBE package-only flow schedules exact dependency evidence",
+                (
+                    package_plan["changed_paths"],
+                    [item["id"] for item in package_plan["checks"]],
+                ),
+                (
+                    ["package-lock.json", "package.json"],
+                    ["npm-lock", "ng-lint", "ng-build"],
+                ),
+            )
+            npm_record = legacy.load_json(
+                package_attempt / "checks" / "npm-lock.json"
+            )
+            package_check_records = [
+                legacy.load_json(path)
+                for path in sorted(
+                    (package_attempt / "checks").glob("*.json")
+                )
+            ]
+            package_prompt = verifier.combined_review_prompt(
+                package_contract,
+                package_plan,
+                verifier.snapshot_scoped_diff(
+                    package_worktree, package_contract, package_task_dir
+                )[1],
+                package_check_records,
+                "combined",
+                package_worktree,
+                package_task_dir,
+            )
+            test.true(
+                "PROBE every package check exposes bounded output",
+                "PLANNED_NPM_LOCK_STREAM" in package_prompt
+                and "PLANNED_NG_BUILD_STREAM" in package_prompt
+                and "PLANNED_NG_LINT_STREAM" in package_prompt,
+            )
+            test.equal(
+                "PROBE npm-lock execution binds the immutable task base",
+                npm_record["evidence"]["bound_environment"],
+                {"MURMUR_HARNESS_BASE_SHA": base},
+            )
+            tampered_npm_record = copy.deepcopy(npm_record)
+            tampered_npm_record["evidence"]["bound_environment"][
+                "MURMUR_HARNESS_BASE_SHA"
+            ] = "f" * 40
+            test.raises(
+                "PROBE changed npm-lock base binding fails closed",
+                lambda: verifier.validate_check_checkpoint(
+                    tampered_npm_record,
+                    package_plan["checks"][0],
+                    package_plan,
+                    package_task_dir,
+                ),
+                "runner-bound environment changed",
+            )
+            test.equal(
+                "PROBE package-only config audit stays evidence-only",
+                (package_unrelated, package_state["status"]),
+                ("NEEDS_EVIDENCE", "NEEDS_EVIDENCE"),
+            )
+            test.true(
+                "PROBE package-only flow executes no config-audit token",
+                not (
+                    package_attempt
+                    / "probes"
+                    / "config-audit.json"
+                ).exists(),
+            )
+            package_invalid_review = (
+                package_attempt / "reviews" / "combined.json"
+            )
+            test.equal(
+                "PROBE package-only fresh invalid review remains auditable",
+                (
+                    package_invalid_review.is_file(),
+                    legacy.load_json(package_invalid_review)["result"][
+                        "probe_requests"
+                    ][0]["probe_id"],
+                    package_state["reason"],
+                ),
+                (
+                    True,
+                    "config-audit",
+                    (
+                        "review requested probes outside the exact plan; "
+                        "no command was executed: config-audit"
+                    ),
+                ),
+            )
+
+            # A retryable probe checkpoint is excluded from green reviewer
+            # evidence, but it must still consume the same per-ID execution
+            # budget. Otherwise every resume forgets the timeout/BLOCKED
+            # attempt and loops forever at execution_number=1.
+            owned.write_text(
+                "/* base */\n/* retryable probe cap */\n",
+                encoding="utf-8",
+            )
+            os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+            ] = "ng-lint"
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE"
+            ] = "retryable probe must consume its bounded budget"
+            original_run_check = legacy.run_check
+            retryable_probe_runs = 0
+
+            def retryable_probe_run_check(
+                check_worktree: Path,
+                check_task_dir: Path,
+                check: Mapping[str, Any],
+                phase: str,
+                *,
+                bound_environment: Optional[
+                    Mapping[str, str]
+                ] = None,
+            ) -> Dict[str, Any]:
+                nonlocal retryable_probe_runs
+                evidence = original_run_check(
+                    check_worktree,
+                    check_task_dir,
+                    check,
+                    phase,
+                    bound_environment=bound_environment,
+                )
+                if phase.endswith("-probe"):
+                    retryable_probe_runs += 1
+                    return {
+                        **evidence,
+                        "passed": False,
+                        "outcome": "BLOCKED",
+                        "timed_out": True,
+                        "blocked_reason": "synthetic retryable probe",
+                    }
+                return evidence
+
+            legacy.run_check = retryable_probe_run_check
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    retryable_first = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                retryable_first_state = harness_cli.load_v2_state(task_dir)
+                retryable_attempt = (
+                    task_dir
+                    / "attempts"
+                    / str(retryable_first_state["attempt_id"])
+                )
+                retryable_projection = (
+                    retryable_attempt / "probes" / "ng-lint.json"
+                )
+                rolled_back_projection = legacy.load_json(
+                    retryable_projection
+                )
+                (
+                    retryable_attempt / "reviews" / "combined.json"
+                ).unlink()
+                os.environ.pop(
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    retryable_second = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                os.environ[
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+                ] = "ng-lint"
+                # Reproduce the replacement bypass: restore execution 1 and
+                # remove its legacy-optional number after execution 2 exists.
+                # The append-only event must repair the projection and refuse
+                # a third process.
+                rolled_back_projection.pop("execution_number")
+                legacy.atomic_write_json(
+                    retryable_projection, rolled_back_projection
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    retryable_capped = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+                numberless_latest = legacy.load_json(
+                    retryable_projection
+                )
+                numberless_latest.pop("execution_number")
+                legacy.atomic_write_json(
+                    retryable_projection, numberless_latest
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    retryable_capped_again = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+            finally:
+                legacy.run_check = original_run_check
+            retryable_state = harness_cli.load_v2_state(task_dir)
+            retryable_attempt = (
+                task_dir
+                / "attempts"
+                / str(retryable_state["attempt_id"])
+            )
+            retryable_record = legacy.load_json(
+                retryable_attempt / "probes" / "ng-lint.json"
+            )
+            retryable_events = []
+            for line in (task_dir / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                event = json.loads(line)
+                if (
+                    event.get("event") == "probe-checkpoint"
+                    and event.get("attempt_id") == retryable_attempt.name
+                    and event.get("probe_id") == "ng-lint"
+                    and event.get("execution_number") is not None
+                ):
+                    retryable_events.append(event)
+            test.equal(
+                "PROBE retryable outcomes consume two bounded executions",
+                (
+                    retryable_first,
+                    retryable_second,
+                    retryable_probe_runs,
+                    retryable_record["execution_number"],
+                    [
+                        event["execution_number"]
+                        for event in retryable_events
+                    ],
+                ),
+                (
+                    "PAUSED_RETRYABLE",
+                    "PAUSED_RETRYABLE",
+                    2,
+                    2,
+                    [1, 2],
+                ),
+            )
+            test.equal(
+                "PROBE rollback and number deletion cannot reset retry budget",
+                (
+                    retryable_capped,
+                    retryable_capped_again,
+                    retryable_probe_runs,
+                    retryable_state["status"],
+                    retryable_record["execution_number"],
+                ),
+                (
+                    "NEEDS_EVIDENCE",
+                    "NEEDS_EVIDENCE",
+                    2,
+                    "NEEDS_EVIDENCE",
+                    2,
+                ),
+            )
+            retryable_projection.unlink()
+            legacy.run_check = retryable_probe_run_check
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    retryable_without_projection = (
+                        harness_cli.verify_task(
+                            contract,
+                            task_dir,
+                            allow_test_adapter=True,
+                        )
+                    )
+            finally:
+                legacy.run_check = original_run_check
+            test.equal(
+                "PROBE deleting latest projection cannot lower event high-water",
+                (
+                    retryable_without_projection,
+                    retryable_probe_runs,
+                    harness_cli.load_v2_state(task_dir)["status"],
+                    legacy.load_json(retryable_projection)[
+                        "execution_number"
+                    ],
+                ),
+                ("NEEDS_EVIDENCE", 2, "NEEDS_EVIDENCE", 2),
+            )
+
+            # Reserve the bounded slot before starting the command. An
+            # exception after the real process exits but before its result can
+            # be checkpointed must not permit unbounded re-execution.
+            owned.write_text(
+                "/* base */\n/* probe pre-run reservation */\n",
+                encoding="utf-8",
+            )
+            post_probe_crashes = 0
+
+            def crash_after_probe_run(
+                check_worktree: Path,
+                check_task_dir: Path,
+                check: Mapping[str, Any],
+                phase: str,
+                *,
+                bound_environment: Optional[
+                    Mapping[str, str]
+                ] = None,
+            ) -> Dict[str, Any]:
+                nonlocal post_probe_crashes
+                evidence = original_run_check(
+                    check_worktree,
+                    check_task_dir,
+                    check,
+                    phase,
+                    bound_environment=bound_environment,
+                )
+                if phase.endswith("-probe"):
+                    post_probe_crashes += 1
+                    raise legacy.HarnessError(
+                        "synthetic post-probe checkpoint crash"
+                    )
+                return evidence
+
+            def verify_after_probe_crash() -> str:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+
+            legacy.run_check = crash_after_probe_run
+            try:
+                test.raises(
+                    "PROBE first post-process crash consumes reservation one",
+                    verify_after_probe_crash,
+                    "synthetic post-probe checkpoint crash",
+                )
+                crash_attempt = str(
+                    harness_cli.load_v2_state(task_dir)["attempt_id"]
+                )
+                (
+                    task_dir
+                    / "attempts"
+                    / crash_attempt
+                    / "reviews"
+                    / "combined.json"
+                ).unlink()
+                os.environ.pop(
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None
+                )
+                test.raises(
+                    "PROBE prior request survives missing fresh review request",
+                    verify_after_probe_crash,
+                    "synthetic post-probe checkpoint crash",
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    crash_capped = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+            finally:
+                legacy.run_check = original_run_check
+            crash_reservations = []
+            for line in (task_dir / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                event = json.loads(line)
+                if (
+                    event.get("event") == "probe-execution-reserved"
+                    and event.get("attempt_id") == crash_attempt
+                    and event.get("probe_id") == "ng-lint"
+                ):
+                    crash_reservations.append(event["execution_number"])
+            test.equal(
+                "PROBE interrupted executions stop at the same hard cap",
+                (
+                    crash_capped,
+                    post_probe_crashes,
+                    crash_reservations,
+                    harness_cli.load_v2_state(task_dir)["status"],
+                ),
+                ("NEEDS_EVIDENCE", 2, [1, 2], "NEEDS_EVIDENCE"),
+            )
+
+            # The state projection witnesses the high-water. Removing the
+            # latest reservation from the ledger while leaving its state event
+            # must be detected as a rewind, not interpreted as free budget.
+            full_event_documents = [
+                json.loads(line)
+                for line in (task_dir / "events.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            truncate_at = next(
+                index
+                for index, event in enumerate(full_event_documents)
+                if (
+                    event.get("event") == "probe-execution-reserved"
+                    and event.get("attempt_id") == crash_attempt
+                    and event.get("probe_id") == "ng-lint"
+                    and event.get("execution_number") == 2
+                )
+            )
+            event_documents = full_event_documents[:truncate_at]
+            legacy.atomic_write_bytes(
+                task_dir / "events.jsonl",
+                b"".join(
+                    legacy.canonical_json(event) + b"\n"
+                    for event in event_documents
+                ),
+            )
+            test.raises(
+                "PROBE witnessed event-tail rewind fails closed",
+                verify_after_probe_crash,
+                "newer than",
+            )
+            test.equal(
+                "PROBE witnessed rewind starts no third process",
+                post_probe_crashes,
+                2,
+            )
+            legacy.atomic_write_bytes(
+                task_dir / "events.jsonl",
+                b"".join(
+                    legacy.canonical_json(event) + b"\n"
+                    for event in full_event_documents
+                ),
+            )
+
+            # A deterministic failed probe remains NEEDS_FIX on every resume;
+            # it can never be omitted from aggregate evidence and briefly
+            # laundered into PASSED.
+            owned.write_text(
+                "/* base */\n/* deterministic probe failure */\n",
+                encoding="utf-8",
+            )
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+            ] = "ng-lint"
+            deterministic_probe_runs = 0
+
+            def deterministic_probe_failure(
+                check_worktree: Path,
+                check_task_dir: Path,
+                check: Mapping[str, Any],
+                phase: str,
+                *,
+                bound_environment: Optional[
+                    Mapping[str, str]
+                ] = None,
+            ) -> Dict[str, Any]:
+                nonlocal deterministic_probe_runs
+                evidence = original_run_check(
+                    check_worktree,
+                    check_task_dir,
+                    check,
+                    phase,
+                    bound_environment=bound_environment,
+                )
+                if phase.endswith("-probe"):
+                    deterministic_probe_runs += 1
+                    return {
+                        **evidence,
+                        "passed": False,
+                        "outcome": "FAIL",
+                        "exit_code": 1,
+                        "blocked_reason": "synthetic deterministic failure",
+                    }
+                return evidence
+
+            legacy.run_check = deterministic_probe_failure
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    deterministic_first = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+            finally:
+                legacy.run_check = original_run_check
+            os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                deterministic_resume = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            test.equal(
+                "PROBE deterministic failure cannot degrade to evidence-only",
+                (
+                    deterministic_first,
+                    deterministic_resume,
+                    deterministic_probe_runs,
+                    harness_cli.load_v2_state(task_dir)["status"],
+                ),
+                ("NEEDS_FIX", "NEEDS_FIX", 1, "NEEDS_FIX"),
+            )
+
+            # Upgrade compatibility: an old numberless event proves that a
+            # process already ran. If its mutable projection disappeared, the
+            # new runner must fail closed rather than inventing slot zero.
+            owned.write_text(
+                "/* base */\n/* legacy probe event */\n",
+                encoding="utf-8",
+            )
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+            ] = "ng-lint"
+            with contextlib.redirect_stdout(io.StringIO()):
+                legacy_collected = harness_cli.verify_task(
+                    contract,
+                    task_dir,
+                    allow_test_adapter=True,
+                )
+            legacy_state = harness_cli.load_v2_state(task_dir)
+            legacy_attempt = str(legacy_state["attempt_id"])
+            legacy_projection = (
+                task_dir
+                / "attempts"
+                / legacy_attempt
+                / "probes"
+                / "ng-lint.json"
+            )
+            rewritten_events = []
+            last_state_document: Optional[Dict[str, Any]] = None
+            for line in (task_dir / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                event = json.loads(line)
+                if event.get("event") == "state":
+                    event["state"].pop("probe_high_water", None)
+                    last_state_document = event["state"]
+                if (
+                    event.get("attempt_id") == legacy_attempt
+                    and event.get("probe_id") == "ng-lint"
+                    and event.get("event")
+                    == "probe-execution-reserved"
+                ):
+                    continue
+                if (
+                    event.get("attempt_id") == legacy_attempt
+                    and event.get("probe_id") == "ng-lint"
+                    and event.get("event") == "probe-checkpoint"
+                ):
+                    event = {
+                        "at": event["at"],
+                        "event": "probe-checkpoint",
+                        "attempt_id": legacy_attempt,
+                        "probe_id": "ng-lint",
+                        "record_path": str(legacy_projection),
+                        "passed": True,
+                    }
+                rewritten_events.append(event)
+            legacy.atomic_write_bytes(
+                task_dir / "events.jsonl",
+                b"".join(
+                    legacy.canonical_json(event) + b"\n"
+                    for event in rewritten_events
+                ),
+            )
+            if last_state_document is None:
+                raise AssertionError("missing state fixture")
+            legacy.atomic_write_json(
+                task_dir / "state.json", last_state_document
+            )
+            unexpected_legacy_probe_runs = 0
+
+            def count_unexpected_legacy_probe(
+                check_worktree: Path,
+                check_task_dir: Path,
+                check: Mapping[str, Any],
+                phase: str,
+                *,
+                bound_environment: Optional[
+                    Mapping[str, str]
+                ] = None,
+            ) -> Dict[str, Any]:
+                nonlocal unexpected_legacy_probe_runs
+                if phase.endswith("-probe"):
+                    unexpected_legacy_probe_runs += 1
+                return original_run_check(
+                    check_worktree,
+                    check_task_dir,
+                    check,
+                    phase,
+                    bound_environment=bound_environment,
+                )
+
+            legacy_events_snapshot = (
+                task_dir / "events.jsonl"
+            ).read_bytes()
+            legacy_state_snapshot = (task_dir / "state.json").read_bytes()
+            legacy_projection_snapshot = legacy_projection.read_bytes()
+            original_reserve_probe = (
+                harness_cli._reserve_probe_execution
+            )
+            migration_reservations = 0
+
+            def crash_after_first_migration_reservation(
+                *args: Any, **kwargs: Any
+            ) -> None:
+                nonlocal migration_reservations
+                original_reserve_probe(*args, **kwargs)
+                migration_reservations += 1
+                if migration_reservations == 1:
+                    raise legacy.HarnessError(
+                        "synthetic migration reservation crash"
+                    )
+
+            legacy.run_check = count_unexpected_legacy_probe
+            try:
+                harness_cli._reserve_probe_execution = (
+                    crash_after_first_migration_reservation
+                )
+                test.raises(
+                    "PROBE legacy migration crash preserves reservation",
+                    verify_after_probe_crash,
+                    "synthetic migration reservation crash",
+                )
+                harness_cli._reserve_probe_execution = (
+                    original_reserve_probe
+                )
+                with contextlib.redirect_stdout(io.StringIO()):
+                    migrated_resume = harness_cli.verify_task(
+                        contract,
+                        task_dir,
+                        allow_test_adapter=True,
+                    )
+            finally:
+                harness_cli._reserve_probe_execution = (
+                    original_reserve_probe
+                )
+                legacy.run_check = original_run_check
+            test.equal(
+                "PROBE legacy migration resumes without a second process",
+                (
+                    migrated_resume,
+                    migration_reservations,
+                    unexpected_legacy_probe_runs,
+                ),
+                ("NEEDS_EVIDENCE", 1, 0),
+            )
+
+            legacy.atomic_write_bytes(
+                task_dir / "events.jsonl", legacy_events_snapshot
+            )
+            legacy.atomic_write_bytes(
+                task_dir / "state.json", legacy_state_snapshot
+            )
+            legacy.atomic_write_bytes(
+                legacy_projection, legacy_projection_snapshot
+            )
+            ambiguous_events = [
+                json.loads(line)
+                for line in legacy_events_snapshot.decode(
+                    "utf-8"
+                ).splitlines()
+            ]
+            ambiguous_events.append(
+                {
+                    "at": legacy.utc_now(),
+                    "event": "probe-checkpoint",
+                    "attempt_id": legacy_attempt,
+                    "probe_id": "ng-lint",
+                    "record_path": str(legacy_projection),
+                    "passed": False,
+                }
+            )
+            legacy.atomic_write_bytes(
+                task_dir / "events.jsonl",
+                b"".join(
+                    legacy.canonical_json(event) + b"\n"
+                    for event in ambiguous_events
+                ),
+            )
+            legacy.run_check = count_unexpected_legacy_probe
+            try:
+                test.raises(
+                    "PROBE ambiguous multi-event legacy history fails closed",
+                    verify_after_probe_crash,
+                    "multiple legacy probe events cannot be migrated safely",
+                )
+            finally:
+                legacy.run_check = original_run_check
+            test.equal(
+                "PROBE failed legacy tail cannot be replaced by green projection",
+                unexpected_legacy_probe_runs,
+                0,
+            )
+
+            legacy.atomic_write_bytes(
+                task_dir / "events.jsonl", legacy_events_snapshot
+            )
+            legacy.atomic_write_bytes(
+                task_dir / "state.json", legacy_state_snapshot
+            )
+            legacy.atomic_write_bytes(
+                legacy_projection, legacy_projection_snapshot
+            )
+            legacy_projection.unlink()
+            legacy.run_check = count_unexpected_legacy_probe
+            try:
+                test.raises(
+                    "PROBE numberless event without projection fails closed",
+                    verify_after_probe_crash,
+                    "legacy probe event has no recoverable projection",
+                )
+            finally:
+                legacy.run_check = original_run_check
+            test.equal(
+                "PROBE legacy missing projection never resets to slot zero",
+                (
+                    legacy_collected,
+                    unexpected_legacy_probe_runs,
+                    harness_cli.load_v2_state(task_dir)["status"],
+                ),
+                ("NEEDS_EVIDENCE", 0, "NEEDS_EVIDENCE"),
+            )
+
+            # Essential closure path: the source review that requested a probe
+            # remains immutable while a fresh review consumes that evidence
+            # and advances the per-kind checkpoint to PASS.
+            closure_worktree = root / "closure-task" / "meetnotes"
+            closure_worktree.parent.mkdir()
+            closure_branch = "agent/v2/probe-closure"
+            _git(
+                repo,
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                closure_branch,
+                str(closure_worktree),
+                base,
+            )
+            closure_task_id = "probe-closure"
+            closure_task_dir = harness_cli.v2_task_dir(
+                common, closure_task_id
+            )
+            closure_task_dir.mkdir(parents=True)
+            closure_contract = {
+                **contract,
+                "task_id": closure_task_id,
+                "description": (
+                    "prove request to probe to fresh acceptance closure"
+                ),
+                "contract_sha256": "",
+                "worktree_path": str(closure_worktree.resolve()),
+                "branch": closure_branch,
+                "created_at": legacy.utc_now(),
+            }
+            closure_contract["contract_sha256"] = verifier.document_hash(
+                closure_contract, "contract_sha256"
+            )
+            legacy.validate_schema(
+                closure_contract,
+                legacy.load_schema("v2-task"),
+                label="v2 probe closure contract",
+            )
+            legacy.atomic_write_json(
+                closure_task_dir / "task.json", closure_contract
+            )
+            legacy.atomic_write_json(
+                closure_task_dir / "runtime.json",
+                {
+                    "schema_version": 2,
+                    "task_root": str(closure_worktree.parent),
+                    "shared_node_modules": None,
+                    "server_worktree": None,
+                    "server_source": str(root / "murmur-server"),
+                    "server_revision": None,
+                },
+            )
+            harness_cli.set_v2_state(
+                closure_task_dir, "OPEN", phase="open"
+            )
+            (
+                closure_worktree / owned_relative
+            ).write_text(
+                "/* base */\n/* probe closure */\n",
+                encoding="utf-8",
+            )
+            os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+            ] = "ng-lint"
+            os.environ.pop(
+                "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON", None
+            )
+            os.environ.pop(
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE", None
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                closure_collected = harness_cli.verify_task(
+                    closure_contract,
+                    closure_task_dir,
+                    allow_test_adapter=True,
+                )
+            closure_state = harness_cli.load_v2_state(
+                closure_task_dir
+            )
+            closure_attempt = (
+                closure_task_dir
+                / "attempts"
+                / str(closure_state["attempt_id"])
+            )
+            closure_probe = legacy.load_json(
+                closure_attempt / "probes" / "ng-lint.json"
+            )
+            source_result_path = Path(
+                str(
+                    closure_probe["request_contexts"][0][
+                        "review_result_path"
+                    ]
+                )
+            )
+            source_result_bytes = source_result_path.read_bytes()
+            source_result_sha256 = legacy.sha256_file(
+                source_result_path
+            )
+            os.environ.pop(
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                closure_passed = harness_cli.verify_task(
+                    closure_contract,
+                    closure_task_dir,
+                    allow_test_adapter=True,
+                )
+            closure_final_state = harness_cli.load_v2_state(
+                closure_task_dir
+            )
+            closure_final_review = legacy.load_json(
+                closure_attempt / "reviews" / "combined.json"
+            )
+            verified_closure = verifier.verify_v2_evidence(
+                closure_contract,
+                closure_task_dir,
+                allow_test_adapter=True,
+            )
+            test.equal(
+                "PROBE closure reaches exact verified PASS",
+                (
+                    closure_collected,
+                    closure_passed,
+                    closure_final_state["status"],
+                    verified_closure["verdict"],
+                ),
+                (
+                    "NEEDS_EVIDENCE",
+                    "PASSED",
+                    "PASSED",
+                    "PASSED",
+                ),
+            )
+            test.true(
+                "PROBE source review artifact stays immutable across fresh PASS",
+                closure_final_review["result_path"]
+                != str(source_result_path)
+                and source_result_path.read_bytes() == source_result_bytes
+                and legacy.sha256_file(source_result_path)
+                == source_result_sha256
+                and closure_probe["request_contexts"][0][
+                    "review_result_sha256"
+                ]
+                == source_result_sha256,
+            )
         finally:
+            legacy.load_config = original_load_config
             if saved_verdict is None:
                 os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_VERDICT", None)
             else:
@@ -1309,6 +2940,22 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 os.environ[
                     "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
                 ] = saved_probe
+            if saved_probe_rationale is None:
+                os.environ.pop(
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE", None
+                )
+            else:
+                os.environ[
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE"
+                ] = saved_probe_rationale
+            if saved_proof_gaps is None:
+                os.environ.pop(
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON", None
+                )
+            else:
+                os.environ[
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON"
+                ] = saved_proof_gaps
 
 
 def retry_cases(test: Tests) -> None:
@@ -1750,6 +3397,7 @@ def readonly_review_wall_timeout_cases(test: Tests) -> None:
                 contract=contract,
                 plan=plan,
                 worktree=repo,
+                task_dir=root,
                 attempt_dir=attempt_dir,
                 diff=b"diff --git a/owned.txt b/owned.txt\n",
                 checks=[],
@@ -1909,6 +3557,7 @@ def state_and_lock_cases(test: Tests) -> None:
             "status": "VERIFYING",
             "updated_at": "2000-01-01T00:00:00Z",
         }
+        stale_projection.pop("state_revision")
         legacy.atomic_write_json(task_dir / "state.json", stale_projection)
         test.equal(
             "STATE stale divergent projection is repaired from ledger",
@@ -1918,12 +3567,25 @@ def state_and_lock_cases(test: Tests) -> None:
         future_projection = {
             **recovered,
             "updated_at": "2999-01-01T00:00:00Z",
+            "state_revision": recovered["state_revision"] + 1,
         }
         legacy.atomic_write_json(task_dir / "state.json", future_projection)
         test.raises(
             "STATE projection newer than ledger fails closed",
             lambda: harness_cli.load_v2_state(task_dir),
             "newer than",
+        )
+        same_revision_projection = {
+            **recovered,
+            "status": "VERIFYING",
+        }
+        legacy.atomic_write_json(
+            task_dir / "state.json", same_revision_projection
+        )
+        test.raises(
+            "STATE equal timestamp divergence fails closed by revision",
+            lambda: harness_cli.load_v2_state(task_dir),
+            "same revision",
         )
         legacy.atomic_write_json(task_dir / "state.json", recovered)
 
@@ -3569,6 +5231,36 @@ def plan_and_probe_cases(test: Tests) -> None:
         verifier.attempt_id(changed) != verifier.attempt_id(angular),
     )
     test.equal("PLAN parent remains current immutable base", angular["base_sha"], base)
+    package_plan, _bundle = verifier.build_plan(
+        contract,
+        ROOT,
+        ["package.json", "package-lock.json"],
+        b"package diff",
+        tree,
+        legacy.load_config(),
+    )
+    test.equal(
+        "PROBE package plan exposes only its own canonical checks",
+        verifier.allowed_probe_ids(package_plan),
+        ["npm-lock", "ng-lint", "ng-build"],
+    )
+    test.true(
+        "PROBE package plan excludes unrelated config and Rust checks",
+        "config-audit" not in verifier.allowed_probe_ids(package_plan)
+        and "rust-lib" not in verifier.allowed_probe_ids(package_plan),
+    )
+    harness_plan, _bundle = verifier.build_plan(
+        contract,
+        ROOT,
+        [".agents/harness/cli.py"],
+        b"harness diff",
+        tree,
+        legacy.load_config(),
+    )
+    test.true(
+        "PROBE harness plan contextually permits config-audit",
+        "config-audit" in verifier.allowed_probe_ids(harness_plan),
+    )
 
     test.raises(
         "PROBE broker rejects arbitrary shell ids",
@@ -3682,9 +5374,9 @@ def main() -> int:
     open_branch_ownership_cases(test)
     standalone_driver_open_cases(test)
     profile_cases(test)
+    npm_lock_evidence_cases(test)
     reviewer_tool_guard_cases(test)
     verdict_cases(test)
-    probe_precedence_flow_cases(test)
     retry_cases(test)
     guardian_and_artifact_cases(test)
     readonly_review_wall_timeout_cases(test)
@@ -3698,6 +5390,7 @@ def main() -> int:
     import_cases(test)
     plan_and_probe_cases(test)
     clean_cases(test)
+    probe_precedence_flow_cases(test)
     if test.failures:
         print("v2 selftest: FAIL")
         for failure in test.failures:
