@@ -147,6 +147,15 @@ pub enum ToolCall {
         offset: usize,
         /// Max chars of transcript to return from `offset` (0 = unlimited = today's behavior).
         max_chars: usize,
+        /// Whether to include the meeting's NOTE at all. Default `true` (byte-identical to before).
+        ///
+        /// An agent that has already read the note in an earlier turn, or that wants transcript
+        /// only, previously had NO way to decline it — and the note is ~19.5k chars on a real
+        /// meeting, so every fresh `offset == 0` call re-paid for it. In the in-app loop that is
+        /// worse than wasteful: `agent.rs::RESULT_BUDGET` truncates the tool result at 4000 chars,
+        /// so a 19.5k note prefix consumed the ENTIRE budget and the transcript window — the thing
+        /// actually asked for — was cut away entirely.
+        include_note: bool,
     },
     /// The full body of one standalone note OR imported/uploaded document by id (Feature D). Gated
     /// by [`Db::get_document_if_visible`] — a sealed-and-not-session-unlocked document is invisible
@@ -172,7 +181,15 @@ pub enum ToolCall {
     /// Roll up every OPEN action item, optionally filtered by owner.
     GetOpenCommitments { owner: Option<String> },
     /// Assemble the gated structured dossier for one entity (caller must pass a non-empty name/id).
-    GetEntityDossier { entity: String },
+    GetEntityDossier {
+        entity: String,
+        /// How much of the note corpus to carry: `none` | `summary` (default) | `full`.
+        note_detail: String,
+        /// Chars to skip into the corpus (`full` only).
+        offset: usize,
+        /// Max corpus chars to return (`full`: window; `summary`: excerpt budget; 0 = default).
+        max_chars: usize,
+    },
     /// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what changed between two
     /// instants (`from`/`to` ISO-8601) plus the full chronological supersession ledger. EGRESS-FREE:
     /// reads the entity's facts through the visibility-gated [`Db::list_facts_visible`] inside
@@ -645,6 +662,7 @@ pub fn execute_tool(
             transcript_format,
             offset,
             max_chars,
+            include_note,
         } => {
             let mid = meeting_id.as_str();
             // A sealed-and-not-unlocked meeting is invisible — including its transcript AND its
@@ -672,14 +690,18 @@ pub fn execute_tool(
                     // timestamps). `transcript_format == "plain"` keeps the LEGACY byte-identical flat
                     // space-join for backward compatibility; every other value (incl. absent/default,
                     // which the MCP/dispatch layer maps to "structured") uses the structured renderer.
-                    let full_transcript = if transcript_format == "plain" {
-                        segs.iter()
+                    let full_transcript = match transcript_format.as_str() {
+                        "plain" => segs
+                            .iter()
                             .map(|s| s.text.trim())
                             .filter(|t| !t.is_empty())
                             .collect::<Vec<_>>()
-                            .join(" ")
-                    } else {
-                        format_structured_transcript(&segs)
+                            .join(" "),
+                        // #13 — OPT-IN compact rendering. Default stays `structured`: making
+                        // compact the default would silently move every agent's offset space with
+                        // no version signal to notice it by.
+                        "compact" => format_compact_transcript(&segs),
+                        _ => format_structured_transcript(&segs),
                     };
                     // B1 — decide "no data" on the RAW content BEFORE windowing. A note-less
                     // meeting whose transcript is empty (INCLUDING a nonexistent id, which
@@ -696,20 +718,35 @@ pub fn execute_tool(
                     // it saw a fraction of the transcript and how to page the rest.
                     let (transcript, disclosure) =
                         page_text_disclosed(&full_transcript, *offset, *max_chars);
-                    // The window is over the TRANSCRIPT only, so scope the header to that section.
+                    // #10 — STAMP THE FORMAT. `structured` and `plain` are different char spaces
+                    // for the same meeting (measured: 116527 vs 70456 chars), so an agent that maps
+                    // offsets in one and then switches lands ~40% off target. Naming the format
+                    // beside TOTAL_CHARS makes the space the offsets belong to self-describing.
                     let transcript_section = match &disclosure {
-                        Some(h) => format!("TRANSCRIPT ({h}):\n{transcript}"),
-                        None => format!("TRANSCRIPT:\n{transcript}"),
+                        Some(h) => {
+                            format!("TRANSCRIPT (format={transcript_format}, {h}):\n{transcript}")
+                        }
+                        None => format!("TRANSCRIPT (format={transcript_format}):\n{transcript}"),
                     };
                     // E1 — the NOTE is a whole-note prefix, NOT part of the transcript window, so
                     // emit it ONLY on the first window (`offset == 0`). Paging a long transcript
-                    // (`offset > 0`) must never re-ship the full note on every page. The
-                    // `offset == 0` output stays byte-identical to before.
+                    // (`offset > 0`) must never re-ship the full note on every page.
+                    //
+                    // #1 — the note now honors `max_chars` too. It used to be interpolated WHOLE
+                    // while only the transcript was windowed, so `get_meeting(id, maxChars: 200)`
+                    // still shipped a ~19.5k note: the advertised bound was simply untrue for that
+                    // section. The `(0,0)` default stays unwindowed, so the legacy in-app path is
+                    // byte-identical.
                     match note {
-                        Some(n) if *offset == 0 => Ok(format!(
-                            "{title_line}NOTE:\n{}\n\n{transcript_section}",
-                            n.markdown
-                        )),
+                        Some(n) if *offset == 0 && *include_note => {
+                            let (body, note_disclosure) =
+                                page_text_disclosed(&n.markdown, 0, *max_chars);
+                            let note_section = match note_disclosure {
+                                Some(h) => format!("NOTE ({h}):\n{body}"),
+                                None => format!("NOTE:\n{body}"),
+                            };
+                            Ok(format!("{title_line}{note_section}\n\n{transcript_section}"))
+                        }
                         _ => Ok(format!("{title_line}{transcript_section}")),
                     }
                 }
@@ -803,7 +840,12 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!("commitments rollup failed: {e}"))),
             }
         }
-        ToolCall::GetEntityDossier { entity } => {
+        ToolCall::GetEntityDossier {
+            entity,
+            note_detail,
+            offset,
+            max_chars,
+        } => {
             // EGRESS-FREE: returns the GATED STRUCTURED DATA for the CLIENT to synthesize. Every read
             // inside `build_dossier_data` is visibility-gated against `unlocked`, so a sealed-and-not-
             // unlocked meeting contributes nothing. No provider / `complete` is ever constructed here.
@@ -814,7 +856,14 @@ pub fn execute_tool(
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::summarize::dossier::build_dossier_data(db, &id, unlocked) {
-                Ok(Some(data)) => Ok(crate::summarize::dossier::format_dossier_client(&data)),
+                Ok(Some(data)) => Ok(
+                    crate::summarize::dossier::format_dossier_client_windowed(
+                        &data,
+                        note_detail,
+                        *offset,
+                        *max_chars,
+                    ),
+                ),
                 Ok(None) => Ok(format!("No visible entity matching \"{entity}\".")),
                 Err(e) => Err(AppError::Storage(format!("dossier build failed: {e}"))),
             }
@@ -1525,11 +1574,20 @@ fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
             if let Some(o) = c.owner.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
                 parts.push(o.to_string());
             }
-            if let Some(d) = c.due_date.as_deref().filter(|d| !d.is_empty()) {
-                parts.push(format!("due {d}"));
+            // An ABSENT due date is stated, not silently omitted. The tool description promises
+            // "owner, due date and source meeting"; on a real vault a date was present on about 1
+            // item in 110, and a silent omission reads as "no deadline was set" rather than
+            // "the note never recorded one".
+            match c.due_date.as_deref().filter(|d| !d.is_empty()) {
+                Some(d) => parts.push(format!("due {d}")),
+                None => parts.push("due —".to_string()),
             }
             parts.push(format!("\"{}\"", c.text.trim()));
-            parts.push(format!("[[{}]]", c.meeting_title));
+            // The wikilink TITLE is for a human; the id is what lets an agent actually navigate to
+            // the meeting (`get_meeting`). `Commitment` already carried `meeting_id` — this just
+            // stopped throwing it away, so "which meeting did I promise that in" is answerable
+            // without a title-to-id search that a duplicate title would make ambiguous anyway.
+            parts.push(format!("[[{}]] [id:{}]", c.meeting_title, c.meeting_id));
             format!("- {}", parts.join(" · "))
         })
         .collect::<Vec<_>>()
@@ -1838,7 +1896,11 @@ fn page_text(text: &str, offset: usize, max_chars: usize) -> String {
 ///
 /// Without this the agent pages a big doc by blind char arithmetic and can't tell a short window
 /// from the whole body — the "windowed reads must disclose the total" honesty gap.
-fn page_text_disclosed(text: &str, offset: usize, max_chars: usize) -> (String, Option<String>) {
+pub(crate) fn page_text_disclosed(
+    text: &str,
+    offset: usize,
+    max_chars: usize,
+) -> (String, Option<String>) {
     if offset == 0 && max_chars == 0 {
         return (text.to_string(), None); // byte-identical default — no header.
     }
@@ -1865,24 +1927,118 @@ fn page_text_disclosed(text: &str, offset: usize, max_chars: usize) -> (String, 
     (body, Some(header))
 }
 
+/// Render one wall-clock offset in seconds at ONE decimal. Upstream offsetting is f64 arithmetic
+/// (`pipeline.rs` `segment.start_s += offset_s`, `audio/merge.rs` `start_s: seg.start_s + offset_s`),
+/// so essentially every offset-shifted segment carries ~16 significant digits — 37 chars per
+/// timestamp pair where 16 suffice, ≈28k wasted chars (≈7k tokens) on a 1h/1355-segment meeting.
+/// A whole second collapses to an integer (`12`, not `12.0`) so short/fixture transcripts render
+/// exactly as before; sub-second precision below 0.1s is below ASR segment resolution anyway.
+fn secs(v: f64) -> String {
+    let r = (v * 10.0).round() / 10.0;
+    if r.fract() == 0.0 {
+        format!("{}", r as i64)
+    } else {
+        format!("{r:.1}")
+    }
+}
+
 /// Feature D — render a meeting's transcript segments as a STRUCTURED, one-line-per-segment block:
 /// `[<start_s>–<end_s>] <Speaker>: <text>`. RAW SECONDS (never MM:SS) so a 2h+ meeting can never
-/// wrap/clip a minutes field. Speaker maps the cheap 2-way stream attribution
-/// (`Segment.speaker`): `Some("me")` → `Me`, `Some("others")` → `Others`, `None`/anything else →
-/// `Unknown`. Empty-text segments are skipped (they carry no content, only silence bounds).
+/// wrap/clip a minutes field, rounded by [`secs`] to one decimal.
+///
+/// Speaker maps the raw `Segment.speaker` tag the SAME way the summarizer does
+/// (`summarize/template.rs`, `summarize/timeline.rs`): `me` → `Me`, plain `others` → `Others`, and a
+/// DIARIZED `others-{N}` (written by `transcribe::diarize::relabel_others` when sherpa-onnx finds
+/// more than one remote speaker) → `Speaker {N+1}`, one label per distinct person. Collapsing those to
+/// `Unknown` — as this renderer used to — meant ENABLING diarization strictly DEGRADED the MCP
+/// transcript while the note/timeline consumers of the same tag read it correctly. An absent tag, an
+/// unknown tag, or a malformed index (`others--1`) stays `Unknown` rather than inventing a
+/// `Speaker 0`. Empty-text segments are skipped (they carry no content, only silence bounds).
+/// Map a raw `Segment.speaker` tag to the display name a rendered transcript shows. Extracted so
+/// the structured and compact renderers cannot drift apart on speaker naming — a second, diverging
+/// copy of this mapping is exactly what let `others-N` render as `Unknown` in the first place.
+fn speaker_label(tag: Option<&str>) -> std::borrow::Cow<'static, str> {
+    use crate::audio::merge::{SPEAKER_ME, SPEAKER_OTHERS};
+    use std::borrow::Cow;
+    match tag {
+        Some(SPEAKER_ME) => Cow::Borrowed("Me"),
+        Some(SPEAKER_OTHERS) => Cow::Borrowed("Others"),
+        // Plain `others` is already handled above, so ask the shared parser for the
+        // NUMBERED branch only (`has_numbered: true`). Reject a negative/overflowing index
+        // so a corrupt tag can never render as `Speaker 0` or panic on `n + 1`.
+        Some(tag) => match crate::transcribe::diarize::cluster_index_of_tag(tag, true)
+            .filter(|n| *n >= 0)
+            .and_then(|n| n.checked_add(1))
+        {
+            Some(label_n) => Cow::Owned(format!("Speaker {label_n}")),
+            None => Cow::Borrowed("Unknown"),
+        },
+        None => Cow::Borrowed("Unknown"),
+    }
+}
+
 fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> String {
     segs.iter()
         .filter(|s| !s.text.trim().is_empty())
         .map(|s| {
-            let speaker = match s.speaker.as_deref() {
-                Some("me") => "Me",
-                Some("others") => "Others",
-                _ => "Unknown",
-            };
-            format!("[{}–{}] {speaker}: {}", s.start_s, s.end_s, s.text.trim())
+            format!(
+                "[{}–{}] {}: {}",
+                secs(s.start_s),
+                secs(s.end_s),
+                speaker_label(s.speaker.as_deref()),
+                s.text.trim()
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render the transcript COMPACTLY: fold each run of consecutive same-speaker segments into ONE
+/// line spanning the whole run, `[run_start–run_end] Speaker: <joined text>`.
+///
+/// About 40% of the structured rendering is per-segment scaffolding — on a 1h meeting, ~1355
+/// segments each repeat a bracketed time range and a speaker label. Merging runs removes the
+/// repetition without dropping a single word of speech.
+///
+/// NOT the default, and deliberately so: this is a DIFFERENT char space from `structured`, so an
+/// agent holding offsets would silently land elsewhere if it changed underneath them. It is also
+/// not a citation source — merging runs destroys per-segment boundaries, so a compact reply must
+/// never be used to seek audio. (Nothing regresses: grounding and receipts work off typed
+/// `Segment`s, never this rendered string.)
+fn format_compact_transcript(segs: &[crate::transcribe::types::Segment]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut run: Option<(String, f64, f64, Vec<String>)> = None;
+    for s in segs.iter().filter(|s| !s.text.trim().is_empty()) {
+        let label = speaker_label(s.speaker.as_deref()).into_owned();
+        match &mut run {
+            // Same speaker as the open run ⇒ extend its end time and append the text.
+            Some((cur, _, end, texts)) if *cur == label => {
+                *end = s.end_s;
+                texts.push(s.text.trim().to_string());
+            }
+            // Speaker changed (or first segment) ⇒ close the open run and start a new one.
+            _ => {
+                if let Some((cur, start, end, texts)) = run.take() {
+                    out.push(format!(
+                        "[{}–{}] {cur}: {}",
+                        secs(start),
+                        secs(end),
+                        texts.join(" ")
+                    ));
+                }
+                run = Some((label, s.start_s, s.end_s, vec![s.text.trim().to_string()]));
+            }
+        }
+    }
+    if let Some((cur, start, end, texts)) = run {
+        out.push(format!(
+            "[{}–{}] {cur}: {}",
+            secs(start),
+            secs(end),
+            texts.join(" ")
+        ));
+    }
+    out.join("\n")
 }
 
 /// Render a list of search hits (FTS or hybrid) into the tool text payload — one line per meeting.
@@ -2163,7 +2319,7 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 let fmt = args
                     .get("transcriptFormat")
                     .and_then(|v| v.as_str())
-                    .filter(|f| *f == "plain")
+                    .filter(|f| *f == "plain" || *f == "compact")
                     .unwrap_or("structured")
                     .to_string();
                 execute_tool(
@@ -2172,6 +2328,11 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                         transcript_format: fmt,
                         offset: u("offset"),
                         max_chars: u("maxChars"),
+                        // Absent ⇒ true, so an existing caller is byte-identical.
+                        include_note: args
+                            .get("includeNote")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
                     },
                     self.db,
                     &unlocked,
@@ -2226,6 +2387,14 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             "get_entity_dossier" => execute_tool(
                 &ToolCall::GetEntityDossier {
                     entity: s("entity"),
+                    note_detail: args
+                        .get("noteDetail")
+                        .and_then(|v| v.as_str())
+                        .filter(|d| matches!(*d, "none" | "summary" | "full"))
+                        .unwrap_or("summary")
+                        .to_string(),
+                    offset: u("offset"),
+                    max_chars: u("maxChars"),
                 },
                 self.db,
                 &unlocked,
@@ -4481,6 +4650,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 0,
+                            include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -4570,6 +4740,7 @@ mod tests {
                 transcript_format: "plain".into(),
                 offset: 0,
                 max_chars: 0,
+                            include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -4583,10 +4754,156 @@ mod tests {
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        let expected = format!("NOTE:\nthe note\n\nTRANSCRIPT:\n{legacy_transcript}");
+        // R7/#10 — the header now STAMPS the selected format, deliberately: `structured` and
+        // `plain` are different char spaces for the same meeting (measured 116527 vs 70456), so an
+        // agent that mapped offsets in one and switched to the other silently landed ~40% off
+        // target. What this test protects is the TRANSCRIPT BODY: the legacy flat join must stay
+        // byte-identical, which it does.
+        let expected = format!("NOTE:\nthe note\n\nTRANSCRIPT (format=plain):\n{legacy_transcript}");
         assert_eq!(
             out, expected,
-            "plain format must be byte-identical to the legacy join"
+            "plain format must render the legacy join byte-identically"
+        );
+    }
+
+    /// R1-A — DIARIZED tags must not collapse to `Unknown`. Murmur ships real N-way diarization
+    /// (`transcribe::diarize::relabel_others` rewrites system-stream segments to `others-{N}`), which
+    /// the summarizer already consumes as DISTINCT people. The MCP renderer must agree: each
+    /// `others-{N}` gets its own `Speaker {N+1}` label, plain `others` stays `Others`, and a
+    /// MALFORMED tag (`others--1`) degrades to `Unknown` rather than leaking a bogus `Speaker 0`.
+    #[test]
+    fn get_meeting_structured_transcript_labels_diarized_speakers() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-diar", "Diarized", "the note", None);
+        db.insert_segments(
+            "m-diar",
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 2.0,
+                    text: "opening".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 4.0,
+                    text: "first guest".into(),
+                    speaker: Some("others-0".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 2,
+                    start_s: 4.0,
+                    end_s: 6.0,
+                    text: "second guest".into(),
+                    speaker: Some("others-1".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 3,
+                    start_s: 6.0,
+                    end_s: 8.0,
+                    text: "undiarized guest".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 4,
+                    start_s: 8.0,
+                    end_s: 10.0,
+                    text: "malformed tag".into(),
+                    speaker: Some("others--1".into()),
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-diar".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 0,
+                            include_note: true,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("Unknown: first guest") && !out.contains("Unknown: second guest"),
+            "a diarized others-N tag must NOT render as Unknown: {out}"
+        );
+        assert!(
+            out.contains("Speaker 1: first guest"),
+            "others-0 → Speaker 1: {out}"
+        );
+        assert!(
+            out.contains("Speaker 2: second guest"),
+            "others-1 → Speaker 2 (distinct from others-0): {out}"
+        );
+        assert!(
+            out.contains("Others: undiarized guest"),
+            "plain others still renders as Others: {out}"
+        );
+        assert!(
+            out.contains("Unknown: malformed tag") && !out.contains("Speaker 0"),
+            "a malformed others--1 tag degrades to Unknown, never Speaker 0: {out}"
+        );
+    }
+
+    /// R1-B — timestamps render at ONE decimal, not full f64 precision. Upstream wall-clock
+    /// offsetting (`pipeline.rs` `segment.start_s += offset_s`, `audio/merge.rs`) leaves essentially
+    /// every offset-shifted segment carrying ~16 significant digits, which is pure token waste in the
+    /// MCP payload (~28k wasted chars on a 1h meeting).
+    #[test]
+    fn get_meeting_structured_transcript_rounds_timestamps() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-prec", "Long meeting", "the note", None);
+        db.insert_segments(
+            "m-prec",
+            &[Segment {
+                idx: 0,
+                start_s: 3659.3188999159997,
+                end_s: 3668.198899916,
+                text: "wrapping up".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-prec".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 0,
+                            include_note: true,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("[3659.3"),
+            "start must round to one decimal: {out}"
+        );
+        assert!(
+            !out.contains("3659.3188"),
+            "full f64 precision must not reach the payload: {out}"
+        );
+        assert!(
+            out.contains("[3659.3–3668.2]"),
+            "both bounds round to one decimal: {out}"
         );
     }
 
@@ -5020,6 +5337,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 6000,
+                            include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -5034,6 +5352,106 @@ mod tests {
             !out.contains("TRANSCRIPT") && !out.contains("[end of content]"),
             "no fake empty-transcript payload may leak for an absent meeting: {out}"
         );
+    }
+
+    /// R7/#1 (regression). `includeNote: false` must drop the NOTE section even on the first
+    /// window, and `maxChars` must BOUND the note instead of shipping it whole.
+    ///
+    /// RED against the previous behavior: `page_text_disclosed` windowed the transcript only while
+    /// `n.markdown` was interpolated verbatim, so `maxChars: 200` still shipped the entire ~19.5k
+    /// note — the advertised bound was simply untrue for that section — and there was no way at all
+    /// to decline the note.
+    #[test]
+    fn get_meeting_note_is_declinable_and_bounded() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let long_note = "NOTE_WORD ".repeat(400); // ~4000 chars
+        seed_meeting(&db, "m-budget", "Long", &long_note, None);
+        db.insert_segments(
+            "m-budget",
+            &[Segment {
+                idx: 0,
+                start_s: 1.0,
+                end_s: 2.0,
+                text: "alpha bravo charlie".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        let call = |include: bool, max: usize| {
+            execute_tool(
+                &ToolCall::GetMeeting {
+                    meeting_id: "m-budget".into(),
+                    transcript_format: "structured".into(),
+                    offset: 0,
+                    max_chars: max,
+                    include_note: include,
+                },
+                &db,
+                &HashSet::new(),
+                &cfg,
+            )
+            .unwrap()
+        };
+
+        // includeNote:false ⇒ no NOTE section at all, transcript still returned.
+        let without = call(false, 0);
+        assert!(
+            !without.contains("NOTE:") && !without.contains("NOTE_WORD"),
+            "includeNote:false must drop the note entirely: {without}"
+        );
+        assert!(without.contains("TRANSCRIPT"), "transcript still returned");
+
+        // includeNote:true + a small maxChars ⇒ the note is WINDOWED, not shipped whole.
+        let bounded = call(true, 200);
+        assert!(bounded.contains("NOTE ("), "the note window is disclosed: {bounded}");
+        assert!(
+            bounded.len() < long_note.len(),
+            "maxChars must bound the note; reply {} vs note {}",
+            bounded.len(),
+            long_note.len()
+        );
+    }
+
+    /// R7/#13 (regression). `compact` folds consecutive same-speaker segments into ONE line.
+    #[test]
+    fn compact_transcript_merges_same_speaker_runs() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-compact", "Runs", "note", None);
+        db.insert_segments(
+            "m-compact",
+            &[
+                Segment { idx: 0, start_s: 1.0, end_s: 2.0, text: "first half".into(), speaker: Some("me".into()), confidence: None },
+                Segment { idx: 1, start_s: 2.0, end_s: 3.0, text: "second half".into(), speaker: Some("me".into()), confidence: None },
+                Segment { idx: 2, start_s: 3.0, end_s: 4.0, text: "their turn".into(), speaker: Some("others".into()), confidence: None },
+            ],
+        )
+        .unwrap();
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-compact".into(),
+                transcript_format: "compact".into(),
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        let body = out.split("TRANSCRIPT").nth(1).unwrap_or(&out);
+        let lines = body.lines().filter(|l| l.starts_with('[')).count();
+        assert_eq!(lines, 2, "two me-segments merge into one run; got:\n{out}");
+        assert!(
+            out.contains("[1–3] Me: first half second half"),
+            "the run spans both segments and joins their text: {out}"
+        );
+        // #10 — the format is stamped so the offset space is self-describing.
+        assert!(out.contains("format=compact"), "format stamped: {out}");
     }
 
     /// E1 (RED-before-GREEN) — `get_meeting` emits the NOTE section only on the FIRST window
@@ -5076,14 +5494,19 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 20,
+                            include_note: true,
             },
             &db,
             &HashSet::new(),
             &cfg,
         )
         .unwrap();
+        // R7/#1 — with an explicit `maxChars`, the note is now WINDOWED like the transcript (it
+        // used to be interpolated whole regardless), so assert the section is present and carries
+        // the start of the body rather than the whole marker. The offset>0 half below is what this
+        // test actually pins, and it is unchanged.
         assert!(
-            first.contains(NOTE_BODY) && first.contains("NOTE:"),
+            first.contains("NOTE") && first.contains(&NOTE_BODY[..20]),
             "the first window (offset 0) must carry the note: {first}"
         );
 
@@ -5095,6 +5518,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 10,
                 max_chars: 20,
+                            include_note: true,
             },
             &db,
             &HashSet::new(),

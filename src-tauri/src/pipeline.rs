@@ -1983,6 +1983,20 @@ pub(crate) struct TranscriptFeed {
     pub summary_text: String,
     /// Whether `summary_text` carries `(speaker)` tags (i.e. ≥2 distinct speakers).
     pub labeled: bool,
+    /// LANE SHAPE, not speaker count: whether the far side is genuinely DIARIZED — at least one kept
+    /// segment carries a NUMBERED `others-N` tag (written by
+    /// [`crate::transcribe::diarize::relabel_others`] when diarization actually separated the remote
+    /// voices).
+    ///
+    /// This is the ONLY signal that says whether per-person attribution is supportable at all.
+    /// `labeled` is NOT: an ordinary dual-stream call has the distinct set `{me, others}` = 2 ⇒
+    /// `labeled == true`, yet the single plain `others` lane holds ALL N remote people COLLAPSED
+    /// together. Handing that feed a prompt that asks for participants' real names leaves the model
+    /// only one way to comply — guessing from vocatives — which is exactly how a 6-person meeting
+    /// note ended up crediting remarks to people who had stopped talking minutes earlier.
+    /// `false` ⇒ the summarizer prompt FORBIDS personal-name attribution
+    /// ([`crate::summarize::template::speaker_attribution_directive_collapsed`]).
+    pub diarized_others: bool,
 }
 
 /// Build the [`TranscriptFeed`] from the merged, time-ordered segments. Drops empty and
@@ -1990,7 +2004,7 @@ pub(crate) struct TranscriptFeed {
 pub(crate) fn build_transcript_feed(
     segments: &[crate::transcribe::types::Segment],
 ) -> TranscriptFeed {
-    use crate::audio::merge::SPEAKER_ME;
+    use crate::audio::merge::{SPEAKER_ME, SPEAKER_OTHERS};
     let kept: Vec<&crate::transcribe::types::Segment> = segments
         .iter()
         .filter(|s| {
@@ -2014,6 +2028,20 @@ pub(crate) fn build_transcript_feed(
         .map(|s| s.speaker.as_deref().unwrap_or(SPEAKER_ME))
         .collect();
     let labeled = distinct.len() >= 2;
+
+    // LANE SHAPE — see `TranscriptFeed::diarized_others`. A NUMBERED `others-N` tag is the only
+    // evidence that the remote side was actually split per-voice; a plain `others` lane is N people
+    // collapsed into one label, so nothing in this feed can support a personal NAME. Mirrors
+    // `transcribe::diarize::tag_is_numbered_cluster` (private to that module — kept as a local
+    // one-liner rather than widening its surface for a read-only shape probe).
+    let diarized_others = kept.iter().any(|s| {
+        s.speaker
+            .as_deref()
+            .and_then(|t| t.strip_prefix(SPEAKER_OTHERS))
+            .and_then(|rest| rest.strip_prefix('-'))
+            .map(|n| n.parse::<i64>().is_ok())
+            .unwrap_or(false)
+    });
 
     // Tier 3b/A3 — PREVENTIVE [UNCLEAR] MARKING. Prefix an acoustically-shaky segment (ASR
     // `confidence < LOW_CONFIDENCE_P`) so the summarizer is TOLD which spans are garbled and does not
@@ -2062,6 +2090,7 @@ pub(crate) fn build_transcript_feed(
         retrieval_text,
         summary_text,
         labeled,
+        diarized_others,
     }
 }
 
@@ -2263,7 +2292,14 @@ async fn summarize_and_export(
             duration_s,
             language,
         },
-        template: template::build_template(&config.note_style, &config.note_language, feed.labeled),
+        // The attribution directive is selected by LANE SHAPE, not speaker count: a collapsed
+        // `others` lane gets the no-personal-name variant (see `TranscriptFeed::diarized_others`).
+        template: template::build_template(
+            &config.note_style,
+            &config.note_language,
+            feed.labeled,
+            feed.diarized_others,
+        ),
         vault_titles,
         // STAGE 1 — no cross-meeting context in the generation prompt (Phase 1). Phase 2 will add
         // links additively on the finished note, not via this field.
@@ -3891,6 +3927,12 @@ mod tests {
 
     /// ≥2 distinct speakers ⇒ labeled with the EXACT `[start-end] (speaker) text` timeline shape,
     /// while `retrieval_text` stays FLAT (no tag/timestamp tokens perturb the RAG query).
+    ///
+    /// R2 UPDATE: this is the ORDINARY dual-stream shape — `me` + ONE plain `others` lane — and it
+    /// now also pins `diarized_others == false`. That is the whole point of DEFECT-A: `labeled` is
+    /// TRUE here (2 distinct labels) while the far side is one collapsed lane that could be holding
+    /// any number of people, so this feed must NOT license personal-name attribution. The assertion
+    /// is added, nothing existing is weakened.
     #[test]
     fn feed_multi_speaker_is_labeled_timeline_format() {
         let segs = vec![
@@ -3899,12 +3941,62 @@ mod tests {
         ];
         let feed = build_transcript_feed(&segs);
         assert!(feed.labeled);
+        assert!(
+            !feed.diarized_others,
+            "a plain `others` lane is COLLAPSED — N remote people under one tag, never diarized"
+        );
         assert_eq!(
             feed.summary_text,
             "[0.0-2.0] (me) hi there\n[2.0-6.0] (others) great to meet you"
         );
         assert_eq!(feed.retrieval_text, "hi there great to meet you");
         assert!(!feed.retrieval_text.contains('[') && !feed.retrieval_text.contains("(me)"));
+    }
+
+    /// R2/DEFECT-A, lane-shape detection at the SOURCE. Only a NUMBERED `others-N` tag (written by
+    /// `transcribe::diarize::relabel_others` when diarization really separated the remote voices)
+    /// sets `diarized_others`; a plain `others` lane never does, however many people were on the
+    /// call. RED against the previous code, which had no lane-shape signal at all and let the
+    /// `labeled` speaker COUNT stand in for it.
+    #[test]
+    fn feed_diarized_others_tracks_lane_shape_not_speaker_count() {
+        // Collapsed: mic + one merged remote lane — the shape that produced the bad note.
+        let collapsed = build_transcript_feed(&[
+            seg(0, 0.0, 2.0, Some("me"), "so what do we do about the migration"),
+            seg(1, 2.0, 6.0, Some("others"), "Anna, can you take the walkthrough"),
+            seg(2, 6.0, 9.0, Some("others"), "sure, I'll do it"),
+        ]);
+        assert!(collapsed.labeled, "still labeled — 2 distinct tags");
+        assert!(
+            !collapsed.diarized_others,
+            "a vocative in the text is NOT diarization: the lane is still collapsed"
+        );
+
+        // Diarized: the remote side really was split per-voice.
+        let diarized = build_transcript_feed(&[
+            seg(0, 0.0, 2.0, Some("me"), "so what do we do about the migration"),
+            seg(1, 2.0, 6.0, Some("others-0"), "I'll take the walkthrough"),
+            seg(2, 6.0, 9.0, Some("others-1"), "I'd rather we wait"),
+        ]);
+        assert!(diarized.labeled);
+        assert!(
+            diarized.diarized_others,
+            "numbered others-N tags ⇒ per-voice attribution is supportable"
+        );
+
+        // A solo-`me` meeting: no far side at all.
+        let solo = build_transcript_feed(&[seg(0, 0.0, 2.0, Some("me"), "note to self")]);
+        assert!(!solo.labeled && !solo.diarized_others);
+
+        // A malformed / non-numeric suffix is NOT a diarized cluster (fail closed: no naming).
+        let bogus = build_transcript_feed(&[
+            seg(0, 0.0, 2.0, Some("me"), "hi"),
+            seg(1, 2.0, 6.0, Some("others-unknown"), "hello"),
+        ]);
+        assert!(
+            !bogus.diarized_others,
+            "only an integer `others-N` suffix counts as a diarized cluster"
+        );
     }
 
     /// Empty + assistant-directed ("Klaudku, …") segments are dropped identically to the old flat

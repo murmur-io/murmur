@@ -113,6 +113,30 @@ fn lookup_saved_template(id: &str) -> Option<NoteTemplate> {
     map.get(id).cloned()
 }
 
+/// R2/DEFECT-B — the ONE shared "don't launder a hedge into a fact" rule, interpolated into BOTH
+/// note-prompt renderers ([`default_template`] and [`style_variant_with_keys`], which between them
+/// cover every built-in style, the `standard`/`""` default, and every saved user template).
+///
+/// WHY IT IS A CONST: the two renderers are independent string literals. A rule pasted into both by
+/// hand drifts on the first edit — and a rule that is present in `standard` but missing from `brief`
+/// is worse than no rule, because it makes the failure style-dependent and therefore invisible.
+/// Single-sourcing it here makes divergence unrepresentable (pinned by
+/// `every_builtin_style_carries_the_hedge_rule`).
+///
+/// WHAT IT FIXES: a speaker said he did not know what a flag was technically, that he had forgotten
+/// what was decided, and that it was "like a Boolean, probably". Nobody confirmed it. The generated
+/// note asserted the flag *is* a Boolean on a named API — a hedge promoted to a specification. The
+/// `(to confirm)` marker is deliberately the EXACT token
+/// [`crate::summarize::recipes::BUILTIN_RECIPES`] already ships (`grounded-email`), so the app has
+/// ONE vocabulary for "not yet confirmed" rather than two.
+pub(crate) const EPISTEMIC_STRENGTH_RULE: &str = "\
+Accuracy rules:
+- PRESERVE EPISTEMIC STRENGTH. When the ONLY support for a claim in the transcript is hedged (\"I \
+don't know\", \"I think\", \"probably\", \"I forgot\", \"maybe\", \"not sure\", \"something like\"), \
+keep the hedge in your wording OR mark the item '(to confirm)'. Never restate an unconfirmed guess \
+as a fact, a specification, or a decision, and never promote one into the Decisions section. An \
+unanswered question stays an open question.";
+
 /// The canonical Obsidian note-format prompt (front-matter + sections), shared by all providers.
 ///
 /// This is the *system / instruction* portion sent to every provider. It instructs the
@@ -121,7 +145,8 @@ fn lookup_saved_template(id: &str) -> Option<NoteTemplate> {
 /// (output must start with `---`) per the design lessons, so the wording here is
 /// load-bearing across all three providers.
 pub fn default_template() -> String {
-    r#"You are a meticulous meeting-notes writer for an Obsidian vault.
+    format!(
+        r#"You are a meticulous meeting-notes writer for an Obsidian vault.
 
 Produce a SINGLE, complete Markdown note summarizing the meeting transcript that
 follows. Output ONLY the note — no preamble, no explanation, no code fences around
@@ -167,8 +192,10 @@ Formatting rules:
 - Use plain Markdown. Use real newlines.
 - Be concise and faithful to the transcript; do not fabricate participants, decisions,
   or action items that are not supported by the transcript.
+
+{EPISTEMIC_STRENGTH_RULE}
 "#
-    .to_string()
+    )
 }
 
 /// Pick the note-format template for a style preset. Unknown styles fall back to standard.
@@ -288,6 +315,8 @@ Formatting rules:
 - Use plain Markdown. Use real newlines.
 - Be faithful to the transcript; do not fabricate participants, decisions, or action
   items that are not supported by the transcript.
+
+{EPISTEMIC_STRENGTH_RULE}
 "#
     )
 }
@@ -334,11 +363,27 @@ never the keys."
 }
 
 /// The full summary system prompt: the style template + the output-language directive, and — when
-/// the transcript is SPEAKER-LABELED (`labeled`, i.e. the meeting had ≥2 distinct diarized speakers)
-/// — the speaker-attribution directive so the model attributes decisions / key points / action-item
-/// OWNERS to who actually said them. `labeled == false` (the default solo-`me` meeting) is
-/// byte-identical to the pre-Tier-0 prompt.
-pub fn build_template(style: &str, note_language: &str, labeled: bool) -> String {
+/// the transcript is SPEAKER-LABELED (`labeled`) — an attribution directive chosen by the feed's
+/// LANE SHAPE (`diarized_others`, see [`crate::pipeline::TranscriptFeed`]):
+///
+///   * `diarized_others == true` — the far side really was split per-voice (`others-0`,
+///     `others-1`, …) ⇒ [`speaker_attribution_directive_diarized`], unchanged from before.
+///   * `diarized_others == false` — one plain `others` lane holding EVERY remote participant ⇒
+///     [`speaker_attribution_directive_collapsed`], which FORBIDS personal-name attribution.
+///
+/// R2/DEFECT-A: the old gate was `labeled` alone, so an ordinary dual-stream call ({me, others} = 2
+/// distinct labels) got the diarized directive — which asks for participants' real names — even
+/// though its single `others` lane could not tell one remote person from another. The model's only
+/// way to comply was to guess from vocatives, and it did: a 63-minute, 6-participant note carried
+/// ~15 name attributions, at least three of them demonstrably wrong.
+///
+/// `labeled == false` (the default solo-`me` meeting) still appends nothing.
+pub fn build_template(
+    style: &str,
+    note_language: &str,
+    labeled: bool,
+    diarized_others: bool,
+) -> String {
     let mut t = format!(
         "{}\n\n{}",
         template_for_style(style),
@@ -346,17 +391,24 @@ pub fn build_template(style: &str, note_language: &str, labeled: bool) -> String
     );
     if labeled {
         t.push_str("\n\n");
-        t.push_str(speaker_attribution_directive());
+        t.push_str(if diarized_others {
+            speaker_attribution_directive_diarized()
+        } else {
+            speaker_attribution_directive_collapsed()
+        });
     }
     t
 }
 
-/// Appended to the system prompt ONLY when the transcript is speaker-labeled (`[start-end] (speaker)
-/// text`, the same shape the timeline consumes — see [`crate::summarize::timeline`]). Tells the model
-/// to attribute content to the speaker who said it (`me` = the person recording; `others` /
-/// `others-0` / `others-1` … = the DISTINCT other participants) so action-item OWNERS and decisions
-/// are correctly assigned instead of guessed from speaker-blind text. Mirrors `timeline::SYSTEM`.
-pub(crate) fn speaker_attribution_directive() -> &'static str {
+/// Appended when the transcript is speaker-labeled AND the far side is genuinely DIARIZED (at least
+/// one numbered `others-N` tag). Tells the model to attribute content to the speaker who said it
+/// (`me` = the person recording; `others-0` / `others-1` … = the DISTINCT other participants) so
+/// action-item OWNERS and decisions are correctly assigned instead of guessed from speaker-blind
+/// text. Mirrors `timeline::SYSTEM`.
+///
+/// UNCHANGED TEXT (renamed from `speaker_attribution_directive`): naming a real participant is only
+/// defensible here, where separate tags actually distinguish the people being named.
+pub(crate) fn speaker_attribution_directive_diarized() -> &'static str {
     "SPEAKER ATTRIBUTION: the transcript below is diarized — each line is `[start-end] (speaker) \
 text` (seconds). The `(speaker)` tag is the source of truth for who is talking: `me` is the person \
 recording the meeting; `others`, `others-0`, `others-1`, … are the DISTINCT people on the other \
@@ -368,6 +420,33 @@ clearly stated in the conversation, otherwise keep the tag label).\n\
 - List the distinct speakers under the `participants` front-matter (real names when clearly stated, \
 else the tag labels).\n\
 Never attribute to `me` something another participant said or owns, and never invent a speaker the \
+tags do not support."
+}
+
+/// Appended when the transcript is speaker-labeled but the far side is COLLAPSED — one plain
+/// `others` lane carrying every remote participant, however many were on the call (no diarization
+/// ran, or it found ≤1 cluster; see [`crate::transcribe::diarize::relabel_others`]).
+///
+/// The lane tag is a CAPTURE CHANNEL, not a person. Nothing in such a feed identifies which of the N
+/// remote people spoke a given line, so any personal name in the note would be a guess dressed as a
+/// record — the exact failure this directive exists to prevent. It therefore forbids personal-name
+/// attribution outright, forbids guessed names in the `participants` front-matter, and allows a
+/// heard name through ONLY as an explicitly-marked inference.
+pub(crate) fn speaker_attribution_directive_collapsed() -> &'static str {
+    "SPEAKER ATTRIBUTION: the transcript below has exactly TWO lanes — `me` (the person recording) \
+and `others` (EVERY remote participant, merged into ONE lane by the capture, however many people \
+were on the call). The `(speaker)` tag is a capture LANE, not a person, and nothing in this \
+transcript says which of the remote people spoke any given line. Therefore:\n\
+- NEVER attribute a statement, decision, key point, or action item to a personal NAME. Attribute \
+only to the lane: `me` or `others` (write action items as `others — action`, or `me — action`).\n\
+- NEVER put a guessed personal name in the `participants` front-matter. List only the lane labels \
+that actually appear (`me`, `others`), or leave the list empty.\n\
+- A name you hear in the conversation (someone being addressed or referred to) may be reported ONLY \
+as an inference and must be marked as one — e.g. `addressed as X (inferred, not a speaker record)` \
+— never as a record of who spoke.\n\
+- Do NOT infer who said what from vocatives, turn order, topic, or who was mentioned nearby. If the \
+lane tag does not establish it, this transcript does not support it.\n\
+Never attribute to `me` something the `others` lane said or owns, and never invent a speaker the \
 tags do not support."
 }
 
@@ -455,16 +534,26 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
             out.push_str(
                 "\n## The user's own in-meeting notes (SKELETON — build the note around these)\n\
                  The user typed these during the meeting, one item per line, in order. They are \
-                 the strongest signal of what mattered. Requirements:\n\
+                 the strongest signal of what mattered. They may also contain material that was \
+                 NEVER discussed — pasted from a document, an agenda, or a plan. Requirements:\n\
                  - Use them as the outline: cover EVERY item, in the user's order, keeping the \
                  user's wording (fix only obvious typos).\n\
                  - Expand each item with concrete detail from the transcript — decisions, owners, \
                  dates, numbers.\n\
+                 - PROVENANCE (this overrides every other instruction): `## Summary`, \
+                 `## Key points`, `## Decisions`, `## Action items` and `## Risks & open questions` \
+                 record THE MEETING. Put a statement there ONLY if the TRANSCRIPT supports it. A \
+                 note item the transcript never covers — however important it looks — does NOT go \
+                 in those sections.\n\
+                 - Put every such uncovered item under ONE section headed exactly \
+                 `## From my notes`, placed after the meeting sections, keeping the user's wording. \
+                 Omit that section when the transcript covers everything.\n\
+                 - An OPEN QUESTION in a document is not a decision. Never promote one into \
+                 `## Decisions` because the notes stated it as a plan.\n\
                  - After covering every item, add one section headed exactly `## Also discussed` \
                  for significant transcript topics the notes missed; omit it when nothing \
                  significant remains.\n\
-                 - Never invent content that is not grounded in the transcript or these notes.\n\
-                 - Never output a section titled `My notes`.\n\
+                 - Never invent content grounded in neither the transcript nor these notes.\n\
                  - Never repeat a section heading; keep every formatting requirement from the \
                  instructions above (front-matter first, section structure, wikilinks).\n\
                  USER NOTES:\n",
@@ -1318,9 +1407,46 @@ mod tests {
             s.contains("## Also discussed"),
             "instructs the Also discussed section"
         );
+        // R3/#4 — DELIBERATE CHANGE. This used to assert the prompt forbade a notes-derived
+        // section outright ("Never output a section titled `My notes`"). That instruction was the
+        // defect: with no home of its own, note material the transcript never covered had to be
+        // distributed into the meeting sections, and a pasted PRD's open question landed under
+        // `## Decisions` where a reader takes it for a team decision. The section is now REQUIRED
+        // and named, so the forbidding clause is gone on purpose.
         assert!(
-            s.contains("Never output a section titled"),
-            "forbids a My notes section"
+            s.contains("## From my notes"),
+            "gives uncovered note material its own named home"
+        );
+    }
+
+    /// R3/#4 (regression). The enhance-mode block must state a PROVENANCE contract: the
+    /// meeting-record sections carry only transcript-supported statements, and anything from the
+    /// user's notes the transcript never covered goes to its own section instead.
+    ///
+    /// RED against the previous behavior: the old block said "Never invent content that is not
+    /// grounded in the transcript OR THESE NOTES", which explicitly WIDENED the grounding set to
+    /// the pasted document, and named no section to hold uncovered material.
+    #[test]
+    fn enhance_mode_prompt_states_a_provenance_contract() {
+        let mut r = req(None);
+        r.user_notes = Some("rename the servers\n50 tools per interface".to_string());
+        let s = render_user_content(&r);
+        assert!(
+            s.contains("## From my notes"),
+            "names the section that holds uncovered note material"
+        );
+        assert!(
+            s.contains("ONLY if the TRANSCRIPT supports it"),
+            "binds the meeting sections to transcript support"
+        );
+        assert!(
+            s.contains("OPEN QUESTION in a document is not a decision"),
+            "blocks the exact failure that put a PRD open question under Decisions"
+        );
+        // The old wording legitimised the notes as a grounding source for the meeting sections.
+        assert!(
+            !s.contains("grounded in the transcript or these notes"),
+            "must not widen the grounding set for the meeting-record sections"
         );
     }
 
@@ -1382,9 +1508,14 @@ mod tests {
         assert!(fm.contains("recipe: synthesis"));
     }
 
-    /// TIER 0: the speaker-attribution directive is appended ONLY when `labeled`, and the
-    /// `labeled == false` prompt is byte-identical to the legacy `template + language` prompt.
-    /// RED on the old 2-arg `build_template` (no `labeled` param, never appends the directive).
+    /// TIER 0: an attribution directive is appended ONLY when `labeled`, and the `labeled == false`
+    /// prompt is byte-identical to the `template + language` prompt.
+    ///
+    /// R2 UPDATE: `build_template` gained the `diarized_others` lane-shape argument, so the
+    /// "labeled" leg of this test now pins the DIARIZED lane specifically (`true, true`) — the case
+    /// whose bytes it always meant to describe. The collapsed lane (`true, false`) is a genuinely
+    /// different prompt and is pinned by `collapsed_lane_prompt_forbids_personal_name_attribution`;
+    /// asserting `contains("OWNER")` against it would be asserting the very defect R2 removes.
     #[test]
     fn build_template_adds_attribution_only_when_labeled() {
         let base = format!(
@@ -1392,15 +1523,18 @@ mod tests {
             template_for_style("standard"),
             language_directive("auto")
         );
-        // Unlabeled (the default solo-`me` meeting): byte-identical to the legacy prompt.
-        let unlabeled = build_template("standard", "auto", false);
-        assert_eq!(
-            unlabeled, base,
-            "unlabeled must be byte-identical to the pre-Tier-0 prompt"
-        );
-        assert!(!unlabeled.contains("SPEAKER ATTRIBUTION"));
-        // Labeled: the unlabeled prompt PLUS the attribution directive instructing owner/speaker.
-        let labeled = build_template("standard", "auto", true);
+        // Unlabeled (the default solo-`me` meeting): byte-identical to the base prompt, whatever the
+        // lane-shape flag says — no tags in the feed ⇒ nothing to attribute.
+        for diarized in [false, true] {
+            let unlabeled = build_template("standard", "auto", false, diarized);
+            assert_eq!(
+                unlabeled, base,
+                "unlabeled must be byte-identical to the pre-Tier-0 prompt (diarized={diarized})"
+            );
+            assert!(!unlabeled.contains("SPEAKER ATTRIBUTION"));
+        }
+        // Labeled + DIARIZED: the base prompt PLUS the attribution directive instructing owner/speaker.
+        let labeled = build_template("standard", "auto", true, true);
         assert!(
             labeled.starts_with(&base),
             "labeled prompt extends the base prompt"
@@ -1411,6 +1545,112 @@ mod tests {
             "instructs action-item OWNER attribution"
         );
         assert!(labeled.contains("(speaker)") && labeled.contains("others"));
+    }
+
+    /// R2/DEFECT-A (regression 1). A COLLAPSED far side — one plain `others` lane holding every
+    /// remote participant — MUST get the no-personal-name directive, and MUST NOT carry the
+    /// real-NAME instruction that only makes sense for a diarized feed.
+    ///
+    /// RED against the previous behavior: `build_template` used to gate on `labeled` alone, so this
+    /// exact feed shape (an ordinary dual-stream call, distinct set {me, others}) received the
+    /// diarized directive — the prompt that told the model to name participants it could not
+    /// possibly identify.
+    #[test]
+    fn collapsed_lane_prompt_forbids_personal_name_attribution() {
+        let p = build_template("standard", "auto", true, false);
+        assert!(
+            p.contains("SPEAKER ATTRIBUTION"),
+            "a collapsed lane still gets an attribution directive, just the forbidding one"
+        );
+        assert!(
+            p.contains(
+                "NEVER attribute a statement, decision, key point, or action item to a personal NAME"
+            ),
+            "collapsed lane must FORBID personal-name attribution; got:\n{p}"
+        );
+        assert!(
+            p.contains("NEVER put a guessed personal name in the `participants` front-matter"),
+            "collapsed lane must forbid guessed names in front-matter; got:\n{p}"
+        );
+        assert!(
+            p.contains("(inferred, not a speaker record)"),
+            "a heard name may only be reported as an explicitly-marked inference; got:\n{p}"
+        );
+        // The diarized directive's naming clauses must be ABSENT — their presence is the defect.
+        assert!(
+            !p.contains("use a participant's real NAME when it is clearly stated"),
+            "collapsed lane must NOT carry the real-NAME instruction; got:\n{p}"
+        );
+        assert!(
+            !p.contains("real names when clearly stated"),
+            "collapsed lane must NOT ask for real names in the participants list; got:\n{p}"
+        );
+        assert_ne!(
+            speaker_attribution_directive_collapsed(),
+            speaker_attribution_directive_diarized(),
+            "the two lane shapes must be genuinely different directives"
+        );
+    }
+
+    /// R2/DEFECT-A (regression 2). A DIARIZED far side (numbered `others-N` tags present) keeps
+    /// TODAY's directive verbatim — the fix narrows where naming is allowed, it does not remove the
+    /// capability where the tags actually support it.
+    ///
+    /// RED against a fix that over-corrects by forbidding names everywhere.
+    #[test]
+    fn diarized_lane_prompt_keeps_existing_attribution_directive() {
+        let p = build_template("standard", "auto", true, true);
+        assert!(
+            p.ends_with(speaker_attribution_directive_diarized()),
+            "the diarized prompt must end with the unchanged diarized directive; got:\n{p}"
+        );
+        assert!(p.contains("use a participant's real NAME when it is clearly stated"));
+        assert!(p.contains("List the distinct speakers under the `participants` front-matter"));
+        assert!(
+            !p.contains("NEVER attribute a statement, decision, key point, or action item to a personal NAME"),
+            "the diarized lane must NOT get the collapsed-lane prohibition; got:\n{p}"
+        );
+    }
+
+    /// R2/DEFECT-B (regression 3). EVERY built-in note style — and the `standard`/`""` default that
+    /// renders `default_template` — must carry the shared hedge rule, so a hedged utterance is never
+    /// laundered into a specification or a decision. Style-dependent honesty is not honesty.
+    ///
+    /// RED against the previous behavior: no style carried any hedge rule at all.
+    #[test]
+    fn every_builtin_style_carries_the_hedge_rule() {
+        for style in ["standard", "", "brief", "detailed", "action"] {
+            let t = template_for_style(style);
+            assert!(
+                t.contains("PRESERVE EPISTEMIC STRENGTH"),
+                "{style}: the built-in style must carry the hedge rule; got:\n{t}"
+            );
+            assert!(
+                t.contains("(to confirm)"),
+                "{style}: the hedge rule must reuse the existing '(to confirm)' marker; got:\n{t}"
+            );
+            assert!(
+                t.contains("never promote one into the Decisions section"),
+                "{style}: a hedged claim must never be promoted into Decisions; got:\n{t}"
+            );
+            // Single-sourced: the rendered rule is the const verbatim, so the two renderers
+            // (`default_template` + `style_variant_with_keys`) cannot drift apart.
+            assert!(
+                t.contains(EPISTEMIC_STRENGTH_RULE),
+                "{style}: must interpolate the shared const, not a hand-copied paraphrase"
+            );
+        }
+        // The marker token is the one `recipes::BUILTIN_RECIPES` already ships — one vocabulary.
+        assert!(
+            crate::summarize::recipes::BUILTIN_RECIPES
+                .iter()
+                .any(|(_, _, prompt)| prompt.contains("(to confirm)")),
+            "the '(to confirm)' marker must stay the SHARED vocabulary with the built-in recipes"
+        );
+        // A saved user template renders through `style_variant_with_keys` too ⇒ same rule.
+        let saved =
+            render_saved_template(&tpl("tpl-hedge", "", &[("Outcome", "what we agreed")], &[]));
+        assert!(saved.contains(EPISTEMIC_STRENGTH_RULE), "{saved}");
     }
 
     fn tpl(id: &str, tone: &str, sections: &[(&str, &str)], extra: &[&str]) -> NoteTemplate {
@@ -1430,13 +1670,18 @@ mod tests {
         }
     }
 
-    /// (i) BYTE-IDENTITY REGRESSION: after the data-driven refactor, the built-in `brief` style must
-    /// render EXACTLY the same prompt as before (the full literal is pinned so any spacing/keyword
-    /// drift from the `style_variant` → `style_variant_with_keys` change fails here). RED if the
-    /// refactor leaks an extra-key line, drops the tone clause, or shifts the front-matter spacing.
+    /// (i) BYTE-IDENTITY REGRESSION: the built-in `brief` style renders EXACTLY this prompt (the full
+    /// literal is pinned so any spacing/keyword drift fails here). RED if a refactor leaks an
+    /// extra-key line, drops the tone clause, or shifts the front-matter spacing.
+    ///
+    /// R2 UPDATE: the pinned literal now ends with the shared hedge rule, interpolated from
+    /// [`EPISTEMIC_STRENGTH_RULE`] rather than re-typed — re-typing it here would create the second
+    /// copy the const exists to prevent, and the rule's own text is pinned by
+    /// `every_builtin_style_carries_the_hedge_rule`. Everything around it stays byte-pinned.
     #[test]
     fn builtin_brief_style_is_byte_identical() {
-        let expected = r#"You are a meticulous meeting-notes writer for an Obsidian vault.
+        let expected = format!(
+            r#"You are a meticulous meeting-notes writer for an Obsidian vault.
 
 Produce a SINGLE, complete Markdown note summarizing the meeting transcript that
 follows. Output ONLY the note — no preamble, no explanation, no code fences around
@@ -1476,7 +1721,10 @@ Formatting rules:
 - Use plain Markdown. Use real newlines.
 - Be faithful to the transcript; do not fabricate participants, decisions, or action
   items that are not supported by the transcript.
-"#;
+
+{EPISTEMIC_STRENGTH_RULE}
+"#
+        );
         assert_eq!(template_for_style("brief"), expected);
     }
 
@@ -1549,7 +1797,7 @@ Formatting rules:
         // Registered → build_template resolves it (pipeline's exact call) + appends the language
         // directive; unlabeled adds no speaker directive.
         set_saved_templates(vec![t.clone()]);
-        let built = build_template("tpl-client-call", "auto", false);
+        let built = build_template("tpl-client-call", "auto", false, false);
         assert!(built.starts_with(&body), "build_template renders the saved body");
         assert!(built.contains("OUTPUT LANGUAGE:"), "language directive appended");
         assert!(!built.contains("SPEAKER ATTRIBUTION"), "no attribution when unlabeled");
