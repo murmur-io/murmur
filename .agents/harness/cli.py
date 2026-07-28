@@ -1320,6 +1320,15 @@ def _run_or_resume_check(
     return record, True
 
 
+def _reviews_require_fix(review_records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return true when evidence requests must not mask a review defect."""
+
+    return any(
+        verifier.review_result_state(record.get("result", {})) == "NEEDS_FIX"
+        for record in review_records
+    )
+
+
 def verify_task(
     contract: Mapping[str, Any],
     task_dir: Path,
@@ -1591,6 +1600,20 @@ def verify_task(
                 for request in review.get("result", {}).get("probe_requests", [])
             }
         )
+        # A typed probe can close an empirical proof gap, but it cannot repair a
+        # reviewer-confirmed code or specification defect.  Resolve that
+        # precedence before probe handling only when a probe was actually
+        # requested.  Probe-free NEEDS_FIX reviews continue through the
+        # pre-existing evidence/checkpoint path unchanged.
+        if requested_probe_ids and _reviews_require_fix(review_records):
+            set_v2_state(
+                task_dir,
+                "NEEDS_FIX",
+                phase="reviews",
+                reason="a review has unresolved FAIL/MAJOR/BLOCKER findings",
+                attempt_id=attempt_dir.name,
+            )
+            return "NEEDS_FIX"
         existing_probe_ids = {
             str(record.get("id")) for record in probe_records
         }
