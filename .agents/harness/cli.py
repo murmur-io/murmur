@@ -98,6 +98,13 @@ def set_v2_state(task_dir: Path, status: str, **details: Any) -> Dict[str, Any]:
             raise legacy.HarnessError(
                 f"v2 task is terminal ({prior.get('status')}); state cannot change"
             )
+    prior_revision = prior.get("state_revision", 0)
+    if (
+        isinstance(prior_revision, bool)
+        or not isinstance(prior_revision, int)
+        or prior_revision < 0
+    ):
+        raise legacy.HarnessError("v2 state revision is malformed")
     state = {
         "schema_version": 2,
         "task_id": task_dir.name,
@@ -109,6 +116,7 @@ def set_v2_state(task_dir: Path, status: str, **details: Any) -> Dict[str, Any]:
             if key not in {"schema_version", "task_id", "status", "updated_at"}
         },
         **details,
+        "state_revision": prior_revision + 1,
     }
     # The append-only event is authoritative.  The projection follows it, so a
     # crash between writes is repaired by load_v2_state instead of losing the
@@ -1243,6 +1251,441 @@ def _load_bound_record(
     return record
 
 
+def _probe_record_sha256(record: Mapping[str, Any]) -> str:
+    return legacy.sha256_bytes(legacy.canonical_json(record))
+
+
+def _probe_witness_key(probes_dir: Path, probe_id: str) -> str:
+    return f"{probes_dir.parent.name}/{probe_id}"
+
+
+def _witness_probe_high_water(
+    task_dir: Path,
+    probes_dir: Path,
+    probe_id: str,
+    execution_number: int,
+) -> None:
+    state = load_v2_state(task_dir)
+    raw = state.get("probe_high_water", {})
+    if not isinstance(raw, Mapping) or any(
+        not isinstance(key, str)
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > verifier.MAX_PROBE_EXECUTIONS_PER_ID
+        for key, value in raw.items()
+    ):
+        raise legacy.HarnessError("v2 probe high-water witness is malformed")
+    witnesses = dict(raw)
+    key = _probe_witness_key(probes_dir, probe_id)
+    prior = int(witnesses.get(key, 0))
+    if prior > execution_number:
+        raise legacy.HarnessError(
+            f"v2 probe event ledger was rewound: {probe_id}"
+        )
+    if prior == execution_number:
+        return
+    witnesses[key] = execution_number
+    set_v2_state(
+        task_dir,
+        str(state["status"]),
+        phase="probes",
+        attempt_id=probes_dir.parent.name,
+        probe_high_water=witnesses,
+    )
+
+
+def _probe_execution_state(
+    task_dir: Path,
+    probes_dir: Path,
+    probe_id: str,
+    declared: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    *,
+    allow_test_adapter: bool,
+) -> Tuple[
+    List[Dict[str, Any]],
+    int,
+    List[bool],
+    List[Dict[str, Any]],
+]:
+    """Load completed records, reserved high-water, and legacy presence."""
+
+    events_path = task_dir / "events.jsonl"
+    records: Dict[int, Dict[str, Any]] = {}
+    reservations: set[int] = set()
+    reservation_contexts: Dict[int, List[Dict[str, Any]]] = {}
+    legacy_event_outcomes: List[bool] = []
+    expected_command_sha256 = legacy.sha256_bytes(
+        str(declared["command"]).encode("utf-8")
+    )
+    try:
+        with events_path.open(
+            "r", encoding="utf-8", errors="strict"
+        ) as handle:
+            for line in handle:
+                document = json.loads(line)
+                if (
+                    not isinstance(document, dict)
+                    or document.get("attempt_id") != probes_dir.parent.name
+                    or document.get("probe_id") != probe_id
+                ):
+                    continue
+                event_kind = document.get("event")
+                if event_kind not in {
+                    "probe-execution-reserved",
+                    "probe-checkpoint",
+                }:
+                    continue
+                execution_number = document.get("execution_number")
+                # Pre-high-water events remain compatible. A validated legacy
+                # projection is migrated to a numbered event below.
+                if execution_number is None:
+                    if event_kind == "probe-checkpoint":
+                        if not isinstance(document.get("passed"), bool):
+                            raise legacy.HarnessError(
+                                "legacy probe event outcome is malformed"
+                            )
+                        legacy_event_outcomes.append(
+                            bool(document["passed"])
+                        )
+                    continue
+                if (
+                    isinstance(execution_number, bool)
+                    or not isinstance(execution_number, int)
+                    or execution_number < 1
+                    or execution_number
+                    > verifier.MAX_PROBE_EXECUTIONS_PER_ID
+                ):
+                    raise legacy.HarnessError(
+                        f"v2 probe event number is malformed: {probe_id}"
+                    )
+                if (
+                    document.get("plan_sha256")
+                    != plan.get("plan_sha256")
+                    or document.get("diff_sha256")
+                    != plan.get("diff_sha256")
+                ):
+                    raise legacy.HarnessError(
+                        f"v2 probe event binding changed: {probe_id}"
+                    )
+                if event_kind == "probe-execution-reserved":
+                    contexts = document.get("request_contexts")
+                    if (
+                        document.get("check_id") != probe_id
+                        or document.get("command_sha256")
+                        != expected_command_sha256
+                        or not isinstance(contexts, list)
+                        or not contexts
+                        or document.get("request_contexts_sha256")
+                        != legacy.sha256_bytes(
+                            legacy.canonical_json(contexts)
+                        )
+                        or any(
+                            not isinstance(context, Mapping)
+                            or context.get("probe_id") != probe_id
+                            or context.get("context_sha256")
+                            != verifier.document_hash(
+                                context, "context_sha256"
+                            )
+                            for context in contexts
+                        )
+                        or execution_number in reservations
+                    ):
+                        raise legacy.HarnessError(
+                            f"v2 probe reservation changed: {probe_id}"
+                        )
+                    reservations.add(execution_number)
+                    reservation_contexts[execution_number] = [
+                        dict(context) for context in contexts
+                    ]
+                    continue
+                expected_path = probes_dir / f"{probe_id}.json"
+                record = document.get("record")
+                if (
+                    not isinstance(record, Mapping)
+                    or not isinstance(document.get("projection_path"), str)
+                    or Path(
+                        str(document.get("projection_path"))
+                    ).absolute()
+                    != expected_path.absolute()
+                    or not isinstance(document.get("record_sha256"), str)
+                    or legacy.SHA256_RE.fullmatch(
+                        str(document.get("record_sha256"))
+                    )
+                    is None
+                ):
+                    raise legacy.HarnessError(
+                        f"v2 probe event binding changed: {probe_id}"
+                    )
+                bound_record = dict(record)
+                if (
+                    bound_record.get("execution_number")
+                    != execution_number
+                    or _probe_record_sha256(bound_record)
+                    != document["record_sha256"]
+                    or not verifier.binding_matches(bound_record, plan)
+                ):
+                    raise legacy.HarnessError(
+                        f"v2 probe event record changed: {probe_id}"
+                    )
+                verifier.validate_probe_checkpoint(
+                    bound_record,
+                    declared,
+                    plan,
+                    task_dir,
+                    allow_test_adapter=allow_test_adapter,
+                )
+                if execution_number in records:
+                    raise legacy.HarnessError(
+                        f"v2 probe event number was reused: {probe_id}"
+                    )
+                records[execution_number] = bound_record
+                if (
+                    execution_number in reservation_contexts
+                    and legacy.canonical_json(
+                        bound_record.get("request_contexts")
+                    )
+                    != legacy.canonical_json(
+                        reservation_contexts[execution_number]
+                    )
+                ):
+                    raise legacy.HarnessError(
+                        f"v2 probe completion context changed: {probe_id}"
+                    )
+                reservations.add(execution_number)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise legacy.HarnessError(
+            f"v2 probe event ledger is malformed: {events_path}: {exc}"
+        ) from exc
+    numbers = sorted(reservations)
+    if numbers and numbers != list(range(1, max(numbers) + 1)):
+        raise legacy.HarnessError(
+            f"v2 probe event high-water is not contiguous: {probe_id}"
+        )
+    high_water = max(numbers, default=0)
+    state = load_v2_state(task_dir)
+    witnesses = state.get("probe_high_water", {})
+    if not isinstance(witnesses, Mapping):
+        raise legacy.HarnessError("v2 probe high-water witness is malformed")
+    witnessed = witnesses.get(
+        _probe_witness_key(probes_dir, probe_id), 0
+    )
+    if (
+        isinstance(witnessed, bool)
+        or not isinstance(witnessed, int)
+        or witnessed < 0
+        or witnessed > verifier.MAX_PROBE_EXECUTIONS_PER_ID
+    ):
+        raise legacy.HarnessError("v2 probe high-water witness is malformed")
+    if witnessed > high_water:
+        raise legacy.HarnessError(
+            f"v2 probe event ledger was rewound: {probe_id}"
+        )
+    return (
+        [records[number] for number in sorted(records)],
+        high_water,
+        legacy_event_outcomes,
+        (
+            reservation_contexts.get(high_water, [])
+            if high_water not in records
+            else []
+        ),
+    )
+
+
+def _reserve_probe_execution(
+    task_dir: Path,
+    probes_dir: Path,
+    probe_id: str,
+    declared: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    execution_number: int,
+    request_contexts: Sequence[Mapping[str, Any]],
+) -> None:
+    contexts = [copy.deepcopy(dict(item)) for item in request_contexts]
+    if not contexts:
+        raise legacy.HarnessError("v2 probe reservation context is missing")
+    _checkpoint_event(
+        task_dir,
+        "probe-execution-reserved",
+        attempt_id=probes_dir.parent.name,
+        probe_id=probe_id,
+        execution_number=execution_number,
+        check_id=probe_id,
+        command_sha256=legacy.sha256_bytes(
+            str(declared["command"]).encode("utf-8")
+        ),
+        request_contexts=contexts,
+        request_contexts_sha256=legacy.sha256_bytes(
+            legacy.canonical_json(contexts)
+        ),
+        plan_sha256=plan["plan_sha256"],
+        diff_sha256=plan["diff_sha256"],
+    )
+    _witness_probe_high_water(
+        task_dir, probes_dir, probe_id, execution_number
+    )
+
+
+def _append_probe_checkpoint(
+    task_dir: Path,
+    probes_dir: Path,
+    probe_id: str,
+    plan: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> None:
+    evidence = record.get("evidence", {})
+    _checkpoint_event(
+        task_dir,
+        "probe-checkpoint",
+        attempt_id=probes_dir.parent.name,
+        probe_id=probe_id,
+        execution_number=record["execution_number"],
+        projection_path=str(probes_dir / f"{probe_id}.json"),
+        record=record,
+        record_sha256=_probe_record_sha256(record),
+        plan_sha256=plan["plan_sha256"],
+        diff_sha256=plan["diff_sha256"],
+        passed=bool(evidence.get("passed")),
+    )
+
+
+def _load_probe_checkpoint(
+    probes_dir: Path,
+    probe_id: str,
+    declared: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    task_dir: Path,
+    *,
+    allow_test_adapter: bool,
+) -> Tuple[Optional[Dict[str, Any]], int, bool, List[Dict[str, Any]]]:
+    """Load the append-only high-water and repair only its latest view."""
+
+    projection_path = probes_dir / f"{probe_id}.json"
+    projection = _load_bound_record(projection_path, plan)
+    if projection is not None:
+        verifier.validate_probe_checkpoint(
+            projection,
+            declared,
+            plan,
+            task_dir,
+            allow_test_adapter=allow_test_adapter,
+        )
+    (
+        records,
+        high_water,
+        legacy_event_outcomes,
+        outstanding_contexts,
+    ) = _probe_execution_state(
+        task_dir,
+        probes_dir,
+        probe_id,
+        declared,
+        plan,
+        allow_test_adapter=allow_test_adapter,
+    )
+    if high_water > 0:
+        _witness_probe_high_water(
+            task_dir, probes_dir, probe_id, high_water
+        )
+    if len(legacy_event_outcomes) > 1:
+        raise legacy.HarnessError(
+            "multiple legacy probe events cannot be migrated safely"
+        )
+    if legacy_event_outcomes and records:
+        migrated_numbered = records[0]
+        if (
+            int(migrated_numbered["execution_number"]) != 1
+            or bool(
+                migrated_numbered.get("evidence", {}).get("passed")
+            )
+            != legacy_event_outcomes[0]
+        ):
+            raise legacy.HarnessError(
+                "legacy probe outcome conflicts with numbered history"
+            )
+    if not records and (
+        high_water == 0 or bool(legacy_event_outcomes)
+    ):
+        if projection is None:
+            if legacy_event_outcomes:
+                raise legacy.HarnessError(
+                    "legacy probe event has no recoverable projection"
+                )
+            if projection_path.exists() or projection_path.is_symlink():
+                raise legacy.HarnessError(
+                    f"v2 probe projection is malformed: {probe_id}"
+                )
+            return None, 0, False, []
+        migration_count = 1
+        if high_water > migration_count:
+            raise legacy.HarnessError(
+                "legacy probe migration exceeds its execution history"
+            )
+        projection_number = projection.get("execution_number", 1)
+        if projection_number != migration_count:
+            raise legacy.HarnessError(
+                "v2 probe projection has no append-only execution history"
+            )
+        migrated = {
+            **projection,
+            "execution_number": migration_count,
+        }
+        if (
+            legacy_event_outcomes
+            and bool(migrated.get("evidence", {}).get("passed"))
+            != legacy_event_outcomes[0]
+        ):
+            raise legacy.HarnessError(
+                "legacy probe outcome conflicts with its projection"
+            )
+        if (
+            high_water == migration_count
+            and legacy.canonical_json(outstanding_contexts)
+            != legacy.canonical_json(migrated["request_contexts"])
+        ):
+            raise legacy.HarnessError(
+                "legacy probe migration context changed"
+            )
+        for number in range(high_water + 1, migration_count + 1):
+            _reserve_probe_execution(
+                task_dir,
+                probes_dir,
+                probe_id,
+                declared,
+                plan,
+                number,
+                migrated["request_contexts"],
+            )
+        _append_probe_checkpoint(
+            task_dir, probes_dir, probe_id, plan, migrated
+        )
+        records = [migrated]
+        high_water = migration_count
+        outstanding_contexts = []
+
+    # The per-ID JSON is only a convenience projection. The append-only event
+    # owns both the full record and its high-water, so rollback or deletion can
+    # never lower the execution count.
+    latest = records[-1] if records else None
+    if latest is not None and (
+        projection is None
+        or legacy.canonical_json(projection)
+        != legacy.canonical_json(latest)
+    ):
+        legacy.atomic_write_json(projection_path, latest)
+    completed_numbers = {
+        int(record["execution_number"]) for record in records
+    }
+    return (
+        latest,
+        high_water,
+        high_water not in completed_numbers,
+        outstanding_contexts,
+    )
+
+
 def _snapshot_still_matches(
     contract: Mapping[str, Any],
     task_dir: Path,
@@ -1291,6 +1734,11 @@ def _run_or_resume_check(
         task_dir,
         declared,
         f"v2-{attempt_dir.name[:12]}",
+        bound_environment=(
+            {"MURMUR_HARNESS_BASE_SHA": str(plan["base_sha"])}
+            if declared.get("id") == "npm-lock"
+            else None
+        ),
     )
     if not _snapshot_still_matches(
         {**contract, "worktree_path": str(verification_worktree)},
@@ -1439,23 +1887,82 @@ def verify_task(
         probes_dir = attempt_dir / "probes"
         probes_dir.mkdir(parents=True, exist_ok=True)
         probe_records: List[Dict[str, Any]] = []
-        for path in sorted(probes_dir.glob("*.json")):
-            record = _load_bound_record(path, plan)
+        probe_checkpoints: Dict[str, Dict[str, Any]] = {}
+        outstanding_probe_contexts: Dict[str, List[Dict[str, Any]]] = {}
+        deterministic_probe_failures: List[str] = []
+        config = legacy.load_config()
+        for probe_id in sorted(verifier.allowed_probe_ids(plan)):
+            declared_probe = verifier.canonical_check(probe_id, config)
+            (
+                record,
+                high_water,
+                incomplete,
+                reserved_contexts,
+            ) = _load_probe_checkpoint(
+                probes_dir,
+                probe_id,
+                declared_probe,
+                plan,
+                task_dir,
+                allow_test_adapter=allow_test_adapter,
+            )
+            if record is not None:
+                prior = record.get("evidence", {})
+                if (
+                    not prior.get("passed")
+                    and prior.get("outcome") != "BLOCKED"
+                    and not prior.get("timed_out")
+                ):
+                    deterministic_probe_failures.append(probe_id)
+                    probe_checkpoints[probe_id] = record
+                    continue
+            if incomplete:
+                if not reserved_contexts:
+                    raise legacy.HarnessError(
+                        f"v2 incomplete probe lost its request context: {probe_id}"
+                    )
+                outstanding_probe_contexts[probe_id] = reserved_contexts
+                probe_checkpoints[probe_id] = {
+                    "id": probe_id,
+                    "execution_number": high_water,
+                    "evidence": {
+                        "passed": False,
+                        "outcome": "BLOCKED",
+                        "timed_out": True,
+                        "blocked_reason": (
+                            "probe execution was reserved but interrupted "
+                            "before its checkpoint"
+                        ),
+                    },
+                }
+                continue
             if record is None:
                 continue
-            try:
-                declared_probe = verifier.canonical_check(
-                    str(record.get("id")), legacy.load_config()
-                )
-                verifier.validate_check_checkpoint(
-                    record, declared_probe, plan, task_dir
-                )
-            except legacy.HarnessError:
-                continue
+            probe_checkpoints[probe_id] = record
             prior = record.get("evidence", {})
             if prior.get("outcome") == "BLOCKED" or prior.get("timed_out"):
+                contexts = record.get("request_contexts")
+                if not isinstance(contexts, list) or not contexts:
+                    raise legacy.HarnessError(
+                        f"v2 retryable probe lost its request context: {probe_id}"
+                    )
+                outstanding_probe_contexts[probe_id] = [
+                    copy.deepcopy(dict(context)) for context in contexts
+                ]
                 continue
             probe_records.append(record)
+        if deterministic_probe_failures:
+            set_v2_state(
+                task_dir,
+                "NEEDS_FIX",
+                phase="probes",
+                reason=(
+                    "deterministic reviewer probe failed: "
+                    + ", ".join(deterministic_probe_failures)
+                ),
+                attempt_id=attempt_dir.name,
+            )
+            return "NEEDS_FIX"
         probe_records.sort(key=lambda item: str(item.get("id", "")))
         probe_hash = verifier.probe_evidence_hash(probe_records)
         records_by_kind: Dict[str, Dict[str, Any]] = {}
@@ -1468,9 +1975,11 @@ def verify_task(
                     contract,
                     plan,
                     diff,
-                    [*check_records, *probe_records],
+                    check_records,
                     str(declared["kind"]),
                     worktree,
+                    task_dir,
+                    probes=probe_records,
                 )
                 try:
                     verifier.validate_review_checkpoint(
@@ -1512,9 +2021,11 @@ def verify_task(
                     contract=contract,
                     plan=plan,
                     worktree=worktree,
+                    task_dir=task_dir,
                     attempt_dir=run_dir,
                     diff=diff,
-                    checks=[*check_records, *probe_records],
+                    checks=check_records,
+                    probes=probe_records,
                     review=declared,
                     probe_evidence_sha256=probe_hash,
                     allow_test_adapter=allow_test_adapter,
@@ -1602,7 +2113,52 @@ def verify_task(
                 for review in review_records
                 for request in review.get("result", {}).get("probe_requests", [])
             }
+            | set(outstanding_probe_contexts)
         )
+        eligible_probe_ids = set(verifier.allowed_probe_ids(plan))
+        invalid_probe_ids = sorted(
+            set(requested_probe_ids) - eligible_probe_ids
+        )
+        if invalid_probe_ids:
+            set_v2_state(
+                task_dir,
+                "NEEDS_EVIDENCE",
+                phase="reviews",
+                reason=(
+                    "review requested probes outside the exact plan; no command "
+                    f"was executed: {', '.join(invalid_probe_ids)}"
+                ),
+                attempt_id=attempt_dir.name,
+            )
+            return "NEEDS_EVIDENCE"
+        request_contexts: Dict[str, List[Dict[str, Any]]] = {}
+        for probe_id in requested_probe_ids:
+            contexts = [
+                *outstanding_probe_contexts.get(probe_id, []),
+                *verifier.probe_request_contexts(
+                    review_records, probe_id
+                ),
+            ]
+            request_contexts[probe_id] = (
+                verifier.canonical_probe_request_contexts(contexts)
+            )
+        missing_contexts = [
+            probe_id
+            for probe_id, contexts in request_contexts.items()
+            if not contexts
+        ]
+        if missing_contexts:
+            set_v2_state(
+                task_dir,
+                "NEEDS_EVIDENCE",
+                phase="reviews",
+                reason=(
+                    "reviewer probe request provenance is missing; no command "
+                    f"was executed: {', '.join(missing_contexts)}"
+                ),
+                attempt_id=attempt_dir.name,
+            )
+            return "NEEDS_EVIDENCE"
         # A typed probe can close an empirical proof gap, but it cannot repair a
         # reviewer-confirmed code or specification defect.  Resolve that
         # precedence before probe handling only when a probe was actually
@@ -1617,41 +2173,27 @@ def verify_task(
                 attempt_id=attempt_dir.name,
             )
             return "NEEDS_FIX"
-        existing_probe_ids = {
-            str(record.get("id")) for record in probe_records
-        }
-        passed_checks = {
-            str(record.get("id")): record
-            for record in check_records
-            if record.get("evidence", {}).get("passed")
-        }
-        aliased_probe_ids = [
-            probe_id
-            for probe_id in requested_probe_ids
-            if probe_id not in existing_probe_ids and probe_id in passed_checks
-        ]
-        for probe_id in aliased_probe_ids:
-            record_path = probes_dir / f"{probe_id}.json"
-            alias = {
-                **passed_checks[probe_id],
-                "source": "planned-check",
-                "created_at": legacy.utc_now(),
-            }
-            legacy.atomic_write_json(record_path, alias)
-            _checkpoint_event(
-                task_dir,
-                "probe-alias-checkpoint",
-                attempt_id=attempt_dir.name,
-                probe_id=probe_id,
-                record_path=str(record_path),
-                source="planned-check",
-            )
-        missing_probe_ids = [
-            probe_id
-            for probe_id in requested_probe_ids
-            if probe_id not in existing_probe_ids
-            and probe_id not in passed_checks
-        ]
+        missing_probe_ids: List[str] = []
+        for probe_id in requested_probe_ids:
+            existing = probe_checkpoints.get(probe_id)
+            if existing is None:
+                missing_probe_ids.append(probe_id)
+                continue
+            execution_number = int(existing.get("execution_number", 1))
+            prior_evidence = existing.get("evidence", {})
+            if (
+                prior_evidence.get("outcome") == "BLOCKED"
+                or prior_evidence.get("timed_out")
+            ):
+                if (
+                    execution_number
+                    < verifier.MAX_PROBE_EXECUTIONS_PER_ID
+                ):
+                    missing_probe_ids.append(probe_id)
+            # One green deterministic execution is sufficient for this exact
+            # plan/diff. Fresh reviewers receive it; rephrased rationales never
+            # create another process. Only retryable infrastructure outcomes
+            # consume the one bounded retry above.
         if missing_probe_ids:
             if any(
                 probe_id in {"rust-lib", "protocol-server"}
@@ -1663,17 +2205,46 @@ def verify_task(
                     {**plan, "server_required": True},
                     verification_worktree=verification_worktree,
                 )
-            config = legacy.load_config()
             probe_pause = False
             probe_failure = False
             for probe_id in missing_probe_ids:
                 declared = verifier.canonical_check(probe_id, config)
                 record_path = probes_dir / f"{probe_id}.json"
+                execution_number = (
+                    int(
+                        probe_checkpoints[probe_id].get(
+                            "execution_number", 1
+                        )
+                    )
+                    if probe_id in probe_checkpoints
+                    else 0
+                ) + 1
+                if (
+                    execution_number
+                    > verifier.MAX_PROBE_EXECUTIONS_PER_ID
+                ):
+                    raise legacy.HarnessError(
+                        f"v2 probe execution budget exhausted: {probe_id}"
+                    )
+                _reserve_probe_execution(
+                    task_dir,
+                    probes_dir,
+                    probe_id,
+                    declared,
+                    plan,
+                    execution_number,
+                    request_contexts[probe_id],
+                )
                 evidence = legacy.run_check(
                     worktree,
                     task_dir,
                     declared,
                     f"v2-{attempt_dir.name[:12]}-probe",
+                    bound_environment=(
+                        {"MURMUR_HARNESS_BASE_SHA": str(plan["base_sha"])}
+                        if probe_id == "npm-lock"
+                        else None
+                    ),
                 )
                 if not _snapshot_still_matches(
                     {
@@ -1690,16 +2261,16 @@ def verify_task(
                         "tree_mutated": True,
                         "blocked_reason": "runner-owned probe changed the exact task diff",
                     }
-                record = verifier.check_record(declared, plan, evidence)
-                legacy.atomic_write_json(record_path, record)
-                _checkpoint_event(
-                    task_dir,
-                    "probe-checkpoint",
-                    attempt_id=attempt_dir.name,
-                    probe_id=probe_id,
-                    record_path=str(record_path),
-                    passed=bool(evidence.get("passed")),
+                record = {
+                    **verifier.check_record(declared, plan, evidence),
+                    "source": "reviewer-probe",
+                    "request_contexts": request_contexts[probe_id],
+                    "execution_number": execution_number,
+                }
+                _append_probe_checkpoint(
+                    task_dir, probes_dir, probe_id, plan, record
                 )
+                legacy.atomic_write_json(record_path, record)
                 if not _snapshot_still_matches(contract, task_dir, plan):
                     set_v2_state(
                         task_dir,
@@ -1739,21 +2310,9 @@ def verify_task(
                 "NEEDS_EVIDENCE",
                 phase="probes",
                 reason=(
-                    "allowlisted probe evidence collected; resume will run fresh "
-                    "reviews against it"
-                ),
-                attempt_id=attempt_dir.name,
-            )
-            return "NEEDS_EVIDENCE"
-        if aliased_probe_ids:
-            set_v2_state(
-                task_dir,
-                "NEEDS_EVIDENCE",
-                phase="probes",
-                reason=(
-                    "reviewer-requested proof was already a planned green "
-                    "check; a bound alias was recorded and resume will run a "
-                    "fresh review without repeating the command"
+                    "context-bound probe evidence collected; resume will run "
+                    "fresh reviews against its command, output, rationale, and "
+                    "prior proof gaps"
                 ),
                 attempt_id=attempt_dir.name,
             )

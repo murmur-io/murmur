@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Dict, Mapping, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import cli as harness_cli
 import task_runner as legacy
@@ -355,6 +355,8 @@ def cached_artifact_tamper_case(test: Tests) -> None:
             task: Path,
             check: Mapping[str, Any],
             phase: str,
+            *,
+            bound_environment: Optional[Mapping[str, str]] = None,
         ) -> Dict[str, Any]:
             nonlocal counter
             counter += 1
@@ -407,6 +409,16 @@ def cached_artifact_tamper_case(test: Tests) -> None:
                 snapshot,
                 checkpoint_number=1,
             )
+            verifier.validate_check_checkpoint(
+                first,
+                declared,
+                plan,
+                task_dir,
+            )
+            test.true(
+                "CACHE pre-change non-npm checkpoint resumes without bound environment",
+                "bound_environment" not in first["evidence"],
+            )
             first_log = Path(first["evidence"]["log_path"])
             first_log.write_bytes(first_log.read_bytes() + b"tampered\n")
             second, second_did_run = harness_cli._run_or_resume_check(
@@ -450,6 +462,7 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
             contract=contract,
             plan=plan,
             worktree=snapshot,
+            task_dir=task_dir,
             attempt_dir=run_dir,
             diff=values["diff"],
             checks=[],
@@ -465,6 +478,7 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
             [],
             "combined",
             snapshot,
+            task_dir,
         )
         expected_prompt_sha = legacy.sha256_bytes(prompt.encode("utf-8"))
         verifier.validate_review_checkpoint(
@@ -478,6 +492,21 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
         test.true(
             "PROMPT untouched runner/model artifacts validate",
             record["prompt_sha256"] == expected_prompt_sha,
+        )
+
+        relabelled = copy.deepcopy(record)
+        relabelled["kind"] = "lock-security"
+        test.raises(
+            "PROMPT review kind cannot be relabelled across planned roles",
+            lambda: verifier.validate_review_checkpoint(
+                relabelled,
+                {"kind": "lock-security", "vendor": "fake"},
+                plan,
+                task_dir,
+                expected_prompt_sha256=expected_prompt_sha,
+                allow_test_adapter=True,
+            ),
+            "label does not match review kind",
         )
 
         forged = copy.deepcopy(record)
@@ -503,6 +532,7 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
             [],
             "combined",
             snapshot,
+            task_dir,
             policy_text=policy + "\nFAULT POLICY DRIFT\n",
         )
         drifted_prompt_sha = legacy.sha256_bytes(
@@ -523,6 +553,41 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
                 allow_test_adapter=True,
             ),
             "prompt hash changed",
+        )
+
+
+def review_stream_binding_cases(test: Tests) -> None:
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-fault-stream-") as raw:
+        task_dir = Path(raw)
+        stream = task_dir / "stdout.log"
+        payload = b"HEAD:" + (b"x" * 5_000) + b":TAIL"
+        stream.write_bytes(payload)
+        digest = legacy.sha256_file(stream)
+        summary = verifier._bounded_stream_summary(  # noqa: SLF001
+            task_dir,
+            str(stream),
+            digest,
+            "fault stream",
+            128,
+        )
+        test.true(
+            "PROMPT stream excerpt is bounded with deterministic head and tail",
+            summary["truncated"]
+            and summary["bytes"] == len(payload)
+            and summary["excerpt"].startswith("HEAD:")
+            and summary["excerpt"].endswith(":TAIL")
+            and "evidence bytes omitted" in summary["excerpt"],
+        )
+        test.raises(
+            "PROMPT stream hash drift fails before review dispatch",
+            lambda: verifier._bounded_stream_summary(  # noqa: SLF001
+                task_dir,
+                str(stream),
+                "f" * 64,
+                "fault stream",
+                128,
+            ),
+            "hash changed",
         )
 
 
@@ -610,6 +675,7 @@ def main() -> int:
     snapshot_aba_and_reconstruction_cases(test)
     cached_artifact_tamper_case(test)
     prompt_policy_tamper_cases(test)
+    review_stream_binding_cases(test)
     protocol_manifest_cases(test)
     if test.failures:
         print("v2 fault selftest: FAIL")

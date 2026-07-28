@@ -2451,7 +2451,14 @@ def check_process_diagnostic(evidence: Mapping[str, Any]) -> str:
     )
 
 
-def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: str) -> Dict[str, Any]:
+def run_check(
+    worktree: Path,
+    task_dir: Path,
+    check: Mapping[str, Any],
+    phase: str,
+    *,
+    bound_environment: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
     safe_phase = re.sub(r"[^a-z0-9._-]+", "-", phase.lower())
     execution_id = _new_execution_id()
     log_path = _execution_artifact_path(
@@ -2510,6 +2517,20 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
                 str(check["command"])
             ),
         )
+        bound_environment_record = dict(
+            sorted((bound_environment or {}).items())
+        )
+        if set(bound_environment_record) - {"MURMUR_HARNESS_BASE_SHA"}:
+            raise HarnessError("check requested an unsupported bound environment key")
+        base_sha = bound_environment_record.get("MURMUR_HARNESS_BASE_SHA")
+        if base_sha is not None and not SHA1_RE.fullmatch(base_sha):
+            raise HarnessError("check bound base SHA is malformed")
+        for name, value in bound_environment_record.items():
+            if name in environment:
+                raise HarnessError(
+                    f"check bound environment would replace runner key {name}"
+                )
+            environment[name] = value
         network_mode = "loopback" if needs_loopback else "none"
         profile = build_check_seatbelt_profile(
             worktree,
@@ -2591,6 +2612,7 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
         "sandbox_mode": "inherited" if inherited_sandbox else "direct",
         "environment_keys_sha256": sha256_bytes(canonical_json(sorted(environment))),
         "environment_sha256": sha256_bytes(canonical_json(environment)),
+        "bound_environment": bound_environment_record,
         "playwright_port": playwright_port,
         "network_mode": network_mode,
         "started_at": started_at,
@@ -3055,16 +3077,23 @@ def invoke_model(
                 "findings": findings,
             }
             if schema_name == "v2-review":
+                fake_proof_gaps = os.environ.get(
+                    "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON"
+                )
                 document["proof_gaps"] = (
-                    [
-                        {
-                            "claim": "synthetic selftest evidence",
-                            "evidence_missing": "synthetic proof",
-                            "how_to_prove": "resume with a fresh reviewer result",
-                        }
-                    ]
-                    if verdict == "BLOCKED"
-                    else []
+                    json.loads(fake_proof_gaps)
+                    if fake_proof_gaps is not None
+                    else (
+                        [
+                            {
+                                "claim": "synthetic selftest evidence",
+                                "evidence_missing": "synthetic proof",
+                                "how_to_prove": "resume with a fresh reviewer result",
+                            }
+                        ]
+                        if verdict == "BLOCKED"
+                        else []
+                    )
                 )
                 # `fake` is reachable only through the explicit selftest
                 # adapter gate. This knob exercises the real typed-probe state
@@ -3076,8 +3105,9 @@ def invoke_model(
                     [
                         {
                             "probe_id": fake_probe_id,
-                            "rationale": (
-                                "selftest-only typed probe state transition"
+                            "rationale": os.environ.get(
+                                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE",
+                                "selftest-only typed probe state transition",
                             ),
                         }
                     ]
