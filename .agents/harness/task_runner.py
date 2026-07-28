@@ -1564,7 +1564,11 @@ def command_needs_sherpa_archive(command: str, worktree: Optional[Path] = None) 
         return False
 
 
-def verified_sherpa_archive(worktree: Path) -> Tuple[Path, str]:
+def verified_sherpa_archive(
+    worktree: Path,
+    *,
+    task_dir: Optional[Path] = None,
+) -> Tuple[Path, str]:
     """Resolve the immutable host cache input and verify it before sandbox use."""
 
     config = load_config()
@@ -1587,20 +1591,122 @@ def verified_sherpa_archive(worktree: Path) -> Tuple[Path, str]:
         or not SHA256_RE.fullmatch(str(expected_sha))
     ):
         raise HarnessError(f"invalid pinned sherpa-onnx artifact config for {architecture}")
+    relative_directory = Path(directory_raw)
+    if relative_directory.is_absolute() or ".." in relative_directory.parts:
+        raise HarnessError("shared_artifacts.sherpa_onnx.directory must be repository-relative")
+
+    def verified_existing(candidate: Path) -> Optional[str]:
+        if not candidate.exists() and not candidate.is_symlink():
+            return None
+        if not candidate.is_file() or candidate.is_symlink():
+            raise HarnessError(f"pinned sherpa-onnx archive is not a regular file: {candidate}")
+        actual = sha256_file(candidate)
+        if actual != expected_sha:
+            raise HarnessError(
+                f"pinned sherpa-onnx archive checksum mismatch: expected {expected_sha}, "
+                f"found {actual} at {candidate}"
+            )
+        return actual
+
     primary, _ = repo_context(worktree)
-    directory = primary / directory_raw
-    candidate = directory / filename
-    if not candidate.is_file() or candidate.is_symlink():
-        raise HarnessError(
-            "pinned sherpa-onnx archive is unavailable; seed the shared cache before running "
-            f"an offline client Rust check: {candidate}"
+    legacy_directory = (primary / relative_directory).resolve(strict=False)
+    legacy_candidate = legacy_directory / filename
+    if task_dir is None:
+        actual_sha = verified_existing(legacy_candidate)
+        if actual_sha is None:
+            raise HarnessError(
+                "pinned sherpa-onnx archive is unavailable; seed the checkout cache "
+                f"before running an offline client Rust check: {legacy_candidate}"
+            )
+        return legacy_directory, actual_sha
+
+    resource_root = shared_resource_root_for_task(task_dir)
+    resource_root.mkdir(parents=True, exist_ok=True)
+    if resource_root.is_symlink() or not resource_root.is_dir():
+        raise HarnessError(f"workspace resource root is not a real directory: {resource_root}")
+    shared_directory = resource_root
+    for part in relative_directory.parts:
+        shared_directory = shared_directory / part
+        if shared_directory.is_symlink():
+            raise HarnessError(
+                f"workspace Sherpa cache directory is symlinked: {shared_directory}"
+            )
+        shared_directory.mkdir(exist_ok=True)
+        if not shared_directory.is_dir():
+            raise HarnessError(
+                f"workspace Sherpa cache path is not a directory: {shared_directory}"
+            )
+    shared_candidate = shared_directory / filename
+    actual_sha = verified_existing(shared_candidate)
+    if actual_sha is not None:
+        return shared_directory, actual_sha
+
+    # Promote one already-downloaded, checksum-pinned legacy archive into the
+    # workspace-wide runner cache. Never download here and never copy from the
+    # isolated verification snapshot itself.
+    workspace = resource_root.parent.parent
+    task = load_json(task_dir / "task.json")
+    task_worktree = Path(str(task.get("worktree_path", "")))
+    source_directories: List[Path] = []
+    if task_worktree.name:
+        source_directories.append(
+            (workspace / task_worktree.name / relative_directory).resolve(strict=False)
         )
-    actual_sha = sha256_file(candidate)
-    if actual_sha != expected_sha:
+    source_directories.append(
+        (workspace / "meetnotes" / relative_directory).resolve(strict=False)
+    )
+    source_candidate: Optional[Path] = None
+    seen_sources: set[Path] = set()
+    for directory in source_directories:
+        if directory == shared_directory or directory in seen_sources:
+            continue
+        seen_sources.add(directory)
+        candidate = directory / filename
+        if verified_existing(candidate) is not None:
+            source_candidate = candidate
+            break
+    if source_candidate is None:
         raise HarnessError(
-            f"pinned sherpa-onnx archive checksum mismatch: expected {expected_sha}, found {actual_sha}"
+            "pinned sherpa-onnx archive is unavailable; seed the workspace shared cache "
+            f"before running an offline client Rust check: {shared_candidate}"
         )
-    return directory.resolve(), actual_sha
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{filename}.",
+        dir=str(shared_directory),
+    )
+    try:
+        with source_candidate.open("rb") as source, os.fdopen(fd, "wb") as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        tmp_path = Path(tmp_name)
+        promoted_sha = sha256_file(tmp_path)
+        if promoted_sha != expected_sha:
+            raise HarnessError(
+                "pinned sherpa-onnx archive changed while promoting it to the "
+                f"workspace cache: {source_candidate}"
+            )
+        try:
+            os.link(tmp_path, shared_candidate)
+        except FileExistsError:
+            concurrent_sha = verified_existing(shared_candidate)
+            if concurrent_sha is None:
+                raise HarnessError("workspace Sherpa cache raced with an invalid archive")
+        directory_fd = os.open(shared_directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+    final_sha = verified_existing(shared_candidate)
+    if final_sha is None:
+        raise HarnessError("workspace Sherpa cache promotion did not create the pinned archive")
+    return shared_directory, final_sha
 
 
 def build_check_environment(
@@ -1655,7 +1761,10 @@ def build_check_environment(
     if playwright_port is not None:
         environment["MURMUR_E2E_PORT"] = str(playwright_port)
     if expose_sherpa_archive:
-        archive_dir, archive_sha = verified_sherpa_archive(worktree)
+        archive_dir, archive_sha = verified_sherpa_archive(
+            worktree,
+            task_dir=task_dir,
+        )
         environment["SHERPA_ONNX_ARCHIVE_DIR"] = str(archive_dir)
         environment["MURMUR_HARNESS_SHERPA_ARCHIVE_SHA256"] = archive_sha
     if outer_sandbox_meta_check:
@@ -1765,7 +1874,10 @@ def build_check_seatbelt_profile(
         except (FileNotFoundError, OSError) as exc:
             raise HarnessError("shared node_modules link became invalid before a check") from exc
     if expose_sherpa_archive:
-        sherpa_dir, _ = verified_sherpa_archive(worktree)
+        sherpa_dir, _ = verified_sherpa_archive(
+            worktree,
+            task_dir=task_dir,
+        )
         read_paths.add(sherpa_dir)
 
     # Seatbelt's file-read-data filter also applies to directory enumeration.
