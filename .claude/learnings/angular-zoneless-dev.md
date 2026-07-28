@@ -41,6 +41,24 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-21 PR#423 meeting-detail perf] Making a data source LAZY breaks any one-shot DOM effect keyed on a DIFFERENT trigger
+- **Pattern:** the meeting transcript `segments` moved from an eager DTO field to a LAZY fetch (loaded only
+  when the Audio tab opens). The audio-panel's receipt-seek did its scroll-into-view + pulse-restart in a
+  ONE-SHOT `afterNextRender` fired from `_applyReceiptSeek`, keyed only on `seekTarget()`. With lazy
+  segments, a receipt clicked from the Note tab sets `seekTarget` BEFORE the segments (and thus the `.frag`)
+  exist → the DOM lookup ran against an EMPTY transcript and silently no-opped (no scroll, no pulse). A
+  green `ng build` + the old tests (which baked segments into the detail DTO) hid it entirely.
+- **Fix:** SPLIT the effect. `_applyReceiptSeek` sets only panel-local flash STATE (`flashSegId`/`flashSeq`)
+  + seeks; a NEW `_scrollFlashIntoView` effect keyed on BOTH `flashKey()` AND `renderedTurns()` does the DOM
+  scroll+pulse, so it RE-RUNS when the lazily-fetched segments finally render. A `lastScrolledFlashKey`
+  field makes it once-per-flash.
+- **Caught by:** adversarial-verifier driving `receipts.spec.ts` + `transcript-cap.spec.ts` against the
+  real lazy path.
+- **Lesson:** when making a data source lazy/async, audit every one-shot DOM read keyed on another trigger.
+  Re-key the DOM step on the rendered list with a once-per-key guard, and update tests that previously
+  embedded the now-lazy data in an eager DTO.
+- **Status:** journal
+
 ### [2026-07-04] Settings auto-save — a type="number" input killed the save stream
 - **Pattern 1:** an `<input type="number">` bound to a STRING-typed form control commits a
   NUMBER (or null when cleared) via NumberValueAccessor — any `.trim()`/string method on
