@@ -120,9 +120,9 @@ export interface AppConfigDto {
    * Speaker voiceprints — recognise the SAME diarized speaker across meetings,
    * fully on-device. OPT-IN, default false: captures a voice fingerprint of remote
    * participants (never egressed, but a biometric nonetheless). Settable and
-   * round-tripped on every `save_config` like `diarizeOthers`; an omitted key
-   * serde-defaults to false in the backend, so the FE MUST always send it or a
-   * normal save silently disables it. Mirrors Rust `AppConfigDto.voiceprint_enabled`.
+   * round-tripped on every `save_config` like `diarizeOthers`. The backend treats an
+   * omitted key as PRESERVE for older/partial clients; Settings still sends the explicit
+   * current choice. Mirrors Rust `AppConfigDto.voiceprint_enabled`.
    */
   voiceprintEnabled: boolean;
   aecEnabled: boolean;
@@ -198,6 +198,17 @@ export interface AppConfigDto {
   notesMode: string;
   autoOrganize: boolean;
   noteLanguage: string;
+  /**
+   * Run the local post-generation support scan. Its conservative, uncalibrated markers are
+   * review cues, not proof that a claim is true or false. Default true.
+   */
+  groundSummary: boolean;
+  /**
+   * Workspace glossary for canonical domain spellings, one `Canonical = alias, alias` entry per
+   * line. OPTIONAL on the wire: omission preserves the backend's stored value, while an explicit
+   * empty string clears it. Settings always loads and sends the real string.
+   */
+  glossary?: string;
   /**
    * Stage E security flags. These are part of the `get_config` / `save_config`
    * round-trip (Rust `AppConfigDto`), so the FE MUST read the current values and
