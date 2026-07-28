@@ -1657,6 +1657,255 @@ def focused_review_evidence_cases(test: Tests) -> None:
         )
 
 
+def specialist_source_context_cases(test: Tests) -> None:
+    base_sha = _git(ROOT, "rev-parse", "HEAD")
+    plan: Dict[str, Any] = {
+        "base_sha": base_sha,
+        "changed_paths": [],
+        "claims": [],
+        "actual_risk_flags": ["egress"],
+        "checks": [],
+        "diff_sha256": "1" * 64,
+        "plan_sha256": "2" * 64,
+        "protocol_sha256": "3" * 64,
+        "server_required": False,
+    }
+    context = verifier.specialist_source_context(
+        ROOT, plan, "egress-security"
+    )
+    included = context["entries"][0]
+    excerpt = included["excerpt"]
+    source_blob = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{base_sha}:src-tauri/src/summarize/mod.rs",
+        ],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout
+    excerpt_bytes = excerpt.encode("utf-8")
+    test.true(
+        "SOURCE CONTEXT exposes the complete canonical egress factory seam",
+        included["status"] == "included"
+        and not included["truncated"]
+        and "egress_is_cloud(id, config)" in excerpt
+        and "PROVIDER_CLAUDE_CODE" in excerpt
+        and "PROVIDER_ANTHROPIC" in excerpt
+        and "PROVIDER_OLLAMA" in excerpt
+        and "PROVIDER_GATEWAY" in excerpt
+        and "RedactingProvider::with_name_redactor_sink_and_model_admission"
+        in excerpt
+        and "active_sink()" in excerpt
+        and excerpt.rstrip().endswith("}")
+        and "Provider instances for the Settings UI" not in excerpt
+        and "pub fn all_providers" not in excerpt,
+    )
+    test.equal(
+        "SOURCE CONTEXT binds exact file selected and included byte counts",
+        (
+            included["file_bytes"],
+            included["file_sha256"],
+            included["selected_bytes"],
+            included["selected_sha256"],
+            included["included_bytes"],
+            included["excerpt_sha256"],
+        ),
+        (
+            len(source_blob),
+            hashlib.sha256(source_blob).hexdigest(),
+            len(excerpt_bytes),
+            hashlib.sha256(excerpt_bytes).hexdigest(),
+            len(excerpt_bytes),
+            hashlib.sha256(excerpt_bytes).hexdigest(),
+        ),
+    )
+    changed_plan = copy.deepcopy(plan)
+    changed_plan["changed_paths"] = [
+        "src-tauri/src/summarize/mod.rs"
+    ]
+    excluded = verifier.specialist_source_context(
+        ROOT, changed_plan, "egress-security"
+    )["entries"][0]
+    test.equal(
+        "SOURCE CONTEXT excludes a changed seam instead of showing stale base",
+        (excluded["status"], "excerpt" in excluded),
+        ("excluded_changed_path", False),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-source-context-") as raw:
+        repo = Path(raw) / "repo"
+        _init_repo(repo)
+        source = repo / "src-tauri" / "src" / "summarize" / "mod.rs"
+        source.parent.mkdir(parents=True)
+        lexical_fixture = (
+            "fn make_provider_resolved() {\n"
+            '    let normal = "escaped quote: \\" braces } {";\n'
+            '    let bytes = b\"} {\";\n'
+            '    let raw = r###\"} { /* not a comment */\"###;\n'
+            "    let character = '}';\n"
+            "    let byte_character = b'{';\n"
+            "    // } line-comment brace\n"
+            "    /* { outer /* } nested */ still outer } */\n"
+            "    if true { let nested = || { 1 }; nested(); }\n"
+            "}\n"
+            "pub fn following_item() {}\n"
+        )
+        source.write_text(lexical_fixture, encoding="utf-8")
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "lexical seam")
+        lexical_plan = {
+            **plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        lexical = verifier.specialist_source_context(
+            repo, lexical_plan, "egress-security"
+        )["entries"][0]
+        test.true(
+            "SOURCE CONTEXT Rust scanner stops at the balanced function brace",
+            lexical["status"] == "included"
+            and lexical["excerpt"].rstrip().endswith("nested(); }\n}")
+            and "following_item" not in lexical["excerpt"],
+        )
+
+        oversized_body = (
+            '"\\\\🙂\t'
+            * (verifier.SPECIALIST_SOURCE_CONTEXT_BYTES // 2)
+        )
+        source.write_text(
+            "fn make_provider_resolved() {\n"
+            "    let consent = true;\n"
+            f"    // {oversized_body}\n"
+            "    active_sink();\n"
+            "}",
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "oversized seam")
+        oversized_sha = _git(repo, "rev-parse", "HEAD")
+        synthetic_plan = {
+            **plan,
+            "base_sha": oversized_sha,
+        }
+        first = verifier.specialist_source_context(
+            repo, synthetic_plan, "egress-security"
+        )
+        second = verifier.specialist_source_context(
+            repo, synthetic_plan, "egress-security"
+        )
+        bounded = first["entries"][0]
+        test.true(
+            "SOURCE CONTEXT full serialized section is bounded and deterministic",
+            bounded["truncated"]
+            and len(
+                verifier.specialist_source_context_section(first).encode(
+                    "utf-8"
+                )
+            )
+            <= verifier.SPECIALIST_SOURCE_CONTEXT_BYTES
+            and first == second
+            and "\ufffd" not in bounded["excerpt"],
+        )
+
+        contract = {
+            "task_id": "source-context-selftest",
+            "description": "bind unchanged trust seam source",
+        }
+        first_prompt = verifier.combined_review_prompt(
+            contract,
+            synthetic_plan,
+            b"",
+            [],
+            "egress-security",
+            repo,
+            repo,
+            policy_text="policy",
+        )
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "let consent = true", "let consent = false"
+            ),
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "change seam")
+        changed_sha = _git(repo, "rev-parse", "HEAD")
+        changed_source_plan = {
+            **synthetic_plan,
+            "base_sha": changed_sha,
+        }
+        second_prompt = verifier.combined_review_prompt(
+            contract,
+            changed_source_plan,
+            b"",
+            [],
+            "egress-security",
+            repo,
+            repo,
+            policy_text="policy",
+        )
+        test.true(
+            "SOURCE CONTEXT bytes change the bound review prompt",
+            hashlib.sha256(first_prompt.encode("utf-8")).hexdigest()
+            != hashlib.sha256(second_prompt.encode("utf-8")).hexdigest(),
+        )
+
+        source.write_text(
+            "fn unrelated() {}\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "remove anchor")
+        missing_plan = {
+            **synthetic_plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        missing = verifier.specialist_source_context(
+            repo, missing_plan, "egress-security"
+        )["entries"][0]
+        test.equal(
+            "SOURCE CONTEXT reports a missing anchor without invented evidence",
+            (missing["status"], "excerpt" in missing),
+            ("start_anchor_missing", False),
+        )
+
+        source.write_text("fn make_provider_resolved();\n", encoding="utf-8")
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "remove opening brace")
+        missing_open_plan = {
+            **synthetic_plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        missing_open = verifier.specialist_source_context(
+            repo, missing_open_plan, "egress-security"
+        )["entries"][0]
+        test.equal(
+            "SOURCE CONTEXT reports a missing opening brace without proof",
+            (missing_open["status"], "excerpt" in missing_open),
+            ("opening_brace_missing", False),
+        )
+
+        source.write_text(
+            'fn make_provider_resolved() { let decoy = "}";\n',
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "remove closing brace")
+        missing_close_plan = {
+            **synthetic_plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        missing_close = verifier.specialist_source_context(
+            repo, missing_close_plan, "egress-security"
+        )["entries"][0]
+        test.equal(
+            "SOURCE CONTEXT reports a missing closing brace without partial proof",
+            (missing_close["status"], "excerpt" in missing_close),
+            ("closing_brace_missing", False),
+        )
+
+
 def probe_precedence_flow_cases(test: Tests) -> None:
     """Pin review-defect precedence through the real v2 verify transition."""
 
@@ -6423,6 +6672,7 @@ def main() -> int:
     reviewer_tool_guard_cases(test)
     verdict_cases(test)
     focused_review_evidence_cases(test)
+    specialist_source_context_cases(test)
     retry_cases(test)
     guardian_and_artifact_cases(test)
     readonly_review_wall_timeout_cases(test)

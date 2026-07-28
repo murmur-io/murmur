@@ -59,6 +59,11 @@ DEFAULT_REVIEW_STREAM_BYTES = 2_048
 NPM_LOCK_REVIEW_STREAM_BYTES = 65_536
 SPECIALIST_TEST_FOCUS_LINES_PER_TERM = 12
 SPECIALIST_TEST_FOCUS_BYTES = 32_768
+SPECIALIST_SOURCE_CONTEXT_BYTES = 32_768
+SPECIALIST_SOURCE_CONTEXT_LABEL = (
+    "Canonical unchanged risk-seam source context "
+    "(snapshot-derived source evidence only; not runtime proof): "
+)
 SPECIALIST_TEST_FOCUS_TERMS = {
     "lock-security": (
         "lock",
@@ -82,6 +87,15 @@ SPECIALIST_TEST_FOCUS_TERMS = {
         "remote",
         "loopback",
         "ledger",
+    ),
+}
+SPECIALIST_SOURCE_SEAMS = {
+    "egress-security": (
+        {
+            "path": "src-tauri/src/summarize/mod.rs",
+            "start": r"(?m)^fn make_provider_resolved\(",
+            "symbol": "make_provider_resolved",
+        },
     ),
 }
 TRANSIENT_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -1098,6 +1112,290 @@ def _review_evidence_summary(
     }
 
 
+def _bounded_source_excerpt(source: bytes, limit: int) -> Tuple[bytes, bool]:
+    if len(source) <= limit:
+        return source, False
+    marker = b"\n... <selected source truncated by byte bound> ...\n"
+    if limit <= len(marker):
+        return marker[:limit], True
+    available = max(0, limit - len(marker))
+    head = available // 2
+    tail = available - head
+    prefix = source[:head].decode("utf-8", "ignore").encode("utf-8")
+    excerpt = prefix + marker
+    if tail:
+        excerpt += source[-tail:].decode("utf-8", "ignore").encode("utf-8")
+    return excerpt, True
+
+
+def specialist_source_context_section(context: Mapping[str, Any]) -> str:
+    return (
+        SPECIALIST_SOURCE_CONTEXT_LABEL
+        + json.dumps(context, sort_keys=True)
+        + "\n"
+    )
+
+
+def _rust_raw_string_end(text: str, offset: int) -> Optional[int]:
+    for prefix in ("br", "cr", "r"):
+        if not text.startswith(prefix, offset):
+            continue
+        cursor = offset + len(prefix)
+        hashes = 0
+        while cursor < len(text) and text[cursor] == "#":
+            hashes += 1
+            cursor += 1
+        if cursor >= len(text) or text[cursor] != '"':
+            continue
+        closing = '"' + ("#" * hashes)
+        end = text.find(closing, cursor + 1)
+        return len(text) if end < 0 else end + len(closing)
+    return None
+
+
+def _rust_char_literal_end(text: str, offset: int) -> Optional[int]:
+    cursor = offset + 1
+    if cursor >= len(text) or text[cursor] in {"'", "\n", "\r"}:
+        return None
+    if text[cursor] == "\\":
+        cursor += 1
+        if cursor >= len(text):
+            return None
+        if text[cursor] == "u" and text.startswith("u{", cursor):
+            closing = text.find("}", cursor + 2)
+            if closing < 0:
+                return None
+            cursor = closing + 1
+        elif text[cursor] == "x":
+            cursor += 3
+        else:
+            cursor += 1
+    else:
+        cursor += 1
+    if cursor < len(text) and text[cursor] == "'":
+        return cursor + 1
+    return None
+
+
+def _rust_braced_item_end(
+    text: str, start_offset: int
+) -> Tuple[Optional[int], str]:
+    cursor = start_offset
+    depth = 0
+    opened = False
+    while cursor < len(text):
+        if text.startswith("//", cursor):
+            newline = text.find("\n", cursor + 2)
+            cursor = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", cursor):
+            comment_depth = 1
+            cursor += 2
+            while cursor < len(text) and comment_depth:
+                if text.startswith("/*", cursor):
+                    comment_depth += 1
+                    cursor += 2
+                elif text.startswith("*/", cursor):
+                    comment_depth -= 1
+                    cursor += 2
+                else:
+                    cursor += 1
+            continue
+        raw_end = _rust_raw_string_end(text, cursor)
+        if raw_end is not None:
+            cursor = raw_end
+            continue
+        if text[cursor] == '"':
+            cursor += 1
+            while cursor < len(text):
+                if text[cursor] == "\\":
+                    cursor += 2
+                elif text[cursor] == '"':
+                    cursor += 1
+                    break
+                else:
+                    cursor += 1
+            continue
+        if text[cursor] == "'":
+            char_end = _rust_char_literal_end(text, cursor)
+            if char_end is not None:
+                cursor = char_end
+                continue
+        if text[cursor] == "{":
+            opened = True
+            depth += 1
+        elif text[cursor] == "}" and opened:
+            depth -= 1
+            if depth == 0:
+                return cursor + 1, "included"
+        cursor += 1
+    return None, (
+        "closing_brace_missing" if opened else "opening_brace_missing"
+    )
+
+
+def _source_context_with_excerpt(
+    common: Mapping[str, Any],
+    *,
+    text: str,
+    raw: bytes,
+    start_offset: int,
+    selected: bytes,
+    excerpt_limit: int,
+    kind: str,
+    base_sha: str,
+) -> Dict[str, Any]:
+    excerpt, truncated = _bounded_source_excerpt(selected, excerpt_limit)
+    return {
+        "kind": kind,
+        "source_revision": base_sha,
+        "max_section_bytes": SPECIALIST_SOURCE_CONTEXT_BYTES,
+        "entries": [
+            {
+                **common,
+                "status": "included",
+                "line_start": text.count("\n", 0, start_offset) + 1,
+                "line_end": (
+                    text.count("\n", 0, start_offset)
+                    + selected.decode("utf-8").count("\n")
+                    + 1
+                ),
+                "file_sha256": legacy.sha256_bytes(raw),
+                "file_bytes": len(raw),
+                "selected_sha256": legacy.sha256_bytes(selected),
+                "selected_bytes": len(selected),
+                "excerpt_sha256": legacy.sha256_bytes(excerpt),
+                "included_bytes": len(excerpt),
+                "truncated": truncated,
+                "excerpt": excerpt.decode("utf-8"),
+            }
+        ],
+    }
+
+
+def specialist_source_context(
+    worktree: Path,
+    plan: Mapping[str, Any],
+    kind: str,
+) -> Dict[str, Any]:
+    """Return bounded source proof for unchanged canonical trust seams.
+
+    The exact diff remains authoritative for changed files.  Unchanged seams
+    are read from the plan's immutable base commit, so prompt reconstruction
+    remains stable after a clean catch-up merge.
+    """
+
+    base_sha = str(plan.get("base_sha", ""))
+    changed_paths = {
+        str(path) for path in plan.get("changed_paths", [])
+    }
+    entries: List[Dict[str, Any]] = []
+    for specification in SPECIALIST_SOURCE_SEAMS.get(kind, ()):
+        path = str(specification["path"])
+        common = {
+            "path": path,
+            "symbol": str(specification["symbol"]),
+            "source_revision": base_sha,
+        }
+        if path in changed_paths:
+            entries.append(
+                {
+                    **common,
+                    "status": "excluded_changed_path",
+                    "reason": "the exact diff is authoritative for this path",
+                }
+            )
+            continue
+        completed = subprocess.run(
+            ["git", "show", f"{base_sha}:{path}"],
+            cwd=str(worktree),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            entries.append({**common, "status": "missing_at_base"})
+            continue
+        raw = completed.stdout
+        file_sha256 = legacy.sha256_bytes(raw)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            entries.append(
+                {
+                    **common,
+                    "status": "invalid_utf8",
+                    "file_sha256": file_sha256,
+                }
+            )
+            continue
+        start = re.search(str(specification["start"]), text)
+        if start is None:
+            entries.append(
+                {
+                    **common,
+                    "status": "start_anchor_missing",
+                    "file_sha256": file_sha256,
+                }
+            )
+            continue
+        end_offset, end_status = _rust_braced_item_end(
+            text, start.start()
+        )
+        if end_offset is None:
+            entries.append(
+                {
+                    **common,
+                    "status": end_status,
+                    "file_sha256": file_sha256,
+                }
+            )
+            continue
+        selected_text = text[start.start() : end_offset]
+        selected = selected_text.encode("utf-8")
+        context = _source_context_with_excerpt(
+            common,
+            text=text,
+            raw=raw,
+            start_offset=start.start(),
+            selected=selected,
+            excerpt_limit=len(selected),
+            kind=kind,
+            base_sha=base_sha,
+        )
+        section_bytes = len(
+            specialist_source_context_section(context).encode("utf-8")
+        )
+        excerpt_limit = len(selected)
+        while section_bytes > SPECIALIST_SOURCE_CONTEXT_BYTES:
+            overage = section_bytes - SPECIALIST_SOURCE_CONTEXT_BYTES
+            excerpt_limit = max(0, excerpt_limit - overage - 128)
+            context = _source_context_with_excerpt(
+                common,
+                text=text,
+                raw=raw,
+                start_offset=start.start(),
+                selected=selected,
+                excerpt_limit=excerpt_limit,
+                kind=kind,
+                base_sha=base_sha,
+            )
+            section_bytes = len(
+                specialist_source_context_section(context).encode("utf-8")
+            )
+            if excerpt_limit == 0 and section_bytes > SPECIALIST_SOURCE_CONTEXT_BYTES:
+                raise legacy.HarnessError(
+                    "canonical risk-seam metadata exceeds its prompt byte bound"
+                )
+        return context
+    return {
+        "kind": kind,
+        "source_revision": base_sha,
+        "max_section_bytes": SPECIALIST_SOURCE_CONTEXT_BYTES,
+        "entries": entries,
+    }
+
+
 def combined_review_prompt(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1128,6 +1426,7 @@ def combined_review_prompt(
         for item in probes
     ]
     eligible_probes = allowed_probe_ids(plan)
+    source_context = specialist_source_context(worktree, plan, kind)
     return (
         f"{policy}\n\n"
         "## Exact v2 task\n"
@@ -1142,6 +1441,7 @@ def combined_review_prompt(
         "Check and probe evidence (commands, hashes, bounded output, and any "
         "source proof gaps): "
         f"{json.dumps(check_summary, sort_keys=True)}\n"
+        f"{specialist_source_context_section(source_context)}"
         f"Context-eligible probe IDs: {json.dumps(eligible_probes)}\n"
         "Pinned server checkout required: "
         f"{'yes' if plan.get('server_required') else 'no'}\n\n"
