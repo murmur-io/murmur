@@ -480,6 +480,10 @@ pub fn run() {
                 }
             };
             app.manage(state);
+            // One Tauri-managed, process-local cancellation authority is shared by the MCP
+            // transport and every relock entrypoint. It contains socket clones and content-free
+            // lease ids only; no meeting data or authentication material.
+            app.manage(std::sync::Arc::new(crate::mcp::McpResponseGate::new()));
 
             // PRE-WINDOW legacy-recovery guard. Historical paired crash artifacts are plaintext and
             // cannot be honestly presented as protected by an already-locked folder. Publish their
@@ -732,14 +736,11 @@ pub fn run() {
             }
             setup_tray(app.handle())?;
             // Localhost MCP server (read-only meeting tools for Claude Desktop/Code; no egress).
-            // Share the session unlock set so sealed-and-not-unlocked notes stay invisible.
-            // Must mirror `AppState::db_path` exactly (same dir + filename) so the MCP server opens
-            // the SAME DB the app did — `app_dir_name()` keeps the dev/release split consistent.
-            if let Some(db_path) = dirs::data_dir()
-                .map(|b| b.join(crate::state::app_dir_name()).join("meetnotes.sqlite"))
+            // Pass the AppHandle so the server resolves the ONE managed AppState for every request:
+            // DB, live session unlock set, seal epoch, and lifecycle guard cannot drift into an
+            // independently-opened/snapshotted authority.
             {
                 let state = app.state::<AppState>();
-                let unlocked = state.unlocked_folders.clone();
                 let require_token = state
                     .config
                     .lock()
@@ -747,7 +748,7 @@ pub fn run() {
                     // Poisoned config ⇒ fail CLOSED (require the token) — aligned with the
                     // reasoner-dispatch poison posture (unreadable config never relaxes auth).
                     .unwrap_or(true);
-                crate::mcp::spawn(db_path, unlocked, require_token);
+                crate::mcp::spawn(app.handle().clone(), require_token);
             }
             // Brain v2 L1.1 — TOPIC-CHUNK startup backfill: index topic segments for every VISIBLE
             // meeting that has a transcript, content-hash idempotent (an already-indexed vault is a
@@ -1041,9 +1042,9 @@ fn relock_and_zeroize_on_lifecycle(handle: &tauri::AppHandle, ctx: &str) {
     if ctx == LIFECYCLE_CTX_APP_EXIT {
         crate::commands::stop_all_capture(state.inner());
     }
-    // relock_all_inner clears the unlock set, zeroizes the cached KEK, re-blanks all sealed notes,
-    // and (as of B12) checkpoints the WAL.
-    if let Err(e) = crate::commands::relock_all_inner(state.inner()) {
+    // The wrapper first cancels every active MCP content socket, then clears the unlock set,
+    // zeroizes the cached KEK, re-blanks all sealed notes, and checkpoints the WAL.
+    if let Err(e) = crate::commands::relock_all_with_visibility_gate(handle, state.inner()) {
         tracing::warn!(target: "lock", error = %e, ctx, "lifecycle relock_all failed");
     }
     // Belt-and-suspenders WAL checkpoint in case relock_all short-circuited before its own.
