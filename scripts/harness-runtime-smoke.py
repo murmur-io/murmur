@@ -94,6 +94,30 @@ def angular_ready() -> bool:
     return False
 
 
+def runtime_mode(root: Path) -> str:
+    candidates = (
+        root / "src-tauri" / "target" / "debug" / "Murmur",
+        root / "target" / "debug" / "Murmur",
+    )
+    return "warm" if any(path.is_file() for path in candidates) else "cold"
+
+
+def selected_timeout(
+    root: Path,
+    *,
+    explicit: int | None,
+    warm_timeout: int,
+    cold_timeout: int,
+) -> tuple[str, int]:
+    mode = runtime_mode(root)
+    timeout = explicit if explicit is not None else (
+        warm_timeout if mode == "warm" else cold_timeout
+    )
+    if timeout < 1:
+        raise ValueError("runtime timeout must be positive")
+    return mode, timeout
+
+
 def emit(verdict: str, reason: str, log_path: Path | None, started_at: str) -> int:
     payload = {
         "schema_version": 1,
@@ -116,13 +140,29 @@ def emit(verdict: str, reason: str, log_path: Path | None, started_at: str) -> i
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Safely prove that the real Tauri dev app boots")
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--warm-timeout", type=int, default=240)
+    parser.add_argument("--cold-timeout", type=int, default=900)
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="check ownership/prerequisites and report the cold/warm budget without launching",
+    )
     parser.add_argument("--settle-seconds", type=int, default=10)
     parser.add_argument("--runtime-write-probe", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     started_at = utc_now()
 
     root = repo_root()
+    try:
+        mode, timeout = selected_timeout(
+            root,
+            explicit=args.timeout,
+            warm_timeout=args.warm_timeout,
+            cold_timeout=args.cold_timeout,
+        )
+    except ValueError as exc:
+        return emit("FAIL", str(exc), None, started_at)
     runtime_root = runtime_dir(root)
     runtime_root.mkdir(parents=True, exist_ok=True)
     run_id = f"boot-{int(time.time())}-{os.getpid()}"
@@ -140,6 +180,17 @@ def main() -> int:
                 None,
                 started_at,
             )
+    if shutil.which("npm") is None:
+        return emit("BLOCKED", "npm is unavailable; runtime probe cannot start", None, started_at)
+    if not (root / "package.json").is_file():
+        return emit("FAIL", "package.json is missing from the Git root", None, started_at)
+    if args.preflight:
+        return emit(
+            "PASS",
+            f"runtime preflight clear; {mode} start budget is {timeout}s",
+            None,
+            started_at,
+        )
 
     original_home = Path.home()
     temp_root = Path(tempfile.mkdtemp(prefix=f"murmur-{run_id}-"))
@@ -170,7 +221,7 @@ def main() -> int:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + args.timeout
+            deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     return emit("FAIL", f"dev process exited early with {proc.returncode}", log_path, started_at)
@@ -178,7 +229,12 @@ def main() -> int:
                     break
                 time.sleep(1)
             else:
-                return emit("FAIL", "timed out waiting for Angular and the real Rust MCP listener", log_path, started_at)
+                return emit(
+                    "FAIL",
+                    f"timed out after {timeout}s waiting for Angular and the real Rust MCP listener ({mode} start)",
+                    log_path,
+                    started_at,
+                )
 
             time.sleep(max(0, args.settle_seconds))
             if proc.poll() is not None:
