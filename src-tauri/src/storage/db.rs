@@ -7251,6 +7251,97 @@ pub(crate) fn fts_match_query(q: &str) -> Option<String> {
     )
 }
 
+/// Canonical content terms under the exact FTS tokenizer used by every production content index.
+///
+/// Rust splitting/lowercasing cannot model `unicode61 remove_diacritics 2`: distinct strings such
+/// as precomposed `résumé`, decomposed `re\u{301}sume\u{301}`, and `resume` are one FTS token and
+/// must never receive multiple fallback coverage votes. A connection-local TEMP FTS table tokenizes
+/// the ORIGINAL query, while `fts5vocab(..., 'instance')` exposes canonical tokens in occurrence
+/// order. Tokens that are not Unicode-alphanumeric or are too short are discarded; the survivors
+/// are stopword-filtered, first-seen deduplicated, and bounded before callers build MATCH SQL.
+pub(crate) fn fts_unicode61_content_terms(
+    conn: &Connection,
+    q: &str,
+    max_terms: usize,
+) -> Result<Vec<String>> {
+    if max_terms == 0 {
+        return Ok(Vec::new());
+    }
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.murmur_query_tokenizer USING fts5(
+             text,
+             tokenize = 'unicode61 remove_diacritics 2'
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS temp.murmur_query_vocab_instance USING fts5vocab(
+             murmur_query_tokenizer,
+             'instance'
+         );",
+    )
+    .map_err(map_err)?;
+
+    // Keep query text transaction-local. Any early error rolls the TEMP insert back on Drop; the
+    // successful path explicitly rolls back too, so no prior query survives for a later read.
+    let tx = conn.unchecked_transaction().map_err(map_err)?;
+    let result = (|| -> Result<Vec<String>> {
+        let mut canonical_terms = Vec::new();
+        let mut seen = HashSet::new();
+        tx.execute("DELETE FROM temp.murmur_query_tokenizer", [])
+            .map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO temp.murmur_query_tokenizer(text) VALUES (?1)",
+            rusqlite::params![q],
+        )
+        .map_err(map_err)?;
+
+        let mut stmt = tx
+            .prepare(
+                "SELECT term
+                   FROM temp.murmur_query_vocab_instance
+                  ORDER BY doc, offset",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_err)?;
+        for row in rows {
+            let canonical = row.map_err(map_err)?;
+            if canonical.chars().count() < 3
+                || !canonical.chars().all(|ch| ch.is_alphanumeric())
+                || crate::summarize::related_context::is_stopword(&canonical)
+            {
+                continue;
+            }
+            if seen.insert(canonical.clone()) {
+                canonical_terms.push(canonical);
+                if canonical_terms.len() == max_terms {
+                    break;
+                }
+            }
+        }
+        Ok(canonical_terms)
+    })();
+    tx.rollback().map_err(map_err)?;
+    result
+}
+
+fn fts_match_content_terms(terms: &[String], separator: &str) -> Option<String> {
+    if terms.is_empty() {
+        return None;
+    }
+    Some(
+        terms
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(separator),
+    )
+}
+
+/// Exact-token OR expression over an already-normalized content-term list.
+pub(crate) fn fts_match_content_terms_any(terms: &[String]) -> Option<String> {
+    fts_match_content_terms(terms, " OR ")
+}
+
 /// The OR-joined twin of [`fts_match_query`]: the same tokenize-and-quote defusal, but terms are
 /// joined with `OR` instead of implicit AND. Used for RELEVANCE filtering (Brain v2 L2.2), where the
 /// "query" is a whole natural-language question and a short fact row should match on ANY shared
