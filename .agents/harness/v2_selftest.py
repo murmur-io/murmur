@@ -5583,17 +5583,15 @@ def lock_review_scope_prompt_cases(test: Tests) -> None:
             "applies": "new_or_changed_folder_lock_read_or_export",
             "requires": (
                 "session_unlock_gate",
-                "negative_non_disclosure_ui",
-                "negative_non_disclosure_mcp",
-                "negative_non_disclosure_tool",
-                "negative_non_disclosure_assets",
-                "negative_non_disclosure_exports",
-                "negative_non_disclosure_logs",
+                "negative_non_disclosure_each_changed_sink",
             ),
             "missing": "BLOCKED",
         },
         "CHANGED_SEAL": {
-            "applies": "new_or_changed_seal_or_encryption_operation",
+            "applies": (
+                "new_or_changed_seal_encryption_or_destructive_"
+                "plaintext_replacement_semantics"
+            ),
             "requires": (
                 "verify_before_destroy_failure",
                 "byte_identical_round_trip",
@@ -5601,7 +5599,10 @@ def lock_review_scope_prompt_cases(test: Tests) -> None:
             "missing": "BLOCKED",
         },
         "UNCHANGED_SEAL": {
-            "applies": "no_changed_seal_or_encryption_operation",
+            "applies": (
+                "no_changed_seal_encryption_or_destructive_"
+                "plaintext_replacement_semantics"
+            ),
             "requires": ("justified_na",),
             "missing": "BLOCKED",
         },
@@ -5646,20 +5647,45 @@ def lock_review_scope_prompt_cases(test: Tests) -> None:
         missing = set(row["requires"]) - set(evidence)
         return row["missing"] if missing else "EVIDENCE_COMPLETE"
 
-    locked_evidence = expected_policy["LOCKED_READ"]["requires"]
+    changed_sink_requirement = "negative_non_disclosure_each_changed_sink"
+
+    def evaluate_locked(
+        changed_sinks: Sequence[str],
+        proved_sinks: Sequence[str],
+        *,
+        has_unlock_gate: bool = True,
+    ) -> str:
+        evidence = ["session_unlock_gate"] if has_unlock_gate else []
+        if set(changed_sinks).issubset(set(proved_sinks)):
+            evidence.append(changed_sink_requirement)
+        return evaluate("LOCKED_READ", evidence)
+
+    possible_sinks = ("ui", "mcp", "tool", "assets", "exports", "logs")
     test.equal(
         "LOCK REVIEW accepts complete affected locked-read evidence",
-        evaluate("LOCKED_READ", locked_evidence),
+        evaluate_locked(["mcp", "tool"], ["mcp", "tool"]),
         "EVIDENCE_COMPLETE",
     )
-    for required in locked_evidence:
+    test.equal(
+        "LOCK REVIEW does not demand unrelated locked-read sinks",
+        evaluate_locked(["mcp"], ["mcp"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "LOCK REVIEW blocks locked-read missing session unlock gate",
+        evaluate_locked(["mcp"], ["mcp"], has_unlock_gate=False),
+        "BLOCKED",
+    )
+    for sink in possible_sinks:
         test.equal(
-            f"LOCK REVIEW blocks locked-read missing {required}",
-            evaluate(
-                "LOCKED_READ",
-                [item for item in locked_evidence if item != required],
-            ),
+            f"LOCK REVIEW blocks affected locked-read sink {sink} without proof",
+            evaluate_locked([sink], []),
             "BLOCKED",
+        )
+        test.equal(
+            f"LOCK REVIEW accepts affected locked-read sink {sink} with proof",
+            evaluate_locked([sink], [sink]),
+            "EVIDENCE_COMPLETE",
         )
 
     changed_seal_evidence = expected_policy["CHANGED_SEAL"]["requires"]
@@ -5701,6 +5727,146 @@ def lock_review_scope_prompt_cases(test: Tests) -> None:
             evaluate("ORG_READ", [item for item in org_evidence if item != required]),
             "BLOCKED",
         )
+    test.true(
+        "LOCK REVIEW wrapper around unchanged seal remains N-A",
+        "same seal call does not by itself change seal" in prompt
+        and "destructive plaintext-replacement semantics" in prompt
+        and "brief call-chain justification" in prompt,
+    )
+
+
+def egress_review_scope_prompt_cases(test: Tests) -> None:
+    prompt = (
+        ROOT / ".agents" / "harness" / "prompts" / "egress-security-reviewer.md"
+    ).read_text(encoding="utf-8")
+    begin = "<!-- EGRESS_REVIEW_POLICY_V1_BEGIN -->"
+    end = "<!-- EGRESS_REVIEW_POLICY_V1_END -->"
+    test.equal("EGRESS REVIEW policy has one start marker", prompt.count(begin), 1)
+    test.equal("EGRESS REVIEW policy has one end marker", prompt.count(end), 1)
+
+    policy_text = prompt.split(begin, 1)[1].split(end, 1)[0]
+    policy: Dict[str, Dict[str, Any]] = {}
+    for raw_line in policy_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        columns = line.split("|")
+        if len(columns) != 4:
+            raise AssertionError(f"invalid egress review policy row: {line}")
+        property_id = columns[0]
+        if property_id in policy:
+            raise AssertionError(f"duplicate egress review policy row: {property_id}")
+        fields: Dict[str, str] = {}
+        for column in columns[1:]:
+            key, separator, value = column.partition("=")
+            if not separator or not key or not value or key in fields:
+                raise AssertionError(f"invalid egress review policy field: {column}")
+            fields[key] = value
+        if set(fields) != {"applies", "requires", "missing"}:
+            raise AssertionError(f"incomplete egress review policy row: {line}")
+        policy[property_id] = {
+            "applies": fields["applies"],
+            "requires": tuple(fields["requires"].split(",")),
+            "missing": fields["missing"],
+        }
+
+    expected_policy = {
+        "CLOUD_EGRESS": {
+            "applies": (
+                "new_or_changed_payload_leaves_device_or_loopback_for_remote_service"
+            ),
+            "requires": (
+                "explicit_consent",
+                "redaction_if_applicable",
+                "egress_ledger",
+                "fail_closed_provider_classification",
+                "no_raw_client_bypass",
+            ),
+            "missing": "BLOCKED",
+        },
+        "LOCAL_LOOPBACK": {
+            "applies": "new_or_changed_local_service_exclusively_bound_to_loopback",
+            "requires": (
+                "loopback_only_bind",
+                "no_remote_or_ambient_network_path",
+                "changed_sink_authorization",
+            ),
+            "missing": "BLOCKED",
+        },
+        "NO_EGRESS": {
+            "applies": "no_new_or_changed_network_or_provider_path",
+            "requires": ("justified_na",),
+            "missing": "BLOCKED",
+        },
+    }
+    test.equal("EGRESS REVIEW parsed policy is exact", policy, expected_policy)
+
+    legacy_unconditional = (
+        "A PASS requires that every new outbound payload goes through explicit consent"
+    )
+    test.true(
+        "EGRESS REVIEW rejects legacy unconditional cloud requirement",
+        legacy_unconditional not in prompt,
+    )
+
+    def evaluate(property_id: str, evidence: Sequence[str]) -> str:
+        row = policy[property_id]
+        missing = set(row["requires"]) - set(evidence)
+        return row["missing"] if missing else "EVIDENCE_COMPLETE"
+
+    cloud_evidence = expected_policy["CLOUD_EGRESS"]["requires"]
+    test.equal(
+        "EGRESS REVIEW accepts complete cloud evidence",
+        evaluate("CLOUD_EGRESS", cloud_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in cloud_evidence:
+        test.equal(
+            f"EGRESS REVIEW blocks cloud path missing {required}",
+            evaluate(
+                "CLOUD_EGRESS",
+                [item for item in cloud_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    loopback_evidence = expected_policy["LOCAL_LOOPBACK"]["requires"]
+    test.equal(
+        "EGRESS REVIEW accepts bounded local loopback without cloud controls",
+        evaluate("LOCAL_LOOPBACK", loopback_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    test.true(
+        "EGRESS REVIEW loopback policy excludes cloud-only controls",
+        set(loopback_evidence).isdisjoint(
+            {"explicit_consent", "redaction_if_applicable", "egress_ledger"}
+        ),
+    )
+    for required in loopback_evidence:
+        test.equal(
+            f"EGRESS REVIEW blocks loopback path missing {required}",
+            evaluate(
+                "LOCAL_LOOPBACK",
+                [item for item in loopback_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    test.equal(
+        "EGRESS REVIEW accepts justified no-egress N-A",
+        evaluate("NO_EGRESS", ["justified_na"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "EGRESS REVIEW blocks unjustified no-egress N-A",
+        evaluate("NO_EGRESS", []),
+        "BLOCKED",
+    )
+    test.true(
+        "EGRESS REVIEW prose pins loopback distinction",
+        "`LOCAL_LOOPBACK` is a local disclosure boundary, not cloud egress" in prompt
+        and "does not require cloud consent, redaction, or an egress-ledger row" in prompt,
+    )
 
 
 def main() -> int:
@@ -5726,6 +5892,7 @@ def main() -> int:
     plan_and_probe_cases(test)
     clean_cases(test)
     lock_review_scope_prompt_cases(test)
+    egress_review_scope_prompt_cases(test)
     probe_precedence_flow_cases(test)
     if test.failures:
         print("v2 selftest: FAIL")
