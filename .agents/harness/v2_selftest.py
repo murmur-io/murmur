@@ -5608,8 +5608,8 @@ def lock_review_scope_prompt_cases(test: Tests) -> None:
         "ORG_READ": {
             "applies": "new_or_changed_org_shared_brain_read_or_sink",
             "requires": (
-                "membership",
-                "consent",
+                "local_membership",
+                "member_gated_import_or_authorized_disclosure",
                 "context_enabled",
                 "tombstones",
                 "result_bounds",
@@ -5629,6 +5629,16 @@ def lock_review_scope_prompt_cases(test: Tests) -> None:
         "LOCK REVIEW rejects legacy unconditional requirements",
         [clause for clause in legacy_unconditional_clauses if clause in prompt],
         [],
+    )
+    test.true(
+        "LOCK REVIEW distinguishes outbound org consent from read authorization",
+        "`org_egress_consented` is an outbound publish gate" in prompt
+        and "not a receiver-side read gate" in prompt
+        and "separate per-read consent requirement" in prompt,
+    )
+    test.true(
+        "LOCK REVIEW policy has no obsolete receiver consent requirement",
+        "consent" not in policy["ORG_READ"]["requires"],
     )
 
     def evaluate(property_id: str, evidence: Sequence[str]) -> str:
