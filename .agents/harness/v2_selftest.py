@@ -5543,6 +5543,156 @@ def clean_cases(test: Tests) -> None:
         )
 
 
+def lock_review_scope_prompt_cases(test: Tests) -> None:
+    prompt = (
+        ROOT / ".agents" / "harness" / "prompts" / "lock-security-reviewer.md"
+    ).read_text(encoding="utf-8")
+    begin = "<!-- LOCK_REVIEW_POLICY_V1_BEGIN -->"
+    end = "<!-- LOCK_REVIEW_POLICY_V1_END -->"
+    test.equal("LOCK REVIEW policy has one start marker", prompt.count(begin), 1)
+    test.equal("LOCK REVIEW policy has one end marker", prompt.count(end), 1)
+
+    policy_text = prompt.split(begin, 1)[1].split(end, 1)[0]
+    policy: Dict[str, Dict[str, Any]] = {}
+    for raw_line in policy_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        columns = line.split("|")
+        if len(columns) != 4:
+            raise AssertionError(f"invalid lock review policy row: {line}")
+        property_id = columns[0]
+        if property_id in policy:
+            raise AssertionError(f"duplicate lock review policy row: {property_id}")
+        fields: Dict[str, str] = {}
+        for column in columns[1:]:
+            key, separator, value = column.partition("=")
+            if not separator or not key or not value or key in fields:
+                raise AssertionError(f"invalid lock review policy field: {column}")
+            fields[key] = value
+        if set(fields) != {"applies", "requires", "missing"}:
+            raise AssertionError(f"incomplete lock review policy row: {line}")
+        policy[property_id] = {
+            "applies": fields["applies"],
+            "requires": tuple(fields["requires"].split(",")),
+            "missing": fields["missing"],
+        }
+
+    expected_policy = {
+        "LOCKED_READ": {
+            "applies": "new_or_changed_folder_lock_read_or_export",
+            "requires": (
+                "session_unlock_gate",
+                "negative_non_disclosure_ui",
+                "negative_non_disclosure_mcp",
+                "negative_non_disclosure_tool",
+                "negative_non_disclosure_assets",
+                "negative_non_disclosure_exports",
+                "negative_non_disclosure_logs",
+            ),
+            "missing": "BLOCKED",
+        },
+        "CHANGED_SEAL": {
+            "applies": "new_or_changed_seal_or_encryption_operation",
+            "requires": (
+                "verify_before_destroy_failure",
+                "byte_identical_round_trip",
+            ),
+            "missing": "BLOCKED",
+        },
+        "UNCHANGED_SEAL": {
+            "applies": "no_changed_seal_or_encryption_operation",
+            "requires": ("justified_na",),
+            "missing": "BLOCKED",
+        },
+        "ORG_READ": {
+            "applies": "new_or_changed_org_shared_brain_read_or_sink",
+            "requires": (
+                "membership",
+                "consent",
+                "context_enabled",
+                "tombstones",
+                "result_bounds",
+                "changed_sink_non_disclosure",
+            ),
+            "missing": "BLOCKED",
+        },
+    }
+    test.equal("LOCK REVIEW parsed policy is exact", policy, expected_policy)
+
+    legacy_unconditional_clauses = (
+        "A PASS requires evidence that every new content read/export",
+        "every seal is verify-before-destroy",
+        "Missing negative-path or byte-identity evidence means BLOCKED",
+    )
+    test.equal(
+        "LOCK REVIEW rejects legacy unconditional requirements",
+        [clause for clause in legacy_unconditional_clauses if clause in prompt],
+        [],
+    )
+
+    def evaluate(property_id: str, evidence: Sequence[str]) -> str:
+        row = policy[property_id]
+        missing = set(row["requires"]) - set(evidence)
+        return row["missing"] if missing else "EVIDENCE_COMPLETE"
+
+    locked_evidence = expected_policy["LOCKED_READ"]["requires"]
+    test.equal(
+        "LOCK REVIEW accepts complete affected locked-read evidence",
+        evaluate("LOCKED_READ", locked_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in locked_evidence:
+        test.equal(
+            f"LOCK REVIEW blocks locked-read missing {required}",
+            evaluate(
+                "LOCKED_READ",
+                [item for item in locked_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    changed_seal_evidence = expected_policy["CHANGED_SEAL"]["requires"]
+    test.equal(
+        "LOCK REVIEW accepts complete changed-seal evidence",
+        evaluate("CHANGED_SEAL", changed_seal_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in changed_seal_evidence:
+        test.equal(
+            f"LOCK REVIEW blocks changed seal missing {required}",
+            evaluate(
+                "CHANGED_SEAL",
+                [item for item in changed_seal_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    test.equal(
+        "LOCK REVIEW accepts justified unchanged-seal N-A",
+        evaluate("UNCHANGED_SEAL", ["justified_na"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "LOCK REVIEW blocks unjustified unchanged-seal N-A",
+        evaluate("UNCHANGED_SEAL", []),
+        "BLOCKED",
+    )
+
+    org_evidence = expected_policy["ORG_READ"]["requires"]
+    test.equal(
+        "LOCK REVIEW accepts complete org visibility evidence",
+        evaluate("ORG_READ", org_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in org_evidence:
+        test.equal(
+            f"LOCK REVIEW blocks org read missing {required}",
+            evaluate("ORG_READ", [item for item in org_evidence if item != required]),
+            "BLOCKED",
+        )
+
+
 def main() -> int:
     test = Tests()
     open_branch_ownership_cases(test)
@@ -5565,6 +5715,7 @@ def main() -> int:
     import_cases(test)
     plan_and_probe_cases(test)
     clean_cases(test)
+    lock_review_scope_prompt_cases(test)
     probe_precedence_flow_cases(test)
     if test.failures:
         print("v2 selftest: FAIL")
