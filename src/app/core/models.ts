@@ -198,6 +198,8 @@ export interface AppConfigDto {
   notesMode: string;
   autoOrganize: boolean;
   noteLanguage: string;
+  /** Flag note claims the recording does not support with a `> unverified` line. */
+  groundSummary: boolean;
   /**
    * Stage E security flags. These are part of the `get_config` / `save_config`
    * round-trip (Rust `AppConfigDto`), so the FE MUST read the current values and

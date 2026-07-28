@@ -707,6 +707,7 @@ export class OnboardingComponent implements OnInit {
       notesMode: base?.notesMode ?? "enhance",
       autoOrganize: base?.autoOrganize ?? false,
       noteLanguage: base?.noteLanguage ?? "auto",
+      groundSummary: base?.groundSummary ?? true,
       // Stage E security flags — read the current values from the snapshot and send
       // them back unchanged so onboarding never resets them (the backend's serde
       // defaults would otherwise clobber mcpRequireToken / cloudEgressConsented to

@@ -123,7 +123,13 @@ pub struct AppConfig {
     /// 16 kHz playback mix. Default OFF — on, it roughly doubles audio disk use per recording.
     pub keep_hires_masters: bool,
     /// Run N-way speaker diarization on the system ("others") stream to label remote speakers
-    /// (others-0/1/2). Default OFF; requires system-audio capture + downloads ~40 MB of models.
+    /// (others-0/1/2). Requires system-audio capture + downloads ~40 MB of models on first use.
+    ///
+    /// DEFAULT ON since 2026-07-28. Off-by-default meant an ordinary call collapsed every remote
+    /// participant into ONE `others` lane — which is what forced the note prompt to guess speaker
+    /// names from vocatives and produced demonstrably wrong attributions. The capability shipped
+    /// long ago (sherpa-onnx segmentation + CAM++ clustering, with its own DER/EER harness); only
+    /// the default was withholding it.
     pub diarize_others: bool,
     /// Capture a per-cluster VOICE BIOMETRIC (speaker embedding) for the diarized "others" clusters,
     /// stored on-device (SQLCipher, folder-lock-sealed, NEVER egressed) so a remote speaker can later
@@ -540,7 +546,11 @@ pub struct AppConfig {
     /// until a gold-label precision/recall pass on real data justifies flipping the default. PRESERVE-
     /// ONLY on the settings DTO for now (the FE toggle is a follow-up) — a normal settings save neither
     /// grants nor clears it; it round-trips through the load/save keys.
-    #[serde(default)]
+    /// `default_true`, matching the struct default. Plain `#[serde(default)]` on a bool yields
+    /// `false` regardless of the `Default` impl, which would have left a config persisted before
+    /// this flag flipped loading OFF while a fresh install loads ON — one setting with two answers
+    /// depending on how you arrived at it.
+    #[serde(default = "default_true")]
     pub ground_summary: bool,
     /// Brain v2 L3 — gate for the TINY-schema grammar constraint on the on-device structured
     /// decode (`GenOptions::use_grammar_constraint` → mistralrs `Constraint::JsonSchema`, schemas
@@ -663,7 +673,7 @@ impl Default for AppConfig {
             capture_system_audio: true,
             vad_enabled: true,
             keep_hires_masters: false,
-            diarize_others: false,
+            diarize_others: true,
             voiceprint_enabled: false,
             aec_enabled: false,
             post_aec_enabled: false,
@@ -730,7 +740,7 @@ impl Default for AppConfig {
             proactive_hints_enabled: true,
             user_memory_enabled: true,
             memory_consolidation_enabled: true,
-            ground_summary: false,
+            ground_summary: true,
             brain_heavy_grammar_enabled: false,
             ask_jit_retrieval: false,
             loop_transcript_compaction: true,
@@ -2403,16 +2413,21 @@ mod tests {
         assert!(AppConfig::load(&db).unwrap().vault_audit_weekly_enabled);
     }
 
-    /// Tier 3b (B): `ground_summary` defaults OFF / opt-in (empty DB ⇒ false, thresholds uncalibrated),
-    /// and both an explicit ON and an explicit OFF round-trip through save/load — so an opt-IN persists
-    /// across reload despite the default-false.
+    /// `ground_summary` defaults ON since 2026-07-28, and both an explicit ON and an explicit OFF
+    /// round-trip through save/load — so a user's opt-OUT persists across reload.
+    ///
+    /// DELIBERATE CHANGE. This test previously pinned the default OFF, "opt-in until calibrated".
+    /// The audit that prompted it showed the cost of that caution: the note claimed things the
+    /// transcript never supported, and the machinery that would have flagged them existed, was
+    /// wired, was tested — and was simply never reachable, since there was not even a Settings
+    /// toggle to turn it on. An unreachable safety net protects nobody.
     #[test]
-    fn ground_summary_defaults_off_and_round_trips_both_ways() {
+    fn ground_summary_defaults_on_and_round_trips_both_ways() {
         let db = temp_db();
-        // Empty DB (no stored key) ⇒ the default (OFF / opt-in until calibrated).
+        // Empty DB (no stored key) ⇒ the default (ON).
         assert!(
-            !AppConfig::load(&db).unwrap().ground_summary,
-            "ground_summary must default OFF on a fresh DB (opt-in until calibrated)"
+            AppConfig::load(&db).unwrap().ground_summary,
+            "ground_summary must default ON on a fresh DB"
         );
 
         // Explicit ON persists (a maintainer/user opt-in).
@@ -2473,10 +2488,15 @@ mod tests {
         );
     }
 
-    /// A config payload that OMITS `ground_summary` (persisted before the field existed) deserializes
-    /// it as `false` via `#[serde(default)]` — matching `AppConfig::default` (opt-in until calibrated).
+    /// A config payload that OMITS `ground_summary` deserializes it as `true` via
+    /// `#[serde(default = "default_true")]` — matching `AppConfig::default`.
+    ///
+    /// The point of this test is the AGREEMENT, not the value: a plain `#[serde(default)]` on a
+    /// bool yields `false` regardless of the `Default` impl, so after the flip a config persisted
+    /// earlier would have loaded OFF while a fresh install loaded ON — one setting with two answers
+    /// depending on how you arrived at it.
     #[test]
-    fn missing_ground_summary_deserializes_off() {
+    fn missing_ground_summary_matches_the_struct_default() {
         // A minimal payload carrying only the no-serde-default fields; `ground_summary` is omitted.
         let json = r#"{
             "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
@@ -2490,8 +2510,13 @@ mod tests {
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert!(
-            !cfg.ground_summary,
-            "serde default for ground_summary must be false (opt-in)"
+            cfg.ground_summary,
+            "the serde default must AGREE with AppConfig::default, not diverge from it"
+        );
+        assert_eq!(
+            cfg.ground_summary,
+            AppConfig::default().ground_summary,
+            "one setting must not have two answers depending on how it was loaded"
         );
     }
 

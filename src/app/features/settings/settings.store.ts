@@ -181,6 +181,7 @@ export class SettingsStore {
     notesMode: "enhance",
     autoOrganize: false,
     noteLanguage: "auto",
+    groundSummary: true,
     // Phase H — brain / in-meeting voice assistant.
     brainBackend: "cloud" as BrainBackend,
     realtimeReactions: false,
@@ -1509,6 +1510,7 @@ export class SettingsStore {
         notesMode: cfg.notesMode ?? "enhance",
         autoOrganize: cfg.autoOrganize ?? false,
         noteLanguage: cfg.noteLanguage ?? "auto",
+        groundSummary: cfg.groundSummary ?? true,
         brainBackend: cfg.brainBackend ?? "cloud",
         realtimeReactions: cfg.realtimeReactions ?? false,
         proactiveHintsEnabled: cfg.proactiveHintsEnabled ?? true,
@@ -2257,6 +2259,7 @@ export class SettingsStore {
       notesMode: v.notesMode,
       autoOrganize: v.autoOrganize,
       noteLanguage: v.noteLanguage,
+      groundSummary: v.groundSummary,
       // Phase H — brain / in-meeting voice assistant.
       brainBackend: v.brainBackend,
       realtimeReactions: v.realtimeReactions,
