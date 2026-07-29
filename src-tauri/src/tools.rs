@@ -104,10 +104,13 @@ impl AssistantScope {
     fn allows(self, tool: &str) -> bool {
         // Local-MCP discovery helpers are intentionally absent from every cloud-capable assistant
         // scope. They can be dispatched only by the loopback MCP mapper into `execute_tool`.
-        if matches!(tool, "list_entities" | "list_note_folders") {
+        if matches!(
+            tool,
+            "list_entities" | "list_note_folders" | "knowledge_diff"
+        ) {
             return false;
         }
-        const VAULT_READS: [&str; 10] = [
+        const VAULT_READS: [&str; 9] = [
             "search_meetings",
             "search_semantic",
             "get_meeting",
@@ -118,9 +121,6 @@ impl AssistantScope {
             "list_recent_meetings",
             "get_open_commitments",
             "get_entity_dossier",
-            // Brain v3 PR-6 — the knowledge diff / decision ledger (an owned-vault fact read,
-            // egress-free; gated by `list_facts_visible` like `get_entity_dossier`).
-            "knowledge_diff",
             // Feature C — the typed note-folder database query (an owned-vault read, egress-free).
             "query_database",
         ];
@@ -259,11 +259,13 @@ pub enum ToolCall {
     /// Local-MCP-only discovery of visible note folders, visible row counts, and typed columns.
     /// Intentionally absent from [`tool_specs`] and [`GatedToolExecutor`].
     ListNoteFolders,
-    /// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what changed between two
-    /// instants (`from`/`to` ISO-8601) plus the full chronological supersession ledger. EGRESS-FREE:
-    /// reads the entity's facts through the visibility-gated [`Db::list_facts_visible`] inside
-    /// [`crate::facts::build_knowledge_diff`], so a sealed-and-not-session-unlocked meeting's fact is
-    /// invisible here too. Caller passes a non-empty entity name/id; `from`/`to` are required.
+    /// LOCAL-MCP-ONLY knowledge diff / decision ledger for one entity: what changed between two
+    /// instants (`from`/`to` ISO-8601), the chronological supersession ledger, and a separate,
+    /// explicitly-HISTORICAL read-time context from Decisions / Risks / Open Questions sections in
+    /// visible mentioning-meeting notes. Intentionally absent from [`tool_specs`] and every
+    /// [`GatedToolExecutor`] scope, so note-derived content can leave this seam only through the
+    /// fixed loopback MCP transport and its visibility-revocation response gate. The note section is
+    /// never represented as current truth or an open-risk ledger.
     KnowledgeDiff {
         entity: String,
         from: String,
@@ -1108,18 +1110,24 @@ pub fn execute_tool(
         ToolCall::KnowledgeDiff { entity, from, to } => {
             // EGRESS-FREE + GATED: resolve the entity through the SAME gated resolver as the dossier
             // (a sealed-only entity never resolves), then build the diff/ledger through the
-            // visibility-gated `build_knowledge_diff` (`list_facts_visible`). No provider is ever
-            // constructed; nothing egresses.
+            // visibility-gated `build_knowledge_diff` (`list_facts_visible`). Separately parse the
+            // CURRENT visible note Markdown at read time through `entity_mentions_visible` +
+            // `get_note_if_visible`; this is historical source context, never fact-ledger state.
+            // No provider is ever constructed; nothing egresses.
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
                 Ok(None) => return entity_not_found(db, entity, unlocked),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
-            match crate::facts::build_knowledge_diff(db, &id, from, to, unlocked) {
-                Ok(kd) => Ok(format_knowledge_diff(entity, &kd)),
-                Err(e) => Err(AppError::Storage(format!("knowledge diff failed: {e}"))),
-            }
+            let kd = crate::facts::build_knowledge_diff(db, &id, from, to, unlocked)
+                .map_err(|e| AppError::Storage(format!("knowledge diff failed: {e}")))?;
+            let note_context =
+                crate::summarize::note_sections::visible_entity_note_context(db, &id, unlocked)
+                    .map_err(|e| {
+                        AppError::Storage(format!("knowledge diff note context failed: {e}"))
+                    })?;
+            Ok(format_knowledge_diff(entity, &kd, &note_context))
         }
         ToolCall::WebSearch { .. } => {
             // EGRESS GUARD: the synchronous, egress-free `execute_tool` is the MCP surface's only
@@ -1856,11 +1864,14 @@ fn edit_distance_at_most_two(left: &str, right: &str) -> bool {
 }
 
 /// Render the KNOWLEDGE DIFF into the tool text payload for the client to narrate: the between-two-
-/// instants set diff (added / removed / changed) then the chronological decision ledger. Each line is
-/// `<subject> · <predicate>: <old> → <new>` (or `+ <new>` / `- <old>`), with the effective date and
-/// the `source:<meetingId>` provenance so the client can cite. No entity/predicate/object is logged —
-/// this is the RETURNED payload, not a log line.
-fn format_knowledge_diff(entity: &str, kd: &crate::facts::EntityKnowledgeDiff) -> String {
+/// instants fact diff + chronological decision ledger, followed by a SEPARATE historical note
+/// context. Extracted note list items remain source-labelled historical material; they are never
+/// represented as bitemporal facts, current truth, or a live/open-risk ledger.
+fn format_knowledge_diff(
+    entity: &str,
+    kd: &crate::facts::EntityKnowledgeDiff,
+    note_context: &crate::summarize::note_sections::HistoricalNoteContext,
+) -> String {
     fn line(c: &crate::facts::FactStateChange) -> String {
         let val = match (&c.old_object, &c.new_object) {
             (Some(o), Some(n)) => format!("{o} → {n}"),
@@ -1904,6 +1915,53 @@ fn format_knowledge_diff(entity: &str, kd: &crate::facts::EntityKnowledgeDiff) -
     section("DECISION LEDGER (oldest → newest)", &kd.ledger);
     if d.changed.is_empty() && d.added.is_empty() && d.removed.is_empty() && kd.ledger.is_empty() {
         out.push_str("\nNo tracked facts in this window.\n");
+    }
+    if !note_context.entries.is_empty()
+        || note_context.meetings_truncated
+        || note_context.entries_truncated
+    {
+        out.push_str(
+            "\nHISTORICAL NOTE CONTEXT FROM CURRENTLY VISIBLE MEETINGS MENTIONING THIS ENTITY:\n\
+             Verbatim list items below are historical meeting-note material, not bitemporal facts, \
+             not necessarily current truth, and not an open-risk ledger.\n",
+        );
+        for entry in &note_context.entries {
+            let kind = match entry.kind {
+                crate::summarize::note_sections::NoteSectionKind::Decision => "historical decision",
+                crate::summarize::note_sections::NoteSectionKind::RiskOrOpenQuestion => {
+                    "historical risk/open question"
+                }
+            };
+            let date = entry.started_at.split(['T', ' ']).next().unwrap_or("");
+            out.push_str(&format!(
+                "- {kind} · [[{}]] · {} · source:{} — {}\n",
+                entry.meeting_title, date, entry.meeting_id, entry.text
+            ));
+        }
+        if note_context.meetings_truncated || note_context.entries_truncated {
+            let meeting_bound = if note_context.meetings_truncated {
+                format!(
+                    "newest {} visible mentioning meetings scanned",
+                    crate::summarize::note_sections::NOTE_CONTEXT_MEETING_LIMIT
+                )
+            } else {
+                format!(
+                    "{} visible mentioning meeting(s) scanned",
+                    note_context.meetings_scanned
+                )
+            };
+            let entry_bound = if note_context.entries_truncated {
+                format!(
+                    "first {} extracted entries shown",
+                    crate::summarize::note_sections::NOTE_CONTEXT_ENTRY_LIMIT
+                )
+            } else {
+                format!("all {} extracted entries shown", note_context.entries.len())
+            };
+            out.push_str(&format!(
+                "[HISTORICAL NOTE CONTEXT TRUNCATED — {meeting_bound}; {entry_bound}.]\n"
+            ));
+        }
     }
     out
 }
@@ -7166,10 +7224,11 @@ mod tests {
             !names.contains("search_transcript")
                 && !names.contains("get_meeting_chapters")
                 && !names.contains("list_entities")
-                && !names.contains("list_note_folders"),
+                && !names.contains("list_note_folders")
+                && !names.contains("knowledge_diff"),
             "local MCP helpers must never become agent/cloud prompt input"
         );
-        for tool in ["list_entities", "list_note_folders"] {
+        for tool in ["list_entities", "list_note_folders", "knowledge_diff"] {
             for scope in [
                 AssistantScope::CurrentMeeting,
                 AssistantScope::Vault,
@@ -7202,6 +7261,15 @@ mod tests {
                 "list_note_folders",
                 ToolCall::ListNoteFolders,
                 "No visible note folders.",
+            ),
+            (
+                "knowledge_diff",
+                ToolCall::KnowledgeDiff {
+                    entity: "nobody".into(),
+                    from: "2026-01-01T00:00:00Z".into(),
+                    to: "2026-12-31T23:59:59Z".into(),
+                },
+                "No visible entity matching \"nobody\".",
             ),
         ];
         for (_, call, expected) in &local_only_calls {
@@ -7265,6 +7333,228 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn knowledge_diff_output(db: &Db, entity: &str, unlocked: &HashSet<String>) -> String {
+        execute_tool(
+            &ToolCall::KnowledgeDiff {
+                entity: entity.to_string(),
+                from: "2026-01-01T00:00:00Z".into(),
+                to: "2026-12-31T23:59:59Z".into(),
+            },
+            db,
+            unlocked,
+            &AppConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// R3 read-time note context: an entity with ZERO fact rows still gets explicitly-historical
+    /// Decisions/Risks from its visible mentioning note; an edit is reflected immediately; a hidden
+    /// meeting is byte-identical to absence, appears only during unlock, and disappears on relock.
+    /// The pre-existing bitemporal fact ledger continues to render independently.
+    #[test]
+    fn knowledge_diff_note_context_is_live_bounded_by_visibility_and_preserves_fact_ledger() {
+        use crate::facts::{FactOp, NewFact};
+        use crate::storage::models::EntityKind;
+
+        let db = tmp_db();
+        seed_meeting(
+            &db,
+            "m-open",
+            "Atlas Open Review",
+            "## Decisions\n- Use the blue launch plan.\n\
+             ## Risks & Open Questions\n- Will Łucja approve the rollout?\n",
+            None,
+        );
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m-open").unwrap();
+        let nothing = HashSet::new();
+
+        // No fact rows at all: note-derived context is still useful, but is explicitly NOT truth.
+        let no_facts = knowledge_diff_output(&db, &atlas, &nothing);
+        assert!(
+            no_facts.contains("No tracked facts in this window.")
+                && no_facts.contains(
+                    "HISTORICAL NOTE CONTEXT FROM CURRENTLY VISIBLE MEETINGS MENTIONING THIS ENTITY"
+                )
+                && no_facts.contains("Use the blue launch plan.")
+                && no_facts.contains("Will Łucja approve the rollout?")
+                && no_facts.contains("not necessarily current truth")
+                && no_facts.contains("not an open-risk ledger"),
+            "zero-fact entity must still return honestly-labelled visible note context: {no_facts}"
+        );
+
+        // Read-time, no stale rows: replace the note and the very next query sees only the new text.
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m-open".into(),
+            provider_id: "claude_code".into(),
+            markdown: "## ✅ Decisions\n- Use the green launch plan.\n".into(),
+            created_at: "2026-07-29T01:00:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        let edited = knowledge_diff_output(&db, &atlas, &nothing);
+        assert!(
+            edited.contains("Use the green launch plan.")
+                && !edited.contains("Use the blue launch plan.")
+                && !edited.contains("Will Łucja approve"),
+            "knowledge_diff must parse the current note, never stale extracted rows: {edited}"
+        );
+
+        // The original bitemporal ledger is unchanged and renders beside—not merged with—the note
+        // context.
+        db.apply_fact_ops(&[FactOp::Add(NewFact {
+            entity_id: atlas.clone(),
+            subject: "Atlas".into(),
+            predicate: "status".into(),
+            object: "active".into(),
+            valid_from: "2026-06-01T00:00:00Z".into(),
+            recorded_at: "2026-06-01T00:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some("m-open".into()),
+        })])
+        .unwrap();
+        let visible_baseline = knowledge_diff_output(&db, &atlas, &nothing);
+        assert!(
+            visible_baseline.contains("ADDED:")
+                && visible_baseline.contains("Atlas · status: + active")
+                && visible_baseline.contains("Use the green launch plan."),
+            "legacy fact diff and historical note context must both remain intact: {visible_baseline}"
+        );
+
+        seed_folder(&db, "f-secret-note-context", "Secret note context");
+        seed_meeting(
+            &db,
+            "m-secret-note-context",
+            "Secret Atlas Decision",
+            "## Decyzje\n- SECRET-ATLAS-DECISION.\n\
+             ## Ryzyka i otwarte pytania\n- SECRET-ATLAS-RISK?\n",
+            Some("f-secret-note-context"),
+        );
+        db.add_mention(&atlas, "m-secret-note-context").unwrap();
+        db.set_folder_locked("f-secret-note-context", true, Some(b"wrapped"))
+            .unwrap();
+
+        // Exact locked-vs-absent non-disclosure: adding a now-sealed source changes zero bytes.
+        let locked = knowledge_diff_output(&db, &atlas, &nothing);
+        assert_eq!(
+            locked, visible_baseline,
+            "a locked mentioning meeting must be byte-identical to the same vault without it"
+        );
+        for secret in [
+            "m-secret-note-context",
+            "Secret Atlas Decision",
+            "SECRET-ATLAS-DECISION",
+            "SECRET-ATLAS-RISK",
+        ] {
+            assert!(
+                !locked.contains(secret),
+                "sealed meeting id/title/content leaked through knowledge_diff: {locked}"
+            );
+        }
+
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-secret-note-context".to_string());
+        let open = knowledge_diff_output(&db, &atlas, &unlocked);
+        assert!(
+            open.contains("m-secret-note-context")
+                && open.contains("[[Secret Atlas Decision]]")
+                && open.contains("SECRET-ATLAS-DECISION")
+                && open.contains("SECRET-ATLAS-RISK"),
+            "session unlock must expose eligible historical note sections: {open}"
+        );
+
+        let relocked = knowledge_diff_output(&db, &atlas, &nothing);
+        assert_eq!(
+            relocked, visible_baseline,
+            "relock must immediately restore byte-identical non-disclosure without a purge"
+        );
+    }
+
+    /// Both independent bounds are honest: only the newest 100 visible mentioning meetings are in
+    /// the source window, and at most 100 extracted entries render with a truncation marker.
+    #[test]
+    fn knowledge_diff_note_context_enforces_meeting_and_entry_bounds() {
+        use crate::storage::models::EntityKind;
+
+        let db = tmp_db();
+        let atlas = db
+            .upsert_entity("Atlas Bounds", EntityKind::Project)
+            .unwrap();
+        // Same started_at is deliberate: the reader's stable id-desc tie-break makes m-101 newest.
+        // The SQL query fetches 101 rows (100 displayed + one truncation witness), so m-000 is not
+        // materialized and m-001 is the witness outside the displayed source window.
+        for index in 0..=101 {
+            let meeting_id = format!("m-{index:03}");
+            let markdown = if index == 0 {
+                "## Decisions\n- OUTSIDE-SQL-WINDOW.\n"
+            } else if index == 1 {
+                "## Decisions\n- OUTSIDE-DISPLAY-WINDOW.\n"
+            } else {
+                "## Summary\n- no eligible historical entry\n"
+            };
+            seed_meeting(
+                &db,
+                &meeting_id,
+                &format!("Bounds {index:03}"),
+                markdown,
+                None,
+            );
+            db.add_mention(&atlas, &meeting_id).unwrap();
+        }
+        let sql_window = db
+            .entity_mentions_visible_limited(&atlas, &HashSet::new(), 101)
+            .unwrap();
+        assert_eq!(sql_window.len(), 101);
+        assert_eq!(sql_window.first().unwrap().meeting_id, "m-101");
+        assert_eq!(sql_window.last().unwrap().meeting_id, "m-001");
+        assert!(
+            sql_window
+                .iter()
+                .all(|meeting| meeting.meeting_id != "m-000"),
+            "the oldest row must be outside the SQL source bound"
+        );
+        let meeting_bounded = knowledge_diff_output(&db, &atlas, &HashSet::new());
+        assert!(
+            !meeting_bounded.contains("OUTSIDE-SQL-WINDOW")
+                && !meeting_bounded.contains("OUTSIDE-DISPLAY-WINDOW")
+                && meeting_bounded.contains("newest 100 visible mentioning meetings scanned"),
+            "SQL and displayed source windows must be bounded with an honest marker: \
+             {meeting_bounded}"
+        );
+
+        let entries_entity = db
+            .upsert_entity("Entry Bounds", EntityKind::Project)
+            .unwrap();
+        let entry_markdown = format!(
+            "## Decisions\n{}",
+            (0..=100)
+                .map(|index| format!("- ENTRY-{index:03}."))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        seed_meeting(&db, "m-entry-bounds", "Entry Bounds", &entry_markdown, None);
+        db.add_mention(&entries_entity, "m-entry-bounds").unwrap();
+        let entry_bounded = knowledge_diff_output(&db, &entries_entity, &HashSet::new());
+        assert_eq!(
+            entry_bounded
+                .lines()
+                .filter(|line| line.starts_with("- historical decision"))
+                .count(),
+            100,
+            "at most 100 extracted entries may render"
+        );
+        assert!(
+            entry_bounded.contains("ENTRY-000")
+                && entry_bounded.contains("ENTRY-099")
+                && !entry_bounded.contains("ENTRY-100")
+                && entry_bounded.contains("first 100 extracted entries shown"),
+            "entry truncation must preserve order and disclose its bound: {entry_bounded}"
+        );
     }
 
     #[test]
