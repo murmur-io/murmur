@@ -15,13 +15,16 @@
 //! (created inline in `Db::migrate()`). The row mappers `row_to_folder` / `row_to_note_folder`
 //! (only ever used by these readers) moved along.
 
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, Row};
 
 use crate::error::{AppError, Result};
-use crate::storage::db::{map_err, Db, RawDocument};
+use crate::storage::db::{map_err, visibility_clause, Db, RawDocument};
 use crate::storage::models::{Folder, NoteFolder, PropertySchemaField};
 
 pub(crate) type MeetingNoteExportRow = (String, String, String, Option<String>);
+pub(crate) type NoteFolderCatalogRow = (NoteFolder, i64, Vec<PropertySchemaField>);
 
 impl Db {
     /// The owning folder id for a document, or `None` if unknown. The folder-lock gate anchor.
@@ -387,6 +390,51 @@ impl Db {
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The local-MCP note-folder discovery catalog: every VISIBLE note folder, its visible record
+    /// count, and its typed schema. This is the single resolver input for `list_note_folders` and
+    /// `query_database`, so an exact locked name/id, the alternatives list, the count, and schema all
+    /// share one lock decision.
+    ///
+    /// LOCK MODEL: a sealed-and-not-session-unlocked folder is absent from this result entirely.
+    /// Its name, id, row count, and schema are all sensitive metadata and must remain
+    /// indistinguishable from an unknown folder. No note body is read here.
+    pub fn list_note_folder_catalog_visible(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<NoteFolderCatalogRow>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT f.id, f.name, f.path, f.parent_id, f.locked, f.kind,
+                    COALESCE(f.is_root, 0),
+                    (SELECT COUNT(*)
+                       FROM documents d
+                      WHERE d.folder_id = f.id AND d.kind = 'note') AS record_count,
+                    COALESCE(nfs.schema_json, '[]') AS schema_json
+               FROM folders f
+               LEFT JOIN note_folder_schemas nfs ON nfs.folder_id = f.id
+              WHERE f.kind = 'note' AND {visible}
+              ORDER BY f.created_at, f.name COLLATE NOCASE, f.id"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let mut folder = row_to_note_folder(row)?;
+                folder.unlocked = folder.locked && unlocked.contains(&folder.id);
+                let record_count: i64 = row.get(7)?;
+                let schema_json: String = row.get(8)?;
+                let schema = serde_json::from_str::<Vec<PropertySchemaField>>(&schema_json)
+                    .unwrap_or_default();
+                Ok((folder, record_count, schema))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
         }
         Ok(out)
     }

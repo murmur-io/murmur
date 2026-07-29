@@ -228,6 +228,10 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::SearchMeetings { .. } => "Related meetings",
         ToolCall::SearchSemantic { .. } => "Semantically related",
         ToolCall::GetEntityDossier { .. } => "Entity dossier",
+        // Local-MCP-only discovery variants: orchestration never constructs them, but exhaustive
+        // labels keep the shared transport enum compile-safe without advertising either to a model.
+        ToolCall::ListEntities { .. } => "Entities",
+        ToolCall::ListNoteFolders => "Note folders",
         // Brain v3 PR-6 — knowledge diff / decision ledger (explicit tool; label for completeness).
         ToolCall::KnowledgeDiff { .. } => "Knowledge diff",
         ToolCall::GetOpenCommitments { .. } => "Open commitments",
