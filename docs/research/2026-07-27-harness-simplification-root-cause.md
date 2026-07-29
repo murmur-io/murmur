@@ -23,10 +23,45 @@
 > concurrently, and found substantive defects without discarding the
 > implementation.
 >
+> A larger transcript-navigation replacement then exercised the resumable loop
+> under sustained pressure in PR #519. Six exact-diff attempts stayed in one
+> worktree while independent reviews found an unbounded segment scan, a
+> speaker-map paging-budget bypass, a pre-projection meeting cap, and missing
+> rollback/feed evidence. The final diff passed 2,548 Rust tests, Clippy, a real
+> Tauri/MCP boot, all three independent reviews, and remote Rust/Web/release
+> parity. This is strong evidence that v2 removed the old work-loss failure
+> mode; it is not evidence that repeated semantic review is cheap.
+>
+> The discovery/triage replacement in PR #520 supplied a second high-risk
+> field run. Two failed review attempts preserved the implementation while
+> exposing a split visibility source in `query_database` and a missing
+> executor-boundary proof for two loopback-only tools. The corrected exact diff
+> passed 2,554 Rust tests plus combined, lock-security, and egress-security
+> reviews with no findings or proof gaps. This run also exposed a remaining
+> development-path defect: `open` did not provision the pinned sibling
+> `murmur-server` checkout, so focused Cargo commands could not resolve the path
+> dependency until verification prepared it. PR #521 fixed that failure
+> fail-fast at `open`, preserved the no-server task shape, and passed 409 v2
+> selftest assertions, the configuration audit, independent review, and remote
+> CI. This is a control-plane fix, not a reason to restore an automatic writer.
+>
+> The read-time Decisions/Risks/Open Questions replacement in PR #522 supplied
+> a third high-risk field run. Successive exact-diff reviews preserved the
+> worktree while catching Polish `i/lub` parsing, an initially unbounded storage
+> read, ambiguity about local-MCP-only reachability, and a missing coherent
+> relock-before-response proof. The final design has no registry table,
+> migration, write-time cache, or model-facing tool: it derives bounded
+> historical context from currently visible notes and revalidates visibility
+> before sending the loopback response. The final local run passed 2,560 Rust
+> tests and combined, lock-security, and egress-security reviews with no
+> findings or proof gaps.
+>
 > One measured performance cost remains: each fresh exact-diff attempt gets a
 > new absolute verification-snapshot path, which invalidates part of Cargo's
-> path-sensitive fingerprinting even when the task target is retained. This is
-> an optimization follow-up, not a trust or resumability failure. V2 stays
+> path-sensitive fingerprinting even when the task target is retained. The
+> R3 attempts measured roughly three to four-and-a-half minutes of repeated
+> partial/cold build time from this effect. This is an optimization follow-up,
+> not a trust or resumability failure. V2 stays
 > opt-in; v1 remains only for existing tasks and externally anchored changes to
 > protected control-plane paths. The diagnosis below is the decision record, not
 > current operator instructions. Current commands live in
@@ -847,10 +882,18 @@ Evidence accumulated by 2026-07-28:
   `receipt-selftest`, and `config-audit` checks passed under the real check
   sandbox. Exact historical assertion counts are deliberately omitted here:
   task evidence binds outcomes and log hashes, not parsed count fields.
+- PR #519 kept six transcript-navigation attempts in one worktree and ended with
+  2,548 Rust tests, Clippy, real Tauri/MCP boot, three clean independent
+  reviews, and green remote integration lanes;
+- PR #520 kept two failed discovery/triage reviews resumable, then passed 2,554
+  Rust tests and the combined, lock, and egress reviews;
+- PR #521 repaired the server-dependency `open` preflight found by #520 and
+  passed the complete harness selftest/config-audit/review/remote-CI chain;
+- PR #522 kept multiple read-time decision-context corrections in one worktree,
+  then passed 2,560 Rust tests and all three high-risk reviews locally.
 
-This is meaningful operational evidence, but it is not the full ten-task corpus
-and does not yet cover the required Rust, Angular, mixed, and high-risk task
-distribution.
+This is meaningful operational evidence across Rust, Angular/mixed, and
+high-risk tasks, but it is not yet the full ten-task shadow corpus.
 
 ### Phase 3: cut over and delete — pending shadow budgets
 
@@ -897,8 +940,8 @@ Measure over a rolling 20-task window:
    corpus before the second general reviewer is removed.
 4. The optimal warm/cold runtime timeout needs measurement on the actual Mac.
 5. The typed reviewer probe broker and its no-arbitrary-shell boundary are
-   implemented and worked in the interrupted/resumed docs task. Broader real
-   Rust and high-risk runs remain outstanding; unrestricted reviewer Bash is
+   implemented and have now worked in multiple real Rust and high-risk runs.
+   The ten-task shadow budget remains incomplete; unrestricted reviewer Bash is
    still not recommended.
 6. Merge queue configuration itself was not changed in this research; the
    workflow now has the required `merge_group` trigger after #499.
@@ -930,6 +973,13 @@ Measure over a rolling 20-task window:
 - [Murmur PR #496](https://github.com/murmur-io/murmur/pull/496)
 - [Murmur PR #499](https://github.com/murmur-io/murmur/pull/499)
 - [Murmur PR #501](https://github.com/murmur-io/murmur/pull/501)
+- [Murmur PR #513](https://github.com/murmur-io/murmur/pull/513)
+- [Murmur PR #515](https://github.com/murmur-io/murmur/pull/515)
+- [Murmur PR #516](https://github.com/murmur-io/murmur/pull/516)
+- [Murmur PR #519](https://github.com/murmur-io/murmur/pull/519)
+- [Murmur PR #520](https://github.com/murmur-io/murmur/pull/520)
+- [Murmur PR #521](https://github.com/murmur-io/murmur/pull/521)
+- [Murmur PR #522](https://github.com/murmur-io/murmur/pull/522)
 
 ### External primary sources
 
