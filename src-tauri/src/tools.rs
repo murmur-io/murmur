@@ -102,6 +102,11 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     fn allows(self, tool: &str) -> bool {
+        // Local-MCP discovery helpers are intentionally absent from every cloud-capable assistant
+        // scope. They can be dispatched only by the loopback MCP mapper into `execute_tool`.
+        if matches!(tool, "list_entities" | "list_note_folders") {
+            return false;
+        }
         const VAULT_READS: [&str; 10] = [
             "search_meetings",
             "search_semantic",
@@ -248,6 +253,12 @@ pub enum ToolCall {
         /// Max corpus chars to return (`full`: window; `summary`: excerpt budget; 0 = default).
         max_chars: usize,
     },
+    /// Local-MCP-only discovery of visible entities. Intentionally absent from [`tool_specs`] and
+    /// [`GatedToolExecutor`], so this metadata cannot enter an in-app/cloud agent loop.
+    ListEntities { query: Option<String>, limit: usize },
+    /// Local-MCP-only discovery of visible note folders, visible row counts, and typed columns.
+    /// Intentionally absent from [`tool_specs`] and [`GatedToolExecutor`].
+    ListNoteFolders,
     /// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what changed between two
     /// instants (`from`/`to` ISO-8601) plus the full chronological supersession ledger. EGRESS-FREE:
     /// reads the entity's facts through the visibility-gated [`Db::list_facts_visible`] inside
@@ -292,11 +303,12 @@ pub enum ToolCall {
     /// prompt.
     OrgBrainSearch { query: String },
     /// Feature C — QUERY a note-folder's TYPED front-matter properties (the Table/Board substrate) as
-    /// a structured database. EGRESS-FREE: reads the LOCAL typed rows through the gated
-    /// [`Db::list_notes_visible_typed`] (a sealed-and-not-session-unlocked folder yields NO rows), then
-    /// applies a DETERMINISTIC, RUST-parsed filter grammar (`key op value`, `AND`/`OR`) — NEVER a second
-    /// LLM call, so there is no prompt-injection surface and nothing egresses. An unparseable filter
-    /// degrades to "no rows matched (could not parse)", NEVER all rows.
+    /// a structured database. EGRESS-FREE: resolves folder identity, visible count, and schema from
+    /// ONE gated catalog row, then projects LOCAL rows through that selected schema using gated note
+    /// readers (a sealed-and-not-session-unlocked folder yields NO rows). Applies a DETERMINISTIC,
+    /// RUST-parsed filter grammar (`key op value`, `AND`/`OR`) — NEVER a second LLM call, so there is
+    /// no prompt-injection surface and nothing egresses. An unparseable filter degrades to "no rows
+    /// matched (could not parse)", NEVER all rows.
     QueryDatabase { folder: String, filter: String },
 }
 
@@ -411,7 +423,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_recent_meetings".into(),
-            description: "List the most recent meetings (newest first).".into(),
+            description: "List the most recent visible meetings (newest first) with status, \
+                          durationSeconds, transcriptChars, hasVisibleNote, and deterministic Error \
+                          statusDetail for triage."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": { "limit": { "type": "integer", "description": "How many (1..=100)." } }
@@ -915,23 +930,65 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!(
                     "document outline read failed: {e}"
                 ))),
-                Ok(entries) if entries.is_empty() => Ok(format!(
-                    "No outline for document {id} (it may be locked, absent, or have no headings — \
-                     read it with get_document)."
-                )),
+                Ok(entries) if entries.is_empty() => {
+                    // A meeting id is a common caller mistake. Redirect only after the document
+                    // reader returned its masked empty result, and only when the meeting exists AND
+                    // is visible. `meeting_is_visible` intentionally returns true for an absent id,
+                    // so the existence conjunct is mandatory. The raw existence read is
+                    // short-circuited for a sealed meeting.
+                    let meeting_is_visible = db.meeting_is_visible(id, unlocked).map_err(|e| {
+                        AppError::Storage(format!("meeting visibility check failed: {e}"))
+                    })?;
+                    let is_visible_meeting = if meeting_is_visible {
+                        db.get_meeting(id)
+                            .map_err(|e| AppError::Storage(format!("meeting lookup failed: {e}")))?
+                            .is_some()
+                    } else {
+                        false
+                    };
+                    if is_visible_meeting {
+                        Ok(format!(
+                            "{id} is a MEETING, not a document — read it with get_meeting."
+                        ))
+                    } else {
+                        // Deliberately omit the caller-supplied id: locked and absent ids must
+                        // receive a byte-identical sentinel, not merely similarly worded responses.
+                        Ok(
+                            "No outline for that document (it may be locked, absent, or have no \
+                             headings — read it with get_document)."
+                                .to_string(),
+                        )
+                    }
+                }
                 Ok(entries) => Ok(format_doc_outline(id, &entries)),
             }
         }
         ToolCall::ListRecentMeetings { limit } => {
-            match db.list_meetings_visible(*limit, unlocked) {
+            // One bounded aggregate reader owns visibility, transcript size, and note presence.
+            // There is no per-row transcript/note query and no sealed meeting produces a row.
+            match db.list_meeting_triage_visible(*limit, unlocked) {
                 Ok(ms) => Ok(ms
                     .iter()
-                    .map(|m| {
+                    .map(|(m, transcript_chars, has_visible_note)| {
+                        let status_detail = match m.status {
+                            crate::storage::models::MeetingStatus::Error
+                                if *transcript_chars == 0 =>
+                            {
+                                "no transcript"
+                            }
+                            crate::storage::models::MeetingStatus::Error => "partial transcript",
+                            _ => "none",
+                        };
                         format!(
-                            "- {} · {} · {:?} · id:{}",
+                            "- {} · {} · status:{:?} · statusDetail:{} · durationSeconds:{} · \
+                             transcriptChars:{} · hasVisibleNote:{} · id:{}",
                             m.title.clone().unwrap_or_else(|| "(untitled)".into()),
                             m.started_at,
                             m.status,
+                            status_detail,
+                            m.duration_s,
+                            transcript_chars,
+                            has_visible_note,
                             m.id
                         )
                     })
@@ -966,7 +1023,7 @@ pub fn execute_tool(
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => return entity_not_found(db, entity, unlocked),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::summarize::dossier::build_dossier_data(db, &id, unlocked) {
@@ -976,9 +1033,77 @@ pub fn execute_tool(
                     *offset,
                     *max_chars,
                 )),
-                Ok(None) => Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => entity_not_found(db, entity, unlocked),
                 Err(e) => Err(AppError::Storage(format!("dossier build failed: {e}"))),
             }
+        }
+        ToolCall::ListEntities { query, limit } => {
+            // GATE: an entity mentioned only by sealed-and-not-session-unlocked meetings is absent
+            // from this source, including its id/name and mention count.
+            let entities = db
+                .list_entities_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("entity list failed: {e}")))?;
+            let query = query.as_deref().map(str::trim).filter(|q| !q.is_empty());
+            let folded_query = query.map(str::to_lowercase);
+            let limit = (*limit).clamp(1, 100);
+            let rows: Vec<_> = entities
+                .into_iter()
+                // `list_entities_visible` already supplies the stable order: visible mention count
+                // descending, then case-insensitive name. Filtering preserves that order.
+                .filter(|entity| match &folded_query {
+                    Some(query) => entity.name.to_lowercase().contains(query),
+                    None => true,
+                })
+                .take(limit)
+                .collect();
+            if rows.is_empty() {
+                return Ok(match query {
+                    Some(q) => format!("No visible entities matching \"{q}\"."),
+                    None => "No visible entities.".to_string(),
+                });
+            }
+            Ok(rows
+                .iter()
+                .map(|entity| {
+                    format!(
+                        "- {} · type:{} · visibleMentions:{} · id:{}",
+                        entity.name,
+                        entity.kind.as_str(),
+                        entity.mention_count,
+                        entity.id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        ToolCall::ListNoteFolders => {
+            let folders = db
+                .list_note_folder_catalog_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("note-folder list failed: {e}")))?;
+            if folders.is_empty() {
+                return Ok("No visible note folders.".to_string());
+            }
+            Ok(folders
+                .iter()
+                .map(|(folder, record_count, schema)| {
+                    let columns = if schema.is_empty() {
+                        "none".to_string()
+                    } else {
+                        schema
+                            .iter()
+                            .map(|field| {
+                                format!("{}:{}", field.key, property_kind_name(field.kind))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    format!(
+                        "- {} · id:{} · visibleRecords:{} · typedColumns:{}",
+                        folder.name, folder.id, record_count, columns
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         ToolCall::KnowledgeDiff { entity, from, to } => {
             // EGRESS-FREE + GATED: resolve the entity through the SAME gated resolver as the dossier
@@ -988,7 +1113,7 @@ pub fn execute_tool(
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => return entity_not_found(db, entity, unlocked),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::facts::build_knowledge_diff(db, &id, from, to, unlocked) {
@@ -1052,35 +1177,36 @@ pub fn execute_tool(
             search_org_brain(db, config, query)
         }
         ToolCall::QueryDatabase { folder, filter } => {
-            // Resolve the note-folder by NAME (case-insensitive) or exact id. Note-folders only, so a
-            // meeting folder can never be queried through here. An unresolvable name is a FRIENDLY
-            // sentinel (never an error) so the model can retry with a different name.
-            let target = match db.note_folder_by_name_or_id(folder) {
-                Ok(Some(f)) => f,
-                Ok(None) => return Ok(format!("No note folder named \"{}\".", folder.trim())),
-                Err(e) => return Err(AppError::Storage(format!("folder resolve failed: {e}"))),
+            // Resolve name/id, visible alternatives, visible count, and schema from ONE gated
+            // catalog. Never call the raw `note_folder_by_name_or_id`: an exact locked name/id must
+            // be indistinguishable from an absent folder.
+            let catalog = db
+                .list_note_folder_catalog_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("folder resolve failed: {e}")))?;
+            let needle = folder.trim();
+            let target = catalog
+                .iter()
+                .find(|(candidate, _, _)| candidate.name.eq_ignore_ascii_case(needle))
+                .or_else(|| {
+                    catalog
+                        .iter()
+                        .find(|(candidate, _, _)| candidate.id == needle)
+                });
+            let Some((target, visible_record_count, schema)) = target else {
+                let available = catalog
+                    .iter()
+                    .map(|(candidate, _, _)| candidate.name.as_str())
+                    .collect::<Vec<_>>();
+                return Ok(if available.is_empty() {
+                    "No visible note folder matching that name or id.".to_string()
+                } else {
+                    format!(
+                        "No visible note folder matching that name or id. Available: {}.",
+                        available.join(", ")
+                    )
+                });
             };
-            // GATE: the typed rows come from `list_notes_visible_typed`, which is built on the gated
-            // `list_notes_visible` (`visibility_clause` against `unlocked`) — a sealed-and-not-session-
-            // unlocked folder yields NO rows here (never a masked row), so no sealed content can leak.
-            let rows = db
-                .list_notes_visible_typed(&target.id, unlocked)
-                .map_err(|e| AppError::Storage(format!("typed rows read failed: {e}")))?;
-            // DETERMINISTIC, RUST-PARSED filter (no second LLM call → egress-free, no injection
-            // surface). An UNPARSEABLE filter yields ZERO matches (never all rows).
-            let matched = filter_rows(&rows, filter);
-            if matched.is_empty() {
-                // Distinguish "parsed but nothing matched" from "could not parse the filter".
-                let f = filter.trim();
-                if !f.is_empty() && parse_filter(f).is_none() {
-                    return Ok(format!(
-                        "No rows matched in \"{}\" (could not parse the filter).",
-                        target.name
-                    ));
-                }
-                return Ok(format!("No rows matched in \"{}\".", target.name));
-            }
-            Ok(format_typed_rows(&target.name, &matched))
+            query_database_from_catalog(db, target, *visible_record_count, schema, filter, unlocked)
         }
     }
 }
@@ -1623,6 +1749,112 @@ fn format_org_hits(hits: &[crate::storage::models::OrgChunkHit]) -> String {
         .join("\n")
 }
 
+const ENTITY_SUGGESTION_QUERY_MAX_CHARS: usize = 128;
+const ENTITY_SUGGESTION_LIMIT: usize = 5;
+
+/// Friendly entity miss with a bounded did-you-mean list. Suggestions never resolve the request;
+/// they only expose names already returned by the visibility-gated entity catalog.
+fn entity_not_found(db: &Db, entity: &str, unlocked: &HashSet<String>) -> Result<String> {
+    let base = format!("No visible entity matching \"{entity}\".");
+    let query = entity.trim();
+    if query.is_empty() || query.chars().count() > ENTITY_SUGGESTION_QUERY_MAX_CHARS {
+        return Ok(base);
+    }
+    let folded_query = query.to_lowercase();
+    let query_initials = initials(query).to_lowercase();
+    let candidates = db
+        .list_entities_visible(unlocked)
+        .map_err(|e| AppError::Storage(format!("entity suggestions failed: {e}")))?;
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let name = candidate.name.trim();
+            let folded_name = name.to_lowercase();
+            let score = if folded_name == folded_query {
+                0
+            } else if folded_name.starts_with(&folded_query)
+                || folded_query.starts_with(&folded_name)
+            {
+                1
+            } else if folded_name.contains(&folded_query)
+                || folded_query.contains(&folded_name)
+                || initials(name).to_lowercase() == folded_query
+                || query_initials == folded_name
+            {
+                2
+            } else if edit_distance_at_most_two(&folded_name, &folded_query) {
+                3
+            } else {
+                return None;
+            };
+            Some((
+                score,
+                std::cmp::Reverse(candidate.mention_count),
+                folded_name,
+                candidate.id,
+                candidate.name,
+            ))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let mut seen = HashSet::new();
+    let suggestions = scored
+        .into_iter()
+        .filter_map(|(_, _, folded_name, _, name)| seen.insert(folded_name).then_some(name))
+        .take(ENTITY_SUGGESTION_LIMIT)
+        .collect::<Vec<_>>();
+    if suggestions.is_empty() {
+        Ok(base)
+    } else {
+        Ok(format!("{base} Did you mean: {}?", suggestions.join(", ")))
+    }
+}
+
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().find(|ch| ch.is_alphanumeric()))
+        .collect()
+}
+
+/// Bounded Levenshtein predicate for typo suggestions. It never changes exact entity resolution.
+fn edit_distance_at_most_two(left: &str, right: &str) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len() < 3
+        || right.len() < 3
+        || left.len().abs_diff(right.len()) > 2
+        || left.len() > ENTITY_SUGGESTION_QUERY_MAX_CHARS
+        || right.len() > ENTITY_SUGGESTION_QUERY_MAX_CHARS
+    {
+        return false;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_idx, left_char) in left.iter().enumerate() {
+        let mut current = Vec::with_capacity(right.len() + 1);
+        current.push(left_idx + 1);
+        let mut row_min = current[0];
+        for (right_idx, right_char) in right.iter().enumerate() {
+            let substitution = previous[right_idx] + usize::from(left_char != right_char);
+            let insertion = current[right_idx] + 1;
+            let deletion = previous[right_idx + 1] + 1;
+            let distance = substitution.min(insertion).min(deletion);
+            row_min = row_min.min(distance);
+            current.push(distance);
+        }
+        if row_min > 2 {
+            return false;
+        }
+        previous = current;
+    }
+    previous[right.len()] <= 2
+}
+
 /// Render the KNOWLEDGE DIFF into the tool text payload for the client to narrate: the between-two-
 /// instants set diff (added / removed / changed) then the chronological decision ledger. Each line is
 /// `<subject> · <predicate>: <old> → <new>` (or `+ <new>` / `- <old>`), with the effective date and
@@ -1868,6 +2100,16 @@ fn property_value_str(v: &crate::storage::models::PropertyValue) -> String {
     }
 }
 
+fn property_kind_name(kind: crate::storage::models::PropertyKind) -> &'static str {
+    match kind {
+        crate::storage::models::PropertyKind::Text => "text",
+        crate::storage::models::PropertyKind::Select => "select",
+        crate::storage::models::PropertyKind::Date => "date",
+        crate::storage::models::PropertyKind::Checkbox => "checkbox",
+        crate::storage::models::PropertyKind::Number => "number",
+    }
+}
+
 /// Does one typed note row satisfy `clause`? A missing key never matches. Numeric comparison when
 /// BOTH the row value and the filter value parse as `f64`; otherwise case-insensitive string. The
 /// tag list is queryable via the reserved key `tags` (a `contains`/`=` over the row's tags).
@@ -1952,11 +2194,102 @@ fn filter_rows<'a>(
         .collect()
 }
 
+/// Build typed rows using the schema carried by the already-selected VISIBLE catalog row. This is
+/// deliberately separate from [`Db::list_notes_visible_typed`]: that general storage helper reads
+/// the persisted schema again, while `query_database` must preserve one resolver snapshot for
+/// identity, count, and schema. Both content reads remain gated, so a sealed-and-not-session-unlocked
+/// folder yields no summaries and no markdown.
+fn typed_rows_from_catalog_schema(
+    db: &Db,
+    folder_id: &str,
+    schema: &[crate::storage::models::PropertySchemaField],
+    unlocked: &HashSet<String>,
+) -> Result<Vec<crate::storage::models::TypedNoteRow>> {
+    let summaries = db
+        .list_notes_visible(Some(folder_id), unlocked)
+        .map_err(|e| AppError::Storage(format!("typed rows read failed: {e}")))?;
+    let mut rows = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let Some(markdown) = db
+            .note_markdown_if_visible(&summary.id, unlocked)
+            .map_err(|e| AppError::Storage(format!("typed row content read failed: {e}")))?
+        else {
+            continue;
+        };
+        let (tags, raw) = crate::storage::db::parse_front_matter(&markdown);
+        let mut values = std::collections::BTreeMap::new();
+        for field in schema {
+            if let Some(raw_value) = raw.get(&field.key) {
+                values.insert(
+                    field.key.clone(),
+                    crate::storage::db::coerce_property_value(
+                        raw_value,
+                        field.kind,
+                        &field.options,
+                    ),
+                );
+            }
+        }
+        rows.push(crate::storage::models::TypedNoteRow {
+            id: summary.id,
+            title: summary.title,
+            folder_id: summary.folder_id,
+            values,
+            tags,
+            updated_at: summary.updated_at,
+        });
+    }
+    Ok(rows)
+}
+
+/// Execute `query_database` from exactly one selected visible-catalog row. Folder identity, visible
+/// total count, and schema all come from the same resolver snapshot; this helper must not perform a
+/// second folder/schema lookup.
+fn query_database_from_catalog(
+    db: &Db,
+    target: &crate::storage::models::NoteFolder,
+    visible_record_count: i64,
+    schema: &[crate::storage::models::PropertySchemaField],
+    filter: &str,
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    let rows = typed_rows_from_catalog_schema(db, &target.id, schema, unlocked)?;
+    // DETERMINISTIC, RUST-PARSED filter (no second LLM call → egress-free, no injection surface).
+    // An UNPARSEABLE filter yields ZERO matches (never all rows).
+    let matched = filter_rows(&rows, filter);
+    if matched.is_empty() {
+        // Distinguish "parsed but nothing matched" from "could not parse the filter".
+        if !filter.trim().is_empty() && parse_filter(filter).is_none() {
+            return Ok(format!(
+                "No rows matched among {visible_record_count} visible records in \"{}\" \
+                 (could not parse the filter).",
+                target.name
+            ));
+        }
+        return Ok(format!(
+            "No rows matched among {visible_record_count} visible records in \"{}\".",
+            target.name
+        ));
+    }
+    Ok(format_typed_rows(
+        &target.name,
+        &matched,
+        visible_record_count,
+    ))
+}
+
 /// Feature C — render matched typed rows into the tool's text payload: a header, then one line per
 /// row: `- [[Title]] · key: value · key: value` (only the row's populated typed values + a `tags:`
 /// suffix when present). Egress-free, plain text; the model cites `[[Title]]`.
-fn format_typed_rows(folder_name: &str, rows: &[&crate::storage::models::TypedNoteRow]) -> String {
-    let mut out = format!("{} rows in \"{folder_name}\":", rows.len());
+fn format_typed_rows(
+    folder_name: &str,
+    rows: &[&crate::storage::models::TypedNoteRow],
+    visible_record_count: i64,
+) -> String {
+    let mut out = format!(
+        "{} matching rows of {visible_record_count} visible records in \"{folder_name}\":",
+        rows.len()
+    );
     for row in rows {
         let mut parts: Vec<String> = Vec::new();
         for (k, v) in &row.values {
@@ -3239,6 +3572,154 @@ mod tests {
                 .collect(),
             tags: Vec::new(),
             updated_at: 0,
+        }
+    }
+
+    /// The selected gated catalog row is the sole resolver snapshot for query_database: its count
+    /// and schema must win even when raw persistence contains deliberately different values. The
+    /// public tool path must also keep an exact locked folder name/id indistinguishable from absent.
+    #[test]
+    fn query_database_uses_selected_visible_catalog_count_and_schema() {
+        use crate::storage::models::{
+            NoteFolder, PropertyKind, PropertySchemaField, PropertyValue,
+        };
+
+        let db = tmp_db();
+        let visible_folder = NoteFolder {
+            id: "nf-catalog".into(),
+            name: "Catalog Tasks".into(),
+            path: "Notes/Catalog Tasks".into(),
+            parent_id: None,
+            locked: false,
+            unlocked: false,
+            is_root: false,
+            kind: "note".into(),
+        };
+        db.insert_note_folder(&visible_folder, "2026-07-29T00:00:00Z")
+            .unwrap();
+        // Persist a DIFFERENT schema from the selected catalog snapshot below. Any subsequent raw
+        // schema lookup would project `db_status` and make the catalog_status filter fail.
+        db.set_note_folder_schema(
+            &visible_folder.id,
+            &[PropertySchemaField {
+                key: "db_status".into(),
+                kind: PropertyKind::Text,
+                options: Vec::new(),
+            }],
+        )
+        .unwrap();
+        db.insert_note(
+            "note-catalog",
+            &visible_folder.id,
+            "catalog-task",
+            "Catalog Task",
+            "---\ncatalog_status: Open\ndb_status: Secret\n---\nbody",
+            1_000,
+        )
+        .unwrap();
+
+        let catalog_schema = vec![PropertySchemaField {
+            key: "catalog_status".into(),
+            kind: PropertyKind::Select,
+            options: vec!["Open".into(), "Done".into()],
+        }];
+        let unlocked = HashSet::new();
+        let out = query_database_from_catalog(
+            &db,
+            &visible_folder,
+            77,
+            &catalog_schema,
+            "catalog_status=Open",
+            &unlocked,
+        )
+        .unwrap();
+        assert!(
+            out.contains("1 matching rows of 77 visible records"),
+            "visible count must come from the selected catalog snapshot: {out}"
+        );
+        assert!(
+            out.contains("catalog_status: Open"),
+            "typed values must use the selected catalog schema: {out}"
+        );
+        assert!(
+            !out.contains("db_status") && !out.contains("Secret"),
+            "a later raw schema lookup bypassed the selected catalog schema: {out}"
+        );
+        assert_eq!(
+            crate::storage::db::coerce_property_value(
+                "Open",
+                catalog_schema[0].kind,
+                &catalog_schema[0].options,
+            ),
+            PropertyValue::Select("Open".into())
+        );
+
+        let secret_folder = NoteFolder {
+            id: "nf-secret".into(),
+            name: "Secret Catalog".into(),
+            path: "Notes/Secret Catalog".into(),
+            parent_id: None,
+            locked: false,
+            unlocked: false,
+            is_root: false,
+            kind: "note".into(),
+        };
+        db.insert_note_folder(&secret_folder, "2026-07-29T00:00:01Z")
+            .unwrap();
+        db.set_note_folder_schema(
+            &secret_folder.id,
+            &[PropertySchemaField {
+                key: "secret_schema".into(),
+                kind: PropertyKind::Text,
+                options: Vec::new(),
+            }],
+        )
+        .unwrap();
+        db.insert_note(
+            "note-secret",
+            &secret_folder.id,
+            "secret-task",
+            "Secret Task",
+            "---\nsecret_schema: classified\n---\nsecret body",
+            2_000,
+        )
+        .unwrap();
+        db.set_folder_locked(&secret_folder.id, true, Some(b"wrapped"))
+            .unwrap();
+
+        let config = AppConfig::default();
+        let absent = execute_tool(
+            &ToolCall::QueryDatabase {
+                folder: "does-not-exist".into(),
+                filter: String::new(),
+            },
+            &db,
+            &unlocked,
+            &config,
+        )
+        .unwrap();
+        for locked_needle in [&secret_folder.id, &secret_folder.name] {
+            let locked = execute_tool(
+                &ToolCall::QueryDatabase {
+                    folder: locked_needle.to_string(),
+                    filter: String::new(),
+                },
+                &db,
+                &unlocked,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(
+                locked, absent,
+                "exact locked name/id must be indistinguishable from an absent folder"
+            );
+            assert!(
+                !locked.contains(&secret_folder.id)
+                    && !locked.contains(&secret_folder.name)
+                    && !locked.contains("secret_schema")
+                    && !locked.contains("classified"),
+                "locked folder metadata leaked through query_database: {locked}"
+            );
         }
     }
 
@@ -5752,7 +6233,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            locked.contains("No outline for document od1"),
+            locked.contains("No outline for that document"),
             "sealed → sentinel: {locked}"
         );
         assert!(
@@ -6665,7 +7146,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_navigation_remains_mcp_only_and_outside_cloud_agent_catalogs() {
+    fn local_mcp_only_tools_remain_outside_cloud_agent_catalogs() {
         let specs = tool_specs();
         let get_meeting = specs
             .iter()
@@ -6682,9 +7163,108 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<HashSet<_>>();
         assert!(
-            !names.contains("search_transcript") && !names.contains("get_meeting_chapters"),
-            "transcript navigation is a loopback MCP surface, not agent/cloud prompt input"
+            !names.contains("search_transcript")
+                && !names.contains("get_meeting_chapters")
+                && !names.contains("list_entities")
+                && !names.contains("list_note_folders"),
+            "local MCP helpers must never become agent/cloud prompt input"
         );
+        for tool in ["list_entities", "list_note_folders"] {
+            for scope in [
+                AssistantScope::CurrentMeeting,
+                AssistantScope::Vault,
+                AssistantScope::Connectors,
+                AssistantScope::Full,
+            ] {
+                assert!(
+                    !scope.allows(tool),
+                    "{tool} must be rejected by every cloud-capable AssistantScope"
+                );
+            }
+        }
+
+        // The variants themselves are intentionally live on the loopback-MCP `execute_tool` seam.
+        // Seedless success sentinels prove that a later GatedToolExecutor result did NOT come from
+        // dispatching either variant and merely happen to look like an allowlist refusal.
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let nothing = HashSet::new();
+        let local_only_calls = [
+            (
+                "list_entities",
+                ToolCall::ListEntities {
+                    query: None,
+                    limit: 10,
+                },
+                "No visible entities.",
+            ),
+            (
+                "list_note_folders",
+                ToolCall::ListNoteFolders,
+                "No visible note folders.",
+            ),
+        ];
+        for (_, call, expected) in &local_only_calls {
+            assert_eq!(
+                execute_tool(call, &db, &nothing, &cfg).unwrap(),
+                *expected,
+                "the local-only ToolCall variant must remain executable on the loopback seam"
+            );
+        }
+
+        // Exercise BOTH ToolExecutor entry points (`specs` and `run`) across every scope and both
+        // surface gates. `run` must return the exact allowlist refusal, never either successful
+        // execute_tool sentinel above. The real agent loop calls these same trait methods.
+        let unlocked = Mutex::new(HashSet::new());
+        for scope in [
+            AssistantScope::CurrentMeeting,
+            AssistantScope::Vault,
+            AssistantScope::Connectors,
+            AssistantScope::Full,
+        ] {
+            for allow_writes in [false, true] {
+                for note_drafts in [false, true] {
+                    let exec = GatedToolExecutor {
+                        db: &db,
+                        unlocked: &unlocked,
+                        config: &cfg,
+                        meeting_id: "live1",
+                        app: None,
+                        recording_token: None,
+                        allow_writes,
+                        note_drafts,
+                        scope,
+                        seal: None,
+                        proposed_note: Mutex::new(None),
+                    };
+                    let executor: &dyn ToolExecutor = &exec;
+                    let advertised = executor
+                        .specs()
+                        .into_iter()
+                        .map(|spec| spec.name)
+                        .collect::<HashSet<_>>();
+                    for (name, _, local_success) in &local_only_calls {
+                        assert!(
+                            !advertised.contains(*name),
+                            "{name} entered GatedToolExecutor::specs at {scope:?}, \
+                             allow_writes={allow_writes}, note_drafts={note_drafts}"
+                        );
+                        match executor.run(name, &serde_json::json!({})) {
+                            Err(AppError::InvalidArg(message)) => assert_eq!(
+                                message,
+                                format!("tool '{name}' is not available"),
+                                "{name} must fail at the GatedToolExecutor allowlist"
+                            ),
+                            other => panic!(
+                                "{name} escaped the GatedToolExecutor allowlist at {scope:?}, \
+                                 allow_writes={allow_writes}, note_drafts={note_drafts}; \
+                                 local execute_tool success would be {local_success:?}, got {other:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
