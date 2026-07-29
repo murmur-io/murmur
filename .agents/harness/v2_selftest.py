@@ -98,9 +98,54 @@ def _standalone_driver(
     name: str = ".murmur-agent-driver",
     canonical_origin: bool = True,
     detached: bool = True,
+    with_server_dependency: bool = False,
 ) -> tuple[Path, Path, str]:
     primary = root / "meetnotes"
     base = _init_repo(primary)
+    if with_server_dependency:
+        server = root / "murmur-server"
+        _init_repo(server)
+        protocol = server / "crates" / "murmur-protocol"
+        (protocol / "src").mkdir(parents=True)
+        (protocol / "Cargo.toml").write_text(
+            "[package]\n"
+            'name = "murmur-protocol"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            "\n[lib]\n"
+            'path = "src/lib.rs"\n',
+            encoding="utf-8",
+        )
+        (protocol / "src" / "lib.rs").write_text(
+            "pub fn pinned() {}\n",
+            encoding="utf-8",
+        )
+        _git(server, "add", "crates/murmur-protocol")
+        _git(server, "commit", "-q", "-m", "add protocol crate")
+        server_revision = _git(server, "rev-parse", "HEAD")
+
+        (primary / "src-tauri").mkdir()
+        (primary / "src-tauri" / "Cargo.toml").write_text(
+            "[package]\n"
+            'name = "murmur-open-selftest"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            "\n[dependencies]\n"
+            'murmur-protocol = { path = "../../murmur-server/crates/murmur-protocol" }\n',
+            encoding="utf-8",
+        )
+        (primary / ".murmur-server-revision").write_text(
+            f"{server_revision}\n",
+            encoding="utf-8",
+        )
+        _git(
+            primary,
+            "add",
+            "src-tauri/Cargo.toml",
+            ".murmur-server-revision",
+        )
+        _git(primary, "commit", "-q", "-m", "pin server dependency")
+        base = _git(primary, "rev-parse", "HEAD")
     driver = root / name
     _git(
         primary,
@@ -131,6 +176,20 @@ def _invoke_open(driver: Path, args: argparse.Namespace) -> int:
             return harness_cli.cmd_open(args)
     finally:
         os.chdir(previous)
+
+
+def _invoke_open_json(
+    driver: Path, args: argparse.Namespace
+) -> tuple[int, Mapping[str, Any]]:
+    previous = Path.cwd()
+    output = io.StringIO()
+    try:
+        os.chdir(driver)
+        with contextlib.redirect_stdout(output):
+            result = harness_cli.cmd_open(args)
+    finally:
+        os.chdir(previous)
+    return result, json.loads(output.getvalue())
 
 
 def _git_tree_digest(git_dir: Path) -> str:
@@ -325,7 +384,7 @@ def standalone_driver_open_cases(test: Tests) -> None:
 
         task_id = "standalone-isolation"
         branch = f"agent/v2/{task_id}"
-        opened = _invoke_open(
+        opened, open_result = _invoke_open_json(
             driver,
             _open_args(task_id, base, branch),
         )
@@ -361,6 +420,14 @@ def standalone_driver_open_cases(test: Tests) -> None:
             metadata_valid = False
 
         test.equal("OPEN standalone driver succeeds offline", opened, 0)
+        test.equal(
+            "OPEN no-server response preserves its existing shape",
+            (
+                open_result["server_worktree"],
+                "server_checkout_mode" in open_result,
+            ),
+            (None, False),
+        )
         test.equal(
             "OPEN creates task branch only in driver common",
             harness_cli._local_branch_oid(driver, branch),
@@ -455,6 +522,143 @@ def standalone_driver_open_cases(test: Tests) -> None:
             "OPEN binds an explicit same-vendor high-risk exception",
             exception_contract["allow_same_vendor_high_risk"],
             True,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-driver-server-open-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(
+            root,
+            with_server_dependency=True,
+        )
+        source = root / "murmur-server"
+        source_git_before = _git_tree_digest(source / ".git")
+        task_id = "standalone-server-dependency"
+        result, opened = _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        runtime = legacy.load_json(task_dir / "runtime.json")
+        server_worktree = (
+            root
+            / ".murmur-agent-tasks"
+            / "v2"
+            / task_id
+            / "murmur-server"
+        )
+        revision = (
+            root
+            / ".murmur-agent-tasks"
+            / "v2"
+            / task_id
+            / "meetnotes"
+            / ".murmur-server-revision"
+        ).read_text(encoding="utf-8").strip()
+
+        test.equal(
+            "OPEN provisions a pinned server dependency immediately",
+            result,
+            0,
+        )
+        test.equal(
+            "OPEN prints the provisioned server checkout and mode",
+            (
+                opened["server_worktree"],
+                opened["server_checkout_mode"],
+            ),
+            (
+                str(server_worktree.resolve()),
+                "local-shared-clone",
+            ),
+        )
+        test.equal(
+            "OPEN runtime records the local shared clone",
+            (
+                runtime["server_worktree"],
+                runtime["server_revision"],
+                runtime["server_checkout_mode"],
+            ),
+            (
+                str(server_worktree.resolve()),
+                revision,
+                "local-shared-clone",
+            ),
+        )
+        test.equal(
+            "OPEN checks out the exact pinned server revision",
+            _git(server_worktree, "rev-parse", "HEAD"),
+            revision,
+        )
+        test.equal(
+            "OPEN server clone keeps Git metadata inside the task root",
+            Path(
+                _git(
+                    server_worktree,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+            ).resolve(),
+            (server_worktree / ".git").resolve(),
+        )
+        test.equal(
+            "OPEN server provisioning does not mutate sibling Git metadata",
+            _git_tree_digest(source / ".git"),
+            source_git_before,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-driver-server-rollback-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(
+            root,
+            with_server_dependency=True,
+        )
+        source = root / "murmur-server"
+        source_git_before = _git_tree_digest(source / ".git")
+        task_id = "standalone-server-rollback"
+        branch = f"agent/v2/{task_id}"
+        task_root = root / ".murmur-agent-tasks" / "v2" / task_id
+        original_set_v2_state = harness_cli.set_v2_state
+
+        def fail_after_server_provision(
+            task_dir: Path, status: str, **updates: Any
+        ) -> Dict[str, Any]:
+            del task_dir, status, updates
+            raise legacy.HarnessError(
+                "forced failure after server provisioning"
+            )
+
+        harness_cli.set_v2_state = fail_after_server_provision
+        try:
+            test.raises(
+                "OPEN reports a failure after server provisioning",
+                lambda: _invoke_open(
+                    driver,
+                    _open_args(task_id, base, branch),
+                ),
+                "forced failure after server provisioning",
+            )
+        finally:
+            harness_cli.set_v2_state = original_set_v2_state
+        test.true(
+            "OPEN rollback removes the provisioned server task root",
+            not task_root.exists(),
+        )
+        test.equal(
+            "OPEN rollback removes its unchanged client branch",
+            harness_cli._local_branch_oid(driver, branch),
+            None,
+        )
+        test.equal(
+            "OPEN rollback leaves sibling Git metadata unchanged",
+            _git_tree_digest(source / ".git"),
+            source_git_before,
         )
 
     with tempfile.TemporaryDirectory(prefix="murmur-v2-driver-linked-") as raw:
