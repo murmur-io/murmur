@@ -609,6 +609,8 @@ def cmd_open(args: argparse.Namespace) -> int:
     branch_expected_oid: Optional[str] = None
     task_dir_created = False
     task_root_created = False
+    provisioned_server_worktree: Optional[Path] = None
+    provisioned_server_mode: Optional[str] = None
     try:
         task_root.mkdir(parents=True)
         task_root_created = True
@@ -650,16 +652,34 @@ def cmd_open(args: argparse.Namespace) -> int:
                 "server_checkout_mode": None,
             },
         )
+        if legacy.has_murmur_server_path_dependency(worktree):
+            provisioned_server_worktree = _ensure_server_worktree(
+                contract,
+                task_dir,
+                {"server_required": True},
+            )
+            provisioned_runtime = legacy.load_json(task_dir / "runtime.json")
+            provisioned_server_mode = str(
+                provisioned_runtime["server_checkout_mode"]
+            )
         set_v2_state(task_dir, "OPEN", phase="open")
     except Exception:
         if server_worktree.exists():
-            server_source = primary.parent / "murmur-server"
-            if server_source.is_dir():
-                legacy.run_capture(
-                    ["git", "worktree", "remove", "--force", str(server_worktree)],
-                    server_source,
-                    check=False,
-                )
+            # The task root was proven absent before OPEN created it, and the
+            # server checkout is the one exact child created by this attempt.
+            # Removing the local shared clone cannot mutate the sibling
+            # repository's Git metadata and also handles a partially completed
+            # clone whose runtime metadata was never written.
+            try:
+                metadata = server_worktree.lstat()
+                if (
+                    not stat.S_ISLNK(metadata.st_mode)
+                    and stat.S_ISDIR(metadata.st_mode)
+                    and server_worktree.parent.resolve() == task_root.resolve()
+                ):
+                    shutil.rmtree(server_worktree)
+            except OSError:
+                pass
         if worktree.exists():
             legacy.run_capture(
                 ["git", "worktree", "remove", "--force", str(worktree)],
@@ -679,19 +699,21 @@ def cmd_open(args: argparse.Namespace) -> int:
             except OSError:
                 pass
         raise
-    print(
-        json.dumps(
-            {
-                "task_id": args.task_id,
-                "generation": 2,
-                "status": "OPEN",
-                "base_sha": base_sha,
-                "worktree": str(worktree),
-                "server_worktree": None,
-            },
-            indent=2,
-        )
-    )
+    opened = {
+        "task_id": args.task_id,
+        "generation": 2,
+        "status": "OPEN",
+        "base_sha": base_sha,
+        "worktree": str(worktree),
+        "server_worktree": (
+            str(provisioned_server_worktree)
+            if provisioned_server_worktree is not None
+            else None
+        ),
+    }
+    if provisioned_server_mode is not None:
+        opened["server_checkout_mode"] = provisioned_server_mode
+    print(json.dumps(opened, indent=2))
     return 0
 
 
@@ -3966,9 +3988,15 @@ def cmd_clean(args: argparse.Namespace) -> int:
     try:
         state = load_v2_state(task_dir)
         if state.get("status") in verifier.V2_TERMINAL_STATES:
+            removed = legacy.prune_task_runtime(task_dir)
+            runtime_note = (
+                f"; pruned runtime: {', '.join(removed)}"
+                if removed
+                else ""
+            )
             print(
                 f"{contract['task_id']}: {state['status']} "
-                "(cleanup already complete)"
+                f"(cleanup already complete{runtime_note})"
             )
             return 0
         worktree = Path(str(contract["worktree_path"]))
@@ -4034,6 +4062,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 intent_sha256=intent["intent_sha256"],
             )
         _execute_clean_intent(contract, task_dir, intent)
+        removed = legacy.prune_task_runtime(task_dir)
         final = str(intent["final_status"])
         set_v2_state(
             task_dir,
@@ -4044,6 +4073,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
             tree_sha=intent["tree_sha"],
             previous_status=intent["previous_status"],
             clean_intent_sha256=intent["intent_sha256"],
+            runtime_removed=removed,
         )
     finally:
         release_v2_run_lock(lock)

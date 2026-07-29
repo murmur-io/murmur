@@ -53,6 +53,11 @@ pub struct SummarizeRequest {
     /// this string EGRESSES to the provider in the prompt — `RedactingProvider` MUST scrub it
     /// alongside the transcript (summarize/redact.rs) before egress.
     pub live_bullets: Option<String>,
+    /// Bounded, structured workspace glossary rendered locally from Settings. `None` means the
+    /// user prompt is byte-identical to the pre-glossary prompt. When present this EGRESSES in the
+    /// note-generation prompt and MUST pass the same shared regex + name-redaction batch as the
+    /// transcript. It is never included in the separate graph-extraction call.
+    pub glossary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +65,15 @@ pub struct SummarizeRequest {
 pub enum Availability {
     Available,
     Unavailable { reason: String },
+}
+
+/// Canonical system prompt used by the trait's free-text JSON fallback. Kept as a helper so the
+/// egress ledger can measure the exact bytes the default path sends without reimplementing it.
+pub(crate) fn default_json_system_prompt(system: &str, schema: &Value) -> String {
+    format!(
+        "{system}\n\nRespond with ONLY a single JSON object matching this schema (no prose, no code fences):\n{}",
+        serde_json::to_string(schema).unwrap_or_default()
+    )
 }
 
 #[async_trait]
@@ -126,10 +140,7 @@ pub trait SummarizerProvider: Send + Sync {
     ) -> Result<(Value, CallMeta)> {
         // Default: embed the schema as a system-prompt instruction and call complete_with_meta
         // so token usage is captured even on the free-text path.
-        let sys = format!(
-            "{system}\n\nRespond with ONLY a single JSON object matching this schema (no prose, no code fences):\n{}",
-            serde_json::to_string(schema).unwrap_or_default()
-        );
+        let sys = default_json_system_prompt(system, schema);
         let (reply, meta) = self.complete_with_meta(&sys, user).await?;
         let v = crate::reason::parse_first_json::<Value>(&reply)?;
         Ok((v, meta))
@@ -283,6 +294,7 @@ mod tests {
             related_context: None,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         };
         let (text, meta) = p.summarize_with_meta(&req).await.unwrap();
         assert_eq!(text, "note body");

@@ -228,10 +228,19 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::SearchMeetings { .. } => "Related meetings",
         ToolCall::SearchSemantic { .. } => "Semantically related",
         ToolCall::GetEntityDossier { .. } => "Entity dossier",
+        // Local-MCP-only discovery variants: orchestration never constructs them, but exhaustive
+        // labels keep the shared transport enum compile-safe without advertising either to a model.
+        ToolCall::ListEntities { .. } => "Entities",
+        ToolCall::ListNoteFolders => "Note folders",
         // Brain v3 PR-6 — knowledge diff / decision ledger (explicit tool; label for completeness).
         ToolCall::KnowledgeDiff { .. } => "Knowledge diff",
         ToolCall::GetOpenCommitments { .. } => "Open commitments",
         ToolCall::GetMeeting { .. } => "Meeting",
+        // MCP-only variants: `map_to_tool_call` never constructs these. Exhaustive labels keep the
+        // transport enum compile-safe without admitting transcript payloads to this cloud-capable
+        // note-orchestration corpus.
+        ToolCall::SearchTranscript { .. } => "Transcript matches",
+        ToolCall::GetMeetingChapters { .. } => "Meeting chapters",
         ToolCall::GetDocument { .. } => "Document",
         // Brain v3 audit Fix 3(b) — the document outline (structural map; explicit tool).
         ToolCall::GetDocumentOutline { .. } => "Document outline",
@@ -362,6 +371,20 @@ mod tests {
         AppConfig {
             provider_id: "anthropic".to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transcript_navigation_is_not_admitted_to_cloud_capable_note_orchestration() {
+        for tool in ["search_transcript", "get_meeting_chapters"] {
+            assert!(
+                map_to_tool_call(&RetrievalQuery {
+                    tool: tool.to_string(),
+                    query: "private transcript".into(),
+                })
+                .is_none(),
+                "{tool} is MCP-only and must not enter the provider-bound corpus"
+            );
         }
     }
 

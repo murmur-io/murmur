@@ -11,6 +11,10 @@ use meetnotes_lib::export;
 use meetnotes_lib::summarize::provider::{MeetingMeta, SummarizeRequest};
 use meetnotes_lib::transcribe::Transcriber;
 
+const E2E_GLOSSARY: &str = "Murmur = MeetNotes, Meet Notes";
+const E2E_GLOSSARY_PROMPT_LINE: &str =
+    r#"- {"canonical":"Murmur","aliases":["MeetNotes","Meet Notes"]}"#;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -55,6 +59,14 @@ async fn main() {
         .last()
         .map(|s| s.end_s as i64)
         .unwrap_or(0);
+    let rendered_glossary =
+        meetnotes_lib::summarize::template::render_glossary_for_prompt(E2E_GLOSSARY)
+            .expect("the deterministic glossary fixture must contain one bounded entry");
+    assert_eq!(
+        rendered_glossary.trim_end(),
+        E2E_GLOSSARY_PROMPT_LINE,
+        "the core fixture must use the exact production glossary renderer"
+    );
     let req = SummarizeRequest {
         transcript: transcript.full_text.clone(),
         meta: MeetingMeta {
@@ -68,7 +80,23 @@ async fn main() {
         related_context: None,
         user_notes: None,
         live_bullets: None,
+        glossary: Some(rendered_glossary),
     };
+
+    // Exercise the real bounded glossary renderer locally without invoking any provider. Identical
+    // fixture bytes must produce identical prompt bytes, with one canonical spelling and its aliases.
+    let glossary_prompt = meetnotes_lib::summarize::template::render_prompt(&req);
+    assert_eq!(
+        glossary_prompt,
+        meetnotes_lib::summarize::template::render_prompt(&req),
+        "the deterministic glossary fixture must render byte-identically"
+    );
+    assert_eq!(
+        glossary_prompt.matches(E2E_GLOSSARY_PROMPT_LINE).count(),
+        1,
+        "the bounded glossary fixture must render exactly once"
+    );
+    eprintln!("[e2e] deterministic workspace glossary rendered locally (no egress)");
 
     println!("provider mode: deterministic-stub (no egress)");
     eprintln!("[e2e] using deterministic local stub (no provider egress)");

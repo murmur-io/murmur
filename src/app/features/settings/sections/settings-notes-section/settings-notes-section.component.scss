@@ -42,6 +42,10 @@
   font-size: 0.9rem;
   font-weight: 550;
 }
+.glossary-input {
+  font-family: var(--font-mono);
+  resize: vertical;
+}
 
 /* --- Capture-system-audio toggle row --- */
 .toggle-row {
