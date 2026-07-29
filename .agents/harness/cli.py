@@ -3036,8 +3036,17 @@ DISPOSABLE_IGNORED_FILES = {
     "src-tauri/binaries/murmur-brain",
     "test-results/.last-run.json",
 }
+SNAPSHOT_DISPOSABLE_IGNORED_FILES = {
+    "src-tauri/binaries/meetnotes-aeccap",
+    "src-tauri/binaries/meetnotes-audiocap",
+    "src-tauri/binaries/meetnotes-sysaudio",
+    "src-tauri/binaries/murmur-brain",
+}
 CARGO_CACHE_PREFIXES = ("src-tauri/target", "target")
 CARGO_CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+IGNORED_POLICY_NONE = "none"
+IGNORED_POLICY_SNAPSHOT_HELPERS = "snapshot-helpers"
+IGNORED_POLICY_FULL = "full"
 
 
 def _valid_cargo_cache_root(worktree: Path, prefix: str) -> bool:
@@ -3076,6 +3085,23 @@ def _disposable_ignored_path(worktree: Path, path: str) -> bool:
             return False
         return _valid_cargo_cache_root(worktree, prefix)
     return False
+
+
+def _ignored_path_allowed(
+    worktree: Path,
+    path: str,
+    *,
+    policy: str,
+) -> bool:
+    if policy == IGNORED_POLICY_NONE:
+        return False
+    if policy == IGNORED_POLICY_SNAPSHOT_HELPERS:
+        return path in SNAPSHOT_DISPOSABLE_IGNORED_FILES
+    if policy == IGNORED_POLICY_FULL:
+        return _disposable_ignored_path(worktree, path)
+    raise runtime.HarnessError(
+        f"v2 clean ignored-byte policy is malformed: {policy}"
+    )
 
 
 def _ignored_paths(worktree: Path) -> List[str]:
@@ -3644,10 +3670,19 @@ def _verification_snapshots_for_cleanup(
                         "refusing clean: verification snapshot HEAD changed"
                     )
                 ignored = _ignored_paths(snapshot)
-                if ignored:
+                protected_ignored = [
+                    path
+                    for path in ignored
+                    if not _ignored_path_allowed(
+                        snapshot,
+                        path,
+                        policy=IGNORED_POLICY_SNAPSHOT_HELPERS,
+                    )
+                ]
+                if protected_ignored:
                     raise runtime.HarnessError(
                         "refusing clean: verification snapshot has ignored bytes: "
-                        + ", ".join(ignored[:20])
+                        + ", ".join(protected_ignored[:20])
                     )
                 expected_tree = runtime.git(
                     primary, "rev-parse", f"{commit_sha}^{{tree}}"
@@ -5399,7 +5434,7 @@ def _freeze_clean_delete_manifest(
     intent: Mapping[str, Any],
     expected_tree: str,
     expected_revision: Optional[str],
-    allow_disposable_ignored: bool,
+    ignored_policy: str,
 ) -> Dict[str, Any]:
     manifest_path = task_dir / f"clean-delete-{role}.json"
     if _immutable_artifact_exists(
@@ -5432,9 +5467,10 @@ def _freeze_clean_delete_manifest(
     unknown = sorted(
         path
         for path in ignored_before
-        if not (
-            allow_disposable_ignored
-            and _disposable_ignored_path(root, path)
+        if not _ignored_path_allowed(
+            root,
+            path,
+            policy=ignored_policy,
         )
     )
     if unknown:
@@ -6274,7 +6310,7 @@ def _prepare_frozen_root_cleanup(
     role: str,
     record: Mapping[str, Any],
     git_owner: Optional[Path],
-    allow_disposable_ignored: bool,
+    ignored_policy: str,
 ) -> Dict[str, Any]:
     original = Path(str(record["path"]))
     quarantine = Path(str(record["quarantine_path"]))
@@ -6319,7 +6355,7 @@ def _prepare_frozen_root_cleanup(
         intent=intent,
         expected_tree=str(record["expected_tree"]),
         expected_revision=record.get("expected_revision"),
-        allow_disposable_ignored=allow_disposable_ignored,
+        ignored_policy=ignored_policy,
     )
     final_control = _archive_git_control(
         task_dir=task_dir,
@@ -6853,7 +6889,7 @@ def _execute_clean_intent(
             "role": "client",
             "record": client_record,
             "git_owner": primary,
-            "allow_disposable_ignored": True,
+            "ignored_policy": IGNORED_POLICY_FULL,
         }
     ]
 
@@ -6881,7 +6917,7 @@ def _execute_clean_intent(
                 "role": "server",
                 "record": server_record,
                 "git_owner": server_owner,
-                "allow_disposable_ignored": False,
+                "ignored_policy": IGNORED_POLICY_NONE,
             }
         )
 
@@ -6902,7 +6938,7 @@ def _execute_clean_intent(
                 "role": f"snapshot-{index:04d}",
                 "record": snapshot_record,
                 "git_owner": None,
-                "allow_disposable_ignored": False,
+                "ignored_policy": IGNORED_POLICY_SNAPSHOT_HELPERS,
             }
         )
 
@@ -6924,9 +6960,7 @@ def _execute_clean_intent(
             role=str(job["role"]),
             record=job["record"],
             git_owner=job["git_owner"],
-            allow_disposable_ignored=bool(
-                job["allow_disposable_ignored"]
-            ),
+            ignored_policy=str(job["ignored_policy"]),
         )
         for job in cleanup_jobs
     ]

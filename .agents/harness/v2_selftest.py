@@ -7665,8 +7665,47 @@ def commit_recovery_cases(test: Tests) -> None:
         snapshot_exclude = present_snapshots[0] / ".git" / "info" / "exclude"
         snapshot_exclude.write_text(
             snapshot_exclude.read_text(encoding="utf-8")
-            + "\n.DS_Store\n",
+            + "\n.DS_Store\n"
+            + "/.angular/cache/\n"
+            + "/src-tauri/binaries/meetnotes-aeccap\n"
+            + "/src-tauri/binaries/meetnotes-audiocap\n"
+            + "/src-tauri/binaries/meetnotes-sysaudio\n"
+            + "/src-tauri/binaries/meetnotes-brain\n"
+            + "/src-tauri/binaries/murmur-brain\n"
+            + "/test-results/.last-run.json\n",
             encoding="utf-8",
+        )
+        snapshot_sidecars = [
+            present_snapshots[0] / relative
+            for relative in (
+                "src-tauri/binaries/meetnotes-aeccap",
+                "src-tauri/binaries/meetnotes-audiocap",
+                "src-tauri/binaries/meetnotes-sysaudio",
+                "src-tauri/binaries/murmur-brain",
+            )
+        ]
+        snapshot_sidecar_payloads: Dict[Path, bytes] = {}
+        for index, sidecar in enumerate(snapshot_sidecars):
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            payload = f"runner snapshot sidecar {index}\n".encode(
+                "ascii"
+            )
+            sidecar.write_bytes(payload)
+            snapshot_sidecar_payloads[sidecar] = payload
+        accepted_snapshots = (
+            harness_cli._verification_snapshots_for_cleanup(
+                contract,
+                task_dir,
+            )
+        )
+        test.true(
+            "CLEAN snapshot policy accepts only the exact runner sidecars",
+            any(
+                path == present_snapshots[0]
+                for path, _reference, _commit, _head
+                in accepted_snapshots
+            )
+            and all(sidecar.is_file() for sidecar in snapshot_sidecars),
         )
         protected_snapshot_byte = present_snapshots[0] / ".DS_Store"
         protected_snapshot_byte.write_bytes(
@@ -7706,6 +7745,113 @@ def commit_recovery_cases(test: Tests) -> None:
             and not (task_dir / "clean-intent.json").exists(),
         )
         protected_snapshot_byte.unlink()
+
+        protected_snapshot_cache = (
+            present_snapshots[0]
+            / ".angular"
+            / "cache"
+            / "compiler.db"
+        )
+        protected_snapshot_cache.parent.mkdir(parents=True)
+        protected_snapshot_cache.write_bytes(
+            b"snapshot prefix policy must stay narrow\n"
+        )
+        blocked_prefix_clean = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                (
+                    "import argparse,sys;"
+                    f"sys.path.insert(0,{fixture_python!r});"
+                    "import cli;"
+                    f"__import__('os').chdir({str(repo)!r});"
+                    "cli.cmd_clean(argparse.Namespace("
+                    "task_id='commit-crash',abandon=False,"
+                    "_allow_test_adapter=True))"
+                ),
+            ],
+            cwd=str(repo),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.true(
+            "CLEAN snapshot exact-files policy rejects ignored cache prefixes",
+            blocked_prefix_clean.returncode != 0
+            and "verification snapshot has ignored bytes"
+            in blocked_prefix_clean.stderr
+            and ".angular/cache/compiler.db"
+            in blocked_prefix_clean.stderr,
+        )
+        test.true(
+            "CLEAN cache-prefix refusal preserves snapshot and exact sidecars",
+            protected_snapshot_cache.read_bytes()
+            == b"snapshot prefix policy must stay narrow\n"
+            and all(sidecar.is_file() for sidecar in snapshot_sidecars)
+            and not (task_dir / "clean-intent.json").exists(),
+        )
+        protected_snapshot_cache.unlink()
+
+        snapshot_client_only_ignored = (
+            (
+                "src-tauri/binaries/meetnotes-brain",
+                b"client-only meetnotes brain\n",
+            ),
+            (
+                "test-results/.last-run.json",
+                b'{"client_only":true}\n',
+            ),
+        )
+        for relative, payload in snapshot_client_only_ignored:
+            protected = present_snapshots[0] / relative
+            protected.parent.mkdir(parents=True, exist_ok=True)
+            protected.write_bytes(payload)
+            blocked_scope_clean = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    (
+                        "import argparse,sys;"
+                        f"sys.path.insert(0,{fixture_python!r});"
+                        "import cli;"
+                        f"__import__('os').chdir({str(repo)!r});"
+                        "cli.cmd_clean(argparse.Namespace("
+                        "task_id='commit-crash',abandon=False,"
+                        "_allow_test_adapter=True))"
+                    ),
+                ],
+                cwd=str(repo),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            test.true(
+                f"CLEAN snapshot policy rejects client-only ignored file {relative}",
+                blocked_scope_clean.returncode != 0
+                and "verification snapshot has ignored bytes"
+                in blocked_scope_clean.stderr
+                and relative in blocked_scope_clean.stderr,
+            )
+            test.true(
+                f"CLEAN client-only refusal preserves every byte for {relative}",
+                repo.is_dir()
+                and present_snapshots[0].is_dir()
+                and protected.read_bytes() == payload
+                and all(
+                    sidecar.read_bytes() == expected
+                    for sidecar, expected
+                    in snapshot_sidecar_payloads.items()
+                )
+                and not (task_dir / "clean-intent.json").exists()
+                and not any(
+                    present_snapshots[0].parent.glob(
+                        ".clean-quarantine-*"
+                    )
+                ),
+            )
+            protected.unlink()
 
         source_manifests = [
             runtime.load_json(path)
@@ -7794,6 +7940,10 @@ def commit_recovery_cases(test: Tests) -> None:
         test.true(
             "CLEAN removes materialized verification snapshots",
             all(not path.exists() for path in present_snapshots),
+        )
+        test.true(
+            "CLEAN exact runner sidecars do not block successful snapshot removal",
+            all(not sidecar.exists() for sidecar in snapshot_sidecars),
         )
         clean_intent = runtime.load_json(task_dir / "clean-intent.json")
         snapshot_archive_index = next(
