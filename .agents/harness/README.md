@@ -45,11 +45,28 @@ scripts/agent-harness commit attachment-loss \
 Keep the task through push, PR checks, and merge. Afterwards:
 
 ```bash
+# Run from the standalone driver/primary, not from a shell inside the task.
 scripts/agent-harness clean attachment-loss
 ```
 
 To abandon a task, use `clean <task-id> --abandon`. Cleanup first archives every
-Git-visible task byte and only then removes that task's worktree and branch.
+Git-visible task byte. It also preserves the exact Git-control state before and
+after quarantine: linked-worktree markers and admin records, plus every ref,
+reflog, config, index, pack, and loose object in standalone server and verifier
+checkouts. A verified self-contained object pack keeps linked-admin, shared
+clone, reflog-only, and index-only objects recoverable without the original
+object database. Immutable completion records bind those payloads. Cleanup then
+stages every root and linked admin directory without unlinking, publishes an
+all-staged barrier, dry-validates every staged root/admin and every recovery
+archive as one set, and publishes an all-validated barrier before the first
+unlink. It repeats that global validation on entry to coordinated finalization;
+an interruption resumes from the same evidence. Git-control archives larger
+than 512 MiB fail closed while all task bytes remain in place. These checks
+protect against crashes and cooperating local processes; as with any
+point-in-time filesystem proof, a malicious process running as the same UID can
+race a completed check. The current Murmur runner records and explicitly
+requires Git's SHA-1 object format. Cleanup also refuses without moving the
+worktree while any process still has a cwd or open file inside it.
 
 ## What is automatic
 

@@ -92,6 +92,20 @@ def _init_repo(repo: Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _seed_executing_protocol(repo: Path) -> str:
+    """Commit the exact protocol imported by this selftest into a fixture."""
+
+    for relative in verifier.protocol_relative_paths(ROOT):
+        source = ROOT / relative
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        target.chmod(source.stat().st_mode & 0o777)
+    _git(repo, "add", "--", *verifier.protocol_relative_paths(ROOT))
+    _git(repo, "commit", "-q", "-m", "seed current harness protocol")
+    return _git(repo, "rev-parse", "HEAD")
+
+
 def _standalone_driver(
     root: Path,
     *,
@@ -146,6 +160,7 @@ def _standalone_driver(
         )
         _git(primary, "commit", "-q", "-m", "pin server dependency")
         base = _git(primary, "rev-parse", "HEAD")
+    base = _seed_executing_protocol(primary)
     driver = root / name
     _git(
         primary,
@@ -214,6 +229,203 @@ def _git_tree_digest(git_dir: Path) -> str:
     return digest.hexdigest()
 
 
+def _tree_leaf_payloads(root: Path) -> Dict[str, bytes]:
+    payloads: Dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            payloads[relative] = os.readlink(path).encode(
+                "utf-8", "surrogateescape"
+            )
+        elif path.is_file():
+            payloads[relative] = path.read_bytes()
+    return payloads
+
+
+def _unique_git_control_payloads(
+    repository: Path,
+    reference: str,
+    object_id: str,
+) -> Dict[str, bytes]:
+    git_dir = Path(
+        _git(
+            repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+        )
+    )
+    relative_paths = (
+        reference,
+        f"logs/{reference}",
+        f"objects/{object_id[:2]}/{object_id[2:]}",
+    )
+    payloads: Dict[str, bytes] = {}
+    for relative in relative_paths:
+        path = git_dir / relative
+        if not path.is_file() or path.is_symlink():
+            raise AssertionError(
+                f"expected loose Git-control payload is absent: {relative}"
+            )
+        payloads[relative] = path.read_bytes()
+    return payloads
+
+
+def _archived_git_control_payloads(
+    task_dir: Path,
+    archive_role: str,
+) -> Dict[str, bytes]:
+    manifest = runtime.load_json(
+        task_dir / f"clean-git-control-{archive_role}.json"
+    )
+    completion = runtime.load_json(
+        task_dir
+        / f"clean-git-control-{archive_role}-complete.json"
+    )
+    if (
+        manifest.get("schema_version") != 2
+        or manifest.get("archive_role") != archive_role
+        or manifest.get("manifest_sha256")
+        != verifier.document_hash(manifest, "manifest_sha256")
+        or completion.get("schema_version") != 2
+        or completion.get("archive_role") != archive_role
+        or completion.get("manifest_sha256")
+        != manifest["manifest_sha256"]
+        or completion.get("complete_sha256")
+        != verifier.document_hash(completion, "complete_sha256")
+    ):
+        raise AssertionError(
+            f"Git-control archive binding mismatch: {archive_role}"
+        )
+    payloads: Dict[str, bytes] = {}
+    for record in completion["payloads"]:
+        if record["source"] != "control":
+            continue
+        payload_path = task_dir / str(record["payload"])
+        payload = payload_path.read_bytes()
+        if runtime.sha256_bytes(payload) != record["sha256"]:
+            raise AssertionError(
+                f"Git-control archive payload hash mismatch: {archive_role}"
+            )
+        payloads[str(record["path"])] = payload
+    return payloads
+
+
+def _git_control_payloads_recoverable(
+    task_dir: Path,
+    archive_roles: Sequence[str],
+    expected: Mapping[str, bytes],
+) -> bool:
+    return all(
+        all(
+            archived.get(relative) == payload
+            for relative, payload in expected.items()
+        )
+        for archived in (
+            _archived_git_control_payloads(task_dir, role)
+            for role in archive_roles
+        )
+    )
+
+
+def _git_object_available(repository: Path, object_id: str) -> bool:
+    completed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "cat-file",
+            "-e",
+            f"{object_id}^{{object}}",
+        ],
+        cwd=str(repository),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def _restore_archived_git_repository(
+    task_dir: Path,
+    archive_role: str,
+    destination: Path,
+    *,
+    linked_admin: bool = False,
+) -> set[str]:
+    manifest = runtime.load_json(
+        task_dir / f"clean-git-control-{archive_role}.json"
+    )
+    completion = runtime.load_json(
+        task_dir
+        / f"clean-git-control-{archive_role}-complete.json"
+    )
+    # Reuse the strict schema/hash/payload validation before restoring bytes.
+    _archived_git_control_payloads(task_dir, archive_role)
+    records = {
+        (str(record["source"]), str(record["path"])): record
+        for record in completion["payloads"]
+    }
+    destination.mkdir()
+    _git(destination, "init", "-q", "--object-format=sha1")
+    git_dir = destination / ".git"
+    for entry in manifest["entries"]:
+        relative = str(entry["path"])
+        if linked_admin and relative in {"commondir", "gitdir"}:
+            continue
+        target = git_dir / relative
+        if entry["kind"] == "directory":
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        record = records[("control", relative)]
+        payload = (task_dir / str(record["payload"])).read_bytes()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if entry["kind"] == "regular":
+            target.write_bytes(payload)
+            target.chmod(int(entry["mode"]))
+        elif entry["kind"] == "symlink":
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            os.symlink(
+                payload.decode("utf-8", "surrogateescape"),
+                target,
+            )
+        else:
+            raise AssertionError(
+                f"unsupported archived Git-control entry: {relative}"
+            )
+
+    pack_record = records[("object-pack", "objects.pack")]
+    index_record = records[("object-pack", "objects.idx")]
+    pack = (task_dir / str(pack_record["payload"])).read_bytes()
+    index = (task_dir / str(index_record["payload"])).read_bytes()
+    if (
+        len(pack) < 20
+        or runtime.sha256_bytes(pack) != pack_record["sha256"]
+        or runtime.sha256_bytes(index) != index_record["sha256"]
+    ):
+        raise AssertionError(
+            f"archived Git-control object pack is malformed: {archive_role}"
+        )
+    pack_name = f"pack-{pack[-20:].hex()}"
+    pack_dir = git_dir / "objects" / "pack"
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    restored_pack = pack_dir / f"{pack_name}.pack"
+    restored_index = pack_dir / f"{pack_name}.idx"
+    restored_pack.write_bytes(pack)
+    restored_index.write_bytes(index)
+    verified = _git(
+        destination,
+        "verify-pack",
+        "-v",
+        str(restored_index),
+    )
+    return {
+        line.split()[0]
+        for line in verified.splitlines()
+        if line and runtime.SHA1_RE.fullmatch(line.split()[0])
+    }
+
+
 def _open_args(task_id: str, base: str, branch: str) -> argparse.Namespace:
     return argparse.Namespace(
         task_id=task_id,
@@ -228,6 +440,241 @@ def _open_args(task_id: str, base: str, branch: str) -> argparse.Namespace:
         kind="harness",
         expected_change=True,
     )
+
+
+def open_protocol_base_cases(test: Tests) -> None:
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-open-protocol-") as raw:
+        root = Path(raw)
+        _primary, driver, current_base = _standalone_driver(root)
+        common = (driver / ".git").resolve()
+
+        missing_base = _git(
+            driver,
+            "rev-list",
+            "--max-parents=0",
+            current_base,
+        )
+        missing_task = "missing-base-protocol"
+        missing_branch = f"agent/v2/{missing_task}"
+        test.raises(
+            "OPEN rejects a base missing the executing protocol before mutation",
+            lambda: _invoke_open(
+                driver,
+                _open_args(missing_task, missing_base, missing_branch),
+            ),
+            "missing required protocol file",
+        )
+        test.true(
+            "OPEN missing-protocol refusal creates no task bytes",
+            not harness_cli.v2_task_dir(common, missing_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / missing_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, missing_branch) is None,
+        )
+
+        extra_module = driver / ".agents" / "harness" / "json.py"
+        extra_module.write_text(
+            "raise RuntimeError('must never shadow the standard library')\n",
+            encoding="utf-8",
+        )
+        _git(driver, "add", ".agents/harness/json.py")
+        _git(driver, "commit", "-q", "-m", "add shadowing protocol module")
+        shadowed_base = _git(driver, "rev-parse", "HEAD")
+        shadowed_task = "shadowed-base-protocol"
+        shadowed_branch = f"agent/v2/{shadowed_task}"
+        test.raises(
+            "OPEN rejects an extra base-side executable protocol module",
+            lambda: _invoke_open(
+                driver,
+                _open_args(shadowed_task, shadowed_base, shadowed_branch),
+            ),
+            "base protocol differs",
+        )
+        test.true(
+            "OPEN extra-module refusal creates no task bytes",
+            not harness_cli.v2_task_dir(common, shadowed_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / shadowed_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, shadowed_branch) is None,
+        )
+        _git(driver, "rm", "-q", ".agents/harness/json.py")
+        _git(driver, "commit", "-q", "-m", "restore protocol path set")
+
+        package = driver / ".agents" / "harness" / "json" / "__init__.py"
+        package.parent.mkdir()
+        package.write_text(
+            "raise RuntimeError('package must never shadow stdlib json')\n",
+            encoding="utf-8",
+        )
+        _git(driver, "add", ".agents/harness/json/__init__.py")
+        _git(driver, "commit", "-q", "-m", "add shadowing protocol package")
+        package_base = _git(driver, "rev-parse", "HEAD")
+        package_task = "package-shadowed-base-protocol"
+        package_branch = f"agent/v2/{package_task}"
+        test.raises(
+            "OPEN rejects an extra base-side protocol package",
+            lambda: _invoke_open(
+                driver,
+                _open_args(package_task, package_base, package_branch),
+            ),
+            "base protocol differs",
+        )
+        test.true(
+            "OPEN extra-package refusal creates no task bytes",
+            not harness_cli.v2_task_dir(common, package_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / package_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, package_branch) is None,
+        )
+        _git(driver, "rm", "-q", "-r", ".agents/harness/json")
+        _git(driver, "commit", "-q", "-m", "restore protocol package set")
+
+        wrapper = driver / "scripts" / "agent-harness"
+        wrapper.chmod(0o644)
+        _git(driver, "add", "scripts/agent-harness")
+        _git(driver, "commit", "-q", "-m", "drop harness executable bit")
+        mode_base = _git(driver, "rev-parse", "HEAD")
+        mode_task = "mode-drifted-base-protocol"
+        mode_branch = f"agent/v2/{mode_task}"
+        test.raises(
+            "OPEN rejects executable mode drift in the selected base",
+            lambda: _invoke_open(
+                driver,
+                _open_args(mode_task, mode_base, mode_branch),
+            ),
+            "base protocol differs",
+        )
+        test.true(
+            "OPEN mode-drift refusal creates no task bytes",
+            not harness_cli.v2_task_dir(common, mode_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / mode_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, mode_branch) is None,
+        )
+        wrapper.chmod(0o755)
+        _git(driver, "add", "scripts/agent-harness")
+        _git(driver, "commit", "-q", "-m", "restore harness executable bit")
+
+        config = driver / ".agents" / "harness" / "config.json"
+        exact_blob = _git(
+            driver,
+            "rev-parse",
+            f"{current_base}:.agents/harness/config.json",
+        )
+        config.write_bytes(config.read_bytes() + b"\n")
+        _git(driver, "add", ".agents/harness/config.json")
+        _git(driver, "commit", "-q", "-m", "drift protocol fixture")
+        drifted_base = _git(driver, "rev-parse", "HEAD")
+        drifted_blob = _git(
+            driver,
+            "rev-parse",
+            f"{drifted_base}:.agents/harness/config.json",
+        )
+        _git(driver, "replace", drifted_blob, exact_blob)
+        test.true(
+            "OPEN immutable base bundle ignores a masking Git replacement",
+            verifier.protocol_bundle_at_commit(driver, drifted_base)
+            != verifier.protocol_bundle(verifier.SOURCE_ROOT),
+        )
+        replaced_task = "replaced-base-protocol"
+        replaced_branch = f"agent/v2/{replaced_task}"
+        test.raises(
+            "OPEN rejects Git replacement refs before mutation",
+            lambda: _invoke_open(
+                driver,
+                _open_args(replaced_task, drifted_base, replaced_branch),
+            ),
+            "forbids Git replacement refs",
+        )
+        test.true(
+            "OPEN replacement-ref refusal creates no task bytes",
+            not harness_cli.v2_task_dir(common, replaced_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / replaced_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, replaced_branch) is None,
+        )
+        _git(driver, "replace", "-d", drifted_blob)
+        drifted_task = "drifted-base-protocol"
+        drifted_branch = f"agent/v2/{drifted_task}"
+        test.raises(
+            "OPEN rejects a drifted base protocol before mutation",
+            lambda: _invoke_open(
+                driver,
+                _open_args(drifted_task, drifted_base, drifted_branch),
+            ),
+            "base protocol differs",
+        )
+        test.true(
+            "OPEN drifted-protocol refusal creates no task bytes",
+            not harness_cli.v2_task_dir(common, drifted_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / drifted_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, drifted_branch) is None,
+        )
+
+        config.write_bytes(
+            (verifier.SOURCE_ROOT / ".agents/harness/config.json").read_bytes()
+        )
+        attributes = driver / ".gitattributes"
+        attributes.write_text(
+            ".agents/harness/config.json filter=corrupt\n",
+            encoding="utf-8",
+        )
+        _git(driver, "add", ".agents/harness/config.json", ".gitattributes")
+        _git(driver, "commit", "-q", "-m", "add checkout smudge fixture")
+        smudge_base = _git(driver, "rev-parse", "HEAD")
+        _git(driver, "config", "filter.corrupt.clean", "cat")
+        _git(driver, "config", "filter.corrupt.smudge", "sed '1s/$/ /'")
+        test.equal(
+            "OPEN smudge fixture keeps the raw base protocol exact",
+            verifier.protocol_bundle_at_commit(driver, smudge_base),
+            verifier.protocol_bundle(verifier.SOURCE_ROOT),
+        )
+        smudge_task = "smudged-checkout-protocol"
+        smudge_branch = f"agent/v2/{smudge_task}"
+        test.raises(
+            "OPEN rejects checkout bytes changed by a smudge filter",
+            lambda: _invoke_open(
+                driver,
+                _open_args(smudge_task, smudge_base, smudge_branch),
+            ),
+            "raw checkout bytes differ",
+        )
+        test.true(
+            "OPEN smudged-checkout refusal rolls back all task mutations",
+            not harness_cli.v2_task_dir(common, smudge_task).exists()
+            and not (
+                root
+                / ".murmur-agent-tasks"
+                / "v2"
+                / smudge_task
+            ).exists()
+            and harness_cli._local_branch_oid(driver, smudge_branch) is None,
+        )
 
 
 def open_branch_ownership_cases(test: Tests) -> None:
@@ -283,7 +730,10 @@ def open_branch_ownership_cases(test: Tests) -> None:
             check: bool = True,
             env: Mapping[str, str] | None = None,
         ) -> subprocess.CompletedProcess:
-            if list(argv[:3]) == ["git", "worktree", "add"]:
+            values = list(argv)
+            if "worktree" in values and values[
+                values.index("worktree") : values.index("worktree") + 2
+            ] == ["worktree", "add"]:
                 raise runtime.HarnessError("forced worktree-add failure")
             return original_run_capture(
                 argv,
@@ -330,7 +780,10 @@ def open_branch_ownership_cases(test: Tests) -> None:
             check: bool = True,
             env: Mapping[str, str] | None = None,
         ) -> subprocess.CompletedProcess:
-            if list(argv[:3]) == ["git", "worktree", "add"]:
+            values = list(argv)
+            if "worktree" in values and values[
+                values.index("worktree") : values.index("worktree") + 2
+            ] == ["worktree", "add"]:
                 _git(
                     driver,
                     "update-ref",
@@ -616,6 +1069,363 @@ def standalone_driver_open_cases(test: Tests) -> None:
             source_git_before,
         )
 
+        client_worktree = server_worktree.parent / "meetnotes"
+        original_clean_intent_document = harness_cli._clean_intent_document
+        raced_head = ""
+
+        def commit_server_after_preflight(
+            *intent_args: Any,
+            **intent_kwargs: Any,
+        ) -> Dict[str, Any]:
+            nonlocal raced_head
+            raced_file = server_worktree / "raced-operator-commit.txt"
+            raced_file.write_bytes(b"valuable raced server bytes\n")
+            _git(server_worktree, "add", "raced-operator-commit.txt")
+            _git(
+                server_worktree,
+                "-c",
+                "user.name=QueaT",
+                "-c",
+                "user.email=kgm004a@gmail.com",
+                "commit",
+                "-q",
+                "-m",
+                "raced clean server commit",
+            )
+            raced_head = _git(server_worktree, "rev-parse", "HEAD")
+            return original_clean_intent_document(
+                *intent_args,
+                **intent_kwargs,
+            )
+
+        previous = Path.cwd()
+        harness_cli._clean_intent_document = commit_server_after_preflight
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN refuses a clean server commit racing preflight and intent",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                ),
+                "server revision changed",
+            )
+        finally:
+            harness_cli._clean_intent_document = (
+                original_clean_intent_document
+            )
+            os.chdir(previous)
+        raced_intent = runtime.load_json(task_dir / "clean-intent.json")
+        test.true(
+            "CLEAN server race preserves client and raced server commit",
+            client_worktree.is_dir()
+            and server_worktree.is_dir()
+            and raced_head != revision
+            and _git(server_worktree, "rev-parse", "HEAD") == raced_head
+            and (
+                server_worktree / "raced-operator-commit.txt"
+            ).read_bytes()
+            == b"valuable raced server bytes\n",
+        )
+        test.true(
+            "CLEAN server race performs no quarantine or terminal transition",
+            not Path(raced_intent["quarantine_path"]).exists()
+            and not Path(
+                raced_intent["server_cleanup"]["quarantine_path"]
+            ).exists()
+            and not any(task_dir.glob("clean-delete-*.json"))
+            and harness_cli.load_v2_state(task_dir)["status"]
+            not in verifier.V2_TERMINAL_STATES,
+        )
+
+        clean_task_id = "standalone-server-clean-success"
+        clean_result, _clean_opened = _invoke_open_json(
+            driver,
+            _open_args(
+                clean_task_id,
+                base,
+                f"agent/v2/{clean_task_id}",
+            ),
+        )
+        clean_task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), clean_task_id
+        )
+        clean_runtime = runtime.load_json(
+            clean_task_dir / "runtime.json"
+        )
+        clean_client = Path(
+            runtime.load_json(clean_task_dir / "task.json")[
+                "worktree_path"
+            ]
+        )
+        clean_server = Path(str(clean_runtime["server_worktree"]))
+        clean_client_revision = _git(clean_client, "rev-parse", "HEAD")
+        _git(
+            clean_client,
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "client reflog-only object closure",
+        )
+        client_reflog_commit = _git(clean_client, "rev-parse", "HEAD")
+        _git(
+            clean_client,
+            "reset",
+            "--soft",
+            "-q",
+            clean_client_revision,
+        )
+        index_blob_process = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=str(clean_client),
+            input=b"client index-only object closure\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if index_blob_process.returncode != 0:
+            raise AssertionError(
+                index_blob_process.stderr.decode(
+                    "utf-8", "replace"
+                ).strip()
+            )
+        client_index_blob = index_blob_process.stdout.decode(
+            "ascii"
+        ).strip()
+        _git(
+            clean_client,
+            "update-index",
+            "--cacheinfo",
+            "100644",
+            client_index_blob,
+            "owned.txt",
+        )
+        test.true(
+            "CLEAN linked client fixture keeps reflog-only and index-only objects",
+            _git(clean_client, "rev-parse", "HEAD")
+            == clean_client_revision
+            and (clean_client / "owned.txt").read_bytes() == b"base\n"
+            and client_reflog_commit != clean_client_revision
+            and runtime.SHA1_RE.fullmatch(client_index_blob) is not None,
+        )
+        clean_server_revision = str(clean_runtime["server_revision"])
+        server_saved_ref = "refs/selftest/archived-server-commit"
+        _git(
+            clean_server,
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "unique server Git-control archive payload",
+        )
+        server_saved_commit = _git(clean_server, "rev-parse", "HEAD")
+        _git(
+            clean_server,
+            "update-ref",
+            "--create-reflog",
+            server_saved_ref,
+            server_saved_commit,
+        )
+        _git(
+            clean_server,
+            "reset",
+            "--hard",
+            "-q",
+            clean_server_revision,
+        )
+        server_control_payloads = _unique_git_control_payloads(
+            clean_server,
+            server_saved_ref,
+            server_saved_commit,
+        )
+        test.equal(
+            "CLEAN server Git-control fixture is visibly clean at its pin",
+            (
+                _git(clean_server, "rev-parse", "HEAD"),
+                _git(clean_server, "status", "--porcelain"),
+            ),
+            (clean_server_revision, ""),
+        )
+
+        original_read_git_control_payload = (
+            harness_cli._read_git_control_payload
+        )
+        injected_server_archive_failure = False
+
+        def fail_during_server_control_payload(
+            source_root: Path,
+            entry: Mapping[str, Any],
+        ) -> bytes:
+            nonlocal injected_server_archive_failure
+            payload = original_read_git_control_payload(
+                source_root,
+                entry,
+            )
+            if (
+                not injected_server_archive_failure
+                and source_root.resolve()
+                == (clean_server / ".git").resolve()
+                and entry["path"] == server_saved_ref
+            ):
+                injected_server_archive_failure = True
+                raise runtime.HarnessError(
+                    "forced Git-control payload archival failure"
+                )
+            return payload
+
+        def clean_server_task() -> int:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=clean_task_id,
+                        abandon=True,
+                    )
+                )
+
+        previous = Path.cwd()
+        harness_cli._read_git_control_payload = (
+            fail_during_server_control_payload
+        )
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN interruption occurs during server Git-control payload archival",
+                clean_server_task,
+                "forced Git-control payload archival failure",
+            )
+        finally:
+            harness_cli._read_git_control_payload = (
+                original_read_git_control_payload
+            )
+            os.chdir(previous)
+        server_pre_manifest = (
+            clean_task_dir / "clean-git-control-server-pre.json"
+        )
+        server_partial_payload = (
+            clean_task_dir
+            / "clean-git-control"
+            / "server-pre"
+            / "payload-00000000.bin"
+        )
+        test.true(
+            "CLEAN interruption preserves roots and durable partial Git-control archive",
+            injected_server_archive_failure
+            and clean_client.is_dir()
+            and clean_server.is_dir()
+            and server_pre_manifest.is_file()
+            and server_partial_payload.is_file()
+            and not (
+                clean_task_dir
+                / "clean-git-control-server-pre-complete.json"
+            ).exists(),
+        )
+        frozen_server_manifest = server_pre_manifest.read_bytes()
+        frozen_partial_payload = server_partial_payload.read_bytes()
+        frozen_partial_identity = (
+            server_partial_payload.stat().st_ino,
+            server_partial_payload.stat().st_mtime_ns,
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(driver)
+            clean_exit = clean_server_task()
+        finally:
+            os.chdir(previous)
+        test.equal(
+            "CLEAN successful server fixture opens and exits green",
+            (clean_result, clean_exit),
+            (0, 0),
+        )
+        test.true(
+            "CLEAN resume reuses immutable Git-control manifest and payload",
+            server_pre_manifest.read_bytes() == frozen_server_manifest
+            and server_partial_payload.read_bytes()
+            == frozen_partial_payload
+            and (
+                server_partial_payload.stat().st_ino,
+                server_partial_payload.stat().st_mtime_ns,
+            )
+            == frozen_partial_identity,
+        )
+        test.true(
+            "CLEAN freezes all roots before removing client and server",
+            not clean_client.exists()
+            and not clean_server.exists()
+            and harness_cli.load_v2_state(clean_task_dir)["status"]
+            == "ABANDONED",
+        )
+        test.true(
+            "CLEAN server pre/final archives recover hidden ref, reflog, and loose object",
+            _git_control_payloads_recoverable(
+                clean_task_dir,
+                ("server-pre", "server-final"),
+                server_control_payloads,
+            ),
+        )
+        restored_server = root / "restored-server-control"
+        restored_server_objects = _restore_archived_git_repository(
+            clean_task_dir,
+            "server-final",
+            restored_server,
+        )
+        restored_server_fsck = subprocess.run(
+            ["git", "fsck", "--full"],
+            cwd=str(restored_server),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        test.true(
+            "CLEAN standalone server archive reconstructs without its source owner",
+            server_saved_commit in restored_server_objects
+            and not _git_object_available(source, server_saved_commit)
+            and _git(
+                restored_server,
+                "rev-parse",
+                server_saved_ref,
+            )
+            == server_saved_commit
+            and _git(
+                restored_server,
+                "cat-file",
+                "-t",
+                server_saved_commit,
+            )
+            == "commit"
+            and restored_server_fsck.returncode == 0,
+        )
+        restored_client = root / "restored-client-control"
+        restored_client_objects = _restore_archived_git_repository(
+            clean_task_dir,
+            "client-final",
+            restored_client,
+            linked_admin=True,
+        )
+        test.true(
+            "CLEAN linked client pack hydrates reflog-only and index-only objects without owner access",
+            {
+                client_reflog_commit,
+                client_index_blob,
+            }.issubset(restored_client_objects)
+            and _git(
+                restored_client,
+                "cat-file",
+                "-t",
+                client_reflog_commit,
+            )
+            == "commit"
+            and _git(
+                restored_client,
+                "cat-file",
+                "-t",
+                client_index_blob,
+            )
+            == "blob",
+        )
+
     with tempfile.TemporaryDirectory(
         prefix="murmur-v2-driver-server-rollback-"
     ) as raw:
@@ -829,6 +1639,775 @@ def standalone_driver_open_cases(test: Tests) -> None:
             "OPEN rejects pre-existing root before branch mutation",
             harness_cli._local_branch_oid(driver, branch),
             None,
+        )
+
+
+def clean_stage_barrier_cases(test: Tests) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-clean-late-server-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(
+            root,
+            with_server_dependency=True,
+        )
+        task_id = "late-server-stage-mutation"
+        opened, _document = _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        contract = runtime.load_json(task_dir / "task.json")
+        client = Path(str(contract["worktree_path"]))
+        client_owned = (client / "owned.txt").read_bytes()
+        original_stage = harness_cli._stage_prepared_root_cleanup
+        late_server_path: Optional[Path] = None
+
+        def mutate_late_server(
+            prepared: Mapping[str, Any],
+        ) -> Dict[str, Any]:
+            nonlocal late_server_path
+            if prepared["role"] == "server" and late_server_path is None:
+                late_server_path = (
+                    Path(str(prepared["quarantine"]))
+                    / "late-server-stage-mutation.txt"
+                )
+                late_server_path.write_bytes(
+                    b"preserve late server bytes\n"
+                )
+            return original_stage(prepared)
+
+        def clean_late_server() -> int:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                )
+
+        previous = Path.cwd()
+        harness_cli._stage_prepared_root_cleanup = mutate_late_server
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN refuses a server mutation after all roots start staging",
+                clean_late_server,
+                "server quarantine gained unmanifested entries",
+            )
+        finally:
+            harness_cli._stage_prepared_root_cleanup = original_stage
+            os.chdir(previous)
+        intent = runtime.load_json(task_dir / "clean-intent.json")
+        client_manifest = runtime.load_json(
+            task_dir / "clean-delete-client.json"
+        )
+        owned_entry = next(
+            entry
+            for entry in client_manifest["entries"]
+            if entry["path"] == "owned.txt"
+        )
+        staged_owned = (
+            Path(str(intent["delete_staging_path"]))
+            / str(owned_entry["staging_name"])
+        )
+        test.true(
+            "CLEAN late server refusal leaves the client staged and recoverable without purge",
+            opened == 0
+            and (task_dir / "clean-delete-all-started.json").is_file()
+            and (task_dir / "clean-stage-client.json").is_file()
+            and not (task_dir / "clean-delete-all-staged.json").exists()
+            and staged_owned.read_bytes() == client_owned
+            and Path(str(intent["quarantine_path"])).is_dir()
+            and late_server_path is not None
+            and late_server_path.read_bytes()
+            == b"preserve late server bytes\n"
+            and harness_cli.load_v2_state(task_dir)["status"]
+            not in verifier.V2_TERMINAL_STATES,
+        )
+        if late_server_path is None:
+            return
+        late_server_path.unlink()
+        previous = Path.cwd()
+        try:
+            os.chdir(driver)
+            resumed = clean_late_server()
+        finally:
+            os.chdir(previous)
+        test.equal(
+            "CLEAN resumes staged roots after the late mutation is removed",
+            (
+                resumed,
+                harness_cli.load_v2_state(task_dir)["status"],
+            ),
+            (0, "ABANDONED"),
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-clean-linked-admin-"
+    ) as raw:
+        root = Path(raw)
+        primary, driver, base = _standalone_driver(root)
+        task_id = "linked-admin-stage-mutation"
+        opened, _document = _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        original_admin_stage = harness_cli._stage_linked_admin
+        saved_admin_payloads: Dict[str, bytes] = {}
+        saved_admin_path: Optional[Path] = None
+        saved_admin_staging: Optional[Path] = None
+
+        def mutate_linked_admin(
+            *,
+            task_dir: Path,
+            role: str,
+            record: Mapping[str, Any],
+            ready: Mapping[str, Any],
+        ) -> Dict[str, Any]:
+            nonlocal saved_admin_path, saved_admin_staging
+            if role == "client" and saved_admin_path is None:
+                saved_admin_path = Path(str(record["git_admin_path"]))
+                saved_admin_staging = Path(
+                    str(record["git_admin_staging_path"])
+                )
+                reference = (
+                    "refs/worktree/selftest/late-admin-stage"
+                )
+                _git(
+                    primary,
+                    f"--git-dir={saved_admin_path}",
+                    "update-ref",
+                    "--create-reflog",
+                    reference,
+                    str(record["expected_revision"]),
+                )
+                for relative in (
+                    reference,
+                    f"logs/{reference}",
+                ):
+                    saved_admin_payloads[relative] = (
+                        saved_admin_path / relative
+                    ).read_bytes()
+            return original_admin_stage(
+                task_dir=task_dir,
+                role=role,
+                record=record,
+                ready=ready,
+            )
+
+        previous = Path.cwd()
+        harness_cli._stage_linked_admin = mutate_linked_admin
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN refuses a non-HEAD linked-admin ref/reflog mutation before admin stage",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                ),
+                "linked Git admin metadata changed after delete-start",
+            )
+        finally:
+            harness_cli._stage_linked_admin = original_admin_stage
+            os.chdir(previous)
+        test.true(
+            "CLEAN linked-admin refusal preserves admin bytes and staged root without purge",
+            opened == 0
+            and saved_admin_path is not None
+            and saved_admin_path.is_dir()
+            and saved_admin_staging is not None
+            and not saved_admin_staging.exists()
+            and all(
+                (saved_admin_path / relative).read_bytes() == payload
+                for relative, payload in saved_admin_payloads.items()
+            )
+            and (task_dir / "clean-delete-all-started.json").is_file()
+            and (task_dir / "clean-stage-client.json").is_file()
+            and not (task_dir / "clean-delete-all-staged.json").exists()
+            and harness_cli.load_v2_state(task_dir)["status"]
+            not in verifier.V2_TERMINAL_STATES,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-sha256-rejection-"
+    ) as raw:
+        repository = Path(raw) / "sha256"
+        initialized = subprocess.run(
+            [
+                "git",
+                "init",
+                "-q",
+                "--object-format=sha256",
+                str(repository),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        test.equal(
+            "CLEAN SHA-256 rejection fixture is supported by Git",
+            initialized.returncode,
+            0,
+        )
+        if initialized.returncode == 0:
+            test.raises(
+                "CLEAN explicitly rejects a SHA-256 Git-control repository",
+                lambda: harness_cli._require_sha1_repository(
+                    repository,
+                    label="selftest Git-control repository",
+                ),
+                "must use Git SHA-1 object format; found sha256",
+            )
+
+
+def clean_global_validation_barrier_cases(test: Tests) -> None:
+    def staged_root_payloads(
+        task_dir: Path,
+        intent: Mapping[str, Any],
+        stages: Sequence[Mapping[str, Any]],
+    ) -> tuple[Dict[tuple[str, str], Path], Dict[Path, bytes]]:
+        records: Dict[str, Mapping[str, Any]] = {
+            "client": {
+                "delete_staging_path": intent["delete_staging_path"],
+            }
+        }
+        if isinstance(intent.get("server_cleanup"), Mapping):
+            records["server"] = intent["server_cleanup"]
+        for index, record in enumerate(
+            intent["verification_snapshots"]
+        ):
+            if record.get("present") is True:
+                records[f"snapshot-{index:04d}"] = record
+        paths: Dict[tuple[str, str], Path] = {}
+        payloads: Dict[Path, bytes] = {}
+        for stage in stages:
+            role = str(stage["role"])
+            manifest = runtime.load_json(
+                task_dir / f"clean-delete-{role}.json"
+            )
+            entries = {
+                str(entry["path"]): entry
+                for entry in manifest["entries"]
+            }
+            staging = Path(
+                str(records[role]["delete_staging_path"])
+            )
+            for relative in stage["root"]["staged"]:
+                entry = entries[str(relative)]
+                path = staging / str(entry["staging_name"])
+                paths[(role, str(relative))] = path
+                payloads[path] = (
+                    os.readlink(path).encode(
+                        "utf-8", "surrogateescape"
+                    )
+                    if path.is_symlink()
+                    else path.read_bytes()
+                )
+        return paths, payloads
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-clean-global-server-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(
+            root,
+            with_server_dependency=True,
+        )
+        task_id = "global-server-stage-mutation"
+        _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        original_bind = harness_cli._bind_all_roots_staged
+        original_finalize = harness_cli._finalize_frozen_root_cleanup
+        original_root_purge = harness_cli._purge_frozen_clean_tree
+        original_admin_purge = harness_cli._purge_staged_git_admin
+        finalized_roles: List[str] = []
+        root_purges = 0
+        admin_purges = 0
+        staged_payloads: Dict[Path, bytes] = {}
+        mutated_path: Optional[Path] = None
+        mutated_metadata: Optional[tuple[int, int, int]] = None
+
+        def inject_after_all_staged(
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            nonlocal mutated_path, mutated_metadata
+            document = original_bind(**kwargs)
+            intent = runtime.load_json(task_dir / "clean-intent.json")
+            paths, payloads = staged_root_payloads(
+                task_dir,
+                intent,
+                kwargs["stages"],
+            )
+            staged_payloads.update(payloads)
+            mutated_path = paths[("server", "owned.txt")]
+            metadata = mutated_path.stat()
+            mutated_metadata = (
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_atime_ns,
+                metadata.st_mtime_ns,
+            )
+            mutated_path.write_bytes(
+                payloads[mutated_path] + b"post-barrier mutation\n"
+            )
+            return document
+
+        def observe_finalize(
+            prepared: Mapping[str, Any],
+            stage: Mapping[str, Any],
+        ) -> None:
+            finalized_roles.append(str(prepared["role"]))
+            original_finalize(prepared, stage)
+
+        def observe_root_purge(*args: Any, **kwargs: Any) -> None:
+            nonlocal root_purges
+            root_purges += 1
+            original_root_purge(*args, **kwargs)
+
+        def observe_admin_purge(*args: Any, **kwargs: Any) -> None:
+            nonlocal admin_purges
+            admin_purges += 1
+            original_admin_purge(*args, **kwargs)
+
+        previous = Path.cwd()
+        harness_cli._bind_all_roots_staged = inject_after_all_staged
+        harness_cli._finalize_frozen_root_cleanup = observe_finalize
+        harness_cli._purge_frozen_clean_tree = observe_root_purge
+        harness_cli._purge_staged_git_admin = observe_admin_purge
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN globally refuses a later server staged-payload mutation",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                ),
+            )
+        finally:
+            harness_cli._bind_all_roots_staged = original_bind
+            harness_cli._finalize_frozen_root_cleanup = original_finalize
+            harness_cli._purge_frozen_clean_tree = original_root_purge
+            harness_cli._purge_staged_git_admin = original_admin_purge
+            os.chdir(previous)
+        test.true(
+            "CLEAN global server refusal performs zero unlink and preserves every staged role",
+            not finalized_roles
+            and root_purges == 0
+            and admin_purges == 0
+            and (task_dir / "clean-delete-all-staged.json").is_file()
+            and not (
+                task_dir / "clean-delete-all-validated.json"
+            ).exists()
+            and mutated_path is not None
+            and mutated_path.is_file()
+            and all(
+                path.is_file() or path.is_symlink()
+                for path in staged_payloads
+            )
+            and all(
+                path == mutated_path
+                or (
+                    os.readlink(path).encode(
+                        "utf-8", "surrogateescape"
+                    )
+                    if path.is_symlink()
+                    else path.read_bytes()
+                )
+                == payload
+                for path, payload in staged_payloads.items()
+            )
+            and harness_cli.load_v2_state(task_dir)["status"]
+            not in verifier.V2_TERMINAL_STATES,
+        )
+        if mutated_path is None or mutated_metadata is None:
+            return
+        mutated_path.write_bytes(staged_payloads[mutated_path])
+        mutated_path.chmod(mutated_metadata[0])
+        os.utime(
+            mutated_path,
+            ns=(mutated_metadata[1], mutated_metadata[2]),
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(driver)
+            with contextlib.redirect_stdout(io.StringIO()):
+                resumed = harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                )
+        finally:
+            os.chdir(previous)
+        test.true(
+            "CLEAN global server validation publishes only after repaired resume",
+            resumed == 0
+            and (
+                task_dir / "clean-delete-all-validated.json"
+            ).is_file()
+            and harness_cli.load_v2_state(task_dir)["status"]
+            == "ABANDONED",
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-clean-global-admin-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(root)
+        task_id = "global-client-admin-mutation"
+        _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        original_bind = harness_cli._bind_all_roots_staged
+        original_finalize = harness_cli._finalize_frozen_root_cleanup
+        original_root_purge = harness_cli._purge_frozen_clean_tree
+        original_admin_purge = harness_cli._purge_staged_git_admin
+        finalized_roles: List[str] = []
+        root_purges = 0
+        admin_purges = 0
+        staged_payloads: Dict[Path, bytes] = {}
+        admin_payloads: Dict[str, bytes] = {}
+        admin_staging: Optional[Path] = None
+        admin_metadata: Optional[tuple[int, int]] = None
+        extra_admin: Optional[Path] = None
+
+        def inject_admin_after_all_staged(
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            nonlocal admin_staging, admin_metadata, extra_admin
+            document = original_bind(**kwargs)
+            intent = runtime.load_json(task_dir / "clean-intent.json")
+            _paths, payloads = staged_root_payloads(
+                task_dir,
+                intent,
+                kwargs["stages"],
+            )
+            staged_payloads.update(payloads)
+            admin_staging = Path(
+                str(intent["git_admin_staging_path"])
+            )
+            admin_payloads.update(
+                _tree_leaf_payloads(admin_staging)
+            )
+            metadata = admin_staging.stat()
+            admin_metadata = (
+                metadata.st_atime_ns,
+                metadata.st_mtime_ns,
+            )
+            extra_admin = admin_staging / "late-admin-entry"
+            extra_admin.write_bytes(b"post-barrier admin mutation\n")
+            return document
+
+        def observe_finalize(
+            prepared: Mapping[str, Any],
+            stage: Mapping[str, Any],
+        ) -> None:
+            finalized_roles.append(str(prepared["role"]))
+            original_finalize(prepared, stage)
+
+        def observe_root_purge(*args: Any, **kwargs: Any) -> None:
+            nonlocal root_purges
+            root_purges += 1
+            original_root_purge(*args, **kwargs)
+
+        def observe_admin_purge(*args: Any, **kwargs: Any) -> None:
+            nonlocal admin_purges
+            admin_purges += 1
+            original_admin_purge(*args, **kwargs)
+
+        previous = Path.cwd()
+        harness_cli._bind_all_roots_staged = (
+            inject_admin_after_all_staged
+        )
+        harness_cli._finalize_frozen_root_cleanup = observe_finalize
+        harness_cli._purge_frozen_clean_tree = observe_root_purge
+        harness_cli._purge_staged_git_admin = observe_admin_purge
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN globally refuses a linked-admin post-stage mutation",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                ),
+            )
+        finally:
+            harness_cli._bind_all_roots_staged = original_bind
+            harness_cli._finalize_frozen_root_cleanup = original_finalize
+            harness_cli._purge_frozen_clean_tree = original_root_purge
+            harness_cli._purge_staged_git_admin = original_admin_purge
+            os.chdir(previous)
+        test.true(
+            "CLEAN global admin refusal performs zero unlink and preserves root/admin staging",
+            not finalized_roles
+            and root_purges == 0
+            and admin_purges == 0
+            and (task_dir / "clean-delete-all-staged.json").is_file()
+            and not (
+                task_dir / "clean-delete-all-validated.json"
+            ).exists()
+            and all(
+                (path.is_file() or path.is_symlink())
+                and (
+                    os.readlink(path).encode(
+                        "utf-8", "surrogateescape"
+                    )
+                    if path.is_symlink()
+                    else path.read_bytes()
+                )
+                == payload
+                for path, payload in staged_payloads.items()
+            )
+            and admin_staging is not None
+            and all(
+                (admin_staging / relative).read_bytes() == payload
+                for relative, payload in admin_payloads.items()
+            )
+            and extra_admin is not None
+            and extra_admin.read_bytes()
+            == b"post-barrier admin mutation\n"
+            and harness_cli.load_v2_state(task_dir)["status"]
+            not in verifier.V2_TERMINAL_STATES,
+        )
+        if (
+            extra_admin is None
+            or admin_staging is None
+            or admin_metadata is None
+        ):
+            return
+        extra_admin.unlink()
+        os.utime(
+            admin_staging,
+            ns=(admin_metadata[0], admin_metadata[1]),
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(driver)
+            with contextlib.redirect_stdout(io.StringIO()):
+                resumed = harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                )
+        finally:
+            os.chdir(previous)
+        test.true(
+            "CLEAN global admin validation publishes only after repaired resume",
+            resumed == 0
+            and (
+                task_dir / "clean-delete-all-validated.json"
+            ).is_file()
+            and harness_cli.load_v2_state(task_dir)["status"]
+            == "ABANDONED",
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-clean-global-archive-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(root)
+        task_id = "global-client-archive-hardlink"
+        _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        original_bind = harness_cli._bind_all_roots_staged
+        original_finalize = harness_cli._finalize_frozen_root_cleanup
+        original_root_purge = harness_cli._purge_frozen_clean_tree
+        original_admin_purge = harness_cli._purge_staged_git_admin
+        finalized_roles: List[str] = []
+        root_purges = 0
+        admin_purges = 0
+        staged_payloads: Dict[Path, bytes] = {}
+        admin_payloads: Dict[str, bytes] = {}
+        admin_staging: Optional[Path] = None
+        archive_payload: Optional[Path] = None
+        archive_bytes = b""
+        archive_mode = 0
+        archive_root_mode = 0
+        external_link: Optional[Path] = None
+
+        def inject_archive_hardlink_after_all_staged(
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            nonlocal admin_staging, archive_payload
+            nonlocal archive_bytes, archive_mode, archive_root_mode
+            nonlocal external_link
+            document = original_bind(**kwargs)
+            intent = runtime.load_json(task_dir / "clean-intent.json")
+            _paths, payloads = staged_root_payloads(
+                task_dir,
+                intent,
+                kwargs["stages"],
+            )
+            staged_payloads.update(payloads)
+            admin_staging = Path(
+                str(intent["git_admin_staging_path"])
+            )
+            admin_payloads.update(
+                _tree_leaf_payloads(admin_staging)
+            )
+            completion = runtime.load_json(
+                task_dir
+                / "clean-git-control-client-final-complete.json"
+            )
+            record = next(
+                payload
+                for payload in completion["payloads"]
+                if payload["source"] == "control"
+            )
+            archive_payload = task_dir / str(record["payload"])
+            archive_bytes = archive_payload.read_bytes()
+            archive_mode = stat.S_IMODE(
+                archive_payload.stat().st_mode
+            )
+            archive_root_mode = stat.S_IMODE(
+                archive_payload.parent.stat().st_mode
+            )
+            external_link = root / "external-archive-payload"
+            external_link.write_bytes(archive_bytes)
+            external_link.chmod(archive_mode)
+            archive_payload.parent.chmod(0o700)
+            archive_payload.unlink()
+            os.link(external_link, archive_payload)
+            archive_payload.parent.chmod(archive_root_mode)
+            return document
+
+        def observe_finalize(
+            prepared: Mapping[str, Any],
+            stage: Mapping[str, Any],
+        ) -> None:
+            finalized_roles.append(str(prepared["role"]))
+            original_finalize(prepared, stage)
+
+        def observe_root_purge(*args: Any, **kwargs: Any) -> None:
+            nonlocal root_purges
+            root_purges += 1
+            original_root_purge(*args, **kwargs)
+
+        def observe_admin_purge(*args: Any, **kwargs: Any) -> None:
+            nonlocal admin_purges
+            admin_purges += 1
+            original_admin_purge(*args, **kwargs)
+
+        previous = Path.cwd()
+        harness_cli._bind_all_roots_staged = (
+            inject_archive_hardlink_after_all_staged
+        )
+        harness_cli._finalize_frozen_root_cleanup = observe_finalize
+        harness_cli._purge_frozen_clean_tree = observe_root_purge
+        harness_cli._purge_staged_git_admin = observe_admin_purge
+        try:
+            os.chdir(driver)
+            test.raises(
+                "CLEAN globally refuses a non-private client archive payload",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                ),
+                "not a private immutable file",
+            )
+        finally:
+            harness_cli._bind_all_roots_staged = original_bind
+            harness_cli._finalize_frozen_root_cleanup = original_finalize
+            harness_cli._purge_frozen_clean_tree = original_root_purge
+            harness_cli._purge_staged_git_admin = original_admin_purge
+            os.chdir(previous)
+        test.true(
+            "CLEAN archive hardlink refusal performs zero unlink and preserves all staging",
+            not finalized_roles
+            and root_purges == 0
+            and admin_purges == 0
+            and (task_dir / "clean-delete-all-staged.json").is_file()
+            and not (
+                task_dir / "clean-delete-all-validated.json"
+            ).exists()
+            and archive_payload is not None
+            and archive_payload.read_bytes() == archive_bytes
+            and archive_payload.stat().st_nlink == 2
+            and external_link is not None
+            and external_link.read_bytes() == archive_bytes
+            and all(
+                (path.is_file() or path.is_symlink())
+                and (
+                    os.readlink(path).encode(
+                        "utf-8", "surrogateescape"
+                    )
+                    if path.is_symlink()
+                    else path.read_bytes()
+                )
+                == payload
+                for path, payload in staged_payloads.items()
+            )
+            and admin_staging is not None
+            and _tree_leaf_payloads(admin_staging)
+            == admin_payloads
+            and harness_cli.load_v2_state(task_dir)["status"]
+            not in verifier.V2_TERMINAL_STATES,
+        )
+        if archive_payload is None or external_link is None:
+            return
+        archive_payload.parent.chmod(0o700)
+        archive_payload.unlink()
+        replacement = (
+            archive_payload.parent / "payload-private-restore.tmp"
+        )
+        replacement.write_bytes(archive_bytes)
+        replacement.chmod(archive_mode)
+        os.replace(replacement, archive_payload)
+        archive_payload.parent.chmod(archive_root_mode)
+        external_link.unlink()
+        test.true(
+            "CLEAN archive payload repair restores an exact private inode",
+            archive_payload.read_bytes() == archive_bytes
+            and archive_payload.stat().st_nlink == 1,
+        )
+        previous = Path.cwd()
+        try:
+            os.chdir(driver)
+            with contextlib.redirect_stdout(io.StringIO()):
+                resumed = harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id=task_id,
+                        abandon=True,
+                    )
+                )
+        finally:
+            os.chdir(previous)
+        test.true(
+            "CLEAN archive validation publishes only after private-payload resume",
+            resumed == 0
+            and (
+                task_dir / "clean-delete-all-validated.json"
+            ).is_file()
+            and harness_cli.load_v2_state(task_dir)["status"]
+            == "ABANDONED",
         )
 
 
@@ -5992,6 +7571,191 @@ def commit_recovery_cases(test: Tests) -> None:
             "non-merge commit",
         )
         _git(repo, "reset", "--hard", "-q", catchup_head)
+
+        cleanup_snapshots = harness_cli._verification_snapshots_for_cleanup(
+            contract, task_dir
+        )
+        present_snapshots = [
+            path
+            for path, _reference, _commit, _head in cleanup_snapshots
+            if path.is_dir()
+        ]
+        test.true(
+            "CLEAN fixture retains a materialized verification snapshot",
+            bool(present_snapshots),
+        )
+        if not present_snapshots:
+            return
+        raced_snapshot = present_snapshots[0]
+        expected_snapshot_head = next(
+            head
+            for path, _reference, _commit, head in cleanup_snapshots
+            if path == raced_snapshot
+        )
+        _git(
+            raced_snapshot,
+            "-c",
+            "user.name=QueaT",
+            "-c",
+            "user.email=kgm004a@gmail.com",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "raced same-tree verification snapshot commit",
+        )
+        raced_snapshot_head = _git(
+            raced_snapshot, "rev-parse", "HEAD"
+        )
+        snapshot_race_clean = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                (
+                    "import argparse,sys;"
+                    f"sys.path.insert(0,{fixture_python!r});"
+                    "import cli;"
+                    f"__import__('os').chdir({str(repo)!r});"
+                    "cli.cmd_clean(argparse.Namespace("
+                    "task_id='commit-crash',abandon=False,"
+                    "_allow_test_adapter=True))"
+                ),
+            ],
+            cwd=str(repo),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.true(
+            "CLEAN refuses a same-tree verification snapshot HEAD race",
+            snapshot_race_clean.returncode != 0
+            and "verification snapshot HEAD changed"
+            in snapshot_race_clean.stderr,
+        )
+        test.true(
+            "CLEAN snapshot HEAD race preserves client and raced commit",
+            repo.is_dir()
+            and raced_snapshot.is_dir()
+            and raced_snapshot_head != expected_snapshot_head
+            and _git(raced_snapshot, "rev-parse", "HEAD")
+            == raced_snapshot_head
+            and not (task_dir / "clean-intent.json").exists(),
+        )
+        snapshot_saved_ref = "refs/selftest/raced-snapshot-head"
+        _git(
+            raced_snapshot,
+            "update-ref",
+            "--create-reflog",
+            snapshot_saved_ref,
+            raced_snapshot_head,
+        )
+        _git(raced_snapshot, "reset", "--soft", "-q", expected_snapshot_head)
+        snapshot_control_payloads = _unique_git_control_payloads(
+            raced_snapshot,
+            snapshot_saved_ref,
+            raced_snapshot_head,
+        )
+        test.equal(
+            "CLEAN snapshot Git-control fixture resets HEAD to its pin",
+            _git(raced_snapshot, "rev-parse", "HEAD"),
+            expected_snapshot_head,
+        )
+
+        snapshot_exclude = present_snapshots[0] / ".git" / "info" / "exclude"
+        snapshot_exclude.write_text(
+            snapshot_exclude.read_text(encoding="utf-8")
+            + "\n.DS_Store\n",
+            encoding="utf-8",
+        )
+        protected_snapshot_byte = present_snapshots[0] / ".DS_Store"
+        protected_snapshot_byte.write_bytes(
+            b"operator-owned snapshot metadata\n"
+        )
+        blocked_clean = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                (
+                    "import argparse,sys;"
+                    f"sys.path.insert(0,{fixture_python!r});"
+                    "import cli;"
+                    f"__import__('os').chdir({str(repo)!r});"
+                    "cli.cmd_clean(argparse.Namespace("
+                    "task_id='commit-crash',abandon=False,"
+                    "_allow_test_adapter=True))"
+                ),
+            ],
+            cwd=str(repo),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.true(
+            "CLEAN refuses ignored bytes in an auxiliary verification snapshot",
+            blocked_clean.returncode != 0
+            and "verification snapshot has ignored bytes"
+            in blocked_clean.stderr,
+        )
+        test.true(
+            "CLEAN auxiliary refusal preserves client and snapshot bytes",
+            repo.is_dir()
+            and protected_snapshot_byte.read_bytes()
+            == b"operator-owned snapshot metadata\n"
+            and not (task_dir / "clean-intent.json").exists(),
+        )
+        protected_snapshot_byte.unlink()
+
+        source_manifests = [
+            runtime.load_json(path)
+            for path in sorted((task_dir / "attempts").glob("*/snapshot.json"))
+        ]
+        source_manifest = next(
+            manifest
+            for manifest in source_manifests
+            if Path(str(manifest["path"])) == present_snapshots[0]
+        )
+        absent_attempt_id = hashlib.sha256(
+            b"absent-cleanup-selftest"
+        ).hexdigest()
+        absent_attempt = task_dir / "attempts" / absent_attempt_id
+        absent_attempt.mkdir()
+        absent_path = harness_cli._verification_snapshot_path(
+            contract, absent_attempt
+        )
+        absent_ref = harness_cli._verification_snapshot_ref(
+            task_id, absent_attempt_id
+        )
+        absent_commit = str(source_manifest["snapshot_commit"])
+        runtime.run_capture(
+            [
+                "git",
+                "update-ref",
+                absent_ref,
+                absent_commit,
+                "0" * 40,
+            ],
+            primary,
+        )
+        absent_manifest = {
+            **source_manifest,
+            "path": str(absent_path),
+            "snapshot_ref": absent_ref,
+            "snapshot_commit": absent_commit,
+            "snapshot_sha256": "",
+        }
+        absent_manifest["snapshot_sha256"] = verifier.document_hash(
+            absent_manifest, "snapshot_sha256"
+        )
+        runtime.atomic_write_json(
+            absent_attempt / "snapshot.json", absent_manifest
+        )
+        sibling = repo.parent / "verify-sibling-sentinel"
+        sibling.mkdir()
+        sibling_byte = sibling / "operator.txt"
+        sibling_byte.write_bytes(b"preserve exact sibling\n")
+
         clean_result = subprocess.run(
             [
                 sys.executable,
@@ -6015,8 +7779,8 @@ def commit_recovery_cases(test: Tests) -> None:
         )
         test.equal(
             "CLEAN closes old committed evidence after verifier-policy catch-up",
-            clean_result.returncode,
-            0,
+            (clean_result.returncode, clean_result.stderr.strip()),
+            (0, ""),
         )
         test.equal(
             "CLEAN records the old committed task as CLOSED",
@@ -6026,6 +7790,77 @@ def commit_recovery_cases(test: Tests) -> None:
         test.true(
             "CLEAN removes the linked committed worktree",
             not repo.exists(),
+        )
+        test.true(
+            "CLEAN removes materialized verification snapshots",
+            all(not path.exists() for path in present_snapshots),
+        )
+        clean_intent = runtime.load_json(task_dir / "clean-intent.json")
+        snapshot_archive_index = next(
+            index
+            for index, record in enumerate(
+                clean_intent["verification_snapshots"]
+            )
+            if Path(str(record["path"])) == raced_snapshot
+        )
+        snapshot_archive_role = f"snapshot-{snapshot_archive_index:04d}"
+        test.true(
+            "CLEAN snapshot pre/final archives recover hidden ref, reflog, and loose object",
+            _git_control_payloads_recoverable(
+                task_dir,
+                (
+                    f"{snapshot_archive_role}-pre",
+                    f"{snapshot_archive_role}-final",
+                ),
+                snapshot_control_payloads,
+            ),
+        )
+        restored_snapshot = root / "restored-snapshot-control"
+        restored_snapshot_objects = _restore_archived_git_repository(
+            task_dir,
+            f"{snapshot_archive_role}-final",
+            restored_snapshot,
+        )
+        restored_snapshot_fsck = subprocess.run(
+            ["git", "fsck", "--full"],
+            cwd=str(restored_snapshot),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        test.true(
+            "CLEAN standalone snapshot archive reconstructs its unique commit and ref",
+            raced_snapshot_head in restored_snapshot_objects
+            and _git(
+                restored_snapshot,
+                "rev-parse",
+                snapshot_saved_ref,
+            )
+            == raced_snapshot_head
+            and _git(
+                restored_snapshot,
+                "cat-file",
+                "-t",
+                raced_snapshot_head,
+            )
+            == "commit"
+            and restored_snapshot_fsck.returncode == 0,
+        )
+        test.equal(
+            "CLEAN deletes the exact ref for an already-absent snapshot",
+            runtime.git(
+                primary,
+                "rev-parse",
+                "--verify",
+                absent_ref,
+                check=False,
+            ),
+            "",
+        )
+        test.equal(
+            "CLEAN preserves an unrelated verification-named sibling",
+            sibling_byte.read_bytes(),
+            b"preserve exact sibling\n",
         )
 
 
@@ -6172,6 +8007,18 @@ def clean_cases(test: Tests) -> None:
         root = Path(raw)
         repo = root / "repo"
         base = _init_repo(repo)
+        (repo / ".gitignore").write_text(
+            "/.angular/\n"
+            "/dist/\n"
+            "/target/\n"
+            "/test-results/\n"
+            "/src-tauri/binaries/murmur-brain\n"
+            "/private-cache/\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-q", "-m", "ignore generated artifacts")
+        base = _git(repo, "rev-parse", "HEAD")
         common = Path(
             _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         )
@@ -6181,6 +8028,49 @@ def clean_cases(test: Tests) -> None:
         _git(repo, "worktree", "add", "-q", "-b", branch, str(worktree), base)
         (worktree / "owned.txt").write_text("base\ndirty tracked\n", encoding="utf-8")
         (worktree / "untracked.txt").write_text("dirty untracked\n", encoding="utf-8")
+        disposable_paths = (
+            ".angular/cache/compiler.db",
+            "dist/meetnotes/app.js",
+            "target/CACHEDIR.TAG",
+            "target/debug/app",
+            "target/debug/app-hardlink",
+            "test-results/.last-run.json",
+            "src-tauri/binaries/murmur-brain",
+        )
+        for relative in disposable_paths:
+            artifact = worktree / relative
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(b"reproducible build artifact\n")
+        (worktree / "target" / "CACHEDIR.TAG").write_bytes(
+            b"Signature: 8a477f597d28d172789f06886806bc55\n"
+        )
+        (worktree / "src-tauri" / "target").mkdir(parents=True)
+        (worktree / "src-tauri" / "target" / "CACHEDIR.TAG").write_bytes(
+            b"Signature: 8a477f597d28d172789f06886806bc55\n"
+        )
+        protected_bundle_layouts = (
+            "target/release/bundle/dmg/Murmur.dmg",
+            "target/universal-apple-darwin/release/bundle/macos/Murmur.app",
+            "src-tauri/target/release/bundle/dmg/Murmur.dmg",
+            (
+                "src-tauri/target/aarch64-apple-darwin/release/"
+                "bundle/macos/Murmur.app"
+            ),
+        )
+        test.true(
+            "CLEAN never classifies any Tauri release bundle layout as disposable",
+            all(
+                not harness_cli._disposable_ignored_path(worktree, path)
+                for path in protected_bundle_layouts
+            ),
+        )
+        (worktree / "target/debug/app-hardlink").unlink()
+        os.link(
+            worktree / "target/debug/app",
+            worktree / "target/debug/app-hardlink",
+        )
+        unknown_ignored = worktree / ".angular" / "operator-note.txt"
+        unknown_ignored.write_bytes(b"operator-owned ignored bytes\n")
         task_dir = harness_cli.v2_task_dir(common, "clean-selftest")
         task_dir.mkdir(parents=True)
         contract: Dict[str, Any] = {
@@ -6240,6 +8130,343 @@ def clean_cases(test: Tests) -> None:
         previous = Path.cwd()
         try:
             os.chdir(repo)
+            test.raises(
+                "CLEAN refuses unknown ignored bytes before archiving or removal",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(task_id="clean-selftest", abandon=True)
+                ),
+                "ignored task bytes are not archived",
+            )
+            test.true(
+                "CLEAN unknown ignored refusal preserves task and valuable bytes",
+                worktree.is_dir()
+                and unknown_ignored.read_bytes() == b"operator-owned ignored bytes\n"
+                and (worktree / ".angular/cache/compiler.db").is_file()
+                and not (task_dir / "archive.json").exists(),
+            )
+            unknown_ignored.unlink()
+            signed_bundle = (
+                worktree
+                / "target"
+                / "universal-apple-darwin"
+                / "release"
+                / "bundle"
+                / "dmg"
+                / "Murmur_1.0.2_universal.dmg"
+            )
+            signed_bundle.parent.mkdir(parents=True)
+            signed_bundle.write_bytes(
+                b"signed notarized stapled operator artifact\n"
+            )
+            test.raises(
+                "CLEAN refuses Tauri release bundles under Cargo target",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest", abandon=True
+                    )
+                ),
+                "Murmur_1.0.2_universal.dmg",
+            )
+            test.true(
+                "CLEAN preserves a refused signed release bundle",
+                signed_bundle.read_bytes()
+                == b"signed notarized stapled operator artifact\n"
+                and worktree.is_dir()
+                and not (task_dir / "archive.json").exists(),
+            )
+            signed_bundle.unlink()
+
+            _git(
+                repo,
+                "config",
+                "filter.scrub.clean",
+                "sed 's/SECRET//g'",
+            )
+            attributes = worktree / ".gitattributes"
+            filtered = worktree / "filter-victim.txt"
+            attributes.write_text(
+                "filter-victim.txt filter=scrub\n",
+                encoding="utf-8",
+            )
+            filtered.write_bytes(b"SECRET operator exact bytes\n")
+            test.raises(
+                "CLEAN refuses a Git clean filter that transforms raw bytes",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest", abandon=True
+                    )
+                ),
+                "archive transformed raw bytes",
+            )
+            test.true(
+                "CLEAN preserves exact filter-transformed source bytes",
+                filtered.read_bytes()
+                == b"SECRET operator exact bytes\n"
+                and worktree.is_dir()
+                and not (task_dir / "archive.json").exists()
+                and not (task_dir / "clean-intent.json").exists(),
+            )
+            attributes.unlink()
+            filtered.unlink()
+            _git(repo, "config", "--unset-all", "filter.scrub.clean")
+
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys;"
+                        "os.chdir(sys.argv[1]);"
+                        "print('ready',flush=True);"
+                        "sys.stdin.read()"
+                    ),
+                    str(worktree),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                if holder.stdout is None:
+                    raise AssertionError("missing cwd holder stdout")
+                test.equal(
+                    "CLEAN cwd-holder fixture is ready",
+                    holder.stdout.readline().strip(),
+                    "ready",
+                )
+                test.raises(
+                    "CLEAN refuses before mutation when another shell cwd uses the task",
+                    lambda: harness_cli.cmd_clean(
+                        argparse.Namespace(
+                            task_id="clean-selftest", abandon=True
+                        )
+                    ),
+                    "still used by a process",
+                )
+                test.true(
+                    "CLEAN cwd refusal leaves original path and no intent",
+                    worktree.is_dir()
+                    and not (task_dir / "archive.json").exists()
+                    and not (task_dir / "clean-intent.json").exists(),
+                )
+            finally:
+                if holder.stdin is not None:
+                    holder.stdin.close()
+                holder.wait(timeout=5)
+
+            _git(
+                repo,
+                "config",
+                "filter.scrub.clean",
+                "sed 's/SECRET//g'",
+            )
+            attributes.write_text(
+                "filter-victim.txt filter=scrub\n",
+                encoding="utf-8",
+            )
+            filtered.write_bytes(b" operator exact bytes\n")
+
+            original_execute_clean_intent = harness_cli._execute_clean_intent
+
+            def fail_after_intent_publication(
+                _contract: Mapping[str, Any],
+                _task_dir: Path,
+                _intent: Mapping[str, Any],
+            ) -> None:
+                raise runtime.HarnessError(
+                    "forced crash after durable clean intent"
+                )
+
+            harness_cli._execute_clean_intent = fail_after_intent_publication
+            try:
+                test.raises(
+                    "CLEAN exposes a crash after intent publication",
+                    lambda: harness_cli.cmd_clean(
+                        argparse.Namespace(
+                            task_id="clean-selftest", abandon=True
+                        )
+                    ),
+                    "forced crash after durable clean intent",
+                )
+            finally:
+                harness_cli._execute_clean_intent = original_execute_clean_intent
+            test.true(
+                "CLEAN publishes immutable intent before quarantine",
+                (task_dir / "clean-intent.json").is_file()
+                and (task_dir / "archive.json").is_file()
+                and worktree.is_dir(),
+            )
+
+            clean_intent = runtime.load_json(task_dir / "clean-intent.json")
+            expected_client_head = str(
+                clean_intent["worktree_revision"]
+            )
+            _git(
+                worktree,
+                "-c",
+                "user.name=QueaT",
+                "-c",
+                "user.email=kgm004a@gmail.com",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "raced same-tree client commit",
+            )
+            raced_client_head = _git(worktree, "rev-parse", "HEAD")
+            test.raises(
+                "CLEAN refuses a same-tree client HEAD race after intent",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest", abandon=True
+                    )
+                ),
+                "client revision changed",
+            )
+            test.true(
+                "CLEAN client HEAD race preserves the original worktree",
+                worktree.is_dir()
+                and raced_client_head != expected_client_head
+                and not Path(clean_intent["quarantine_path"]).exists()
+                and not (task_dir / "clean-delete-client.json").exists(),
+            )
+            _git(
+                repo,
+                "update-ref",
+                "refs/selftest/raced-client-head",
+                raced_client_head,
+            )
+            _git(worktree, "reset", "--soft", expected_client_head)
+
+            filtered.write_bytes(b"SECRET operator exact bytes\n")
+            test.raises(
+                "CLEAN freeze refuses post-intent raw bytes hidden by a clean filter",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest", abandon=True
+                    )
+                ),
+                "client freeze transformed raw bytes",
+            )
+            quarantined = Path(clean_intent["quarantine_path"])
+            quarantined_filtered = quarantined / "filter-victim.txt"
+            test.true(
+                "CLEAN post-intent filter refusal preserves exact raw bytes",
+                not worktree.exists()
+                and quarantined_filtered.read_bytes()
+                == b"SECRET operator exact bytes\n"
+                and not (task_dir / "clean-delete-client.json").exists(),
+            )
+            quarantined_filtered.write_bytes(b" operator exact bytes\n")
+
+            late_unknown = (
+                quarantined / ".angular" / "operator-after-intent.txt"
+            )
+            late_unknown.write_bytes(b"late operator-owned bytes\n")
+            test.raises(
+                "CLEAN durable intent still refuses a late unknown ignored file",
+                lambda: harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest", abandon=True
+                    )
+                ),
+                "ignored bytes are not archived",
+            )
+            quarantined_unknown = (
+                quarantined / ".angular" / "operator-after-intent.txt"
+            )
+            test.true(
+                "CLEAN late unknown refusal preserves worktree and durable archive",
+                not worktree.exists()
+                and quarantined.is_dir()
+                and quarantined_unknown.read_bytes()
+                == b"late operator-owned bytes\n"
+                and (task_dir / "archive.json").is_file()
+                and (task_dir / "clean-intent.json").is_file(),
+            )
+            quarantined_unknown.unlink()
+            original_visible_tree = harness_cli._visible_tree
+            visible_calls = 0
+            race_unknown = (
+                quarantined / ".angular" / "operator-after-tree.txt"
+            )
+
+            def inject_unknown_after_tree(
+                visible_worktree: Path, runtime_dir: Path
+            ) -> str:
+                nonlocal visible_calls
+                result = original_visible_tree(
+                    visible_worktree, runtime_dir
+                )
+                if visible_worktree == quarantined:
+                    visible_calls += 1
+                    if visible_calls == 2:
+                        race_unknown.write_bytes(
+                            b"post-tree operator bytes\n"
+                        )
+                return result
+
+            harness_cli._visible_tree = inject_unknown_after_tree
+            try:
+                test.raises(
+                    "CLEAN catches a file racing the final visible-tree proof",
+                    lambda: harness_cli.cmd_clean(
+                        argparse.Namespace(
+                            task_id="clean-selftest", abandon=True
+                        )
+                    ),
+                    "filesystem changed during freeze",
+                )
+            finally:
+                harness_cli._visible_tree = original_visible_tree
+            test.true(
+                "CLEAN post-tree race remains recoverable in quarantine",
+                race_unknown.read_bytes() == b"post-tree operator bytes\n"
+                and quarantined.is_dir()
+                and not (task_dir / "clean-delete-client.json").exists(),
+            )
+            race_unknown.unlink()
+            late_cache = (
+                quarantined / ".angular" / "cache" / "late-cache.db"
+            )
+            late_cache.write_bytes(b"late reproducible cache\n")
+            original_rmdir = harness_cli.os.rmdir
+            staging = Path(clean_intent["delete_staging_path"])
+
+            def fail_after_root_removal(
+                path: Any, *rmdir_args: Any, **rmdir_kwargs: Any
+            ) -> None:
+                if (
+                    not rmdir_args
+                    and not rmdir_kwargs
+                    and Path(path) == staging
+                ):
+                    raise runtime.HarnessError(
+                        "forced crash before staging finalization"
+                    )
+                original_rmdir(path, *rmdir_args, **rmdir_kwargs)
+
+            harness_cli.os.rmdir = fail_after_root_removal
+            try:
+                test.raises(
+                    "CLEAN exposes a crash after root removal",
+                    lambda: harness_cli.cmd_clean(
+                        argparse.Namespace(
+                            task_id="clean-selftest", abandon=True
+                        )
+                    ),
+                    "forced crash before staging finalization",
+                )
+            finally:
+                harness_cli.os.rmdir = original_rmdir
+            test.true(
+                "CLEAN crash retains only empty manifest-backed staging",
+                not quarantined.exists()
+                and staging.is_dir()
+                and not any(staging.iterdir())
+                and staging.parent.is_dir(),
+            )
             with contextlib.redirect_stdout(io.StringIO()):
                 harness_cli.cmd_clean(
                     argparse.Namespace(task_id="clean-selftest", abandon=True)
@@ -6259,6 +8486,13 @@ def clean_cases(test: Tests) -> None:
             "CLEAN archive preserves untracked dirty bytes",
             _git(repo, "show", f"{archive_ref}:untracked.txt"),
             "dirty untracked",
+        )
+        archived_paths = set(
+            _git(repo, "ls-tree", "-r", "--name-only", archive_ref).splitlines()
+        )
+        test.true(
+            "CLEAN discards only allowlisted reproducible ignored artifacts",
+            all(path not in archived_paths for path in disposable_paths),
         )
         test.equal(
             "CLEAN records first-pass disposable runtime removal",
@@ -6640,8 +8874,11 @@ def egress_review_scope_prompt_cases(test: Tests) -> None:
 
 def main() -> int:
     test = Tests()
+    open_protocol_base_cases(test)
     open_branch_ownership_cases(test)
     standalone_driver_open_cases(test)
+    clean_stage_barrier_cases(test)
+    clean_global_validation_barrier_cases(test)
     profile_cases(test)
     npm_lock_evidence_cases(test)
     reviewer_tool_guard_cases(test)

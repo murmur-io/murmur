@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -281,39 +282,67 @@ def protocol_relative_paths(worktree: Path) -> List[str]:
         raise runtime.HarnessError(
             "v2 protocol directory is missing or unsafe: .agents/harness"
         )
-    # New runner modules must enter the protocol automatically.  A hand-kept
-    # list silently omitted exactly the sort of executable helper that can
-    # change a verdict (metrics, migrations, or fault-test entrypoints).
-    python_modules = sorted(harness_root.glob("*.py"))
-    unsafe_python = [
-        path.relative_to(worktree).as_posix()
-        for path in python_modules
-        if not path.is_file() or path.is_symlink()
-    ]
-    if unsafe_python:
-        raise runtime.HarnessError(
-            "v2 protocol Python module is missing or unsafe: "
-            + ", ".join(unsafe_python)
-        )
-    values.update(
-        path.relative_to(worktree).as_posix() for path in python_modules
-    )
-    for directory in (
-        ".agents/harness/checks",
-        ".agents/harness/prompts",
-        ".agents/harness/schemas",
-    ):
-        root = worktree / directory
-        if not root.is_dir() or root.is_symlink():
+    # Bind the complete control-plane directory. This is intentionally a closed
+    # path set: an added module, package, importable extension, policy input, or
+    # other helper must never enter a task base outside the protocol hash.
+    for path in harness_root.rglob("*"):
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        relative = path.relative_to(worktree).as_posix()
+        if not stat.S_ISREG(metadata.st_mode):
             raise runtime.HarnessError(
-                f"v2 protocol directory is missing or unsafe: {directory}"
+                f"v2 protocol path is not a regular file: {relative}"
             )
-        values.update(
-            path.relative_to(worktree).as_posix()
-            for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        )
+        values.add(relative)
     return sorted(values)
+
+
+def protocol_relative_paths_at_commit(repo: Path, commit_sha: str) -> List[str]:
+    """Enumerate the immutable tree's complete executable protocol path set."""
+
+    values = set(PROTOCOL_FILES)
+    listed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            commit_sha,
+            "--",
+            ".agents/harness",
+        ],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if listed.returncode != 0:
+        raise runtime.HarnessError("v2 base protocol tree is unreadable")
+    for record in (item for item in listed.stdout.split(b"\0") if item):
+        try:
+            header, raw_path = record.split(b"\t", 1)
+            mode, kind, _object_id = header.decode("ascii").split()
+            relative = raw_path.decode("utf-8", "surrogateescape")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise runtime.HarnessError(
+                "v2 base protocol tree entry is malformed"
+            ) from exc
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            raise runtime.HarnessError(
+                f"v2 base protocol file is not a regular blob: {relative}"
+            )
+        values.add(relative)
+    return sorted(values)
+
+
+def _protocol_git_mode(path: Path) -> str:
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise runtime.HarnessError(f"v2 protocol file is not regular: {path}")
+    return "100755" if metadata.st_mode & 0o111 else "100644"
 
 
 def protocol_bundle(worktree: Path) -> Dict[str, Any]:
@@ -325,6 +354,7 @@ def protocol_bundle(worktree: Path) -> Dict[str, Any]:
         files.append(
             {
                 "path": relative,
+                "mode": _protocol_git_mode(path),
                 "sha256": runtime.sha256_file(path),
             }
         )
@@ -334,6 +364,217 @@ def protocol_bundle(worktree: Path) -> Dict[str, Any]:
     }
     bundle["protocol_sha256"] = canonical_hash(bundle)
     return bundle
+
+
+def protocol_bundle_at_commit(repo: Path, commit_sha: str) -> Dict[str, Any]:
+    """Read the executing protocol's exact path set from one immutable Git tree.
+
+    `git show <commit>:<path>` follows a symlink blob as ordinary bytes, which is
+    not strong enough for the control plane.  Resolve each entry through
+    `ls-tree`, require a regular blob mode, and hash the blob object directly.
+    """
+
+    files: List[Dict[str, str]] = []
+    for relative in protocol_relative_paths_at_commit(repo, commit_sha):
+        listed = subprocess.run(
+            [
+                "git",
+                "--no-replace-objects",
+                "ls-tree",
+                "-z",
+                commit_sha,
+                "--",
+                relative,
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        records = [record for record in listed.stdout.split(b"\0") if record]
+        if listed.returncode != 0 or len(records) != 1:
+            raise runtime.HarnessError(
+                f"v2 base is missing required protocol file: {relative}"
+            )
+        try:
+            header, raw_path = records[0].split(b"\t", 1)
+            mode, kind, object_id = header.decode("ascii").split()
+            actual_path = raw_path.decode("utf-8", "surrogateescape")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise runtime.HarnessError(
+                f"v2 base protocol tree entry is malformed: {relative}"
+            ) from exc
+        if (
+            actual_path != relative
+            or kind != "blob"
+            or mode not in {"100644", "100755"}
+            or not runtime.SHA1_RE.fullmatch(object_id)
+        ):
+            raise runtime.HarnessError(
+                f"v2 base protocol file is not a regular blob: {relative}"
+            )
+        blob = subprocess.run(
+            ["git", "--no-replace-objects", "cat-file", "blob", object_id],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if blob.returncode != 0:
+            raise runtime.HarnessError(
+                f"v2 base protocol blob is unreadable: {relative}"
+            )
+        files.append(
+            {
+                "path": relative,
+                "mode": mode,
+                "sha256": hashlib.sha256(blob.stdout).hexdigest(),
+            }
+        )
+    bundle: Dict[str, Any] = {
+        "schema_version": 2,
+        "files": files,
+    }
+    bundle["protocol_sha256"] = canonical_hash(bundle)
+    return bundle
+
+
+def require_no_git_replacements(repo: Path) -> None:
+    """Fail closed on mutable replacement refs even though Git reads ignore them."""
+
+    if os.environ.get("GIT_REPLACE_REF_BASE"):
+        raise runtime.HarnessError(
+            "v2 forbids GIT_REPLACE_REF_BASE in the Harness environment"
+        )
+    listed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/replace/",
+        ],
+        cwd=str(repo),
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if listed.returncode != 0:
+        raise runtime.HarnessError("v2 cannot inspect Git replacement refs")
+    replacements = [line for line in listed.stdout.splitlines() if line]
+    if replacements:
+        raise runtime.HarnessError(
+            "v2 forbids Git replacement refs: " + ", ".join(replacements[:10])
+        )
+
+
+def verify_raw_checkout(repo: Path, commit_sha: str, worktree: Path) -> None:
+    """Require checkout bytes to equal the raw immutable Git tree.
+
+    Git smudge filters and checkout hooks can make a nominally clean worktree
+    differ from the selected object graph. Compare filesystem leaves directly
+    to raw blob object IDs, without invoking attributes or filters.
+    """
+
+    listed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            commit_sha,
+        ],
+        cwd=str(repo),
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if listed.returncode != 0:
+        raise runtime.HarnessError("v2 raw checkout tree is unreadable")
+    expected: Dict[str, Tuple[str, str]] = {}
+    for record in (item for item in listed.stdout.split(b"\0") if item):
+        try:
+            header, raw_path = record.split(b"\t", 1)
+            mode, kind, object_id = header.decode("ascii").split()
+            relative = raw_path.decode("utf-8", "surrogateescape")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise runtime.HarnessError(
+                "v2 raw checkout tree entry is malformed"
+            ) from exc
+        if (
+            kind != "blob"
+            or mode not in {"100644", "100755", "120000"}
+            or not runtime.SHA1_RE.fullmatch(object_id)
+        ):
+            raise runtime.HarnessError(
+                f"v2 raw checkout has an unsupported entry: {relative}"
+            )
+        expected[relative] = (mode, object_id)
+
+    actual: Dict[str, Path] = {}
+    for current, directories, files in os.walk(worktree, followlinks=False):
+        current_path = Path(current)
+        relative_dir = current_path.relative_to(worktree)
+        if relative_dir == Path("."):
+            directories[:] = [name for name in directories if name != ".git"]
+            files = [name for name in files if name != ".git"]
+        for name in list(directories):
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                directories.remove(name)
+                relative = candidate.relative_to(worktree).as_posix()
+                actual[relative] = candidate
+            elif not stat.S_ISDIR(metadata.st_mode):
+                raise runtime.HarnessError(
+                    "v2 raw checkout contains a special entry: "
+                    + candidate.relative_to(worktree).as_posix()
+                )
+        for name in files:
+            candidate = current_path / name
+            relative = candidate.relative_to(worktree).as_posix()
+            actual[relative] = candidate
+    if set(actual) != set(expected):
+        extra = sorted(set(actual) - set(expected))
+        missing = sorted(set(expected) - set(actual))
+        raise runtime.HarnessError(
+            "v2 raw checkout path set differs from its base"
+            f" (extra={extra[:10]}, missing={missing[:10]})"
+        )
+
+    for relative, (expected_mode, expected_oid) in expected.items():
+        path = actual[relative]
+        metadata = path.lstat()
+        if expected_mode == "120000":
+            if not stat.S_ISLNK(metadata.st_mode):
+                raise runtime.HarnessError(
+                    f"v2 raw checkout type differs from its base: {relative}"
+                )
+            payload = os.readlink(path).encode("utf-8", "surrogateescape")
+        else:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise runtime.HarnessError(
+                    f"v2 raw checkout type differs from its base: {relative}"
+                )
+            actual_mode = (
+                "100755" if metadata.st_mode & 0o111 else "100644"
+            )
+            if actual_mode != expected_mode:
+                raise runtime.HarnessError(
+                    f"v2 raw checkout mode differs from its base: {relative}"
+                )
+            payload = path.read_bytes()
+        header = f"blob {len(payload)}\0".encode("ascii")
+        actual_oid = hashlib.sha1(header + payload).hexdigest()
+        if actual_oid != expected_oid:
+            raise runtime.HarnessError(
+                f"v2 raw checkout bytes differ from its base: {relative}"
+            )
 
 
 def executable_protocol_bundle(worktree: Path) -> Dict[str, Any]:
