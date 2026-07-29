@@ -32,6 +32,43 @@ use crate::error::{AppError, Result};
 use crate::settings::AppConfig;
 use crate::storage::Db;
 
+/// The persisted capture-lane projection used by every transcript coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptChannel {
+    Merged,
+    Mic,
+    System,
+}
+
+impl TranscriptChannel {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self> {
+        match value {
+            None | Some("") | Some("merged") => Ok(Self::Merged),
+            Some("mic") => Ok(Self::Mic),
+            Some("system") => Ok(Self::System),
+            Some(other) => Err(AppError::InvalidArg(format!(
+                "unsupported transcript channel \"{other}\"; expected merged, mic, or system"
+            ))),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Mic => "mic",
+            Self::System => "system",
+        }
+    }
+
+    fn render_channel(self) -> crate::audio::merge::RenderChannel {
+        match self {
+            Self::Merged => crate::audio::merge::RenderChannel::Merged,
+            Self::Mic => crate::audio::merge::RenderChannel::Mic,
+            Self::System => crate::audio::merge::RenderChannel::System,
+        }
+    }
+}
+
 /// The BRAIN CASCADE tier a [`GatedToolExecutor`] runs at (Phase 5). It is the STRUCTURAL escalation
 /// boundary: which tools the model may reach this turn is decided by CODE (`specs()` filter +
 /// `run()` allowlist), not prompt-trust. A weak model that mis-judges scope STILL cannot reach a
@@ -65,6 +102,11 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     fn allows(self, tool: &str) -> bool {
+        // Local-MCP discovery helpers are intentionally absent from every cloud-capable assistant
+        // scope. They can be dispatched only by the loopback MCP mapper into `execute_tool`.
+        if matches!(tool, "list_entities" | "list_note_folders") {
+            return false;
+        }
         const VAULT_READS: [&str; 10] = [
             "search_meetings",
             "search_semantic",
@@ -141,6 +183,11 @@ pub enum ToolCall {
     GetMeeting {
         meeting_id: String,
         transcript_format: String,
+        /// Capture lane whose rendered text defines this call's offset coordinate.
+        channel: TranscriptChannel,
+        /// Enrolled names are authorized only for the local MCP presentation path. The
+        /// cloud-capable in-app executor always sets this false.
+        include_speaker_map: bool,
         /// Brain v3 PR-2 — agent PAGING: skip this many chars into the TRANSCRIPT before returning
         /// (default 0 = today's behavior). Lets the agentic loop iterate a long transcript past the
         /// per-result budget. The NOTE is always returned in full (it's short).
@@ -156,6 +203,22 @@ pub enum ToolCall {
         /// so a 19.5k note prefix consumed the ENTIRE budget and the transcript window — the thing
         /// actually asked for — was cut away entirely.
         include_note: bool,
+    },
+    /// MCP-only located lexical search inside transcript segments. Every returned offset addresses
+    /// the canonical structured projection for `channel`. Intentionally absent from [`tool_specs`]
+    /// and [`GatedToolExecutor`]: this payload cannot enter an in-app/cloud agent loop.
+    SearchTranscript {
+        query: String,
+        meeting_id: Option<String>,
+        limit: usize,
+        max_per_meeting: usize,
+        channel: TranscriptChannel,
+    },
+    /// MCP-only gated timeline topic map projected onto structured transcript character offsets.
+    /// Intentionally absent from the in-app agent catalog for the same no-egress boundary.
+    GetMeetingChapters {
+        meeting_id: String,
+        channel: TranscriptChannel,
     },
     /// The full body of one standalone note OR imported/uploaded document by id (Feature D). Gated
     /// by [`Db::get_document_if_visible`] — a sealed-and-not-session-unlocked document is invisible
@@ -190,6 +253,12 @@ pub enum ToolCall {
         /// Max corpus chars to return (`full`: window; `summary`: excerpt budget; 0 = default).
         max_chars: usize,
     },
+    /// Local-MCP-only discovery of visible entities. Intentionally absent from [`tool_specs`] and
+    /// [`GatedToolExecutor`], so this metadata cannot enter an in-app/cloud agent loop.
+    ListEntities { query: Option<String>, limit: usize },
+    /// Local-MCP-only discovery of visible note folders, visible row counts, and typed columns.
+    /// Intentionally absent from [`tool_specs`] and [`GatedToolExecutor`].
+    ListNoteFolders,
     /// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what changed between two
     /// instants (`from`/`to` ISO-8601) plus the full chronological supersession ledger. EGRESS-FREE:
     /// reads the entity's facts through the visibility-gated [`Db::list_facts_visible`] inside
@@ -234,11 +303,12 @@ pub enum ToolCall {
     /// prompt.
     OrgBrainSearch { query: String },
     /// Feature C — QUERY a note-folder's TYPED front-matter properties (the Table/Board substrate) as
-    /// a structured database. EGRESS-FREE: reads the LOCAL typed rows through the gated
-    /// [`Db::list_notes_visible_typed`] (a sealed-and-not-session-unlocked folder yields NO rows), then
-    /// applies a DETERMINISTIC, RUST-parsed filter grammar (`key op value`, `AND`/`OR`) — NEVER a second
-    /// LLM call, so there is no prompt-injection surface and nothing egresses. An unparseable filter
-    /// degrades to "no rows matched (could not parse)", NEVER all rows.
+    /// a structured database. EGRESS-FREE: resolves folder identity, visible count, and schema from
+    /// ONE gated catalog row, then projects LOCAL rows through that selected schema using gated note
+    /// readers (a sealed-and-not-session-unlocked folder yields NO rows). Applies a DETERMINISTIC,
+    /// RUST-parsed filter grammar (`key op value`, `AND`/`OR`) — NEVER a second LLM call, so there is
+    /// no prompt-injection surface and nothing egresses. An unparseable filter degrades to "no rows
+    /// matched (could not parse)", NEVER all rows.
     QueryDatabase { folder: String, filter: String },
 }
 
@@ -300,13 +370,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "get_meeting".into(),
             description: "Fetch one meeting's AI note and full transcript by its id (from a prior \
                           search hit). For a very long transcript, page through it with offset + \
-                          maxChars.".into(),
+                          maxChars. The in-app assistant always receives the conservative merged \
+                          capture view; raw mic/system lanes are available only over local MCP."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "meetingId": { "type": "string", "description": "The meeting id from a prior search result." },
+                    "transcriptFormat": { "type": "string", "enum": ["structured", "plain", "compact"], "description": "Transcript rendering (default structured)." },
                     "offset": { "type": "integer", "description": "Chars to skip into the transcript (default 0)." },
-                    "maxChars": { "type": "integer", "description": "Max transcript chars to return from offset (default all)." }
+                    "maxChars": { "type": "integer", "description": "Max transcript chars to return from offset (default all)." },
+                    "includeNote": { "type": "boolean", "description": "Include the note on the first page (default true)." }
                 },
                 "required": ["meetingId"]
             }),
@@ -349,7 +423,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_recent_meetings".into(),
-            description: "List the most recent meetings (newest first).".into(),
+            description: "List the most recent visible meetings (newest first) with status, \
+                          durationSeconds, transcriptChars, hasVisibleNote, and deterministic Error \
+                          statusDetail for triage."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": { "limit": { "type": "integer", "description": "How many (1..=100)." } }
@@ -660,6 +737,8 @@ pub fn execute_tool(
         ToolCall::GetMeeting {
             meeting_id,
             transcript_format,
+            channel,
+            include_speaker_map,
             offset,
             max_chars,
             include_note,
@@ -685,13 +764,18 @@ pub fn execute_tool(
                         .map(|t| format!("TITLE: [[{t}]]\n\n"))
                         .unwrap_or_default();
                     let note = db.get_note_if_visible(mid, unlocked).ok().flatten();
-                    let segs = db.get_segments(mid).unwrap_or_default();
+                    let stored = db
+                        .get_segments_with_echo_provenance(mid)
+                        .unwrap_or_default();
+                    let (segs, echo_suppressed) = split_stored_segments(stored);
+                    let projection = TranscriptProjection::new(&segs, *channel, &echo_suppressed);
                     // Feature D: DEFAULT to the STRUCTURED per-segment transcript (speaker + raw-second
                     // timestamps). `transcript_format == "plain"` keeps the LEGACY byte-identical flat
                     // space-join for backward compatibility; every other value (incl. absent/default,
                     // which the MCP/dispatch layer maps to "structured") uses the structured renderer.
                     let full_transcript = match transcript_format.as_str() {
-                        "plain" => segs
+                        "plain" => projection
+                            .segments
                             .iter()
                             .map(|s| s.text.trim())
                             .filter(|t| !t.is_empty())
@@ -700,8 +784,8 @@ pub fn execute_tool(
                         // #13 — OPT-IN compact rendering. Default stays `structured`: making
                         // compact the default would silently move every agent's offset space with
                         // no version signal to notice it by.
-                        "compact" => format_compact_transcript(&segs),
-                        _ => format_structured_transcript(&segs),
+                        "compact" => format_compact_transcript(&projection.segments),
+                        _ => projection.text.clone(),
                     };
                     // B1 — decide "no data" on the RAW content BEFORE windowing. A note-less
                     // meeting whose transcript is empty (INCLUDING a nonexistent id, which
@@ -723,11 +807,35 @@ pub fn execute_tool(
                     // offsets in one and then switches lands ~40% off target. Naming the format
                     // beside TOTAL_CHARS makes the space the offsets belong to self-describing.
                     let transcript_section = match &disclosure {
-                        Some(h) => {
-                            format!("TRANSCRIPT (format={transcript_format}, {h}):\n{transcript}")
-                        }
-                        None => format!("TRANSCRIPT (format={transcript_format}):\n{transcript}"),
+                        Some(h) => format!(
+                            "TRANSCRIPT (format={transcript_format}, channel={}, {h}):\n{transcript}",
+                            channel.as_str()
+                        ),
+                        None => format!(
+                            "TRANSCRIPT (format={transcript_format}, channel={}):\n{transcript}",
+                            channel.as_str()
+                        ),
                     };
+                    // Enrolled labels are a first-page prefix, like the note: later transcript
+                    // pages keep the exact transcript coordinate and never repeat personal names.
+                    // When paging is bounded, apply the SAME char-safe disclosure budget to this
+                    // added content instead of prepending an unbounded map outside `max_chars`.
+                    let speaker_map = if *include_speaker_map && *offset == 0 {
+                        let full_map = speaker_map_header(db, mid, &projection.lines, unlocked)?;
+                        if full_map.is_empty() || *max_chars == 0 {
+                            full_map
+                        } else {
+                            let (body, map_disclosure) =
+                                page_text_disclosed(full_map.trim_end(), 0, *max_chars);
+                            match map_disclosure {
+                                Some(h) => format!("SPEAKER MAP ({h}):\n{body}\n\n"),
+                                None => format!("{body}\n\n"),
+                            }
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let transcript_section = format!("{speaker_map}{transcript_section}");
                     // E1 — the NOTE is a whole-note prefix, NOT part of the transcript window, so
                     // emit it ONLY on the first window (`offset == 0`). Paging a long transcript
                     // (`offset > 0`) must never re-ship the full note on every page.
@@ -745,13 +853,34 @@ pub fn execute_tool(
                                 Some(h) => format!("NOTE ({h}):\n{body}"),
                                 None => format!("NOTE:\n{body}"),
                             };
-                            Ok(format!("{title_line}{note_section}\n\n{transcript_section}"))
+                            Ok(format!(
+                                "{title_line}{note_section}\n\n{transcript_section}"
+                            ))
                         }
                         _ => Ok(format!("{title_line}{transcript_section}")),
                     }
                 }
             }
         }
+        ToolCall::SearchTranscript {
+            query,
+            meeting_id,
+            limit,
+            max_per_meeting,
+            channel,
+        } => format_transcript_search(
+            db,
+            query,
+            meeting_id.as_deref(),
+            *limit,
+            *max_per_meeting,
+            *channel,
+            unlocked,
+        ),
+        ToolCall::GetMeetingChapters {
+            meeting_id,
+            channel,
+        } => format_meeting_chapters(db, meeting_id, *channel, unlocked),
         ToolCall::GetDocument {
             document_id,
             offset,
@@ -801,23 +930,65 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!(
                     "document outline read failed: {e}"
                 ))),
-                Ok(entries) if entries.is_empty() => Ok(format!(
-                    "No outline for document {id} (it may be locked, absent, or have no headings — \
-                     read it with get_document)."
-                )),
+                Ok(entries) if entries.is_empty() => {
+                    // A meeting id is a common caller mistake. Redirect only after the document
+                    // reader returned its masked empty result, and only when the meeting exists AND
+                    // is visible. `meeting_is_visible` intentionally returns true for an absent id,
+                    // so the existence conjunct is mandatory. The raw existence read is
+                    // short-circuited for a sealed meeting.
+                    let meeting_is_visible = db.meeting_is_visible(id, unlocked).map_err(|e| {
+                        AppError::Storage(format!("meeting visibility check failed: {e}"))
+                    })?;
+                    let is_visible_meeting = if meeting_is_visible {
+                        db.get_meeting(id)
+                            .map_err(|e| AppError::Storage(format!("meeting lookup failed: {e}")))?
+                            .is_some()
+                    } else {
+                        false
+                    };
+                    if is_visible_meeting {
+                        Ok(format!(
+                            "{id} is a MEETING, not a document — read it with get_meeting."
+                        ))
+                    } else {
+                        // Deliberately omit the caller-supplied id: locked and absent ids must
+                        // receive a byte-identical sentinel, not merely similarly worded responses.
+                        Ok(
+                            "No outline for that document (it may be locked, absent, or have no \
+                             headings — read it with get_document)."
+                                .to_string(),
+                        )
+                    }
+                }
                 Ok(entries) => Ok(format_doc_outline(id, &entries)),
             }
         }
         ToolCall::ListRecentMeetings { limit } => {
-            match db.list_meetings_visible(*limit, unlocked) {
+            // One bounded aggregate reader owns visibility, transcript size, and note presence.
+            // There is no per-row transcript/note query and no sealed meeting produces a row.
+            match db.list_meeting_triage_visible(*limit, unlocked) {
                 Ok(ms) => Ok(ms
                     .iter()
-                    .map(|m| {
+                    .map(|(m, transcript_chars, has_visible_note)| {
+                        let status_detail = match m.status {
+                            crate::storage::models::MeetingStatus::Error
+                                if *transcript_chars == 0 =>
+                            {
+                                "no transcript"
+                            }
+                            crate::storage::models::MeetingStatus::Error => "partial transcript",
+                            _ => "none",
+                        };
                         format!(
-                            "- {} · {} · {:?} · id:{}",
+                            "- {} · {} · status:{:?} · statusDetail:{} · durationSeconds:{} · \
+                             transcriptChars:{} · hasVisibleNote:{} · id:{}",
                             m.title.clone().unwrap_or_else(|| "(untitled)".into()),
                             m.started_at,
                             m.status,
+                            status_detail,
+                            m.duration_s,
+                            transcript_chars,
+                            has_visible_note,
                             m.id
                         )
                     })
@@ -852,21 +1023,87 @@ pub fn execute_tool(
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => return entity_not_found(db, entity, unlocked),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::summarize::dossier::build_dossier_data(db, &id, unlocked) {
-                Ok(Some(data)) => Ok(
-                    crate::summarize::dossier::format_dossier_client_windowed(
-                        &data,
-                        note_detail,
-                        *offset,
-                        *max_chars,
-                    ),
-                ),
-                Ok(None) => Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(Some(data)) => Ok(crate::summarize::dossier::format_dossier_client_windowed(
+                    &data,
+                    note_detail,
+                    *offset,
+                    *max_chars,
+                )),
+                Ok(None) => entity_not_found(db, entity, unlocked),
                 Err(e) => Err(AppError::Storage(format!("dossier build failed: {e}"))),
             }
+        }
+        ToolCall::ListEntities { query, limit } => {
+            // GATE: an entity mentioned only by sealed-and-not-session-unlocked meetings is absent
+            // from this source, including its id/name and mention count.
+            let entities = db
+                .list_entities_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("entity list failed: {e}")))?;
+            let query = query.as_deref().map(str::trim).filter(|q| !q.is_empty());
+            let folded_query = query.map(str::to_lowercase);
+            let limit = (*limit).clamp(1, 100);
+            let rows: Vec<_> = entities
+                .into_iter()
+                // `list_entities_visible` already supplies the stable order: visible mention count
+                // descending, then case-insensitive name. Filtering preserves that order.
+                .filter(|entity| match &folded_query {
+                    Some(query) => entity.name.to_lowercase().contains(query),
+                    None => true,
+                })
+                .take(limit)
+                .collect();
+            if rows.is_empty() {
+                return Ok(match query {
+                    Some(q) => format!("No visible entities matching \"{q}\"."),
+                    None => "No visible entities.".to_string(),
+                });
+            }
+            Ok(rows
+                .iter()
+                .map(|entity| {
+                    format!(
+                        "- {} · type:{} · visibleMentions:{} · id:{}",
+                        entity.name,
+                        entity.kind.as_str(),
+                        entity.mention_count,
+                        entity.id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        ToolCall::ListNoteFolders => {
+            let folders = db
+                .list_note_folder_catalog_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("note-folder list failed: {e}")))?;
+            if folders.is_empty() {
+                return Ok("No visible note folders.".to_string());
+            }
+            Ok(folders
+                .iter()
+                .map(|(folder, record_count, schema)| {
+                    let columns = if schema.is_empty() {
+                        "none".to_string()
+                    } else {
+                        schema
+                            .iter()
+                            .map(|field| {
+                                format!("{}:{}", field.key, property_kind_name(field.kind))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    format!(
+                        "- {} · id:{} · visibleRecords:{} · typedColumns:{}",
+                        folder.name, folder.id, record_count, columns
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         ToolCall::KnowledgeDiff { entity, from, to } => {
             // EGRESS-FREE + GATED: resolve the entity through the SAME gated resolver as the dossier
@@ -876,7 +1113,7 @@ pub fn execute_tool(
             let entity = entity.as_str();
             let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
                 Ok(Some(id)) => id,
-                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Ok(None) => return entity_not_found(db, entity, unlocked),
                 Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
             };
             match crate::facts::build_knowledge_diff(db, &id, from, to, unlocked) {
@@ -940,35 +1177,36 @@ pub fn execute_tool(
             search_org_brain(db, config, query)
         }
         ToolCall::QueryDatabase { folder, filter } => {
-            // Resolve the note-folder by NAME (case-insensitive) or exact id. Note-folders only, so a
-            // meeting folder can never be queried through here. An unresolvable name is a FRIENDLY
-            // sentinel (never an error) so the model can retry with a different name.
-            let target = match db.note_folder_by_name_or_id(folder) {
-                Ok(Some(f)) => f,
-                Ok(None) => return Ok(format!("No note folder named \"{}\".", folder.trim())),
-                Err(e) => return Err(AppError::Storage(format!("folder resolve failed: {e}"))),
+            // Resolve name/id, visible alternatives, visible count, and schema from ONE gated
+            // catalog. Never call the raw `note_folder_by_name_or_id`: an exact locked name/id must
+            // be indistinguishable from an absent folder.
+            let catalog = db
+                .list_note_folder_catalog_visible(unlocked)
+                .map_err(|e| AppError::Storage(format!("folder resolve failed: {e}")))?;
+            let needle = folder.trim();
+            let target = catalog
+                .iter()
+                .find(|(candidate, _, _)| candidate.name.eq_ignore_ascii_case(needle))
+                .or_else(|| {
+                    catalog
+                        .iter()
+                        .find(|(candidate, _, _)| candidate.id == needle)
+                });
+            let Some((target, visible_record_count, schema)) = target else {
+                let available = catalog
+                    .iter()
+                    .map(|(candidate, _, _)| candidate.name.as_str())
+                    .collect::<Vec<_>>();
+                return Ok(if available.is_empty() {
+                    "No visible note folder matching that name or id.".to_string()
+                } else {
+                    format!(
+                        "No visible note folder matching that name or id. Available: {}.",
+                        available.join(", ")
+                    )
+                });
             };
-            // GATE: the typed rows come from `list_notes_visible_typed`, which is built on the gated
-            // `list_notes_visible` (`visibility_clause` against `unlocked`) — a sealed-and-not-session-
-            // unlocked folder yields NO rows here (never a masked row), so no sealed content can leak.
-            let rows = db
-                .list_notes_visible_typed(&target.id, unlocked)
-                .map_err(|e| AppError::Storage(format!("typed rows read failed: {e}")))?;
-            // DETERMINISTIC, RUST-PARSED filter (no second LLM call → egress-free, no injection
-            // surface). An UNPARSEABLE filter yields ZERO matches (never all rows).
-            let matched = filter_rows(&rows, filter);
-            if matched.is_empty() {
-                // Distinguish "parsed but nothing matched" from "could not parse the filter".
-                let f = filter.trim();
-                if !f.is_empty() && parse_filter(f).is_none() {
-                    return Ok(format!(
-                        "No rows matched in \"{}\" (could not parse the filter).",
-                        target.name
-                    ));
-                }
-                return Ok(format!("No rows matched in \"{}\".", target.name));
-            }
-            Ok(format_typed_rows(&target.name, &matched))
+            query_database_from_catalog(db, target, *visible_record_count, schema, filter, unlocked)
         }
     }
 }
@@ -1480,7 +1718,7 @@ pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Resu
     }
     let hits = search_org_brain_hits(db, config, query)?;
     if hits.is_empty() {
-        return Ok(format!("No org-brain results for \"{q}\"."));
+        return Ok("No org-brain results.".to_string());
     }
     Ok(neutralize_murmur_fences(&format_org_hits(&hits)))
 }
@@ -1509,6 +1747,112 @@ fn format_org_hits(hits: &[crate::storage::models::OrgChunkHit]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+const ENTITY_SUGGESTION_QUERY_MAX_CHARS: usize = 128;
+const ENTITY_SUGGESTION_LIMIT: usize = 5;
+
+/// Friendly entity miss with a bounded did-you-mean list. Suggestions never resolve the request;
+/// they only expose names already returned by the visibility-gated entity catalog.
+fn entity_not_found(db: &Db, entity: &str, unlocked: &HashSet<String>) -> Result<String> {
+    let base = format!("No visible entity matching \"{entity}\".");
+    let query = entity.trim();
+    if query.is_empty() || query.chars().count() > ENTITY_SUGGESTION_QUERY_MAX_CHARS {
+        return Ok(base);
+    }
+    let folded_query = query.to_lowercase();
+    let query_initials = initials(query).to_lowercase();
+    let candidates = db
+        .list_entities_visible(unlocked)
+        .map_err(|e| AppError::Storage(format!("entity suggestions failed: {e}")))?;
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let name = candidate.name.trim();
+            let folded_name = name.to_lowercase();
+            let score = if folded_name == folded_query {
+                0
+            } else if folded_name.starts_with(&folded_query)
+                || folded_query.starts_with(&folded_name)
+            {
+                1
+            } else if folded_name.contains(&folded_query)
+                || folded_query.contains(&folded_name)
+                || initials(name).to_lowercase() == folded_query
+                || query_initials == folded_name
+            {
+                2
+            } else if edit_distance_at_most_two(&folded_name, &folded_query) {
+                3
+            } else {
+                return None;
+            };
+            Some((
+                score,
+                std::cmp::Reverse(candidate.mention_count),
+                folded_name,
+                candidate.id,
+                candidate.name,
+            ))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    let mut seen = HashSet::new();
+    let suggestions = scored
+        .into_iter()
+        .filter_map(|(_, _, folded_name, _, name)| seen.insert(folded_name).then_some(name))
+        .take(ENTITY_SUGGESTION_LIMIT)
+        .collect::<Vec<_>>();
+    if suggestions.is_empty() {
+        Ok(base)
+    } else {
+        Ok(format!("{base} Did you mean: {}?", suggestions.join(", ")))
+    }
+}
+
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().find(|ch| ch.is_alphanumeric()))
+        .collect()
+}
+
+/// Bounded Levenshtein predicate for typo suggestions. It never changes exact entity resolution.
+fn edit_distance_at_most_two(left: &str, right: &str) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len() < 3
+        || right.len() < 3
+        || left.len().abs_diff(right.len()) > 2
+        || left.len() > ENTITY_SUGGESTION_QUERY_MAX_CHARS
+        || right.len() > ENTITY_SUGGESTION_QUERY_MAX_CHARS
+    {
+        return false;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_idx, left_char) in left.iter().enumerate() {
+        let mut current = Vec::with_capacity(right.len() + 1);
+        current.push(left_idx + 1);
+        let mut row_min = current[0];
+        for (right_idx, right_char) in right.iter().enumerate() {
+            let substitution = previous[right_idx] + usize::from(left_char != right_char);
+            let insertion = current[right_idx] + 1;
+            let deletion = previous[right_idx + 1] + 1;
+            let distance = substitution.min(insertion).min(deletion);
+            row_min = row_min.min(distance);
+            current.push(distance);
+        }
+        if row_min > 2 {
+            return false;
+        }
+        previous = current;
+    }
+    previous[right.len()] <= 2
 }
 
 /// Render the KNOWLEDGE DIFF into the tool text payload for the client to narrate: the between-two-
@@ -1756,6 +2100,16 @@ fn property_value_str(v: &crate::storage::models::PropertyValue) -> String {
     }
 }
 
+fn property_kind_name(kind: crate::storage::models::PropertyKind) -> &'static str {
+    match kind {
+        crate::storage::models::PropertyKind::Text => "text",
+        crate::storage::models::PropertyKind::Select => "select",
+        crate::storage::models::PropertyKind::Date => "date",
+        crate::storage::models::PropertyKind::Checkbox => "checkbox",
+        crate::storage::models::PropertyKind::Number => "number",
+    }
+}
+
 /// Does one typed note row satisfy `clause`? A missing key never matches. Numeric comparison when
 /// BOTH the row value and the filter value parse as `f64`; otherwise case-insensitive string. The
 /// tag list is queryable via the reserved key `tags` (a `contains`/`=` over the row's tags).
@@ -1840,11 +2194,102 @@ fn filter_rows<'a>(
         .collect()
 }
 
+/// Build typed rows using the schema carried by the already-selected VISIBLE catalog row. This is
+/// deliberately separate from [`Db::list_notes_visible_typed`]: that general storage helper reads
+/// the persisted schema again, while `query_database` must preserve one resolver snapshot for
+/// identity, count, and schema. Both content reads remain gated, so a sealed-and-not-session-unlocked
+/// folder yields no summaries and no markdown.
+fn typed_rows_from_catalog_schema(
+    db: &Db,
+    folder_id: &str,
+    schema: &[crate::storage::models::PropertySchemaField],
+    unlocked: &HashSet<String>,
+) -> Result<Vec<crate::storage::models::TypedNoteRow>> {
+    let summaries = db
+        .list_notes_visible(Some(folder_id), unlocked)
+        .map_err(|e| AppError::Storage(format!("typed rows read failed: {e}")))?;
+    let mut rows = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let Some(markdown) = db
+            .note_markdown_if_visible(&summary.id, unlocked)
+            .map_err(|e| AppError::Storage(format!("typed row content read failed: {e}")))?
+        else {
+            continue;
+        };
+        let (tags, raw) = crate::storage::db::parse_front_matter(&markdown);
+        let mut values = std::collections::BTreeMap::new();
+        for field in schema {
+            if let Some(raw_value) = raw.get(&field.key) {
+                values.insert(
+                    field.key.clone(),
+                    crate::storage::db::coerce_property_value(
+                        raw_value,
+                        field.kind,
+                        &field.options,
+                    ),
+                );
+            }
+        }
+        rows.push(crate::storage::models::TypedNoteRow {
+            id: summary.id,
+            title: summary.title,
+            folder_id: summary.folder_id,
+            values,
+            tags,
+            updated_at: summary.updated_at,
+        });
+    }
+    Ok(rows)
+}
+
+/// Execute `query_database` from exactly one selected visible-catalog row. Folder identity, visible
+/// total count, and schema all come from the same resolver snapshot; this helper must not perform a
+/// second folder/schema lookup.
+fn query_database_from_catalog(
+    db: &Db,
+    target: &crate::storage::models::NoteFolder,
+    visible_record_count: i64,
+    schema: &[crate::storage::models::PropertySchemaField],
+    filter: &str,
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    let rows = typed_rows_from_catalog_schema(db, &target.id, schema, unlocked)?;
+    // DETERMINISTIC, RUST-PARSED filter (no second LLM call → egress-free, no injection surface).
+    // An UNPARSEABLE filter yields ZERO matches (never all rows).
+    let matched = filter_rows(&rows, filter);
+    if matched.is_empty() {
+        // Distinguish "parsed but nothing matched" from "could not parse the filter".
+        if !filter.trim().is_empty() && parse_filter(filter).is_none() {
+            return Ok(format!(
+                "No rows matched among {visible_record_count} visible records in \"{}\" \
+                 (could not parse the filter).",
+                target.name
+            ));
+        }
+        return Ok(format!(
+            "No rows matched among {visible_record_count} visible records in \"{}\".",
+            target.name
+        ));
+    }
+    Ok(format_typed_rows(
+        &target.name,
+        &matched,
+        visible_record_count,
+    ))
+}
+
 /// Feature C — render matched typed rows into the tool's text payload: a header, then one line per
 /// row: `- [[Title]] · key: value · key: value` (only the row's populated typed values + a `tags:`
 /// suffix when present). Egress-free, plain text; the model cites `[[Title]]`.
-fn format_typed_rows(folder_name: &str, rows: &[&crate::storage::models::TypedNoteRow]) -> String {
-    let mut out = format!("{} rows in \"{folder_name}\":", rows.len());
+fn format_typed_rows(
+    folder_name: &str,
+    rows: &[&crate::storage::models::TypedNoteRow],
+    visible_record_count: i64,
+) -> String {
+    let mut out = format!(
+        "{} matching rows of {visible_record_count} visible records in \"{folder_name}\":",
+        rows.len()
+    );
     for row in rows {
         let mut parts: Vec<String> = Vec::new();
         for (k, v) in &row.values {
@@ -1977,20 +2422,79 @@ fn speaker_label(tag: Option<&str>) -> std::borrow::Cow<'static, str> {
     }
 }
 
-fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> String {
-    segs.iter()
-        .filter(|s| !s.text.trim().is_empty())
-        .map(|s| {
-            format!(
-                "[{}–{}] {}: {}",
-                secs(s.start_s),
-                secs(s.end_s),
-                speaker_label(s.speaker.as_deref()),
-                s.text.trim()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+struct ProjectedTranscriptLine<'a> {
+    segment: &'a crate::transcribe::types::Segment,
+    speaker: String,
+    text: String,
+    start_char: usize,
+    end_char: usize,
+}
+
+/// The ONE transcript projection used by body rendering, located search, and chapter offsets.
+///
+/// Offsets count Unicode scalar values (the same unit as `page_text_disclosed`) and address the
+/// exact `structured` text returned by `get_meeting` for the stamped channel.
+struct TranscriptProjection<'a> {
+    segments: Vec<&'a crate::transcribe::types::Segment>,
+    lines: Vec<ProjectedTranscriptLine<'a>>,
+    text: String,
+}
+
+impl<'a> TranscriptProjection<'a> {
+    fn new(
+        segs: &'a [crate::transcribe::types::Segment],
+        channel: TranscriptChannel,
+        echo_suppressed: &HashSet<i64>,
+    ) -> Self {
+        let segments = crate::audio::merge::select_render_channel(
+            segs,
+            channel.render_channel(),
+            echo_suppressed,
+        );
+        let mut lines = Vec::new();
+        let mut rendered = Vec::new();
+        let mut cursor = 0usize;
+        for segment in segments
+            .iter()
+            .copied()
+            .filter(|s| !s.text.trim().is_empty())
+        {
+            let speaker = speaker_label(segment.speaker.as_deref()).into_owned();
+            let text = segment.text.trim().to_string();
+            let line = format!(
+                "[{}–{}] {speaker}: {text}",
+                secs(segment.start_s),
+                secs(segment.end_s)
+            );
+            let start_char = cursor;
+            let end_char = start_char.saturating_add(line.chars().count());
+            cursor = end_char.saturating_add(1);
+            rendered.push(line);
+            lines.push(ProjectedTranscriptLine {
+                segment,
+                speaker,
+                text,
+                start_char,
+                end_char,
+            });
+        }
+        Self {
+            segments,
+            lines,
+            text: rendered.join("\n"),
+        }
+    }
+}
+
+fn split_stored_segments(
+    stored: Vec<crate::storage::models::StoredTranscriptSegment>,
+) -> (Vec<crate::transcribe::types::Segment>, HashSet<i64>) {
+    let echo_suppressed = stored
+        .iter()
+        .filter_map(|row| row.echo_suppressed.then_some(row.segment.idx))
+        .collect();
+    let segments = stored.into_iter().map(|row| row.segment).collect();
+    (segments, echo_suppressed)
 }
 
 /// Render the transcript COMPACTLY: fold each run of consecutive same-speaker segments into ONE
@@ -2005,7 +2509,7 @@ fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> S
 /// not a citation source — merging runs destroys per-segment boundaries, so a compact reply must
 /// never be used to seek audio. (Nothing regresses: grounding and receipts work off typed
 /// `Segment`s, never this rendered string.)
-fn format_compact_transcript(segs: &[crate::transcribe::types::Segment]) -> String {
+fn format_compact_transcript(segs: &[&crate::transcribe::types::Segment]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut run: Option<(String, f64, f64, Vec<String>)> = None;
     for s in segs.iter().filter(|s| !s.text.trim().is_empty()) {
@@ -2039,6 +2543,360 @@ fn format_compact_transcript(segs: &[crate::transcribe::types::Segment]) -> Stri
         ));
     }
     out.join("\n")
+}
+
+fn one_line_bounded(value: &str, max_chars: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let mut out: String = collapsed
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
+        out.push('…');
+        out
+    }
+}
+
+const MAX_SPEAKER_MAP_ENTRIES: usize = 20;
+const MAX_TRANSCRIPT_SEARCH_RAW_HITS: usize = 500;
+
+/// Return a bounded one-line excerpt centered on a lexical query hit.
+///
+/// FTS selects the candidate segment, but callers need the excerpt itself to retain the evidence
+/// that caused the hit. Unicode case folding is mapped back to source scalar positions so slicing
+/// stays panic-free and uses the same character unit as transcript offsets.
+fn query_centered_excerpt(value: &str, query: &str, max_chars: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source = collapsed.chars().collect::<Vec<_>>();
+    if source.len() <= max_chars {
+        return collapsed;
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut folded = Vec::new();
+    let mut folded_to_source = Vec::new();
+    for (source_idx, ch) in source.iter().copied().enumerate() {
+        for lower in ch.to_lowercase() {
+            folded.push(lower);
+            folded_to_source.push(source_idx);
+        }
+    }
+    let folded_query = query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .collect::<Vec<_>>();
+    let mut needles = Vec::new();
+    if !folded_query.is_empty() {
+        needles.push(folded_query);
+    }
+    let mut terms = query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_lowercase().chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    needles.extend(terms);
+
+    let hit = needles.iter().find_map(|needle| {
+        (needle.len() <= folded.len()).then(|| {
+            folded
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .map(|start| {
+                    (
+                        folded_to_source[start],
+                        folded_to_source[start + needle.len() - 1] + 1,
+                    )
+                })
+        })?
+    });
+    let Some((hit_start, hit_end)) = hit else {
+        return one_line_bounded(&collapsed, max_chars);
+    };
+
+    // Reserve room for both truncation markers. If the centered window reaches an outer edge, the
+    // unused marker slot simply makes the excerpt one character shorter than the hard maximum.
+    let content_budget = max_chars.saturating_sub(2).max(1);
+    let hit_center = hit_start.saturating_add(hit_end.saturating_sub(hit_start) / 2);
+    let mut start = hit_center.saturating_sub(content_budget / 2);
+    start = start.min(source.len().saturating_sub(content_budget));
+    let mut end = start.saturating_add(content_budget).min(source.len());
+    if hit_end.saturating_sub(hit_start) <= content_budget {
+        if start > hit_start {
+            start = hit_start;
+            end = start.saturating_add(content_budget).min(source.len());
+        }
+        if end < hit_end {
+            end = hit_end;
+            start = end.saturating_sub(content_budget);
+        }
+    }
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(source[start..end].iter());
+    if end < source.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Render enrolled names for only the diarized speakers present in this disclosed channel.
+///
+/// The DB reader returns labels only, never biometric embeddings, and independently applies the
+/// meeting visibility predicate. The map is intentionally outside the transcript body so it does
+/// not move the stamped character coordinate.
+fn speaker_map_header(
+    db: &Db,
+    meeting_id: &str,
+    lines: &[ProjectedTranscriptLine<'_>],
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    let rendered_clusters: HashSet<i64> = lines
+        .iter()
+        .filter_map(|line| {
+            crate::transcribe::diarize::cluster_index_of_tag(line.segment.speaker.as_deref()?, true)
+        })
+        .collect();
+    if rendered_clusters.is_empty() {
+        return Ok(String::new());
+    }
+    let mut mappings = db
+        .list_visible_speaker_labels_for_meeting(meeting_id, unlocked)?
+        .into_iter()
+        .filter(|row| rendered_clusters.contains(&row.cluster_index))
+        .filter_map(|row| {
+            let label = one_line_bounded(&row.label, 100);
+            let speaker_n = row.cluster_index.checked_add(1)?;
+            (!label.is_empty()).then_some((speaker_n, format!("- Speaker {speaker_n} = {label}")))
+        })
+        .collect::<Vec<_>>();
+    mappings.sort_by_key(|(speaker_n, _)| *speaker_n);
+    mappings.dedup_by_key(|(speaker_n, _)| *speaker_n);
+    if mappings.is_empty() {
+        Ok(String::new())
+    } else {
+        let total = mappings.len();
+        mappings.truncate(MAX_SPEAKER_MAP_ENTRIES);
+        let truncation = if total > mappings.len() {
+            format!(
+                "\n[speaker map truncated: showing {} of {total} matching enrolled labels]",
+                mappings.len()
+            )
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "SPEAKERS (enrolled names; unlisted speakers are unidentified):\n{}{truncation}\n\n",
+            mappings
+                .iter()
+                .map(|(_, mapping)| mapping.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
+    }
+}
+
+fn transcript_timestamp(start_s: f64) -> String {
+    let total = start_s.max(0.0).floor() as u64;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+fn format_transcript_search(
+    db: &Db,
+    query: &str,
+    meeting_id: Option<&str>,
+    limit: usize,
+    max_per_meeting: usize,
+    channel: TranscriptChannel,
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok("No transcript passages match \"\".".to_string());
+    }
+    let limit = limit.clamp(1, 100);
+    let max_per_meeting = max_per_meeting.clamp(1, 20);
+    let (raw_hits, candidate_meetings_truncated, raw_hits_truncated) = db
+        .search_transcript_segments_visible(
+            query,
+            meeting_id,
+            channel.render_channel(),
+            20,
+            MAX_TRANSCRIPT_SEARCH_RAW_HITS,
+            unlocked,
+        )?;
+    if raw_hits.is_empty() {
+        return Ok(format!("No transcript passages match \"{query}\"."));
+    }
+
+    let mut sections = Vec::new();
+    let mut total_matches = 0usize;
+    let mut shown = 0usize;
+    let mut cursor = 0usize;
+    while cursor < raw_hits.len() {
+        let meeting_id = raw_hits[cursor].meeting_id.clone();
+        let meeting_title = raw_hits[cursor].meeting_title.clone();
+        let start = cursor;
+        while cursor < raw_hits.len() && raw_hits[cursor].meeting_id == meeting_id {
+            cursor += 1;
+        }
+        let matching_indices: HashSet<i64> = raw_hits[start..cursor]
+            .iter()
+            .map(|hit| hit.seg_idx)
+            .collect();
+        let stored = db.get_segments_with_echo_provenance(&meeting_id)?;
+        let (segments, echo_suppressed) = split_stored_segments(stored);
+        let projection = TranscriptProjection::new(&segments, channel, &echo_suppressed);
+        let projected_hits = projection
+            .lines
+            .iter()
+            .filter(|line| matching_indices.contains(&line.segment.idx))
+            .collect::<Vec<_>>();
+        total_matches = total_matches.saturating_add(projected_hits.len());
+        if projected_hits.is_empty() || shown >= limit {
+            continue;
+        }
+
+        let mut lines = Vec::new();
+        for line in projected_hits
+            .into_iter()
+            .take(max_per_meeting)
+            .take(limit.saturating_sub(shown))
+        {
+            lines.push(format!(
+                "- offset {}..{} · @{} ({:.1}s) · seg {} · {} — {}",
+                line.start_char,
+                line.end_char,
+                transcript_timestamp(line.segment.start_s),
+                line.segment.start_s,
+                line.segment.idx,
+                line.speaker,
+                query_centered_excerpt(&line.text, query, 240)
+            ));
+            shown += 1;
+        }
+        if !lines.is_empty() {
+            let speaker_map = speaker_map_header(db, &meeting_id, &projection.lines, unlocked)?;
+            sections.push(format!(
+                "[meeting:{meeting_id}] [[{}]]\n{speaker_map}{}",
+                one_line_bounded(&meeting_title, 160),
+                lines.join("\n")
+            ));
+        }
+    }
+
+    if total_matches == 0 && !candidate_meetings_truncated && !raw_hits_truncated {
+        return Ok(format!("No transcript passages match \"{query}\"."));
+    }
+    let any_truncated = candidate_meetings_truncated || raw_hits_truncated;
+    let count_disclosure = if any_truncated {
+        format!(
+            "shown={shown}, counted={total_matches}, candidateMeetings<=20, \
+             candidateMeetingsTruncated={candidate_meetings_truncated}, \
+             rawCandidatesScanned={}, scanTruncated={raw_hits_truncated}, exactTotal=false",
+            raw_hits.len(),
+        )
+    } else {
+        format!(
+            "shown={shown}, total={total_matches}, candidateMeetings<=20, \
+             candidateMeetingsTruncated=false, rawCandidatesScanned={}, \
+             scanTruncated=false, exactTotal=true",
+            raw_hits.len(),
+        )
+    };
+    let count_explanation = if candidate_meetings_truncated && raw_hits_truncated {
+        "counted is exact after selected-channel projection only within both bounded candidate \
+         meetings and the bounded raw-row scan; additional selected-channel meetings and raw \
+         candidates were not evaluated."
+    } else if candidate_meetings_truncated {
+        "counted is exact after selected-channel projection only within the bounded candidate \
+         meetings; additional selected-channel meetings were not evaluated."
+    } else if raw_hits_truncated {
+        "counted is exact after channel projection only within the bounded raw-candidate scan; \
+         undisclosed raw candidates were not evaluated."
+    } else {
+        "Counts are exact after channel projection within the bounded candidate-meeting set."
+    };
+    let sections = if sections.is_empty() {
+        "No passages from the bounded raw-candidate scan survive the selected channel projection."
+            .to_string()
+    } else {
+        sections.join("\n\n")
+    };
+    Ok(format!(
+        "TRANSCRIPT SEARCH (format=structured, channel={}, {count_disclosure})\n\
+         {count_explanation}\n\n{sections}",
+        channel.as_str(),
+    ))
+}
+
+fn format_meeting_chapters(
+    db: &Db,
+    meeting_id: &str,
+    channel: TranscriptChannel,
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    let Some(raw_timeline) = db.get_timeline_data_visible(meeting_id, unlocked)? else {
+        // Keep sealed and absent meetings indistinguishable. A visible meeting without a generated
+        // timeline may disclose only that the derived map is unavailable.
+        return match db.meeting_is_visible(meeting_id, unlocked)?
+            && db.get_meeting(meeting_id)?.is_some()
+        {
+            true => Ok(format!(
+                "No chapter map has been generated for meeting {meeting_id}."
+            )),
+            false => Ok(format!("No chapter map for meeting {meeting_id}.")),
+        };
+    };
+    let timeline: crate::storage::models::MeetingTimeline = serde_json::from_str(&raw_timeline)
+        .map_err(|_| AppError::Storage("meeting chapter map is unavailable".into()))?;
+    let stored = db.get_segments_with_echo_provenance(meeting_id)?;
+    let (segments, echo_suppressed) = split_stored_segments(stored);
+    let projection = TranscriptProjection::new(&segments, channel, &echo_suppressed);
+    if timeline.topics.is_empty() {
+        return Ok(format!(
+            "CHAPTERS (format=structured, channel={}):\nNo recorded chapters.",
+            channel.as_str()
+        ));
+    }
+
+    let mut rows = Vec::new();
+    for topic in timeline.topics {
+        let overlaps = projection
+            .lines
+            .iter()
+            .filter(|line| line.segment.end_s > topic.start_s && line.segment.start_s < topic.end_s)
+            .collect::<Vec<_>>();
+        let prefix = format!(
+            "- [{}–{}] {}",
+            secs(topic.start_s),
+            secs(topic.end_s),
+            one_line_bounded(&topic.label, 200)
+        );
+        match (overlaps.first(), overlaps.last()) {
+            (Some(first), Some(last)) => rows.push(format!(
+                "{prefix} · offset {}..{}",
+                first.start_char, last.end_char
+            )),
+            _ => rows.push(prefix),
+        }
+    }
+    let speaker_map = speaker_map_header(db, meeting_id, &projection.lines, unlocked)?;
+    Ok(format!(
+        "CHAPTERS (format=structured, channel={}):\n{speaker_map}{}",
+        channel.as_str(),
+        rows.join("\n")
+    ))
 }
 
 /// Render a list of search hits (FTS or hybrid) into the tool text payload — one line per meeting.
@@ -2198,12 +3056,8 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             .filter(|s| scope.allows(&s.name))
             .filter(|s| match s.name.as_str() {
                 // Connectors require the AppHandle (async sidecar / consent path).
-                "web_search"
-                | "calendar_lookup"
-                | "jira_search"
-                | "slack_search"
-                | "notion_search"
-                | "clickup_search" => has_app,
+                "web_search" | "calendar_lookup" | "jira_search" | "slack_search"
+                | "notion_search" | "clickup_search" => has_app,
                 // Shared Brain: advertised ONLY when an org is joined + org egress is consented
                 // (fail-closed). Unlike the connectors it is egress-free (a local read), so it needs
                 // NO AppHandle — it runs on the DB + config alone.
@@ -2326,6 +3180,11 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                     &ToolCall::GetMeeting {
                         meeting_id: s("meetingId"),
                         transcript_format: fmt,
+                        // Raw mic/system lanes are a local MCP diagnostic surface. The in-app
+                        // assistant may not select them, even if an unadvertised argument is
+                        // injected directly into this executor.
+                        channel: TranscriptChannel::Merged,
+                        include_speaker_map: false,
                         offset: u("offset"),
                         max_chars: u("maxChars"),
                         // Absent ⇒ true, so an existing caller is byte-identical.
@@ -2713,6 +3572,154 @@ mod tests {
                 .collect(),
             tags: Vec::new(),
             updated_at: 0,
+        }
+    }
+
+    /// The selected gated catalog row is the sole resolver snapshot for query_database: its count
+    /// and schema must win even when raw persistence contains deliberately different values. The
+    /// public tool path must also keep an exact locked folder name/id indistinguishable from absent.
+    #[test]
+    fn query_database_uses_selected_visible_catalog_count_and_schema() {
+        use crate::storage::models::{
+            NoteFolder, PropertyKind, PropertySchemaField, PropertyValue,
+        };
+
+        let db = tmp_db();
+        let visible_folder = NoteFolder {
+            id: "nf-catalog".into(),
+            name: "Catalog Tasks".into(),
+            path: "Notes/Catalog Tasks".into(),
+            parent_id: None,
+            locked: false,
+            unlocked: false,
+            is_root: false,
+            kind: "note".into(),
+        };
+        db.insert_note_folder(&visible_folder, "2026-07-29T00:00:00Z")
+            .unwrap();
+        // Persist a DIFFERENT schema from the selected catalog snapshot below. Any subsequent raw
+        // schema lookup would project `db_status` and make the catalog_status filter fail.
+        db.set_note_folder_schema(
+            &visible_folder.id,
+            &[PropertySchemaField {
+                key: "db_status".into(),
+                kind: PropertyKind::Text,
+                options: Vec::new(),
+            }],
+        )
+        .unwrap();
+        db.insert_note(
+            "note-catalog",
+            &visible_folder.id,
+            "catalog-task",
+            "Catalog Task",
+            "---\ncatalog_status: Open\ndb_status: Secret\n---\nbody",
+            1_000,
+        )
+        .unwrap();
+
+        let catalog_schema = vec![PropertySchemaField {
+            key: "catalog_status".into(),
+            kind: PropertyKind::Select,
+            options: vec!["Open".into(), "Done".into()],
+        }];
+        let unlocked = HashSet::new();
+        let out = query_database_from_catalog(
+            &db,
+            &visible_folder,
+            77,
+            &catalog_schema,
+            "catalog_status=Open",
+            &unlocked,
+        )
+        .unwrap();
+        assert!(
+            out.contains("1 matching rows of 77 visible records"),
+            "visible count must come from the selected catalog snapshot: {out}"
+        );
+        assert!(
+            out.contains("catalog_status: Open"),
+            "typed values must use the selected catalog schema: {out}"
+        );
+        assert!(
+            !out.contains("db_status") && !out.contains("Secret"),
+            "a later raw schema lookup bypassed the selected catalog schema: {out}"
+        );
+        assert_eq!(
+            crate::storage::db::coerce_property_value(
+                "Open",
+                catalog_schema[0].kind,
+                &catalog_schema[0].options,
+            ),
+            PropertyValue::Select("Open".into())
+        );
+
+        let secret_folder = NoteFolder {
+            id: "nf-secret".into(),
+            name: "Secret Catalog".into(),
+            path: "Notes/Secret Catalog".into(),
+            parent_id: None,
+            locked: false,
+            unlocked: false,
+            is_root: false,
+            kind: "note".into(),
+        };
+        db.insert_note_folder(&secret_folder, "2026-07-29T00:00:01Z")
+            .unwrap();
+        db.set_note_folder_schema(
+            &secret_folder.id,
+            &[PropertySchemaField {
+                key: "secret_schema".into(),
+                kind: PropertyKind::Text,
+                options: Vec::new(),
+            }],
+        )
+        .unwrap();
+        db.insert_note(
+            "note-secret",
+            &secret_folder.id,
+            "secret-task",
+            "Secret Task",
+            "---\nsecret_schema: classified\n---\nsecret body",
+            2_000,
+        )
+        .unwrap();
+        db.set_folder_locked(&secret_folder.id, true, Some(b"wrapped"))
+            .unwrap();
+
+        let config = AppConfig::default();
+        let absent = execute_tool(
+            &ToolCall::QueryDatabase {
+                folder: "does-not-exist".into(),
+                filter: String::new(),
+            },
+            &db,
+            &unlocked,
+            &config,
+        )
+        .unwrap();
+        for locked_needle in [&secret_folder.id, &secret_folder.name] {
+            let locked = execute_tool(
+                &ToolCall::QueryDatabase {
+                    folder: locked_needle.to_string(),
+                    filter: String::new(),
+                },
+                &db,
+                &unlocked,
+                &config,
+            )
+            .unwrap();
+            assert_eq!(
+                locked, absent,
+                "exact locked name/id must be indistinguishable from an absent folder"
+            );
+            assert!(
+                !locked.contains(&secret_folder.id)
+                    && !locked.contains(&secret_folder.name)
+                    && !locked.contains("secret_schema")
+                    && !locked.contains("classified"),
+                "locked folder metadata leaked through query_database: {locked}"
+            );
         }
     }
 
@@ -4286,6 +5293,10 @@ mod tests {
             semantic_search_enabled: false,
             ..AppConfig::default()
         };
+        assert!(
+            !cfg.org_egress_consented,
+            "fixture must prove publish consent is not the joined member's read gate"
+        );
 
         let hits = search_org_brain_hits(&db, &cfg, "nebula pricing rollout").unwrap();
         assert!(
@@ -4387,6 +5398,148 @@ mod tests {
         assert!(
             out.contains("Launch plan"),
             "MCP org_search must find the item: {out}"
+        );
+    }
+
+    /// ORG SEARCH FLOOR THROUGH THE REAL TOOL SEAM: `execute_tool` with semantic
+    /// retrieval disabled must use only the SQL/FTS leg, surface a 3/6 exact-token hit, reject 1/6
+    /// and `Kongo` substring noise, and return the normal no-results sentinel when the only candidate
+    /// covers 1/3 terms. `tmp_db()` is file-backed SQLCipher via `Db::open_with_key`.
+    #[test]
+    fn mcp_org_search_lexical_floor_rejects_noise_without_semantic() {
+        let db = tmp_db();
+        seed_org(&db);
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        ingest_org(
+            &db,
+            "it-signal",
+            "erin",
+            "Signal",
+            "hybrid source operator decision",
+            &[31u8; 32],
+        );
+        ingest_org(
+            &db,
+            "it-one",
+            "mallory",
+            "One-token noise",
+            "Kong travel diary",
+            &[32u8; 32],
+        );
+        ingest_org(
+            &db,
+            "it-prefix",
+            "mallory",
+            "Substring noise",
+            "Kongo travel diary",
+            &[33u8; 32],
+        );
+
+        let out = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid mode source truth kong operator".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Signal") && out.contains("[org · erin]"),
+            "the lexical 3/6 hit must surface with provenance: {out}"
+        );
+        assert!(
+            !out.contains("One-token noise") && !out.contains("Substring noise"),
+            "1/6 and Kong/Kongo substring noise must not reach tool output: {out}"
+        );
+
+        ingest_org(
+            &db,
+            "it-three-one",
+            "mallory",
+            "One of three",
+            "violet memo",
+            &[34u8; 32],
+        );
+        let no_results = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "violet quartz ember".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            no_results.starts_with("No org-brain results"),
+            "a lexical 1/3-only corpus must return the normal no-results sentinel: {no_results}"
+        );
+
+        // The per-instance context gate applies at the final rendered tool sink.
+        db.set_org_context_enabled("org-1", false).unwrap();
+        let disabled = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid source operator".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            disabled.starts_with("No org-brain results")
+                && !disabled.contains("Signal")
+                && !disabled.contains("hybrid source operator"),
+            "disabled org content must not reach the tool sink: {disabled}"
+        );
+        db.set_org_context_enabled("org-1", true).unwrap();
+
+        // Tombstoning purges the matching chunk and the SQL predicate remains defense-in-depth.
+        db.tombstone_org_item("it-signal").unwrap();
+        let tombstoned = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid source operator".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            tombstoned.starts_with("No org-brain results")
+                && !tombstoned.contains("Signal")
+                && !tombstoned.contains("hybrid source operator"),
+            "tombstoned org content must not reach the tool sink: {tombstoned}"
+        );
+
+        // Membership is the local ORG_READ authorization boundary. A stale replica without
+        // `org_state` is invisible even though the matching plaintext row still exists.
+        let departed = tmp_db();
+        ingest_org(
+            &departed,
+            "it-departed",
+            "mallory",
+            "Departed secret",
+            "hybrid source operator",
+            &[35u8; 32],
+        );
+        let departed_out = execute_tool(
+            &ToolCall::OrgBrainSearch {
+                query: "hybrid source operator".into(),
+            },
+            &departed,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            departed_out.starts_with("No org-brain results")
+                && !departed_out.contains("Departed secret")
+                && !departed_out.contains("hybrid source operator"),
+            "non-member replica content must not reach the tool sink: {departed_out}"
         );
     }
 
@@ -4648,9 +5801,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m1".into(),
                 transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 0,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -4738,9 +5893,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m2".into(),
                 transcript_format: "plain".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 0,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -4759,7 +5916,9 @@ mod tests {
         // agent that mapped offsets in one and switched to the other silently landed ~40% off
         // target. What this test protects is the TRANSCRIPT BODY: the legacy flat join must stay
         // byte-identical, which it does.
-        let expected = format!("NOTE:\nthe note\n\nTRANSCRIPT (format=plain):\n{legacy_transcript}");
+        let expected = format!(
+            "NOTE:\nthe note\n\nTRANSCRIPT (format=plain, channel=merged):\n{legacy_transcript}"
+        );
         assert_eq!(
             out, expected,
             "plain format must render the legacy join byte-identically"
@@ -4827,9 +5986,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m-diar".into(),
                 transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 0,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -4884,9 +6045,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m-prec".into(),
                 transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 0,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -5070,7 +6233,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            locked.contains("No outline for document od1"),
+            locked.contains("No outline for that document"),
             "sealed → sentinel: {locked}"
         );
         assert!(
@@ -5335,9 +6498,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "does-not-exist".into(),
                 transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 6000,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -5385,6 +6550,8 @@ mod tests {
                 &ToolCall::GetMeeting {
                     meeting_id: "m-budget".into(),
                     transcript_format: "structured".into(),
+                    channel: TranscriptChannel::Merged,
+                    include_speaker_map: false,
                     offset: 0,
                     max_chars: max,
                     include_note: include,
@@ -5406,7 +6573,10 @@ mod tests {
 
         // includeNote:true + a small maxChars ⇒ the note is WINDOWED, not shipped whole.
         let bounded = call(true, 200);
-        assert!(bounded.contains("NOTE ("), "the note window is disclosed: {bounded}");
+        assert!(
+            bounded.contains("NOTE ("),
+            "the note window is disclosed: {bounded}"
+        );
         assert!(
             bounded.len() < long_note.len(),
             "maxChars must bound the note; reply {} vs note {}",
@@ -5424,9 +6594,30 @@ mod tests {
         db.insert_segments(
             "m-compact",
             &[
-                Segment { idx: 0, start_s: 1.0, end_s: 2.0, text: "first half".into(), speaker: Some("me".into()), confidence: None },
-                Segment { idx: 1, start_s: 2.0, end_s: 3.0, text: "second half".into(), speaker: Some("me".into()), confidence: None },
-                Segment { idx: 2, start_s: 3.0, end_s: 4.0, text: "their turn".into(), speaker: Some("others".into()), confidence: None },
+                Segment {
+                    idx: 0,
+                    start_s: 1.0,
+                    end_s: 2.0,
+                    text: "first half".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 3.0,
+                    text: "second half".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 2,
+                    start_s: 3.0,
+                    end_s: 4.0,
+                    text: "their turn".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                },
             ],
         )
         .unwrap();
@@ -5434,6 +6625,8 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m-compact".into(),
                 transcript_format: "compact".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 0,
                 include_note: false,
@@ -5452,6 +6645,1098 @@ mod tests {
         );
         // #10 — the format is stamped so the offset space is self-describing.
         assert!(out.contains("format=compact"), "format stamped: {out}");
+    }
+
+    #[test]
+    fn transcript_search_offsets_round_trip_through_the_same_channel_projection() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-nav", "Navigation", "note", None);
+        let segments = vec![
+            Segment {
+                idx: 7,
+                start_s: 5.0,
+                end_s: 7.0,
+                text: "the contract is now signed by both parties".into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            },
+            Segment {
+                idx: 9,
+                start_s: 7.2,
+                end_s: 8.9,
+                text: "my separate reply has landed safely".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            },
+        ];
+        db.insert_segments("m-nav", &segments).unwrap();
+
+        let projection =
+            TranscriptProjection::new(&segments, TranscriptChannel::Merged, &HashSet::new());
+        assert_eq!(
+            projection.lines.len(),
+            2,
+            "merged preserves both canonical stored segments"
+        );
+        let expected_range = format!(
+            "offset {}..{}",
+            projection.lines[0].start_char, projection.lines[0].end_char
+        );
+        let search = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "contract signed".into(),
+                meeting_id: Some("m-nav".into()),
+                limit: 20,
+                max_per_meeting: 5,
+                channel: TranscriptChannel::Merged,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            search.contains("format=structured, channel=merged, shown=1, total=1"),
+            "counts must be post-projection: {search}"
+        );
+        assert!(
+            search.contains(&expected_range),
+            "search range must address the canonical structured body: {search}"
+        );
+
+        let meeting = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-nav".into(),
+                transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            meeting.ends_with(&projection.text),
+            "get_meeting must expose the exact searched coordinate: {meeting}"
+        );
+
+        let mic = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "separate reply".into(),
+                meeting_id: Some("m-nav".into()),
+                limit: 20,
+                max_per_meeting: 5,
+                channel: TranscriptChannel::Mic,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            mic.contains("channel=mic, shown=1, total=1") && mic.contains(" · Me — "),
+            "the raw mic lane remains inspectable: {mic}"
+        );
+    }
+
+    #[test]
+    fn explicit_echo_provenance_hides_only_merged_and_legacy_rows_default_visible() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-echo", "Echo provenance", "note", None);
+        let rows = vec![
+            crate::storage::models::StoredTranscriptSegment {
+                segment: Segment {
+                    idx: 40,
+                    start_s: 5.0,
+                    end_s: 7.0,
+                    text: "the measured echo phrase has four words".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                },
+                echo_suppressed: false,
+            },
+            crate::storage::models::StoredTranscriptSegment {
+                segment: Segment {
+                    idx: 41,
+                    start_s: 5.3,
+                    end_s: 7.3,
+                    text: "the measured echo phrase has four words".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                echo_suppressed: true,
+            },
+        ];
+        db.replace_segments_with_echo_provenance("m-echo", &rows)
+            .unwrap();
+
+        let stored = db.get_segments_with_echo_provenance("m-echo").unwrap();
+        assert_eq!(stored.len(), 2, "raw storage retains both capture lanes");
+        assert_eq!(
+            stored.iter().map(|row| row.segment.idx).collect::<Vec<_>>(),
+            vec![40, 41],
+            "raw indices remain stable"
+        );
+        assert!(
+            !stored[0].echo_suppressed && stored[1].echo_suppressed,
+            "only ingest may set the explicit provenance bit"
+        );
+
+        let call = |channel| {
+            execute_tool(
+                &ToolCall::GetMeeting {
+                    meeting_id: "m-echo".into(),
+                    transcript_format: "structured".into(),
+                    channel,
+                    include_speaker_map: false,
+                    offset: 0,
+                    max_chars: 0,
+                    include_note: false,
+                },
+                &db,
+                &HashSet::new(),
+                &cfg,
+            )
+            .unwrap()
+        };
+        let merged = call(TranscriptChannel::Merged);
+        assert_eq!(
+            merged
+                .matches("the measured echo phrase has four words")
+                .count(),
+            1,
+            "merged filters only the persisted flag: {merged}"
+        );
+        let mic = call(TranscriptChannel::Mic);
+        assert!(
+            mic.contains("Me: the measured echo phrase has four words"),
+            "raw mic disclosure retains a flagged row: {mic}"
+        );
+
+        let search = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "measured echo phrase".into(),
+                meeting_id: Some("m-echo".into()),
+                limit: 20,
+                max_per_meeting: 5,
+                channel: TranscriptChannel::Merged,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            search.contains("channel=merged, shown=1, total=1"),
+            "search counts must use the same persisted projection: {search}"
+        );
+
+        seed_meeting(&db, "m-legacy-echo", "Legacy repetition", "note", None);
+        let legacy = rows.into_iter().map(|row| row.segment).collect::<Vec<_>>();
+        db.insert_segments("m-legacy-echo", &legacy).unwrap();
+        let legacy_rows = db
+            .get_segments_with_echo_provenance("m-legacy-echo")
+            .unwrap();
+        assert!(
+            legacy_rows.iter().all(|row| !row.echo_suppressed),
+            "omitted provenance defaults visible for legacy rows"
+        );
+        let legacy_merged = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-legacy-echo".into(),
+                transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_merged
+                .matches("the measured echo phrase has four words")
+                .count(),
+            2,
+            "legacy overlap is never guessed away from text/timestamps: {legacy_merged}"
+        );
+    }
+
+    #[test]
+    fn transcript_search_bounds_high_frequency_candidates_and_discloses_inexact_count() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-many-hits", "Many bounded hits", "note", None);
+        let segments = (0..(MAX_TRANSCRIPT_SEARCH_RAW_HITS + 5))
+            .map(|idx| Segment {
+                idx: idx as i64,
+                start_s: idx as f64,
+                end_s: idx as f64 + 0.5,
+                text: format!("highfrequency bounded marker {idx}"),
+                speaker: Some("others".into()),
+                confidence: None,
+            })
+            .collect::<Vec<_>>();
+        db.insert_segments("m-many-hits", &segments).unwrap();
+
+        let (db_hits, meetings_truncated, rows_truncated) = db
+            .search_transcript_segments_visible(
+                "highfrequency",
+                Some("m-many-hits"),
+                TranscriptChannel::Merged.render_channel(),
+                20,
+                7,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(db_hits.len(), 7, "the DB result honors its hard row cap");
+        assert!(
+            rows_truncated,
+            "the extra probe row must report undisclosed candidates"
+        );
+        assert!(
+            !meetings_truncated,
+            "one scoped meeting cannot truncate the meeting set"
+        );
+
+        let out = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "highfrequency".into(),
+                meeting_id: Some("m-many-hits".into()),
+                limit: 100,
+                max_per_meeting: 20,
+                channel: TranscriptChannel::Merged,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("shown=20, counted=500")
+                && out.contains("rawCandidatesScanned=500")
+                && out.contains("scanTruncated=true")
+                && out.contains("exactTotal=false"),
+            "a bounded scan must never masquerade as an exact corpus total: {out}"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("- offset "))
+                .count(),
+            20,
+            "per-meeting disclosure remains independently bounded"
+        );
+    }
+
+    #[test]
+    fn transcript_search_applies_channel_before_meeting_cap_and_discloses_meeting_truncation() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+
+        // All meetings share a timestamp, so their ids define recency order. These 20 mic-only
+        // meetings sort ahead of the one selected-channel system meeting. A pre-projection
+        // meeting cap would therefore lose the valid system hit.
+        for idx in 0..20 {
+            let meeting_id = format!("z-mic-{idx:02}");
+            seed_meeting(&db, &meeting_id, &format!("Mic-only {idx}"), "note", None);
+            db.insert_segments(
+                &meeting_id,
+                &[Segment {
+                    idx: 0,
+                    start_s: 1.0,
+                    end_s: 2.0,
+                    text: "selected channel sentinel".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                }],
+            )
+            .unwrap();
+        }
+        seed_meeting(&db, "a-system-channel", "System target", "note", None);
+        db.insert_segments(
+            "a-system-channel",
+            &[Segment {
+                idx: 0,
+                start_s: 1.0,
+                end_s: 2.0,
+                text: "selected channel sentinel".into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        let selected = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "selected channel sentinel".into(),
+                meeting_id: None,
+                limit: 100,
+                max_per_meeting: 5,
+                channel: TranscriptChannel::System,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            selected.contains("[meeting:a-system-channel]"),
+            "the selected-channel hit below the unfiltered meeting cap must survive: {selected}"
+        );
+        assert!(
+            !selected.contains("[meeting:z-mic-"),
+            "mic-only candidates must not consume system-channel capacity: {selected}"
+        );
+        assert!(
+            selected.contains("candidateMeetingsTruncated=false")
+                && selected.contains("exactTotal=true"),
+            "one selected-channel meeting has an exact count: {selected}"
+        );
+
+        for idx in 0..21 {
+            let meeting_id = format!("overflow-system-{idx:02}");
+            seed_meeting(
+                &db,
+                &meeting_id,
+                &format!("Overflow system {idx}"),
+                "note",
+                None,
+            );
+            db.insert_segments(
+                &meeting_id,
+                &[Segment {
+                    idx: 0,
+                    start_s: 3.0,
+                    end_s: 4.0,
+                    text: "selected overflow sentinel".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                }],
+            )
+            .unwrap();
+        }
+
+        let truncated = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "selected overflow sentinel".into(),
+                meeting_id: None,
+                limit: 100,
+                max_per_meeting: 5,
+                channel: TranscriptChannel::System,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            truncated.contains("counted=20")
+                && truncated.contains("candidateMeetingsTruncated=true")
+                && truncated.contains("scanTruncated=false")
+                && truncated.contains("exactTotal=false"),
+            "meeting-set truncation must be explicit and make the total inexact: {truncated}"
+        );
+    }
+
+    #[test]
+    fn transcript_search_empty_queries_are_successful_zero_hits_even_when_scoped() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-empty-query", "Must stay hidden", "note", None);
+        db.insert_segments(
+            "m-empty-query",
+            &[Segment {
+                idx: 0,
+                start_s: 1.0,
+                end_s: 2.0,
+                text: "must stay hidden too".into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        for query in ["", " \t\n "] {
+            let out = execute_tool(
+                &ToolCall::SearchTranscript {
+                    query: query.into(),
+                    meeting_id: Some("m-empty-query".into()),
+                    limit: 20,
+                    max_per_meeting: 5,
+                    channel: TranscriptChannel::Merged,
+                },
+                &db,
+                &HashSet::new(),
+                &cfg,
+            )
+            .expect("empty transcript query is a successful zero-hit search");
+            assert_eq!(out, "No transcript passages match \"\".");
+            assert!(
+                !out.contains("m-empty-query") && !out.contains("Must stay hidden"),
+                "the scoped zero-hit response must not disclose meeting existence: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_search_excerpt_centers_the_lexical_hit_without_moving_offsets() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-late-hit", "Late hit", "note", None);
+        let long_text = format!("{}needle-at-the-end", "unrelated prefix ".repeat(40));
+        let segments = vec![Segment {
+            idx: 11,
+            start_s: 8.0,
+            end_s: 10.0,
+            text: long_text,
+            speaker: Some("others".into()),
+            confidence: None,
+        }];
+        db.insert_segments("m-late-hit", &segments).unwrap();
+        let projection =
+            TranscriptProjection::new(&segments, TranscriptChannel::Merged, &HashSet::new());
+        let expected_range = format!(
+            "offset {}..{}",
+            projection.lines[0].start_char, projection.lines[0].end_char
+        );
+
+        let out = execute_tool(
+            &ToolCall::SearchTranscript {
+                query: "needle".into(),
+                meeting_id: Some("m-late-hit".into()),
+                limit: 20,
+                max_per_meeting: 5,
+                channel: TranscriptChannel::Merged,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        let hit_line = out
+            .lines()
+            .find(|line| line.starts_with("- offset "))
+            .expect("search result line");
+        let excerpt = hit_line
+            .split_once(" — ")
+            .map(|(_, excerpt)| excerpt)
+            .expect("bounded excerpt");
+        assert!(
+            excerpt.starts_with('…') && excerpt.contains("needle-at-the-end"),
+            "the excerpt must retain a late lexical hit and mark leading truncation: {excerpt}"
+        );
+        assert!(
+            excerpt.chars().count() <= 240,
+            "the centered excerpt exceeded its scalar bound: {}",
+            excerpt.chars().count()
+        );
+        assert!(
+            hit_line.contains(&expected_range),
+            "excerpt centering must not change the canonical transcript coordinate: {hit_line}"
+        );
+    }
+
+    #[test]
+    fn local_mcp_only_tools_remain_outside_cloud_agent_catalogs() {
+        let specs = tool_specs();
+        let get_meeting = specs
+            .iter()
+            .find(|spec| spec.name == "get_meeting")
+            .expect("in-app get_meeting spec");
+        assert!(
+            get_meeting.parameters["properties"]
+                .get("channel")
+                .is_none(),
+            "raw capture lanes must not be advertised to the cloud-capable assistant"
+        );
+        let names = specs
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<HashSet<_>>();
+        assert!(
+            !names.contains("search_transcript")
+                && !names.contains("get_meeting_chapters")
+                && !names.contains("list_entities")
+                && !names.contains("list_note_folders"),
+            "local MCP helpers must never become agent/cloud prompt input"
+        );
+        for tool in ["list_entities", "list_note_folders"] {
+            for scope in [
+                AssistantScope::CurrentMeeting,
+                AssistantScope::Vault,
+                AssistantScope::Connectors,
+                AssistantScope::Full,
+            ] {
+                assert!(
+                    !scope.allows(tool),
+                    "{tool} must be rejected by every cloud-capable AssistantScope"
+                );
+            }
+        }
+
+        // The variants themselves are intentionally live on the loopback-MCP `execute_tool` seam.
+        // Seedless success sentinels prove that a later GatedToolExecutor result did NOT come from
+        // dispatching either variant and merely happen to look like an allowlist refusal.
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let nothing = HashSet::new();
+        let local_only_calls = [
+            (
+                "list_entities",
+                ToolCall::ListEntities {
+                    query: None,
+                    limit: 10,
+                },
+                "No visible entities.",
+            ),
+            (
+                "list_note_folders",
+                ToolCall::ListNoteFolders,
+                "No visible note folders.",
+            ),
+        ];
+        for (_, call, expected) in &local_only_calls {
+            assert_eq!(
+                execute_tool(call, &db, &nothing, &cfg).unwrap(),
+                *expected,
+                "the local-only ToolCall variant must remain executable on the loopback seam"
+            );
+        }
+
+        // Exercise BOTH ToolExecutor entry points (`specs` and `run`) across every scope and both
+        // surface gates. `run` must return the exact allowlist refusal, never either successful
+        // execute_tool sentinel above. The real agent loop calls these same trait methods.
+        let unlocked = Mutex::new(HashSet::new());
+        for scope in [
+            AssistantScope::CurrentMeeting,
+            AssistantScope::Vault,
+            AssistantScope::Connectors,
+            AssistantScope::Full,
+        ] {
+            for allow_writes in [false, true] {
+                for note_drafts in [false, true] {
+                    let exec = GatedToolExecutor {
+                        db: &db,
+                        unlocked: &unlocked,
+                        config: &cfg,
+                        meeting_id: "live1",
+                        app: None,
+                        recording_token: None,
+                        allow_writes,
+                        note_drafts,
+                        scope,
+                        seal: None,
+                        proposed_note: Mutex::new(None),
+                    };
+                    let executor: &dyn ToolExecutor = &exec;
+                    let advertised = executor
+                        .specs()
+                        .into_iter()
+                        .map(|spec| spec.name)
+                        .collect::<HashSet<_>>();
+                    for (name, _, local_success) in &local_only_calls {
+                        assert!(
+                            !advertised.contains(*name),
+                            "{name} entered GatedToolExecutor::specs at {scope:?}, \
+                             allow_writes={allow_writes}, note_drafts={note_drafts}"
+                        );
+                        match executor.run(name, &serde_json::json!({})) {
+                            Err(AppError::InvalidArg(message)) => assert_eq!(
+                                message,
+                                format!("tool '{name}' is not available"),
+                                "{name} must fail at the GatedToolExecutor allowlist"
+                            ),
+                            other => panic!(
+                                "{name} escaped the GatedToolExecutor allowlist at {scope:?}, \
+                                 allow_writes={allow_writes}, note_drafts={note_drafts}; \
+                                 local execute_tool success would be {local_success:?}, got {other:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_app_get_meeting_forces_merged_even_for_an_injected_channel_argument() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-agent-channel", "Agent channel", "note", None);
+        db.insert_segments(
+            "m-agent-channel",
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 1.0,
+                    end_s: 2.0,
+                    text: "system lane remains in merged".into(),
+                    speaker: Some("others-0".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 3.0,
+                    end_s: 4.0,
+                    text: "mic lane remains in merged".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+        db.insert_voiceprint(
+            "vp-agent-boundary",
+            "m-agent-channel",
+            0,
+            Some("NER_MODEL_UNAVAILABLE_NAME"),
+            &[0.1, 0.2],
+            "2026-07-28T00:00:00Z",
+        )
+        .unwrap();
+        let unlocked = Mutex::new(HashSet::new());
+        let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::Vault);
+
+        for injected in ["system", "mic", "invented"] {
+            let out = exec
+                .run(
+                    "get_meeting",
+                    &serde_json::json!({
+                        "meetingId": "m-agent-channel",
+                        "channel": injected,
+                        "includeNote": false
+                    }),
+                )
+                .expect("unadvertised channel input is clamped to merged");
+            assert!(
+                out.contains("channel=merged")
+                    && out.contains("system lane remains in merged")
+                    && out.contains("mic lane remains in merged")
+                    && !out.contains("channel=system")
+                    && !out.contains("channel=mic")
+                    && !out.contains("NER_MODEL_UNAVAILABLE_NAME")
+                    && !out.contains("SPEAKERS ("),
+                "in-app get_meeting escaped the merged/no-enrolled-label boundary for {injected}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_search_discloses_only_during_session_unlock() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-search", "Private search");
+        seed_meeting(
+            &db,
+            "m-secret-search",
+            "Secret launch",
+            "private note",
+            Some("f-search"),
+        );
+        db.insert_segments(
+            "m-secret-search",
+            &[Segment {
+                idx: 42,
+                start_s: 12.0,
+                end_s: 14.0,
+                text: "ultraviolet launch phrase".into(),
+                speaker: Some("others-0".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+        db.set_folder_locked("f-search", true, None).unwrap();
+        let call = ToolCall::SearchTranscript {
+            query: "ultraviolet launch".into(),
+            meeting_id: None,
+            limit: 20,
+            max_per_meeting: 5,
+            channel: TranscriptChannel::Merged,
+        };
+
+        let assert_masked = |out: &str| {
+            assert_eq!(
+                out, "No transcript passages match \"ultraviolet launch\".",
+                "locked and absent results must be indistinguishable"
+            );
+            for secret in [
+                "m-secret-search",
+                "Secret launch",
+                "ultraviolet launch phrase",
+                "Speaker",
+                "offset",
+                "total=",
+                "seg 42",
+                "@00:12",
+            ] {
+                assert!(
+                    !out.contains(secret),
+                    "locked search leaked {secret:?}: {out}"
+                );
+            }
+        };
+
+        let locked =
+            execute_tool(&call, &db, &HashSet::new(), &cfg).expect("locked search is masked");
+        assert_masked(&locked);
+
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-search".to_string());
+        let open = execute_tool(&call, &db, &unlocked, &cfg).unwrap();
+        assert!(
+            open.contains("[meeting:m-secret-search]")
+                && open.contains("[[Secret launch]]")
+                && open.contains("ultraviolet launch phrase")
+                && open.contains("offset")
+                && open.contains("total=1"),
+            "session unlock alone admits the matching content: {open}"
+        );
+
+        unlocked.remove("f-search");
+        let relocked = execute_tool(&call, &db, &unlocked, &cfg).unwrap();
+        assert_masked(&relocked);
+    }
+
+    #[test]
+    fn chapters_use_the_structured_channel_coordinate_and_mask_locked_timelines() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-nav", "Private");
+        seed_meeting(&db, "m-chapters", "Secret planning", "note", Some("f-nav"));
+        let segments = vec![
+            Segment {
+                idx: 0,
+                start_s: 0.0,
+                end_s: 1.0,
+                text: "opening".into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            },
+            Segment {
+                idx: 1,
+                start_s: 3.0,
+                end_s: 5.0,
+                text: "launch plan details".into(),
+                speaker: Some("others-0".into()),
+                confidence: None,
+            },
+        ];
+        db.insert_segments("m-chapters", &segments).unwrap();
+        db.set_timeline_data(
+            "m-chapters",
+            &serde_json::to_string(&crate::storage::models::MeetingTimeline {
+                speakers: Vec::new(),
+                topics: vec![
+                    crate::storage::models::TopicSpan {
+                        label: "Launch plan".into(),
+                        start_s: 2.5,
+                        end_s: 5.5,
+                    },
+                    crate::storage::models::TopicSpan {
+                        label: "No lane overlap".into(),
+                        start_s: 20.0,
+                        end_s: 21.0,
+                    },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let projection =
+            TranscriptProjection::new(&segments, TranscriptChannel::Merged, &HashSet::new());
+        let target = &projection.lines[1];
+        let expected_range = format!("offset {}..{}", target.start_char, target.end_char);
+        let open = execute_tool(
+            &ToolCall::GetMeetingChapters {
+                meeting_id: "m-chapters".into(),
+                channel: TranscriptChannel::Merged,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            open.contains("format=structured, channel=merged")
+                && open.contains("Launch plan")
+                && open.contains(&expected_range),
+            "chapter range must point into the same projection: {open}"
+        );
+        let non_overlap = open
+            .lines()
+            .find(|line| line.contains("No lane overlap"))
+            .expect("non-overlapping topic remains listed");
+        assert!(
+            !non_overlap.contains("offset"),
+            "a topic with no rendered line must omit the offset field: {non_overlap}"
+        );
+
+        db.set_folder_locked("f-nav", true, None).unwrap();
+        let locked = execute_tool(
+            &ToolCall::GetMeetingChapters {
+                meeting_id: "m-chapters".into(),
+                channel: TranscriptChannel::Merged,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(locked, "No chapter map for meeting m-chapters.");
+        assert!(
+            !locked.contains("Launch plan") && !locked.contains("Secret planning"),
+            "locked derived content and title stay masked: {locked}"
+        );
+    }
+
+    #[test]
+    fn speaker_map_reads_only_visible_present_labels_and_never_ghosts() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-speaker", "Speakers");
+        seed_meeting(&db, "m-speaker", "Call", "note", Some("f-speaker"));
+        db.insert_segments(
+            "m-speaker",
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 1.0,
+                    end_s: 2.0,
+                    text: "hello there".into(),
+                    speaker: Some("others-1".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 3.0,
+                    text: "   ".into(),
+                    speaker: Some("others-2".into()),
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+        db.insert_voiceprint(
+            "vp-visible",
+            "m-speaker",
+            1,
+            Some("Anna\nNowak"),
+            &[0.1, 0.2],
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_voiceprint(
+            "vp-ghost",
+            "m-speaker",
+            7,
+            Some("Ghost"),
+            &[0.3, 0.4],
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_voiceprint(
+            "vp-empty",
+            "m-speaker",
+            2,
+            Some("EmptyGhost"),
+            &[0.5, 0.6],
+            "2026-07-01T00:00:00Z",
+        )
+        .unwrap();
+
+        let open = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-speaker".into(),
+                transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: true,
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(open.contains("- Speaker 2 = Anna Nowak"), "{open}");
+        assert!(
+            !open.contains("Ghost"),
+            "absent and empty-text speakers are omitted: {open}"
+        );
+
+        db.set_folder_locked("f-speaker", true, None).unwrap();
+        let locked = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-speaker".into(),
+                transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: true,
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(locked, "No data for meeting m-speaker.");
+        assert!(!locked.contains("Anna"), "{locked}");
+    }
+
+    #[test]
+    fn speaker_map_is_deterministically_bounded_and_discloses_truncation() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-speaker-bound", "Many speakers", "note", None);
+        let count = MAX_SPEAKER_MAP_ENTRIES + 5;
+        let segments = (0..count)
+            .map(|cluster| Segment {
+                idx: cluster as i64,
+                start_s: cluster as f64,
+                end_s: cluster as f64 + 0.5,
+                text: format!("speaker turn {cluster}"),
+                speaker: Some(format!("others-{cluster}")),
+                confidence: None,
+            })
+            .collect::<Vec<_>>();
+        db.insert_segments("m-speaker-bound", &segments).unwrap();
+        for cluster in 0..count {
+            db.insert_voiceprint(
+                &format!("vp-speaker-bound-{cluster}"),
+                "m-speaker-bound",
+                cluster as i64,
+                Some(&format!("ENROLLED_NAME_{cluster:02}")),
+                &[cluster as f32, 1.0],
+                "2026-07-28T00:00:00Z",
+            )
+            .unwrap();
+        }
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-speaker-bound".into(),
+                transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: true,
+                offset: 0,
+                max_chars: 0,
+                include_note: false,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("- Speaker "))
+                .count(),
+            MAX_SPEAKER_MAP_ENTRIES,
+            "speaker-map output must have a hard deterministic entry cap: {out}"
+        );
+        assert!(
+            out.contains("[speaker map truncated: showing 20 of 25 matching enrolled labels]"),
+            "the omitted labels must be disclosed honestly: {out}"
+        );
+        assert!(
+            !out.contains("ENROLLED_NAME_24"),
+            "a label beyond the response cap leaked: {out}"
+        );
+    }
+
+    #[test]
+    fn get_meeting_speaker_map_honors_page_budget_and_is_first_page_only() {
+        const MAP_BUDGET: usize = 40;
+        const ENROLLED_PREFIX: &str = "ENROLLED_BUDGET_PREFIX";
+        const ENROLLED_TAIL: &str = "ENROLLED_BUDGET_FORBIDDEN_TAIL";
+
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m-speaker-page", "Paged speaker", "note", None);
+        db.insert_segments(
+            "m-speaker-page",
+            &[Segment {
+                idx: 0,
+                start_s: 1.0,
+                end_s: 3.0,
+                text: "a transcript long enough for a later character page".into(),
+                speaker: Some("others-0".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+        let long_label = format!("{ENROLLED_PREFIX} {} {ENROLLED_TAIL}", "x".repeat(120));
+        db.insert_voiceprint(
+            "vp-speaker-page",
+            "m-speaker-page",
+            0,
+            Some(&long_label),
+            &[0.1, 0.2],
+            "2026-07-28T00:00:00Z",
+        )
+        .unwrap();
+
+        let call = |offset| {
+            execute_tool(
+                &ToolCall::GetMeeting {
+                    meeting_id: "m-speaker-page".into(),
+                    transcript_format: "structured".into(),
+                    channel: TranscriptChannel::Merged,
+                    include_speaker_map: true,
+                    offset,
+                    max_chars: MAP_BUDGET,
+                    include_note: false,
+                },
+                &db,
+                &HashSet::new(),
+                &cfg,
+            )
+            .unwrap()
+        };
+
+        let first = call(0);
+        assert!(
+            first.contains("SPEAKER MAP (TOTAL_CHARS:")
+                && first.contains("(showing 0..40)):")
+                && !first.contains(ENROLLED_TAIL),
+            "first-page label disclosure must be char-bounded and honest: {first}"
+        );
+        let map_body = first
+            .split_once("):\n")
+            .and_then(|(_, rest)| rest.split_once("\n\nTRANSCRIPT"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("missing bounded speaker-map section: {first}"));
+        assert!(
+            map_body.chars().count() <= MAP_BUDGET,
+            "speaker-map body exceeded maxChars: {} > {MAP_BUDGET}",
+            map_body.chars().count()
+        );
+
+        let later = call(1);
+        assert!(
+            !later.contains("SPEAKER MAP")
+                && !later.contains("SPEAKERS (enrolled")
+                && !later.contains(ENROLLED_PREFIX)
+                && !later.contains(ENROLLED_TAIL),
+            "nonzero transcript pages must not repeat enrolled names: {later}"
+        );
+        assert!(
+            later.contains("TRANSCRIPT (format=structured, channel=merged"),
+            "later page still returns the requested transcript coordinate: {later}"
+        );
     }
 
     /// E1 (RED-before-GREEN) — `get_meeting` emits the NOTE section only on the FIRST window
@@ -5492,9 +7777,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m-page".into(),
                 transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 0,
                 max_chars: 20,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -5516,9 +7803,11 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m-page".into(),
                 transcript_format: "structured".into(),
+                channel: TranscriptChannel::Merged,
+                include_speaker_map: false,
                 offset: 10,
                 max_chars: 20,
-                            include_note: true,
+                include_note: true,
             },
             &db,
             &HashSet::new(),
@@ -5542,7 +7831,13 @@ mod tests {
     fn search_semantic_empty_query_matches_nothing() {
         let db = tmp_db();
         let cfg = AppConfig::default(); // semantic default ON — the guard must precede the model branch.
-        seed_meeting(&db, "m-hit", "Zephyr Kickoff", "zephyr launch planning", None);
+        seed_meeting(
+            &db,
+            "m-hit",
+            "Zephyr Kickoff",
+            "zephyr launch planning",
+            None,
+        );
         let out = execute_tool(
             &ToolCall::SearchSemantic { query: "".into() },
             &db,

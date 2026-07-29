@@ -28,7 +28,7 @@
 //! - If ScreenCaptureKit permission is denied / system capture is off, there is no system
 //!   stream at all and the caller falls back to mic-only (everything "me").
 
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 use crate::transcribe::types::Segment;
 
@@ -140,6 +140,34 @@ const ECHO_RELAXED_AFTER_S: f64 = 4.0;
 const ECHO_RELAXED_SIMILARITY: f32 = 0.7;
 const ECHO_CONCAT_MAX: usize = 3;
 const ECHO_CONCAT_MAX_GAP_S: f64 = 1.0;
+/// The capture-lane projection requested by transcript readers.
+///
+/// This is deliberately owned by the audio merge seam: `Segment.speaker` is the persisted lane
+/// marker, and this module already owns the load-bearing distinction between the local microphone
+/// (`me`) and the clean system side (`others` / `others-N`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderChannel {
+    Merged,
+    Mic,
+    System,
+}
+
+/// SQL form of the canonical persisted-tag rule used by [`RenderChannel::System`].
+///
+/// The system lane is intentionally any attributed row that is not `me`, not merely labels with
+/// an `others` prefix. That keeps diarizer and future/noncanonical capture tags visible. DB search
+/// interpolates this exact predicate before its candidate-meeting cap so search and rendering
+/// cannot silently disagree about which persisted rows belong to the system lane.
+pub(crate) const SYSTEM_SPEAKER_SQL_PREDICATE: &str =
+    "AND s.speaker IS NOT NULL AND s.speaker <> 'me'";
+
+/// Raw persisted rows, the ingest-cleaned summary projection, and the raw indices hidden only from
+/// the default merged presentation.
+pub struct EchoClassifiedSegments {
+    pub stored: Vec<Segment>,
+    pub merged: Vec<Segment>,
+    pub suppressed_indices: Vec<i64>,
+}
 
 /// Lowercased Unicode-alphanumeric tokens ("Zamknijmy budżet!" → ["zamknijmy","budżet"]).
 fn norm_tokens(text: &str) -> Vec<String> {
@@ -184,7 +212,11 @@ fn token_lcs(a: &[String], b: &[String]) -> f32 {
     dp[a.len()][b.len()] as f32 / shorter as f32
 }
 
-/// Is this segment on the clean (system) side? Diarization may have relabelled to others-N.
+/// Is this segment on the clean (system) side?
+///
+/// Keep this in lockstep with [`SYSTEM_SPEAKER_SQL_PREDICATE`]: any non-null tag except `me`
+/// belongs to the system lane. Diarization commonly writes `others-N`, but that prefix is not the
+/// semantic boundary.
 fn is_others(seg: &Segment) -> bool {
     seg.speaker
         .as_deref()
@@ -195,6 +227,7 @@ fn is_others(seg: &Segment) -> bool {
 /// One candidate = a run of 1..=ECHO_CONCAT_MAX consecutive `others` segments (close in time).
 struct Candidate {
     start_s: f64,
+    end_s: f64,
     tokens: Vec<String>,
     text_norm: String,
 }
@@ -216,6 +249,7 @@ fn build_candidates(others: &[&Segment]) -> Vec<Candidate> {
             text.push_str(&others[i + k].text.to_lowercase());
             out.push(Candidate {
                 start_s: others[i].start_s,
+                end_s: others[i + k].end_s,
                 tokens: tokens.clone(),
                 text_norm: norm_tokens(&text).join(" "),
             });
@@ -224,24 +258,21 @@ fn build_candidates(others: &[&Segment]) -> Vec<Candidate> {
     out
 }
 
-/// Drop `me` segments that are echo copies of `others` speech. Returns the cleaned,
-/// re-indexed segments + the suppressed count. See the tier rules in the header comment.
-pub fn suppress_cross_stream_echo(
-    segments: Vec<Segment>,
-    leak: Option<&crate::audio::align::EchoLeak>,
-) -> (Vec<Segment>, usize) {
-    // Echo only exists when the user is on speakers, which is exactly what a measured leak means.
-    // No leak ⇒ no echo ⇒ NOTHING is deduplicated (headphones / unreliable-offset recordings are
-    // returned untouched). This gates BOTH tiers — the strict tier is no longer ungated.
-    let leak_armed = leak
-        .map(|l| l.correlation >= crate::audio::align::MIN_CORR)
-        .unwrap_or(false);
+/// Compute the conservative echo drop-mask without mutating or re-indexing the stored segments.
+///
+/// The storage-time caller below arms this only with measured acoustic leak evidence. The cleaned
+/// merged projection is computed once from this mask. Read-time renderers consume only the
+/// persisted outcome and never repeat this content/timestamp heuristic.
+fn cross_stream_echo_drop_mask(
+    segments: &[Segment],
+    min_start_lag_s: f64,
+    min_end_lag_s: f64,
+) -> Vec<bool> {
     let others_refs: Vec<&Segment> = segments.iter().filter(|s| is_others(s)).collect();
-    if !leak_armed || others_refs.is_empty() {
-        return (segments, 0);
+    if others_refs.is_empty() {
+        return vec![false; segments.len()];
     }
     let candidates = build_candidates(&others_refs);
-
     let mut drop = vec![false; segments.len()];
     for (i, seg) in segments.iter().enumerate() {
         if seg.speaker.as_deref() != Some(SPEAKER_ME) {
@@ -256,18 +287,14 @@ pub fn suppress_cross_stream_echo(
             if cand.tokens.len() < ECHO_MIN_TOKENS {
                 continue;
             }
-            // `delta` = how much LATER the `me` (echo) copy starts than the `others` source.
-            // Echo lags, so both windows run from a small causal back-tolerance forward.
-            // (leak evidence is already guaranteed — the fn early-returned otherwise.)
             let delta = seg.start_s - cand.start_s;
-            let strict_hit = (-ECHO_CAUSAL_BACK_S..=ECHO_STRICT_FWD_S).contains(&delta)
+            let end_delta = seg.end_s - cand.end_s;
+            if delta < min_start_lag_s || end_delta < min_end_lag_s {
+                continue;
+            }
+            let strict_hit = delta <= ECHO_STRICT_FWD_S
                 && jaccard(&me_tokens, &cand.tokens) >= ECHO_STRICT_JACCARD;
-            // Relaxed tier uses ORDER-PRESERVING signals only (equality, contiguous substring,
-            // or token-LCS): acoustic echo is the SAME speech, so Whisper decodes it in the same
-            // word order. An order-INSENSITIVE metric (multiset coverage) was dropped because it
-            // eats a genuine `me` line whose words merely reappear — reordered — in a nearby
-            // `others` segment (lock-security finding). Content-loss beats garbled-echo recall.
-            let relaxed_hit = (-ECHO_CAUSAL_BACK_S..=ECHO_RELAXED_AFTER_S).contains(&delta)
+            let relaxed_hit = delta <= ECHO_RELAXED_AFTER_S
                 && (me_norm == cand.text_norm
                     || cand.text_norm.contains(&me_norm)
                     || me_norm.contains(&cand.text_norm)
@@ -278,17 +305,81 @@ pub fn suppress_cross_stream_echo(
             }
         }
     }
+    drop
+}
 
-    let suppressed = drop.iter().filter(|d| **d).count();
-    let mut out: Vec<Segment> = segments
-        .into_iter()
-        .zip(drop)
-        .filter_map(|(s, d)| if d { None } else { Some(s) })
-        .collect();
-    for (i, seg) in out.iter_mut().enumerate() {
-        seg.idx = i as i64;
+/// Select the transcript lane for a read-only renderer without touching stored segment indices.
+///
+/// `Merged` is the canonical stored view. It never guesses from text and timestamps whether a
+/// persisted segment is echo: that is information-theoretically ambiguous with genuine repetition.
+/// Acoustic-leak-evidenced suppression belongs to ingest, before persistence. `Mic` and `System`
+/// expose their original persisted lanes for diagnosis. An unattributed legacy segment belongs to
+/// neither raw lane but remains present in `Merged`.
+pub(crate) fn select_render_channel<'a>(
+    segments: &'a [Segment],
+    channel: RenderChannel,
+    echo_suppressed: &HashSet<i64>,
+) -> Vec<&'a Segment> {
+    match channel {
+        RenderChannel::Mic => segments
+            .iter()
+            .filter(|seg| seg.speaker.as_deref() == Some(SPEAKER_ME))
+            .collect(),
+        RenderChannel::System => segments.iter().filter(|seg| is_others(seg)).collect(),
+        RenderChannel::Merged => segments
+            .iter()
+            .filter(|segment| !echo_suppressed.contains(&segment.idx))
+            .collect(),
     }
-    (out, suppressed)
+}
+
+/// Classify acoustic echo once at ingest while preserving every raw captured row.
+///
+/// The returned `suppressed_indices` are explicit provenance for storage/presentation. They are
+/// produced only when the caller supplies measured [`EchoLeak`] evidence above the established
+/// correlation floor. `merged` is the cleaned projection used by the summarizer; `stored` retains
+/// all original lane rows and stable raw indices for later mic/system inspection.
+pub fn classify_cross_stream_echo(
+    segments: Vec<Segment>,
+    leak: Option<&crate::audio::align::EchoLeak>,
+) -> EchoClassifiedSegments {
+    let leak_armed = leak
+        .map(|leak| leak.correlation >= crate::audio::align::MIN_CORR)
+        .unwrap_or(false);
+    let drop = if leak_armed && segments.iter().any(is_others) {
+        cross_stream_echo_drop_mask(&segments, -ECHO_CAUSAL_BACK_S, f64::NEG_INFINITY)
+    } else {
+        vec![false; segments.len()]
+    };
+    let suppressed_indices = segments
+        .iter()
+        .zip(&drop)
+        .filter_map(|(segment, drop)| drop.then_some(segment.idx))
+        .collect::<Vec<_>>();
+    let mut merged = segments
+        .iter()
+        .zip(&drop)
+        .filter_map(|(segment, drop)| (!drop).then_some(segment.clone()))
+        .collect::<Vec<_>>();
+    for (idx, segment) in merged.iter_mut().enumerate() {
+        segment.idx = idx as i64;
+    }
+    EchoClassifiedSegments {
+        stored: segments,
+        merged,
+        suppressed_indices,
+    }
+}
+
+/// Drop `me` segments that are echo copies of `others` speech. Returns the cleaned,
+/// re-indexed segments + the suppressed count. See the tier rules in the header comment.
+pub fn suppress_cross_stream_echo(
+    segments: Vec<Segment>,
+    leak: Option<&crate::audio::align::EchoLeak>,
+) -> (Vec<Segment>, usize) {
+    let classified = classify_cross_stream_echo(segments, leak);
+    let suppressed = classified.suppressed_indices.len();
+    (classified.merged, suppressed)
 }
 
 #[cfg(test)]
@@ -595,6 +686,130 @@ mod tests {
             "the clean copy survives"
         );
         assert_eq!(out[0].idx, 0, "re-indexed");
+    }
+
+    /// The read projection never mutates or re-indexes persisted segments. Echo classification
+    /// requires acoustic evidence at ingest; once rows are stored, merged keeps every row while
+    /// the raw views filter only by capture lane.
+    #[test]
+    fn render_channel_preserves_all_stored_segments_and_raw_lanes() {
+        let segs = vec![
+            seg_sp(
+                5.0,
+                7.0,
+                "the contract is now signed by both parties",
+                "others",
+            ),
+            seg_sp(5.4, 7.3, "the contract is now signed by both parties", "me"),
+            seg_sp(10.0, 11.0, "I built them", "others"),
+            seg_sp(10.1, 11.1, "I do not know", "me"),
+        ];
+        let merged = select_render_channel(&segs, RenderChannel::Merged, &HashSet::new());
+        assert_eq!(
+            merged.len(),
+            4,
+            "read-time projection keeps every stored row"
+        );
+        assert!(
+            merged.iter().any(|seg| seg.text == "I do not know"),
+            "distinct simultaneous speech survives"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|seg| seg.text.contains("contract"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            select_render_channel(&segs, RenderChannel::Mic, &HashSet::new()).len(),
+            2
+        );
+        assert_eq!(
+            select_render_channel(&segs, RenderChannel::System, &HashSet::new()).len(),
+            2
+        );
+        assert_eq!(
+            merged[2].idx, segs[2].idx,
+            "rendering never re-indexes persisted segments"
+        );
+    }
+
+    /// A persisted system tag is not required to use the conventional `others[-N]` vocabulary.
+    /// The canonical boundary is exactly non-null and not `me`, matching the SQL predicate used by
+    /// transcript search.
+    #[test]
+    fn system_render_channel_includes_noncanonical_non_me_tag() {
+        let segs = vec![
+            seg_sp(1.0, 2.0, "custom remote lane", "remote-custom"),
+            seg_sp(2.0, 3.0, "local lane", "me"),
+            Segment {
+                idx: 2,
+                start_s: 3.0,
+                end_s: 4.0,
+                text: "legacy unattributed lane".into(),
+                speaker: None,
+                confidence: None,
+            },
+        ];
+
+        let system = select_render_channel(&segs, RenderChannel::System, &HashSet::new());
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].speaker.as_deref(), Some("remote-custom"));
+        assert_eq!(system[0].text, "custom remote lane");
+    }
+
+    /// Text plus timing cannot distinguish echo from genuine repetition. Both overlapping and
+    /// turn-taking persisted repetitions survive the canonical read projection. An ordinary
+    /// overlapping echo is removed only by the separate ingest path when acoustic leak evidence is
+    /// present, and its cleaned output remains stable through the canonical projection.
+    #[test]
+    fn render_channel_never_guesses_echo_without_acoustic_evidence() {
+        let mut overlapping = vec![
+            seg_sp(5.0, 7.0, "we should ship the release today", "others"),
+            seg_sp(5.25, 7.25, "We should ship the release today!", "me"),
+        ];
+        overlapping[0].idx = 7;
+        overlapping[1].idx = 8;
+        assert_eq!(
+            select_render_channel(&overlapping, RenderChannel::Merged, &HashSet::new()).len(),
+            2,
+            "overlapping same-content stored speech survives"
+        );
+
+        let turn_taking = vec![
+            seg_sp(5.0, 7.0, "we should ship the release today", "others"),
+            seg_sp(7.2, 9.2, "We should ship the release today!", "me"),
+        ];
+        assert_eq!(
+            select_render_channel(&turn_taking, RenderChannel::Merged, &HashSet::new()).len(),
+            2,
+            "genuine non-overlapping repetition survives"
+        );
+
+        let classified = classify_cross_stream_echo(overlapping, Some(&leak(0.9)));
+        assert_eq!(
+            classified.suppressed_indices.len(),
+            1,
+            "acoustic leak evidence identifies the echo"
+        );
+        assert_eq!(classified.stored.len(), 2, "both raw rows are retained");
+        let hidden = classified
+            .suppressed_indices
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            select_render_channel(&classified.stored, RenderChannel::Merged, &hidden).len(),
+            1,
+            "merged filters only the explicit ingest provenance"
+        );
+        assert_eq!(
+            select_render_channel(&classified.stored, RenderChannel::Mic, &hidden).len(),
+            1,
+            "the raw mic lane still exposes the marked captured row"
+        );
+        assert_eq!(classified.merged.len(), 1, "summary feed stays echo-clean");
     }
 
     /// HEADPHONES IMMUNITY (RED-before-GREEN): with NO measured leak, echo is physically
