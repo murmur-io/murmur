@@ -196,8 +196,24 @@ impl Db {
         entity_id: &str,
         unlocked: &HashSet<String>,
     ) -> Result<Vec<VaultSource>> {
+        self.entity_mentions_visible_limited(entity_id, unlocked, usize::MAX)
+    }
+
+    /// The newest bounded window of VISIBLE meetings mentioning `entity_id`.
+    ///
+    /// The limit is applied by SQLite after the visibility predicate and stable
+    /// newest-first ordering. Callers that need an honest truncation bit should
+    /// request `display_limit + 1`; this avoids materialising an unbounded
+    /// mention set merely to learn that more rows exist.
+    pub fn entity_mentions_visible_limited(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+        limit: usize,
+    ) -> Result<Vec<VaultSource>> {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
+        let row_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT m.id, m.title, m.started_at
                FROM entity_mentions em
@@ -211,11 +227,12 @@ impl Db {
                          WHERE n.meeting_id = m.id AND {visible}
                       )
                     )
-              ORDER BY m.started_at DESC, m.id DESC"
+              ORDER BY m.started_at DESC, m.id DESC
+              LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![entity_id], |r| {
+            .query_map(rusqlite::params![entity_id, row_limit], |r| {
                 let meeting_id: String = r.get(0)?;
                 let title: Option<String> = r.get(1)?;
                 let started_at: String = r.get(2)?;
