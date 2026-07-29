@@ -19,13 +19,14 @@ interface ConnectionDef {
 }
 
 /**
- * The four connections, in display order. ALWAYS all rendered — the gateway
+ * The connections, in display order. ALWAYS all rendered — the gateway
  * card no longer hides behind `providerId === 'gateway'` (the old T1
  * split-brain); `provider_statuses` omitting an unconfigured gateway just
  * renders as "Not set up".
  */
 const CONNECTIONS: readonly ConnectionDef[] = [
   { id: "claude_code", name: "Claude Code" },
+  { id: "codex_cli", name: "Codex" },
   { id: "anthropic", name: "Anthropic API" },
   { id: "ollama", name: "Ollama" },
   { id: "gateway", name: "Kong AI Gateway" },

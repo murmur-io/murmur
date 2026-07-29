@@ -112,13 +112,13 @@ impl Drop for ClaudeProcessGroup {
 }
 
 #[cfg(unix)]
-fn isolate_process_group(command: &mut Command) {
+pub(crate) fn isolate_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
 }
 
 #[cfg(not(unix))]
-fn isolate_process_group(_command: &mut Command) {}
+pub(crate) fn isolate_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn signal_process_group(pgid: i32, signal: i32) -> crate::error::Result<()> {
@@ -135,7 +135,7 @@ fn signal_process_group(pgid: i32, signal: i32) -> crate::error::Result<()> {
         Ok(()) // ESRCH: the group is already absent.
     } else {
         Err(AppError::Summarize(format!(
-            "failed signaling claude process group: {error}"
+            "failed signaling external cloud CLI process group: {error}"
         )))
     }
 }
@@ -154,7 +154,7 @@ fn process_group_is_alive(pgid: i32) -> crate::error::Result<bool> {
         Some(3) => Ok(false), // ESRCH
         Some(1) => Ok(true),  // EPERM still proves a group exists.
         _ => Err(AppError::Summarize(format!(
-            "failed checking claude process group: {error}"
+            "failed checking external cloud CLI process group: {error}"
         ))),
     }
 }
@@ -195,7 +195,7 @@ where
                 return if exceeded {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "claude output exceeded bounded limit",
+                        "external cloud CLI output exceeded bounded limit",
                     ))
                 } else {
                     Ok(bytes)
@@ -227,16 +227,16 @@ async fn kill_and_prove_group_dead(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(AppError::Summarize(
-                "claude process group remained alive after teardown deadline".into(),
+                "external cloud CLI process group remained alive after teardown deadline".into(),
             ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-/// Recording-priority cancellation for active OR previously unproven Claude CLI groups. The CLI is
-/// cloud-bound and may have a Node descendant holding pipes/network after its direct parent exits;
-/// Start may proceed only after every isolated group is proven absent.
+/// Recording-priority cancellation for active OR previously unproven external cloud CLI groups.
+/// A CLI may have descendants holding pipes/network after its direct parent exits; Start may
+/// proceed only after every isolated group is proven absent.
 pub(crate) async fn kill_for_recording(timeout: Duration) -> crate::error::Result<bool> {
     #[cfg(not(unix))]
     {
@@ -280,9 +280,10 @@ pub(crate) async fn kill_for_recording(timeout: Duration) -> crate::error::Resul
     }
 }
 
-async fn kill_and_reap_claude(
+async fn kill_and_reap_external_cli(
     child: &mut Child,
     group: &mut ClaudeProcessGroup,
+    provider_label: &str,
 ) -> crate::error::Result<()> {
     let deadline = tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT;
     let pre_kill_error = match child.try_wait() {
@@ -306,12 +307,12 @@ async fn kill_and_reap_claude(
             }
             Ok(None) => Err(AppError::Summarize(match pre_kill_error {
                 Some(precheck) => format!(
-                    "failed checking claude status before teardown: {precheck}; failed to kill claude: {kill_error}"
+                    "failed checking {provider_label} status before teardown: {precheck}; failed to kill {provider_label}: {kill_error}"
                 ),
-                None => format!("failed to kill claude after deadline: {kill_error}"),
+                None => format!("failed to kill {provider_label} after deadline: {kill_error}"),
             })),
             Err(wait_error) => Err(AppError::Summarize(format!(
-                "failed to kill claude after deadline: {kill_error}; status check failed: {wait_error}"
+                "failed to kill {provider_label} after deadline: {kill_error}; status check failed: {wait_error}"
             ))),
         };
     }
@@ -324,18 +325,19 @@ async fn kill_and_reap_claude(
             Ok(())
         }
         Ok(Err(error)) => Err(AppError::Summarize(format!(
-            "failed to reap claude after kill: {error}"
+            "failed to reap {provider_label} after kill: {error}"
         ))),
         Err(_) => Err(AppError::Summarize(format!(
-            "claude did not reap within {}s after kill",
+            "{provider_label} did not reap within {}s after kill",
             CLAUDE_REAP_TIMEOUT.as_secs()
         ))),
     }
 }
 
-async fn collect_claude_output(
+async fn collect_external_cli_output(
     mut stdout_task: PipeReadTask,
     mut stderr_task: PipeReadTask,
+    provider_label: &str,
 ) -> crate::error::Result<(Vec<u8>, Vec<u8>)> {
     let drains = async { tokio::join!(&mut stdout_task, &mut stderr_task) };
 
@@ -343,26 +345,26 @@ async fn collect_claude_output(
         Ok((stdout, stderr)) => {
             let stdout = stdout
                 .map_err(|error| {
-                    AppError::Summarize(format!("claude stdout reader failed: {error}"))
+                    AppError::Summarize(format!("{provider_label} stdout reader failed: {error}"))
                 })?
                 .map_err(|error| {
-                    AppError::Summarize(format!("failed reading claude stdout: {error}"))
+                    AppError::Summarize(format!("failed reading {provider_label} stdout: {error}"))
                 })?;
             let stderr = stderr
                 .map_err(|error| {
-                    AppError::Summarize(format!("claude stderr reader failed: {error}"))
+                    AppError::Summarize(format!("{provider_label} stderr reader failed: {error}"))
                 })?
                 .map_err(|error| {
-                    AppError::Summarize(format!("failed reading claude stderr: {error}"))
+                    AppError::Summarize(format!("failed reading {provider_label} stderr: {error}"))
                 })?;
             Ok((stdout, stderr))
         }
         Err(_) => {
             stdout_task.abort();
             stderr_task.abort();
-            Err(AppError::Summarize(
-                "claude output pipes did not close after process exit".into(),
-            ))
+            Err(AppError::Summarize(format!(
+                "{provider_label} output pipes did not close after process exit"
+            )))
         }
     }
 }
@@ -371,19 +373,35 @@ async fn collect_claude_output(
 /// deadline. Stdout/stderr are drained concurrently so neither pipe can back-pressure the child.
 /// Every error path explicitly kill/reaps before returning; `kill_on_drop` remains the cancellation
 /// belt when the caller itself drops this future.
-async fn run_claude_child(
+pub(crate) async fn run_external_cli_child(
+    child: Child,
+    stdin_content: &[u8],
+    provider_label: &str,
+) -> crate::error::Result<std::process::Output> {
+    run_external_cli_child_with_timeout(child, stdin_content, provider_label, CLAUDE_TIMEOUT).await
+}
+
+/// The same process-group-safe transaction as [`run_external_cli_child`], with a caller-selected
+/// wall-clock budget for short local probes. The teardown and bounded-output guarantees are
+/// identical; callers cannot accidentally turn a readiness probe into a generation-length wait.
+pub(crate) async fn run_external_cli_child_with_timeout(
     mut child: Child,
     stdin_content: &[u8],
+    provider_label: &str,
+    timeout: Duration,
 ) -> crate::error::Result<std::process::Output> {
     let mut process_group = ClaudeProcessGroup::register(&child);
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            let teardown =
+                kill_and_reap_external_cli(&mut child, &mut process_group, provider_label).await;
             return match teardown {
-                Ok(()) => Err(AppError::Summarize("failed to open claude stdout".into())),
+                Ok(()) => Err(AppError::Summarize(format!(
+                    "failed to open {provider_label} stdout"
+                ))),
                 Err(error) => Err(AppError::Summarize(format!(
-                    "failed to open claude stdout; teardown failed: {error}"
+                    "failed to open {provider_label} stdout; teardown failed: {error}"
                 ))),
             };
         }
@@ -391,11 +409,14 @@ async fn run_claude_child(
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            let teardown =
+                kill_and_reap_external_cli(&mut child, &mut process_group, provider_label).await;
             return match teardown {
-                Ok(()) => Err(AppError::Summarize("failed to open claude stderr".into())),
+                Ok(()) => Err(AppError::Summarize(format!(
+                    "failed to open {provider_label} stderr"
+                ))),
                 Err(error) => Err(AppError::Summarize(format!(
-                    "failed to open claude stderr; teardown failed: {error}"
+                    "failed to open {provider_label} stderr; teardown failed: {error}"
                 ))),
             };
         }
@@ -403,29 +424,29 @@ async fn run_claude_child(
     let stdout_task = spawn_pipe_reader(stdout, CLAUDE_STDOUT_LIMIT_BYTES);
     let stderr_task = spawn_pipe_reader(stderr, CLAUDE_STDERR_LIMIT_BYTES);
 
-    let execution = tokio::time::timeout(CLAUDE_TIMEOUT, async {
+    let execution = tokio::time::timeout(timeout, async {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| AppError::Summarize("failed to open claude stdin".into()))?;
+            .ok_or_else(|| AppError::Summarize(format!("failed to open {provider_label} stdin")))?;
         stdin.write_all(stdin_content).await.map_err(|error| {
-            AppError::Summarize(format!("failed writing to claude stdin: {error}"))
+            AppError::Summarize(format!("failed writing to {provider_label} stdin: {error}"))
         })?;
         stdin.shutdown().await.map_err(|error| {
-            AppError::Summarize(format!("failed closing claude stdin: {error}"))
+            AppError::Summarize(format!("failed closing {provider_label} stdin: {error}"))
         })?;
         drop(stdin);
-        child
-            .wait()
-            .await
-            .map_err(|error| AppError::Summarize(format!("failed waiting on claude: {error}")))
+        child.wait().await.map_err(|error| {
+            AppError::Summarize(format!("failed waiting on {provider_label}: {error}"))
+        })
     })
     .await;
 
     let status = match execution {
         Ok(Ok(status)) => status,
         Ok(Err(primary)) => {
-            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            let teardown =
+                kill_and_reap_external_cli(&mut child, &mut process_group, provider_label).await;
             stdout_task.abort();
             stderr_task.abort();
             return match teardown {
@@ -436,17 +457,18 @@ async fn run_claude_child(
             };
         }
         Err(_) => {
-            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            let teardown =
+                kill_and_reap_external_cli(&mut child, &mut process_group, provider_label).await;
             stdout_task.abort();
             stderr_task.abort();
             return match teardown {
                 Ok(()) => Err(AppError::Summarize(format!(
-                    "claude timed out after {}s",
-                    CLAUDE_TIMEOUT.as_secs()
+                    "{provider_label} timed out after {}s",
+                    timeout.as_secs()
                 ))),
                 Err(error) => Err(AppError::Summarize(format!(
-                    "claude timed out after {}s; teardown failed: {error}",
-                    CLAUDE_TIMEOUT.as_secs()
+                    "{provider_label} timed out after {}s; teardown failed: {error}",
+                    timeout.as_secs()
                 ))),
             };
         }
@@ -462,7 +484,8 @@ async fn run_claude_child(
     .await?;
     process_group.mark_proven_dead();
 
-    let (stdout, stderr) = collect_claude_output(stdout_task, stderr_task).await?;
+    let (stdout, stderr) =
+        collect_external_cli_output(stdout_task, stderr_task, provider_label).await?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -502,7 +525,7 @@ const MURMUR_ENV_PREFIX: &str = "MURMUR_";
 ///   (so an env `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / proxy var works like older versions),
 ///   EXCEPT [`NEVER_INHERIT_ENV`] which is always removed. `PATH` is still pinned to the login shell's
 ///   so a GUI-launched app can find `claude` + the `node` it spawns.
-fn harden_env(cmd: &mut Command, inherit: bool) {
+pub(crate) fn harden_env(cmd: &mut Command, inherit: bool) {
     if inherit {
         cmd.env("PATH", shell_path());
         for key in NEVER_INHERIT_ENV {
@@ -560,7 +583,7 @@ const STRICT_MCP_CONFIG_FLAG: &str = "--strict-mcp-config";
 /// Finder / `open`) inherits only a minimal PATH (`/usr/bin:/bin:…`), so `claude` (and the
 /// `node` it spawns) won't be found. Recover the real PATH from the login shell and
 /// augment it with common locations. Cached — the shell probe runs at most once.
-fn shell_path() -> &'static str {
+pub(crate) fn shell_path() -> &'static str {
     static CACHE: OnceLock<String> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut parts: Vec<String> = Vec::new();
@@ -607,15 +630,15 @@ fn shell_path() -> &'static str {
 /// world-writable, so a binary an attacker could swap (world-writable, or planted under a dir
 /// they own) is rejected. On success returns the absolute, validated path; otherwise the error
 /// explains why — and is intentionally PII-free.
-fn resolve_binary(binary: &str) -> crate::error::Result<String> {
+fn resolve_binary(binary: &str, provider_label: &str) -> crate::error::Result<String> {
     if binary.contains('/') {
         let p = Path::new(binary);
-        vet_binary(p)?;
+        vet_binary(p, provider_label)?;
         return Ok(p.to_string_lossy().into_owned());
     }
     for dir in shell_path().split(':').filter(|d| !d.is_empty()) {
         let candidate = Path::new(dir).join(binary);
-        if candidate.is_file() && vet_binary(&candidate).is_ok() {
+        if candidate.is_file() && vet_binary(&candidate, provider_label).is_ok() {
             return Ok(candidate.to_string_lossy().into_owned());
         }
     }
@@ -626,15 +649,18 @@ fn resolve_binary(binary: &str) -> crate::error::Result<String> {
 
 /// Reject a binary path unless it is a regular file, owned by the current uid, and not
 /// world-writable (F3). A symlink is resolved first so the *target's* metadata is what we check.
-fn vet_binary(path: &Path) -> crate::error::Result<()> {
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|e| AppError::Unavailable(format!("claude binary path is not resolvable: {e}")))?;
+pub(crate) fn vet_binary(path: &Path, provider_label: &str) -> crate::error::Result<()> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        AppError::Unavailable(format!(
+            "{provider_label} binary path is not resolvable: {e}"
+        ))
+    })?;
     let meta = std::fs::metadata(&canonical)
-        .map_err(|e| AppError::Unavailable(format!("cannot stat claude binary: {e}")))?;
+        .map_err(|e| AppError::Unavailable(format!("cannot stat {provider_label} binary: {e}")))?;
     if !meta.is_file() {
-        return Err(AppError::Unavailable(
-            "configured claude binary is not a regular file".to_string(),
-        ));
+        return Err(AppError::Unavailable(format!(
+            "configured {provider_label} binary is not a regular file"
+        )));
     }
     #[cfg(unix)]
     {
@@ -644,15 +670,15 @@ fn vet_binary(path: &Path) -> crate::error::Result<()> {
         // SAFETY: getuid() is always-succeeds FFI.
         let our_uid = unsafe { libc_getuid() };
         if meta.uid() != our_uid {
-            return Err(AppError::Unavailable(
-                "claude binary is not owned by the current user".to_string(),
-            ));
+            return Err(AppError::Unavailable(format!(
+                "{provider_label} binary is not owned by the current user"
+            )));
         }
         // World-writable (o+w) means anyone could replace its contents.
         if meta.permissions().mode() & 0o002 != 0 {
-            return Err(AppError::Unavailable(
-                "claude binary is world-writable — refusing to execute".to_string(),
-            ));
+            return Err(AppError::Unavailable(format!(
+                "{provider_label} binary is world-writable — refusing to execute"
+            )));
         }
     }
     Ok(())
@@ -664,6 +690,119 @@ fn vet_binary(path: &Path) -> crate::error::Result<()> {
 extern "C" {
     #[link_name = "getuid"]
     fn libc_getuid() -> u32;
+}
+
+/// Probe one external cloud CLI under the same admission, process-group, timeout, environment and
+/// teardown guarantees as real generation. Callers receive a non-failing [`Availability`] result.
+fn build_external_cli_probe_command(
+    bin: &str,
+    args: &[&str],
+    inherit_env: bool,
+    current_dir: Option<&Path>,
+) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    isolate_process_group(&mut cmd);
+    harden_env(&mut cmd, inherit_env);
+    if let Some(current_dir) = current_dir {
+        cmd.current_dir(current_dir);
+    }
+    cmd
+}
+
+async fn probe_external_cli(
+    binary: &str,
+    args: &[&str],
+    inherit_env: bool,
+    current_dir: Option<&Path>,
+    provider_label: &str,
+) -> Availability {
+    let _process_lease = match crate::perf::acquire_external_egress_lease(None) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return Availability::Unavailable {
+                reason: error.to_string(),
+            }
+        }
+    };
+    let bin = match resolve_binary(binary, provider_label) {
+        Ok(bin) => bin,
+        Err(error) => {
+            return Availability::Unavailable {
+                reason: error.to_string(),
+            }
+        }
+    };
+    let invocation = format!("`{} {}`", bin, args.join(" "));
+    let mut cmd = build_external_cli_probe_command(&bin, args, inherit_env, current_dir);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Availability::Unavailable {
+                reason: format!("failed to start {provider_label} probe {invocation} ({error})"),
+            }
+        }
+    };
+    let mut process_group = ClaudeProcessGroup::register(&child);
+    let status = match tokio::time::timeout(CLAUDE_AVAILABILITY_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => {
+            match kill_and_prove_group_dead(
+                process_group.pgid(),
+                tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT,
+            )
+            .await
+            {
+                Ok(()) => {
+                    process_group.mark_proven_dead();
+                    Ok(status)
+                }
+                Err(error) => Err(format!(
+                    "{provider_label} probe {invocation} teardown failed ({error})"
+                )),
+            }
+        }
+        Ok(Err(error)) => {
+            match kill_and_reap_external_cli(
+                    &mut child,
+                    &mut process_group,
+                    provider_label,
+                )
+                .await
+                {
+                    Ok(()) => Err(format!(
+                        "{provider_label} probe {invocation} wait failed ({error})"
+                    )),
+                    Err(teardown) => Err(format!(
+                        "{provider_label} probe {invocation} wait failed ({error}); teardown failed ({teardown})"
+                    )),
+                }
+        }
+        Err(_) => {
+            match kill_and_reap_external_cli(&mut child, &mut process_group, provider_label).await {
+                Ok(()) => Err(format!(
+                    "{provider_label} probe {invocation} timed out after {}s",
+                    CLAUDE_AVAILABILITY_TIMEOUT.as_secs()
+                )),
+                Err(error) => Err(format!(
+                    "{provider_label} probe {invocation} timed out and teardown failed ({error})"
+                )),
+            }
+        }
+    };
+    match status {
+        Ok(status) if status.success() => Availability::Available,
+        Ok(status) => Availability::Unavailable {
+            reason: format!(
+                "{provider_label} probe {invocation} exited with status {}",
+                status.code().unwrap_or(-1)
+            ),
+        },
+        Err(reason) => Availability::Unavailable { reason },
+    }
 }
 
 /// Spawns the local `claude -p` CLI in headless print mode to generate the note.
@@ -741,83 +880,14 @@ impl SummarizerProvider for ClaudeCodeProvider {
     /// Probe whether the `claude` binary is reachable by running `claude --version`.
     /// Non-failing: any spawn/exec/validation error is reported as `Unavailable`.
     async fn availability(&self) -> Availability {
-        // The probe is local, but it still spawns the same Node-backed executable. Admit it through
-        // the external-process lane so recording Start cannot observe an empty group registry and
-        // then have `--version` spawn in the final check-to-capture gap.
-        let _process_lease = match crate::perf::acquire_external_egress_lease(None) {
-            Ok(lease) => lease,
-            Err(error) => {
-                return Availability::Unavailable {
-                    reason: error.to_string(),
-                }
-            }
-        };
-        let bin = match resolve_binary(&self.binary) {
-            Ok(b) => b,
-            Err(e) => {
-                return Availability::Unavailable {
-                    reason: e.to_string(),
-                }
-            }
-        };
-        let mut cmd = Command::new(&bin);
-        cmd.arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        isolate_process_group(&mut cmd);
-        harden_env(&mut cmd, self.inherit_env); // F2: env_clear + minimal PATH so no secrets leak to the child.
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return Availability::Unavailable {
-                    reason: format!("`{bin}` not found ({error})"),
-                }
-            }
-        };
-        let mut process_group = ClaudeProcessGroup::register(&child);
-        let status = match tokio::time::timeout(CLAUDE_AVAILABILITY_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => {
-                match kill_and_prove_group_dead(
-                    process_group.pgid(),
-                    tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        process_group.mark_proven_dead();
-                        Ok(status)
-                    }
-                    Err(error) => Err(format!("`{bin} --version` teardown failed ({error})")),
-                }
-            }
-            Ok(Err(error)) => match kill_and_reap_claude(&mut child, &mut process_group).await {
-                Ok(()) => Err(format!("`{bin} --version` wait failed ({error})")),
-                Err(teardown) => Err(format!(
-                    "`{bin} --version` wait failed ({error}); teardown failed ({teardown})"
-                )),
-            },
-            Err(_) => match kill_and_reap_claude(&mut child, &mut process_group).await {
-                Ok(()) => Err(format!(
-                    "`{bin} --version` timed out after {}s",
-                    CLAUDE_AVAILABILITY_TIMEOUT.as_secs()
-                )),
-                Err(error) => Err(format!(
-                    "`{bin} --version` timed out and teardown failed ({error})"
-                )),
-            },
-        };
-        match status {
-            Ok(status) if status.success() => Availability::Available,
-            Ok(status) => Availability::Unavailable {
-                reason: format!(
-                    "`{bin} --version` exited with status {}",
-                    status.code().unwrap_or(-1)
-                ),
-            },
-            Err(reason) => Availability::Unavailable { reason },
-        }
+        probe_external_cli(
+            &self.binary,
+            &["--version"],
+            self.inherit_env,
+            None,
+            "Claude Code",
+        )
+        .await
     }
 
     /// Spawn `claude -p --system-prompt <tpl> --disallowedTools <all>`, feed the meeting
@@ -834,12 +904,12 @@ impl SummarizerProvider for ClaudeCodeProvider {
         // stdin = metadata + vault link targets + transcript (the "user" content).
         let stdin_content = template::render_user_content(req);
 
-        let bin = resolve_binary(&self.binary)?;
+        let bin = resolve_binary(&self.binary, "Claude Code")?;
         let mut cmd = build_claude_command(&bin, &system_prompt, &self.model, self.inherit_env);
         let child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
-        let output = run_claude_child(child, stdin_content.as_bytes()).await?;
+        let output = run_external_cli_child(child, stdin_content.as_bytes(), "Claude Code").await?;
 
         if !output.status.success() {
             // F6: never echo claude's stderr at a PII-retaining level (it can carry prompt/transcript
@@ -875,7 +945,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
     }
 
     async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
-        let bin = resolve_binary(&self.binary)?;
+        let bin = resolve_binary(&self.binary, "Claude Code")?;
         // Same hermetic seam as `summarize`: empty allowlist + `--strict-mcp-config`. The Ask agentic
         // loop uses Murmur's OWN JSON tool protocol (the model emits `{"tool":…}` text that
         // `GatedToolExecutor` parses + executes) — it needs ZERO claude native tools or MCP, so this
@@ -884,7 +954,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
         let child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
-        let output = run_claude_child(child, user.as_bytes()).await?;
+        let output = run_external_cli_child(child, user.as_bytes(), "Claude Code").await?;
         if !output.status.success() {
             // F6: suppress stderr content (may carry prompt/transcript text); code only. Same
             // actionable error + opt-in capture as `summarize`.
@@ -912,7 +982,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
 /// `complete`) — the single testable SEAM for the hermeticity flags (F1). Sets, in order:
 /// `-p`, `--system-prompt <system>`, `--allowedTools ""` (fail-closed tool isolation),
 /// `--strict-mcp-config` (zero ambient MCP servers), the optional `--model <id>`, piped stdio,
-/// `kill_on_drop` (F6), and the hardened env (F2). [`run_claude_child`] owns stdin + wait + teardown
+/// `kill_on_drop` (F6), and the hardened env (F2). [`run_external_cli_child`] owns stdin + wait + teardown
 /// under one deadline.
 ///
 /// Keeping this in ONE place is what lets a unit test assert (via `get_args()`) that every real spawn
@@ -1128,6 +1198,38 @@ mod tests {
             Some("claude-opus-4-8".to_string()),
             "the --model override rides the shared seam: {args:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn readiness_failure_keeps_the_binary_and_probe_argv_actionable() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let script =
+            crate::storage::db::unique_temp_path("murmur-claude-readiness-diagnostic", "sh");
+        let mut file = std::fs::File::create(&script).unwrap();
+        writeln!(file, "#!/bin/sh").unwrap();
+        writeln!(file, "exit 7").unwrap();
+        drop(file);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let path = script.to_string_lossy().into_owned();
+        let availability =
+            probe_external_cli(&path, &["--version"], false, None, "Claude Code").await;
+        let Availability::Unavailable { reason } = availability else {
+            panic!("non-zero readiness probe must be unavailable");
+        };
+        assert!(reason.contains(&path), "binary path must remain actionable");
+        assert!(
+            reason.contains("--version"),
+            "probe argv must remain actionable"
+        );
+        assert!(
+            reason.contains("status 7"),
+            "exit status must remain visible"
+        );
+        let _ = std::fs::remove_file(script);
     }
 
     #[test]

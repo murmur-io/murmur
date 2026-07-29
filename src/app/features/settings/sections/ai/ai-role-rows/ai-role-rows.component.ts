@@ -16,6 +16,7 @@ import { SettingsStore } from "../../../settings.store";
 /** Provider-backed connection ids (a per-role model select makes sense on these). */
 const PROVIDER_CONNECTION_IDS: readonly string[] = [
   "claude_code",
+  "codex_cli",
   "anthropic",
   "ollama",
   "gateway",

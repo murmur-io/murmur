@@ -1,0 +1,49 @@
+@switch (provider()) {
+  @case ("claude_code") {
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4" />
+      <path
+        d="m9.1 3.8 5.8 16.4M3.8 9.1l16.4 5.8M14.9 3.8 9.1 20.2M20.2 9.1 3.8 14.9"
+      />
+    </svg>
+  }
+  @case ("codex_cli") {
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M12 3.4a4.3 4.3 0 0 1 4.1 3 4.3 4.3 0 0 1 3.2 6.8 4.3 4.3 0 0 1-3.1 6.4 4.3 4.3 0 0 1-7.5.5 4.3 4.3 0 0 1-4.8-5.7 4.3 4.3 0 0 1 .9-7.3A4.3 4.3 0 0 1 12 3.4Z"
+      />
+      <path
+        d="m8.1 8.2 3.9-2.3 3.9 2.3v4.6L12 15.1l-3.9-2.3V8.2Zm0 4.6v4.5l3.9 2.2 3.9-2.2v-4.5"
+      />
+    </svg>
+  }
+  @case ("anthropic") {
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m5 19 5.2-14h3.6L19 19M7.2 13.2h9.6M16.8 5l2.2 6" />
+    </svg>
+  }
+  @case ("ollama") {
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M8.2 8.5 7 4.5l3.4 2M15.8 8.5 17 4.5l-3.4 2M7 11c0-2.6 2.2-4.5 5-4.5s5 1.9 5 4.5v5.2c0 2-2.2 3.3-5 3.3s-5-1.3-5-3.3V11Z"
+      />
+      <path d="M9.7 12.1h.1M14.2 12.1h.1M10 16c1.1.7 2.9.7 4 0" />
+    </svg>
+  }
+  @case ("gateway") {
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="5" cy="12" r="2.2" />
+      <circle cx="19" cy="6" r="2.2" />
+      <circle cx="19" cy="18" r="2.2" />
+      <path d="M7.2 12h4.2m0 0 5.4-5m-5.4 5 5.4 5M11.4 7.5V16.5" />
+    </svg>
+  }
+  @default {
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M12 3v5m0 8v5M3 12h5m8 0h5M5.6 5.6l3.5 3.5m5.8 5.8 3.5 3.5m0-12.8-3.5 3.5m-5.8 5.8-3.5 3.5"
+      />
+      <circle cx="12" cy="12" r="3.2" />
+    </svg>
+  }
+}
