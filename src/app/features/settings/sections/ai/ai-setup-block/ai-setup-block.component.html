@@ -14,6 +14,7 @@
           <span class="field-label">Engine</span>
           <select formControlName="providerId" (change)="onEngineChanged($event)">
             <option value="claude_code">Claude Code (default)</option>
+            <option value="codex_cli">Codex</option>
             <option value="anthropic">Anthropic API</option>
             <option value="ollama">Ollama</option>
             <option value="gateway">Kong AI Gateway (OpenAI-compatible)</option>
@@ -21,9 +22,9 @@
         </label>
 
         <!--
-          Model + reasoning-effort. providerModel steers ONLY the claude_code
-          /anthropic arms (gateway/ollama read their own connection-card
-          model), so the picker renders for those two — for gateway/ollama we
+          Model + reasoning-effort. providerModel steers the claude_code,
+          codex_cli and anthropic arms (gateway/ollama read their own connection-card
+          model), so the picker renders for those three — for gateway/ollama we
           point at the connection card, now under Advanced.
         -->
         @switch (form.controls.providerId.value) {
@@ -45,7 +46,9 @@
               <div class="model-row">
                 @if (defaultModelCatalog().length > 0) {
                   <select formControlName="providerModel" class="model-select">
-                    <option value="">Default (provider's pick)</option>
+                    <option value="" data-provider-default>
+                      Default (provider's pick)
+                    </option>
                     @for (id of defaultModelCatalog(); track id) {
                       <option [value]="id">{{ id }}</option>
                     }

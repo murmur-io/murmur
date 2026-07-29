@@ -314,6 +314,7 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
 
   const PROVIDERS = [
     { id: "claude_code", available: true },
+    { id: "codex_cli", available: true },
     { id: "anthropic", available: true },
     { id: "ollama", available: true },
     { id: "local", available: true },
@@ -731,6 +732,7 @@ scope to the GA-critical path only.
       case "list_models":
         if (args && args.connection === "ollama") return ["llama3.1:8b", "qwen2.5:7b", "mistral:7b"];
         if (args && args.connection === "gateway") return [];
+        if (args && args.connection === "codex_cli") return ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
         return ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
       case "gateway_health": return { reachable: false, modelCount: 0 };
       case "get_egress_ledger": return EGRESS;

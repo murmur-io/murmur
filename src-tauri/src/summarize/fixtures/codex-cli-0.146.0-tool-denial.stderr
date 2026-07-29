@@ -1,0 +1,1 @@
+2026-07-29T11:23:22.140177Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: Murmur Codex provider has no local tools.. Command: /usr/bin/printf MURMUR_TOOL_SHOULD_NOT_RUN

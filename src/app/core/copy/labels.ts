@@ -14,12 +14,13 @@
  * in the SAME commit or they drift — the Rust half is pinned by
  * `roles::tests::connection_labels_mirror_the_frontend_copy_module`.
  *
- * These are BRAND names, deliberately kept: "Claude Code", "Anthropic API", "Ollama" and "Kong AI
- * Gateway" are what the user typed into Settings and what they will search for. Replacing a brand
+ * These are BRAND names, deliberately kept: "Claude Code", "Codex", "Anthropic API", "Ollama" and
+ * "Kong AI Gateway" are what the user picked in Settings and what they will search for. Replacing a brand
  * with a category ("your AI service") would be vaguer, not plainer.
  */
 export const CONNECTION_LABELS: Readonly<Record<string, string>> = {
   claude_code: "Claude Code",
+  codex_cli: "Codex",
   anthropic: "Anthropic API",
   ollama: "Ollama",
   gateway: "Kong AI Gateway",
@@ -45,6 +46,8 @@ export function cloudDestinationLabel(id: string | null | undefined): string {
     case "anthropic":
     case "claude_code":
       return "Anthropic's cloud";
+    case "codex_cli":
+      return "OpenAI's cloud";
     case "gateway":
       return "your Kong AI Gateway";
     case "ollama":
