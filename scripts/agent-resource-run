@@ -20,6 +20,12 @@ import subprocess
 import sys
 import time
 
+HARNESS_LIBRARY = (
+    Path(__file__).resolve().parent.parent / ".agents" / "harness"
+)
+sys.path.insert(0, str(HARNESS_LIBRARY))
+import resource_lane
+
 
 TIMEOUT_EXIT = 124
 SUPERVISOR_EXIT = 125
@@ -286,13 +292,17 @@ def lane_owner(lane_handle):
     }
 
 
-def print_lane_wait(lane_handle):
+def print_lane_wait(lane_handle, queue_status):
     owner = lane_owner(lane_handle)
     print(
         "agent-resource-run: waiting for lane "
         "owner_pid={owner_pid} task={task} command={command} since={since} "
+        "queue_position={queue_position}/{queue_depth} queued_since={queued_since} "
         "heartbeat={heartbeat}".format(
             **owner,
+            queue_position=queue_status["position"],
+            queue_depth=queue_status["depth"],
+            queued_since=queue_status["queued_at"],
             heartbeat=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         ),
         file=sys.stderr,
@@ -311,56 +321,91 @@ def acquire_lane(
     heartbeat_seconds,
 ):
     next_heartbeat = None
-    while True:
-        if supervisor.signal_received is not None:
-            return False
-        try:
-            fcntl.flock(lane_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lane_handle.seek(0)
-            lane_handle.truncate()
-            json.dump(
-                {
-                    "pid": os.getpid(),
-                    "cwd": str(Path.cwd()),
-                    "acquired_epoch": int(time.time()),
-                    "task": task,
-                    "command": command,
-                    "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                },
-                lane_handle,
-                sort_keys=True,
-            )
-            lane_handle.write("\n")
-            lane_handle.flush()
-            os.fsync(lane_handle.fileno())
-            return True
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EAGAIN):
-                raise
-
-        now = time.monotonic()
-        if next_heartbeat is None or now >= next_heartbeat:
-            print_lane_wait(lane_handle)
-            next_heartbeat = now + heartbeat_seconds
-
-        remaining = absolute_deadline - now
-        if remaining <= 0:
-            owner = ""
-            try:
+    ticket = resource_lane.join_lane_queue(
+        lane_path.parent,
+        task=task,
+        command=command,
+    )
+    acquired = False
+    try:
+        while True:
+            if supervisor.signal_received is not None:
+                return False
+            queue_status = resource_lane.lane_queue_status(ticket)
+            if queue_status["position"] == 1:
+                try:
+                    fcntl.flock(
+                        lane_handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    acquired = True
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+            if acquired:
                 lane_handle.seek(0)
-                owner = lane_handle.read().strip()
-            except OSError:
-                pass
-            suffix = " (owner: {})".format(owner) if owner else ""
-            print(
-                "agent-resource-run: aggregate deadline exceeded waiting for lane {}{}".format(
-                    lane_path, suffix
-                ),
-                file=sys.stderr,
+                lane_handle.truncate()
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "cwd": str(Path.cwd()),
+                        "acquired_epoch": int(time.time()),
+                        "task": task,
+                        "command": command,
+                        "since": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(),
+                        ),
+                    },
+                    lane_handle,
+                    sort_keys=True,
+                )
+                lane_handle.write("\n")
+                lane_handle.flush()
+                os.fsync(lane_handle.fileno())
+                resource_lane.leave_lane_queue(ticket)
+                return True
+
+            now = time.monotonic()
+            if next_heartbeat is None or now >= next_heartbeat:
+                print_lane_wait(lane_handle, queue_status)
+                next_heartbeat = now + heartbeat_seconds
+
+            remaining = absolute_deadline - now
+            if remaining <= 0:
+                owner = ""
+                try:
+                    lane_handle.seek(0)
+                    owner = lane_handle.read().strip()
+                except OSError:
+                    pass
+                suffix = " (owner: {})".format(owner) if owner else ""
+                print(
+                    "agent-resource-run: aggregate deadline exceeded waiting for "
+                    "lane {}{} queue_position={}/{} queued_since={}".format(
+                        lane_path,
+                        suffix,
+                        queue_status["position"],
+                        queue_status["depth"],
+                        queue_status["queued_at"],
+                    ),
+                    file=sys.stderr,
+                )
+                return False
+            until_heartbeat = max(
+                0.0,
+                next_heartbeat - time.monotonic(),
             )
-            return False
-        until_heartbeat = max(0.0, next_heartbeat - time.monotonic())
-        time.sleep(min(POLL_SECONDS, remaining, until_heartbeat or POLL_SECONDS))
+            time.sleep(
+                min(
+                    POLL_SECONDS,
+                    remaining,
+                    until_heartbeat or POLL_SECONDS,
+                )
+            )
+    finally:
+        if not acquired:
+            resource_lane.leave_lane_queue(ticket)
 
 
 def survivor_lock_guard(supervisor, lane_fd):

@@ -13,8 +13,9 @@ use crate::storage::models::{
     Analytics, BacklinkSource, Commitment, CorrectionRecord, DayCount, DocChunkHit,
     DocOutlineEntry, DocumentInfo, DocumentSummary, EntityKind, GraphNode, Meeting,
     MeetingActionSummary, MeetingStatus, NoteCitation, NoteTemplate, NoteTemplateSection,
-    PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertyValue, RecipeRecord, SavedView,
-    SearchHit, StatusCount,
+    PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertyValue, RecipeRecord,
+    SavedView, SearchHit, StatusCount, StoredTranscriptSegment, TranscriptSegmentHit,
+    VisibleSpeakerLabel,
 };
 use crate::transcribe::types::Segment;
 
@@ -376,6 +377,7 @@ impl Db {
                start_s REAL NOT NULL,
                end_s REAL NOT NULL,
                text TEXT NOT NULL,
+               echo_suppressed INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY (meeting_id, idx),
                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
              );
@@ -653,6 +655,15 @@ impl Db {
         // pattern) — NULL for legacy rows transcribed before dual-stream, which read back as
         // `speaker: None` (unattributed). NOT per-remote-person diarization; see types::Segment.
         Self::add_column_if_missing(&conn, "segments", "speaker", "TEXT")?;
+        // Explicit presentation-only echo provenance. It is written only by the ingest path after
+        // measured acoustic leak evidence. Legacy rows default visible; read-time renderers never
+        // infer this flag from text or timestamps.
+        Self::add_column_if_missing(
+            &conn,
+            "segments",
+            "echo_suppressed",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // Phase F0 LOCK-SAFETY: link each correction-log example to the meeting it derived from, so
         // the gated reader can join meetings→folders for a visibility check and the seal/delete paths
         // can purge a sealed meeting's rows. Guarded ALTER (idempotent); NULL for legacy/unattributed
@@ -3641,7 +3652,8 @@ impl Db {
                 .map(|(i, m)| (m.id.clone(), 1.0 / (i as f64 + 1.0)))
                 .collect();
         }
-        let knn_scored = self.knn_meeting_distances(query_vec, limit, min_cosine, unlocked, range)?;
+        let knn_scored =
+            self.knn_meeting_distances(query_vec, limit, min_cosine, unlocked, range)?;
         let graph_scored: Vec<(String, f64)> = graph
             .iter()
             .enumerate()
@@ -4957,28 +4969,90 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically persist every raw capture-lane row plus explicit ingest-time echo provenance.
+    ///
+    /// The provenance bit affects only the default merged presentation. Raw mic/system readers
+    /// retain every row and stable raw index. Callers without measured acoustic evidence continue
+    /// using [`Self::replace_segments`], whose omitted column resets to the legacy-safe default 0.
+    pub fn replace_segments_with_echo_provenance(
+        &self,
+        meeting_id: &str,
+        segments: &[StoredTranscriptSegment],
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM segments WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO segments
+                       (meeting_id, idx, start_s, end_s, text, speaker, confidence, echo_suppressed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .map_err(map_err)?;
+            for stored in segments {
+                let segment = &stored.segment;
+                stmt.execute(rusqlite::params![
+                    meeting_id,
+                    segment.idx,
+                    segment.start_s,
+                    segment.end_s,
+                    segment.text,
+                    segment.speaker,
+                    segment.confidence,
+                    i64::from(stored.echo_suppressed),
+                ])
+                .map_err(map_err)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
     // `delete_unsealed_segments` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// All segments for a meeting, ordered by `idx`.
     pub fn get_segments(&self, meeting_id: &str) -> Result<Vec<Segment>> {
+        Ok(self
+            .get_segments_with_echo_provenance(meeting_id)?
+            .into_iter()
+            .map(|stored| stored.segment)
+            .collect())
+    }
+
+    /// All raw stored segment rows plus their explicit ingest-time echo provenance.
+    ///
+    /// The additive column defaults to false for every legacy row. This reader is intentionally
+    /// ungated like `get_segments`; callers must first pass the meeting visibility boundary.
+    pub fn get_segments_with_echo_provenance(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Vec<StoredTranscriptSegment>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT idx, start_s, end_s, text, speaker, confidence
+                "SELECT idx, start_s, end_s, text, speaker, confidence, echo_suppressed
                    FROM segments WHERE meeting_id = ?1 ORDER BY idx",
             )
             .map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![meeting_id], |row| {
-                Ok(Segment {
-                    idx: row.get(0)?,
-                    start_s: row.get(1)?,
-                    end_s: row.get(2)?,
-                    text: row.get(3)?,
-                    // NULL (legacy / unattributed rows) → None.
-                    speaker: row.get(4)?,
-                    // NULL (legacy / Fast-path rows) → None; a stored REAL → Some(f32).
-                    confidence: row.get(5)?,
+                Ok(StoredTranscriptSegment {
+                    segment: Segment {
+                        idx: row.get(0)?,
+                        start_s: row.get(1)?,
+                        end_s: row.get(2)?,
+                        text: row.get(3)?,
+                        // NULL (legacy / unattributed rows) → None.
+                        speaker: row.get(4)?,
+                        // NULL (legacy / Fast-path rows) → None; a stored REAL → Some(f32).
+                        confidence: row.get(5)?,
+                    },
+                    echo_suppressed: row.get::<_, i64>(6)? != 0,
                 })
             })
             .map_err(map_err)?;
@@ -5020,6 +5094,38 @@ impl Db {
         )
         .optional()
         .map_err(map_err)
+    }
+
+    /// Visibility-gated timeline read for MCP chapter navigation.
+    ///
+    /// Topic labels and speaker names are derived note content. The plaintext timeline being
+    /// blanked on seal is only defense-in-depth; this query independently applies the same meeting
+    /// visibility predicate as search and `get_meeting`. Locked and absent meetings both return
+    /// `None`, so the caller cannot turn chapter availability into an existence oracle.
+    pub fn get_timeline_data_visible(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT t.data
+               FROM timelines t
+               JOIN meetings m ON m.id = t.meeting_id
+              WHERE m.id = ?1
+                AND (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )"
+        );
+        conn.query_row(&sql, rusqlite::params![meeting_id], |row| row.get(0))
+            .optional()
+            .map_err(map_err)
     }
 
     pub fn set_timeline_data(&self, meeting_id: &str, data: &str) -> Result<()> {
@@ -5690,6 +5796,143 @@ impl Db {
         self.search_visible_impl(query, limit, unlocked, None)
     }
 
+    /// Visibility-gated transcript FTS hits that retain their stored segment id.
+    ///
+    /// Unlike `search_visible_impl`, this does not collapse a meeting to one snippet. It first
+    /// applies the persisted channel predicate before selecting at most `max_meetings` recent
+    /// visible meetings with a transcript match, then returns at most `max_segments` matching
+    /// segment ids inside those meetings. Independent `max_meetings + 1` and `max_segments + 1`
+    /// sentinels report meeting-set and raw-row truncation. The tool layer joins those ids against
+    /// the canonical channel projection and must disclose either bound rather than presenting a
+    /// bounded post-projection count as the corpus-wide total.
+    pub(crate) fn search_transcript_segments_visible(
+        &self,
+        query: &str,
+        meeting_id: Option<&str>,
+        channel: crate::audio::merge::RenderChannel,
+        max_meetings: i64,
+        max_segments: usize,
+        unlocked: &HashSet<String>,
+    ) -> Result<(Vec<TranscriptSegmentHit>, bool, bool)> {
+        let Some(and_expr) = fts_match_query(query.trim()) else {
+            return Ok((Vec::new(), false, false));
+        };
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let channel_filter = match channel {
+            crate::audio::merge::RenderChannel::Merged => "AND s.echo_suppressed = 0",
+            crate::audio::merge::RenderChannel::Mic => "AND s.speaker = 'me'",
+            crate::audio::merge::RenderChannel::System => {
+                crate::audio::merge::SYSTEM_SPEAKER_SQL_PREDICATE
+            }
+        };
+        let scope = if meeting_id.is_some() {
+            "AND m.id = :meeting_id"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "WITH segment_hits(rid, meeting_id, idx) AS (
+                 SELECT s.rowid, s.meeting_id, s.idx
+                   FROM fts_segments
+                   JOIN segments s ON s.rowid = fts_segments.rowid
+                  WHERE fts_segments MATCH :query
+                    AND s.text <> ''
+                    {channel_filter}
+             ),
+             candidate_visible_hit_meetings(id, started_at) AS (
+                 SELECT m.id, m.started_at
+                   FROM segment_hits h
+                   JOIN meetings m ON m.id = h.meeting_id
+                  WHERE (
+                          NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                       OR EXISTS (
+                            SELECT 1 FROM notes n
+                             LEFT JOIN folders f ON f.id = n.folder_id
+                             WHERE n.meeting_id = m.id AND {visible}
+                          )
+                        )
+                    {scope}
+                  GROUP BY m.id, m.started_at
+                  ORDER BY m.started_at DESC, m.id DESC
+                  LIMIT :meeting_probe_limit
+             ),
+             visible_hit_meetings(id, started_at) AS (
+                 SELECT id, started_at
+                   FROM candidate_visible_hit_meetings
+                  ORDER BY started_at DESC, id DESC
+                  LIMIT :max_meetings
+             )
+             SELECT s.meeting_id,
+                    COALESCE(m.title, '(untitled)'),
+                    s.idx,
+                    (
+                      SELECT COUNT(*) > :max_meetings
+                        FROM candidate_visible_hit_meetings
+                    )
+               FROM segment_hits h
+               JOIN visible_hit_meetings vm ON vm.id = h.meeting_id
+               JOIN segments s ON s.rowid = h.rid
+               JOIN meetings m ON m.id = s.meeting_id
+              ORDER BY vm.started_at DESC, s.meeting_id ASC, s.idx ASC
+              LIMIT :row_probe_limit"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                TranscriptSegmentHit {
+                    meeting_id: row.get(0)?,
+                    meeting_title: row.get(1)?,
+                    seg_idx: row.get(2)?,
+                },
+                row.get::<_, i64>(3)? != 0,
+            ))
+        };
+        let max_meetings = max_meetings.clamp(1, 20);
+        let meeting_probe_limit = max_meetings.saturating_add(1);
+        let max_segments = max_segments.clamp(1, 5_000);
+        let row_probe_limit = i64::try_from(max_segments.saturating_add(1)).unwrap_or(5_001);
+        let rows = match meeting_id {
+            Some(mid) => stmt
+                .query_map(
+                    rusqlite::named_params! {
+                        ":query": and_expr,
+                        ":meeting_id": mid,
+                        ":meeting_probe_limit": meeting_probe_limit,
+                        ":max_meetings": max_meetings,
+                        ":row_probe_limit": row_probe_limit,
+                    },
+                    map_row,
+                )
+                .map_err(map_err)?
+                .collect::<std::result::Result<Vec<_>, _>>(),
+            None => stmt
+                .query_map(
+                    rusqlite::named_params! {
+                        ":query": and_expr,
+                        ":meeting_probe_limit": meeting_probe_limit,
+                        ":max_meetings": max_meetings,
+                        ":row_probe_limit": row_probe_limit,
+                    },
+                    map_row,
+                )
+                .map_err(map_err)?
+                .collect::<std::result::Result<Vec<_>, _>>(),
+        };
+        let mut rows = rows.map_err(map_err)?;
+        let meeting_truncated = rows
+            .first()
+            .map(|(_, meeting_truncated)| *meeting_truncated)
+            .unwrap_or(false);
+        let raw_rows_truncated = rows.len() > max_segments;
+        rows.truncate(max_segments);
+        Ok((
+            rows.into_iter().map(|(hit, _)| hit).collect(),
+            meeting_truncated,
+            raw_rows_truncated,
+        ))
+    }
+
     /// Brain v2 L1.5 — [`Self::search_visible`] with an optional `started_at` window
     /// (`(from_iso, to_iso_exclusive)`, from `summarize::temporal`). TEMPORAL FALLBACK: when a
     /// window is present and the lexical FTS match finds nothing inside it (the common shape of a
@@ -6229,7 +6472,8 @@ impl Db {
                 if let Some(want) = owner_lc.as_deref() {
                     match item.owner.as_deref() {
                         Some(o)
-                            if crate::summarize::action_items::normalize_owner(o).to_lowercase()
+                            if crate::summarize::action_items::normalize_owner(o)
+                                .to_lowercase()
                                 == want => {}
                         _ => continue,
                     }
@@ -6633,6 +6877,58 @@ impl Db {
             });
         }
         Ok(out)
+    }
+
+    /// Visibility-gated speaker names for one meeting, without loading biometric embeddings.
+    ///
+    /// A voiceprint label is personal content. This query applies the same meeting gate as the full
+    /// voiceprint reader and returns only the latest non-empty label for each cluster. The MCP
+    /// transcript renderer never needs, reads, or serializes the CAM++ embedding blob.
+    pub fn list_visible_speaker_labels_for_meeting(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<VisibleSpeakerLabel>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT vp.cluster_index, vp.label
+               FROM speaker_voiceprints vp
+               JOIN meetings m ON m.id = vp.meeting_id
+              WHERE vp.meeting_id = ?1
+                AND TRIM(COALESCE(vp.label, '')) <> ''
+                AND NOT EXISTS (
+                      SELECT 1
+                        FROM speaker_voiceprints newer
+                       WHERE newer.meeting_id = vp.meeting_id
+                         AND newer.cluster_index = vp.cluster_index
+                         AND TRIM(COALESCE(newer.label, '')) <> ''
+                         AND (
+                              newer.created_at > vp.created_at
+                           OR (newer.created_at = vp.created_at AND newer.id > vp.id)
+                         )
+                    )
+                AND (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+              ORDER BY vp.cluster_index ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |row| {
+                Ok(VisibleSpeakerLabel {
+                    cluster_index: row.get(0)?,
+                    label: row.get(1)?,
+                })
+            })
+            .map_err(map_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_err)
     }
 
     /// ENROLL (Phase 2): bind a person `label` to the voiceprint of ONE diarized cluster of
@@ -7251,6 +7547,97 @@ pub(crate) fn fts_match_query(q: &str) -> Option<String> {
     )
 }
 
+/// Canonical content terms under the exact FTS tokenizer used by every production content index.
+///
+/// Rust splitting/lowercasing cannot model `unicode61 remove_diacritics 2`: distinct strings such
+/// as precomposed `résumé`, decomposed `re\u{301}sume\u{301}`, and `resume` are one FTS token and
+/// must never receive multiple fallback coverage votes. A connection-local TEMP FTS table tokenizes
+/// the ORIGINAL query, while `fts5vocab(..., 'instance')` exposes canonical tokens in occurrence
+/// order. Tokens that are not Unicode-alphanumeric or are too short are discarded; the survivors
+/// are stopword-filtered, first-seen deduplicated, and bounded before callers build MATCH SQL.
+pub(crate) fn fts_unicode61_content_terms(
+    conn: &Connection,
+    q: &str,
+    max_terms: usize,
+) -> Result<Vec<String>> {
+    if max_terms == 0 {
+        return Ok(Vec::new());
+    }
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.murmur_query_tokenizer USING fts5(
+             text,
+             tokenize = 'unicode61 remove_diacritics 2'
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS temp.murmur_query_vocab_instance USING fts5vocab(
+             murmur_query_tokenizer,
+             'instance'
+         );",
+    )
+    .map_err(map_err)?;
+
+    // Keep query text transaction-local. Any early error rolls the TEMP insert back on Drop; the
+    // successful path explicitly rolls back too, so no prior query survives for a later read.
+    let tx = conn.unchecked_transaction().map_err(map_err)?;
+    let result = (|| -> Result<Vec<String>> {
+        let mut canonical_terms = Vec::new();
+        let mut seen = HashSet::new();
+        tx.execute("DELETE FROM temp.murmur_query_tokenizer", [])
+            .map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO temp.murmur_query_tokenizer(text) VALUES (?1)",
+            rusqlite::params![q],
+        )
+        .map_err(map_err)?;
+
+        let mut stmt = tx
+            .prepare(
+                "SELECT term
+                   FROM temp.murmur_query_vocab_instance
+                  ORDER BY doc, offset",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_err)?;
+        for row in rows {
+            let canonical = row.map_err(map_err)?;
+            if canonical.chars().count() < 3
+                || !canonical.chars().all(|ch| ch.is_alphanumeric())
+                || crate::summarize::related_context::is_stopword(&canonical)
+            {
+                continue;
+            }
+            if seen.insert(canonical.clone()) {
+                canonical_terms.push(canonical);
+                if canonical_terms.len() == max_terms {
+                    break;
+                }
+            }
+        }
+        Ok(canonical_terms)
+    })();
+    tx.rollback().map_err(map_err)?;
+    result
+}
+
+fn fts_match_content_terms(terms: &[String], separator: &str) -> Option<String> {
+    if terms.is_empty() {
+        return None;
+    }
+    Some(
+        terms
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(separator),
+    )
+}
+
+/// Exact-token OR expression over an already-normalized content-term list.
+pub(crate) fn fts_match_content_terms_any(terms: &[String]) -> Option<String> {
+    fts_match_content_terms(terms, " OR ")
+}
+
 /// The OR-joined twin of [`fts_match_query`]: the same tokenize-and-quote defusal, but terms are
 /// joined with `OR` instead of implicit AND. Used for RELEVANCE filtering (Brain v2 L2.2), where the
 /// "query" is a whole natural-language question and a short fact row should match on ANY shared
@@ -7358,6 +7745,199 @@ fn excerpt(text: &str, q: &str) -> String {
         s.push('…');
     }
     s
+}
+
+#[cfg(test)]
+mod echo_provenance_regression_tests {
+    use super::*;
+
+    fn mem_db() -> Db {
+        register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
+        db.migrate().unwrap();
+        db
+    }
+
+    fn meeting(id: &str) -> Meeting {
+        Meeting {
+            id: id.to_string(),
+            started_at: "2026-07-29T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Echo provenance regression".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Transcribed,
+            folder_id: None,
+        }
+    }
+
+    fn stored(
+        idx: i64,
+        start_s: f64,
+        end_s: f64,
+        text: &str,
+        speaker: Option<&str>,
+        confidence: Option<f32>,
+        echo_suppressed: bool,
+    ) -> StoredTranscriptSegment {
+        StoredTranscriptSegment {
+            segment: Segment {
+                idx,
+                start_s,
+                end_s,
+                text: text.to_string(),
+                speaker: speaker.map(str::to_string),
+                confidence,
+            },
+            echo_suppressed,
+        }
+    }
+
+    fn canonical_stored(rows: &[StoredTranscriptSegment]) -> Vec<u8> {
+        serde_json::to_vec(rows).expect("stored transcript rows serialize")
+    }
+
+    #[test]
+    fn echo_provenance_round_trips_exact_sparse_rows_in_idx_order() {
+        let db = mem_db();
+        db.insert_meeting(&meeting("m-echo-roundtrip")).unwrap();
+        let rows = vec![
+            stored(
+                42,
+                90_001.125,
+                90_004.875,
+                "Zażółć gęślą jaźń 🫧",
+                None,
+                None,
+                true,
+            ),
+            stored(
+                3,
+                0.000_976_562_5,
+                1.234_567_890_125,
+                "先に届いた system row",
+                Some("remote-custom"),
+                Some(0.8125),
+                false,
+            ),
+            stored(
+                900,
+                123_456.789_062_5,
+                123_460.000_000_25,
+                "local sparse tail",
+                Some("me"),
+                Some(0.0),
+                false,
+            ),
+        ];
+        db.replace_segments_with_echo_provenance("m-echo-roundtrip", &rows)
+            .unwrap();
+
+        let actual = db
+            .get_segments_with_echo_provenance("m-echo-roundtrip")
+            .unwrap();
+        let expected = vec![rows[1].clone(), rows[0].clone(), rows[2].clone()];
+        assert_eq!(
+            canonical_stored(&actual),
+            canonical_stored(&expected),
+            "sparse ids, f64 timestamps, Unicode, nullable fields, ordering, and both provenance \
+             flags must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn echo_provenance_replace_rolls_back_delete_and_partial_insert_on_constraint_failure() {
+        let db = mem_db();
+        db.insert_meeting(&meeting("m-echo-rollback")).unwrap();
+        let before = vec![
+            stored(
+                7,
+                1.25,
+                2.5,
+                "original system",
+                Some("remote-custom"),
+                Some(0.75),
+                false,
+            ),
+            stored(19, 3.75, 5.5, "original marked mic", Some("me"), None, true),
+        ];
+        db.replace_segments_with_echo_provenance("m-echo-rollback", &before)
+            .unwrap();
+
+        let duplicate_idx = vec![
+            stored(
+                4,
+                10.0,
+                11.0,
+                "first fresh row",
+                Some("others"),
+                None,
+                false,
+            ),
+            stored(
+                4,
+                12.0,
+                13.0,
+                "duplicate primary key",
+                Some("me"),
+                None,
+                true,
+            ),
+        ];
+        assert!(
+            db.replace_segments_with_echo_provenance("m-echo-rollback", &duplicate_idx)
+                .is_err(),
+            "the second duplicate idx must fail after the transaction deleted and inserted once"
+        );
+
+        let after = db
+            .get_segments_with_echo_provenance("m-echo-rollback")
+            .unwrap();
+        assert_eq!(
+            canonical_stored(&after),
+            canonical_stored(&before),
+            "the failed replacement must roll back both DELETE and partial INSERT byte-exactly"
+        );
+    }
+
+    #[test]
+    fn system_search_uses_the_same_non_null_non_me_rule_as_rendering() {
+        let db = mem_db();
+        db.insert_meeting(&meeting("m-noncanonical-system"))
+            .unwrap();
+        db.replace_segments_with_echo_provenance(
+            "m-noncanonical-system",
+            &[stored(
+                8,
+                1.0,
+                2.0,
+                "noncanonical predicate sentinel",
+                Some("remote-custom"),
+                None,
+                false,
+            )],
+        )
+        .unwrap();
+
+        let (hits, meetings_truncated, rows_truncated) = db
+            .search_transcript_segments_visible(
+                "noncanonical predicate sentinel",
+                None,
+                crate::audio::merge::RenderChannel::System,
+                20,
+                100,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].meeting_id, "m-noncanonical-system");
+        assert_eq!(hits[0].seg_idx, 8);
+        assert!(!meetings_truncated && !rows_truncated);
+    }
 }
 
 #[cfg(test)]

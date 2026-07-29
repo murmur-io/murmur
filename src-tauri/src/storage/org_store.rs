@@ -25,8 +25,15 @@ use rusqlite::OptionalExtension;
 
 use crate::embed::Embedder;
 use crate::error::Result;
-use crate::storage::db::{fts_match_query, fts_match_query_any, map_err, Db};
+use crate::storage::db::{
+    fts_match_content_terms_any, fts_match_query, fts_unicode61_content_terms, map_err, Db,
+};
 use crate::storage::models::OrgChunkHit;
+
+/// Keep the fallback comfortably below SQLite's compound-SELECT and bind-parameter ceilings.
+/// Natural-language org queries should never approach this; taking the first bounded unique terms
+/// also prevents an untrusted query from making SQL preparation scale without bound.
+const MAX_ORG_FTS_CONTENT_TERMS: usize = 32;
 
 /// Chunk/vector material for one org item, prepared before entering the short feed-commit
 /// transaction. Keeping model inference on this side of the transaction is load-bearing: recording
@@ -1777,10 +1784,10 @@ impl Db {
             return Ok(Vec::new());
         }
         let q = query.trim();
+        let conn = self.lock();
         let Some(and_expr) = fts_match_query(q) else {
             return Ok(Vec::new()); // punctuation-only / empty query → no hits, never an FTS error.
         };
-        let conn = self.lock();
         // Over-fetch a bounded multiple of `limit` so per-item dedup has candidates, but keep the SQL
         // LIMIT as the hard bound (spike #2). 8× is generous for a per-item dedup at small `limit`.
         let sql_cap = limit.saturating_mul(8).clamp(limit, 512);
@@ -1813,13 +1820,83 @@ impl Db {
             }
             Ok(out)
         };
-        // S2 AND→OR fallback: implicit-AND matched nothing ⇒ retry with the content-word OR twin.
-        // Fires only on an empty AND result — never widens a successful query.
+        // Preserve the full pre-fallback strict query exactly. In particular, do not cap,
+        // deduplicate, or stopword-filter it: the bounded canonical list belongs only to the
+        // fallback and a row matching merely the first 32 terms must not satisfy a longer strict
+        // query. Only an empty strict result may activate the fallback.
         let mut rows_vec = run(&mut stmt, &and_expr)?;
         if rows_vec.is_empty() {
-            if let Some(any_expr) = fts_match_query_any(q) {
-                if any_expr != and_expr {
-                    rows_vec = run(&mut stmt, &any_expr)?;
+            let terms =
+                fts_unicode61_content_terms(&conn, q, MAX_ORG_FTS_CONTENT_TERMS)?;
+            let Some(any_expr) = fts_match_content_terms_any(&terms) else {
+                return Ok(Vec::new());
+            };
+            if any_expr != and_expr {
+                // Relevance floor: an OR candidate must match at least ceil(unique_terms / 2)
+                // EXACT FTS tokens in one chunk. Each UNION branch is one unique query term and
+                // returns a rowid only when unicode61 MATCH sees that whole token (`Kong` therefore
+                // does not match `Kongo`). GROUP/HAVING qualifies coverage before BM25 ORDER/LIMIT;
+                // Rust never inspects snippets or performs substring matching.
+                let branches = terms
+                    .iter()
+                    .map(|_| {
+                        "SELECT rowid AS chunk_rowid
+                           FROM fts_org_chunks
+                          WHERE fts_org_chunks MATCH ?"
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL ");
+                let threshold = i64::try_from(terms.len().div_ceil(2)).map_err(|_| {
+                    crate::error::AppError::InvalidArg(
+                        "org search query has too many unique content terms".to_string(),
+                    )
+                })?;
+                let fallback_sql = format!(
+                    "WITH matched_terms(chunk_rowid) AS ({branches}),
+                          qualified_chunks(chunk_rowid) AS (
+                              SELECT chunk_rowid
+                                FROM matched_terms
+                               GROUP BY chunk_rowid
+                              HAVING COUNT(*) >= ?
+                          )
+                     SELECT oi.item_id, oi.author_hint, oi.title, oc.text, oi.content_sha256,
+                            bm25(fts_org_chunks) AS rank
+                       FROM fts_org_chunks
+                       JOIN qualified_chunks qc ON qc.chunk_rowid = fts_org_chunks.rowid
+                       JOIN org_chunks oc ON oc.id = fts_org_chunks.rowid
+                       JOIN org_items oi ON oi.item_id = oc.item_id
+                       JOIN org_state os ON os.org_id = oi.org_id
+                      WHERE fts_org_chunks MATCH ?
+                        AND oi.tombstoned = 0
+                        AND os.context_enabled = 1
+                      ORDER BY rank ASC, oi.item_id ASC
+                      LIMIT ?"
+                );
+                let mut params: Vec<rusqlite::types::Value> = terms
+                    .iter()
+                    // `terms` contains only Unicode alphanumerics, but quote each one to pin exact
+                    // FTS-token semantics and keep it inert as MATCH syntax.
+                    .map(|term| rusqlite::types::Value::Text(format!("\"{term}\"")))
+                    .collect();
+                params.push(rusqlite::types::Value::Integer(threshold));
+                params.push(rusqlite::types::Value::Text(any_expr));
+                params.push(rusqlite::types::Value::Integer(sql_cap));
+
+                let mut fallback_stmt = conn.prepare(&fallback_sql).map_err(map_err)?;
+                let fallback_rows = fallback_stmt
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        Ok(OrgChunkHit {
+                            item_id: row.get(0)?,
+                            author_hint: row.get(1)?,
+                            title: row.get(2)?,
+                            snippet: row.get(3)?,
+                            content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                        })
+                    })
+                    .map_err(map_err)?;
+                rows_vec.clear();
+                for row in fallback_rows {
+                    rows_vec.push(row.map_err(map_err)?);
                 }
             }
         }

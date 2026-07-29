@@ -98,9 +98,54 @@ def _standalone_driver(
     name: str = ".murmur-agent-driver",
     canonical_origin: bool = True,
     detached: bool = True,
+    with_server_dependency: bool = False,
 ) -> tuple[Path, Path, str]:
     primary = root / "meetnotes"
     base = _init_repo(primary)
+    if with_server_dependency:
+        server = root / "murmur-server"
+        _init_repo(server)
+        protocol = server / "crates" / "murmur-protocol"
+        (protocol / "src").mkdir(parents=True)
+        (protocol / "Cargo.toml").write_text(
+            "[package]\n"
+            'name = "murmur-protocol"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            "\n[lib]\n"
+            'path = "src/lib.rs"\n',
+            encoding="utf-8",
+        )
+        (protocol / "src" / "lib.rs").write_text(
+            "pub fn pinned() {}\n",
+            encoding="utf-8",
+        )
+        _git(server, "add", "crates/murmur-protocol")
+        _git(server, "commit", "-q", "-m", "add protocol crate")
+        server_revision = _git(server, "rev-parse", "HEAD")
+
+        (primary / "src-tauri").mkdir()
+        (primary / "src-tauri" / "Cargo.toml").write_text(
+            "[package]\n"
+            'name = "murmur-open-selftest"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            "\n[dependencies]\n"
+            'murmur-protocol = { path = "../../murmur-server/crates/murmur-protocol" }\n',
+            encoding="utf-8",
+        )
+        (primary / ".murmur-server-revision").write_text(
+            f"{server_revision}\n",
+            encoding="utf-8",
+        )
+        _git(
+            primary,
+            "add",
+            "src-tauri/Cargo.toml",
+            ".murmur-server-revision",
+        )
+        _git(primary, "commit", "-q", "-m", "pin server dependency")
+        base = _git(primary, "rev-parse", "HEAD")
     driver = root / name
     _git(
         primary,
@@ -131,6 +176,20 @@ def _invoke_open(driver: Path, args: argparse.Namespace) -> int:
             return harness_cli.cmd_open(args)
     finally:
         os.chdir(previous)
+
+
+def _invoke_open_json(
+    driver: Path, args: argparse.Namespace
+) -> tuple[int, Mapping[str, Any]]:
+    previous = Path.cwd()
+    output = io.StringIO()
+    try:
+        os.chdir(driver)
+        with contextlib.redirect_stdout(output):
+            result = harness_cli.cmd_open(args)
+    finally:
+        os.chdir(previous)
+    return result, json.loads(output.getvalue())
 
 
 def _git_tree_digest(git_dir: Path) -> str:
@@ -325,7 +384,7 @@ def standalone_driver_open_cases(test: Tests) -> None:
 
         task_id = "standalone-isolation"
         branch = f"agent/v2/{task_id}"
-        opened = _invoke_open(
+        opened, open_result = _invoke_open_json(
             driver,
             _open_args(task_id, base, branch),
         )
@@ -361,6 +420,14 @@ def standalone_driver_open_cases(test: Tests) -> None:
             metadata_valid = False
 
         test.equal("OPEN standalone driver succeeds offline", opened, 0)
+        test.equal(
+            "OPEN no-server response preserves its existing shape",
+            (
+                open_result["server_worktree"],
+                "server_checkout_mode" in open_result,
+            ),
+            (None, False),
+        )
         test.equal(
             "OPEN creates task branch only in driver common",
             harness_cli._local_branch_oid(driver, branch),
@@ -455,6 +522,143 @@ def standalone_driver_open_cases(test: Tests) -> None:
             "OPEN binds an explicit same-vendor high-risk exception",
             exception_contract["allow_same_vendor_high_risk"],
             True,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-driver-server-open-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(
+            root,
+            with_server_dependency=True,
+        )
+        source = root / "murmur-server"
+        source_git_before = _git_tree_digest(source / ".git")
+        task_id = "standalone-server-dependency"
+        result, opened = _invoke_open_json(
+            driver,
+            _open_args(task_id, base, f"agent/v2/{task_id}"),
+        )
+        task_dir = harness_cli.v2_task_dir(
+            (driver / ".git").resolve(), task_id
+        )
+        runtime = legacy.load_json(task_dir / "runtime.json")
+        server_worktree = (
+            root
+            / ".murmur-agent-tasks"
+            / "v2"
+            / task_id
+            / "murmur-server"
+        )
+        revision = (
+            root
+            / ".murmur-agent-tasks"
+            / "v2"
+            / task_id
+            / "meetnotes"
+            / ".murmur-server-revision"
+        ).read_text(encoding="utf-8").strip()
+
+        test.equal(
+            "OPEN provisions a pinned server dependency immediately",
+            result,
+            0,
+        )
+        test.equal(
+            "OPEN prints the provisioned server checkout and mode",
+            (
+                opened["server_worktree"],
+                opened["server_checkout_mode"],
+            ),
+            (
+                str(server_worktree.resolve()),
+                "local-shared-clone",
+            ),
+        )
+        test.equal(
+            "OPEN runtime records the local shared clone",
+            (
+                runtime["server_worktree"],
+                runtime["server_revision"],
+                runtime["server_checkout_mode"],
+            ),
+            (
+                str(server_worktree.resolve()),
+                revision,
+                "local-shared-clone",
+            ),
+        )
+        test.equal(
+            "OPEN checks out the exact pinned server revision",
+            _git(server_worktree, "rev-parse", "HEAD"),
+            revision,
+        )
+        test.equal(
+            "OPEN server clone keeps Git metadata inside the task root",
+            Path(
+                _git(
+                    server_worktree,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+            ).resolve(),
+            (server_worktree / ".git").resolve(),
+        )
+        test.equal(
+            "OPEN server provisioning does not mutate sibling Git metadata",
+            _git_tree_digest(source / ".git"),
+            source_git_before,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="murmur-v2-driver-server-rollback-"
+    ) as raw:
+        root = Path(raw)
+        _primary, driver, base = _standalone_driver(
+            root,
+            with_server_dependency=True,
+        )
+        source = root / "murmur-server"
+        source_git_before = _git_tree_digest(source / ".git")
+        task_id = "standalone-server-rollback"
+        branch = f"agent/v2/{task_id}"
+        task_root = root / ".murmur-agent-tasks" / "v2" / task_id
+        original_set_v2_state = harness_cli.set_v2_state
+
+        def fail_after_server_provision(
+            task_dir: Path, status: str, **updates: Any
+        ) -> Dict[str, Any]:
+            del task_dir, status, updates
+            raise legacy.HarnessError(
+                "forced failure after server provisioning"
+            )
+
+        harness_cli.set_v2_state = fail_after_server_provision
+        try:
+            test.raises(
+                "OPEN reports a failure after server provisioning",
+                lambda: _invoke_open(
+                    driver,
+                    _open_args(task_id, base, branch),
+                ),
+                "forced failure after server provisioning",
+            )
+        finally:
+            harness_cli.set_v2_state = original_set_v2_state
+        test.true(
+            "OPEN rollback removes the provisioned server task root",
+            not task_root.exists(),
+        )
+        test.equal(
+            "OPEN rollback removes its unchanged client branch",
+            harness_cli._local_branch_oid(driver, branch),
+            None,
+        )
+        test.equal(
+            "OPEN rollback leaves sibling Git metadata unchanged",
+            _git_tree_digest(source / ".git"),
+            source_git_before,
         )
 
     with tempfile.TemporaryDirectory(prefix="murmur-v2-driver-linked-") as raw:
@@ -1463,6 +1667,449 @@ def verdict_cases(test: Tests) -> None:
     )
 
 
+def focused_review_evidence_cases(test: Tests) -> None:
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-focused-evidence-") as raw:
+        task_dir = Path(raw)
+        logs = task_dir / "logs"
+        logs.mkdir()
+        padding = "x" * (verifier.DEFAULT_REVIEW_STREAM_BYTES + 128)
+        lock_lines = [
+            "test tools::tests::org_read_requires_member ... ok",
+            "test storage::tests::context_disabled_hides_org_item ... ok",
+            "test storage::tests::tombstone_removes_org_item ... ok",
+            "test mcp::tests::revocation_stops_locked_tail ... ok",
+        ]
+        egress_lines = [
+            "test summarize::tests::remote_ollama_requires_consent ... ok",
+            "test summarize::tests::egress_ledger_is_content_free ... ok",
+        ]
+        nonmatching = "test unrelated::tests::middle_secret_sentinel ... ok"
+        stdout = logs / "rust.stdout.log"
+        stdout.write_text(
+            "HEAD\n"
+            + padding
+            + "\n"
+            + nonmatching
+            + "\n"
+            + "\n".join(lock_lines + egress_lines)
+            + "\n"
+            + padding
+            + "\nTAIL\n",
+            encoding="utf-8",
+        )
+        stderr = logs / "rust.stderr.log"
+        stderr.write_text("", encoding="utf-8")
+
+        def item_for(path: Path) -> Dict[str, Any]:
+            return {
+                "id": "rust-lib",
+                "command": "cargo test --lib",
+                "evidence": {
+                    "passed": True,
+                    "outcome": "PASS",
+                    "exit_code": 0,
+                    "duration_ms": 1,
+                    "resource_wait_ms": 0,
+                    "log_sha256": "0" * 64,
+                    "stdout_path": str(path),
+                    "stdout_sha256": legacy.sha256_file(path),
+                    "stderr_path": str(stderr),
+                    "stderr_sha256": legacy.sha256_file(stderr),
+                },
+            }
+
+        item = item_for(stdout)
+        lock_summary = verifier._review_evidence_summary(
+            item,
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )
+        lock_inventory = lock_summary["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE surfaces security tests from truncated middle",
+            all(line in lock_inventory["excerpt"] for line in lock_lines)
+            and all(line not in lock_summary["stdout"]["excerpt"] for line in lock_lines),
+        )
+        test.true(
+            "FOCUSED EVIDENCE omits nonmatching middle output",
+            nonmatching not in lock_inventory["excerpt"]
+            and nonmatching not in lock_summary["stdout"]["excerpt"],
+        )
+        egress_inventory = verifier._review_evidence_summary(
+            item,
+            task_dir,
+            channel="reviewer-probe",
+            review_kind="egress-security",
+        )["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE is specialist-specific",
+            all(line in egress_inventory["excerpt"] for line in egress_lines)
+            and lock_lines[0] not in egress_inventory["excerpt"],
+        )
+
+        many = logs / "many.stdout.log"
+        many.write_text(
+            "".join(
+                f"test org::tests::case_{index:04d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM + 20
+                )
+            ),
+            encoding="utf-8",
+        )
+        bounded = verifier._review_evidence_summary(
+            item_for(many),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        test.equal(
+            "FOCUSED EVIDENCE bounds each term deterministically",
+            (
+                bounded["included_lines"],
+                bounded["matching_lines_total"],
+                bounded["truncated"],
+            ),
+            (
+                verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM,
+                verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM + 20,
+                True,
+            ),
+        )
+
+        overlapping = logs / "overlapping.stdout.log"
+        overlapping.write_text(
+            "".join(
+                f"test org::tests::org_only_{index:04d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+                )
+            )
+            + "".join(
+                f"test org::member::tests::overlap_{index:04d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM + 4
+                )
+            ),
+            encoding="utf-8",
+        )
+        overlapping_inventory = verifier._review_evidence_summary(
+            item_for(overlapping),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE overlapping terms retain independent hard caps",
+            overlapping_inventory["per_term_included"]["org"]
+            == verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+            and overlapping_inventory["per_term_included"]["member"]
+            == verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+            and all(
+                count <= verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+                for count in overlapping_inventory["per_term_included"].values()
+            ),
+        )
+
+        byte_pressure = logs / "byte-pressure.stdout.log"
+        long_name = "z" * 4_000
+        byte_pressure.write_text(
+            "".join(
+                f"test org::tests::{long_name}_{index:02d} ... ok\n"
+                for index in range(
+                    verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+                )
+            ),
+            encoding="utf-8",
+        )
+        first_byte_summary = verifier._review_evidence_summary(
+            item_for(byte_pressure),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        second_byte_summary = verifier._review_evidence_summary(
+            item_for(byte_pressure),
+            task_dir,
+            channel="planned-check",
+            review_kind="lock-security",
+        )["stdout"]["focused_test_inventory"]
+        test.true(
+            "FOCUSED EVIDENCE byte pressure is bounded complete and deterministic",
+            first_byte_summary["matching_lines_total"]
+            == verifier.SPECIALIST_TEST_FOCUS_LINES_PER_TERM
+            and first_byte_summary["included_lines"]
+            < first_byte_summary["matching_lines_total"]
+            and first_byte_summary["included_bytes"]
+            <= verifier.SPECIALIST_TEST_FOCUS_BYTES
+            and first_byte_summary["truncated"]
+            and first_byte_summary == second_byte_summary,
+        )
+
+        corrupt_item = item_for(stdout)
+        corrupt_item["evidence"]["stdout_sha256"] = "f" * 64
+        test.raises(
+            "FOCUSED EVIDENCE remains bound to raw artifact hash",
+            lambda: verifier._review_evidence_summary(
+                corrupt_item,
+                task_dir,
+                channel="planned-check",
+                review_kind="lock-security",
+            ),
+            "hash changed",
+        )
+
+
+def specialist_source_context_cases(test: Tests) -> None:
+    base_sha = _git(ROOT, "rev-parse", "HEAD")
+    plan: Dict[str, Any] = {
+        "base_sha": base_sha,
+        "changed_paths": [],
+        "claims": [],
+        "actual_risk_flags": ["egress"],
+        "checks": [],
+        "diff_sha256": "1" * 64,
+        "plan_sha256": "2" * 64,
+        "protocol_sha256": "3" * 64,
+        "server_required": False,
+    }
+    context = verifier.specialist_source_context(
+        ROOT, plan, "egress-security"
+    )
+    included = context["entries"][0]
+    excerpt = included["excerpt"]
+    source_blob = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{base_sha}:src-tauri/src/summarize/mod.rs",
+        ],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout
+    excerpt_bytes = excerpt.encode("utf-8")
+    test.true(
+        "SOURCE CONTEXT exposes the complete canonical egress factory seam",
+        included["status"] == "included"
+        and not included["truncated"]
+        and "egress_is_cloud(id, config)" in excerpt
+        and "PROVIDER_CLAUDE_CODE" in excerpt
+        and "PROVIDER_ANTHROPIC" in excerpt
+        and "PROVIDER_OLLAMA" in excerpt
+        and "PROVIDER_GATEWAY" in excerpt
+        and "RedactingProvider::with_name_redactor_sink_and_model_admission"
+        in excerpt
+        and "active_sink()" in excerpt
+        and excerpt.rstrip().endswith("}")
+        and "Provider instances for the Settings UI" not in excerpt
+        and "pub fn all_providers" not in excerpt,
+    )
+    test.equal(
+        "SOURCE CONTEXT binds exact file selected and included byte counts",
+        (
+            included["file_bytes"],
+            included["file_sha256"],
+            included["selected_bytes"],
+            included["selected_sha256"],
+            included["included_bytes"],
+            included["excerpt_sha256"],
+        ),
+        (
+            len(source_blob),
+            hashlib.sha256(source_blob).hexdigest(),
+            len(excerpt_bytes),
+            hashlib.sha256(excerpt_bytes).hexdigest(),
+            len(excerpt_bytes),
+            hashlib.sha256(excerpt_bytes).hexdigest(),
+        ),
+    )
+    changed_plan = copy.deepcopy(plan)
+    changed_plan["changed_paths"] = [
+        "src-tauri/src/summarize/mod.rs"
+    ]
+    excluded = verifier.specialist_source_context(
+        ROOT, changed_plan, "egress-security"
+    )["entries"][0]
+    test.equal(
+        "SOURCE CONTEXT excludes a changed seam instead of showing stale base",
+        (excluded["status"], "excerpt" in excluded),
+        ("excluded_changed_path", False),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-source-context-") as raw:
+        repo = Path(raw) / "repo"
+        _init_repo(repo)
+        source = repo / "src-tauri" / "src" / "summarize" / "mod.rs"
+        source.parent.mkdir(parents=True)
+        lexical_fixture = (
+            "fn make_provider_resolved() {\n"
+            '    let normal = "escaped quote: \\" braces } {";\n'
+            '    let bytes = b\"} {\";\n'
+            '    let raw = r###\"} { /* not a comment */\"###;\n'
+            "    let character = '}';\n"
+            "    let byte_character = b'{';\n"
+            "    // } line-comment brace\n"
+            "    /* { outer /* } nested */ still outer } */\n"
+            "    if true { let nested = || { 1 }; nested(); }\n"
+            "}\n"
+            "pub fn following_item() {}\n"
+        )
+        source.write_text(lexical_fixture, encoding="utf-8")
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "lexical seam")
+        lexical_plan = {
+            **plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        lexical = verifier.specialist_source_context(
+            repo, lexical_plan, "egress-security"
+        )["entries"][0]
+        test.true(
+            "SOURCE CONTEXT Rust scanner stops at the balanced function brace",
+            lexical["status"] == "included"
+            and lexical["excerpt"].rstrip().endswith("nested(); }\n}")
+            and "following_item" not in lexical["excerpt"],
+        )
+
+        oversized_body = (
+            '"\\\\🙂\t'
+            * (verifier.SPECIALIST_SOURCE_CONTEXT_BYTES // 2)
+        )
+        source.write_text(
+            "fn make_provider_resolved() {\n"
+            "    let consent = true;\n"
+            f"    // {oversized_body}\n"
+            "    active_sink();\n"
+            "}",
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "oversized seam")
+        oversized_sha = _git(repo, "rev-parse", "HEAD")
+        synthetic_plan = {
+            **plan,
+            "base_sha": oversized_sha,
+        }
+        first = verifier.specialist_source_context(
+            repo, synthetic_plan, "egress-security"
+        )
+        second = verifier.specialist_source_context(
+            repo, synthetic_plan, "egress-security"
+        )
+        bounded = first["entries"][0]
+        test.true(
+            "SOURCE CONTEXT full serialized section is bounded and deterministic",
+            bounded["truncated"]
+            and len(
+                verifier.specialist_source_context_section(first).encode(
+                    "utf-8"
+                )
+            )
+            <= verifier.SPECIALIST_SOURCE_CONTEXT_BYTES
+            and first == second
+            and "\ufffd" not in bounded["excerpt"],
+        )
+
+        contract = {
+            "task_id": "source-context-selftest",
+            "description": "bind unchanged trust seam source",
+        }
+        first_prompt = verifier.combined_review_prompt(
+            contract,
+            synthetic_plan,
+            b"",
+            [],
+            "egress-security",
+            repo,
+            repo,
+            policy_text="policy",
+        )
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "let consent = true", "let consent = false"
+            ),
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "change seam")
+        changed_sha = _git(repo, "rev-parse", "HEAD")
+        changed_source_plan = {
+            **synthetic_plan,
+            "base_sha": changed_sha,
+        }
+        second_prompt = verifier.combined_review_prompt(
+            contract,
+            changed_source_plan,
+            b"",
+            [],
+            "egress-security",
+            repo,
+            repo,
+            policy_text="policy",
+        )
+        test.true(
+            "SOURCE CONTEXT bytes change the bound review prompt",
+            hashlib.sha256(first_prompt.encode("utf-8")).hexdigest()
+            != hashlib.sha256(second_prompt.encode("utf-8")).hexdigest(),
+        )
+
+        source.write_text(
+            "fn unrelated() {}\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "remove anchor")
+        missing_plan = {
+            **synthetic_plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        missing = verifier.specialist_source_context(
+            repo, missing_plan, "egress-security"
+        )["entries"][0]
+        test.equal(
+            "SOURCE CONTEXT reports a missing anchor without invented evidence",
+            (missing["status"], "excerpt" in missing),
+            ("start_anchor_missing", False),
+        )
+
+        source.write_text("fn make_provider_resolved();\n", encoding="utf-8")
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "remove opening brace")
+        missing_open_plan = {
+            **synthetic_plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        missing_open = verifier.specialist_source_context(
+            repo, missing_open_plan, "egress-security"
+        )["entries"][0]
+        test.equal(
+            "SOURCE CONTEXT reports a missing opening brace without proof",
+            (missing_open["status"], "excerpt" in missing_open),
+            ("opening_brace_missing", False),
+        )
+
+        source.write_text(
+            'fn make_provider_resolved() { let decoy = "}";\n',
+            encoding="utf-8",
+        )
+        _git(repo, "add", source.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "remove closing brace")
+        missing_close_plan = {
+            **synthetic_plan,
+            "base_sha": _git(repo, "rev-parse", "HEAD"),
+        }
+        missing_close = verifier.specialist_source_context(
+            repo, missing_close_plan, "egress-security"
+        )["entries"][0]
+        test.equal(
+            "SOURCE CONTEXT reports a missing closing brace without partial proof",
+            (missing_close["status"], "excerpt" in missing_close),
+            ("closing_brace_missing", False),
+        )
+
+
 def probe_precedence_flow_cases(test: Tests) -> None:
     """Pin review-defect precedence through the real v2 verify transition."""
 
@@ -1710,6 +2357,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         forged_ng_build,
                         task_dir,
                         channel="planned-check",
+                        review_kind="combined",
                     )["source"],
                     "PLANNED_NG_BUILD_STREAM" in forged_channel_prompt,
                 ),
@@ -3731,6 +4379,23 @@ def standalone_driver_lane_cases(test: Tests) -> None:
                 "LANE independent-clone wait is visible",
                 "waiting for lane" in blocked.stderr,
             )
+            test.true(
+                "LANE visible wait reports FIFO position and enqueue time",
+                "queue_position=1/1" in blocked.stderr
+                and "queued_since=" in blocked.stderr,
+            )
+            test.equal(
+                "LANE timed-out waiter removes its FIFO ticket",
+                list(
+                    (
+                        driver_root
+                        / legacy.resource_lane.QUEUE_DIRECTORY
+                    ).glob(
+                        f"*{legacy.resource_lane.TICKET_SUFFIX}"
+                    )
+                ),
+                [],
+            )
         finally:
             release_marker.write_text("release\n", encoding="utf-8")
             if holder.poll() is None:
@@ -3751,6 +4416,268 @@ def standalone_driver_lane_cases(test: Tests) -> None:
             released.returncode,
             0,
         )
+
+
+def fifo_lane_cases(test: Tests) -> None:
+    """Mixed lane clients must enter in ticket order and reap dead waiters."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-fifo-lane-") as raw:
+        root = Path(raw)
+        repo = root / "meetnotes"
+        _init_repo(repo)
+        common = Path(
+            _git(
+                repo,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_dirs: Dict[str, Path] = {}
+        for label in ("holder", "older", "newer"):
+            task_dir = (
+                common / "agent-harness" / "v2" / "tasks" / label
+            )
+            task_dir.mkdir(parents=True)
+            task_dirs[label] = task_dir
+        resource_root = legacy.shared_resource_root_for_task(
+            task_dirs["holder"]
+        )
+        queue_root = (
+            resource_root / legacy.resource_lane.QUEUE_DIRECTORY
+        )
+        runner = ROOT / "scripts" / "agent-resource-run"
+        library = str(Path(__file__).resolve().parent)
+
+        holder_code = (
+            "import pathlib,sys,time;"
+            f"sys.path.insert(0,{library!r});"
+            "import task_runner;"
+            "lease=task_runner.acquire_cargo_lane("
+            "pathlib.Path(sys.argv[1]),5,command='fifo-holder');"
+            "print('ready',flush=True);"
+            "marker=pathlib.Path(sys.argv[2]);deadline=time.monotonic()+10;"
+            "\nwhile not marker.exists() and time.monotonic()<deadline:"
+            "\n time.sleep(0.01)"
+            "\ntask_runner.release_cargo_lane(lease)"
+        )
+        task_waiter_code = (
+            "import os,pathlib,sys,time;"
+            f"sys.path.insert(0,{library!r});"
+            "import task_runner;"
+            "lease=task_runner.acquire_cargo_lane("
+            "pathlib.Path(sys.argv[1]),5,command='fifo-'+sys.argv[3]);"
+            "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600);"
+            "os.write(fd,(sys.argv[3]+'\\n').encode());os.close(fd);"
+            "time.sleep(0.05);task_runner.release_cargo_lane(lease)"
+        )
+        append_code = (
+            "import os,sys,time;"
+            "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600);"
+            "os.write(fd,(sys.argv[2]+'\\n').encode());os.close(fd);"
+            "time.sleep(0.05)"
+        )
+
+        def queue_depth() -> int:
+            if not queue_root.is_dir():
+                return 0
+            return len(
+                list(
+                    queue_root.glob(
+                        f"*{legacy.resource_lane.TICKET_SUFFIX}"
+                    )
+                )
+            )
+
+        def wait_for_depth(expected: int) -> bool:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if queue_depth() == expected:
+                    return True
+                time.sleep(0.01)
+            return queue_depth() == expected
+
+        def resource_waiter(order: Path, label: str) -> subprocess.Popen[str]:
+            environment = os.environ.copy()
+            environment["MURMUR_HARNESS_TASK"] = f"fifo-{label}"
+            return subprocess.Popen(
+                [
+                    str(runner),
+                    "--deadline-seconds",
+                    "5",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    append_code,
+                    str(order),
+                    label,
+                ],
+                cwd=str(repo),
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        def task_waiter(order: Path, label: str) -> subprocess.Popen[str]:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    task_waiter_code,
+                    str(task_dirs[label]),
+                    str(order),
+                    label,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        def run_order_case(
+            name: str,
+            older_factory: Any,
+            newer_factory: Any,
+        ) -> None:
+            marker = root / f"release-{name}"
+            order = root / f"order-{name}"
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    holder_code,
+                    str(task_dirs["holder"]),
+                    str(marker),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            older: Optional[subprocess.Popen[str]] = None
+            newer: Optional[subprocess.Popen[str]] = None
+            try:
+                ready = (
+                    holder.stdout.readline().strip()
+                    if holder.stdout
+                    else ""
+                )
+                older = older_factory(order, "older")
+                older_joined = wait_for_depth(1)
+                newer = newer_factory(order, "newer")
+                newer_joined = wait_for_depth(2)
+                marker.write_text("release\n", encoding="utf-8")
+                older_result = older.wait(timeout=5)
+                newer_result = newer.wait(timeout=5)
+                holder_result = holder.wait(timeout=5)
+                test.equal(f"FIFO {name} holder acquired", ready, "ready")
+                test.true(f"FIFO {name} older ticket is visible", older_joined)
+                test.true(f"FIFO {name} newer ticket is visible", newer_joined)
+                test.equal(f"FIFO {name} older exits green", older_result, 0)
+                test.equal(f"FIFO {name} newer exits green", newer_result, 0)
+                test.equal(f"FIFO {name} holder exits green", holder_result, 0)
+                test.equal(
+                    f"FIFO {name} preserves admission order",
+                    order.read_text(encoding="utf-8").splitlines(),
+                    ["older", "newer"],
+                )
+            finally:
+                marker.write_text("release\n", encoding="utf-8")
+                for process in (newer, older, holder):
+                    if process is not None and process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=3)
+
+        run_order_case(
+            "resource-before-harness",
+            resource_waiter,
+            task_waiter,
+        )
+        run_order_case(
+            "harness-before-resource",
+            task_waiter,
+            resource_waiter,
+        )
+
+        marker = root / "release-stale-holder"
+        stale_order = root / "order-stale"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                holder_code,
+                str(task_dirs["holder"]),
+                str(marker),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stale_code = (
+            "import pathlib,sys,time;"
+            f"sys.path.insert(0,{library!r});"
+            "import task_runner;"
+            "root=task_runner.shared_resource_root_for_task("
+            "pathlib.Path(sys.argv[1]));"
+            "ticket=task_runner.resource_lane.join_lane_queue("
+            "root,task='stale',command='killed-waiter');"
+            "print('queued',flush=True);"
+            "\nwhile True:\n time.sleep(1)"
+        )
+        stale: Optional[subprocess.Popen[str]] = None
+        survivor: Optional[subprocess.Popen[str]] = None
+        try:
+            holder_ready = (
+                holder.stdout.readline().strip() if holder.stdout else ""
+            )
+            stale = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    stale_code,
+                    str(task_dirs["older"]),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stale_ready = (
+                stale.stdout.readline().strip() if stale.stdout else ""
+            )
+            survivor = resource_waiter(stale_order, "newer")
+            survivor_joined = wait_for_depth(2)
+            stale.kill()
+            stale.wait(timeout=3)
+            marker.write_text("release\n", encoding="utf-8")
+            survivor_result = survivor.wait(timeout=5)
+            holder_result = holder.wait(timeout=5)
+            test.equal("FIFO stale holder acquired", holder_ready, "ready")
+            test.equal("FIFO stale waiter armed", stale_ready, "queued")
+            test.true(
+                "FIFO live waiter queues behind stale candidate",
+                survivor_joined,
+            )
+            test.equal(
+                "FIFO SIGKILL stale waiter does not block successor",
+                survivor_result,
+                0,
+            )
+            test.equal("FIFO stale holder exits green", holder_result, 0)
+            test.equal(
+                "FIFO successor runs exactly once after stale reap",
+                stale_order.read_text(encoding="utf-8").splitlines(),
+                ["newer"],
+            )
+            test.equal(
+                "FIFO stale ticket is removed",
+                queue_depth(),
+                0,
+            )
+        finally:
+            marker.write_text("release\n", encoding="utf-8")
+            for process in (survivor, stale, holder):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=3)
 
 
 def sherpa_workspace_cache_cases(test: Tests) -> None:
@@ -5517,6 +6444,27 @@ def clean_cases(test: Tests) -> None:
                 "server_revision": None,
             },
         )
+        checks_root = task_dir / "runtime" / "checks"
+        for name in ("cargo-target", "cargo-home", "npm-cache"):
+            disposable = checks_root / name
+            disposable.mkdir(parents=True)
+            (disposable / "cache.bin").write_bytes(b"private cache\n")
+        profile = checks_root / "profiles" / "check.sb"
+        profile.parent.mkdir(parents=True)
+        profile.write_text("(version 1)\n", encoding="utf-8")
+        evidence = task_dir / "attempts" / "evidence.json"
+        evidence.parent.mkdir()
+        evidence.write_text('{"passed":true}\n', encoding="utf-8")
+        shared_cache = (
+            root
+            / ".murmur-agent-tasks"
+            / ".resources"
+            / "target"
+            / "sherpa-onnx-prebuilt"
+            / "archive.tar.bz2"
+        )
+        shared_cache.parent.mkdir(parents=True)
+        shared_cache.write_bytes(b"shared pinned archive\n")
         harness_cli.set_v2_state(task_dir, "OPEN", phase="open")
         previous = Path.cwd()
         try:
@@ -5541,6 +6489,382 @@ def clean_cases(test: Tests) -> None:
             _git(repo, "show", f"{archive_ref}:untracked.txt"),
             "dirty untracked",
         )
+        test.equal(
+            "CLEAN records first-pass disposable runtime removal",
+            state["runtime_removed"],
+            ["cargo-home", "cargo-target", "npm-cache"],
+        )
+        test.true(
+            "CLEAN removes task-private Cargo and npm caches",
+            all(
+                not (checks_root / name).exists()
+                for name in ("cargo-target", "cargo-home", "npm-cache")
+            ),
+        )
+        test.true(
+            "CLEAN preserves attested sandbox profiles",
+            profile.is_file(),
+        )
+        test.true("CLEAN preserves task evidence", evidence.is_file())
+        test.equal(
+            "CLEAN preserves workspace shared pinned cache",
+            shared_cache.read_bytes(),
+            b"shared pinned archive\n",
+        )
+
+        late_cache = checks_root / "cargo-target"
+        late_cache.mkdir()
+        (late_cache / "late.bin").write_bytes(b"late\n")
+        previous = Path.cwd()
+        try:
+            os.chdir(repo)
+            with contextlib.redirect_stdout(io.StringIO()):
+                harness_cli.cmd_clean(
+                    argparse.Namespace(
+                        task_id="clean-selftest",
+                        abandon=False,
+                    )
+                )
+        finally:
+            os.chdir(previous)
+        test.true(
+            "CLEAN terminal retry prunes late private runtime",
+            not late_cache.exists(),
+        )
+        test.true(
+            "CLEAN terminal retry still preserves profiles and evidence",
+            profile.is_file() and evidence.is_file(),
+        )
+        test.true(
+            "CLEAN terminal retry preserves shared pinned cache",
+            shared_cache.is_file(),
+        )
+
+
+def lock_review_scope_prompt_cases(test: Tests) -> None:
+    prompt = (
+        ROOT / ".agents" / "harness" / "prompts" / "lock-security-reviewer.md"
+    ).read_text(encoding="utf-8")
+    begin = "<!-- LOCK_REVIEW_POLICY_V1_BEGIN -->"
+    end = "<!-- LOCK_REVIEW_POLICY_V1_END -->"
+    test.equal("LOCK REVIEW policy has one start marker", prompt.count(begin), 1)
+    test.equal("LOCK REVIEW policy has one end marker", prompt.count(end), 1)
+
+    policy_text = prompt.split(begin, 1)[1].split(end, 1)[0]
+    policy: Dict[str, Dict[str, Any]] = {}
+    for raw_line in policy_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        columns = line.split("|")
+        if len(columns) != 4:
+            raise AssertionError(f"invalid lock review policy row: {line}")
+        property_id = columns[0]
+        if property_id in policy:
+            raise AssertionError(f"duplicate lock review policy row: {property_id}")
+        fields: Dict[str, str] = {}
+        for column in columns[1:]:
+            key, separator, value = column.partition("=")
+            if not separator or not key or not value or key in fields:
+                raise AssertionError(f"invalid lock review policy field: {column}")
+            fields[key] = value
+        if set(fields) != {"applies", "requires", "missing"}:
+            raise AssertionError(f"incomplete lock review policy row: {line}")
+        policy[property_id] = {
+            "applies": fields["applies"],
+            "requires": tuple(fields["requires"].split(",")),
+            "missing": fields["missing"],
+        }
+
+    expected_policy = {
+        "LOCKED_READ": {
+            "applies": "new_or_changed_folder_lock_read_or_export",
+            "requires": (
+                "session_unlock_gate",
+                "negative_non_disclosure_each_changed_sink",
+            ),
+            "missing": "BLOCKED",
+        },
+        "CHANGED_SEAL": {
+            "applies": (
+                "new_or_changed_seal_encryption_or_destructive_"
+                "plaintext_replacement_semantics"
+            ),
+            "requires": (
+                "verify_before_destroy_failure",
+                "byte_identical_round_trip",
+            ),
+            "missing": "BLOCKED",
+        },
+        "UNCHANGED_SEAL": {
+            "applies": (
+                "no_changed_seal_encryption_or_destructive_"
+                "plaintext_replacement_semantics"
+            ),
+            "requires": ("justified_na",),
+            "missing": "BLOCKED",
+        },
+        "ORG_READ": {
+            "applies": "new_or_changed_org_shared_brain_read_or_sink",
+            "requires": (
+                "local_membership",
+                "member_gated_import_or_authorized_disclosure",
+                "context_enabled",
+                "tombstones",
+                "result_bounds",
+                "changed_sink_non_disclosure",
+            ),
+            "missing": "BLOCKED",
+        },
+    }
+    test.equal("LOCK REVIEW parsed policy is exact", policy, expected_policy)
+
+    legacy_unconditional_clauses = (
+        "A PASS requires evidence that every new content read/export",
+        "every seal is verify-before-destroy",
+        "Missing negative-path or byte-identity evidence means BLOCKED",
+    )
+    test.equal(
+        "LOCK REVIEW rejects legacy unconditional requirements",
+        [clause for clause in legacy_unconditional_clauses if clause in prompt],
+        [],
+    )
+    test.true(
+        "LOCK REVIEW distinguishes outbound org consent from read authorization",
+        "`org_egress_consented` is an outbound publish gate" in prompt
+        and "not a receiver-side read gate" in prompt
+        and "separate per-read consent requirement" in prompt,
+    )
+    test.true(
+        "LOCK REVIEW policy has no obsolete receiver consent requirement",
+        "consent" not in policy["ORG_READ"]["requires"],
+    )
+
+    def evaluate(property_id: str, evidence: Sequence[str]) -> str:
+        row = policy[property_id]
+        missing = set(row["requires"]) - set(evidence)
+        return row["missing"] if missing else "EVIDENCE_COMPLETE"
+
+    changed_sink_requirement = "negative_non_disclosure_each_changed_sink"
+
+    def evaluate_locked(
+        changed_sinks: Sequence[str],
+        proved_sinks: Sequence[str],
+        *,
+        has_unlock_gate: bool = True,
+    ) -> str:
+        evidence = ["session_unlock_gate"] if has_unlock_gate else []
+        if set(changed_sinks).issubset(set(proved_sinks)):
+            evidence.append(changed_sink_requirement)
+        return evaluate("LOCKED_READ", evidence)
+
+    possible_sinks = ("ui", "mcp", "tool", "assets", "exports", "logs")
+    test.equal(
+        "LOCK REVIEW accepts complete affected locked-read evidence",
+        evaluate_locked(["mcp", "tool"], ["mcp", "tool"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "LOCK REVIEW does not demand unrelated locked-read sinks",
+        evaluate_locked(["mcp"], ["mcp"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "LOCK REVIEW blocks locked-read missing session unlock gate",
+        evaluate_locked(["mcp"], ["mcp"], has_unlock_gate=False),
+        "BLOCKED",
+    )
+    for sink in possible_sinks:
+        test.equal(
+            f"LOCK REVIEW blocks affected locked-read sink {sink} without proof",
+            evaluate_locked([sink], []),
+            "BLOCKED",
+        )
+        test.equal(
+            f"LOCK REVIEW accepts affected locked-read sink {sink} with proof",
+            evaluate_locked([sink], [sink]),
+            "EVIDENCE_COMPLETE",
+        )
+
+    changed_seal_evidence = expected_policy["CHANGED_SEAL"]["requires"]
+    test.equal(
+        "LOCK REVIEW accepts complete changed-seal evidence",
+        evaluate("CHANGED_SEAL", changed_seal_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in changed_seal_evidence:
+        test.equal(
+            f"LOCK REVIEW blocks changed seal missing {required}",
+            evaluate(
+                "CHANGED_SEAL",
+                [item for item in changed_seal_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    test.equal(
+        "LOCK REVIEW accepts justified unchanged-seal N-A",
+        evaluate("UNCHANGED_SEAL", ["justified_na"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "LOCK REVIEW blocks unjustified unchanged-seal N-A",
+        evaluate("UNCHANGED_SEAL", []),
+        "BLOCKED",
+    )
+
+    org_evidence = expected_policy["ORG_READ"]["requires"]
+    test.equal(
+        "LOCK REVIEW accepts complete org visibility evidence",
+        evaluate("ORG_READ", org_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in org_evidence:
+        test.equal(
+            f"LOCK REVIEW blocks org read missing {required}",
+            evaluate("ORG_READ", [item for item in org_evidence if item != required]),
+            "BLOCKED",
+        )
+    test.true(
+        "LOCK REVIEW wrapper around unchanged seal remains N-A",
+        "same seal call does not by itself change seal" in prompt
+        and "destructive plaintext-replacement semantics" in prompt
+        and "brief call-chain justification" in prompt,
+    )
+
+
+def egress_review_scope_prompt_cases(test: Tests) -> None:
+    prompt = (
+        ROOT / ".agents" / "harness" / "prompts" / "egress-security-reviewer.md"
+    ).read_text(encoding="utf-8")
+    begin = "<!-- EGRESS_REVIEW_POLICY_V1_BEGIN -->"
+    end = "<!-- EGRESS_REVIEW_POLICY_V1_END -->"
+    test.equal("EGRESS REVIEW policy has one start marker", prompt.count(begin), 1)
+    test.equal("EGRESS REVIEW policy has one end marker", prompt.count(end), 1)
+
+    policy_text = prompt.split(begin, 1)[1].split(end, 1)[0]
+    policy: Dict[str, Dict[str, Any]] = {}
+    for raw_line in policy_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        columns = line.split("|")
+        if len(columns) != 4:
+            raise AssertionError(f"invalid egress review policy row: {line}")
+        property_id = columns[0]
+        if property_id in policy:
+            raise AssertionError(f"duplicate egress review policy row: {property_id}")
+        fields: Dict[str, str] = {}
+        for column in columns[1:]:
+            key, separator, value = column.partition("=")
+            if not separator or not key or not value or key in fields:
+                raise AssertionError(f"invalid egress review policy field: {column}")
+            fields[key] = value
+        if set(fields) != {"applies", "requires", "missing"}:
+            raise AssertionError(f"incomplete egress review policy row: {line}")
+        policy[property_id] = {
+            "applies": fields["applies"],
+            "requires": tuple(fields["requires"].split(",")),
+            "missing": fields["missing"],
+        }
+
+    expected_policy = {
+        "CLOUD_EGRESS": {
+            "applies": (
+                "new_or_changed_payload_leaves_device_or_loopback_for_remote_service"
+            ),
+            "requires": (
+                "explicit_consent",
+                "redaction_if_applicable",
+                "egress_ledger",
+                "fail_closed_provider_classification",
+                "no_raw_client_bypass",
+            ),
+            "missing": "BLOCKED",
+        },
+        "LOCAL_LOOPBACK": {
+            "applies": "new_or_changed_local_service_exclusively_bound_to_loopback",
+            "requires": (
+                "loopback_only_bind",
+                "no_remote_or_ambient_network_path",
+                "changed_sink_authorization",
+            ),
+            "missing": "BLOCKED",
+        },
+        "NO_EGRESS": {
+            "applies": "no_new_or_changed_network_or_provider_path",
+            "requires": ("justified_na",),
+            "missing": "BLOCKED",
+        },
+    }
+    test.equal("EGRESS REVIEW parsed policy is exact", policy, expected_policy)
+
+    legacy_unconditional = (
+        "A PASS requires that every new outbound payload goes through explicit consent"
+    )
+    test.true(
+        "EGRESS REVIEW rejects legacy unconditional cloud requirement",
+        legacy_unconditional not in prompt,
+    )
+
+    def evaluate(property_id: str, evidence: Sequence[str]) -> str:
+        row = policy[property_id]
+        missing = set(row["requires"]) - set(evidence)
+        return row["missing"] if missing else "EVIDENCE_COMPLETE"
+
+    cloud_evidence = expected_policy["CLOUD_EGRESS"]["requires"]
+    test.equal(
+        "EGRESS REVIEW accepts complete cloud evidence",
+        evaluate("CLOUD_EGRESS", cloud_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    for required in cloud_evidence:
+        test.equal(
+            f"EGRESS REVIEW blocks cloud path missing {required}",
+            evaluate(
+                "CLOUD_EGRESS",
+                [item for item in cloud_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    loopback_evidence = expected_policy["LOCAL_LOOPBACK"]["requires"]
+    test.equal(
+        "EGRESS REVIEW accepts bounded local loopback without cloud controls",
+        evaluate("LOCAL_LOOPBACK", loopback_evidence),
+        "EVIDENCE_COMPLETE",
+    )
+    test.true(
+        "EGRESS REVIEW loopback policy excludes cloud-only controls",
+        set(loopback_evidence).isdisjoint(
+            {"explicit_consent", "redaction_if_applicable", "egress_ledger"}
+        ),
+    )
+    for required in loopback_evidence:
+        test.equal(
+            f"EGRESS REVIEW blocks loopback path missing {required}",
+            evaluate(
+                "LOCAL_LOOPBACK",
+                [item for item in loopback_evidence if item != required],
+            ),
+            "BLOCKED",
+        )
+
+    test.equal(
+        "EGRESS REVIEW accepts justified no-egress N-A",
+        evaluate("NO_EGRESS", ["justified_na"]),
+        "EVIDENCE_COMPLETE",
+    )
+    test.equal(
+        "EGRESS REVIEW blocks unjustified no-egress N-A",
+        evaluate("NO_EGRESS", []),
+        "BLOCKED",
+    )
+    test.true(
+        "EGRESS REVIEW prose pins loopback distinction",
+        "`LOCAL_LOOPBACK` is a local disclosure boundary, not cloud egress" in prompt
+        and "does not require cloud consent, redaction, or an egress-ledger row" in prompt,
+    )
 
 
 def main() -> int:
@@ -5551,11 +6875,14 @@ def main() -> int:
     npm_lock_evidence_cases(test)
     reviewer_tool_guard_cases(test)
     verdict_cases(test)
+    focused_review_evidence_cases(test)
+    specialist_source_context_cases(test)
     retry_cases(test)
     guardian_and_artifact_cases(test)
     readonly_review_wall_timeout_cases(test)
     state_and_lock_cases(test)
     standalone_driver_lane_cases(test)
+    fifo_lane_cases(test)
     sherpa_workspace_cache_cases(test)
     verification_snapshot_cases(test)
     snapshot_node_modules_manifest_cases(test)
@@ -5565,6 +6892,8 @@ def main() -> int:
     import_cases(test)
     plan_and_probe_cases(test)
     clean_cases(test)
+    lock_review_scope_prompt_cases(test)
+    egress_review_scope_prompt_cases(test)
     probe_precedence_flow_cases(test)
     if test.failures:
         print("v2 selftest: FAIL")

@@ -15,12 +15,17 @@ use crate::error::{AppError, Result};
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
 use crate::state::AppState;
-use crate::storage::models::{MeetingStatus, NoteRecord};
+use crate::storage::models::{MeetingStatus, NoteRecord, StoredTranscriptSegment};
 use crate::summarize::provider::{MeetingMeta, SummarizeRequest};
 use crate::summarize::roles::Role;
 use crate::summarize::{provider_for, template};
 use crate::transcribe::{self, Transcriber};
 use crate::{audio, export};
+
+type AsrDiarizeOutput = (
+    crate::audio::merge::EchoClassifiedSegments,
+    Vec<crate::transcribe::diarize::ClusterVoiceprint>,
+);
 
 pub struct PipelineResult {
     pub note_markdown: String,
@@ -1739,18 +1744,15 @@ async fn run_inner(
     // `with_stage_watchdog` for why the timeout does NOT kill the underlying blocking compute.
     let asr_watchdog = asr_watchdog_bound(duration_s);
     let asr_diarize_started = std::time::Instant::now();
-    let (merged_segments, echo_suppressed, cluster_voiceprints) = with_stage_watchdog(
+    let (classified_transcript, cluster_voiceprints) =
+        with_stage_watchdog(
         asr_watchdog,
         "asr_diarize",
         crate::perf::run_heavy_maybe_recording(
             &state.heavy_inference,
             None,
             crate::perf::ResidentModelKind::Whisper,
-            move || -> Result<(
-                Vec<crate::transcribe::types::Segment>,
-                usize,
-                Vec<crate::transcribe::diarize::ClusterVoiceprint>,
-            )> {
+            move || -> Result<AsrDiarizeOutput> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
         let transcriber = Transcriber::load(&model_path_owned)?;
@@ -1842,11 +1844,12 @@ async fn run_inner(
 
         // Anchor each stream's segments to its capture-start host instant → absolute timeline,
         // merge sorted by absolute start, drop empty (e.g. muted-mic) segments, label "me"/"others" —
-        // then drop mic-echo copies of others' speech (speakers → mic bleed; leak-gated). `leak` is
-        // Copy, captured by this move closure.
-        let (merged, echo_suppressed) =
-            crate::audio::merge::suppress_cross_stream_echo(merge_streams(streams), leak.as_ref());
-                Ok((merged, echo_suppressed, cluster_voiceprints))
+        // classify mic-echo copies of others' speech (speakers → mic bleed; leak-gated). Every raw
+        // capture row remains in storage with explicit provenance; only the merged presentation and
+        // summarizer projection omit a measured echo copy. `leak` is Copy, captured by this closure.
+        let classified =
+            crate::audio::merge::classify_cross_stream_echo(merge_streams(streams), leak.as_ref());
+                Ok((classified, cluster_voiceprints))
             },
         ),
     )
@@ -1889,16 +1892,20 @@ async fn run_inner(
     }
 
     if has_system {
-        tracing::info!(target: "transcribe", segments = merged_segments.len(), "merged mic + system streams (me/others)");
+        tracing::info!(target: "transcribe", segments = classified_transcript.merged.len(), "merged mic + system streams (me/others)");
     }
 
     // ATOMIC replace (delete + insert in one tx), not a keyed `INSERT OR REPLACE`: a fresh meeting
     // is byte-identical (nothing to delete), but a RE-RUN of the pipeline over the same meeting
     // (`retry_transcription` / disk salvage after a partial prior run) must not leave a stale
     // higher-idx tail from the previous transcript interleaved into the new one.
-    state.db.replace_segments(meeting_id, &merged_segments)?;
+    // This seam also builds the summarizer feed from the classifier's CLEANED projection. Keeping
+    // persistence and feed construction together prevents a future refactor from feeding the raw
+    // stored rows (including a leak-qualified mic echo) to the summarizer.
+    let (feed, echo_suppressed) =
+        persist_classified_transcript(&state.db, meeting_id, classified_transcript)?;
     if echo_suppressed > 0 {
-        tracing::info!(target: "transcribe", suppressed = echo_suppressed, "cross-stream echo segments removed");
+        tracing::info!(target: "transcribe", suppressed = echo_suppressed, "cross-stream echo segments marked and hidden from merged transcript");
         let _ = app.emit(
             crate::events::EVENT_ECHO_SUPPRESSED,
             crate::events::EchoSuppressedPayload {
@@ -1919,7 +1926,6 @@ async fn run_inner(
     // text`, the exact shape the timeline already consumes) when the meeting has ≥2 distinct speakers
     // — so the note can attribute owners/decisions — and stays byte-identical flat text for the
     // default solo-`me` meeting. `retrieval_text` is always the flat join (RAG query unchanged).
-    let feed = build_transcript_feed(&merged_segments);
 
     if feed.summary_text.trim().is_empty() {
         return Err(AppError::Transcribe(
@@ -2092,6 +2098,37 @@ pub(crate) fn build_transcript_feed(
         labeled,
         diarized_others,
     }
+}
+
+/// Persist the classifier's raw capture rows with explicit echo provenance, then build the
+/// summarizer feed only from its cleaned merged projection.
+///
+/// This is the production seam between leak classification, canonical storage, and model input.
+/// Keeping the two projections in one typed value makes it impossible for the caller to persist
+/// only the cleaned rows or accidentally summarize the raw echo-bearing rows.
+fn persist_classified_transcript(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    classified: crate::audio::merge::EchoClassifiedSegments,
+) -> Result<(TranscriptFeed, usize)> {
+    let crate::audio::merge::EchoClassifiedSegments {
+        stored,
+        merged,
+        suppressed_indices,
+    } = classified;
+    let echo_suppressed = suppressed_indices.len();
+    let suppressed_indices = suppressed_indices
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let stored = stored
+        .into_iter()
+        .map(|segment| StoredTranscriptSegment {
+            echo_suppressed: suppressed_indices.contains(&segment.idx),
+            segment,
+        })
+        .collect::<Vec<_>>();
+    db.replace_segments_with_echo_provenance(meeting_id, &stored)?;
+    Ok((build_transcript_feed(&merged), echo_suppressed))
 }
 
 /// Resolve the summarize step's (config, NOTES provider) from the LIVE state — the egress
@@ -2310,6 +2347,10 @@ async fn summarize_and_export(
             None
         },
         live_bullets: live_bullets.clone(),
+        // Deterministic, bounded prompt-only projection of the user-authored workspace glossary.
+        // `None` for absent/blank keeps the pre-feature prompt byte-identical. Cloud dispatch still
+        // goes through this request's one existing RedactingProvider seam.
+        glossary: template::render_glossary_for_prompt(&config.glossary),
     };
 
     let (generated, call_meta) = provider.summarize_with_meta(&request).await?;
@@ -3909,6 +3950,58 @@ mod tests {
         }
     }
 
+    /// The real post-ASR seam must keep the two projections distinct: leak-qualified echo remains
+    /// available in canonical raw storage with provenance, while the exact feed handed to the
+    /// summarizer contains only the cleaned merged projection.
+    #[test]
+    fn classified_echo_persists_both_raw_rows_but_builds_cleaned_summary_feed() {
+        let db_path = temp_db_path("classified-echo-seam");
+        let db = crate::storage::Db::open_with_key(&db_path, TEST_DEK).unwrap();
+        db.insert_meeting(&guard_test_meeting("m-classified-echo"))
+            .unwrap();
+        let phrase = "the contract is now signed by both parties";
+        let classified = crate::audio::merge::classify_cross_stream_echo(
+            vec![
+                seg(11, 5.0, 7.0, Some("others"), phrase),
+                seg(29, 5.4, 7.3, Some("me"), phrase),
+            ],
+            Some(&crate::audio::align::EchoLeak {
+                offset_s: 0.4,
+                correlation: 0.9,
+            }),
+        );
+        assert_eq!(
+            classified.suppressed_indices,
+            vec![29],
+            "measured leak evidence marks only the mic echo"
+        );
+
+        let (feed, suppressed) =
+            persist_classified_transcript(&db, "m-classified-echo", classified).unwrap();
+        assert_eq!(suppressed, 1);
+
+        let stored = db
+            .get_segments_with_echo_provenance("m-classified-echo")
+            .unwrap();
+        assert_eq!(stored.len(), 2, "both raw capture rows remain canonical");
+        assert_eq!(stored[0].segment.idx, 11);
+        assert_eq!(stored[0].segment.speaker.as_deref(), Some("others"));
+        assert!(!stored[0].echo_suppressed);
+        assert_eq!(stored[1].segment.idx, 29);
+        assert_eq!(stored[1].segment.speaker.as_deref(), Some("me"));
+        assert!(stored[1].echo_suppressed);
+
+        assert_eq!(
+            feed.summary_text, phrase,
+            "the production summarizer input contains only the cleaned system copy"
+        );
+        assert_eq!(feed.retrieval_text, phrase);
+        assert_eq!(feed.summary_text.matches(phrase).count(), 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
+
     /// The default mono-`me` meeting (one distinct label, incl. `None`→`me`): NOT labeled;
     /// `summary_text` == `retrieval_text` == the exact legacy flat join. Guards no-regression on the
     /// artifact 100% of users read. RED on any change that tags a single-speaker meeting.
@@ -3962,8 +4055,20 @@ mod tests {
     fn feed_diarized_others_tracks_lane_shape_not_speaker_count() {
         // Collapsed: mic + one merged remote lane — the shape that produced the bad note.
         let collapsed = build_transcript_feed(&[
-            seg(0, 0.0, 2.0, Some("me"), "so what do we do about the migration"),
-            seg(1, 2.0, 6.0, Some("others"), "Anna, can you take the walkthrough"),
+            seg(
+                0,
+                0.0,
+                2.0,
+                Some("me"),
+                "so what do we do about the migration",
+            ),
+            seg(
+                1,
+                2.0,
+                6.0,
+                Some("others"),
+                "Anna, can you take the walkthrough",
+            ),
             seg(2, 6.0, 9.0, Some("others"), "sure, I'll do it"),
         ]);
         assert!(collapsed.labeled, "still labeled — 2 distinct tags");
@@ -3974,7 +4079,13 @@ mod tests {
 
         // Diarized: the remote side really was split per-voice.
         let diarized = build_transcript_feed(&[
-            seg(0, 0.0, 2.0, Some("me"), "so what do we do about the migration"),
+            seg(
+                0,
+                0.0,
+                2.0,
+                Some("me"),
+                "so what do we do about the migration",
+            ),
             seg(1, 2.0, 6.0, Some("others-0"), "I'll take the walkthrough"),
             seg(2, 6.0, 9.0, Some("others-1"), "I'd rather we wait"),
         ]);

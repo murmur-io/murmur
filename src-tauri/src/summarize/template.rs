@@ -45,7 +45,11 @@ pub fn validate_note_template(name: &str, tone: &str, t: &NoteTemplate) -> Resul
     // … and fields that never do (any `{{` is refused).
     let plain_fields: [&str; 2] = [name, tone];
 
-    for f in plain_fields.iter().copied().chain(dsl_fields.iter().copied()) {
+    for f in plain_fields
+        .iter()
+        .copied()
+        .chain(dsl_fields.iter().copied())
+    {
         for tok in FORBIDDEN_TEMPLATE_TOKENS {
             if f.contains(tok) {
                 return Err(AppError::InvalidArg(format!(
@@ -282,7 +286,12 @@ fn style_variant_with_keys(tone: &str, body_sections: &str, extra_keys: &[String
     let extra = extra_keys
         .iter()
         .filter(|k| !k.contains("{{"))
-        .map(|k| format!("- {}: (fill in from the meeting, or omit if unknown)\n", k.trim()))
+        .map(|k| {
+            format!(
+                "- {}: (fill in from the meeting, or omit if unknown)\n",
+                k.trim()
+            )
+        })
         .collect::<String>();
     format!(
         r#"You are a meticulous meeting-notes writer for an Obsidian vault.
@@ -351,7 +360,9 @@ pub fn language_name(note_language: &str) -> Option<String> {
 /// front-matter KEYS stay English so Obsidian keeps parsing them.
 pub fn language_directive(note_language: &str) -> String {
     let target = match language_name(note_language) {
-        None => "the SAME language as the meeting transcript below (match the speakers)".to_string(),
+        None => {
+            "the SAME language as the meeting transcript below (match the speakers)".to_string()
+        }
         Some(name) => name,
     };
     format!(
@@ -464,6 +475,111 @@ tags do not support."
 /// the true OOM backstop).
 const LOCAL_NOTE_MAX_CHARS: usize = 40_000;
 
+/// Workspace-glossary limits. The raw Settings value may be arbitrarily large, but the provider
+/// prompt and the local alias map are both derived from this one bounded representation.
+pub(crate) const GLOSSARY_MAX_ENTRIES: usize = 64;
+pub(crate) const GLOSSARY_MAX_ALIASES_PER_ENTRY: usize = 8;
+pub(crate) const GLOSSARY_MAX_TERM_CHARS: usize = 80;
+pub(crate) const GLOSSARY_MAX_RENDERED_BYTES: usize = 4_096;
+const GLOSSARY_TRUNCATION_MARKER: &str = "- [additional glossary entries or aliases omitted]\n";
+
+/// One parsed line of the workspace glossary. The canonical form is what generated graph entities
+/// are rewritten to; aliases are match-only and never become a separate store.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct GlossaryEntry {
+    pub(crate) canonical: String,
+    pub(crate) aliases: Vec<String>,
+}
+
+/// The single bounded representation shared by the note prompt and local graph canonicalization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BoundedGlossary {
+    pub(crate) entries: Vec<GlossaryEntry>,
+    pub(crate) rendered: String,
+    pub(crate) truncated: bool,
+}
+
+fn clean_glossary_term(raw: &str) -> Option<String> {
+    let term = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if term.is_empty()
+        || term.chars().count() > GLOSSARY_MAX_TERM_CHARS
+        || term.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(term)
+}
+
+/// Parse `Canonical` / `Canonical = alias, alias` lines into a deterministic bounded structure.
+///
+/// Input order is preserved. Once either the entry count or rendered-byte budget is exhausted, the
+/// remaining input is ignored and a fixed marker is appended. The marker budget is reserved up
+/// front, so `rendered.len()` can never exceed [`GLOSSARY_MAX_RENDERED_BYTES`].
+pub(crate) fn bounded_glossary(raw: &str) -> BoundedGlossary {
+    let content_budget =
+        GLOSSARY_MAX_RENDERED_BYTES.saturating_sub(GLOSSARY_TRUNCATION_MARKER.len());
+    let mut bounded = BoundedGlossary::default();
+
+    for raw_line in raw.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (canonical_raw, aliases_raw) = line.split_once('=').unwrap_or((line, ""));
+        let Some(canonical) = clean_glossary_term(canonical_raw) else {
+            continue;
+        };
+
+        let mut aliases = Vec::new();
+        for raw_alias in aliases_raw.split(',') {
+            let Some(alias) = clean_glossary_term(raw_alias) else {
+                continue;
+            };
+            if alias == canonical || aliases.iter().any(|seen| seen == &alias) {
+                continue;
+            }
+            if aliases.len() == GLOSSARY_MAX_ALIASES_PER_ENTRY {
+                bounded.truncated = true;
+                break;
+            }
+            aliases.push(alias);
+        }
+
+        if bounded.entries.len() == GLOSSARY_MAX_ENTRIES {
+            bounded.truncated = true;
+            break;
+        }
+        let entry = GlossaryEntry { canonical, aliases };
+        // JSON escaping keeps user-authored punctuation data, never prompt structure. Struct field
+        // order is fixed, so identical Settings bytes produce identical provider bytes.
+        let rendered_line = format!(
+            "- {}\n",
+            serde_json::to_string(&entry).expect("glossary strings always serialize")
+        );
+        if bounded.rendered.len() + rendered_line.len() > content_budget {
+            bounded.truncated = true;
+            break;
+        }
+        bounded.rendered.push_str(&rendered_line);
+        bounded.entries.push(entry);
+    }
+
+    if bounded.truncated {
+        bounded.rendered.push_str(GLOSSARY_TRUNCATION_MARKER);
+    }
+    bounded
+}
+
+/// Render the bounded glossary carried on [`SummarizeRequest`]. `None` is load-bearing: the
+/// no-glossary note prompt stays byte-identical to the pre-feature prompt.
+///
+/// Public so the deterministic no-egress core example can exercise the exact production renderer
+/// instead of maintaining a second fixture-only parser.
+pub fn render_glossary_for_prompt(raw: &str) -> Option<String> {
+    let bounded = bounded_glossary(raw);
+    (!bounded.entries.is_empty()).then_some(bounded.rendered)
+}
+
 pub fn render_prompt(req: &SummarizeRequest) -> String {
     // `render_prompt` serves ONLY the on-device combined-prompt providers (local mistralrs +
     // Ollama); cloud providers (Anthropic, Claude Code) render via `render_user_content` directly.
@@ -507,6 +623,16 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
     ));
     if let Some(lang) = &req.meta.language {
         out.push_str(&format!("- language: {lang}\n"));
+    }
+
+    if let Some(glossary) = req.glossary.as_deref().filter(|g| !g.is_empty()) {
+        out.push_str(
+            "\nWORKSPACE GLOSSARY (canonical spellings; use only when the transcript clearly \
+             refers to a listed alias)\n\
+             Prefer each `canonical` spelling over its listed aliases. Do not invent a glossary \
+             match and do not use this section as evidence that a person or project attended.\n",
+        );
+        out.push_str(glossary);
     }
 
     out.push_str("\nEXISTING NOTE TITLES (valid [[wikilink]] targets — link only these):\n");
@@ -697,13 +823,8 @@ pub fn is_known_template_var(ident: &str) -> bool {
 
 /// The front-matter keys Murmur OWNS: it renders each one deterministically, so a model-emitted line
 /// for the same key is dropped during the merge rather than duplicated.
-const OWNED_FRONT_MATTER_KEYS: [&str; 5] = [
-    "title",
-    "date",
-    "duration_minutes",
-    "tags",
-    "participants",
-];
+const OWNED_FRONT_MATTER_KEYS: [&str; 5] =
+    ["title", "date", "duration_minutes", "tags", "participants"];
 
 /// Bound on how many items a list variable renders (a runaway entity list must not turn the
 /// front-matter block into the note) and on how many model-emitted lines survive the merge.
@@ -1146,7 +1267,10 @@ pub fn assemble_note_with_template(
     let mut lines = deterministic_front_matter_lines(template, vars);
     let owned: std::collections::HashSet<String> = lines
         .iter()
-        .filter_map(|l| l.split_once(':').map(|(k, _)| k.trim().to_ascii_lowercase()))
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(k, _)| k.trim().to_ascii_lowercase())
+        })
         .collect();
     lines.extend(preserved_front_matter_lines(&model_yaml, &owned));
 
@@ -1205,7 +1329,9 @@ fn preserved_front_matter_lines(
                 if c == "---" {
                     break;
                 }
-                let Some(item) = c.strip_prefix('-') else { break };
+                let Some(item) = c.strip_prefix('-') else {
+                    break;
+                };
                 // Unwrap the model's own quoting so the re-emitted flow list quotes ONCE.
                 items.push(
                     item.trim()
@@ -1275,6 +1401,7 @@ mod tests {
             related_context: related,
             user_notes: None,
             live_bullets: None,
+            glossary: None,
         }
     }
 
@@ -1290,6 +1417,98 @@ mod tests {
         // Reconstruct the exact expected string to pin byte-identity.
         let expected = "MEETING METADATA\n- date: 2026-06-28\n- duration_minutes: 30\n- language: en\n\nEXISTING NOTE TITLES (valid [[wikilink]] targets — link only these):\n- Roadmap\n\nTRANSCRIPT\nWe shipped v2 and agreed Anna owns the rollout.\n";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn empty_glossary_keeps_user_prompt_byte_identical() {
+        let base = render_user_content(&req(None));
+        for raw in ["", "   \n\t", "# comment only"] {
+            let mut with_empty = req(None);
+            with_empty.glossary = render_glossary_for_prompt(raw);
+            assert_eq!(
+                render_user_content(&with_empty),
+                base,
+                "empty/comment-only glossary must not add even a blank section"
+            );
+        }
+    }
+
+    #[test]
+    fn glossary_renderer_is_structured_and_deterministically_bounded() {
+        let mut raw = "Konnect = Connect, Kinect, Connect\n".to_string();
+        for i in 0..100 {
+            raw.push_str(&format!("Canonical {i} = Alias {i}\n"));
+        }
+        let bounded = bounded_glossary(&raw);
+
+        assert!(
+            bounded.truncated,
+            "more than 64 valid entries must truncate"
+        );
+        assert_eq!(bounded.entries.len(), GLOSSARY_MAX_ENTRIES);
+        assert!(
+            bounded.rendered.len() <= GLOSSARY_MAX_RENDERED_BYTES,
+            "rendered prompt field must stay within its explicit byte budget"
+        );
+        assert!(bounded
+            .rendered
+            .starts_with("- {\"canonical\":\"Konnect\",\"aliases\":[\"Connect\",\"Kinect\"]}\n"));
+        assert!(
+            bounded.rendered.ends_with(GLOSSARY_TRUNCATION_MARKER),
+            "truncation must be explicit to the provider"
+        );
+        assert_eq!(
+            bounded.entries[0].aliases,
+            vec!["Connect", "Kinect"],
+            "duplicate aliases are removed without changing order"
+        );
+
+        let rerendered = bounded_glossary(&raw);
+        assert_eq!(
+            bounded, rerendered,
+            "same input must produce identical bytes"
+        );
+    }
+
+    #[test]
+    fn glossary_renderer_enforces_alias_and_utf8_byte_budgets() {
+        let aliases = (0..20)
+            .map(|i| format!("Alias {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let alias_bounded = bounded_glossary(&format!("Canonical = {aliases}"));
+        assert_eq!(
+            alias_bounded.entries[0].aliases.len(),
+            GLOSSARY_MAX_ALIASES_PER_ENTRY
+        );
+        assert!(alias_bounded.truncated);
+        assert!(alias_bounded.rendered.ends_with(GLOSSARY_TRUNCATION_MARKER));
+
+        let multibyte_term = "Ż".repeat(GLOSSARY_MAX_TERM_CHARS - 2);
+        let raw = (0..40)
+            .map(|i| format!("{multibyte_term}{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let byte_bounded = bounded_glossary(&raw);
+        assert!(byte_bounded.truncated);
+        assert!(
+            byte_bounded.rendered.len() <= GLOSSARY_MAX_RENDERED_BYTES,
+            "the byte budget must hold even when terms contain multi-byte Unicode"
+        );
+        assert!(byte_bounded.rendered.ends_with(GLOSSARY_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn rendered_glossary_precedes_titles_and_transcript() {
+        let mut request = req(None);
+        request.glossary =
+            render_glossary_for_prompt("Konnect = Connect, Kinect\nFastMCP = Fast MCP");
+        let out = render_user_content(&request);
+        let glossary = out.find("WORKSPACE GLOSSARY").unwrap();
+        let titles = out.find("EXISTING NOTE TITLES").unwrap();
+        let transcript = out.find("\nTRANSCRIPT\n").unwrap();
+        assert!(glossary < titles && titles < transcript);
+        assert!(out.contains("- {\"canonical\":\"Konnect\",\"aliases\":[\"Connect\",\"Kinect\"]}"));
     }
 
     /// mem-2 (P0.2): the ON-DEVICE note prompt (`render_prompt`, used only by local mistralrs +
@@ -1498,8 +1717,14 @@ mod tests {
             "whiteboard.png",
             "synthesis",
         );
-        assert!(fm.starts_with("---\n"), "front-matter must start with ---: {fm}");
-        assert!(fm.trim_end().ends_with("---"), "front-matter must close with ---: {fm}");
+        assert!(
+            fm.starts_with("---\n"),
+            "front-matter must start with ---: {fm}"
+        );
+        assert!(
+            fm.trim_end().ends_with("---"),
+            "front-matter must close with ---: {fm}"
+        );
         // The colon + quotes in the title are quoted+escaped, never bare.
         assert!(fm.contains("title: \"Q3: Planning \\\"board\\\"\""), "{fm}");
         assert!(fm.contains("date: 2026-07-25"));
@@ -1787,20 +2012,34 @@ Formatting rules:
              After the closing"
         ));
         // Ordered sections, in order, with instructions.
-        let out_at = body.find("## Outcome\nOne line: what we agreed.").expect("s1");
+        let out_at = body
+            .find("## Outcome\nOne line: what we agreed.")
+            .expect("s1");
         let next_at = body
             .find("## Next steps\n- [ ] Owner — action")
             .expect("s2");
         assert!(out_at < next_at, "sections render in author order");
-        assert!(body.contains("# <title>\n\n## Outcome"), "title heads the body");
+        assert!(
+            body.contains("# <title>\n\n## Outcome"),
+            "title heads the body"
+        );
 
         // Registered → build_template resolves it (pipeline's exact call) + appends the language
         // directive; unlabeled adds no speaker directive.
         set_saved_templates(vec![t.clone()]);
         let built = build_template("tpl-client-call", "auto", false, false);
-        assert!(built.starts_with(&body), "build_template renders the saved body");
-        assert!(built.contains("OUTPUT LANGUAGE:"), "language directive appended");
-        assert!(!built.contains("SPEAKER ATTRIBUTION"), "no attribution when unlabeled");
+        assert!(
+            built.starts_with(&body),
+            "build_template renders the saved body"
+        );
+        assert!(
+            built.contains("OUTPUT LANGUAGE:"),
+            "language directive appended"
+        );
+        assert!(
+            !built.contains("SPEAKER ATTRIBUTION"),
+            "no attribution when unlabeled"
+        );
         // Cleanup so the process-global registry doesn't leak into other tests.
         set_saved_templates(vec![]);
     }
@@ -1874,8 +2113,14 @@ Formatting rules:
         let vars = hostile_vars();
         let (front, _scaffold) = render_template(None, &vars);
 
-        assert!(front.starts_with("---\n"), "front-matter must open with ---: {front}");
-        assert!(front.trim_end().ends_with("---"), "…and close with ---: {front}");
+        assert!(
+            front.starts_with("---\n"),
+            "front-matter must open with ---: {front}"
+        );
+        assert!(
+            front.trim_end().ends_with("---"),
+            "…and close with ---: {front}"
+        );
         assert_eq!(fence_lines(&front), 2, "exactly ONE yaml document: {front}");
         assert!(!front.contains("<%") && !front.contains("%>"), "{front}");
         assert!(!front.contains("{{"), "{front}");
@@ -1890,7 +2135,10 @@ Formatting rules:
             .find(|l| l.starts_with("participants:"))
             .expect("participants line");
         assert!(participants.contains("\"admin: true\""), "{participants}");
-        assert!(participants.contains("\"tp.system.prompt()\""), "{participants}");
+        assert!(
+            participants.contains("\"tp.system.prompt()\""),
+            "{participants}"
+        );
         assert!(participants.contains("\"Ann: the CFO\""), "{participants}");
         assert!(participants.contains("Bob"), "{participants}");
         assert!(!participants.contains('\n'), "single-line: {participants}");
@@ -1898,7 +2146,11 @@ Formatting rules:
         // The same holds for the FULL assembled note (front-matter + the model's body).
         let note = assemble_note_with_template(None, &vars, "---\ntitle: guessed\n---\n\n# Body\n");
         assert!(note.starts_with("---\n"), "{note}");
-        assert_eq!(fence_lines(&note), 2, "assembled note is one yaml doc: {note}");
+        assert_eq!(
+            fence_lines(&note),
+            2,
+            "assembled note is one yaml doc: {note}"
+        );
         assert!(!note.contains("<%") && !note.contains("%>"), "{note}");
         assert!(note.contains("# Body"), "the model body survives: {note}");
         // Murmur's deterministic title WINS over the model's guess.
@@ -1956,14 +2208,24 @@ Formatting rules:
         for v in TEMPLATE_VARS {
             assert!(is_known_template_var(v), "{v} must be known");
         }
-        for v in ["meeting_id", "transcript", "note", "audio_path", "folder", ""] {
+        for v in [
+            "meeting_id",
+            "transcript",
+            "note",
+            "audio_path",
+            "folder",
+            "",
+        ] {
             assert!(!is_known_template_var(v), "{v} must NOT be a template var");
         }
         assert!(!TEMPLATE_VARS.contains(&"meeting_id"));
         // Every allowlisted ident actually resolves (no half-wired var).
         let vars = hostile_vars();
         for v in TEMPLATE_VARS {
-            assert!(resolve_var_inline(&vars, v, None).is_some(), "{v} unresolved");
+            assert!(
+                resolve_var_inline(&vars, v, None).is_some(),
+                "{v} unresolved"
+            );
             assert!(resolve_var_yaml(&vars, v, None).is_some(), "{v} unresolved");
         }
         // The grammar itself compiles (the renderer/validator share it).
@@ -2003,7 +2265,10 @@ Formatting rules:
         }
         // The refusal NAMES the allowlist so the user can fix it.
         let msg = format!("{:?}", validate_note_template(&mid.name, &mid.tone, &mid));
-        assert!(msg.contains("participants"), "error must list the allowlist: {msg}");
+        assert!(
+            msg.contains("participants"),
+            "error must list the allowlist: {msg}"
+        );
     }
 
     /// The DSL's FIELD SCOPE is enforced, not merely documented: `name` and `tone` are never
@@ -2032,8 +2297,14 @@ Formatting rules:
             "`{{{{}}}}` in the name must be refused; got {err:?}"
         );
         // The refusal explains WHERE variables are supported.
-        let msg = format!("{:?}", validate_note_template("Weekly {{title}}", &named.tone, &named));
-        assert!(msg.contains("SECTIONS"), "error must name the supported fields: {msg}");
+        let msg = format!(
+            "{:?}",
+            validate_note_template("Weekly {{title}}", &named.tone, &named)
+        );
+        assert!(
+            msg.contains("SECTIONS"),
+            "error must name the supported fields: {msg}"
+        );
     }
 
     /// A section instruction reaches the model VERBATIM in the prompt, so the model can echo the raw
@@ -2043,14 +2314,18 @@ Formatting rules:
     #[test]
     fn placeholders_echoed_by_the_model_are_resolved_in_the_body() {
         let vars = hostile_vars();
-        let model = "---\ntitle: guess\n---\n\n# Q3\n\nAttendees: {{participants}}\nOn {{date:YYYY}}.\n";
+        let model =
+            "---\ntitle: guess\n---\n\n# Q3\n\nAttendees: {{participants}}\nOn {{date:YYYY}}.\n";
         let note = assemble_note_with_template(None, &vars, model);
 
         assert!(
             !note.contains("{{"),
             "no placeholder may survive into the user's note: {note}"
         );
-        assert!(note.contains("Attendees: admin: true, tp.system.prompt()"), "{note}");
+        assert!(
+            note.contains("Attendees: admin: true, tp.system.prompt()"),
+            "{note}"
+        );
         assert!(note.contains("On 2026."), "{note}");
         // Resolution in the body is still sanitized — the fence/Templater tokens stay stripped.
         assert!(!note.contains("<%") && !note.contains("%>"), "{note}");
@@ -2089,14 +2364,19 @@ Formatting rules:
             .lines()
             .find(|l| l.starts_with("participants:"))
             .expect("participants line");
-        for quoted in ["\"No\"", "\"yes\"", "\"Off\"", "\"null\"", "\"~\"", "\"3.14\""] {
+        for quoted in [
+            "\"No\"", "\"yes\"", "\"Off\"", "\"null\"", "\"~\"", "\"3.14\"",
+        ] {
             assert!(
                 participants.contains(quoted),
                 "{quoted} must be quoted, not re-typed by YAML: {participants}"
             );
         }
         // A plain name still renders BARE — the guard must not over-quote everything.
-        assert!(participants.contains("Anna,") || participants.contains("Anna]"), "{participants}");
+        assert!(
+            participants.contains("Anna,") || participants.contains("Anna]"),
+            "{participants}"
+        );
         // The ISO date is not a number, so it stays bare (Obsidian parses it as a date).
         assert!(front.contains("date: 2026-07-26"), "{front}");
         // duration_minutes is a REAL number and must stay unquoted.
@@ -2164,13 +2444,19 @@ Formatting rules:
 
         // The prompt still ASKS for the plain key, and no longer asks for the ones Murmur fills.
         let prompt = render_saved_template(&t);
-        assert!(prompt.contains("- project: (fill in from the meeting"), "{prompt}");
+        assert!(
+            prompt.contains("- project: (fill in from the meeting"),
+            "{prompt}"
+        );
         assert!(!prompt.contains("- client:"), "{prompt}");
         assert!(!prompt.contains("- slug:"), "{prompt}");
 
         // The body scaffold resolves its vars and heads with the real title.
         assert!(scaffold.starts_with("# Q3 planning\n"), "{scaffold}");
-        assert!(scaffold.contains("Attendees: admin: true, tp.system.prompt()"), "{scaffold}");
+        assert!(
+            scaffold.contains("Attendees: admin: true, tp.system.prompt()"),
+            "{scaffold}"
+        );
         assert!(!scaffold.contains("{{"), "{scaffold}");
     }
 
@@ -2194,7 +2480,10 @@ Formatting rules:
         let note = assemble_note_with_template(None, &vars, model);
 
         assert_eq!(fence_lines(&note), 2, "one yaml doc: {note}");
-        assert!(note.contains("murmur_enhanced: true"), "stamp preserved: {note}");
+        assert!(
+            note.contains("murmur_enhanced: true"),
+            "stamp preserved: {note}"
+        );
         assert_eq!(
             note.lines().filter(|l| l.starts_with("title:")).count(),
             1,
@@ -2206,7 +2495,10 @@ Formatting rules:
         assert!(note.contains("project: \"tp.system\""), "{note}");
         assert!(!note.contains("empty:"), "dangling key dropped: {note}");
         assert!(!note.contains("bad key!"), "unsafe key dropped: {note}");
-        assert!(!note.contains("- someone"), "orphan list item dropped: {note}");
+        assert!(
+            !note.contains("- someone"),
+            "orphan list item dropped: {note}"
+        );
         assert!(note.contains("# Real body"), "{note}");
     }
 
