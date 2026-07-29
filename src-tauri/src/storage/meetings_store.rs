@@ -26,6 +26,8 @@ use crate::error::{AppError, Result};
 use crate::storage::db::{map_err, row_to_meeting, visibility_clause, Db, RawManualNotes};
 use crate::storage::models::{Meeting, MeetingStatus};
 
+pub(crate) type MeetingTriageRow = (Meeting, i64, bool);
+
 impl Db {
     pub fn insert_meeting(&self, m: &Meeting) -> Result<()> {
         let conn = self.lock();
@@ -560,6 +562,61 @@ impl Db {
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(map_err)??);
+        }
+        Ok(out)
+    }
+
+    /// A bounded, visibility-gated aggregate for local-MCP meeting triage.
+    ///
+    /// Each row carries the meeting, transcript character count, and whether at least one visible
+    /// note exists. One SQL statement supplies all three, so `list_recent_meetings` does not issue
+    /// an extra transcript/note read per meeting. A sealed-and-not-session-unlocked meeting produces
+    /// no row at all, exactly like [`Self::list_meetings_visible`].
+    pub fn list_meeting_triage_visible(
+        &self,
+        limit: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<MeetingTriageRow>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let limit = limit.clamp(1, 100);
+        let sql = format!(
+            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
+                    (SELECT nf.folder_id FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id,
+                    COALESCE(
+                      (SELECT SUM(LENGTH(s.text)) FROM segments s WHERE s.meeting_id = m.id),
+                      0
+                    ) AS transcript_chars,
+                    EXISTS (
+                      SELECT 1 FROM notes n
+                       LEFT JOIN folders f ON f.id = n.folder_id
+                       WHERE n.meeting_id = m.id AND {visible}
+                    ) AS has_visible_note
+               FROM meetings m
+              WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                 OR EXISTS (
+                      SELECT 1 FROM notes n
+                       LEFT JOIN folders f ON f.id = n.folder_id
+                       WHERE n.meeting_id = m.id AND {visible}
+                    )
+              ORDER BY m.started_at DESC, m.id DESC
+              LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                let meeting = row_to_meeting(row)?;
+                let transcript_chars: i64 = row.get(8)?;
+                let has_visible_note = row.get::<_, i64>(9)? != 0;
+                Ok((meeting, transcript_chars, has_visible_note))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (meeting, transcript_chars, has_visible_note) = row.map_err(map_err)?;
+            out.push((meeting?, transcript_chars, has_visible_note));
         }
         Ok(out)
     }
