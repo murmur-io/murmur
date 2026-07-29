@@ -120,7 +120,14 @@ pub fn make_provider(
         model,
         effort: config.provider_effort.clone(),
     };
-    make_provider_resolved(&target, config, heavy, None)
+    make_provider_resolved(
+        &target,
+        config,
+        heavy,
+        None,
+        #[cfg(test)]
+        None,
+    )
 }
 
 /// Build the `SummarizerProvider` serving `role`, resolved through the role layer
@@ -147,7 +154,14 @@ pub fn provider_for(
             target.connection
         )));
     }
-    make_provider_resolved(&target, config, heavy, None)
+    make_provider_resolved(
+        &target,
+        config,
+        heavy,
+        None,
+        #[cfg(test)]
+        None,
+    )
 }
 
 /// Recording postprocess provider: identical consent/redaction/ledger seam, with the exact session
@@ -165,7 +179,14 @@ pub(crate) fn provider_for_recording(
             role.as_str(), target.connection
         )));
     }
-    make_provider_resolved(&target, config, heavy, Some(token))
+    make_provider_resolved(
+        &target,
+        config,
+        heavy,
+        Some(token),
+        #[cfg(test)]
+        None,
+    )
 }
 
 /// The EFFECTIVE model id a resolved target sends: the target's own model, or — when empty —
@@ -209,26 +230,6 @@ fn provider_egress_destination(id: &str, config: &AppConfig) -> String {
     }
 }
 
-/// The parameterized factory core: build a provider for a RESOLVED (connection, model, effort)
-/// triple. ALL egress invariants live here, keyed off the resolved connection:
-/// the fail-closed consent gate, the [`egress_is_cloud`] classification, the
-/// [`RedactingProvider`] wrap, and the egress-ledger fields.
-fn make_provider_resolved(
-    target: &roles::RoleTarget,
-    config: &AppConfig,
-    heavy: &Arc<tokio::sync::Semaphore>,
-    recording_token: Option<crate::perf::RecordingSessionToken>,
-) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
-    make_provider_resolved_inner(
-        target,
-        config,
-        heavy,
-        recording_token,
-        #[cfg(test)]
-        None,
-    )
-}
-
 #[cfg(test)]
 struct ProviderTestOverrides {
     codex_inner: Arc<dyn SummarizerProvider>,
@@ -236,14 +237,19 @@ struct ProviderTestOverrides {
     sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
 }
 
-fn make_provider_resolved_inner(
-    target: &roles::RoleTarget,
-    config: &AppConfig,
-    heavy: &Arc<tokio::sync::Semaphore>,
-    recording_token: Option<crate::perf::RecordingSessionToken>,
+/// The parameterized factory core: build a provider for a RESOLVED (connection, model, effort)
+/// triple. ALL egress invariants live here, keyed off the resolved connection:
+/// the fail-closed consent gate, the [`egress_is_cloud`] classification, the concrete provider,
+/// the [`RedactingProvider`] wrap, and the content-free egress-ledger fields. Keep this canonical
+/// seam structurally complete so the verifier can extract it as one balanced Rust item.
+fn make_provider_resolved(
+    resolved_target: &roles::RoleTarget,
+    app_config: &AppConfig,
+    heavy_semaphore: &Arc<tokio::sync::Semaphore>,
+    recording_session: Option<crate::perf::RecordingSessionToken>,
     #[cfg(test)] test_overrides: Option<ProviderTestOverrides>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
-    let id = target.connection.as_str();
+    let connection_id = resolved_target.connection.as_str();
     // E10 — fail-closed consent gate, now classification-aware: no cloud provider is built (so no
     // content can be sent) until the user has explicitly consented once. ollama is gated ONLY when
     // its base URL is non-loopback (remote) — closing the gap where a remote ollama_base_url would
@@ -252,60 +258,60 @@ fn make_provider_resolved_inner(
     // screen turns THIS specific failure into an "Allow" banner rather than an error. Before the
     // code existed the frontend regex-matched this sentence, so rewording it silently broke the
     // consent flow for every cloud user; the code is now the contract and the prose is free.
-    if egress_is_cloud(id, config) && !config.cloud_egress_consented {
+    if egress_is_cloud(connection_id, app_config) && !app_config.cloud_egress_consented {
         return Err(crate::error::AppError::Unavailable(crate::errcode::tag(
             crate::errcode::CLOUD_CONSENT,
             "this provider sends meeting content off-device; grant one-time consent before using it",
         )));
     }
 
-    let inner: Arc<dyn SummarizerProvider> = match id {
+    let inner: Arc<dyn SummarizerProvider> = match connection_id {
         PROVIDER_CLAUDE_CODE => Arc::new(
-            ClaudeCodeProvider::with_binary(config.claude_binary.clone())
+            ClaudeCodeProvider::with_binary(app_config.claude_binary.clone())
                 // A resolved model is passed as `--model`; an empty value (the default) lets the
                 // CLI use its own default. Effort is N/A for the CLI.
-                .with_model(target.model.clone())
+                .with_model(resolved_target.model.clone())
                 // Opt-in: inherit the shell env (restores env ANTHROPIC_API_KEY); DB keys stay stripped.
-                .with_inherit_env(config.claude_code_inherit_env),
+                .with_inherit_env(app_config.claude_code_inherit_env),
         ),
         PROVIDER_CODEX_CLI => {
             #[cfg(test)]
             if let Some(overrides) = &test_overrides {
                 overrides.codex_inner.clone()
             } else {
-                codex_cli::provider(target.model.clone())
+                codex_cli::provider(resolved_target.model.clone())
             }
             #[cfg(not(test))]
-            codex_cli::provider(target.model.clone())
+            codex_cli::provider(resolved_target.model.clone())
         }
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
             let api_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?;
             // A resolved model takes precedence over the legacy `anthropic_model`; effort is
             // the adaptive-thinking tier (provider default when empty).
-            let model = if target.model.trim().is_empty() {
-                config.anthropic_model.clone()
+            let model = if resolved_target.model.trim().is_empty() {
+                app_config.anthropic_model.clone()
             } else {
-                target.model.clone()
+                resolved_target.model.clone()
             };
             Arc::new(AnthropicProvider::with_effort(
                 api_key,
                 model,
-                target.effort.clone(),
+                resolved_target.effort.clone(),
             ))
         }
         PROVIDER_OLLAMA => {
-            let model = if target.model.trim().is_empty() {
-                config.ollama_model.clone()
+            let model = if resolved_target.model.trim().is_empty() {
+                app_config.ollama_model.clone()
             } else {
-                target.model.clone()
+                resolved_target.model.clone()
             };
-            let ollama_is_local = !egress_is_cloud(id, config);
+            let ollama_is_local = !egress_is_cloud(connection_id, app_config);
             let ollama = Arc::new(OllamaProvider::with_model_admission(
-                config.ollama_base_url.clone(),
+                app_config.ollama_base_url.clone(),
                 model,
                 ollama_is_local,
-                recording_token.clone(),
+                recording_session.clone(),
             ));
             if ollama_is_local {
                 return Ok(ollama); // LOCAL ollama: unwrapped, unchanged behavior
@@ -313,7 +319,7 @@ fn make_provider_resolved_inner(
             ollama // REMOTE ollama: falls through to the RedactingProvider wrap below
         }
         PROVIDER_GATEWAY => {
-            if config.gateway_base_url.trim().is_empty() {
+            if app_config.gateway_base_url.trim().is_empty() {
                 return Err(crate::error::AppError::InvalidArg(
                     "gateway base URL is not set".into(),
                 ));
@@ -322,14 +328,14 @@ fn make_provider_resolved_inner(
             let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT)
                 .ok()
                 .flatten();
-            let model = if target.model.trim().is_empty() {
-                config.gateway_model.clone()
+            let model = if resolved_target.model.trim().is_empty() {
+                app_config.gateway_model.clone()
             } else {
-                target.model.clone()
+                resolved_target.model.clone()
             };
             // R1/R4 enforced at construction via `validate_gateway_url` inside `new()`.
             Arc::new(crate::summarize::gateway::OpenAiCompatProvider::new(
-                config.gateway_base_url.clone(),
+                app_config.gateway_base_url.clone(),
                 model,
                 api_key,
             )?)
@@ -342,32 +348,37 @@ fn make_provider_resolved_inner(
             // NEVER a silent cloud fallback. Weights load once via the shared MODEL_CACHE. Returned
             // UNWRAPPED (no redaction, no ledger) like a loopback Ollama — `egress_is_cloud(local)` is
             // false, so the consent gate above was skipped and nothing egresses.
-            let model_id = if target.model.trim().is_empty() {
-                config.brain_model_id.clone()
+            let model_id = if resolved_target.model.trim().is_empty() {
+                app_config.brain_model_id.clone()
             } else {
-                Some(target.model.clone())
+                Some(resolved_target.model.clone())
             };
-            let configured = config.brain_model_path.as_deref().map(std::path::Path::new);
+            let configured = app_config
+                .brain_model_path
+                .as_deref()
+                .map(std::path::Path::new);
             match crate::reason::resolve_brain_model(configured, model_id.as_deref())? {
                 Some(path) => {
                     // The FullyLocal Notes/Ask provider now drives the on-device HEAVY engine through
                     // the killable brain sidecar (mistralrs no longer links here). Timeouts come from
                     // the live config so a wedged child can never hang the app.
                     let timeouts = crate::reason::sidecar::SidecarTimeouts {
-                        idle_secs: config.brain_idle_timeout_secs,
-                        ready_secs: config.brain_ready_timeout_secs,
-                        hard_cap_secs: config.brain_hard_cap_secs,
+                        idle_secs: app_config.brain_idle_timeout_secs,
+                        ready_secs: app_config.brain_ready_timeout_secs,
+                        hard_cap_secs: app_config.brain_hard_cap_secs,
                     };
                     let reasoner: Arc<dyn crate::reason::LocalReasoner> = Arc::new(
                         crate::reason::sidecar::SidecarReasoner::new(path, timeouts)?,
                     );
-                    let provider = match recording_token.clone() {
+                    let provider = match recording_session.clone() {
                         Some(token) => local::LocalSummarizerProvider::new_recording(
                             reasoner,
-                            heavy.clone(),
+                            heavy_semaphore.clone(),
                             token,
                         ),
-                        None => local::LocalSummarizerProvider::new(reasoner, heavy.clone()),
+                        None => {
+                            local::LocalSummarizerProvider::new(reasoner, heavy_semaphore.clone())
+                        }
                     };
                     return Ok(Arc::new(provider));
                 }
@@ -401,10 +412,10 @@ fn make_provider_resolved_inner(
     // audit row. Non-PII destination label + requested model are computed per provider arm here;
     // The recording-aware constructor also admits the NER load/inference under the exact session
     // token, before any cloud dispatch.
-    let destination = provider_egress_destination(id, config);
+    let destination = provider_egress_destination(connection_id, app_config);
     // Provenance fix: record the EFFECTIVE model — for anthropic with an empty resolved model
     // that is `anthropic_model` (previously recorded as empty even though the request carried it).
-    let model_requested = effective_model_requested(target, config);
+    let model_requested = effective_model_requested(resolved_target, app_config);
     #[cfg(test)]
     let (names, sink) = if let Some(overrides) = test_overrides {
         (overrides.names, overrides.sink)
@@ -419,44 +430,18 @@ fn make_provider_resolved_inner(
         crate::summarize::redact::active_name_redactor(),
         crate::summarize::egress_log::active_sink(),
     );
-    Ok(wrap_cloud_provider(
-        inner,
-        names,
-        sink,
-        id.to_string(),
-        destination,
-        model_requested,
-        heavy.clone(),
-        recording_token,
-    ))
-}
-
-/// The one production constructor for content-capable cloud providers. Keeping this as a named seam
-/// lets tests pin Codex to the same regex/name-redaction, ledger and recording-admission wiring that
-/// `make_provider_resolved` uses, without ever spawning the external CLI.
-#[allow(clippy::too_many_arguments)]
-fn wrap_cloud_provider(
-    inner: Arc<dyn SummarizerProvider>,
-    names: Arc<dyn crate::summarize::redact::NameRedactor>,
-    sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
-    provider_id: String,
-    destination: String,
-    model_requested: String,
-    heavy: Arc<tokio::sync::Semaphore>,
-    recording_token: Option<crate::perf::RecordingSessionToken>,
-) -> Arc<dyn SummarizerProvider> {
-    Arc::new(
+    Ok(Arc::new(
         crate::summarize::redact::RedactingProvider::with_name_redactor_sink_and_model_admission(
             inner,
             names,
             sink,
-            provider_id,
+            connection_id.to_string(),
             destination,
             model_requested,
-            heavy,
-            recording_token,
+            heavy_semaphore.clone(),
+            recording_session,
         ),
-    )
+    ))
 }
 
 /// Provider instances for the Settings UI "Provider availability" fan-out.
@@ -678,16 +663,27 @@ mod tests {
     async fn codex_uses_the_production_redaction_and_content_free_ledger_seam() {
         let inner = Arc::new(CaptureCodexProvider::default());
         let sink = Arc::new(CaptureSink::default());
-        let provider = wrap_cloud_provider(
-            inner.clone(),
-            Arc::new(FixtureNameRedactor),
-            sink.clone(),
-            PROVIDER_CODEX_CLI.to_string(),
-            provider_egress_destination(PROVIDER_CODEX_CLI, &AppConfig::default()),
-            "gpt-5.6-terra".to_string(),
-            Arc::new(tokio::sync::Semaphore::new(1)),
+        let config = AppConfig {
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
+        let target = roles::RoleTarget {
+            connection: PROVIDER_CODEX_CLI.to_string(),
+            model: "gpt-5.6-terra".to_string(),
+            effort: String::new(),
+        };
+        let provider = make_provider_resolved(
+            &target,
+            &config,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
             None,
-        );
+            Some(ProviderTestOverrides {
+                codex_inner: inner.clone(),
+                names: Arc::new(FixtureNameRedactor),
+                sink: sink.clone(),
+            }),
+        )
+        .expect("Codex must use the canonical consent, redaction, and ledger factory");
 
         let output = provider
             .complete(

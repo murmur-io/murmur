@@ -2586,7 +2586,7 @@ mod tests {
             model: "gpt-5.6-terra".to_string(),
             effort: String::new(),
         };
-        let provider = super::super::make_provider_resolved_inner(
+        let provider = super::super::make_provider_resolved(
             &target,
             &config,
             &Arc::new(tokio::sync::Semaphore::new(1)),
