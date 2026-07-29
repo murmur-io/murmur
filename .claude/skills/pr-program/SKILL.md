@@ -9,7 +9,7 @@ description: >-
 # /pr-program
 
 Harness verifies one task. The program queue remains an orchestrator concern.
-V2 has no writer and no repair loop: an implementation agent edits the isolated
+It has no writer and no repair loop: a developer edits the isolated
 worktree, while the runner alone owns checks, reviews, evidence, and PASS.
 
 ## Program rules
@@ -119,14 +119,13 @@ PR.
 
 ## Protected control-plane exception
 
-Harness v2 refuses to certify its own protected harness, hook, rule, skill, and
-learnings surfaces. Those changes use the separate externally anchored v1
-bootstrap with `--kind harness` and `seal-prepared`; this exception must never
-be used to bypass v2 for ordinary product work.
+The Harness refuses to certify its own protected harness, hook, rule, skill,
+learnings, CI, and receipt-policy surfaces. Make those changes in a dedicated
+worktree outside the runner-owned `../.murmur-agent-tasks` root, for example
+`../.murmur-control-plane/<task-id>`. Run every control-plane selftest, obtain
+a fresh independent review, and rely on the base-anchored GitHub CI gate.
+Never create a self-receipt.
 
-## Do not resurrect v1 habits
-
-Do not use manual worktrees, `init/run`, custom `--check`, inferred `--risk`,
-manual reviewer workflows, receipt trailers, `rm -rf`, or local rebase of an
-attested commit. Protected control-plane changes are the sole bootstrap
-exception described above.
+Do not use retired lifecycle commands, custom executable checks, inferred risk
+overrides, hand-written receipt trailers, `rm -rf`, or local rebase of an
+attested commit.

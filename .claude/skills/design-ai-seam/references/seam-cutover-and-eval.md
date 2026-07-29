@@ -87,8 +87,9 @@ better" is not a delta.
 
 ### The real gate for everything else
 
-`scripts/ci.sh` is the one-shot final gate (remote-enforcement audit → config audit → hooks selftest
-→ harness selftest → meta-eval → swiftc → clippy `-D warnings` → `cargo test` → cargo audit/deny
+`scripts/ci.sh` is the one-shot final gate (receipt/remote-enforcement audits → config audit
+→ hooks selftest → Harness lifecycle/fault/metrics selftests → swiftc → clippy `-D warnings`
+→ `cargo test` → cargo audit/deny
 → cargo build → ng lint → ng build → E2E). In the ITERATE loop use
 `cargo test --lib` from `src-tauri/`; NEVER `cargo clippy --all-targets` in the loop (it thrashes the
 openssl/sqlcipher profile and times out). A new EGRESSING `SummarizeRequest` field ALSO extends the
