@@ -1650,7 +1650,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "knowledge_diff",
-            "description": "The DECISION LEDGER for one person or project: what you knew about it changed over time (bitemporal facts). Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id, plus two ISO-8601 instants 'from' and 'to' (e.g. '2026-06-01T00:00:00Z'). Returns what CHANGED between those two moments (added / removed / changed facts, e.g. status in-progress → shipped) PLUS the full chronological supersession ledger — each decision carries the old value, the new value, when it took effect, and the source meeting id. Answers 'what changed since', 'when did X flip', 'the history of Y's status'. Sealed-and-locked meetings' facts are excluded.",
+            "description": "The DECISION LEDGER for one person or project: what you knew about it changed over time (bitemporal facts). Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id, plus two ISO-8601 instants 'from' and 'to' (e.g. '2026-06-01T00:00:00Z'). Returns what CHANGED between those two moments (added / removed / changed facts) PLUS the chronological supersession ledger. A separate bounded section may quote Decisions and Risks/Open Questions from currently visible mentioning-meeting notes; those items are explicitly historical source material, not bitemporal facts, current truth, or an open-risk ledger. Sealed-and-locked meetings are excluded.",
             "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" }, "from": { "type": "string", "description": "ISO-8601 instant to snapshot the earlier state at." }, "to": { "type": "string", "description": "ISO-8601 instant to snapshot the later state at." } }, "required": ["entity", "from", "to"] }
         },
         {
@@ -1933,10 +1933,11 @@ fn dispatch_tool(
                 max_chars: mcp_usize_arg(args, "maxChars").min(MAX_TOOL_WINDOW_CHARS),
             }
         }
-        // Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity. Routes through the
-        // SAME gated reader (`resolve_entity_id` + `build_knowledge_diff` → `list_facts_visible`) as
-        // the dossier, so a sealed-and-not-unlocked meeting's fact is invisible here too. `entity`,
-        // `from`, `to` are all required.
+        // LOCAL_LOOPBACK ONLY: KnowledgeDiff is absent from model-facing `tool_specs` and every
+        // GatedToolExecutor scope. This mapper is reachable only through this module's fixed
+        // 127.0.0.1 listener, exact Host/Origin/token gates, visibility snapshot, and response
+        // revalidation/cancellation. The gated reader covers both fact rows and read-time note
+        // context. `entity`, `from`, and `to` are all required.
         "knowledge_diff" => {
             let entity = args.get("entity").and_then(Value::as_str).unwrap_or("");
             if entity.trim().is_empty() {
@@ -3289,6 +3290,133 @@ mod tests {
             response["error"]["message"],
             Value::String(VISIBILITY_RETRY_MESSAGE.into())
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// KnowledgeDiff note context is reachable only through the fixed loopback MCP catalog, and a
+    /// relock after materialization but before response production discards content AND bounded
+    /// source-count metadata. The model-facing/GatedToolExecutor boundary is asserted separately in
+    /// `tools::tests::local_mcp_only_tools_remain_outside_cloud_agent_catalogs`.
+    #[test]
+    fn knowledge_diff_note_context_is_loopback_only_and_revoked_after_relock() {
+        use crate::storage::models::{EntityKind, Folder};
+
+        assert!(mcp_listener_addr().ip().is_loopback());
+        assert_eq!(*mcp_listener_addr().ip(), Ipv4Addr::LOCALHOST);
+        assert!(
+            tools_spec()
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "knowledge_diff")),
+            "knowledge_diff must stay in the fixed local MCP catalog"
+        );
+        assert!(
+            crate::tools::tool_specs()
+                .iter()
+                .all(|tool| tool.name != "knowledge_diff"),
+            "knowledge_diff note context must not enter a model-facing tool catalog"
+        );
+
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-kd-race".into(),
+            name: "Private knowledge diff".into(),
+            path: "Private knowledge diff".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-29T00:00:00Z".into(),
+        })
+        .unwrap();
+        let entity_id = db.upsert_entity("Atlas Race", EntityKind::Project).unwrap();
+        for index in 0..=100 {
+            let meeting_id = format!("m-kd-race-{index:03}");
+            seed(
+                &db,
+                &meeting_id,
+                &format!("PRIVATE_KD_TITLE_{index:03}"),
+                &format!("## Decisions\n- PRIVATE_KD_CONTENT_{index:03}.\n"),
+                Some("f-kd-race"),
+            );
+            db.add_mention(&entity_id, &meeting_id).unwrap();
+        }
+        db.set_folder_locked("f-kd-race", true, None).unwrap();
+
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-kd-race".to_string());
+        let lifecycle = Mutex::new(());
+        let epoch = AtomicU64::new(0);
+        let unlocked = Mutex::new(unlocked);
+        let context = RpcContext {
+            db: Some(&db),
+            lifecycle: &lifecycle,
+            seal_epoch: &epoch,
+            unlocked_folders: &unlocked,
+        };
+        let params = json!({
+            "name": "knowledge_diff",
+            "arguments": {
+                "entity": "Atlas Race",
+                "from": "2026-01-01T00:00:00Z",
+                "to": "2026-12-31T23:59:59Z"
+            }
+        });
+        let pending = match handle_tool_call(
+            &context,
+            json!(71),
+            Some(&params),
+            Instant::now() + REQUEST_DEADLINE,
+        ) {
+            RpcReply::Content(pending) => pending,
+            RpcReply::Immediate(response) => {
+                panic!("knowledge_diff unexpectedly finalized early: {response}")
+            }
+        };
+        let materialized = pending
+            .outcome
+            .as_ref()
+            .unwrap_or_else(|error| panic!("knowledge_diff failed before relock: {error:?}"));
+        for expected in [
+            "PRIVATE_KD_TITLE_100",
+            "PRIVATE_KD_CONTENT_100",
+            "source:m-kd-race-100",
+            "HISTORICAL NOTE CONTEXT TRUNCATED",
+            "newest 100 visible mentioning meetings scanned",
+        ] {
+            assert!(
+                materialized.contains(expected),
+                "race fixture did not materialize {expected:?}: {materialized}"
+            );
+        }
+
+        {
+            let _lifecycle = lifecycle.lock().unwrap();
+            epoch.fetch_add(1, Ordering::SeqCst);
+            unlocked.lock().unwrap().clear();
+        }
+        let response = {
+            let _lifecycle = lifecycle.lock().unwrap();
+            finalize_content_reply(pending, &epoch, &unlocked)
+        };
+        assert_eq!(response["error"]["code"], VISIBILITY_RETRY_CODE);
+        assert_eq!(
+            response["error"]["message"],
+            Value::String(VISIBILITY_RETRY_MESSAGE.into())
+        );
+        let serialized = response.to_string();
+        for forbidden in [
+            "PRIVATE_KD_TITLE",
+            "PRIVATE_KD_CONTENT",
+            "m-kd-race",
+            "Atlas Race",
+            "HISTORICAL NOTE CONTEXT",
+            "meeting",
+            "scanned",
+            "TRUNCATED",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "knowledge_diff leaked materialized content/count metadata after relock: {serialized}"
+            );
+        }
         let _ = std::fs::remove_file(&p);
     }
 
