@@ -24,7 +24,7 @@
 //! (`crate::transcribe::model` / `crate::reason` / `crate::embed`) these commands call (E0255). The
 //! glob re-export makes every moved command resolve UNCHANGED at `crate::commands::…` for
 //! `generate_handler!` in `lib.rs` and every caller. The shared imports (`AppError`, `AppHandle`,
-//! `AppState`, `State`, `AppConfig`, `ProviderStatus`, `SearchHit`, `all_providers`, `secrets`,
+//! `AppState`, `State`, `AppConfig`, `ProviderStatus`, `SearchHit`, `secrets`,
 //! `GATEWAY_KEY_ACCOUNT`, `ReindexResult`, …) come in via `use super::*`.
 
 use super::*;
@@ -84,6 +84,7 @@ pub async fn list_gateway_models(
 /// Model ids for the connections whose catalog is static, compile-time data — pure so it is
 /// unit-testable without state or network. `None`-network connections only:
 ///   - `"claude_code"` / `"anthropic"` → the curated [`crate::summarize::provider::CLAUDE_MODELS`],
+///   - `"codex_cli"` → the curated [`crate::summarize::provider::CODEX_MODELS`],
 ///   - `"local"` → the on-device `reason::BRAIN_MODELS` registry ids,
 ///   - `"off"` → empty (a valid connection that runs no models),
 ///   - anything else → `AppError::InvalidArg`.
@@ -93,13 +94,17 @@ pub(crate) fn static_connection_models(connection: &str) -> Result<Vec<String>, 
             .iter()
             .map(|id| id.to_string())
             .collect()),
+        "codex_cli" => Ok(crate::summarize::provider::CODEX_MODELS
+            .iter()
+            .map(|id| id.to_string())
+            .collect()),
         "local" => Ok(crate::reason::BRAIN_MODELS
             .iter()
             .map(|m| m.id.to_string())
             .collect()),
         "off" => Ok(vec![]),
         other => Err(AppError::InvalidArg(format!(
-            "unknown connection '{other}' — expected claude_code, anthropic, ollama, gateway, local, or off"
+            "unknown connection '{other}' — expected claude_code, codex_cli, anthropic, ollama, gateway, local, or off"
         ))),
     }
 }
@@ -109,7 +114,7 @@ pub(crate) fn static_connection_models(connection: &str) -> Result<Vec<String>, 
 ///   - `"gateway"` → `GET {gateway_base_url}/v1/models` (shares [`gateway_model_ids`] with
 ///     `list_gateway_models`),
 ///   - `"ollama"` → `GET {ollama_base_url}/api/tags`, model names only,
-///   - `"claude_code"` / `"anthropic"` / `"local"` / `"off"` → static lists
+///   - `"claude_code"` / `"codex_cli"` / `"anthropic"` / `"local"` / `"off"` → static lists
 ///     (see [`static_connection_models`]),
 ///   - anything else → `AppError::InvalidArg`.
 ///
@@ -209,7 +214,15 @@ pub async fn gateway_health(state: State<'_, AppState>) -> Result<GatewayHealthD
     })
 }
 
-/// availability() fan-out across all three providers for the Settings UI.
+/// availability() fan-out across configured providers for the Settings UI.
+///
+/// Codex is deliberately NOT part of `external_process_availability_providers` because that helper
+/// returns content-capable provider objects and must not expose the private raw Codex provider
+/// outside its cloud wrapper. The separate readiness probe resolves the login-shell PATH (cached
+/// after first lookup), vets the
+/// executable, validates a private local `auth.json`, and runs only a hardened local
+/// `codex --version`. It therefore distinguishes installed, signed-in, and version-compatible
+/// states without loading ambient config or creating provider egress.
 #[tauri::command]
 pub async fn provider_statuses(
     state: State<'_, AppState>,
@@ -224,20 +237,44 @@ pub async fn provider_statuses(
         guard.clone()
     };
 
-    let providers = all_providers(&config);
-    let mut out = Vec::with_capacity(providers.len());
-    for p in providers {
-        let (available, reason) = match p.availability().await {
+    let providers = crate::summarize::external_process_availability_providers(&config);
+    let mut out = Vec::with_capacity(providers.len() + 1);
+    // Preserve the existing provider order and fail-fast lease behavior. Codex's availability-only
+    // probe is appended after that fan-out without exposing its raw content provider.
+    for provider in providers {
+        let (available, reason) = match provider.availability().await {
             Availability::Available => (true, None),
             Availability::Unavailable { reason } => (false, Some(reason)),
         };
         out.push(ProviderStatus {
-            id: p.id().to_string(),
+            id: provider.id().to_string(),
             available,
             reason,
         });
     }
-    Ok(out)
+    let availability = crate::summarize::codex_cli::probe_availability().await;
+    Ok(append_codex_provider_status(out, availability))
+}
+
+/// Pure final assembly seam for the one provider whose readiness probe intentionally stays outside
+/// the legacy external-process fan-out. Keeping this separate makes the positive UI wiring
+/// runner-testable without constructing a Tauri `State`.
+pub(crate) fn append_codex_provider_status(
+    mut statuses: Vec<ProviderStatus>,
+    availability: crate::summarize::provider::Availability,
+) -> Vec<ProviderStatus> {
+    use crate::summarize::provider::Availability;
+
+    let (available, reason) = match availability {
+        Availability::Available => (true, None),
+        Availability::Unavailable { reason } => (false, Some(reason)),
+    };
+    statuses.push(ProviderStatus {
+        id: crate::summarize::PROVIDER_CODEX_CLI.to_string(),
+        available,
+        reason,
+    });
+    statuses
 }
 
 /// Download the Whisper model matching the chosen size + language (multilingual unless

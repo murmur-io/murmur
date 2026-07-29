@@ -19,7 +19,6 @@ use crate::storage::models::{
     PeopleList, PinResult, PropertyKind, PropertySchemaField, SearchHit, TopicThread, TypedNoteRow,
 };
 use crate::storage::Db;
-use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
 use tauri::Emitter;
@@ -1073,7 +1072,8 @@ pub async fn start_recording(
         .await?
         {
             return Err(AppError::Unavailable(
-                "Claude Code could not be proven stopped; recording was not started".into(),
+                "Cloud AI CLI processes could not be proven stopped; recording was not started"
+                    .into(),
             ));
         }
         let remaining = quiescence_deadline.saturating_duration_since(std::time::Instant::now());

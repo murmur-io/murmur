@@ -12513,6 +12513,32 @@
         );
     }
 
+    #[test]
+    fn codex_global_and_role_selection_round_trip_through_settings() {
+        let state = build_state("cfg-codex-roundtrip");
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.provider_id = "codex_cli".to_string();
+        dto.provider_model = "gpt-5.6-terra".to_string();
+        dto.role_notes_connection = "codex_cli".to_string();
+        dto.role_notes_model = "gpt-5.6-luna".to_string();
+
+        // Drive the real validation/merge/persist/cache core immediately preceding the Tauri
+        // `save_config` command's AppHandle-only prune/listener side effects. This catches any
+        // command-level provider or role-connection allowlist, not just raw AppConfig storage.
+        save_config_inner(&state, dto).unwrap();
+
+        let loaded = AppConfig::load(&state.db).unwrap();
+        assert_eq!(loaded.provider_id, "codex_cli");
+        assert_eq!(loaded.provider_model, "gpt-5.6-terra");
+        assert_eq!(loaded.role_notes_connection, "codex_cli");
+        assert_eq!(loaded.role_notes_model, "gpt-5.6-luna");
+        let cached = state.config.lock().unwrap();
+        assert_eq!(cached.provider_id, "codex_cli");
+        assert_eq!(cached.provider_model, "gpt-5.6-terra");
+        assert_eq!(cached.role_notes_connection, "codex_cli");
+        assert_eq!(cached.role_notes_model, "gpt-5.6-luna");
+    }
+
     // ─── list_models — static connection catalogs (pure, no network) ─────────────────────────
 
     /// `claude_code` and `anthropic` both serve the curated CLAUDE_MODELS constant — the single
@@ -12532,6 +12558,60 @@
                 "curated list must include the default Opus id"
             );
         }
+    }
+
+    /// Codex exposes its own curated current catalog, in the UI's intended display order.
+    #[test]
+    fn list_models_codex_returns_curated_constant() {
+        let ids =
+            static_connection_models("codex_cli").expect("codex_cli must resolve statically");
+        let want: Vec<String> = crate::summarize::provider::CODEX_MODELS
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(ids, want, "codex_cli must serve CODEX_MODELS verbatim");
+        assert_eq!(
+            ids,
+            vec![
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_status_assembly_appends_codex_without_reordering_existing_rows() {
+        use crate::summarize::provider::Availability;
+
+        let existing = ProviderStatus {
+            id: "claude_code".into(),
+            available: true,
+            reason: None,
+        };
+        let available =
+            append_codex_provider_status(vec![existing.clone()], Availability::Available);
+        assert_eq!(
+            available
+                .iter()
+                .map(|status| status.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude_code", "codex_cli"]
+        );
+        assert!(available[1].available);
+        assert_eq!(available[1].reason, None);
+
+        let reason = "run `codex login` in Terminal".to_string();
+        let unavailable = append_codex_provider_status(
+            vec![existing],
+            Availability::Unavailable {
+                reason: reason.clone(),
+            },
+        );
+        assert_eq!(unavailable[0].id, "claude_code");
+        assert_eq!(unavailable[1].id, "codex_cli");
+        assert!(!unavailable[1].available);
+        assert_eq!(unavailable[1].reason.as_deref(), Some(reason.as_str()));
     }
 
     /// `local` serves exactly the BRAIN_MODELS registry ids, in registry order.

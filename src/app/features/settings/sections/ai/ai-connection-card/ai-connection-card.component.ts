@@ -10,6 +10,7 @@ import { ReactiveFormsModule } from "@angular/forms";
 import type { ProviderStatus } from "../../../../../core/models";
 import { SettingsStore } from "../../../settings.store";
 import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
+import { MurProviderIconComponent } from "../../../../../design-system/provider-icon/provider-icon.component";
 
 /** Render-ready view-model for one connection card (built by the parent). */
 export interface ConnectionCardVm {
@@ -35,7 +36,10 @@ export interface ConnectionCardVm {
   selector: "app-ai-connection-card",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
-    MurToggleComponent,ReactiveFormsModule],
+    MurProviderIconComponent,
+    MurToggleComponent,
+    ReactiveFormsModule,
+  ],
   templateUrl: "./ai-connection-card.component.html",
   styleUrl: "./ai-connection-card.component.scss",
 })

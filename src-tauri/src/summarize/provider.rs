@@ -12,6 +12,13 @@ use crate::summarize::meta::CallMeta;
 /// capable first). Static compile-time data — no I/O, no egress.
 pub const CLAUDE_MODELS: &[&str] = &["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
 
+/// Curated Codex model ids offered for the `codex_cli` connection.
+///
+/// These are the current Sol/Terra/Luna roles exposed by Codex CLI: highest-quality, balanced,
+/// and fast respectively. Static compile-time data; selecting one passes it verbatim to
+/// `codex exec --model`.
+pub const CODEX_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingMeta {
@@ -78,7 +85,7 @@ pub(crate) fn default_json_system_prompt(system: &str, schema: &Value) -> String
 
 #[async_trait]
 pub trait SummarizerProvider: Send + Sync {
-    /// Stable id: "claude_code" | "anthropic" | "ollama".
+    /// Stable id: "claude_code" | "codex_cli" | "anthropic" | "ollama" | "gateway".
     fn id(&self) -> &str;
 
     /// Cheap, non-failing readiness probe (key set? ollama up? claude in PATH?).

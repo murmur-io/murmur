@@ -10,6 +10,7 @@ pub mod action_items;
 pub mod anthropic;
 pub mod chat;
 pub mod claude_code;
+pub mod codex_cli;
 pub mod digest;
 pub mod dossier;
 pub mod egress_log;
@@ -52,10 +53,14 @@ pub const DEFAULT_PROVIDER_ID: &str = "claude_code";
 
 /// Stable provider ids (mirrors each provider's `id()`).
 pub const PROVIDER_CLAUDE_CODE: &str = "claude_code";
+pub const PROVIDER_CODEX_CLI: &str = "codex_cli";
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
 pub const PROVIDER_OLLAMA: &str = "ollama";
 /// OpenAI-compatible AI Gateway provider (LiteLLM / Kong / Portkey / vLLM / …).
 pub const PROVIDER_GATEWAY: &str = "gateway";
+pub(crate) const CLAUDE_EGRESS_DESTINATION: &str = "claude_code (Anthropic CLI)";
+pub(crate) const CODEX_EGRESS_DESTINATION: &str = "codex_cli (OpenAI Codex CLI)";
+pub(crate) const ANTHROPIC_EGRESS_DESTINATION: &str = "api.anthropic.com";
 
 /// Keychain account under which the Anthropic API key is stored
 /// (matches `set_anthropic_key` / `has_anthropic_key` in `commands.rs`).
@@ -64,7 +69,7 @@ pub const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
 /// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` — never a fallback to the Anthropic key (R3).
 pub const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
 
-/// Egress classification for `make_provider`. claude_code/anthropic/gateway always send content
+/// Egress classification for `make_provider`. Claude/Codex/Anthropic/Gateway always send content
 /// off-device. ollama is local ONLY when its base URL host is loopback — a remote `ollama_base_url`
 /// is cloud egress and MUST be redacted + consent-gated. Unknown ids default to cloud (fail-safe).
 ///
@@ -72,7 +77,7 @@ pub const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
 /// FORWARD to the cloud — so it is never consent-exempt and is always redaction-wrapped.
 pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
     match id {
-        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC | PROVIDER_GATEWAY => true,
+        PROVIDER_CLAUDE_CODE | PROVIDER_CODEX_CLI | PROVIDER_ANTHROPIC | PROVIDER_GATEWAY => true,
         PROVIDER_OLLAMA => match reqwest::Url::parse(&config.ollama_base_url) {
             Ok(u) => !gateway::host_is_loopback(&u),
             Err(_) => true, // unparseable → fail safe (treat as cloud)
@@ -88,7 +93,7 @@ pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
 
 /// Build a provider by id, wiring config + secrets. Unknown id → `AppError::InvalidArg`.
 ///
-/// Egress policy (E6/E7/E10): every cloud provider — `claude_code` AND `anthropic` — is wrapped
+/// Egress policy (E6/E7/E10): every cloud provider is wrapped
 /// in [`RedactingProvider`] so high-confidence PII is scrubbed before any content leaves the
 /// device, and is refused entirely until the user has granted one-time cloud-egress consent.
 /// `ollama` is local-only and bypasses both.
@@ -102,10 +107,12 @@ pub fn make_provider(
     config: &AppConfig,
     heavy: &Arc<tokio::sync::Semaphore>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
-    // The legacy per-arm model semantics: only claude_code/anthropic ever read `provider_model`;
+    // The CLI/direct provider arms read `provider_model`;
     // ollama/gateway resolve from ollama_model/gateway_model ("" = inherit below).
     let model = match id {
-        PROVIDER_CLAUDE_CODE | PROVIDER_ANTHROPIC => config.provider_model.clone(),
+        PROVIDER_CLAUDE_CODE | PROVIDER_CODEX_CLI | PROVIDER_ANTHROPIC => {
+            config.provider_model.clone()
+        }
         _ => String::new(),
     };
     let target = roles::RoleTarget {
@@ -163,7 +170,8 @@ pub(crate) fn provider_for_recording(
 
 /// The EFFECTIVE model id a resolved target sends: the target's own model, or — when empty —
 /// the connection's default (`anthropic_model` / `ollama_model` / `gateway_model`). For
-/// `claude_code` an empty model stays `""` (the CLI's own default is unknowable here). This is
+/// `claude_code`/`codex_cli` an empty model stays `""` (the CLI's own default is unknowable here).
+/// This is
 /// the single source of truth for provenance: the egress-ledger `model_requested` AND the note's
 /// provenance row both derive from it, fixing the gap where anthropic-with-empty-`provider_model`
 /// recorded an empty model even though the request carried `anthropic_model`.
@@ -180,6 +188,27 @@ pub(crate) fn effective_model_requested(target: &roles::RoleTarget, config: &App
     }
 }
 
+/// Content-free destination provenance used by the production redaction/ledger wrapper.
+///
+/// Keep this as the single source of truth for provider construction; privacy receipts reuse the
+/// fixed destination constants above for the corresponding note-level disclosure.
+fn provider_egress_destination(id: &str, config: &AppConfig) -> String {
+    match id {
+        PROVIDER_CLAUDE_CODE => CLAUDE_EGRESS_DESTINATION.to_string(),
+        PROVIDER_CODEX_CLI => CODEX_EGRESS_DESTINATION.to_string(),
+        PROVIDER_ANTHROPIC => ANTHROPIC_EGRESS_DESTINATION.to_string(),
+        PROVIDER_GATEWAY => reqwest::Url::parse(&config.gateway_base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "gateway".to_string()),
+        PROVIDER_OLLAMA => reqwest::Url::parse(&config.ollama_base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "ollama".to_string()),
+        _ => id.to_string(),
+    }
+}
+
 /// The parameterized factory core: build a provider for a RESOLVED (connection, model, effort)
 /// triple. ALL egress invariants live here, keyed off the resolved connection:
 /// the fail-closed consent gate, the [`egress_is_cloud`] classification, the
@@ -189,6 +218,30 @@ fn make_provider_resolved(
     config: &AppConfig,
     heavy: &Arc<tokio::sync::Semaphore>,
     recording_token: Option<crate::perf::RecordingSessionToken>,
+) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    make_provider_resolved_inner(
+        target,
+        config,
+        heavy,
+        recording_token,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+struct ProviderTestOverrides {
+    codex_inner: Arc<dyn SummarizerProvider>,
+    names: Arc<dyn crate::summarize::redact::NameRedactor>,
+    sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+}
+
+fn make_provider_resolved_inner(
+    target: &roles::RoleTarget,
+    config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+    #[cfg(test)] test_overrides: Option<ProviderTestOverrides>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     let id = target.connection.as_str();
     // E10 — fail-closed consent gate, now classification-aware: no cloud provider is built (so no
@@ -215,6 +268,16 @@ fn make_provider_resolved(
                 // Opt-in: inherit the shell env (restores env ANTHROPIC_API_KEY); DB keys stay stripped.
                 .with_inherit_env(config.claude_code_inherit_env),
         ),
+        PROVIDER_CODEX_CLI => {
+            #[cfg(test)]
+            if let Some(overrides) = &test_overrides {
+                overrides.codex_inner.clone()
+            } else {
+                codex_cli::provider(target.model.clone())
+            }
+            #[cfg(not(test))]
+            codex_cli::provider(target.model.clone())
+        }
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
             let api_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?;
@@ -338,34 +401,62 @@ fn make_provider_resolved(
     // audit row. Non-PII destination label + requested model are computed per provider arm here;
     // The recording-aware constructor also admits the NER load/inference under the exact session
     // token, before any cloud dispatch.
-    let destination = match id {
-        PROVIDER_CLAUDE_CODE => "claude_code (Anthropic CLI)".to_string(),
-        PROVIDER_ANTHROPIC => "api.anthropic.com".to_string(),
-        PROVIDER_GATEWAY => reqwest::Url::parse(&config.gateway_base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| "gateway".to_string()),
-        PROVIDER_OLLAMA => reqwest::Url::parse(&config.ollama_base_url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .unwrap_or_else(|| "ollama".to_string()),
-        _ => id.to_string(),
-    };
+    let destination = provider_egress_destination(id, config);
     // Provenance fix: record the EFFECTIVE model — for anthropic with an empty resolved model
     // that is `anthropic_model` (previously recorded as empty even though the request carried it).
     let model_requested = effective_model_requested(target, config);
-    Ok(Arc::new(
-        crate::summarize::redact::RedactingProvider::with_name_redactor_sink_and_model_admission(
-            inner,
+    #[cfg(test)]
+    let (names, sink) = if let Some(overrides) = test_overrides {
+        (overrides.names, overrides.sink)
+    } else {
+        (
             crate::summarize::redact::active_name_redactor(),
             crate::summarize::egress_log::active_sink(),
-            id.to_string(),
+        )
+    };
+    #[cfg(not(test))]
+    let (names, sink) = (
+        crate::summarize::redact::active_name_redactor(),
+        crate::summarize::egress_log::active_sink(),
+    );
+    Ok(wrap_cloud_provider(
+        inner,
+        names,
+        sink,
+        id.to_string(),
+        destination,
+        model_requested,
+        heavy.clone(),
+        recording_token,
+    ))
+}
+
+/// The one production constructor for content-capable cloud providers. Keeping this as a named seam
+/// lets tests pin Codex to the same regex/name-redaction, ledger and recording-admission wiring that
+/// `make_provider_resolved` uses, without ever spawning the external CLI.
+#[allow(clippy::too_many_arguments)]
+fn wrap_cloud_provider(
+    inner: Arc<dyn SummarizerProvider>,
+    names: Arc<dyn crate::summarize::redact::NameRedactor>,
+    sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+    provider_id: String,
+    destination: String,
+    model_requested: String,
+    heavy: Arc<tokio::sync::Semaphore>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+) -> Arc<dyn SummarizerProvider> {
+    Arc::new(
+        crate::summarize::redact::RedactingProvider::with_name_redactor_sink_and_model_admission(
+            inner,
+            names,
+            sink,
+            provider_id,
             destination,
             model_requested,
-            heavy.clone(),
+            heavy,
             recording_token,
         ),
-    ))
+    )
 }
 
 /// Provider instances for the Settings UI "Provider availability" fan-out.
@@ -377,7 +468,13 @@ fn make_provider_resolved(
 /// keyless `AnthropicProvider` (which then reports `Unavailable`) rather than failing the
 /// whole fan-out. The gateway entry is included ONLY when `gateway_base_url` is non-empty
 /// AND the URL is valid; a bad URL degrades to omission (never panics).
-pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
+///
+/// Sole production consumer: `commands::models::provider_statuses`. Codex is appended there through
+/// its availability-only `codex_cli::probe_availability`; returning the private raw Codex provider
+/// here would create a crate-visible path around the cloud wrapper.
+pub(crate) fn external_process_availability_providers(
+    config: &AppConfig,
+) -> Vec<Arc<dyn SummarizerProvider>> {
     let anthropic_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)
         .ok()
         .flatten();
@@ -422,12 +519,68 @@ pub fn all_providers(config: &AppConfig) -> Vec<Arc<dyn SummarizerProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CaptureCodexProvider {
+        prompts: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SummarizerProvider for CaptureCodexProvider {
+        fn id(&self) -> &str {
+            PROVIDER_CODEX_CLI
+        }
+
+        async fn availability(&self) -> provider::Availability {
+            provider::Availability::Available
+        }
+
+        async fn summarize(
+            &self,
+            req: &provider::SummarizeRequest,
+        ) -> crate::error::Result<String> {
+            Ok(req.transcript.clone())
+        }
+
+        async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push((system.to_string(), user.to_string()));
+            Ok(format!("{system}\n{user}"))
+        }
+    }
+
+    struct FixtureNameRedactor;
+
+    impl redact::NameRedactor for FixtureNameRedactor {
+        fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
+            let scrubbed = text.replace("Alice", "⟪NAME_1⟫");
+            let pairs = (scrubbed != text)
+                .then(|| vec![("⟪NAME_1⟫".to_string(), "Alice".to_string())])
+                .unwrap_or_default();
+            (scrubbed, pairs)
+        }
+    }
+
+    #[derive(Default)]
+    struct CaptureSink {
+        entries: Mutex<Vec<egress_log::EgressEntry>>,
+    }
+
+    impl egress_log::EgressSink for CaptureSink {
+        fn record(&self, entry: egress_log::EgressEntry) {
+            self.entries.lock().unwrap().push(entry);
+        }
+    }
 
     #[test]
     fn egress_is_cloud_classification() {
-        // claude_code and anthropic are always cloud regardless of config.
+        // Claude, Codex, and Anthropic are always cloud regardless of config.
         let cfg = AppConfig::default();
         assert!(egress_is_cloud(PROVIDER_CLAUDE_CODE, &cfg));
+        assert!(egress_is_cloud(PROVIDER_CODEX_CLI, &cfg));
         assert!(egress_is_cloud(PROVIDER_ANTHROPIC, &cfg));
 
         // ollama with default loopback URL is NOT cloud.
@@ -459,6 +612,114 @@ mod tests {
         assert!(!egress_is_cloud(roles::CONN_LOCAL, &cfg));
         assert!(!egress_is_cloud(roles::CONN_OFF, &cfg));
         assert!(!egress_is_cloud(roles::CONN_AFM, &cfg));
+    }
+
+    #[test]
+    fn availability_registry_keeps_the_raw_codex_provider_private() {
+        // The only production caller is `commands::models::provider_statuses`; naming this
+        // registry after its narrow purpose prevents it becoming a generic provider allowlist.
+        // Codex is appended there through an availability-only probe.
+        let ids: Vec<String> = external_process_availability_providers(&AppConfig::default())
+            .into_iter()
+            .map(|provider| provider.id().to_string())
+            .collect();
+        assert!(
+            !ids.iter().any(|id| id == PROVIDER_CODEX_CLI),
+            "availability fan-out must not expose the raw content-capable Codex provider"
+        );
+    }
+
+    #[test]
+    fn production_codex_destination_mapping_is_registered() {
+        assert_eq!(
+            provider_egress_destination(PROVIDER_CODEX_CLI, &AppConfig::default()),
+            CODEX_EGRESS_DESTINATION
+        );
+    }
+
+    #[test]
+    fn codex_is_registered_across_every_provider_id_dispatch_seam() {
+        // Exhaustive grep-audit for provider-id registries:
+        // - this module: cloud classification, legacy factory/model resolution, concrete factory,
+        //   destination provenance;
+        // - redact.rs: ProviderEgressClass::CodexStdin + exact renderers (its dedicated tests);
+        // - roles.rs/router.rs: legacy/explicit role targets, display label, cloud routing (their
+        //   provider identity-matrix tests);
+        // - commands/models.rs: static catalog (lifecycle test);
+        // - commands::save_config_inner: config acceptance/persistence (lifecycle test).
+        // `external_process_availability_providers` is intentionally not an allowlist: its sole
+        // production caller appends the availability-only Codex readiness probe out of band.
+        let config = AppConfig {
+            provider_id: PROVIDER_CODEX_CLI.to_string(),
+            provider_model: "gpt-5.6-terra".to_string(),
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
+        assert!(egress_is_cloud(PROVIDER_CODEX_CLI, &config));
+        assert_eq!(
+            provider_egress_destination(PROVIDER_CODEX_CLI, &config),
+            CODEX_EGRESS_DESTINATION
+        );
+        let target = roles::provider_target(roles::Role::Notes, &config);
+        assert_eq!(target.connection, PROVIDER_CODEX_CLI);
+        assert_eq!(target.model, "gpt-5.6-terra");
+        assert_eq!(effective_model_requested(&target, &config), "gpt-5.6-terra");
+        assert_eq!(roles::connection_display_name(PROVIDER_CODEX_CLI), "Codex");
+        let provider = make_provider(
+            PROVIDER_CODEX_CLI,
+            &config,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .expect("registered Codex id must build through the production factory");
+        assert_eq!(provider.id(), PROVIDER_CODEX_CLI);
+    }
+
+    #[tokio::test]
+    async fn codex_uses_the_production_redaction_and_content_free_ledger_seam() {
+        let inner = Arc::new(CaptureCodexProvider::default());
+        let sink = Arc::new(CaptureSink::default());
+        let provider = wrap_cloud_provider(
+            inner.clone(),
+            Arc::new(FixtureNameRedactor),
+            sink.clone(),
+            PROVIDER_CODEX_CLI.to_string(),
+            provider_egress_destination(PROVIDER_CODEX_CLI, &AppConfig::default()),
+            "gpt-5.6-terra".to_string(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
+        );
+
+        let output = provider
+            .complete(
+                "Summarize for Alice.",
+                "Alice can be reached at alice@example.com.",
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("Alice"));
+        assert!(output.contains("alice@example.com"));
+
+        let prompts = inner.prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        let dispatched = format!("{}\n{}", prompts[0].0, prompts[0].1);
+        assert!(!dispatched.contains("Alice"));
+        assert!(!dispatched.contains("alice@example.com"));
+        assert!(dispatched.contains("⟪NAME_1⟫"));
+        assert!(dispatched.contains("⟪EMAIL_1⟫"));
+        drop(prompts);
+
+        let entries = sink.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.provider_id, PROVIDER_CODEX_CLI);
+        assert_eq!(entry.destination, CODEX_EGRESS_DESTINATION);
+        assert_eq!(entry.model_requested, "gpt-5.6-terra");
+        assert_eq!(entry.call_kind, "complete");
+        assert_eq!(entry.redactions.name, 1);
+        assert_eq!(entry.redactions.email, 1);
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains("Alice"));
+        assert!(!debug.contains("alice@example.com"));
     }
 
     #[test]
@@ -523,7 +784,7 @@ mod tests {
 
     #[test]
     fn cloud_providers_are_redaction_wrapped() {
-        // Both cloud providers must be wrapped so PII is scrubbed before egress. The wrapper is
+        // Every cloud provider must be wrapped so PII is scrubbed before egress. The wrapper is
         // transparent to `id()`, so we assert construction succeeds (with consent granted) and
         // the wrapped provider reports the inner id.
         let cfg = consented_config();
@@ -534,6 +795,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cc.id(), PROVIDER_CLAUDE_CODE);
+        let codex = make_provider(
+            PROVIDER_CODEX_CLI,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
+        assert_eq!(codex.id(), PROVIDER_CODEX_CLI);
         let an = make_provider(
             PROVIDER_ANTHROPIC,
             &cfg,
@@ -560,10 +828,10 @@ mod tests {
 
     #[test]
     fn cloud_providers_refused_without_consent() {
-        // Fail-closed: neither cloud provider can be built until consent is granted, so no
+        // Fail-closed: no cloud provider can be built until consent is granted, so no
         // content can ever be sent before the user has acknowledged egress.
         let cfg = AppConfig::default(); // consent OFF
-        for id in [PROVIDER_CLAUDE_CODE, PROVIDER_ANTHROPIC] {
+        for id in [PROVIDER_CLAUDE_CODE, PROVIDER_CODEX_CLI, PROVIDER_ANTHROPIC] {
             // `dyn SummarizerProvider` isn't Debug, so inspect the Result without `{:?}`.
             let res = make_provider(id, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)));
             assert!(
@@ -597,7 +865,7 @@ mod tests {
             "granted consent must build the cloud provider"
         );
         cfg.revoke_cloud_egress(&db).unwrap();
-        for id in [PROVIDER_CLAUDE_CODE, PROVIDER_ANTHROPIC] {
+        for id in [PROVIDER_CLAUDE_CODE, PROVIDER_CODEX_CLI, PROVIDER_ANTHROPIC] {
             let res = make_provider(id, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)));
             assert!(
                 matches!(res, Err(crate::error::AppError::Unavailable(_))),
@@ -866,6 +1134,11 @@ mod tests {
         assert_eq!(effective_model_requested(&t("gateway", ""), &cfg), "gpt-4o");
         // claude_code's default is the CLI's own — unknowable here, stays "".
         assert_eq!(effective_model_requested(&t("claude_code", ""), &cfg), "");
+        assert_eq!(effective_model_requested(&t("codex_cli", ""), &cfg), "");
+        assert_eq!(
+            effective_model_requested(&t("codex_cli", "gpt-5.6-terra"), &cfg),
+            "gpt-5.6-terra"
+        );
         assert_eq!(
             effective_model_requested(&t("claude_code", "claude-haiku-4-5"), &cfg),
             "claude-haiku-4-5"
