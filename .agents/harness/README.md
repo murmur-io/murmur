@@ -60,6 +60,11 @@ scripts/agent-harness open attachment-loss \
 
 `open` starts from a committed base, creates
 `../.murmur-agent-tasks/v2/<task-id>/meetnotes`, and prints the exact worktree.
+If that committed tree has the pinned `murmur-server` Cargo path dependency,
+`open` also creates and prints an exact-revision local shared clone at
+`../.murmur-agent-tasks/v2/<task-id>/murmur-server`. Its Git metadata stays
+inside the task root, so focused Rust commands work immediately without
+mutating the sibling repository's worktree registry.
 The primary checkout's dirty bytes are never copied. Edit only the printed
 worktree and stay inside the declared `--owned` paths. After opening, invoke the
 task worktree's own `scripts/agent-harness`; the runner refuses a caller whose
