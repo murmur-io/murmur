@@ -64,9 +64,12 @@ an interruption resumes from the same evidence. Git-control archives larger
 than 512 MiB fail closed while all task bytes remain in place. These checks
 protect against crashes and cooperating local processes; as with any
 point-in-time filesystem proof, a malicious process running as the same UID can
-race a completed check. The current Murmur runner records and explicitly
-requires Git's SHA-1 object format. Cleanup also refuses without moving the
-worktree while any process still has a cwd or open file inside it.
+race a completed check. Runner-owned verification snapshots may discard only
+the four exact runtime-helper filenames in their dedicated allowlist;
+other ignored files, directories, and caches remain forbidden there. The
+current Murmur runner records and explicitly requires Git's SHA-1 object
+format. Cleanup also refuses without moving the worktree while any process
+still has a cwd or open file inside it.
 
 ## What is automatic
 
