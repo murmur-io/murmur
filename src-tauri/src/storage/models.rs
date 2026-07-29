@@ -608,6 +608,44 @@ pub struct SearchHit {
     pub matched_in: String,
 }
 
+/// One visibility-gated FTS transcript match before presentation-channel projection.
+///
+/// The tool layer joins this stable stored segment id against the canonical rendered projection.
+/// That is what lets the final hit carry a character offset in the exact same coordinate system as
+/// `get_meeting`, while a `merged` projection may safely omit an echoed raw segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSegmentHit {
+    pub meeting_id: String,
+    pub meeting_title: String,
+    pub seg_idx: i64,
+}
+
+/// One persisted raw capture-lane segment plus explicit presentation-only echo provenance.
+///
+/// `echo_suppressed` is set only by the ingest path after measured acoustic leak evidence. Legacy
+/// rows and deserialized payloads that predate the field default to visible, so read-time rendering
+/// never guesses from text/timestamps and never hides old data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredTranscriptSegment {
+    #[serde(flatten)]
+    pub segment: crate::transcribe::types::Segment,
+    #[serde(default)]
+    pub echo_suppressed: bool,
+}
+
+/// A visibility-gated enrolled speaker label without the biometric embedding.
+///
+/// Transcript rendering needs only the cluster-to-name mapping. Keeping this DTO separate from the
+/// full voiceprint row prevents a read-only text response from loading CAM++ biometric vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibleSpeakerLabel {
+    pub cluster_index: i64,
+    pub label: String,
+}
+
 /// Lightweight metadata for one uploaded document — the FE list DTO. Carries NO text (the text is
 /// gated content surfaced only by `get_document`, never in the list). `created_at` is epoch millis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
