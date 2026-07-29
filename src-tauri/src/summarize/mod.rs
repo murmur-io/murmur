@@ -25,6 +25,7 @@ pub mod meta;
 /// at runtime by `redact::active_name_redactor` when the NER model dir is present, else the
 /// byte-identical `NoopNameRedactor` (so a no-model build's name egress is unchanged).
 pub mod ner_deberta;
+pub(crate) mod note_sections;
 pub mod ollama;
 pub mod organize;
 pub mod provider;
