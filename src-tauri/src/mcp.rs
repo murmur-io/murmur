@@ -1630,7 +1630,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "list_recent_meetings",
-            "description": "List the most recent meetings (title, date, status, id).",
+            "description": "List the most recent visible meetings for triage: title/date/status/id plus durationSeconds, transcriptChars, hasVisibleNote, and deterministic statusDetail for Error rows ('no transcript' or 'partial transcript'). Sealed-and-locked meetings are excluded.",
             "inputSchema": { "type": "object", "properties": { "limit": { "type": "number" } } }
         },
         {
@@ -1652,6 +1652,16 @@ fn tools_spec() -> Value {
             "name": "knowledge_diff",
             "description": "The DECISION LEDGER for one person or project: what you knew about it changed over time (bitemporal facts). Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id, plus two ISO-8601 instants 'from' and 'to' (e.g. '2026-06-01T00:00:00Z'). Returns what CHANGED between those two moments (added / removed / changed facts, e.g. status in-progress → shipped) PLUS the full chronological supersession ledger — each decision carries the old value, the new value, when it took effect, and the source meeting id. Answers 'what changed since', 'when did X flip', 'the history of Y's status'. Sealed-and-locked meetings' facts are excluded.",
             "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" }, "from": { "type": "string", "description": "ISO-8601 instant to snapshot the earlier state at." }, "to": { "type": "string", "description": "ISO-8601 instant to snapshot the later state at." } }, "required": ["entity", "from", "to"] }
+        },
+        {
+            "name": "list_entities",
+            "description": "List visible people and projects with their exact id, type, and visible meeting-mention count. Use this local discovery tool before get_entity_dossier or knowledge_diff instead of guessing a name. Optionally filter by a bounded case-insensitive substring. Results are newest-lock-snapshot safe, default to 40, and never exceed 100. Entities known only from sealed-and-locked meetings are excluded.",
+            "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "Optional case-insensitive substring filter (first 128 characters are used)." }, "limit": { "type": "number", "description": "Maximum results (default 40, maximum 100)." } } }
+        },
+        {
+            "name": "list_note_folders",
+            "description": "List visible note folders with the exact id/name accepted by query_database, visible record count, and typed columns. Call this before guessing a folder. A sealed-and-not-session-unlocked folder is absent together with its name, id, count, and schema.",
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "org_search",
@@ -1748,6 +1758,7 @@ fn mcp_usize_arg(args: &Value, key: &str) -> usize {
 /// and page the rest with explicit `offset`. A client that DOES pass paging is honored verbatim.
 /// DELIBERATE default change (documented): the pre-fix MCP default `(0,0)` returned the whole body.
 const MCP_DEFAULT_WINDOW_CHARS: usize = 6000;
+const MCP_ENTITY_FILTER_MAX_CHARS: usize = 128;
 
 /// Resolve the MCP paging window for a body tool: honor an explicit `maxChars`, but whenever the
 /// client gives no (or a zero) `maxChars`, bound it to [`MCP_DEFAULT_WINDOW_CHARS`] so a huge payload
@@ -1796,6 +1807,20 @@ fn dispatch_tool(
                 .unwrap_or("")
                 .to_string(),
         },
+        "list_entities" => ToolCall::ListEntities {
+            query: args
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+                .map(|query| query.chars().take(MCP_ENTITY_FILTER_MAX_CHARS).collect()),
+            limit: args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(40)
+                .clamp(1, 100) as usize,
+        },
+        "list_note_folders" => ToolCall::ListNoteFolders,
         "search_transcript" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             ToolCall::SearchTranscript {
@@ -2029,10 +2054,18 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_thirteen_tools() {
+    fn tools_list_has_fifteen_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 15);
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_entities"),
+            "entity discovery must be advertised on local MCP"
+        );
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_note_folders"),
+            "note-folder discovery must be advertised on local MCP"
+        );
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -4186,6 +4219,324 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// R2 folder discovery uses one gated catalog for listing, exact name/id resolution,
+    /// alternatives, visible record count, and schema. A locked exact name/id must therefore be
+    /// byte-identical to an absent lookup and leak none of those fields.
+    #[test]
+    fn note_folder_discovery_and_exact_lookup_share_one_visibility_gate() {
+        use crate::storage::models::{NoteFolder, PropertyKind, PropertySchemaField};
+
+        let (db, p) = temp_db();
+        for (id, name, locked) in [
+            ("nf-open", "Roadmap", false),
+            ("nf-secret", "Secret Salaries", true),
+        ] {
+            db.insert_note_folder(
+                &NoteFolder {
+                    id: id.into(),
+                    name: name.into(),
+                    path: format!("Notes/{name}"),
+                    parent_id: None,
+                    locked,
+                    unlocked: false,
+                    is_root: false,
+                    kind: "note".into(),
+                },
+                "2026-07-29T00:00:00Z",
+            )
+            .unwrap();
+            db.set_note_folder_schema(
+                id,
+                &[PropertySchemaField {
+                    key: if locked { "compensation" } else { "status" }.into(),
+                    kind: PropertyKind::Select,
+                    options: vec!["Open".into()],
+                }],
+            )
+            .unwrap();
+            db.insert_note(
+                &format!("note-{id}"),
+                id,
+                &format!("slug-{id}"),
+                if locked {
+                    "Secret Pay Plan"
+                } else {
+                    "Public Plan"
+                },
+                "---\nstatus: Open\n---\nbody",
+                1_000,
+            )
+            .unwrap();
+        }
+
+        let listed = dispatch_tool(&db, "list_note_folders", &json!({}), &HashSet::new()).unwrap();
+        assert!(
+            listed.contains("Roadmap")
+                && listed.contains("id:nf-open")
+                && listed.contains("visibleRecords:1")
+                && listed.contains("typedColumns:status:select"),
+            "visible folder metadata must be discoverable: {listed}"
+        );
+        assert!(
+            !listed.contains("Secret")
+                && !listed.contains("nf-secret")
+                && !listed.contains("compensation"),
+            "sealed folder name/id/count/schema leaked: {listed}"
+        );
+
+        let lookup = |folder: &str| {
+            dispatch_tool(
+                &db,
+                "query_database",
+                &json!({ "folder": folder, "filter": "" }),
+                &HashSet::new(),
+            )
+            .unwrap()
+        };
+        let locked_name = lookup("Secret Salaries");
+        let locked_id = lookup("nf-secret");
+        let absent = lookup("definitely-absent");
+        assert_eq!(locked_name, absent);
+        assert_eq!(locked_id, absent);
+        assert!(
+            absent.contains("Available: Roadmap")
+                && !absent.contains("Secret")
+                && !absent.contains("nf-secret"),
+            "only visible alternatives may appear: {absent}"
+        );
+
+        let mut unlocked = HashSet::new();
+        unlocked.insert("nf-secret".to_string());
+        let unlocked_list = dispatch_tool(&db, "list_note_folders", &json!({}), &unlocked).unwrap();
+        assert!(
+            unlocked_list.contains("Secret Salaries")
+                && unlocked_list.contains("compensation:select"),
+            "session-unlocked folder must become discoverable: {unlocked_list}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Entity discovery and suggestions must come only from `list_entities_visible`. Suggestions
+    /// recover prefix/substring/initialism/typo misses without weakening the exact resolver itself.
+    #[test]
+    fn entity_discovery_and_did_you_mean_exclude_sealed_entities() {
+        use crate::storage::models::{EntityKind, Folder};
+
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-secret".into(),
+            name: "Private".into(),
+            path: "Private".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-29T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed(&db, "m-open", "Visible", "KO project", None);
+        seed(
+            &db,
+            "m-secret",
+            "Secret",
+            "Classified Phoenix",
+            Some("f-secret"),
+        );
+        let ko = db.upsert_entity("KO", EntityKind::Project).unwrap();
+        let connect = db.upsert_entity("Connect", EntityKind::Project).unwrap();
+        let phoenix = db.upsert_entity("Phoenix", EntityKind::Project).unwrap();
+        db.add_mention(&ko, "m-open").unwrap();
+        db.add_mention(&connect, "m-open").unwrap();
+        for idx in 0..6 {
+            let candidate = db
+                .upsert_entity(&format!("Concord {idx}"), EntityKind::Project)
+                .unwrap();
+            db.add_mention(&candidate, "m-open").unwrap();
+        }
+        db.add_mention(&phoenix, "m-secret").unwrap();
+        db.set_folder_locked("f-secret", true, None).unwrap();
+
+        let listed = dispatch_tool(&db, "list_entities", &json!({}), &HashSet::new()).unwrap();
+        assert!(
+            listed.contains("KO")
+                && listed.contains("type:project")
+                && listed.contains("visibleMentions:1")
+        );
+        assert!(
+            !listed.contains("Phoenix"),
+            "sealed-only entity leaked through discovery: {listed}"
+        );
+
+        let miss = dispatch_tool(
+            &db,
+            "get_entity_dossier",
+            &json!({ "entity": "Kong Operator", "noteDetail": "none" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            miss.starts_with("No visible entity matching")
+                && miss.contains("Did you mean: KO?")
+                && !miss.contains("DOSSIER"),
+            "initialism must suggest, not weaken exact resolution: {miss}"
+        );
+        let diff_miss = dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({
+                "entity": "Kong Operator",
+                "from": "2026-07-01T00:00:00Z",
+                "to": "2026-07-29T00:00:00Z"
+            }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            diff_miss.contains("Did you mean: KO?"),
+            "knowledge_diff must use the same suggestion path: {diff_miss}"
+        );
+        let typo = dispatch_tool(
+            &db,
+            "get_entity_dossier",
+            &json!({ "entity": "Conect", "noteDetail": "none" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            typo.contains("Did you mean: Connect?"),
+            "edit distance <=2 should recover a typo: {typo}"
+        );
+        let bounded = dispatch_tool(
+            &db,
+            "get_entity_dossier",
+            &json!({ "entity": "Conc", "noteDetail": "none" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let suggestions = bounded
+            .split_once("Did you mean: ")
+            .map(|(_, names)| names.trim_end_matches('?'))
+            .expect("prefix suggestions");
+        assert_eq!(
+            suggestions.split(", ").count(),
+            5,
+            "suggestions must be capped at five: {bounded}"
+        );
+        let sealed_miss = dispatch_tool(
+            &db,
+            "get_entity_dossier",
+            &json!({ "entity": "Phoenx", "noteDetail": "none" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            !sealed_miss.contains("Phoenix"),
+            "typo suggestions became a sealed-name oracle: {sealed_miss}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn entity_discovery_defaults_to_forty_and_clamps_to_one_hundred() {
+        use crate::storage::models::EntityKind;
+
+        let (db, p) = temp_db();
+        seed(&db, "m-catalog", "Catalog", "catalog body", None);
+        for idx in 0..105 {
+            let id = db
+                .upsert_entity(&format!("Entity {idx:03}"), EntityKind::Project)
+                .unwrap();
+            db.add_mention(&id, "m-catalog").unwrap();
+        }
+        let listed =
+            |args: Value| dispatch_tool(&db, "list_entities", &args, &HashSet::new()).unwrap();
+        assert_eq!(listed(json!({})).lines().count(), 40);
+        assert_eq!(listed(json!({ "limit": 999 })).lines().count(), 100);
+        assert_eq!(listed(json!({ "limit": 0 })).lines().count(), 1);
+        let filtered = listed(json!({ "query": "entity 042", "limit": 100 }));
+        assert_eq!(filtered.lines().count(), 1);
+        assert!(filtered.contains("Entity 042"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Meeting triage is one visibility-gated aggregate. Error detail is deterministic from the
+    /// visible transcript size, and no sealed row contributes any metadata.
+    #[test]
+    fn recent_meeting_triage_reports_sizes_and_error_detail_without_sealed_rows() {
+        use crate::storage::models::{Folder, MeetingStatus};
+        use crate::transcribe::types::Segment;
+
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-secret".into(),
+            name: "Private".into(),
+            path: "Private".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-29T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed(&db, "m-empty", "Broken empty", "visible note", None);
+        seed(&db, "m-partial", "Broken partial", "visible note", None);
+        seed(
+            &db,
+            "m-secret",
+            "Secret broken",
+            "sealed note",
+            Some("f-secret"),
+        );
+        for id in ["m-empty", "m-partial", "m-secret"] {
+            db.update_meeting_status(id, MeetingStatus::Error).unwrap();
+        }
+        for id in ["m-partial", "m-secret"] {
+            db.insert_segments(
+                id,
+                &[Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 1.0,
+                    text: "partial words".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                }],
+            )
+            .unwrap();
+        }
+        db.set_folder_locked("f-secret", true, None).unwrap();
+
+        let out = dispatch_tool(
+            &db,
+            "list_recent_meetings",
+            &json!({ "limit": 20 }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let empty = out
+            .lines()
+            .find(|line| line.contains("Broken empty"))
+            .expect("empty error row");
+        assert!(
+            empty.contains("status:Error")
+                && empty.contains("statusDetail:no transcript")
+                && empty.contains("durationSeconds:60")
+                && empty.contains("transcriptChars:0")
+                && empty.contains("hasVisibleNote:true"),
+            "empty error triage fields: {empty}"
+        );
+        let partial = out
+            .lines()
+            .find(|line| line.contains("Broken partial"))
+            .expect("partial error row");
+        assert!(
+            partial.contains("statusDetail:partial transcript")
+                && partial.contains("transcriptChars:13"),
+            "partial error triage fields: {partial}"
+        );
+        assert!(
+            !out.contains("Secret broken") && !out.contains("m-secret"),
+            "sealed meeting metadata leaked through triage: {out}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// Phase 5b: `get_entity_dossier` is visibility-gated AND egress-free. A sealed-and-not-unlocked
     /// mentioning meeting contributes nothing to the dossier payload (no title, no note body), and
     /// reappears once the folder is session-unlocked. The dispatch builds GATED STRUCTURED DATA only
@@ -4646,7 +4997,7 @@ mod tests {
         // Locked, not unlocked → the "no outline" sentinel; the heading trail must NOT leak.
         let out = dispatch_tool(&db, "get_document_outline", &args, &HashSet::new()).unwrap();
         assert!(
-            out.contains("No outline for document od1"),
+            out.contains("No outline for that document"),
             "sealed → sentinel: {out}"
         );
         assert!(
@@ -4665,6 +5016,61 @@ mod tests {
         assert!(
             out2.contains("SecretDesign › Keys (p.2)"),
             "document order preserved: {out2}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A visible meeting id redirects to `get_meeting`, but a locked meeting id remains literally
+    /// byte-identical to an absent id. The visibility check must run before the raw existence read.
+    #[test]
+    fn document_outline_redirects_only_for_visible_meeting_ids() {
+        use crate::storage::models::Folder;
+
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-secret".into(),
+            name: "Private".into(),
+            path: "Private".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-29T00:00:00Z".into(),
+        })
+        .unwrap();
+        seed(&db, "m-visible", "Visible meeting", "note", None);
+        seed(
+            &db,
+            "m-secret",
+            "Secret meeting",
+            "secret note",
+            Some("f-secret"),
+        );
+        db.set_folder_locked("f-secret", true, None).unwrap();
+
+        let outline = |id: &str| {
+            dispatch_tool(
+                &db,
+                "get_document_outline",
+                &json!({ "documentId": id }),
+                &HashSet::new(),
+            )
+            .unwrap()
+        };
+        let visible = outline("m-visible");
+        assert!(
+            visible.contains("m-visible is a MEETING") && visible.contains("get_meeting"),
+            "visible meeting should redirect: {visible}"
+        );
+        let locked = outline("m-secret");
+        let absent = outline("absent-id");
+        assert_eq!(
+            locked, absent,
+            "locked and absent ids require a byte-identical sentinel"
+        );
+        assert!(
+            !locked.contains("m-secret")
+                && !locked.contains("Secret meeting")
+                && !locked.contains("MEETING"),
+            "locked meeting existence leaked: {locked}"
         );
         let _ = std::fs::remove_file(&p);
     }
