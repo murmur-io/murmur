@@ -1,7 +1,7 @@
 <!-- Generated 2026-07-27 via /research (murmur-researcher fan-out). Pricing/funding/version = point-in-time. -->
 # Research: Harness root cause and simplification
 
-> **Implementation update — 2026-07-28.** The recommended verifier-only
+> **Implementation update — 2026-07-29.** The recommended verifier-only
 > architecture is now on `murmur`. PR #496 landed the v2 engine; #499 activated
 > the generation-aware CLI and resumable evidence lifecycle; #501 made
 > verification snapshots self-contained under Seatbelt; #513 made the shared
@@ -54,7 +54,8 @@
 > historical context from currently visible notes and revalidates visibility
 > before sending the loopback response. The final local run passed 2,560 Rust
 > tests and combined, lock-security, and egress-security reviews with no
-> findings or proof gaps.
+> findings or proof gaps; the merge receipt, Web lane, Rust lane, and
+> release-parity gate also passed remotely before #522 was merged.
 >
 > One measured performance cost remains: each fresh exact-diff attempt gets a
 > new absolute verification-snapshot path, which invalidates part of Cargo's
