@@ -21,7 +21,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-import task_runner as legacy
+import runtime
 
 
 V2_STATES = {
@@ -109,7 +109,7 @@ PROTOCOL_FILES = (
     ".claude/rules/agentic-workflow.md",
     ".agents/harness/cli.py",
     ".agents/harness/verifier.py",
-    ".agents/harness/task_runner.py",
+    ".agents/harness/runtime.py",
     ".agents/harness/process_guardian.py",
     ".agents/harness/hook_guard.py",
     ".agents/harness/config_audit.py",
@@ -142,7 +142,7 @@ PROTOCOL_FILES = (
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
 
-class ReviewPaused(legacy.HarnessError):
+class ReviewPaused(runtime.HarnessError):
     """A reviewer infrastructure failure exhausted the one bounded retry."""
 
     def __init__(self, message: str, attempts: Sequence[Mapping[str, Any]]) -> None:
@@ -166,7 +166,7 @@ def last_state_event(task_dir: Path) -> Optional[Dict[str, Any]]:
                 ):
                     result = document["state"]
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"v2 event ledger is malformed: {path}: {exc}"
         ) from exc
     return result
@@ -177,30 +177,30 @@ def load_v2_state(task_dir: Path) -> Dict[str, Any]:
 
     event_state = last_state_event(task_dir)
     if event_state is None:
-        raise legacy.HarnessError("v2 state has no authoritative event")
+        raise runtime.HarnessError("v2 state has no authoritative event")
     if (
         event_state.get("schema_version") != 2
         or event_state.get("task_id") != task_dir.name
         or event_state.get("status") not in V2_STATES
         or not isinstance(event_state.get("updated_at"), str)
     ):
-        raise legacy.HarnessError("v2 authoritative state event is malformed")
-    event_time = legacy.parse_timestamp(
+        raise runtime.HarnessError("v2 authoritative state event is malformed")
+    event_time = runtime.parse_timestamp(
         event_state["updated_at"], "v2 state event updated_at"
     )
     state_path = task_dir / "state.json"
     if not state_path.is_file():
-        legacy.atomic_write_json(state_path, event_state)
+        runtime.atomic_write_json(state_path, event_state)
         return event_state
-    projected = legacy.load_json(state_path)
+    projected = runtime.load_json(state_path)
     if (
         projected.get("schema_version") != 2
         or projected.get("task_id") != task_dir.name
         or projected.get("status") not in V2_STATES
         or not isinstance(projected.get("updated_at"), str)
     ):
-        raise legacy.HarnessError("v2 state projection is malformed")
-    projected_time = legacy.parse_timestamp(
+        raise runtime.HarnessError("v2 state projection is malformed")
+    projected_time = runtime.parse_timestamp(
         projected["updated_at"], "v2 state projection updated_at"
     )
     event_revision = event_state.get("state_revision")
@@ -214,39 +214,39 @@ def load_v2_state(task_dir: Path) -> Dict[str, Any]:
             or not isinstance(revision, int)
             or revision < 1
         ):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 state {label} revision is malformed"
             )
     if event_revision is not None:
         if projected_revision is not None:
             if projected_revision > event_revision:
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "v2 state projection is newer than its event ledger"
                 )
             if (
                 projected_revision == event_revision
                 and projected != event_state
             ):
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "v2 state projection conflicts at the same revision"
                 )
     elif projected_revision is not None:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 revised state projection has a legacy event ledger"
         )
     elif projected_time > event_time or (
         projected_time == event_time and projected != event_state
     ):
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 state projection is newer than or conflicts with its event ledger"
         )
     if projected != event_state:
-        legacy.atomic_write_json(state_path, event_state)
+        runtime.atomic_write_json(state_path, event_state)
     return event_state
 
 
 def canonical_hash(value: Any) -> str:
-    return legacy.sha256_bytes(legacy.canonical_json(value))
+    return runtime.sha256_bytes(runtime.canonical_json(value))
 
 
 def document_hash(document: Mapping[str, Any], hash_field: str) -> str:
@@ -264,12 +264,12 @@ def validate_hashed_document(
     schema: Optional[Mapping[str, Any]] = None,
 ) -> None:
     selected_schema = (
-        dict(schema) if schema is not None else legacy.load_schema(schema_name)
+        dict(schema) if schema is not None else runtime.load_schema(schema_name)
     )
-    legacy.validate_schema(dict(document), selected_schema, label=label)
+    runtime.validate_schema(dict(document), selected_schema, label=label)
     expected = document_hash(document, hash_field)
     if document.get(hash_field) != expected:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"{label} {hash_field} mismatch: expected {expected}, found {document.get(hash_field)}"
         )
 
@@ -278,7 +278,7 @@ def protocol_relative_paths(worktree: Path) -> List[str]:
     values = set(PROTOCOL_FILES)
     harness_root = worktree / ".agents" / "harness"
     if not harness_root.is_dir() or harness_root.is_symlink():
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 protocol directory is missing or unsafe: .agents/harness"
         )
     # New runner modules must enter the protocol automatically.  A hand-kept
@@ -291,7 +291,7 @@ def protocol_relative_paths(worktree: Path) -> List[str]:
         if not path.is_file() or path.is_symlink()
     ]
     if unsafe_python:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 protocol Python module is missing or unsafe: "
             + ", ".join(unsafe_python)
         )
@@ -305,7 +305,7 @@ def protocol_relative_paths(worktree: Path) -> List[str]:
     ):
         root = worktree / directory
         if not root.is_dir() or root.is_symlink():
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 protocol directory is missing or unsafe: {directory}"
             )
         values.update(
@@ -321,11 +321,11 @@ def protocol_bundle(worktree: Path) -> Dict[str, Any]:
     for relative in protocol_relative_paths(worktree):
         path = worktree / relative
         if not path.is_file() or path.is_symlink():
-            raise legacy.HarnessError(f"v2 protocol file is missing or unsafe: {relative}")
+            raise runtime.HarnessError(f"v2 protocol file is missing or unsafe: {relative}")
         files.append(
             {
                 "path": relative,
-                "sha256": legacy.sha256_file(path),
+                "sha256": runtime.sha256_file(path),
             }
         )
     bundle: Dict[str, Any] = {
@@ -342,7 +342,7 @@ def executable_protocol_bundle(worktree: Path) -> Dict[str, Any]:
     executing = protocol_bundle(SOURCE_ROOT)
     pinned = protocol_bundle(worktree)
     if executing != pinned:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "the executing Harness v2 protocol differs from the task worktree; "
             f"run {worktree / 'scripts' / 'agent-harness'} for this task"
         )
@@ -358,7 +358,7 @@ def git_file_at_commit(repo: Path, commit_sha: str, relative: str) -> bytes:
         check=False,
     )
     if completed.returncode != 0:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"v2 attested commit is missing required file: {relative}"
         )
     return completed.stdout
@@ -372,11 +372,11 @@ def attested_json_object(
             git_file_at_commit(repo, commit_sha, relative).decode("utf-8")
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"v2 attested {label} is malformed"
         ) from exc
     if not isinstance(document, dict):
-        raise legacy.HarnessError(f"v2 attested {label} is not an object")
+        raise runtime.HarnessError(f"v2 attested {label} is not an object")
     return document
 
 
@@ -393,7 +393,7 @@ def attested_schema(
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
     return any(
-        re.fullmatch(legacy._glob_pattern_to_regex(pattern), path)
+        re.fullmatch(runtime._glob_pattern_to_regex(pattern), path)
         for pattern in patterns
     )
 
@@ -402,14 +402,14 @@ def actual_risks(paths: Sequence[str], config: Mapping[str, Any]) -> List[str]:
     result: List[str] = []
     classification = config.get("risk_classification", {})
     if not isinstance(classification, Mapping):
-        raise legacy.HarnessError("risk_classification is malformed")
+        raise runtime.HarnessError("risk_classification is malformed")
     for risk in ("lock", "egress", "protocol"):
         patterns = classification.get(risk, [])
         if not isinstance(patterns, list):
-            raise legacy.HarnessError(f"risk_classification.{risk} is malformed")
+            raise runtime.HarnessError(f"risk_classification.{risk} is malformed")
         if any(
             isinstance(pattern, str)
-            and re.fullmatch(legacy._glob_pattern_to_regex(pattern), path)
+            and re.fullmatch(runtime._glob_pattern_to_regex(pattern), path)
             for path in paths
             for pattern in patterns
         ):
@@ -510,10 +510,10 @@ def derive_profile(
     claim_set = set(claims)
     unknown_claims = claim_set - {"runtime", "performance"}
     if unknown_claims:
-        raise legacy.HarnessError("unknown v2 claims: " + ", ".join(sorted(unknown_claims)))
+        raise runtime.HarnessError("unknown v2 claims: " + ", ".join(sorted(unknown_claims)))
     canonical = config.get("canonical_checks", {})
     if not isinstance(canonical, Mapping):
-        raise legacy.HarnessError("canonical_checks is malformed")
+        raise runtime.HarnessError("canonical_checks is malformed")
     timeout = int(config.get("check_timeout_seconds", 1800))
     check_ids: List[str] = []
 
@@ -553,13 +553,13 @@ def derive_profile(
     reviews = [{"kind": "combined", "vendor": reviewer}]
     opposite = {"claude": "codex", "codex": "claude", "fake": "fake"}.get(reviewer)
     if opposite is None:
-        raise legacy.HarnessError(f"unsupported v2 reviewer: {reviewer}")
+        raise runtime.HarnessError(f"unsupported v2 reviewer: {reviewer}")
     specialist_vendor = reviewer if allow_same_vendor_high_risk else opposite
     mapping = config.get("risk_reviews", {})
     for risk in risks:
         kind = mapping.get(risk) if isinstance(mapping, Mapping) else None
         if not isinstance(kind, str):
-            raise legacy.HarnessError(f"no specialist review configured for {risk}")
+            raise runtime.HarnessError(f"no specialist review configured for {risk}")
         reviews.append({"kind": kind, "vendor": specialist_vendor})
     return checks, reviews, risks
 
@@ -568,11 +568,11 @@ def canonical_check(
     check_id: str, config: Mapping[str, Any]
 ) -> Dict[str, Any]:
     if check_id not in ALLOWED_PROBES:
-        raise legacy.HarnessError(f"probe/check id is not allowlisted: {check_id}")
+        raise runtime.HarnessError(f"probe/check id is not allowlisted: {check_id}")
     canonical = config.get("canonical_checks", {})
     command = canonical.get(check_id) if isinstance(canonical, Mapping) else None
     if not isinstance(command, str) or not command.strip():
-        raise legacy.HarnessError(f"no canonical command for v2 check {check_id}")
+        raise runtime.HarnessError(f"no canonical command for v2 check {check_id}")
     return {
         "id": check_id,
         "command": command,
@@ -590,14 +590,14 @@ def allowed_probe_ids(plan: Mapping[str, Any]) -> List[str]:
 
     checks = plan.get("checks", [])
     if not isinstance(checks, list):
-        raise legacy.HarnessError("v2 plan checks are malformed")
+        raise runtime.HarnessError("v2 plan checks are malformed")
     result: List[str] = []
     for check in checks:
         if not isinstance(check, Mapping):
-            raise legacy.HarnessError("v2 plan check is malformed")
+            raise runtime.HarnessError("v2 plan check is malformed")
         check_id = check.get("id")
         if not isinstance(check_id, str) or check_id not in ALLOWED_PROBES:
-            raise legacy.HarnessError("v2 plan contains a non-canonical probe id")
+            raise runtime.HarnessError("v2 plan contains a non-canonical probe id")
         if check_id not in result:
             result.append(check_id)
     return result
@@ -629,13 +629,13 @@ def build_plan(
             contract.get("allow_same_vendor_high_risk", False)
         ),
     )
-    head_sha = legacy.git(worktree, "rev-parse", "HEAD")
+    head_sha = runtime.git(worktree, "rev-parse", "HEAD")
     plan: Dict[str, Any] = {
         "schema_version": 2,
         "task_id": contract["task_id"],
         "contract_sha256": contract["contract_sha256"],
         "base_sha": head_sha,
-        "diff_sha256": legacy.sha256_bytes(diff),
+        "diff_sha256": runtime.sha256_bytes(diff),
         "tree_sha": tree_sha,
         "protocol_sha256": bundle["protocol_sha256"],
         "changed_paths": list(paths),
@@ -652,7 +652,7 @@ def build_plan(
         "plan_sha256": "",
     }
     plan["plan_sha256"] = document_hash(plan, "plan_sha256")
-    legacy.validate_schema(plan, legacy.load_schema("v2-plan"), label="v2 plan")
+    runtime.validate_schema(plan, runtime.load_schema("v2-plan"), label="v2 plan")
     return plan, bundle
 
 
@@ -663,39 +663,39 @@ def snapshot_scoped_diff(
 ) -> Tuple[List[str], bytes, str]:
     """Snapshot all Git-visible task bytes through a private temporary index.
 
-    Unlike the v1 staging primitive this never resets or writes the developer's
-    real index.  Untracked files and deletions are represented exactly, and the
-    resulting tree SHA is the one a later v2 commit must reproduce.
+    This never resets or writes the developer's real index. Untracked files and
+    deletions are represented exactly, and the resulting tree SHA is the one a
+    later receipt commit must reproduce.
     """
 
-    if legacy.git(worktree, "rev-parse", "HEAD") != contract["base_sha"]:
-        raise legacy.HarnessError(
-            "v2 task HEAD changed; import/re-open against the actual parent before verification"
+    if runtime.git(worktree, "rev-parse", "HEAD") != contract["base_sha"]:
+        raise runtime.HarnessError(
+            "task HEAD changed; clean and re-open against the actual parent before verification"
         )
-    paths = legacy.changed_paths(worktree)
+    paths = runtime.changed_paths(worktree)
     violations = [
         path
         for path in paths
-        if not legacy.path_is_owned(path, contract["owned_paths"])
+        if not runtime.path_is_owned(path, contract["owned_paths"])
     ]
     if violations:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "out-of-scope v2 changes: " + ", ".join(violations)
         )
-    unsafe = legacy.unsafe_changed_nodes(worktree, paths)
+    unsafe = runtime.unsafe_changed_nodes(worktree, paths)
     if unsafe:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "unsafe changed nodes in v2 task: " + ", ".join(unsafe)
         )
-    contaminated = legacy.tool_output_contaminated_paths(worktree, paths)
+    contaminated = runtime.tool_output_contaminated_paths(worktree, paths)
     if contaminated:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "renderer-truncated output exists in changed files: "
             + ", ".join(contaminated)
         )
-    runtime = task_dir / "runtime"
-    runtime.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_index = tempfile.mkstemp(prefix="v2-index-", dir=str(runtime))
+    runtime_dir = task_dir / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_index = tempfile.mkstemp(prefix="v2-index-", dir=str(runtime_dir))
     os.close(descriptor)
     index_path = Path(raw_index)
     environment = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
@@ -746,12 +746,12 @@ def snapshot_scoped_diff(
         ).stdout.strip()
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else str(exc.stderr)
-        raise legacy.HarnessError(f"could not snapshot v2 diff: {stderr.strip()}") from exc
+        raise runtime.HarnessError(f"could not snapshot v2 diff: {stderr.strip()}") from exc
     finally:
         index_path.unlink(missing_ok=True)
     if bool(diff) != bool(contract["expected_change"]):
         expectation = "requires a change" if contract["expected_change"] else "is no-change"
-        raise legacy.HarnessError(f"v2 task {expectation}, but exact diff presence disagrees")
+        raise runtime.HarnessError(f"v2 task {expectation}, but exact diff presence disagrees")
     return paths, diff, tree_sha
 
 
@@ -898,7 +898,7 @@ def retry_call(
         if outcome.get("ok"):
             return outcome, attempts
         if not outcome.get("transient"):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"review invocation failed permanently: {outcome.get('error', 'unknown error')}"
             )
         if number == 2:
@@ -1049,10 +1049,10 @@ def _review_evidence_summary(
 ) -> Dict[str, Any]:
     evidence = item.get("evidence", item)
     if not isinstance(evidence, Mapping):
-        raise legacy.HarnessError("v2 review check evidence is malformed")
+        raise runtime.HarnessError("v2 review check evidence is malformed")
     check_id = item.get("id")
     if channel not in {"planned-check", "reviewer-probe"}:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"invalid review evidence channel: {channel}"
         )
     limit = (
@@ -1068,7 +1068,7 @@ def _review_evidence_summary(
     request_contexts = []
     for context in item.get("request_contexts", []):
         if not isinstance(context, Mapping):
-            raise legacy.HarnessError("v2 probe request context is malformed")
+            raise runtime.HarnessError("v2 probe request context is malformed")
         request_contexts.append(
             {
                 key: context.get(key)
@@ -1260,11 +1260,11 @@ def _source_context_with_excerpt(
                     + selected.decode("utf-8").count("\n")
                     + 1
                 ),
-                "file_sha256": legacy.sha256_bytes(raw),
+                "file_sha256": runtime.sha256_bytes(raw),
                 "file_bytes": len(raw),
-                "selected_sha256": legacy.sha256_bytes(selected),
+                "selected_sha256": runtime.sha256_bytes(selected),
                 "selected_bytes": len(selected),
-                "excerpt_sha256": legacy.sha256_bytes(excerpt),
+                "excerpt_sha256": runtime.sha256_bytes(excerpt),
                 "included_bytes": len(excerpt),
                 "truncated": truncated,
                 "excerpt": excerpt.decode("utf-8"),
@@ -1317,7 +1317,7 @@ def specialist_source_context(
             entries.append({**common, "status": "missing_at_base"})
             continue
         raw = completed.stdout
-        file_sha256 = legacy.sha256_bytes(raw)
+        file_sha256 = runtime.sha256_bytes(raw)
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -1384,7 +1384,7 @@ def specialist_source_context(
                 specialist_source_context_section(context).encode("utf-8")
             )
             if excerpt_limit == 0 and section_bytes > SPECIALIST_SOURCE_CONTEXT_BYTES:
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "canonical risk-seam metadata exceeds its prompt byte bound"
                 )
         return context
@@ -1411,9 +1411,9 @@ def combined_review_prompt(
     if policy_text is not None:
         policy = policy_text
     elif kind == "combined":
-        policy = legacy.read_prompt("combined-reviewer")
+        policy = runtime.read_prompt("combined-reviewer")
     else:
-        policy = legacy.read_prompt(kind + "-reviewer")
+        policy = runtime.read_prompt(kind + "-reviewer")
     check_summary = [
         _review_evidence_summary(
             item, task_dir, channel="planned-check", review_kind=kind
@@ -1474,14 +1474,14 @@ def invoke_readonly_review(
 ) -> Dict[str, Any]:
     vendor = review["vendor"]
     if vendor == "fake" and not allow_test_adapter:
-        raise legacy.HarnessError("fake v2 reviewer is restricted to selftests")
+        raise runtime.HarnessError("fake v2 reviewer is restricted to selftests")
     kind = review["kind"]
     safe_kind = re.sub(r"[^a-z0-9._-]+", "-", kind.lower())
-    config = legacy.load_config()
-    timeout = int(config.get("reviewer_timeout_seconds", config["agent_timeout_seconds"]))
+    config = runtime.load_config()
+    timeout = int(config["reviewer_timeout_seconds"])
     retry_records = attempt_dir / "review-attempts"
     retry_records.mkdir(parents=True, exist_ok=True)
-    before = legacy.workspace_fingerprint(worktree)
+    before = runtime.workspace_fingerprint(worktree)
     prompt = combined_review_prompt(
         contract,
         plan,
@@ -1492,14 +1492,14 @@ def invoke_readonly_review(
         task_dir,
         probes=probes,
     )
-    prompt_sha256 = legacy.sha256_bytes(prompt.encode("utf-8"))
+    prompt_sha256 = runtime.sha256_bytes(prompt.encode("utf-8"))
 
     def one(number: int) -> Mapping[str, Any]:
         label = f"review-{safe_kind}-try-{number}"
         log_path = attempt_dir / "logs" / f"{label}-{vendor}.jsonl"
         started = time.monotonic()
         try:
-            run = legacy.invoke_model(
+            run = runtime.invoke_model(
                 vendor,
                 role="reviewer",
                 prompt=prompt,
@@ -1521,7 +1521,7 @@ def invoke_readonly_review(
                 "duration_ms": run.get("duration_ms"),
                 "telemetry": telemetry,
                 "run": run,
-                "created_at": legacy.utc_now(),
+                "created_at": runtime.utc_now(),
             }
         except Exception as exc:  # noqa: BLE001 - classify from runner-owned process evidence
             telemetry = model_telemetry(log_path, timed_out="timeout" in str(exc).lower())
@@ -1537,9 +1537,9 @@ def invoke_readonly_review(
                 "telemetry": telemetry,
                 "retry_after_seconds": telemetry.get("retry_after_seconds"),
                 "error": f"{type(exc).__name__}: {exc}",
-                "created_at": legacy.utc_now(),
+                "created_at": runtime.utc_now(),
             }
-        legacy.atomic_write_json(retry_records / f"{label}.json", record)
+        runtime.atomic_write_json(retry_records / f"{label}.json", record)
         return record
 
     try:
@@ -1560,18 +1560,18 @@ def invoke_readonly_review(
             for item in exc.attempts
         ]
         raise
-    if legacy.workspace_fingerprint(worktree) != before:
-        raise legacy.HarnessError(
+    if runtime.workspace_fingerprint(worktree) != before:
+        raise runtime.HarnessError(
             f"{kind} review changed the worktree; reviewer sandbox must remain read-only"
         )
     run = dict(successful["run"])
     if run.get("prompt_sha256") != prompt_sha256:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"{kind} review invocation prompt hash differs from runner input"
         )
     result = run["result"]
-    legacy.validate_schema(
-        result, legacy.load_schema("v2-review"), label=f"{kind} v2 review"
+    runtime.validate_schema(
+        result, runtime.load_schema("v2-review"), label=f"{kind} v2 review"
     )
     # invoke_model creates every result/invocation/log with a fresh UUID and
     # exclusive-create semantics.  The per-kind review checkpoint may advance
@@ -1611,7 +1611,7 @@ def invoke_readonly_review(
             }
             for item in attempts
         ],
-        "created_at": legacy.utc_now(),
+        "created_at": runtime.utc_now(),
     }
     return record
 
@@ -1625,7 +1625,7 @@ def check_record(
         "id": check["id"],
         "command": check["command"],
         "evidence": dict(evidence),
-        "created_at": legacy.utc_now(),
+        "created_at": runtime.utc_now(),
     }
 
 
@@ -1657,7 +1657,7 @@ def probe_request_contexts(
     for review in reviews:
         result = review.get("result", {})
         if not isinstance(result, Mapping):
-            raise legacy.HarnessError("v2 source review result is malformed")
+            raise runtime.HarnessError("v2 source review result is malformed")
         proof_gaps = copy.deepcopy(list(result.get("proof_gaps", [])))
         for request in result.get("probe_requests", []):
             if not isinstance(request, Mapping) or request.get("probe_id") != probe_id:
@@ -1739,7 +1739,7 @@ def build_evidence(
         "task_id": contract["task_id"],
         "contract_sha256": contract["contract_sha256"],
         **evidence_binding(plan),
-        "parent_sha": legacy.git(worktree, "rev-parse", "HEAD"),
+        "parent_sha": runtime.git(worktree, "rev-parse", "HEAD"),
         "tree_sha": plan["tree_sha"],
         "changed_paths": list(plan["changed_paths"]),
         "actual_risk_flags": list(plan["actual_risk_flags"]),
@@ -1748,7 +1748,6 @@ def build_evidence(
         "probes": [dict(item) for item in probes],
         "reviews": [dict(item) for item in reviews],
         **review_outcomes,
-        "degraded_provenance": list(contract.get("degraded_provenance", [])),
         "telemetry": {
             "resource_wait_ms": sum(
                 int(record.get("evidence", {}).get("resource_wait_ms", 0) or 0)
@@ -1774,30 +1773,30 @@ def build_evidence(
         },
         "verdict": verdict,
         "reason": reason,
-        "created_at": legacy.utc_now(),
+        "created_at": runtime.utc_now(),
         "evidence_sha256": "",
     }
     evidence["evidence_sha256"] = document_hash(evidence, "evidence_sha256")
-    legacy.validate_schema(
-        evidence, legacy.load_schema("v2-evidence"), label="v2 evidence"
+    runtime.validate_schema(
+        evidence, runtime.load_schema("v2-evidence"), label="v2 evidence"
     )
     return evidence
 
 
 def _artifact_inside(task_dir: Path, raw: Any, expected_hash: Any, label: str) -> Path:
     if not isinstance(raw, str) or not raw:
-        raise legacy.HarnessError(f"{label} path is missing")
+        raise runtime.HarnessError(f"{label} path is missing")
     path = Path(raw)
     try:
         resolved = path.resolve(strict=True)
         resolved.relative_to(task_dir.resolve())
     except (FileNotFoundError, OSError, ValueError) as exc:
-        raise legacy.HarnessError(f"{label} is missing or outside the v2 task store") from exc
+        raise runtime.HarnessError(f"{label} is missing or outside the v2 task store") from exc
     metadata = path.lstat()
     if not path.is_file() or path.is_symlink() or metadata.st_nlink != 1:
-        raise legacy.HarnessError(f"{label} is not a single-link regular evidence file")
-    if legacy.sha256_file(path) != expected_hash:
-        raise legacy.HarnessError(f"{label} hash changed")
+        raise runtime.HarnessError(f"{label} is not a single-link regular evidence file")
+    if runtime.sha256_file(path) != expected_hash:
+        raise runtime.HarnessError(f"{label} hash changed")
     return path
 
 
@@ -1808,18 +1807,18 @@ def validate_check_checkpoint(
     task_dir: Path,
 ) -> None:
     if not binding_matches(record, plan):
-        raise legacy.HarnessError("v2 check checkpoint binding is stale")
+        raise runtime.HarnessError("v2 check checkpoint binding is stale")
     if record.get("id") != declared.get("id"):
-        raise legacy.HarnessError("v2 check checkpoint id changed")
+        raise runtime.HarnessError("v2 check checkpoint id changed")
     if record.get("command") != declared.get("command"):
-        raise legacy.HarnessError("v2 check checkpoint command changed")
+        raise runtime.HarnessError("v2 check checkpoint command changed")
     result = record.get("evidence")
     if not isinstance(result, Mapping):
-        raise legacy.HarnessError("v2 check checkpoint evidence is malformed")
+        raise runtime.HarnessError("v2 check checkpoint evidence is malformed")
     if result.get("id") != declared.get("id"):
-        raise legacy.HarnessError("v2 check result id changed")
+        raise runtime.HarnessError("v2 check result id changed")
     if result.get("command") != declared.get("command"):
-        raise legacy.HarnessError("v2 check result command changed")
+        raise runtime.HarnessError("v2 check result command changed")
     expected_bound_environment = (
         {"MURMUR_HARNESS_BASE_SHA": str(plan["base_sha"])}
         if declared.get("id") == "npm-lock"
@@ -1829,7 +1828,7 @@ def validate_check_checkpoint(
         result.get("bound_environment", {})
         != expected_bound_environment
     ):
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 check runner-bound environment changed"
         )
     log_path = _artifact_inside(
@@ -1841,9 +1840,9 @@ def validate_check_checkpoint(
     expected_stdout = log_path.with_suffix(".stdout.log")
     expected_stderr = log_path.with_suffix(".stderr.log")
     if result.get("stdout_path") != str(expected_stdout):
-        raise legacy.HarnessError("v2 check stdout path is not bound to its log")
+        raise runtime.HarnessError("v2 check stdout path is not bound to its log")
     if result.get("stderr_path") != str(expected_stderr):
-        raise legacy.HarnessError("v2 check stderr path is not bound to its log")
+        raise runtime.HarnessError("v2 check stderr path is not bound to its log")
     _artifact_inside(
         task_dir,
         str(expected_stdout),
@@ -1869,7 +1868,7 @@ def validate_check_checkpoint(
         f"check {declared.get('id')} guardian",
     )
     if result.get("leader_exited_with_live_group"):
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"v2 check {declared.get('id')} left a live process group"
         )
 
@@ -1886,11 +1885,11 @@ def validate_probe_checkpoint(
     validate_check_checkpoint(record, declared, plan, task_dir)
     probe_id = record.get("id")
     if probe_id not in allowed_probe_ids(plan):
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"v2 probe {probe_id} is outside the exact plan"
         )
     if record.get("source") != "reviewer-probe":
-        raise legacy.HarnessError("v2 probe has no reviewer-probe provenance")
+        raise runtime.HarnessError("v2 probe has no reviewer-probe provenance")
     execution_number = record.get("execution_number", 1)
     if (
         isinstance(execution_number, bool)
@@ -1898,12 +1897,12 @@ def validate_probe_checkpoint(
         or execution_number < 1
         or execution_number > MAX_PROBE_EXECUTIONS_PER_ID
     ):
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 probe execution number is malformed or exceeds its bound"
         )
     contexts = record.get("request_contexts")
     if not isinstance(contexts, list) or not contexts:
-        raise legacy.HarnessError("v2 probe request provenance is missing")
+        raise runtime.HarnessError("v2 probe request provenance is missing")
     required_keys = {
         "probe_id",
         "review_kind",
@@ -1924,14 +1923,14 @@ def validate_probe_checkpoint(
     seen: set[str] = set()
     for context in contexts:
         if not isinstance(context, Mapping) or set(context) != required_keys:
-            raise legacy.HarnessError("v2 probe request context is malformed")
+            raise runtime.HarnessError("v2 probe request context is malformed")
         if context.get("probe_id") != probe_id:
-            raise legacy.HarnessError("v2 probe request context id changed")
+            raise runtime.HarnessError("v2 probe request context id changed")
         if (
             context.get("review_kind"),
             context.get("review_vendor"),
         ) not in expected_reviews:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe request context review is outside the plan"
             )
         context_hash = context.get("context_sha256")
@@ -1940,18 +1939,18 @@ def validate_probe_checkpoint(
             or context_hash in seen
             or context_hash != document_hash(context, "context_sha256")
         ):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe request context hash is stale or duplicated"
             )
         seen.add(context_hash)
         if not isinstance(context.get("rationale"), str):
-            raise legacy.HarnessError("v2 probe request rationale is malformed")
+            raise runtime.HarnessError("v2 probe request rationale is malformed")
         proof_gaps = context.get("proof_gaps")
         if not isinstance(proof_gaps, list):
-            raise legacy.HarnessError("v2 probe source proof gaps are malformed")
+            raise runtime.HarnessError("v2 probe source proof gaps are malformed")
         source_review = context.get("source_review")
         if not isinstance(source_review, Mapping):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe source review checkpoint is malformed"
             )
         source_fields = {
@@ -1963,16 +1962,16 @@ def validate_probe_checkpoint(
         }
         for context_key, review_key in source_fields.items():
             if context.get(context_key) != source_review.get(review_key):
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "v2 probe source review checkpoint metadata changed"
                 )
         source_result_summary = source_review.get("result")
         if not isinstance(source_result_summary, Mapping):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe source review result summary is malformed"
             )
         if source_result_summary.get("proof_gaps") != proof_gaps:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe source proof gaps differ from its checkpoint"
             )
         expected_request = {
@@ -1982,7 +1981,7 @@ def validate_probe_checkpoint(
         if expected_request not in source_result_summary.get(
             "probe_requests", []
         ):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe request differs from its source review checkpoint"
             )
         source_declarations = [
@@ -1993,14 +1992,14 @@ def validate_probe_checkpoint(
             and item.get("vendor") == context.get("review_vendor")
         ]
         if len(source_declarations) != 1:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe source review is not uniquely declared in the plan"
             )
         prompt_hash = context.get("review_prompt_sha256")
         if not isinstance(prompt_hash, str) or not re.fullmatch(
             r"[0-9a-f]{64}", prompt_hash
         ):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe source review prompt hash is malformed"
             )
         validate_review_checkpoint(
@@ -2018,26 +2017,26 @@ def validate_probe_checkpoint(
             context.get("review_result_sha256"),
             f"probe {probe_id} source review result",
         )
-        source_result = legacy.load_json(source_path)
-        legacy.validate_schema(
+        source_result = runtime.load_json(source_path)
+        runtime.validate_schema(
             source_result,
             (
                 dict(review_schema)
                 if review_schema is not None
-                else legacy.load_schema("v2-review")
+                else runtime.load_schema("v2-review")
             ),
             label=f"probe {probe_id} source review",
         )
         if source_result.get("proof_gaps") != proof_gaps:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe source proof gaps differ from the review artifact"
             )
         if expected_request not in source_result.get("probe_requests", []):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe request differs from the source review artifact"
             )
     if list(contexts) != canonical_probe_request_contexts(contexts):
-        raise legacy.HarnessError("v2 probe request contexts are not canonical")
+        raise runtime.HarnessError("v2 probe request contexts are not canonical")
 
 
 def validate_review_checkpoint(
@@ -2051,26 +2050,26 @@ def validate_review_checkpoint(
     review_schema: Optional[Mapping[str, Any]] = None,
 ) -> None:
     if not binding_matches(record, plan):
-        raise legacy.HarnessError("v2 review checkpoint binding is stale")
+        raise runtime.HarnessError("v2 review checkpoint binding is stale")
     if record.get("kind") != declared.get("kind"):
-        raise legacy.HarnessError("v2 review checkpoint kind changed")
+        raise runtime.HarnessError("v2 review checkpoint kind changed")
     if record.get("vendor") != declared.get("vendor"):
-        raise legacy.HarnessError("v2 review checkpoint vendor changed")
+        raise runtime.HarnessError("v2 review checkpoint vendor changed")
     if record.get("prompt_sha256") != expected_prompt_sha256:
-        raise legacy.HarnessError("v2 review checkpoint prompt hash changed")
+        raise runtime.HarnessError("v2 review checkpoint prompt hash changed")
     if record.get("vendor") == "fake" and not allow_test_adapter:
-        raise legacy.HarnessError("fake v2 review checkpoint is forbidden")
+        raise runtime.HarnessError("fake v2 review checkpoint is forbidden")
     label = record.get("label")
     vendor = record.get("vendor")
     if not isinstance(label, str) or not isinstance(vendor, str):
-        raise legacy.HarnessError("v2 review checkpoint label/vendor is malformed")
+        raise runtime.HarnessError("v2 review checkpoint label/vendor is malformed")
     safe_kind = re.sub(
         r"[^a-z0-9._-]+", "-", str(declared.get("kind", "")).lower()
     )
     if re.fullmatch(
         rf"review-{re.escape(safe_kind)}-try-[12]", label
     ) is None:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 review checkpoint label does not match review kind"
         )
     raw_invocation_path = Path(str(record.get("invocation_path", "")))
@@ -2081,58 +2080,58 @@ def validate_review_checkpoint(
     )
     expected_log = run_dir / "logs" / f"{label}-{vendor}.jsonl"
 
-    result_path = legacy.evidence_file(
+    result_path = runtime.evidence_file(
         task_dir,
         record.get("result_path"),
         expected_result,
         f"review {declared.get('kind')} result",
     )
-    if legacy.sha256_file(result_path) != record.get("result_sha256"):
-        raise legacy.HarnessError("v2 review checkpoint result hash changed")
-    result = legacy.load_json(result_path)
-    legacy.validate_schema(
+    if runtime.sha256_file(result_path) != record.get("result_sha256"):
+        raise runtime.HarnessError("v2 review checkpoint result hash changed")
+    result = runtime.load_json(result_path)
+    runtime.validate_schema(
         result,
         (
             dict(review_schema)
             if review_schema is not None
-            else legacy.load_schema("v2-review")
+            else runtime.load_schema("v2-review")
         ),
         label=f"review {declared.get('kind')}",
     )
     if result != record.get("result"):
-        raise legacy.HarnessError("v2 review checkpoint result summary changed")
-    invocation_path = legacy.evidence_file(
+        raise runtime.HarnessError("v2 review checkpoint result summary changed")
+    invocation_path = runtime.evidence_file(
         task_dir,
         record.get("invocation_path"),
         expected_invocation,
         f"review {declared.get('kind')} invocation",
     )
-    if legacy.sha256_file(invocation_path) != record.get("invocation_sha256"):
-        raise legacy.HarnessError("v2 review checkpoint invocation hash changed")
-    invocation = legacy.load_json(invocation_path)
+    if runtime.sha256_file(invocation_path) != record.get("invocation_sha256"):
+        raise runtime.HarnessError("v2 review checkpoint invocation hash changed")
+    invocation = runtime.load_json(invocation_path)
     if invocation.get("prompt_sha256") != expected_prompt_sha256:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 review invocation prompt hash changed"
         )
-    log_path = legacy.evidence_file(
+    log_path = runtime.evidence_file(
         task_dir,
         record.get("log_path"),
         expected_log,
         f"review {declared.get('kind')} log",
     )
-    if legacy.sha256_file(log_path) != record.get("log_sha256"):
-        raise legacy.HarnessError("v2 review checkpoint log hash changed")
+    if runtime.sha256_file(log_path) != record.get("log_sha256"):
+        raise runtime.HarnessError("v2 review checkpoint log hash changed")
     execution_ids = {
-        legacy._artifact_execution_id(result_path, expected_result),
-        legacy._artifact_execution_id(invocation_path, expected_invocation),
-        legacy._artifact_execution_id(log_path, expected_log),
+        runtime._artifact_execution_id(result_path, expected_result),
+        runtime._artifact_execution_id(invocation_path, expected_invocation),
+        runtime._artifact_execution_id(log_path, expected_log),
     }
     if (
         len(execution_ids) != 1
         or None in execution_ids
         or record.get("execution_id") not in execution_ids
     ):
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 review artifacts do not share one execution id"
         )
     if record.get("vendor") != "fake":
@@ -2143,7 +2142,7 @@ def validate_review_checkpoint(
             f"review {declared.get('kind')} guardian",
         )
         if record.get("leader_exited_with_live_group"):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared.get('kind')} left a live process group"
             )
 
@@ -2161,8 +2160,8 @@ def verify_v2_evidence(
     worktree = Path(str(contract["worktree_path"]))
     attested_schemas: Dict[str, Dict[str, Any]] = {}
     if attested_commit_sha is not None:
-        if not legacy.SHA1_RE.fullmatch(attested_commit_sha):
-            raise legacy.HarnessError("v2 attested commit is malformed")
+        if not runtime.SHA1_RE.fullmatch(attested_commit_sha):
+            raise runtime.HarnessError("v2 attested commit is malformed")
         attested_schemas = {
             name: attested_schema(worktree, attested_commit_sha, name)
             for name in ("v2-task", "v2-plan", "v2-review", "v2-evidence")
@@ -2176,30 +2175,30 @@ def verify_v2_evidence(
     )
     state = load_v2_state(task_dir)
     if state.get("status") not in {"PASSED", "COMMITTED"}:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             f"v2 receipt requires PASSED/COMMITTED state; found {state.get('status')}"
         )
     if not worktree.is_dir() or worktree.is_symlink():
-        raise legacy.HarnessError("v2 task worktree is missing or unsafe")
-    if Path(legacy.git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree.resolve():
-        raise legacy.HarnessError("v2 worktree path is not its Git root")
-    if legacy.git(worktree, "branch", "--show-current") != contract["branch"]:
-        raise legacy.HarnessError("v2 task branch changed")
-    current_head = legacy.git(worktree, "rev-parse", "HEAD")
+        raise runtime.HarnessError("v2 task worktree is missing or unsafe")
+    if Path(runtime.git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree.resolve():
+        raise runtime.HarnessError("v2 worktree path is not its Git root")
+    if runtime.git(worktree, "branch", "--show-current") != contract["branch"]:
+        raise runtime.HarnessError("v2 task branch changed")
+    current_head = runtime.git(worktree, "rev-parse", "HEAD")
     if attested_commit_sha is not None:
-        parents = legacy.git(
+        parents = runtime.git(
             worktree, "show", "-s", "--format=%P", attested_commit_sha
         ).split()
         if parents != [contract["base_sha"]]:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 attested commit is not the exact child of task base"
             )
-        if legacy.git_bytes(worktree, "status", "--porcelain").strip():
-            raise legacy.HarnessError(
+        if runtime.git_bytes(worktree, "status", "--porcelain").strip():
+            raise runtime.HarnessError(
                 "v2 committed evidence requires a clean worktree/index"
             )
         evidence_parent = contract["base_sha"]
-        encoded_paths = legacy.git_bytes(
+        encoded_paths = runtime.git_bytes(
             worktree,
             "diff",
             "--name-only",
@@ -2214,7 +2213,7 @@ def verify_v2_evidence(
             for item in encoded_paths.split(b"\x00")
             if item
         )
-        diff = legacy.git_bytes(
+        diff = runtime.git_bytes(
             worktree,
             "diff",
             "--binary",
@@ -2225,16 +2224,16 @@ def verify_v2_evidence(
             attested_commit_sha,
             "--",
         )
-        tree_sha = legacy.git(
+        tree_sha = runtime.git(
             worktree, "rev-parse", f"{attested_commit_sha}^{{tree}}"
         )
         violations = [
             path
             for path in paths
-            if not legacy.path_is_owned(path, contract["owned_paths"])
+            if not runtime.path_is_owned(path, contract["owned_paths"])
         ]
         if violations:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "out-of-scope paths in v2 attested commit: "
                 + ", ".join(violations)
             )
@@ -2242,16 +2241,16 @@ def verify_v2_evidence(
         paths, diff, tree_sha = snapshot_scoped_diff(worktree, contract, task_dir)
         evidence_parent = current_head
     elif allow_committed_head:
-        evidence_parent = legacy.git(worktree, "rev-parse", "HEAD^")
+        evidence_parent = runtime.git(worktree, "rev-parse", "HEAD^")
         if evidence_parent != contract["base_sha"]:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 recovery commit is not the single exact child of task base"
             )
-        if legacy.git_bytes(worktree, "status", "--porcelain").strip():
-            raise legacy.HarnessError(
+        if runtime.git_bytes(worktree, "status", "--porcelain").strip():
+            raise runtime.HarnessError(
                 "v2 recovery commit worktree/index is not clean"
             )
-        encoded_paths = legacy.git_bytes(
+        encoded_paths = runtime.git_bytes(
             worktree,
             "diff",
             "--name-only",
@@ -2266,7 +2265,7 @@ def verify_v2_evidence(
             for item in encoded_paths.split(b"\x00")
             if item
         )
-        diff = legacy.git_bytes(
+        diff = runtime.git_bytes(
             worktree,
             "diff",
             "--binary",
@@ -2277,19 +2276,19 @@ def verify_v2_evidence(
             current_head,
             "--",
         )
-        tree_sha = legacy.git(worktree, "rev-parse", "HEAD^{tree}")
+        tree_sha = runtime.git(worktree, "rev-parse", "HEAD^{tree}")
         violations = [
             path
             for path in paths
-            if not legacy.path_is_owned(path, contract["owned_paths"])
+            if not runtime.path_is_owned(path, contract["owned_paths"])
         ]
         if violations:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "out-of-scope paths in v2 recovery commit: "
                 + ", ".join(violations)
             )
     else:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 task HEAD changed after PASS without an active commit recovery"
         )
 
@@ -2297,8 +2296,8 @@ def verify_v2_evidence(
     try:
         plan_path.resolve(strict=True).relative_to(task_dir.resolve())
     except (FileNotFoundError, OSError, ValueError) as exc:
-        raise legacy.HarnessError("v2 plan path escapes the task store") from exc
-    plan = legacy.load_json(plan_path)
+        raise runtime.HarnessError("v2 plan path escapes the task store") from exc
+    plan = runtime.load_json(plan_path)
     validate_hashed_document(
         plan,
         "v2-plan",
@@ -2307,19 +2306,19 @@ def verify_v2_evidence(
         schema=attested_schemas.get("v2-plan"),
     )
     if plan.get("changed_paths") != paths:
-        raise legacy.HarnessError("v2 plan changed paths are stale")
-    if plan.get("diff_sha256") != legacy.sha256_bytes(diff):
-        raise legacy.HarnessError("v2 plan diff is stale")
+        raise runtime.HarnessError("v2 plan changed paths are stale")
+    if plan.get("diff_sha256") != runtime.sha256_bytes(diff):
+        raise runtime.HarnessError("v2 plan diff is stale")
     if plan.get("tree_sha") != tree_sha:
-        raise legacy.HarnessError("v2 plan tree is stale")
+        raise runtime.HarnessError("v2 plan tree is stale")
     protocol_path = plan_path.parent / "protocol.json"
     try:
         protocol_path.resolve(strict=True).relative_to(task_dir.resolve())
     except (FileNotFoundError, OSError, ValueError) as exc:
-        raise legacy.HarnessError(
+        raise runtime.HarnessError(
             "v2 protocol bundle path escapes the task store"
         ) from exc
-    bundle = legacy.load_json(protocol_path)
+    bundle = runtime.load_json(protocol_path)
     if (
         bundle.get("schema_version") != 2
         or bundle.get("protocol_sha256")
@@ -2332,10 +2331,10 @@ def verify_v2_evidence(
         )
         or not isinstance(bundle.get("files"), list)
     ):
-        raise legacy.HarnessError("v2 recorded protocol bundle is malformed")
+        raise runtime.HarnessError("v2 recorded protocol bundle is malformed")
     if attested_commit_sha is None:
         if bundle != executable_protocol_bundle(worktree):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 recorded protocol bundle differs from executable bytes"
             )
     else:
@@ -2347,15 +2346,15 @@ def verify_v2_evidence(
                 or not isinstance(item.get("sha256"), str)
                 or item["path"] in seen_protocol_paths
             ):
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "v2 recorded protocol file entry is malformed"
                 )
             seen_protocol_paths.add(item["path"])
             committed_bytes = git_file_at_commit(
                 worktree, attested_commit_sha, item["path"]
             )
-            if legacy.sha256_bytes(committed_bytes) != item["sha256"]:
-                raise legacy.HarnessError(
+            if runtime.sha256_bytes(committed_bytes) != item["sha256"]:
+                raise runtime.HarnessError(
                     f"v2 attested protocol byte changed: {item['path']}"
                 )
     for key, value in (
@@ -2373,11 +2372,11 @@ def verify_v2_evidence(
         ("created_at", contract["created_at"]),
     ):
         if plan.get(key) != value:
-            raise legacy.HarnessError(f"v2 plan {key} differs from its contract")
+            raise runtime.HarnessError(f"v2 plan {key} differs from its contract")
     if plan.get("protocol_sha256") != bundle["protocol_sha256"]:
-        raise legacy.HarnessError("v2 plan protocol bundle is stale")
+        raise runtime.HarnessError("v2 plan protocol bundle is stale")
     if attested_commit_sha is None:
-        profile_config = legacy.load_config()
+        profile_config = runtime.load_config()
     else:
         profile_config = attested_json_object(
             worktree,
@@ -2395,18 +2394,18 @@ def verify_v2_evidence(
         ),
     )
     if plan.get("checks") != expected_checks:
-        raise legacy.HarnessError("v2 plan check profile is stale")
+        raise runtime.HarnessError("v2 plan check profile is stale")
     if plan.get("reviews") != expected_reviews:
-        raise legacy.HarnessError("v2 plan review profile is stale")
+        raise runtime.HarnessError("v2 plan review profile is stale")
     if plan.get("actual_risk_flags") != expected_risks:
-        raise legacy.HarnessError("v2 plan sensitive-risk profile is stale")
+        raise runtime.HarnessError("v2 plan sensitive-risk profile is stale")
 
     evidence_path = Path(str(state.get("evidence_path", "")))
     try:
         evidence_path.resolve(strict=True).relative_to(task_dir.resolve())
     except (FileNotFoundError, OSError, ValueError) as exc:
-        raise legacy.HarnessError("v2 evidence path escapes the task store") from exc
-    evidence = legacy.load_json(evidence_path)
+        raise runtime.HarnessError("v2 evidence path escapes the task store") from exc
+    evidence = runtime.load_json(evidence_path)
     validate_hashed_document(
         evidence,
         "v2-evidence",
@@ -2425,26 +2424,22 @@ def verify_v2_evidence(
         ("changed_paths", paths),
         ("actual_risk_flags", expected_risks),
         ("claims", list(plan["claims"])),
-        (
-            "degraded_provenance",
-            list(contract.get("degraded_provenance", [])),
-        ),
     ):
         if evidence.get(key) != value:
-            raise legacy.HarnessError(f"v2 evidence {key} is stale")
+            raise runtime.HarnessError(f"v2 evidence {key} is stale")
     if evidence.get("verdict") != "PASSED":
-        raise legacy.HarnessError("v2 evidence verdict is not PASSED")
+        raise runtime.HarnessError("v2 evidence verdict is not PASSED")
 
     check_records = evidence.get("checks", [])
     if [item.get("id") for item in check_records] != [
         item["id"] for item in expected_checks
     ]:
-        raise legacy.HarnessError("v2 evidence check set/order differs from plan")
+        raise runtime.HarnessError("v2 evidence check set/order differs from plan")
     for record, declared in zip(check_records, expected_checks):
         validate_check_checkpoint(record, declared, plan, task_dir)
         result = record.get("evidence", {})
         if not result.get("passed") or result.get("exit_code") != 0:
-            raise legacy.HarnessError(f"v2 check {declared['id']} is not green")
+            raise runtime.HarnessError(f"v2 check {declared['id']} is not green")
         _artifact_inside(
             task_dir, result.get("log_path"), result.get("log_sha256"), f"check {declared['id']} log"
         )
@@ -2474,12 +2469,12 @@ def verify_v2_evidence(
     for record in probe_records:
         probe_id = record.get("id")
         if probe_id not in eligible_probe_ids or probe_id in probe_ids:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "v2 probe evidence has a duplicate/id outside the exact plan"
             )
         probe_ids.add(probe_id)
         if not binding_matches(record, plan):
-            raise legacy.HarnessError(f"v2 probe {probe_id} binding is stale")
+            raise runtime.HarnessError(f"v2 probe {probe_id} binding is stale")
         declared = canonical_check(str(probe_id), profile_config)
         validate_probe_checkpoint(
             record,
@@ -2491,7 +2486,7 @@ def verify_v2_evidence(
         )
         result = record.get("evidence", {})
         if not result.get("passed") or result.get("exit_code") != 0:
-            raise legacy.HarnessError(f"v2 probe {probe_id} is not green")
+            raise runtime.HarnessError(f"v2 probe {probe_id} is not green")
         log_path = _artifact_inside(
             task_dir,
             result.get("log_path"),
@@ -2522,15 +2517,15 @@ def verify_v2_evidence(
     if [(item.get("kind"), item.get("vendor")) for item in review_records] != [
         (item["kind"], item["vendor"]) for item in expected_reviews
     ]:
-        raise legacy.HarnessError("v2 evidence review set/order differs from plan")
+        raise runtime.HarnessError("v2 evidence review set/order differs from plan")
     sessions: set = set()
     for record, declared in zip(review_records, expected_reviews):
         if not binding_matches(record, plan):
-            raise legacy.HarnessError(f"v2 review {declared['kind']} binding is stale")
+            raise runtime.HarnessError(f"v2 review {declared['kind']} binding is stale")
         if record.get("vendor") != declared["vendor"]:
-            raise legacy.HarnessError(f"v2 review {declared['kind']} vendor changed")
+            raise runtime.HarnessError(f"v2 review {declared['kind']} vendor changed")
         if record.get("probe_evidence_sha256") != expected_probe_hash:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared['kind']} did not see the recorded probe evidence"
             )
         if attested_commit_sha is None:
@@ -2548,7 +2543,7 @@ def verify_v2_evidence(
                     f".agents/harness/prompts/{policy_name}.md",
                 ).decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     f"v2 attested review policy is not UTF-8: {policy_name}"
                 ) from exc
         expected_prompt = combined_review_prompt(
@@ -2567,17 +2562,17 @@ def verify_v2_evidence(
             declared,
             plan,
             task_dir,
-            expected_prompt_sha256=legacy.sha256_bytes(
+            expected_prompt_sha256=runtime.sha256_bytes(
                 expected_prompt.encode("utf-8")
             ),
             allow_test_adapter=allow_test_adapter,
             review_schema=attested_schemas.get("v2-review"),
         )
         if record.get("vendor") == "fake" and not allow_test_adapter:
-            raise legacy.HarnessError("fake v2 evidence is forbidden outside selftests")
+            raise runtime.HarnessError("fake v2 evidence is forbidden outside selftests")
         session = record.get("session_id")
         if not isinstance(session, str) or not session or session in sessions:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared['kind']} has missing/reused session provenance"
             )
         sessions.add(session)
@@ -2587,18 +2582,18 @@ def verify_v2_evidence(
             record.get("result_sha256"),
             f"review {declared['kind']} result",
         )
-        result = legacy.load_json(result_path)
-        legacy.validate_schema(
+        result = runtime.load_json(result_path)
+        runtime.validate_schema(
             result,
             (
                 attested_schemas["v2-review"]
                 if attested_commit_sha is not None
-                else legacy.load_schema("v2-review")
+                else runtime.load_schema("v2-review")
             ),
             label=f"review {declared['kind']}",
         )
         if result != record.get("result"):
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared['kind']} result summary changed"
             )
         result_state = review_result_state(result)
@@ -2607,14 +2602,14 @@ def verify_v2_evidence(
                 finding.get("severity") in SEVERE_FINDINGS
                 for finding in result.get("findings", [])
             ):
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "v2 PASS contains unresolved MAJOR/BLOCKER findings"
                 )
             if result.get("proof_gaps") or result.get("probe_requests"):
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     "v2 PASS contains unresolved proof gaps"
                 )
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared['kind']} is not an admissible PASS"
             )
         invocation_path = _artifact_inside(
@@ -2634,10 +2629,10 @@ def verify_v2_evidence(
         if not isinstance(label, str) or re.fullmatch(
             rf"review-{re.escape(safe_kind)}-try-[12]", label
         ) is None:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared['kind']} invocation label is malformed"
             )
-        invocation_time = legacy.verify_model_invocation(
+        invocation_time = runtime.verify_model_invocation(
             task_dir,
             vendor=str(record["vendor"]),
             role="reviewer",
@@ -2655,35 +2650,35 @@ def verify_v2_evidence(
             prompt_sha256=str(record["prompt_sha256"]),
             require_cwd_binding=True,
         )
-        review_time = legacy.parse_timestamp(
+        review_time = runtime.parse_timestamp(
             record.get("created_at"), f"v2 review {declared['kind']}.created_at"
         )
         if invocation_time > review_time:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 review {declared['kind']} predates its invocation"
             )
         if record["vendor"] != "fake":
-            metadata = legacy.extract_model_metadata(
+            metadata = runtime.extract_model_metadata(
                 log_path, str(record["vendor"]), str(session)
             )
             if metadata["session_id"] != session:
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     f"v2 review {declared['kind']} session differs from real model log"
                 )
             if metadata["model"] != record.get("model"):
-                raise legacy.HarnessError(
+                raise runtime.HarnessError(
                     f"v2 review {declared['kind']} model differs from real model log"
                 )
     expected_review_outcomes = aggregate_review_outcomes(review_records)
     for field, expected in expected_review_outcomes.items():
         if evidence.get(field) != expected:
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 f"v2 evidence {field} differs from its bound review records"
             )
     if evidence.get("findings") and any(
         item.get("severity") in SEVERE_FINDINGS for item in evidence["findings"]
     ):
-        raise legacy.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
+        raise runtime.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
     if evidence.get("proof_gaps") or evidence.get("probe_requests"):
-        raise legacy.HarnessError("v2 PASS contains unresolved proof gaps")
+        raise runtime.HarnessError("v2 PASS contains unresolved proof gaps")
     return evidence

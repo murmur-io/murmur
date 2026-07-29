@@ -105,7 +105,7 @@ Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/
 ## Agents, skills, rules & hooks (this repo's `.claude/`)
 
 - **Rules** (`.claude/rules/`): `rust-tauri`, `angular-zoneless`, `lock-model`, `agentic-workflow` — **always-on** (auto-imported at the top of this file); apply them without being asked.
-- **Harness + hooks** (`.agents/harness/`, `scripts/agent-harness`, `.claude/hooks/`): the neutral runner owns isolated worktrees, bounded repair, checks, independent reviews, hash-bound PASS attestations, and the exact `commit`/`close` lifecycle. Hooks are fast defense-in-depth; CI is the remote truth. Run `scripts/agent-harness selftest` and `scripts/agent-config-audit`.
+- **Harness + hooks** (`.agents/harness/`, `scripts/agent-harness`, `.claude/hooks/`): the verifier-only runner owns isolated worktrees, exact-diff checks, independent reviews, hash-bound PASS receipts, guarded `commit`, resumable evidence, and lossless `clean`. It has no writer or automatic repair loop. Hooks are fast defense-in-depth; CI is the remote truth. Run `scripts/agent-harness selftest` and `scripts/agent-config-audit`.
 - **Skills** (`.claude/skills/`): **invoke these PROACTIVELY the moment a task matches — the user should NOT have to type the slash command:**
   - cutting a build / version bump / publishing a release → **`release-murmur`**
   - starting, iterating, or debugging the dev app → **`tauri-dev`**
@@ -116,4 +116,4 @@ Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/
   - writing / tuning a GitHub Actions workflow → **`github-actions`**
 - **Agents** (`.claude/agents/`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `ci-cd-engineer` (designs & maintains CI — the local `scripts/ci.sh` gate + the GitHub Actions macOS PR-gate that wraps it; CD/notarized release stays with `release-engineer`), `murmur-researcher` — dispatch as subagents; the implementer never owns the verdict.
 
-When a task mutates the repository, use `scripts/agent-harness`: one isolated writer, deterministic checks, fresh independent reviewers, bounded repair and a hash-bound attestation. The implementer never owns the verdict.
+Use `scripts/agent-harness` for risky/multi-step work that needs a hash-bound receipt. The implementer edits the isolated worktree but never owns the verdict. For protected Harness/control-plane changes, which cannot self-certify, use a dedicated worktree outside the runner-owned `../.murmur-agent-tasks` root (for example `../.murmur-control-plane/<task-id>`), the complete control-plane selftests, a fresh independent review, and the base-anchored CI gate.

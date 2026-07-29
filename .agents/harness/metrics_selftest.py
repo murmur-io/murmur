@@ -36,9 +36,7 @@ def _append(path: Path, *documents: Any, raw: str = "") -> None:
             handle.write(raw)
 
 
-def _state(at: str, status: str, *, generation: int) -> Mapping[str, Any]:
-    if generation == 1:
-        return {"at": at, "event": "state", "status": status}
+def _state(at: str, status: str) -> Mapping[str, Any]:
     return {
         "at": at,
         "event": "state",
@@ -54,20 +52,19 @@ def _state(at: str, status: str, *, generation: int) -> Mapping[str, Any]:
 def cases(test: Tests) -> None:
     with tempfile.TemporaryDirectory(prefix="murmur-metrics-") as raw:
         common = Path(raw) / ".git"
-        v1 = common / "agent-harness" / "tasks"
-        v2 = common / "agent-harness" / "v2" / "tasks"
+        tasks = common / "agent-harness" / "v2" / "tasks"
 
-        task_a = v1 / "task-a" / "events.jsonl"
+        task_a = tasks / "task-a" / "events.jsonl"
         _append(
             task_a,
-            _state("2026-07-01T10:00:00Z", "INITIALIZED", generation=1),
+            _state("2026-07-01T10:00:00Z", "OPEN"),
             {
                 "at": "2026-07-01T10:01:00Z",
                 "event": "model-invocation",
-                "label": "round-01-writer",
-                "role": "writer",
+                "label": "review-combined-try-1",
+                "role": "reviewer",
                 "vendor": "claude",
-                "result_path": "/task-a/writer.json",
+                "result_path": "/task-a/review.json",
                 "duration_ms": 1000,
                 "timed_out": False,
             },
@@ -79,10 +76,10 @@ def cases(test: Tests) -> None:
                 "timed_out": False,
                 "outcome": "PASS",
             },
-            _state("2026-07-01T10:03:00Z", "CLOSED", generation=1),
+            _state("2026-07-01T10:03:00Z", "CLOSED"),
         )
 
-        task_b = v1 / "task-b" / "events.jsonl"
+        task_b = tasks / "task-b" / "events.jsonl"
         process = {
             "at": "2026-07-02T10:01:00Z",
             "event": "model-process-exit",
@@ -104,7 +101,7 @@ def cases(test: Tests) -> None:
         }
         _append(
             task_b,
-            _state("2026-07-02T10:00:00Z", "RUNNING", generation=1),
+            _state("2026-07-02T10:00:00Z", "VERIFYING"),
             process,
             invocation,
             {
@@ -115,15 +112,15 @@ def cases(test: Tests) -> None:
                 "timed_out": True,
                 "outcome": "BLOCKED",
             },
-            _state("2026-07-02T10:03:00Z", "BLOCKED", generation=1),
+            _state("2026-07-02T10:03:00Z", "BLOCKED"),
             [1, 2, 3],
             raw="{not-json}\n",
         )
 
-        task_c_top = v2 / "task-c" / "events.jsonl"
+        task_c_top = tasks / "task-c" / "events.jsonl"
         _append(
             task_c_top,
-            _state("2026-07-03T10:00:00Z", "OPEN", generation=2),
+            _state("2026-07-03T10:00:00Z", "OPEN"),
             {
                 "at": "2026-07-03T10:01:00Z",
                 "event": "check",
@@ -132,11 +129,11 @@ def cases(test: Tests) -> None:
                 "timed_out": False,
                 "outcome": "PASS",
             },
-            _state("2026-07-03T10:05:00Z", "PAUSED_RETRYABLE", generation=2),
-            _state("2026-07-03T10:06:00Z", "PASSED", generation=2),
+            _state("2026-07-03T10:05:00Z", "PAUSED_RETRYABLE"),
+            _state("2026-07-03T10:06:00Z", "PASSED"),
         )
         task_c_review = (
-            v2
+            tasks
             / "task-c"
             / "attempts"
             / "attempt-1"
@@ -168,16 +165,11 @@ def cases(test: Tests) -> None:
             )
 
         report = metrics.collect_metrics(common, limit=20)
-        test.equal("TASK all generations counted", report["tasks"]["count"], 3)
+        test.equal("TASK all tasks counted", report["tasks"]["count"], 3)
         test.equal(
             "TASK statuses come only from authoritative state events",
             report["tasks"]["by_status"],
             {"BLOCKED": 1, "CLOSED": 1, "PASSED": 1},
-        )
-        test.equal(
-            "TASK generation split is explicit",
-            report["tasks"]["by_generation"],
-            {"v1": 2, "v2": 1},
         )
         test.equal(
             "MODEL process-exit plus invocation is deduplicated",
@@ -185,7 +177,7 @@ def cases(test: Tests) -> None:
             4,
         )
         test.equal(
-            "MODEL absent legacy cost is not guessed",
+            "MODEL absent cost is not guessed",
             report["models"]["cost_usd_coverage"],
             {
                 "available": 3,
@@ -218,7 +210,7 @@ def cases(test: Tests) -> None:
         test.equal(
             "REVIEW attempts are role-derived",
             report["reviews"]["attempts"],
-            3,
+            4,
         )
         test.equal(
             "REVIEW retry labels count only extra attempts",
@@ -236,7 +228,7 @@ def cases(test: Tests) -> None:
             4,
         )
         test.equal(
-            "CHECK runs include both generations",
+            "CHECK runs include all tasks",
             report["checks"]["runs"],
             3,
         )
@@ -271,7 +263,7 @@ def cases(test: Tests) -> None:
             1,
         )
         test.equal(
-            "LIMIT selects newest task generations",
+            "LIMIT selects newest tasks",
             [
                 item["task_id"]
                 for item in metrics.collect_metrics(common, limit=2)["tasks"]["records"]

@@ -105,17 +105,17 @@ def _load_json(path: Path) -> Any:
         raise GuardFailure(f"invalid JSON in {path}: {exc}") from exc
 
 
-def _task_runner_module() -> Any:
+def _runtime_module() -> Any:
     """Import the runner helpers so fingerprints/diffs have one exact definition."""
 
     harness_path = str(HARNESS_ROOT)
     if harness_path not in sys.path:
         sys.path.insert(0, harness_path)
     try:
-        import task_runner  # type: ignore
+        import runtime  # type: ignore
     except Exception as exc:  # pragma: no cover - exercised as a fail-closed path
-        raise GuardFailure(f"cannot load the canonical task runner: {exc}") from exc
-    return task_runner
+        raise GuardFailure(f"cannot load the canonical harness runtime: {exc}") from exc
+    return runtime
 
 
 def _v2_verifier_module() -> Any:
@@ -502,56 +502,6 @@ def _push_targets_protected(invocation: GitInvocation) -> bool:
     return False
 
 
-def _v1_terminal_state_is_proven(task_dir: Path) -> bool:
-    """Require the v1 state projection and its latest state event to agree."""
-
-    try:
-        runner = _task_runner_module()
-        state = _load_json(task_dir / "state.json")
-        if not isinstance(state, dict):
-            return False
-        status = state.get("status")
-        updated_at = state.get("updated_at")
-        if (
-            state.get("task_id") != task_dir.name
-            or status not in runner.TERMINAL_STATES
-            or not isinstance(updated_at, str)
-        ):
-            return False
-        runner.parse_timestamp(updated_at, f"{task_dir.name}.updated_at")
-
-        last_state_event: Optional[Dict[str, Any]] = None
-        with (task_dir / "events.jsonl").open(
-            "r", encoding="utf-8", errors="strict"
-        ) as handle:
-            for line in handle:
-                event = json.loads(line)
-                if not isinstance(event, dict):
-                    raise ValueError("v1 event is not an object")
-                if event.get("event") == "state":
-                    last_state_event = event
-        if last_state_event is None:
-            return False
-        event_at = last_state_event.get("at")
-        if not isinstance(event_at, str):
-            return False
-        runner.parse_timestamp(event_at, f"{task_dir.name} state event at")
-        if (
-            last_state_event.get("status") != status
-            or event_at != updated_at
-            or last_state_event.get("round", 0) != state.get("round", 0)
-        ):
-            return False
-        for key in ("phase", "reason"):
-            if key in state and last_state_event.get(key) != state.get(key):
-                return False
-        return True
-    except Exception:
-        # An existing claimed worktree with incomplete lifecycle evidence is
-        # unknown-live. Branch surgery in the primary checkout must fail closed.
-        return False
-
-
 def _v2_terminal_state_is_proven(task_dir: Path) -> bool:
     """Use the v2 append-only last-state event; state.json is a projection."""
 
@@ -582,9 +532,7 @@ def _v2_terminal_state_is_proven(task_dir: Path) -> bool:
             or last_wrapper.get("at") != updated_at
         ):
             return False
-        _task_runner_module().parse_timestamp(
-            updated_at, f"{task_dir.name} v2 state event updated_at"
-        )
+        _parse_time(updated_at, f"{task_dir.name} state event updated_at")
         return state["status"] in verifier.V2_TERMINAL_STATES
     except Exception:
         # Missing/malformed authoritative state means unknown-live whenever the
@@ -593,20 +541,11 @@ def _v2_terminal_state_is_proven(task_dir: Path) -> bool:
 
 
 def _live_harness_task_ids(common: Path) -> List[str]:
-    """Return nonterminal or state-unknown tasks with an existing worktree.
-
-    V2's append-only event is authoritative, so a SIGKILL between its fsync and
-    the state.json projection cannot hide a live task. V1 predates that ordering
-    and is terminal only when state.json and its latest state event agree.
-    """
+    """Return nonterminal or state-unknown tasks with an existing worktree."""
 
     result: List[str] = []
-    for generation, root in (
-        ("v1", common / "agent-harness" / "tasks"),
-        ("v2", common / "agent-harness" / "v2" / "tasks"),
-    ):
-        if not root.is_dir():
-            continue
+    root = common / "agent-harness" / "v2" / "tasks"
+    if root.is_dir():
         for task_dir in sorted(path for path in root.iterdir() if path.is_dir()):
             try:
                 contract = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
@@ -624,13 +563,8 @@ def _live_harness_task_ids(common: Path) -> List[str]:
                 continue
             if not worktree.exists():
                 continue
-            terminal = (
-                _v1_terminal_state_is_proven(task_dir)
-                if generation == "v1"
-                else _v2_terminal_state_is_proven(task_dir)
-            )
-            if not terminal:
-                result.append(f"{generation}:{task_dir.name}")
+            if not _v2_terminal_state_is_proven(task_dir):
+                result.append(task_dir.name)
     return result
 
 
@@ -810,29 +744,17 @@ def _manifest_worktree(document: Any) -> Optional[Path]:
     return Path(document["worktree_path"]).resolve()
 
 
-def _validate_task_manifest(
-    document: Any, generation: int, manifest: Path
-) -> Dict[str, Any]:
+def _validate_task_manifest(document: Any, manifest: Path) -> Dict[str, Any]:
     if not isinstance(document, dict):
         raise GuardFailure(f"task manifest is not an object: {manifest}")
-    runner = _task_runner_module()
     try:
-        if generation == 1:
-            runner.validate_schema(
-                document, runner.load_schema("task"), label="v1 task contract"
-            )
-            if runner.contract_hash(document) != document.get("contract_sha256"):
-                raise GuardFailure("v1 task contract hash is malformed or stale")
-        elif generation == 2:
-            v2 = _v2_verifier_module()
-            v2.validate_hashed_document(
-                document,
-                "v2-task",
-                "contract_sha256",
-                "v2 task contract",
-            )
-        else:
-            raise GuardFailure(f"unknown task generation: {generation}")
+        v2 = _v2_verifier_module()
+        v2.validate_hashed_document(
+            document,
+            "v2-task",
+            "contract_sha256",
+            "task contract",
+        )
     except GuardFailure:
         raise
     except Exception as exc:
@@ -840,46 +762,23 @@ def _validate_task_manifest(
     return document
 
 
-def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path, int]:
-    v1_root = common / "agent-harness" / "tasks"
-    v2_root = common / "agent-harness" / "v2" / "tasks"
-    explicit_ref = os.environ.get("MURMUR_AGENT_TASK_REF", "").strip()
+def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path]:
+    tasks_root = common / "agent-harness" / "v2" / "tasks"
     explicit_id = os.environ.get("MURMUR_AGENT_TASK_ID", "").strip()
-    if explicit_ref:
-        match = re.fullmatch(r"(v1|v2):(.+)", explicit_ref)
-        if not match or not TASK_ID_RE.fullmatch(match.group(2)):
-            raise GuardFailure("MURMUR_AGENT_TASK_REF must be v1:<id> or v2:<id>")
-        generation = 1 if match.group(1) == "v1" else 2
-        explicit_id = match.group(2)
-    else:
-        generation = 0
     if explicit_id:
         if not TASK_ID_RE.fullmatch(explicit_id):
             raise GuardFailure("MURMUR_AGENT_TASK_ID is invalid")
-        roots = [(generation, v1_root if generation == 1 else v2_root)] if generation else [
-            (2, v2_root),
-            (1, v1_root),
-        ]
-        found: List[Tuple[Dict[str, Any], Path, int]] = []
-        for candidate_generation, root in roots:
-            manifest = root / explicit_id / "task.json"
-            if manifest.is_file():
-                document = _validate_task_manifest(
-                    _load_json(manifest), candidate_generation, manifest
-                )
-                if _manifest_worktree(document) != repo.resolve():
-                    raise GuardFailure("explicit task manifest belongs to a different worktree")
-                found.append((document, manifest.parent, candidate_generation))
-        if len(found) == 1:
-            return found[0]
-        if not found:
+        manifest = tasks_root / explicit_id / "task.json"
+        if not manifest.is_file():
             raise GuardFailure("explicit task reference does not exist")
+        document = _validate_task_manifest(_load_json(manifest), manifest)
+        if _manifest_worktree(document) != repo.resolve():
+            raise GuardFailure("explicit task manifest belongs to a different worktree")
+        return document, manifest.parent
 
-    matches: List[Tuple[Dict[str, Any], Path, int]] = []
-    for candidate_generation, root in ((1, v1_root), (2, v2_root)):
-        if not root.is_dir():
-            continue
-        for manifest in sorted(root.glob("*/task.json")):
+    matches: List[Tuple[Dict[str, Any], Path]] = []
+    if tasks_root.is_dir():
+        for manifest in sorted(tasks_root.glob("*/task.json")):
             try:
                 raw = _load_json(manifest)
             except GuardFailure:
@@ -889,47 +788,14 @@ def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path, int]:
                 continue
             if _manifest_worktree(raw) != repo.resolve():
                 continue
-            document = _validate_task_manifest(
-                raw, candidate_generation, manifest
-            )
-            matches.append((document, manifest.parent, candidate_generation))
-    if len(matches) > 2:
+            document = _validate_task_manifest(raw, manifest)
+            matches.append((document, manifest.parent))
+    if len(matches) > 1:
         raise GuardFailure("multiple task manifests claim this worktree")
-    if len(matches) == 2:
-        v1 = next((item for item in matches if item[2] == 1), None)
-        v2 = next((item for item in matches if item[2] == 2), None)
-        if v1 is None or v2 is None:
-            raise GuardFailure("multiple same-generation task manifests claim this worktree")
-        expected = {
-            "generation": 1,
-            "task_id": v1[0].get("task_id"),
-            "contract_sha256": v1[0].get("contract_sha256"),
-        }
-        if v2[0].get("supersedes") != expected:
-            raise GuardFailure("v1/v2 worktree claim is ambiguous")
-        return v2
     if len(matches) == 1:
         return matches[0]
-
-    # Legacy pointer is only a fallback and can never redirect to another
-    # worktree.  Concurrency-safe discovery above remains authoritative.
-    pointer = common / "agent-harness" / "current-task"
-    if pointer.is_file():
-        try:
-            raw = pointer.read_text(encoding="utf-8").strip()
-            if raw.startswith("{"):
-                parsed = json.loads(raw)
-                raw = parsed.get("task_id", "") if isinstance(parsed, dict) else ""
-        except (OSError, json.JSONDecodeError) as exc:
-            raise GuardFailure(f"invalid legacy current-task pointer: {exc}") from exc
-        if TASK_ID_RE.fullmatch(raw):
-            task_dir = v1_root / raw
-            document = _load_json(task_dir / "task.json")
-            if _manifest_worktree(document) == repo.resolve():
-                return document, task_dir, 1
-            raise GuardFailure("legacy current-task pointer belongs to a different worktree")
     raise NoTaskForWorktree(
-        "no task manifest matches this worktree; use scripts/agent-harness init/run"
+        "no task manifest matches this worktree; use scripts/agent-harness open"
     )
 
 
@@ -998,255 +864,6 @@ def _classify_actual_risks(paths: Sequence[str], config: Mapping[str, Any]) -> L
     return result
 
 
-def _validate_provenance(
-    attestation: Mapping[str, Any],
-    task: Mapping[str, Any],
-    *,
-    allow_test_adapter: bool = False,
-) -> None:
-    writer = attestation["writer"]
-    reviewer = attestation["reviewer"]
-    writer_vendor = task.get("writer")
-    reviewer_vendor = task.get("reviewer")
-    if allow_test_adapter and writer_vendor == reviewer_vendor == "fake":
-        pass
-    elif writer_vendor not in {"codex", "claude"} or reviewer_vendor not in {"codex", "claude"}:
-        raise GuardFailure("fake or unknown model vendors are forbidden outside harness selftests")
-    if writer.get("vendor") != task.get("writer"):
-        raise GuardFailure("attestation writer does not match the task contract")
-    if reviewer.get("vendor") != task.get("reviewer"):
-        raise GuardFailure("attestation reviewer does not match the task contract")
-    if writer.get("round") != attestation.get("rounds"):
-        raise GuardFailure("writer round does not match attestation rounds")
-
-    for label, identity in (("writer", writer), ("reviewer", reviewer)):
-        for field in ("cli_version", "model"):
-            value = identity.get(field)
-            if not isinstance(value, str) or not value:
-                raise GuardFailure(f"{label} provenance field {field} is empty")
-    writer_session = writer.get("session_id")
-    if not isinstance(writer_session, str) or not writer_session:
-        raise GuardFailure("writer provenance session_id is empty")
-
-
-def _validate_attestation(
-    repo: Path,
-    common: Path,
-    task: Dict[str, Any],
-    task_dir: Path,
-    *,
-    allow_test_adapter: bool = False,
-) -> None:
-    runner = _task_runner_module()
-    try:
-        runner.validate_schema(task, runner.load_schema("task"), label="task contract")
-    except Exception as exc:
-        raise GuardFailure(str(exc)) from exc
-    if runner.contract_hash(task) != task.get("contract_sha256"):
-        raise GuardFailure("task contract hash is malformed or stale")
-
-    top, actual_common, head, branch = _repo_context(repo)
-    if actual_common != common.resolve():
-        raise GuardFailure("Git common directory changed while validating the task")
-    expected_paths = {
-        "repo_realpath": _primary_worktree(top),
-        "worktree_path": top,
-        "git_common_dir": common.resolve(),
-    }
-    for key, expected in expected_paths.items():
-        if Path(str(task.get(key, ""))).resolve() != expected:
-            raise GuardFailure(f"task {key} does not match the current repository")
-    if task.get("branch") != branch:
-        raise GuardFailure("task branch does not match the current worktree branch")
-    if not SHA1_RE.fullmatch(str(task.get("base_sha", ""))):
-        raise GuardFailure("task base_sha is malformed")
-    ancestor = _run(["git", "merge-base", "--is-ancestor", str(task["base_sha"]), head], top, check=False)
-    if ancestor.returncode != 0:
-        raise GuardFailure("task base_sha is not an ancestor of current HEAD")
-
-    current_instructions = runner.instructions_hash(top)
-    current_dependencies = runner.dependency_revisions(top)
-    if task.get("instructions_sha256") != current_instructions:
-        raise GuardFailure("task instructions fingerprint is stale")
-    if task.get("dependency_revisions") != current_dependencies:
-        raise GuardFailure("task dependency revisions are stale")
-
-    attestation = _load_json(task_dir / "attestation.json")
-    try:
-        runner.validate_schema(attestation, runner.load_schema("attestation"), label="attestation")
-    except Exception as exc:
-        raise GuardFailure(str(exc)) from exc
-    if attestation.get("verdict") != "PASS":
-        raise GuardFailure("attestation verdict is not PASS")
-
-    for key in (
-        "task_id",
-        "contract_sha256",
-        "instructions_sha256",
-        "dependency_revisions",
-        "base_sha",
-        "repo_realpath",
-        "worktree_path",
-    ):
-        if attestation.get(key) != task.get(key):
-            raise GuardFailure(f"attestation {key} does not match the task contract")
-    if attestation.get("head_sha") != head:
-        raise GuardFailure("attestation HEAD is stale")
-
-    current_diff = runner.staged_diff(top)
-    current_diff_hash = _sha256(current_diff)
-    current_tree = _git_text(top, "write-tree")
-    if attestation.get("staged_diff_sha256") != current_diff_hash:
-        raise GuardFailure("attestation staged diff hash is stale")
-    if attestation.get("tree_sha") != current_tree:
-        raise GuardFailure("attestation index tree is stale")
-    if attestation.get("instructions_sha256") != current_instructions:
-        raise GuardFailure("attestation instructions fingerprint is stale")
-    if attestation.get("dependency_revisions") != current_dependencies:
-        raise GuardFailure("attestation dependency revisions are stale")
-
-    paths = _staged_paths(top)
-    owned = task.get("owned_paths", [])
-    violations = [path for path in paths if not _path_is_owned(path, owned)]
-    if violations:
-        raise GuardFailure("staged paths exceed task ownership: " + ", ".join(violations))
-    if task.get("expected_change") and not current_diff:
-        raise GuardFailure("task requires a change, but staged diff is empty")
-    if not task.get("expected_change") and current_diff:
-        raise GuardFailure("no-change task unexpectedly has a staged diff")
-
-    if _git_bytes(top, "diff", "--binary", "--no-ext-diff", "--").strip():
-        raise GuardFailure("unstaged tracked changes make the receipt incomplete")
-    if _git_bytes(top, "ls-files", "--others", "--exclude-standard", "-z").strip(b"\x00"):
-        raise GuardFailure("untracked files make the receipt incomplete")
-
-    config = _load_json(top / ".agents" / "harness" / "config.json") if (top / ".agents" / "harness" / "config.json").is_file() else runner.load_config()
-    actual_risks = _classify_actual_risks(paths, config)
-    task_risks = task.get("risk_flags", [])
-    attested_risks = attestation.get("risk_flags", [])
-    if not isinstance(task_risks, list) or not isinstance(attested_risks, list):
-        raise GuardFailure("risk flags are malformed")
-    required_risks = set(task_risks) | set(actual_risks)
-    if not required_risks.issubset(set(attested_risks)):
-        missing = sorted(required_risks - set(attested_risks))
-        raise GuardFailure("attestation is missing automatically classified risks: " + ", ".join(missing))
-
-    _validate_provenance(attestation, task, allow_test_adapter=allow_test_adapter)
-    rounds = attestation.get("rounds")
-    if not isinstance(rounds, int) or rounds < 1 or rounds > int(task.get("max_repair_rounds", 0)) + 1:
-        raise GuardFailure("attestation rounds exceed the bounded repair loop")
-
-    task_created = _parse_time(task.get("created_at"), "task.created_at")
-    receipt_created = _parse_time(attestation.get("created_at"), "attestation.created_at")
-    if receipt_created < task_created or receipt_created > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
-        raise GuardFailure("attestation timestamp is stale or from the future")
-
-    check_map: Dict[str, Mapping[str, Any]] = {}
-    for check in attestation.get("checks", []):
-        check_id = check.get("id")
-        if not isinstance(check_id, str) or check_id in check_map:
-            raise GuardFailure("attestation checks have a missing or duplicate id")
-        if check.get("exit_code") != 0:
-            raise GuardFailure(f"attested check {check_id} is not green")
-        log_path = Path(str(check.get("log_path", "")))
-        if not log_path.is_absolute():
-            log_path = task_dir / log_path
-        try:
-            log_path.resolve().relative_to(task_dir.resolve())
-        except (OSError, ValueError) as exc:
-            raise GuardFailure(f"attested check {check_id} log is outside the task store") from exc
-        if not log_path.is_file():
-            raise GuardFailure(f"attested check {check_id} log is missing")
-        stdout_path = log_path.with_suffix(".stdout.log")
-        stderr_path = log_path.with_suffix(".stderr.log")
-        for stream, stream_path, hash_field in (
-            ("stdout", stdout_path, "stdout_sha256"),
-            ("stderr", stderr_path, "stderr_sha256"),
-        ):
-            try:
-                stream_path.resolve().relative_to(task_dir.resolve())
-            except (OSError, ValueError) as exc:
-                raise GuardFailure(f"attested check {check_id} {stream} is outside the task store") from exc
-            if not stream_path.is_file() or _sha256(stream_path.read_bytes()) != check.get(hash_field):
-                raise GuardFailure(f"attested check {check_id} {stream} is missing or changed")
-        check_map[check_id] = check
-
-    declared_checks: Dict[str, str] = {}
-    for check in list(task.get("checks", [])) + list(task.get("final_checks", [])):
-        check_id = check.get("id")
-        command = check.get("command")
-        if check_id in declared_checks and declared_checks[check_id] != command:
-            raise GuardFailure(f"task reuses check id {check_id} with another command")
-        declared_checks[check_id] = command
-    for check_id, command in declared_checks.items():
-        evidence = check_map.get(check_id)
-        if evidence is None:
-            raise GuardFailure(f"required check evidence is missing: {check_id}")
-        if evidence.get("command") != command:
-            raise GuardFailure(f"attested command differs for check {check_id}")
-
-    risk_evidence = config.get("risk_required_evidence", {})
-    for risk in required_risks:
-        for check_id in risk_evidence.get(risk, []):
-            if check_id not in check_map or check_map[check_id].get("exit_code") != 0:
-                raise GuardFailure(f"risk {risk} requires green evidence check {check_id}")
-
-    review_map: Dict[str, Mapping[str, Any]] = {}
-    writer_session = attestation["writer"]["session_id"]
-    reviewer_sessions: set = set()
-    for review in attestation.get("reviews", []):
-        kind = review.get("kind")
-        if not isinstance(kind, str) or kind in review_map:
-            raise GuardFailure("attestation reviews have a missing or duplicate kind")
-        if review.get("verdict") != "PASS":
-            raise GuardFailure(f"review {kind} is not PASS")
-        if review.get("staged_diff_sha256") != current_diff_hash:
-            raise GuardFailure(f"review {kind} was made against another staged diff")
-        review_created = _parse_time(review.get("created_at"), f"review[{kind}].created_at")
-        if review_created < task_created or review_created > receipt_created:
-            raise GuardFailure(f"review {kind} timestamp is stale")
-        reviewer_run = review.get("reviewer", {})
-        session_id = reviewer_run.get("session_id") if isinstance(reviewer_run, dict) else None
-        if not isinstance(session_id, str) or not session_id:
-            raise GuardFailure(f"review {kind} has no reviewer session provenance")
-        if session_id == writer_session:
-            raise GuardFailure(f"review {kind} reused the writer session")
-        if session_id in reviewer_sessions:
-            raise GuardFailure(f"review {kind} reused another review session")
-        reviewer_sessions.add(session_id)
-        for field in ("vendor", "cli_version", "model"):
-            value = reviewer_run.get(field) if isinstance(reviewer_run, dict) else None
-            if not isinstance(value, str) or not value:
-                raise GuardFailure(f"review {kind} provenance field {field} is empty")
-        if reviewer_run.get("vendor") != task.get("reviewer"):
-            raise GuardFailure(f"review {kind} vendor does not match the independent reviewer contract")
-        if not SHA256_RE.fullmatch(str(review.get("artifact_sha256", ""))):
-            raise GuardFailure(f"review {kind} artifact hash is malformed")
-        artifact_hash = review["artifact_sha256"]
-        artifacts = sorted((task_dir / "results").glob("*.json"))
-        if not any(path.is_file() and _sha256(path.read_bytes()) == artifact_hash for path in artifacts):
-            raise GuardFailure(f"review {kind} artifact is missing or changed")
-        review_map[kind] = review
-
-    required_reviews = list(config.get("required_reviews", []))
-    risk_review_mapping = config.get("risk_reviews", {})
-    for risk in required_risks:
-        review_name = risk_review_mapping.get(risk)
-        if isinstance(review_name, str) and review_name not in required_reviews:
-            required_reviews.append(review_name)
-    for kind in required_reviews:
-        if kind not in review_map:
-            raise GuardFailure(f"required automatic review is missing: {kind}")
-
-    # The runner is the canonical verifier used by the explicit verify and
-    # commit commands. Hooks may add contextual checks, but may never accept a
-    # receipt that the canonical verifier rejects.
-    try:
-        runner.verify_attestation(task, task_dir, allow_test_adapter=allow_test_adapter)
-    except Exception as exc:
-        raise GuardFailure(str(exc)) from exc
-
-
 def _finish_guard(
     command: str, process_cwd: Path, *, allow_test_adapter: bool = False
 ) -> Optional[str]:
@@ -1264,21 +881,11 @@ def _finish_guard(
         try:
             repo = _repo_for_invocation(commits[0])
             _, common, _, _ = _repo_context(repo)
-            task, task_dir, generation = _resolve_task(repo, common)
-            if generation == 2:
-                raise GuardFailure(
-                    "Harness v2 owns the durable commit intent and receipt; "
-                    f"use scripts/agent-harness commit {task['task_id']} -m <message>"
-                )
-            else:
-                _validate_attestation(
-                    repo,
-                    common,
-                    task,
-                    task_dir,
-                    allow_test_adapter=allow_test_adapter,
-                )
-            return None
+            task, _task_dir = _resolve_task(repo, common)
+            raise GuardFailure(
+                "the Harness owns the durable commit intent and receipt; "
+                f"use scripts/agent-harness commit {task['task_id']} -m <message>"
+            )
         except NoTaskForWorktree:
             return None  # normal mode: no active harness task → allow the commit
         except GuardFailure as exc:
@@ -1308,12 +915,8 @@ def _guard_refusal_task_dirs(
     )
     primary = _primary_worktree(top)
     matches: List[Path] = []
-    for generation, root in (
-        ("v1", common / "agent-harness" / "tasks"),
-        ("v2", common / "agent-harness" / "v2" / "tasks"),
-    ):
-        if not root.is_dir():
-            continue
+    root = common / "agent-harness" / "v2" / "tasks"
+    if root.is_dir():
         for task_dir in sorted(path for path in root.iterdir() if path.is_dir()):
             try:
                 task = _load_json(task_dir / "task.json")
@@ -1327,12 +930,7 @@ def _guard_refusal_task_dirs(
                 continue
             if claimed is None or not claimed.exists():
                 continue
-            terminal = (
-                _v1_terminal_state_is_proven(task_dir)
-                if generation == "v1"
-                else _v2_terminal_state_is_proven(task_dir)
-            )
-            if not terminal:
+            if not _v2_terminal_state_is_proven(task_dir):
                 matches.append(task_dir)
     return sorted(set(matches))
 
@@ -1551,109 +1149,6 @@ def _secret_case(test: _Selftest, vendor: str, relative: str, content: str, want
         test.result(f"{vendor}: secret in {relative}", got, want)
 
 
-def _write_receipt(repo: Path, task_id: str, *, risk: bool = False) -> Tuple[Path, Dict[str, Any], Dict[str, Any]]:
-    runner = _task_runner_module()
-    top, common, head, branch = _repo_context(repo)
-    task_dir = common / "agent-harness" / "tasks" / task_id
-    task_dir.mkdir(parents=True, exist_ok=True)
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    checks = [{"id": "unit", "command": "test -f owned.txt", "timeout_seconds": 30}]
-    if risk:
-        checks.append(
-            {
-                "id": "rust-lib",
-                "command": runner.canonical_check_commands(runner.load_config())["rust-lib"],
-                "timeout_seconds": 60,
-            }
-        )
-    task: Dict[str, Any] = {
-        "schema_version": 1,
-        "task_id": task_id,
-        "description": "hook guard selftest",
-        "kind": "harness",
-        "base_sha": head,
-        "contract_sha256": "",
-        "instructions_sha256": runner.instructions_hash(top),
-        "dependency_revisions": runner.dependency_revisions(top),
-        "repo_realpath": str(top),
-        "git_common_dir": str(common),
-        "worktree_path": str(top),
-        "branch": branch,
-        "owned_paths": ["owned.txt"],
-        "risk_flags": ["lock"] if risk else [],
-        "writer": "fake",
-        "reviewer": "fake",
-        "max_repair_rounds": 2,
-        "checks": checks,
-        "final_checks": [],
-        "expected_change": True,
-        "created_at": now,
-    }
-    task["contract_sha256"] = runner.contract_hash(task)
-    (task_dir / "task.json").write_text(json.dumps(task, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    diff = runner.staged_diff(top)
-    diff_hash = _sha256(diff)
-    evidence = [runner.run_check(top, task_dir, check, "round-01") for check in checks]
-    failures = [check for check in evidence if not check["passed"]]
-    if failures:
-        rendered = []
-        for check in failures:
-            log_path = Path(check["log_path"])
-            try:
-                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
-            except OSError as exc:
-                log_tail = f"<unreadable: {exc}>"
-            rendered.append(
-                f"{check['id']} exit={check['exit_code']} timed_out={check['timed_out']} "
-                f"log_tail={log_tail!r}"
-            )
-        details = ", ".join(rendered)
-        raise GuardFailure(f"hook selftest deterministic evidence unexpectedly failed: {details}")
-    review_kinds = ["spec", "adversarial"] + (["lock-security"] if risk else [])
-    reviews = []
-    writer_run = runner.invoke_model(
-        "fake",
-        role="writer",
-        prompt="hook guard selftest writer",
-        schema_name="model-result",
-        worktree=top,
-        task_dir=task_dir,
-        label="round-01-writer",
-        timeout_seconds=30,
-        instructions_sha256=task["instructions_sha256"],
-    )
-    for kind in review_kinds:
-        model_review = runner.invoke_model(
-            "fake",
-            role="reviewer",
-            prompt=f"hook guard selftest {kind}",
-            schema_name="review",
-            worktree=top,
-            task_dir=task_dir,
-            label=f"round-01-{kind}",
-            timeout_seconds=30,
-            instructions_sha256=task["instructions_sha256"],
-        )
-        review = runner._review_evidence(model_review)
-        review.update({"kind": kind, "staged_diff_sha256": diff_hash, "created_at": runner.utc_now()})
-        reviews.append(review)
-    (task_dir / "diffs").mkdir(exist_ok=True)
-    (task_dir / "diffs" / "attested.diff").write_bytes(diff)
-    attestation = runner.create_attestation(task, top, 1, evidence, reviews, [writer_run])
-    (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    runner.set_state(
-        task_dir,
-        "PASSED",
-        round=1,
-        phase="complete",
-        attestation=str(task_dir / "attestation.json"),
-        staged_diff_sha256=attestation["staged_diff_sha256"],
-        tree_sha=attestation["tree_sha"],
-    )
-    return task_dir, task, attestation
-
-
 def _finish_repo() -> Path:
     # Cargo discovers .cargo/config.toml by walking every parent of its cwd.
     # The outer harness TMPDIR lives below the primary checkout's common .git,
@@ -1672,87 +1167,34 @@ def _finish_repo() -> Path:
     return repo
 
 
-def _linked_worktree_runner_case(test: _Selftest) -> None:
-    """Prove an attestation made by the real runner passes from its linked WT."""
-
-    with tempfile.TemporaryDirectory(prefix="murmur-hook-linked-worktree-") as temp:
-        repo = Path(temp) / "repo"
-        _init_repo(repo)
-        runner = _task_runner_module()
-        init_args = argparse.Namespace(
-            task_id="hook-linked-integration",
-            kind="harness",
-            agent="fake",
-            reviewer="fake",
-            prompt="linked worktree hook integration",
-            owned=["base.txt"],
-            risk=[],
-            check=["unit::test -f base.txt"],
-            final_check=["final::test -f base.txt"],
-            max_repair_rounds=2,
-            base=None,
-            branch=None,
-            expected_change=False,
-            quiet=True,
-            _allow_test_adapter=True,
-        )
-        previous_cwd = Path.cwd()
-        try:
-            os.chdir(repo)
-            runner.cmd_init(init_args)
-            contract, task_dir, _ = runner.load_task_from_current_repo(
-                "hook-linked-integration", repo
-            )
-            worktree = Path(contract["worktree_path"]).resolve()
-            if runner.run_task(contract, task_dir, allow_test_adapter=True) != "PASSED":
-                test.result("runner linked-worktree run", "FAIL", "PASS")
-                return
-        except Exception as exc:
-            test.result("runner linked-worktree init", f"FAIL: {exc}", "PASS")
-            return
-        finally:
-            os.chdir(previous_cwd)
-        _, common, _, _ = _repo_context(worktree)
-        task_dir = common / "agent-harness" / "tasks" / "hook-linked-integration"
-        task = _load_json(task_dir / "task.json")
-        paths_match = (
-            Path(str(task.get("repo_realpath", ""))).resolve() == repo.resolve()
-            and Path(str(task.get("worktree_path", ""))).resolve() == worktree
-            and worktree != repo.resolve()
-        )
-        test.result("runner receipt identifies linked worktree", "PASS" if paths_match else "FAIL", "PASS")
-        for vendor in ("codex", "claude"):
-            got, _ = test.invoke(
-                vendor,
-                "finish-guard",
-                "git commit -m integration",
-                worktree,
-                allow_test_adapter=True,
-            )
-            test.result(f"{vendor}: real runner linked receipt", got, "ALLOW")
-            got, _ = test.invoke(
-                vendor,
-                "finish-guard",
-                "git commit -m integration",
-                repo,
-                payload_workdir=worktree,
-                allow_test_adapter=True,
-            )
-            test.result(f"{vendor}: payload workdir selects linked receipt", got, "ALLOW")
-
-        artifact = next((task_dir / "results").glob("*spec*.json"), None)
-        if artifact is None:
-            test.result("runner review artifact exists", "FAIL", "PASS")
-            return
-        artifact.write_text('{"tampered":true}\n', encoding="utf-8")
-        got, _ = test.invoke(
-            "codex",
-            "finish-guard",
-            "git commit -m integration",
-            worktree,
-            allow_test_adapter=True,
-        )
-        test.result("codex: tampered runner artifact", got, "BLOCK")
+def _write_task_claim(repo: Path, task_id: str) -> Path:
+    runtime = _runtime_module()
+    verifier = _v2_verifier_module()
+    top, common, head, branch = _repo_context(repo)
+    task_dir = common / "agent-harness" / "v2" / "tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    contract: Dict[str, Any] = {
+        "schema_version": 2,
+        "task_id": task_id,
+        "description": "hook guard selftest",
+        "kind": "harness",
+        "base_sha": head,
+        "contract_sha256": "",
+        "repo_realpath": str(top),
+        "git_common_dir": str(common),
+        "worktree_path": str(top),
+        "branch": branch,
+        "owned_paths": ["owned.txt"],
+        "claims": [],
+        "reviewer": "fake",
+        "expected_change": True,
+        "created_at": runtime.utc_now(),
+    }
+    contract["contract_sha256"] = verifier.document_hash(
+        contract, "contract_sha256"
+    )
+    runtime.atomic_write_json(task_dir / "task.json", contract)
+    return task_dir
 
 
 def _resource_lane_runner_cases(test: _Selftest) -> None:
@@ -1870,7 +1312,7 @@ def _resource_lane_runner_cases(test: _Selftest) -> None:
                 ).stdout.strip()
             )
             lane_path = (
-                _task_runner_module().shared_resource_root_for_common(common)
+                _runtime_module().shared_resource_root_for_common(common)
                 / "cargo.lock"
             )
             owner_seen = False
@@ -1929,8 +1371,8 @@ def _resource_lane_runner_cases(test: _Selftest) -> None:
             direct_code = (
                 "import pathlib,sys;"
                 f"sys.path.insert(0,{str((SOURCE_ROOT / '.agents' / 'harness')).__repr__()});"
-                "import task_runner;"
-                "task_runner.acquire_cargo_lane("
+                "import runtime;"
+                "runtime.acquire_cargo_lane("
                 "pathlib.Path(sys.argv[1]),0.25,"
                 "command='direct-selftest',heartbeat_seconds=0.05)"
             )
@@ -2427,115 +1869,6 @@ def _run_selftest() -> int:
                 encoding="utf-8",
             )
 
-            v1_worktree = Path(temp) / "live-v1-task"
-            v1_worktree.mkdir()
-            v1_task = (
-                repo / ".git" / "agent-harness" / "tasks" / "v1-primary-isolation"
-            )
-            v1_task.mkdir(parents=True)
-            (v1_task / "task.json").write_text(
-                json.dumps({"worktree_path": str(v1_worktree.resolve())}) + "\n",
-                encoding="utf-8",
-            )
-            v1_live_updated_at = "2026-07-28T10:02:00Z"
-            v1_live_state = {
-                "task_id": v1_task.name,
-                "status": "INITIALIZED",
-                "updated_at": v1_live_updated_at,
-                "round": 0,
-                "phase": "init",
-            }
-            (v1_task / "state.json").write_text(
-                json.dumps(v1_live_state) + "\n", encoding="utf-8"
-            )
-            (v1_task / "events.jsonl").write_text(
-                json.dumps(
-                    {
-                        "at": v1_live_updated_at,
-                        "event": "state",
-                        "status": "INITIALIZED",
-                        "round": 0,
-                        "phase": "init",
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            test.expect(
-                "live v1 task blocks primary branch surgery",
-                vendor,
-                "block-bash",
-                "git reset --hard HEAD",
-                repo,
-                "BLOCK",
-            )
-
-            v1_terminal_updated_at = "2026-07-28T10:03:00Z"
-            v1_terminal_state = {
-                **v1_live_state,
-                "status": "CLOSED",
-                "updated_at": v1_terminal_updated_at,
-                "phase": "close",
-            }
-            (v1_task / "state.json").write_text(
-                json.dumps(v1_terminal_state) + "\n", encoding="utf-8"
-            )
-            v1_terminal_event = {
-                "at": v1_terminal_updated_at,
-                "event": "state",
-                "status": "CLOSED",
-                "round": 0,
-                "phase": "close",
-            }
-            (v1_task / "events.jsonl").write_text(
-                json.dumps(v1_terminal_event) + "\n",
-                encoding="utf-8",
-            )
-            test.expect(
-                "matching v1 terminal state and event permit existing task worktree",
-                vendor,
-                "block-bash",
-                "git switch --detach HEAD",
-                repo,
-                "ALLOW",
-            )
-            (v1_task / "events.jsonl").write_text(
-                json.dumps({**v1_terminal_event, "status": "REAPED"}) + "\n",
-                encoding="utf-8",
-            )
-            test.expect(
-                "disagreeing v1 terminal state and event are unknown-live",
-                vendor,
-                "block-bash",
-                "git switch --detach HEAD",
-                repo,
-                "BLOCK",
-            )
-            (v1_task / "events.jsonl").write_text(
-                json.dumps(v1_terminal_event) + "\n",
-                encoding="utf-8",
-            )
-            (v1_task / "state.json").write_text(
-                "{malformed state\n", encoding="utf-8"
-            )
-            test.expect(
-                "malformed v1 state with existing claimed worktree is unknown-live",
-                vendor,
-                "block-bash",
-                "git merge feature/nope",
-                repo,
-                "BLOCK",
-            )
-            (v1_task / "state.json").unlink()
-            test.expect(
-                "missing v1 state with existing claimed worktree is unknown-live",
-                vendor,
-                "block-bash",
-                "git merge feature/nope",
-                repo,
-                "BLOCK",
-            )
-
             driver = Path(temp) / "driver"
             _run(
                 ["git", "worktree", "add", "--detach", str(driver), "HEAD"],
@@ -2755,7 +2088,7 @@ def _run_selftest() -> int:
         )
         _secret_case(test, vendor, "plain.txt", "normal source text", "ALLOW", "git -c user.name=x commit -m x")
 
-    print("-- hash-bound finish gate --")
+    print("-- verifier-only finish gate --")
     for vendor in ("codex", "claude"):
         repo = _finish_repo()
         got, _ = test.invoke(
@@ -2765,13 +2098,12 @@ def _run_selftest() -> int:
             repo,
             use_default_finish=True,
         )
-        test.result(f"{vendor}: default-enforce missing manifest", got, "ALLOW")
+        test.result(f"{vendor}: normal worktree commit", got, "ALLOW")
 
-        # Malformed manifest is found by explicit task id and must fail closed.
         _, common, _, _ = _repo_context(repo)
-        malformed_dir = common / "agent-harness" / "tasks" / "malformed"
-        malformed_dir.mkdir(parents=True)
-        (malformed_dir / "task.json").write_text("{", encoding="utf-8")
+        malformed = common / "agent-harness" / "v2" / "tasks" / "malformed"
+        malformed.mkdir(parents=True)
+        (malformed / "task.json").write_text("{", encoding="utf-8")
         got, _ = test.invoke(
             vendor,
             "finish-guard",
@@ -2779,27 +2111,16 @@ def _run_selftest() -> int:
             repo,
             extra_env={"MURMUR_AGENT_TASK_ID": "malformed"},
         )
-        test.result(f"{vendor}: malformed task manifest", got, "BLOCK")
-        got, _ = test.invoke(
-            vendor,
-            "finish-guard",
-            "git commit -m x",
-            repo,
-        )
-        test.result(
-            f"{vendor}: unrelated unreadable historical manifest does not poison commits",
-            got,
-            "ALLOW",
-        )
-        shutil.rmtree(malformed_dir)
+        test.result(f"{vendor}: malformed explicit task fails closed", got, "BLOCK")
+        shutil.rmtree(malformed)
 
-        valid_json_bad_dir = common / "agent-harness" / "v2" / "tasks" / "bad-v2"
-        valid_json_bad_dir.mkdir(parents=True)
-        (valid_json_bad_dir / "task.json").write_text(
+        bad = common / "agent-harness" / "v2" / "tasks" / "bad-task"
+        bad.mkdir(parents=True)
+        (bad / "task.json").write_text(
             json.dumps(
                 {
                     "schema_version": 2,
-                    "task_id": "bad-v2",
+                    "task_id": "bad-task",
                     "worktree_path": str(repo.resolve()),
                     "contract_sha256": "0" * 64,
                 }
@@ -2813,172 +2134,25 @@ def _run_selftest() -> int:
             "git commit -m x",
             repo,
         )
-        test.result(
-            f"{vendor}: malformed v2 manifest claiming current worktree",
-            got,
-            "BLOCK",
-        )
-        got, _ = test.invoke(
-            vendor,
-            "finish-guard",
-            "git commit -m x",
-            repo,
-            extra_env={"MURMUR_AGENT_TASK_REF": "v2:bad-v2"},
-        )
-        test.result(
-            f"{vendor}: valid JSON malformed v2 hash/schema claim",
-            got,
-            "BLOCK",
-        )
-        shutil.rmtree(valid_json_bad_dir.parent.parent)
-        valid_json_bad_v1 = common / "agent-harness" / "tasks" / "bad-v1"
-        valid_json_bad_v1.mkdir(parents=True)
-        (valid_json_bad_v1 / "task.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "task_id": "bad-v1",
-                    "worktree_path": str(repo.resolve()),
-                    "contract_sha256": "0" * 64,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        got, _ = test.invoke(
-            vendor,
-            "finish-guard",
-            "git commit -m x",
-            repo,
-            extra_env={"MURMUR_AGENT_TASK_REF": "v1:bad-v1"},
-        )
-        test.result(
-            f"{vendor}: valid JSON malformed v1 hash/schema claim",
-            got,
-            "BLOCK",
-        )
-        shutil.rmtree(valid_json_bad_v1)
+        test.result(f"{vendor}: malformed claiming task fails closed", got, "BLOCK")
+        shutil.rmtree(bad)
 
-        task_dir, task, attestation = _write_receipt(repo, "fresh")
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", repo)
+        test.result(f"{vendor}: no-task heavy command remains normal", got, "ALLOW")
+        _write_task_claim(repo, "active-task")
         got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
-        test.result(f"{vendor}: production rejects fake receipt", got, "BLOCK")
-        got, _ = test.invoke(
-            vendor,
-            "finish-guard",
-            "git commit -m x",
-            repo,
-            allow_test_adapter=True,
-        )
-        test.result(f"{vendor}: internal selftest accepts fresh receipt", got, "ALLOW")
-
-        (task_dir / "attestation.json").write_text('{"verdict":"PASS"}\n', encoding="utf-8")
-        got, _ = test.invoke(
-            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
-        )
-        test.result(f"{vendor}: minimal receipt", got, "BLOCK")
-
-        # With a task claiming the worktree, the resource lane is enforced again.
-        # This MUST be pinned through CLEAN single-task resolution, not the
-        # ambiguous fail-safe: reusing `repo` here would leave TWO manifests
-        # ("fresh" above + a new one) claiming the same worktree_path, so
-        # _resolve_task raises GuardFailure("multiple task manifests claim
-        # this worktree") and _worktree_has_active_task returns True via its
-        # `except GuardFailure` fail-safe branch -- never exercising the real
-        # "exactly one task resolves" happy path the gate depends on. Use a
-        # DEDICATED _finish_repo() fixture instead: it starts with no task
-        # manifest of its own, so writing exactly one receipt on it resolves
-        # unambiguously (see _resolve_task: `len(matches) == 1` returns
-        # directly, only `len(matches) > 1` raises the ambiguous GuardFailure).
-        lane_repo = _finish_repo()
-        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", lane_repo)
-        test.result(f"{vendor}: no-task heavy allowed (clean fixture mirror)", got, "ALLOW")
-
-        _write_receipt(lane_repo, "lane")
-        # Exactly one manifest (this "lane" task) now claims lane_repo's
-        # worktree, so _resolve_task's `matches` list has length 1 and
-        # returns that single match directly -- _worktree_has_active_task
-        # returns True via the real "task found" path, not the
-        # ambiguous-manifests fail-safe. This is the happy path pinned.
-        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", lane_repo)
-        test.result(f"{vendor}: task-present unwrapped heavy blocked (clean single-task)", got, "BLOCK")
-        # Absolute path: lane_repo is a separate git init unrelated to
-        # SOURCE_ROOT, so a *relative* "scripts/agent-resource-run" would not
-        # resolve to the canonical runner from this cwd and would misclassify
-        # as an untrusted lookalike (see resource_policy.is_lane_runner).
+        test.result(f"{vendor}: raw task commit delegates to harness", got, "BLOCK")
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", repo)
+        test.result(f"{vendor}: task heavy command requires lane", got, "BLOCK")
         lane_runner = SOURCE_ROOT / "scripts" / "agent-resource-run"
         got, _ = test.invoke(
             vendor,
             "block-bash",
             f"{lane_runner} --chdir src-tauri -- cargo test --lib",
-            lane_repo,
+            repo,
         )
-        test.result(f"{vendor}: task-present lane-wrapped allowed", got, "ALLOW")
-        shutil.rmtree(lane_repo.parent)
-
-        (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        attestation["reviews"][0]["verdict"] = "FAIL"
-        (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        got, _ = test.invoke(
-            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
-        )
-        test.result(f"{vendor}: failed review", got, "BLOCK")
-
-        # Rebuild a fresh receipt, then mutate the staged tree.
-        task_dir, task, attestation = _write_receipt(repo, "fresh")
-        (repo / "owned.txt").write_text("changed again\n", encoding="utf-8")
-        _run(["git", "add", "owned.txt"], repo)
-        got, _ = test.invoke(
-            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
-        )
-        test.result(f"{vendor}: changed staged hash", got, "BLOCK")
-
-        # Remove the non-risk task so discovery remains unambiguous, then prove
-        # path/risk-required reviews and evidence cannot be omitted.
-        shutil.rmtree(task_dir)
-        task_dir, task, attestation = _write_receipt(repo, "lock-risk", risk=True)
-        attestation["reviews"] = [review for review in attestation["reviews"] if review["kind"] != "lock-security"]
-        (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        got, _ = test.invoke(
-            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
-        )
-        test.result(f"{vendor}: missing risk review", got, "BLOCK")
-
-        task_dir, task, attestation = _write_receipt(repo, "lock-risk")
-        attestation["reviews"][0]["reviewer"]["session_id"] = attestation["writer"]["session_id"]
-        (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        got, _ = test.invoke(
-            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
-        )
-        test.result(f"{vendor}: reviewer reused writer session", got, "BLOCK")
-
+        test.result(f"{vendor}: task lane-wrapped command", got, "ALLOW")
         shutil.rmtree(repo.parent)
-
-    print("-- provenance vendor rule (same-vendor allowed; public fake rejected) --")
-    same_vendor_attestation = {
-        "writer": {"vendor": "claude", "round": 1, "cli_version": "x", "model": "m", "session_id": "sess-w"},
-        "reviewer": {"vendor": "claude", "cli_version": "x", "model": "m", "session_id": "sess-r"},
-        "rounds": 1,
-    }
-    same_vendor_task = {"writer": "claude", "reviewer": "claude"}
-    try:
-        _validate_provenance(same_vendor_attestation, same_vendor_task)
-        test.result("same-vendor provenance accepted", "ACCEPT", "ACCEPT")
-    except GuardFailure as exc:
-        test.result("same-vendor provenance accepted", f"BLOCK:{exc}", "ACCEPT")
-    fake_attestation = {
-        "writer": {"vendor": "fake", "round": 1, "cli_version": "x", "model": "m", "session_id": "sess-w"},
-        "reviewer": {"vendor": "fake", "cli_version": "x", "model": "m", "session_id": "sess-r"},
-        "rounds": 1,
-    }
-    fake_task = {"writer": "fake", "reviewer": "fake"}
-    try:
-        _validate_provenance(fake_attestation, fake_task)
-        test.result("public fake provenance rejected", "ACCEPT", "BLOCK")
-    except GuardFailure:
-        test.result("public fake provenance rejected", "BLOCK", "BLOCK")
-
-    print("-- real runner / linked-worktree integration --")
-    _linked_worktree_runner_case(test)
 
     print("-- repo-global resource lane --")
     _resource_lane_runner_cases(test)
