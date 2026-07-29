@@ -36,6 +36,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import resource_lane
 
 
+# Git replacement objects make a visible commit SHA resolve through mutable
+# local refs. Harness evidence and worktree provisioning must always consume the
+# repository's raw object graph instead.
+os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
+
+
 HARNESS_ROOT = Path(__file__).resolve().parent
 SCHEMAS_DIR = HARNESS_ROOT / "schemas"
 PROMPTS_DIR = HARNESS_ROOT / "prompts"
@@ -377,10 +383,13 @@ def run_capture(
     check: bool = True,
     env: Optional[Mapping[str, str]] = None,
 ) -> subprocess.CompletedProcess:
+    selected_env = dict(env) if env else dict(os.environ)
+    if argv and Path(str(argv[0])).name == "git":
+        selected_env["GIT_NO_REPLACE_OBJECTS"] = "1"
     completed = subprocess.run(
         list(argv),
         cwd=str(cwd) if cwd else None,
-        env=dict(env) if env else None,
+        env=selected_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -401,6 +410,7 @@ def git_bytes(cwd: Path, *args: str, check: bool = True) -> bytes:
     completed = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,

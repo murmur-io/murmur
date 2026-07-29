@@ -18,11 +18,13 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -143,6 +145,7 @@ def load_v2_task(
 ) -> Tuple[Dict[str, Any], Path, Path]:
     _valid_task_id(task_id)
     primary, common = runtime.repo_context(cwd)
+    verifier.require_no_git_replacements(primary)
     task_dir = v2_task_dir(common, task_id)
     contract = runtime.load_json(task_dir / "task.json")
     contract_schema: Optional[Mapping[str, Any]] = None
@@ -489,6 +492,8 @@ def _require_safe_new_task_root(driver: Path, task_root: Path) -> None:
 def cmd_open(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
     primary, common = _standalone_driver_context(cwd)
+    verifier.require_no_git_replacements(primary)
+    _require_sha1_repository(primary, label="v2 Harness driver")
     _valid_task_id(args.task_id)
     task_dir = v2_task_dir(common, args.task_id)
     task_root = primary.parent / ".murmur-agent-tasks" / "v2" / args.task_id
@@ -516,6 +521,13 @@ def cmd_open(args: argparse.Namespace) -> int:
     base_sha = _fetch_base(cwd, args.base)
     if not runtime.SHA1_RE.fullmatch(base_sha):
         raise runtime.HarnessError("v2 base did not resolve to a commit")
+    executing_protocol = verifier.protocol_bundle(verifier.SOURCE_ROOT)
+    base_protocol = verifier.protocol_bundle_at_commit(primary, base_sha)
+    if base_protocol != executing_protocol:
+        raise runtime.HarnessError(
+            "v2 base protocol differs from the executing Harness; update the "
+            "base before opening a task"
+        )
     branch = args.branch or f"agent/v2/{args.task_id}"
     if branch in {"murmur", "main", "master"}:
         raise runtime.HarnessError("v2 task cannot use a protected branch")
@@ -565,9 +577,22 @@ def cmd_open(args: argparse.Namespace) -> int:
         branch_expected_oid = _create_open_branch(primary, branch, base_sha)
         branch_created = True
         runtime.run_capture(
-            ["git", "worktree", "add", str(worktree), branch],
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                str(worktree),
+                branch,
+            ],
             primary,
         )
+        verifier.verify_raw_checkout(primary, base_sha, worktree)
+        if verifier.protocol_bundle(worktree) != executing_protocol:
+            raise runtime.HarnessError(
+                "v2 checked-out protocol differs from the executing Harness"
+            )
         unsafe = [
             path
             for path in owned
@@ -2788,12 +2813,126 @@ def _v2_archive_ref(task_id: str) -> str:
     return f"refs/agent-harness/v2/archive/{safe}-{suffix}"
 
 
+def _verify_tree_matches_raw_bytes(
+    worktree: Path,
+    tree: str,
+    *,
+    label: str,
+) -> None:
+    """Prove a Git tree stores each visible filesystem leaf byte-for-byte."""
+
+    listed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            tree,
+        ],
+        cwd=str(worktree),
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if listed.returncode != 0:
+        raise runtime.HarnessError(
+            f"v2 clean {label} tree is unreadable for raw-byte proof"
+        )
+    archived: Dict[str, Tuple[str, str]] = {}
+    for raw_record in (
+        record for record in listed.stdout.split(b"\0") if record
+    ):
+        try:
+            header, raw_path = raw_record.split(b"\t", 1)
+            mode, kind, object_id = header.decode("ascii").split()
+            relative = raw_path.decode("utf-8", "surrogateescape")
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise runtime.HarnessError(
+                f"v2 clean {label} tree entry is malformed"
+            ) from exc
+        if (
+            kind != "blob"
+            or mode not in {"100644", "100755", "120000"}
+            or not runtime.SHA1_RE.fullmatch(object_id)
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {label} has an unsupported entry: {relative}"
+            )
+        archived[relative] = (mode, object_id)
+
+    visible = {
+        relative
+        for relative in _clean_visible_paths(worktree)
+        if (
+            (worktree / relative).exists()
+            or (worktree / relative).is_symlink()
+        )
+    }
+    if set(archived) != visible:
+        extra = sorted(set(archived) - visible)
+        missing = sorted(visible - set(archived))
+        raise runtime.HarnessError(
+            f"v2 clean {label} path set differs from raw filesystem bytes"
+            f" (extra={extra[:10]}, missing={missing[:10]})"
+        )
+
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+    )
+    for relative, (expected_mode, expected_oid) in archived.items():
+        path = worktree / relative
+        before = path.lstat()
+        if expected_mode == "120000":
+            if not stat.S_ISLNK(before.st_mode):
+                raise runtime.HarnessError(
+                    f"v2 clean {label} type differs from raw bytes: {relative}"
+                )
+            payload = os.readlink(path).encode(
+                "utf-8", "surrogateescape"
+            )
+        else:
+            if not stat.S_ISREG(before.st_mode):
+                raise runtime.HarnessError(
+                    f"v2 clean {label} type differs from raw bytes: {relative}"
+                )
+            actual_mode = (
+                "100755" if before.st_mode & 0o111 else "100644"
+            )
+            if actual_mode != expected_mode:
+                raise runtime.HarnessError(
+                    f"v2 clean {label} mode differs from raw bytes: {relative}"
+                )
+            payload = path.read_bytes()
+        after = path.lstat()
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean raw bytes changed during {label} proof: {relative}"
+            )
+        header = f"blob {len(payload)}\0".encode("ascii")
+        actual_oid = hashlib.sha1(header + payload).hexdigest()
+        if actual_oid != expected_oid:
+            raise runtime.HarnessError(
+                f"v2 clean {label} transformed raw bytes: {relative}"
+            )
+
+
 def _archive_all_visible_bytes(
     primary: Path,
     worktree: Path,
     contract: Mapping[str, Any],
     task_dir: Path,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, str, str]:
     """Archive HEAD plus every tracked/untracked byte via a private index."""
 
     runtime_dir = task_dir / "runtime"
@@ -2831,6 +2970,11 @@ def _archive_all_visible_bytes(
             text=True,
             capture_output=True,
         ).stdout.strip()
+        _verify_tree_matches_raw_bytes(
+            worktree,
+            tree,
+            label="archive",
+        )
     except subprocess.CalledProcessError as exc:
         detail = (
             exc.stderr.decode("utf-8", "replace")
@@ -2877,10 +3021,64 @@ def _archive_all_visible_bytes(
             "created_at": runtime.utc_now(),
         },
     )
-    return archive_ref, snapshot, tree
+    return archive_ref, snapshot, tree, head
 
 
-def _non_disposable_ignored_paths(worktree: Path) -> List[str]:
+DISPOSABLE_IGNORED_PREFIXES = (
+    ".angular/cache",
+    "dist/meetnotes",
+)
+DISPOSABLE_IGNORED_FILES = {
+    "src-tauri/binaries/meetnotes-aeccap",
+    "src-tauri/binaries/meetnotes-audiocap",
+    "src-tauri/binaries/meetnotes-brain",
+    "src-tauri/binaries/meetnotes-sysaudio",
+    "src-tauri/binaries/murmur-brain",
+    "test-results/.last-run.json",
+}
+CARGO_CACHE_PREFIXES = ("src-tauri/target", "target")
+CARGO_CACHE_TAG_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+
+
+def _valid_cargo_cache_root(worktree: Path, prefix: str) -> bool:
+    tag = worktree / prefix / "CACHEDIR.TAG"
+    try:
+        metadata = tag.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4_096:
+        return False
+    try:
+        return tag.read_bytes().startswith(CARGO_CACHE_TAG_SIGNATURE)
+    except OSError:
+        return False
+
+
+def _disposable_ignored_path(worktree: Path, path: str) -> bool:
+    if path in DISPOSABLE_IGNORED_FILES:
+        return True
+    if any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in DISPOSABLE_IGNORED_PREFIXES
+    ):
+        return True
+    for prefix in CARGO_CACHE_PREFIXES:
+        if path != prefix and not path.startswith(prefix + "/"):
+            continue
+        relative = path.removeprefix(prefix).lstrip("/")
+        components = relative.split("/") if relative else []
+        if any(
+            components[index : index + 2] == ["release", "bundle"]
+            for index in range(len(components) - 1)
+        ):
+            # Tauri release bundles can contain signed, notarized, and stapled
+            # operator artifacts. They are ignored by Git but not reproducible.
+            return False
+        return _valid_cargo_cache_root(worktree, prefix)
+    return False
+
+
+def _ignored_paths(worktree: Path) -> List[str]:
     raw = runtime.git_bytes(
         worktree,
         "ls-files",
@@ -2904,18 +3102,235 @@ def _non_disposable_ignored_paths(worktree: Path) -> List[str]:
     return values
 
 
+def _non_disposable_ignored_paths(worktree: Path) -> List[str]:
+    return [
+        path
+        for path in _ignored_paths(worktree)
+        if not _disposable_ignored_path(worktree, path)
+    ]
+
+
+def _linked_worktree_admin_path(worktree: Path, owner: Path) -> Path:
+    try:
+        marker_text = (worktree / ".git").read_text(
+            encoding="utf-8"
+        ).strip()
+    except (OSError, UnicodeError) as exc:
+        raise runtime.HarnessError(
+            "v2 clean cannot read linked worktree metadata"
+        ) from exc
+    prefix = "gitdir: "
+    if not marker_text.startswith(prefix):
+        raise runtime.HarnessError("v2 clean linked worktree metadata is malformed")
+    raw_admin = Path(marker_text.removeprefix(prefix))
+    git_admin = (
+        raw_admin if raw_admin.is_absolute() else (worktree / raw_admin)
+    ).resolve()
+    common = Path(
+        runtime.git(
+            owner,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        )
+    ).resolve()
+    if git_admin.parent != common / "worktrees":
+        raise runtime.HarnessError("v2 clean linked worktree admin path is unsafe")
+    return git_admin
+
+
+def _new_clean_root_record(
+    path: Path,
+    *,
+    expected_tree: str,
+    expected_revision: Optional[str],
+    git_owner: Optional[Path],
+) -> Dict[str, Any]:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise runtime.HarnessError(f"v2 clean root is unsafe: {path}")
+    quarantine = (
+        path.parent
+        / f".clean-quarantine-{secrets.token_hex(16)}"
+        / path.name
+    )
+    git_admin = (
+        _linked_worktree_admin_path(path, git_owner)
+        if git_owner is not None
+        else None
+    )
+    return {
+        "path": str(path),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "quarantine_path": str(quarantine),
+        "delete_staging_path": str(quarantine.parent / ".delete-staging"),
+        "expected_tree": expected_tree,
+        "expected_revision": expected_revision,
+        "git_admin_path": (
+            str(git_admin)
+            if git_admin is not None
+            else None
+        ),
+        "git_admin_staging_path": (
+            str(
+                git_admin.parent
+                / (
+                    f".clean-{git_admin.name}-"
+                    f"{quarantine.parent.name.removeprefix('.clean-quarantine-')}"
+                )
+            )
+            if git_admin is not None
+            else None
+        ),
+    }
+
+
+def _validate_clean_root_record(
+    record: Mapping[str, Any],
+    *,
+    expected_path: Path,
+    git_owner: Optional[Path],
+) -> None:
+    if Path(str(record.get("path", ""))) != expected_path:
+        raise runtime.HarnessError("v2 clean root record path is stale")
+    for key in ("device", "inode"):
+        if not isinstance(record.get(key), int) or record[key] <= 0:
+            raise runtime.HarnessError(
+                f"v2 clean root record {key} is malformed"
+            )
+    if not runtime.SHA1_RE.fullmatch(str(record.get("expected_tree", ""))):
+        raise runtime.HarnessError(
+            "v2 clean root record expected tree is malformed"
+        )
+    expected_revision = record.get("expected_revision")
+    if expected_revision is not None and not runtime.SHA1_RE.fullmatch(
+        str(expected_revision)
+    ):
+        raise runtime.HarnessError(
+            "v2 clean root record expected revision is malformed"
+        )
+    quarantine = Path(str(record.get("quarantine_path", "")))
+    staging = Path(str(record.get("delete_staging_path", "")))
+    if (
+        quarantine.name != expected_path.name
+        or quarantine.parent.parent != expected_path.parent
+        or not re.fullmatch(
+            r"\.clean-quarantine-[0-9a-f]{32}", quarantine.parent.name
+        )
+        or staging != quarantine.parent / ".delete-staging"
+    ):
+        raise runtime.HarnessError(
+            "v2 clean root record quarantine path is unsafe"
+        )
+    raw_admin = record.get("git_admin_path")
+    raw_admin_staging = record.get("git_admin_staging_path")
+    if git_owner is None:
+        if raw_admin is not None or raw_admin_staging is not None:
+            raise runtime.HarnessError(
+                "v2 standalone clean root unexpectedly has Git admin metadata"
+            )
+    else:
+        admin = Path(str(raw_admin or ""))
+        common = Path(
+            runtime.git(
+                git_owner,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        ).resolve()
+        if admin.parent != common / "worktrees":
+            raise runtime.HarnessError(
+                "v2 clean root record Git admin path is unsafe"
+            )
+        admin_staging = Path(str(raw_admin_staging or ""))
+        if (
+            admin_staging.parent != admin.parent
+            or not re.fullmatch(
+                rf"\.clean-{re.escape(admin.name)}-[0-9a-f]{{32}}",
+                admin_staging.name,
+            )
+        ):
+            raise runtime.HarnessError(
+                "v2 clean root record Git admin staging path is unsafe"
+            )
+
+
 def _clean_intent_document(
     contract: Mapping[str, Any],
     *,
+    worktree: Path,
     final_status: str,
     previous_status: str,
     archive_ref: str,
     snapshot_sha: str,
     tree_sha: str,
-    server: Tuple[Optional[Path], Optional[Path], Optional[str]],
-    verification_snapshots: Sequence[Tuple[Path, str, str]],
+    worktree_revision: str,
+    server: Tuple[
+        Optional[Path],
+        Optional[Path],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+    ],
+    verification_snapshots: Sequence[Tuple[Path, str, str, str]],
 ) -> Dict[str, Any]:
-    server_worktree, server_source, server_mode = server
+    (
+        server_worktree,
+        server_source,
+        server_mode,
+        server_revision,
+        server_tree,
+    ) = server
+    primary = Path(str(contract["repo_realpath"])).resolve()
+    client_record = _new_clean_root_record(
+        worktree,
+        expected_tree=tree_sha,
+        expected_revision=worktree_revision,
+        git_owner=primary,
+    )
+    server_record: Optional[Dict[str, Any]] = None
+    if server_worktree is not None:
+        if server_revision is None or server_tree is None:
+            raise runtime.HarnessError(
+                "v2 clean server preflight lost its pinned revision"
+            )
+        server_record = _new_clean_root_record(
+            server_worktree,
+            expected_tree=server_tree,
+            expected_revision=server_revision,
+            git_owner=(
+                server_source if server_mode == "linked-worktree" else None
+            ),
+        )
+    snapshot_records = []
+    for path, reference, commit, head_revision in verification_snapshots:
+        if path.exists() or path.is_symlink():
+            record = {
+                **_new_clean_root_record(
+                    path,
+                    expected_tree=runtime.git(
+                        primary, "rev-parse", f"{commit}^{{tree}}"
+                    ),
+                    expected_revision=head_revision,
+                    git_owner=None,
+                ),
+                "present": True,
+            }
+        else:
+            record = {
+                "path": str(path),
+                "present": False,
+                "expected_revision": head_revision,
+            }
+        snapshot_records.append(
+            {
+                **record,
+                "snapshot_ref": reference,
+                "snapshot_commit": commit,
+            }
+        )
     document: Dict[str, Any] = {
         "schema_version": 2,
         "task_id": contract["task_id"],
@@ -2925,21 +3340,24 @@ def _clean_intent_document(
         "archive_ref": archive_ref,
         "snapshot_sha": snapshot_sha,
         "tree_sha": tree_sha,
+        "worktree_revision": worktree_revision,
         "worktree_path": contract["worktree_path"],
+        "worktree_device": client_record["device"],
+        "worktree_inode": client_record["inode"],
+        "quarantine_path": client_record["quarantine_path"],
+        "delete_staging_path": client_record["delete_staging_path"],
+        "git_admin_path": client_record["git_admin_path"],
+        "git_admin_staging_path": client_record[
+            "git_admin_staging_path"
+        ],
         "branch": contract["branch"],
         "server_worktree": (
             str(server_worktree) if server_worktree is not None else None
         ),
         "server_source": str(server_source) if server_source is not None else None,
         "server_mode": server_mode,
-        "verification_snapshots": [
-            {
-                "path": str(path),
-                "snapshot_ref": reference,
-                "snapshot_commit": commit,
-            }
-            for path, reference, commit in verification_snapshots
-        ],
+        "server_cleanup": server_record,
+        "verification_snapshots": snapshot_records,
         "created_at": runtime.utc_now(),
         "intent_sha256": "",
     }
@@ -2971,17 +3389,120 @@ def _load_clean_intent(
             raise runtime.HarnessError(f"v2 clean intent {key} is stale")
     if document.get("final_status") not in {"CLOSED", "ABANDONED"}:
         raise runtime.HarnessError("v2 clean intent final status is malformed")
+    for key in ("worktree_device", "worktree_inode"):
+        if not isinstance(document.get(key), int) or document[key] <= 0:
+            raise runtime.HarnessError(f"v2 clean intent {key} is malformed")
+    if not runtime.SHA1_RE.fullmatch(
+        str(document.get("worktree_revision", ""))
+    ):
+        raise runtime.HarnessError(
+            "v2 clean intent worktree revision is malformed"
+        )
+    worktree = Path(str(contract["worktree_path"]))
+    quarantine = Path(str(document.get("quarantine_path", "")))
+    staging = Path(str(document.get("delete_staging_path", "")))
+    if (
+        quarantine.name != worktree.name
+        or quarantine.parent.parent != worktree.parent
+        or not re.fullmatch(
+            r"\.clean-quarantine-[0-9a-f]{32}", quarantine.parent.name
+        )
+        or staging != quarantine.parent / ".delete-staging"
+    ):
+        raise runtime.HarnessError("v2 clean intent quarantine path is unsafe")
+    git_admin = Path(str(document.get("git_admin_path", "")))
+    common = Path(str(contract["git_common_dir"])).resolve()
+    if git_admin.parent != common / "worktrees":
+        raise runtime.HarnessError("v2 clean intent Git admin path is unsafe")
+    git_admin_staging = Path(
+        str(document.get("git_admin_staging_path", ""))
+    )
+    if (
+        git_admin_staging.parent != git_admin.parent
+        or not re.fullmatch(
+            rf"\.clean-{re.escape(git_admin.name)}-[0-9a-f]{{32}}",
+            git_admin_staging.name,
+        )
+    ):
+        raise runtime.HarnessError(
+            "v2 clean intent Git admin staging path is unsafe"
+        )
+    server_raw = document.get("server_worktree")
+    server_record = document.get("server_cleanup")
+    if server_raw is None:
+        if server_record is not None:
+            raise runtime.HarnessError(
+                "v2 clean intent has unexpected server cleanup metadata"
+            )
+    else:
+        if not isinstance(server_record, Mapping):
+            raise runtime.HarnessError(
+                "v2 clean intent server cleanup metadata is missing"
+            )
+        server_mode = document.get("server_mode")
+        server_owner = (
+            Path(str(document.get("server_source")))
+            if server_mode == "linked-worktree"
+            else None
+        )
+        _validate_clean_root_record(
+            server_record,
+            expected_path=Path(str(server_raw)),
+            git_owner=server_owner,
+        )
+        if server_record.get("expected_revision") is None:
+            raise runtime.HarnessError(
+                "v2 clean intent server revision binding is missing"
+            )
+    snapshots = document.get("verification_snapshots")
+    if not isinstance(snapshots, list):
+        raise runtime.HarnessError(
+            "v2 clean intent snapshot cleanup metadata is malformed"
+        )
+    task_root = worktree.parent
+    for record in snapshots:
+        if not isinstance(record, Mapping):
+            raise runtime.HarnessError(
+                "v2 clean intent snapshot cleanup record is malformed"
+            )
+        snapshot = Path(str(record.get("path", "")))
+        if snapshot.parent != task_root or not snapshot.name.startswith("verify-"):
+            raise runtime.HarnessError(
+                "v2 clean intent snapshot path escaped the task root"
+            )
+        if not runtime.SHA1_RE.fullmatch(
+            str(record.get("snapshot_commit", ""))
+        ) or not runtime.SHA1_RE.fullmatch(
+            str(record.get("expected_revision", ""))
+        ):
+            raise runtime.HarnessError(
+                "v2 clean intent snapshot revision binding is malformed"
+            )
+        if record.get("present") is True:
+            _validate_clean_root_record(
+                record, expected_path=snapshot, git_owner=None
+            )
+        elif record.get("present") is not False:
+            raise runtime.HarnessError(
+                "v2 clean intent snapshot presence is malformed"
+            )
     return document
 
 
 def _server_cleanup_preflight(
     contract: Mapping[str, Any], task_dir: Path
-) -> Tuple[Optional[Path], Optional[Path], Optional[str]]:
+) -> Tuple[
+    Optional[Path],
+    Optional[Path],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]:
     runtime_doc = runtime.load_json(task_dir / "runtime.json")
     raw_worktree = runtime_doc.get("server_worktree")
     raw_source = runtime_doc.get("server_source")
     if not raw_worktree:
-        return None, None, None
+        return None, None, None, None, None
     server_worktree = Path(str(raw_worktree))
     server_source = Path(str(raw_source))
     expected = Path(str(contract["worktree_path"])).parent / "murmur-server"
@@ -2989,9 +3510,29 @@ def _server_cleanup_preflight(
         raise runtime.HarnessError("recorded v2 server worktree escapes the task root")
     if not server_worktree.is_dir() or server_worktree.is_symlink():
         raise runtime.HarnessError("recorded v2 server worktree is missing or unsafe")
+    _require_sha1_repository(
+        server_worktree,
+        label="v2 pinned server checkout",
+    )
+    _require_quarantine_idle(server_worktree)
     if runtime.git_bytes(server_worktree, "status", "--porcelain").strip():
         raise runtime.HarnessError(
             "refusing clean: pinned server worktree is dirty; nothing was removed"
+        )
+    ignored = _ignored_paths(server_worktree)
+    if ignored:
+        raise runtime.HarnessError(
+            "refusing clean: pinned server checkout has ignored bytes: "
+            + ", ".join(ignored[:20])
+        )
+    expected_revision = str(runtime_doc.get("server_revision") or "")
+    if (
+        not runtime.SHA1_RE.fullmatch(expected_revision)
+        or runtime.git(server_worktree, "rev-parse", "HEAD")
+        != expected_revision
+    ):
+        raise runtime.HarnessError(
+            "refusing clean: pinned server revision changed"
         )
     mode = str(runtime_doc.get("server_checkout_mode") or "linked-worktree")
     if mode not in {"linked-worktree", "local-shared-clone"}:
@@ -3011,13 +3552,31 @@ def _server_cleanup_preflight(
             raise runtime.HarnessError(
                 "local v2 server clone unexpectedly shares mutable Git metadata"
             )
-    return server_worktree, server_source, mode
+    expected_tree = runtime.git(
+        server_worktree,
+        "rev-parse",
+        f"{expected_revision}^{{tree}}",
+    )
+    if not runtime.SHA1_RE.fullmatch(expected_tree):
+        raise runtime.HarnessError(
+            "refusing clean: pinned server tree is malformed"
+        )
+    return (
+        server_worktree,
+        server_source,
+        mode,
+        expected_revision,
+        expected_tree,
+    )
 
 
 def _verification_snapshots_for_cleanup(
-    contract: Mapping[str, Any], task_dir: Path
-) -> List[Tuple[Path, str, str]]:
-    values: List[Tuple[Path, str, str]] = []
+    contract: Mapping[str, Any],
+    task_dir: Path,
+    *,
+    validate_worktrees: bool = True,
+) -> List[Tuple[Path, str, str, str]]:
+    values: List[Tuple[Path, str, str, str]] = []
     attempts = task_dir / "attempts"
     if not attempts.is_dir():
         return values
@@ -3038,6 +3597,7 @@ def _verification_snapshots_for_cleanup(
         snapshot = Path(str(manifest.get("path", "")))
         reference = str(manifest.get("snapshot_ref", ""))
         commit_sha = str(manifest.get("snapshot_commit", ""))
+        head_revision = str(manifest.get("base_sha", ""))
         if snapshot.resolve() != expected_path:
             raise runtime.HarnessError("v2 cleanup snapshot path is stale")
         if reference != _verification_snapshot_ref(
@@ -3046,6 +3606,8 @@ def _verification_snapshots_for_cleanup(
             raise runtime.HarnessError("v2 cleanup snapshot ref is stale")
         if not runtime.SHA1_RE.fullmatch(commit_sha):
             raise runtime.HarnessError("v2 cleanup snapshot commit is malformed")
+        if not runtime.SHA1_RE.fullmatch(head_revision):
+            raise runtime.HarnessError("v2 cleanup snapshot HEAD is malformed")
         current_ref = runtime.git(
             primary, "rev-parse", "--verify", reference, check=False
         )
@@ -3056,19 +3618,45 @@ def _verification_snapshots_for_cleanup(
                 raise runtime.HarnessError(
                     "v2 cleanup snapshot path is not a safe directory"
                 )
-            common = Path(
-                runtime.git(
+            if validate_worktrees:
+                _require_sha1_repository(
                     snapshot,
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-common-dir",
+                    label="v2 verification snapshot",
                 )
-            ).resolve()
-            if common != (snapshot / ".git").resolve():
-                raise runtime.HarnessError(
-                    "v2 cleanup snapshot shares mutable Git metadata"
+                _require_quarantine_idle(snapshot)
+                common = Path(
+                    runtime.git(
+                        snapshot,
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--git-common-dir",
+                    )
+                ).resolve()
+                if common != (snapshot / ".git").resolve():
+                    raise runtime.HarnessError(
+                        "v2 cleanup snapshot shares mutable Git metadata"
+                    )
+                if (
+                    runtime.git(snapshot, "rev-parse", "HEAD")
+                    != head_revision
+                ):
+                    raise runtime.HarnessError(
+                        "refusing clean: verification snapshot HEAD changed"
+                    )
+                ignored = _ignored_paths(snapshot)
+                if ignored:
+                    raise runtime.HarnessError(
+                        "refusing clean: verification snapshot has ignored bytes: "
+                        + ", ".join(ignored[:20])
+                    )
+                expected_tree = runtime.git(
+                    primary, "rev-parse", f"{commit_sha}^{{tree}}"
                 )
-        values.append((snapshot, reference, commit_sha))
+                if _visible_tree(snapshot, task_dir / "runtime") != expected_tree:
+                    raise runtime.HarnessError(
+                        "refusing clean: verification snapshot bytes changed"
+                    )
+        values.append((snapshot, reference, commit_sha, head_revision))
     return values
 
 
@@ -3312,6 +3900,2893 @@ def verify_v2_committed(
     return receipt
 
 
+def _clean_entry_snapshot_at(
+    parent_fd: int,
+    name: str,
+    relative: str,
+    root_device: int,
+) -> Dict[str, Any]:
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if before.st_dev != root_device:
+        raise runtime.HarnessError(
+            f"v2 clean entry crosses a filesystem boundary: {relative}"
+        )
+    common: Dict[str, Any] = {
+        "path": relative,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mode": stat.S_IMODE(before.st_mode),
+        "nlink": before.st_nlink,
+        "size": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+    }
+    if stat.S_ISDIR(before.st_mode):
+        return {**common, "kind": "directory", "sha256": ""}
+    if stat.S_ISREG(before.st_mode):
+        flags = os.O_RDONLY
+        for optional in ("O_CLOEXEC", "O_NOFOLLOW"):
+            flags |= int(getattr(os, optional, 0))
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+            ):
+                raise runtime.HarnessError(
+                    f"v2 clean entry changed while opening: {relative}"
+                )
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns")
+        if any(getattr(before, key) != getattr(after, key) for key in stable_fields):
+            raise runtime.HarnessError(
+                f"v2 clean entry changed while hashing: {relative}"
+            )
+        return {**common, "kind": "regular", "sha256": digest.hexdigest()}
+    if stat.S_ISLNK(before.st_mode):
+        target = os.readlink(name, dir_fd=parent_fd)
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns")
+        if any(getattr(before, key) != getattr(after, key) for key in stable_fields):
+            raise runtime.HarnessError(
+                f"v2 clean symlink changed while reading: {relative}"
+            )
+        return {
+            **common,
+            "kind": "symlink",
+            "sha256": runtime.sha256_bytes(
+                target.encode("utf-8", "surrogateescape")
+            ),
+        }
+    raise runtime.HarnessError(
+        f"v2 clean refuses a special filesystem entry: {relative}"
+    )
+
+
+def _clean_tree_snapshot(
+    root: Path,
+    *,
+    max_regular_bytes: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    root_fd = os.open(root, flags)
+    root_metadata = os.fstat(root_fd)
+    entries: List[Dict[str, Any]] = []
+    regular_bytes = 0
+
+    def visit(directory_fd: int, prefix: str) -> None:
+        nonlocal regular_bytes
+        with os.scandir(directory_fd) as iterator:
+            names = sorted(entry.name for entry in iterator)
+        for name in names:
+            relative = f"{prefix}/{name}" if prefix else name
+            before = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISREG(before.st_mode):
+                regular_bytes += before.st_size
+                if (
+                    max_regular_bytes is not None
+                    and regular_bytes > max_regular_bytes
+                ):
+                    raise runtime.HarnessError(
+                        "v2 clean Git-control metadata exceeds the "
+                        "recoverable archive limit"
+                    )
+            snapshot = _clean_entry_snapshot_at(
+                directory_fd, name, relative, root_metadata.st_dev
+            )
+            entries.append(snapshot)
+            if snapshot["kind"] == "directory":
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        snapshot["device"],
+                        snapshot["inode"],
+                    ):
+                        raise runtime.HarnessError(
+                            f"v2 clean directory changed while opening: {relative}"
+                        )
+                    visit(child_fd, relative)
+                finally:
+                    os.close(child_fd)
+
+    try:
+        visit(root_fd, "")
+    finally:
+        os.close(root_fd)
+    return sorted(entries, key=lambda entry: str(entry["path"]))
+
+
+def _clean_visible_paths(worktree: Path) -> set[str]:
+    raw = runtime.git_bytes(
+        worktree,
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+    )
+    return {
+        item.decode("utf-8", "surrogateescape")
+        for item in raw.split(b"\0")
+        if item
+    }
+
+
+def _clean_entry_matches(
+    expected: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    common = ("kind", "device", "inode", "mode")
+    if any(expected.get(key) != current.get(key) for key in common):
+        return False
+    if expected.get("kind") == "directory":
+        return True
+    # Deleting one name of a frozen hardlink group legitimately decrements the
+    # remaining names' link counts. Identity, bytes, mode, size, and mtime stay
+    # bound; nlink is evidence in the manifest but not a per-name delete guard.
+    exact = ("size", "mtime_ns", "sha256")
+    return all(expected.get(key) == current.get(key) for key in exact)
+
+
+GIT_CONTROL_ARCHIVE_LIMIT = 512 * 1024 * 1024
+
+
+def _immutable_artifact_exists(path: Path, *, label: str) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {label} is not a private immutable file"
+        )
+    return True
+
+
+def _ensure_private_durable_directory(path: Path, *, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        os.mkdir(path, 0o700)
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise runtime.HarnessError(f"v2 clean {label} is unsafe")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise runtime.HarnessError(f"v2 clean {label} is not private")
+
+
+def _git_control_root(
+    repo_root: Path,
+    record: Mapping[str, Any],
+    git_owner: Optional[Path],
+) -> Path:
+    if git_owner is not None:
+        candidate = Path(str(record["git_admin_path"]))
+    else:
+        candidate = repo_root / ".git"
+    if not candidate.exists() and not candidate.is_symlink():
+        raise runtime.HarnessError(
+            "v2 clean Git-control root is missing"
+        )
+    if not candidate.is_dir() or candidate.is_symlink():
+        raise runtime.HarnessError(
+            "v2 clean Git-control root is missing or unsafe"
+        )
+    return candidate
+
+
+def _clean_directory_projection(
+    root: Path,
+    *,
+    max_regular_bytes: Optional[int] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    before = root.lstat()
+    if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise runtime.HarnessError(
+            "v2 clean Git-control directory is unsafe"
+        )
+    entries = _control_entry_projection(
+        _clean_tree_snapshot(
+            root,
+            max_regular_bytes=max_regular_bytes,
+        )
+    )
+    after = root.lstat()
+    stable = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+    )
+    if any(getattr(before, key) != getattr(after, key) for key in stable):
+        raise runtime.HarnessError(
+            "v2 clean Git-control root changed while archiving"
+        )
+    projection = {
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mode": stat.S_IMODE(after.st_mode),
+        "nlink": after.st_nlink,
+        "size": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+    }
+    return projection, entries
+
+
+def _clean_path_projection(path: Path, relative: str) -> Dict[str, Any]:
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    parent_fd = os.open(path.parent, flags)
+    try:
+        parent = os.fstat(parent_fd)
+        return _clean_entry_snapshot_at(
+            parent_fd,
+            path.name,
+            relative,
+            parent.st_dev,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def _control_entry_projection(
+    entries: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    keys = (
+        "path",
+        "kind",
+        "device",
+        "inode",
+        "mode",
+        "nlink",
+        "size",
+        "mtime_ns",
+        "sha256",
+    )
+    return [
+        {key: entry[key] for key in keys}
+        for entry in entries
+    ]
+
+
+def _read_git_control_payload(
+    source_root: Path,
+    entry: Mapping[str, Any],
+) -> bytes:
+    path = source_root / str(entry["path"])
+    before = path.lstat()
+    if entry["kind"] == "regular":
+        if not stat.S_ISREG(before.st_mode):
+            raise runtime.HarnessError(
+                "v2 clean Git-control payload type changed"
+            )
+        payload = path.read_bytes()
+    elif entry["kind"] == "symlink":
+        if not stat.S_ISLNK(before.st_mode):
+            raise runtime.HarnessError(
+                "v2 clean Git-control payload type changed"
+            )
+        payload = os.readlink(path).encode(
+            "utf-8", "surrogateescape"
+        )
+    else:
+        raise runtime.HarnessError(
+            "v2 clean Git-control payload kind is malformed"
+        )
+    after = path.lstat()
+    current = {
+        "kind": entry["kind"],
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "mode": stat.S_IMODE(after.st_mode),
+        "size": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "sha256": runtime.sha256_bytes(payload),
+    }
+    if not _clean_entry_matches(entry, current):
+        raise runtime.HarnessError(
+            "v2 clean Git-control payload changed during archival: "
+            + str(entry["path"])
+        )
+    return payload
+
+
+def _require_sha1_repository(repo: Path, *, label: str) -> None:
+    object_format = runtime.git(
+        repo,
+        "rev-parse",
+        "--show-object-format",
+        check=False,
+    )
+    if object_format != "sha1":
+        raise runtime.HarnessError(
+            f"{label} must use Git SHA-1 object format; found "
+            f"{object_format or 'unknown'}"
+        )
+
+
+def _existing_git_object(repo: Path, object_id: str) -> bool:
+    completed = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "cat-file",
+            "-e",
+            f"{object_id}^{{object}}",
+        ],
+        cwd=str(repo),
+        env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def _control_object_seeds(
+    *,
+    repo_root: Path,
+    control_root: Path,
+    git_owner: Optional[Path],
+    entries: Sequence[Mapping[str, Any]],
+) -> Tuple[str, List[str]]:
+    _require_sha1_repository(
+        repo_root,
+        label="v2 clean Git-control repository",
+    )
+    if git_owner is None:
+        completed = subprocess.run(
+            [
+                "git",
+                "--no-replace-objects",
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+            cwd=str(repo_root),
+            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise runtime.HarnessError(
+                "v2 clean cannot enumerate standalone Git objects: "
+                + completed.stderr.strip()
+            )
+        seeds = sorted(
+            {
+                line
+                for line in completed.stdout.splitlines()
+                if runtime.SHA1_RE.fullmatch(line)
+            }
+        )
+        malformed = [
+            line
+            for line in completed.stdout.splitlines()
+            if line and not runtime.SHA1_RE.fullmatch(line)
+        ]
+        if malformed:
+            raise runtime.HarnessError(
+                "v2 clean standalone Git object inventory is malformed"
+            )
+        return "all-objects", seeds
+
+    candidates: set[str] = set()
+    head = runtime.git(repo_root, "rev-parse", "HEAD", check=False)
+    if runtime.SHA1_RE.fullmatch(head):
+        candidates.add(head)
+    for argv in (
+        ("ls-files", "--stage", "-z"),
+        ("ls-files", "--resolve-undo", "-z"),
+    ):
+        raw = runtime.git_bytes(repo_root, *argv)
+        candidates.update(
+            match.group(0).decode("ascii")
+            for match in re.finditer(rb"[0-9a-f]{40}", raw)
+        )
+    for entry in entries:
+        if entry["kind"] != "regular":
+            continue
+        payload = _read_git_control_payload(control_root, entry)
+        candidates.update(
+            match.group(0).decode("ascii")
+            for match in re.finditer(rb"[0-9a-f]{40}", payload)
+        )
+    seeds = sorted(
+        object_id
+        for object_id in candidates
+        if object_id != "0" * 40
+        and _existing_git_object(repo_root, object_id)
+    )
+    if not seeds:
+        raise runtime.HarnessError(
+            "v2 clean linked Git-control object closure is empty"
+        )
+    return "reachable-closure", seeds
+
+
+def _atomic_install_file(source: Path, destination: Path) -> None:
+    if _immutable_artifact_exists(
+        destination,
+        label="Git-control object pack",
+    ):
+        return
+    try:
+        os.link(source, destination)
+    except FileExistsError as exc:
+        raise runtime.HarnessError(
+            f"refusing to overwrite prior execution artifact: {destination}"
+        ) from exc
+    parent_fd = os.open(
+        destination.parent,
+        os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)),
+    )
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _ensure_control_object_pack(
+    *,
+    repo_root: Optional[Path],
+    archive_root: Path,
+    mode: str,
+    seeds: Optional[Sequence[str]],
+    expected: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    pack_path = archive_root / "objects.pack"
+    index_path = archive_root / "objects.idx"
+    if expected is None:
+        if repo_root is None or seeds is None:
+            raise runtime.HarnessError(
+                "v2 clean Git-control object pack cannot be recovered"
+            )
+        runtime_dir = archive_root.parent.parent / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="clean-object-pack-",
+            dir=str(runtime_dir),
+        ) as raw_temporary:
+            temporary = Path(raw_temporary)
+            temporary_pack = temporary / "objects.pack"
+            temporary_index = temporary / "objects.idx"
+            with temporary_pack.open("wb") as output:
+                completed = subprocess.run(
+                    [
+                        "git",
+                        "--no-replace-objects",
+                        "pack-objects",
+                        "--stdout",
+                        *(["--revs"] if mode == "reachable-closure" else []),
+                    ],
+                    cwd=str(repo_root),
+                    env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+                    input=("\n".join(seeds) + "\n").encode("ascii"),
+                    stdout=output,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            if completed.returncode != 0:
+                raise runtime.HarnessError(
+                    "v2 clean could not create a self-contained "
+                    "Git object pack: "
+                    + completed.stderr.decode("utf-8", "replace").strip()
+                )
+            if (
+                temporary_pack.stat().st_size
+                > GIT_CONTROL_ARCHIVE_LIMIT
+            ):
+                raise runtime.HarnessError(
+                    "v2 clean Git object pack exceeds the recoverable "
+                    "archive limit"
+                )
+            indexed = subprocess.run(
+                [
+                    "git",
+                    "index-pack",
+                    "-o",
+                    str(temporary_index),
+                    str(temporary_pack),
+                ],
+                cwd=str(repo_root),
+                env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if indexed.returncode != 0:
+                raise runtime.HarnessError(
+                    "v2 clean Git object pack failed index verification: "
+                    + indexed.stderr.strip()
+                )
+            _atomic_install_file(temporary_pack, pack_path)
+            _atomic_install_file(temporary_index, index_path)
+        expected = {
+            "mode": mode,
+            "seed_count": len(seeds),
+            "seeds_sha256": runtime.sha256_bytes(
+                ("\n".join(seeds) + "\n").encode("ascii")
+            ),
+            "pack_sha256": runtime.sha256_file(pack_path),
+            "index_sha256": runtime.sha256_file(index_path),
+        }
+    if (
+        expected.get("mode") != mode
+        or not isinstance(expected.get("seed_count"), int)
+        or not runtime.SHA256_RE.fullmatch(
+            str(expected.get("seeds_sha256", ""))
+        )
+    ):
+        raise runtime.HarnessError(
+            "v2 clean Git-control object pack metadata is malformed"
+        )
+    if seeds is not None and (
+        expected["seed_count"] != len(seeds)
+        or expected["seeds_sha256"]
+        != runtime.sha256_bytes(
+            ("\n".join(seeds) + "\n").encode("ascii")
+        )
+    ):
+        raise runtime.HarnessError(
+            "refusing clean: Git-control object inventory changed"
+        )
+    for path, key in (
+        (pack_path, "pack_sha256"),
+        (index_path, "index_sha256"),
+    ):
+        if not _immutable_artifact_exists(
+            path, label="Git-control object pack"
+        ) or runtime.sha256_file(path) != expected.get(key):
+            raise runtime.HarnessError(
+                "v2 clean Git-control object pack is missing or stale"
+            )
+    verified = subprocess.run(
+        ["git", "verify-pack", "-v", str(index_path)],
+        cwd=str(archive_root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if verified.returncode != 0:
+        raise runtime.HarnessError(
+            "v2 clean archived Git object pack is corrupt: "
+            + verified.stderr.strip()
+        )
+    packed_objects = {
+        line.split()[0]
+        for line in verified.stdout.splitlines()
+        if line
+        and runtime.SHA1_RE.fullmatch(line.split()[0])
+    }
+    if seeds is not None and not set(seeds).issubset(packed_objects):
+        raise runtime.HarnessError(
+            "v2 clean archived Git object pack omits bound objects"
+        )
+    return dict(expected)
+
+
+def _archive_git_control(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    archive_role: str,
+    repo_root: Path,
+    record: Mapping[str, Any],
+    git_owner: Optional[Path],
+    live: bool,
+) -> Dict[str, Any]:
+    manifest_path = (
+        task_dir / f"clean-git-control-{archive_role}.json"
+    )
+    complete_path = (
+        task_dir
+        / f"clean-git-control-{archive_role}-complete.json"
+    )
+    expected_control_root = (
+        Path(str(record["git_admin_path"]))
+        if git_owner is not None
+        else repo_root / ".git"
+    )
+    expected_marker = (
+        repo_root / ".git" if git_owner is not None else None
+    )
+    current_root: Optional[Dict[str, Any]] = None
+    current_entries: Optional[List[Dict[str, Any]]] = None
+    current_marker: Optional[Dict[str, Any]] = None
+    object_mode: Optional[str] = None
+    object_seeds: Optional[List[str]] = None
+    current_object_inventory: Optional[Dict[str, Any]] = None
+    control_root: Optional[Path] = None
+    if live:
+        control_root = _git_control_root(
+            repo_root, record, git_owner
+        )
+        current_root, current_entries = (
+            _clean_directory_projection(
+                control_root,
+                max_regular_bytes=GIT_CONTROL_ARCHIVE_LIMIT,
+            )
+        )
+        if expected_marker is not None:
+            current_marker = _clean_path_projection(
+                expected_marker, ".git"
+            )
+            if current_marker["kind"] != "regular":
+                raise runtime.HarnessError(
+                    "v2 clean linked Git marker is not a regular file"
+                )
+            if (
+                int(current_marker["size"])
+                > GIT_CONTROL_ARCHIVE_LIMIT
+            ):
+                raise runtime.HarnessError(
+                    "v2 clean linked Git marker exceeds the "
+                    "recoverable archive limit"
+                )
+        object_mode, object_seeds = _control_object_seeds(
+            repo_root=repo_root,
+            control_root=control_root,
+            git_owner=git_owner,
+            entries=current_entries,
+        )
+        current_object_inventory = {
+            "format": "sha1",
+            "mode": object_mode,
+            "seed_count": len(object_seeds),
+            "seeds_sha256": runtime.sha256_bytes(
+                ("\n".join(object_seeds) + "\n").encode("ascii")
+            ),
+            "seeds": object_seeds,
+        }
+
+    if _immutable_artifact_exists(
+        manifest_path, label=f"{archive_role} Git-control manifest"
+    ):
+        document = runtime.load_json(manifest_path)
+        if document.get("manifest_sha256") != verifier.document_hash(
+            document, "manifest_sha256"
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {archive_role} Git-control manifest "
+                "hash mismatch"
+            )
+        for key, expected in (
+            ("schema_version", 2),
+            ("archive_role", archive_role),
+            ("intent_sha256", intent["intent_sha256"]),
+            ("repo_root", str(repo_root)),
+            ("control_root", str(expected_control_root)),
+            (
+                "marker_path",
+                (
+                    str(expected_marker)
+                    if expected_marker is not None
+                    else None
+                ),
+            ),
+        ):
+            if document.get(key) != expected:
+                raise runtime.HarnessError(
+                    f"v2 clean {archive_role} Git-control manifest "
+                    "is stale"
+                )
+        if (
+            live
+            and (
+                document.get("root") != current_root
+                or document.get("entries") != current_entries
+                or document.get("marker") != current_marker
+                or document.get("object_inventory")
+                != current_object_inventory
+            )
+        ):
+            raise runtime.HarnessError(
+                f"refusing clean: {archive_role} Git-control "
+                "metadata changed"
+            )
+    else:
+        if not live or current_root is None or current_entries is None:
+            raise runtime.HarnessError(
+                f"v2 clean {archive_role} Git-control root disappeared "
+                "before archival"
+            )
+        document = {
+            "schema_version": 2,
+            "archive_role": archive_role,
+            "intent_sha256": intent["intent_sha256"],
+            "repo_root": str(repo_root),
+            "control_root": str(expected_control_root),
+            "marker_path": (
+                str(expected_marker)
+                if expected_marker is not None
+                else None
+            ),
+            "root": current_root,
+            "entries": current_entries,
+            "marker": current_marker,
+            "object_inventory": current_object_inventory,
+            "manifest_sha256": "",
+        }
+        document["manifest_sha256"] = verifier.document_hash(
+            document, "manifest_sha256"
+        )
+        runtime.atomic_create_json(manifest_path, document)
+
+    archive_base = task_dir / "clean-git-control"
+    _ensure_private_durable_directory(
+        archive_base,
+        label="Git-control archive base",
+    )
+    archive_root = archive_base / archive_role
+    _ensure_private_durable_directory(
+        archive_root,
+        label=f"{archive_role} Git-control archive path",
+    )
+    archive_root_before = archive_root.lstat()
+
+    payload_records = []
+    payload_index = 0
+    sources: List[Tuple[str, Mapping[str, Any], Optional[Path]]] = [
+        ("control", entry, control_root)
+        for entry in document["entries"]
+    ]
+    marker_entry = document.get("marker")
+    if isinstance(marker_entry, Mapping):
+        sources.append(
+            (
+                "marker",
+                marker_entry,
+                expected_marker.parent
+                if live and expected_marker is not None
+                else None,
+            )
+        )
+    for source, entry, source_root in sources:
+        if entry["kind"] == "directory":
+            continue
+        destination = archive_root / f"payload-{payload_index:08d}.bin"
+        payload_index += 1
+        if _immutable_artifact_exists(
+            destination,
+            label=f"{archive_role} Git-control payload",
+        ):
+            payload_sha256 = runtime.sha256_file(destination)
+            if payload_sha256 != entry["sha256"]:
+                raise runtime.HarnessError(
+                    f"v2 clean {archive_role} Git-control payload "
+                    "hash mismatch"
+                )
+        else:
+            if source_root is None:
+                raise runtime.HarnessError(
+                    f"v2 clean {archive_role} Git-control payload "
+                    "is missing"
+                )
+            payload = _read_git_control_payload(
+                source_root,
+                entry,
+            )
+            runtime.atomic_create_bytes(destination, payload)
+            payload_sha256 = runtime.sha256_bytes(payload)
+        payload_records.append(
+            {
+                "source": source,
+                "path": entry["path"],
+                "payload": str(destination.relative_to(task_dir)),
+                "sha256": payload_sha256,
+            }
+        )
+
+    inventory = document.get("object_inventory")
+    if (
+        not isinstance(inventory, Mapping)
+        or inventory.get("format") != "sha1"
+        or inventory.get("mode")
+        not in {"all-objects", "reachable-closure"}
+        or not isinstance(inventory.get("seeds"), list)
+        or inventory.get("seed_count")
+        != len(inventory.get("seeds", []))
+        or any(
+            not isinstance(object_id, str)
+            or not runtime.SHA1_RE.fullmatch(object_id)
+            for object_id in inventory.get("seeds", [])
+        )
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {archive_role} Git object inventory is malformed"
+        )
+    existing_completion: Optional[Dict[str, Any]] = None
+    if _immutable_artifact_exists(
+        complete_path,
+        label=f"{archive_role} Git-control completion",
+    ):
+        loaded_completion = runtime.load_json(complete_path)
+        if loaded_completion.get(
+            "complete_sha256"
+        ) != verifier.document_hash(
+            loaded_completion, "complete_sha256"
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {archive_role} Git-control completion "
+                "hash mismatch"
+            )
+        existing_completion = loaded_completion
+    object_pack = _ensure_control_object_pack(
+        repo_root=repo_root if live else None,
+        archive_root=archive_root,
+        mode=str(inventory["mode"]),
+        seeds=list(inventory["seeds"]),
+        expected=(
+            existing_completion.get("object_pack")
+            if existing_completion is not None
+            else None
+        ),
+    )
+    for name, key in (
+        ("objects.pack", "pack_sha256"),
+        ("objects.idx", "index_sha256"),
+    ):
+        payload_records.append(
+            {
+                "source": "object-pack",
+                "path": name,
+                "payload": str(
+                    (archive_root / name).relative_to(task_dir)
+                ),
+                "sha256": object_pack[key],
+            }
+        )
+    total_archive_bytes = sum(
+        int(entry["size"])
+        for entry in document["entries"]
+        if entry["kind"] == "regular"
+    ) + sum(
+        (archive_root / name).stat().st_size
+        for name in ("objects.pack", "objects.idx")
+    )
+    if total_archive_bytes > GIT_CONTROL_ARCHIVE_LIMIT:
+        raise runtime.HarnessError(
+            f"v2 clean {archive_role} Git-control archive exceeds "
+            "the recoverable archive limit"
+        )
+    if live:
+        verified_root, verified_entries = (
+            _clean_directory_projection(
+                expected_control_root,
+                max_regular_bytes=GIT_CONTROL_ARCHIVE_LIMIT,
+            )
+        )
+        verified_marker = (
+            _clean_path_projection(expected_marker, ".git")
+            if expected_marker is not None
+            else None
+        )
+        if (
+            document.get("root") != verified_root
+            or document.get("entries") != verified_entries
+            or document.get("marker") != verified_marker
+        ):
+            raise runtime.HarnessError(
+                f"refusing clean: {archive_role} Git-control source "
+                "changed during payload archival"
+            )
+        verified_mode, verified_seeds = _control_object_seeds(
+            repo_root=repo_root,
+            control_root=expected_control_root,
+            git_owner=git_owner,
+            entries=verified_entries,
+        )
+        if (
+            verified_mode != inventory["mode"]
+            or len(verified_seeds) != inventory["seed_count"]
+            or runtime.sha256_bytes(
+                ("\n".join(verified_seeds) + "\n").encode("ascii")
+            )
+            != inventory["seeds_sha256"]
+        ):
+            raise runtime.HarnessError(
+                f"refusing clean: {archive_role} Git object inventory "
+                "changed during archival"
+            )
+    for record in payload_records:
+        payload_path = task_dir / str(record["payload"])
+        os.chmod(payload_path, 0o400, follow_symlinks=False)
+    os.chmod(archive_root, 0o500)
+    archive_fd = os.open(
+        archive_root,
+        os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)),
+    )
+    try:
+        os.fsync(archive_fd)
+    finally:
+        os.close(archive_fd)
+    archive_root_after = archive_root.lstat()
+    if (archive_root_after.st_dev, archive_root_after.st_ino) != (
+        archive_root_before.st_dev,
+        archive_root_before.st_ino,
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {archive_role} Git-control archive root "
+            "was replaced"
+        )
+    archive_identity = {
+        "path": str(archive_root),
+        "device": archive_root_after.st_dev,
+        "inode": archive_root_after.st_ino,
+        "mode": stat.S_IMODE(archive_root_after.st_mode),
+    }
+    completion = {
+        "schema_version": 2,
+        "archive_role": archive_role,
+        "manifest_sha256": document["manifest_sha256"],
+        "archive_root": archive_identity,
+        "object_pack": object_pack,
+        "payloads": payload_records,
+        "complete_sha256": "",
+    }
+    completion["complete_sha256"] = verifier.document_hash(
+        completion, "complete_sha256"
+    )
+    if existing_completion is not None:
+        if existing_completion != completion:
+            raise runtime.HarnessError(
+                f"v2 clean {archive_role} Git-control completion "
+                "is stale"
+            )
+    else:
+        runtime.atomic_create_json(complete_path, completion)
+    return document
+
+
+def _bind_clean_delete_ready(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    role: str,
+    delete_manifest: Mapping[str, Any],
+    pre_control: Mapping[str, Any],
+    final_control: Mapping[str, Any],
+) -> Dict[str, Any]:
+    path = task_dir / f"clean-delete-ready-{role}.json"
+    completion_hashes: Dict[str, str] = {}
+    for phase, manifest in (
+        ("pre", pre_control),
+        ("final", final_control),
+    ):
+        archive_role = f"{role}-{phase}"
+        completion_path = (
+            task_dir
+            / f"clean-git-control-{archive_role}-complete.json"
+        )
+        if not _immutable_artifact_exists(
+            completion_path,
+            label=f"{archive_role} Git-control completion",
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {archive_role} Git-control completion "
+                "is missing"
+            )
+        completion = runtime.load_json(completion_path)
+        if (
+            completion.get("complete_sha256")
+            != verifier.document_hash(
+                completion, "complete_sha256"
+            )
+            or completion.get("manifest_sha256")
+            != manifest["manifest_sha256"]
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {archive_role} Git-control completion "
+                "is stale"
+            )
+        completion_hashes[phase] = str(
+            completion["complete_sha256"]
+        )
+    document = {
+        "schema_version": 1,
+        "role": role,
+        "intent_sha256": intent["intent_sha256"],
+        "delete_manifest_sha256": delete_manifest["manifest_sha256"],
+        "pre_control_sha256": pre_control["manifest_sha256"],
+        "final_control_sha256": final_control["manifest_sha256"],
+        "pre_control_complete_sha256": completion_hashes["pre"],
+        "final_control_complete_sha256": completion_hashes["final"],
+        "ready_sha256": "",
+    }
+    document["ready_sha256"] = verifier.document_hash(
+        document, "ready_sha256"
+    )
+    if _immutable_artifact_exists(
+        path, label=f"{role} delete-ready binding"
+    ):
+        existing = runtime.load_json(path)
+        if existing != document:
+            raise runtime.HarnessError(
+                f"v2 clean {role} delete-ready binding is stale"
+            )
+    else:
+        runtime.atomic_create_json(path, document)
+    return document
+
+
+def _verify_linked_admin_archive(
+    *,
+    task_dir: Path,
+    role: str,
+    record: Mapping[str, Any],
+) -> None:
+    admin = Path(str(record["git_admin_path"]))
+    if not admin.exists() and not admin.is_symlink():
+        return
+    if not admin.is_dir() or admin.is_symlink():
+        raise runtime.HarnessError(
+            f"v2 clean {role} linked Git admin path is unsafe"
+        )
+    manifest_path = (
+        task_dir / f"clean-git-control-{role}-final.json"
+    )
+    if not _immutable_artifact_exists(
+        manifest_path,
+        label=f"{role} final Git-control manifest",
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} final Git-control manifest is missing"
+        )
+    document = runtime.load_json(manifest_path)
+    current_root, current_entries = _clean_directory_projection(
+        admin,
+        max_regular_bytes=GIT_CONTROL_ARCHIVE_LIMIT,
+    )
+    if (
+        document.get("control_root") != str(admin)
+        or document.get("root") != current_root
+        or document.get("entries") != current_entries
+    ):
+        raise runtime.HarnessError(
+            f"refusing clean: {role} linked Git admin metadata "
+            "changed after delete-start"
+        )
+
+
+def _stage_linked_admin(
+    *,
+    task_dir: Path,
+    role: str,
+    record: Mapping[str, Any],
+    ready: Mapping[str, Any],
+) -> Dict[str, Any]:
+    admin = Path(str(record["git_admin_path"]))
+    staging = Path(str(record["git_admin_staging_path"]))
+    admin_exists = admin.exists() or admin.is_symlink()
+    staging_exists = staging.exists() or staging.is_symlink()
+    if admin_exists and staging_exists:
+        raise runtime.HarnessError(
+            f"v2 clean {role} found live and staged Git admin roots"
+        )
+    manifest_path = (
+        task_dir / f"clean-git-control-{role}-final.json"
+    )
+    if not _immutable_artifact_exists(
+        manifest_path,
+        label=f"{role} final Git-control manifest",
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} final Git-control manifest is missing"
+        )
+    manifest = runtime.load_json(manifest_path)
+    if admin_exists:
+        _verify_linked_admin_archive(
+            task_dir=task_dir,
+            role=role,
+            record=record,
+        )
+        os.rename(admin, staging)
+        parent_fd = os.open(
+            admin.parent,
+            os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0)),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        staging_exists = True
+    if not staging_exists or not staging.is_dir() or staging.is_symlink():
+        raise runtime.HarnessError(
+            f"v2 clean {role} staged Git admin root is missing or unsafe"
+        )
+    current_root, current_entries = _clean_directory_projection(
+        staging,
+        max_regular_bytes=GIT_CONTROL_ARCHIVE_LIMIT,
+    )
+    if (
+        manifest.get("root") != current_root
+        or manifest.get("entries") != current_entries
+    ):
+        raise runtime.HarnessError(
+            f"refusing clean: {role} staged Git admin metadata changed"
+        )
+    document = {
+        "schema_version": 1,
+        "role": role,
+        "ready_sha256": ready["ready_sha256"],
+        "control_manifest_sha256": manifest["manifest_sha256"],
+        "original_path": str(admin),
+        "staging_path": str(staging),
+        "admin_stage_sha256": "",
+    }
+    document["admin_stage_sha256"] = verifier.document_hash(
+        document, "admin_stage_sha256"
+    )
+    stage_path = task_dir / f"clean-admin-stage-{role}.json"
+    if _immutable_artifact_exists(
+        stage_path, label=f"{role} Git admin stage completion"
+    ):
+        if runtime.load_json(stage_path) != document:
+            raise runtime.HarnessError(
+                f"v2 clean {role} Git admin stage completion is stale"
+            )
+    else:
+        runtime.atomic_create_json(stage_path, document)
+    return document
+
+
+def _load_admin_stage(
+    *,
+    task_dir: Path,
+    role: str,
+    ready: Mapping[str, Any],
+) -> Dict[str, Any]:
+    path = task_dir / f"clean-admin-stage-{role}.json"
+    if not _immutable_artifact_exists(
+        path, label=f"{role} Git admin stage completion"
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} Git admin stage completion is missing"
+        )
+    document = runtime.load_json(path)
+    if (
+        document.get("admin_stage_sha256")
+        != verifier.document_hash(
+            document, "admin_stage_sha256"
+        )
+        or document.get("ready_sha256") != ready["ready_sha256"]
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} Git admin stage completion is stale"
+        )
+    return document
+
+
+def _validate_staged_git_admin(
+    *,
+    task_dir: Path,
+    role: str,
+    record: Mapping[str, Any],
+    admin_stage: Mapping[str, Any],
+    require_complete: bool,
+) -> None:
+    original = Path(str(record["git_admin_path"]))
+    staging = Path(str(record["git_admin_staging_path"]))
+    if original.exists() or original.is_symlink():
+        raise runtime.HarnessError(
+            f"v2 clean {role} Git admin root reappeared before "
+            "global validation"
+        )
+    manifest_path = (
+        task_dir / f"clean-git-control-{role}-final.json"
+    )
+    if not _immutable_artifact_exists(
+        manifest_path,
+        label=f"{role} final Git-control manifest",
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} final Git-control manifest is missing"
+        )
+    manifest = runtime.load_json(manifest_path)
+    if (
+        admin_stage.get("admin_stage_sha256")
+        != verifier.document_hash(
+            admin_stage, "admin_stage_sha256"
+        )
+        or admin_stage.get("original_path") != str(original)
+        or admin_stage.get("staging_path") != str(staging)
+        or admin_stage.get("control_manifest_sha256")
+        != manifest.get("manifest_sha256")
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} Git admin stage binding is stale"
+        )
+    if staging.exists() or staging.is_symlink():
+        if not staging.is_dir() or staging.is_symlink():
+            raise runtime.HarnessError(
+                f"v2 clean {role} staged Git admin root is unsafe"
+            )
+        metadata = staging.lstat()
+        root = manifest["root"]
+        if (
+            metadata.st_dev != int(root["device"])
+            or metadata.st_ino != int(root["inode"])
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {role} staged Git admin identity changed"
+            )
+        expected = {
+            str(entry["path"]): entry
+            for entry in manifest["entries"]
+        }
+        current = {
+            str(entry["path"]): entry
+            for entry in _clean_tree_snapshot(staging)
+        }
+        extras = sorted(set(current) - set(expected))
+        if extras:
+            raise runtime.HarnessError(
+                f"v2 clean {role} staged Git admin gained entries: "
+                + ", ".join(extras[:20])
+            )
+        for relative, entry in current.items():
+            if not _clean_entry_matches(expected[relative], entry):
+                raise runtime.HarnessError(
+                    f"v2 clean {role} staged Git admin changed: "
+                    f"{relative}"
+                )
+        if require_complete and set(current) != set(expected):
+            raise runtime.HarnessError(
+                f"v2 clean {role} staged Git admin is incomplete before "
+                "global validation"
+            )
+    elif require_complete:
+        raise runtime.HarnessError(
+            f"v2 clean {role} staged Git admin root disappeared before "
+            "global validation"
+        )
+
+
+def _purge_staged_git_admin(
+    *,
+    task_dir: Path,
+    role: str,
+    record: Mapping[str, Any],
+    admin_stage: Mapping[str, Any],
+) -> None:
+    _validate_staged_git_admin(
+        task_dir=task_dir,
+        role=role,
+        record=record,
+        admin_stage=admin_stage,
+        require_complete=False,
+    )
+    original = Path(str(record["git_admin_path"]))
+    staging = Path(str(record["git_admin_staging_path"]))
+    manifest = runtime.load_json(
+        task_dir / f"clean-git-control-{role}-final.json"
+    )
+    if staging.exists() or staging.is_symlink():
+        expected = {
+            str(entry["path"]): entry
+            for entry in manifest["entries"]
+        }
+        current = {
+            str(entry["path"]): entry
+            for entry in _clean_tree_snapshot(staging)
+        }
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        root_fd = os.open(staging, flags)
+        try:
+            leaves = sorted(
+                (
+                    entry
+                    for entry in manifest["entries"]
+                    if entry["kind"] != "directory"
+                ),
+                key=lambda entry: (
+                    -str(entry["path"]).count("/"),
+                    str(entry["path"]),
+                ),
+            )
+            for entry in leaves:
+                relative = str(entry["path"])
+                parent, _, name = relative.rpartition("/")
+                parent_fd = _open_clean_parent_fd(root_fd, parent)
+                if parent_fd is None:
+                    continue
+                try:
+                    try:
+                        value = _clean_entry_snapshot_at(
+                            parent_fd,
+                            name,
+                            relative,
+                            int(entry["device"]),
+                        )
+                    except FileNotFoundError:
+                        continue
+                    if not _clean_entry_matches(entry, value):
+                        raise runtime.HarnessError(
+                            f"v2 clean {role} staged Git admin leaf "
+                            "changed"
+                        )
+                    os.unlink(name, dir_fd=parent_fd)
+                finally:
+                    os.close(parent_fd)
+            directories = sorted(
+                (
+                    entry
+                    for entry in manifest["entries"]
+                    if entry["kind"] == "directory"
+                ),
+                key=lambda entry: (
+                    -str(entry["path"]).count("/"),
+                    str(entry["path"]),
+                ),
+            )
+            for entry in directories:
+                relative = str(entry["path"])
+                parent, _, name = relative.rpartition("/")
+                parent_fd = _open_clean_parent_fd(root_fd, parent)
+                if parent_fd is None:
+                    continue
+                try:
+                    try:
+                        value = _clean_entry_snapshot_at(
+                            parent_fd,
+                            name,
+                            relative,
+                            int(entry["device"]),
+                        )
+                    except FileNotFoundError:
+                        continue
+                    if not _clean_entry_matches(entry, value):
+                        raise runtime.HarnessError(
+                            f"v2 clean {role} staged Git admin "
+                            "directory changed"
+                        )
+                    os.rmdir(name, dir_fd=parent_fd)
+                finally:
+                    os.close(parent_fd)
+            with os.scandir(root_fd) as iterator:
+                leftovers = sorted(entry.name for entry in iterator)
+            if leftovers:
+                raise runtime.HarnessError(
+                    f"v2 clean {role} staged Git admin is not empty: "
+                    + ", ".join(leftovers[:20])
+                )
+            metadata = os.fstat(root_fd)
+            root = manifest["root"]
+            if (
+                metadata.st_dev != int(root["device"])
+                or metadata.st_ino != int(root["inode"])
+            ):
+                raise runtime.HarnessError(
+                    f"v2 clean {role} staged Git admin identity changed"
+                )
+        finally:
+            os.close(root_fd)
+        os.rmdir(staging)
+    if original.exists() or original.is_symlink():
+        raise runtime.HarnessError(
+            f"v2 clean {role} Git admin root survived purge"
+        )
+
+
+def _mark_clean_delete_started(
+    *,
+    task_dir: Path,
+    role: str,
+    ready: Mapping[str, Any],
+) -> Dict[str, Any]:
+    path = task_dir / f"clean-delete-started-{role}.json"
+    document = {
+        "schema_version": 1,
+        "role": role,
+        "ready_sha256": ready["ready_sha256"],
+        "started_sha256": "",
+    }
+    document["started_sha256"] = verifier.document_hash(
+        document, "started_sha256"
+    )
+    if _immutable_artifact_exists(
+        path, label=f"{role} delete-start binding"
+    ):
+        existing = runtime.load_json(path)
+        if existing != document:
+            raise runtime.HarnessError(
+                f"v2 clean {role} delete-start binding is stale"
+            )
+    else:
+        runtime.atomic_create_json(path, document)
+    return document
+
+
+def _require_quarantine_idle(root: Path) -> None:
+    lsof = Path("/usr/sbin/lsof")
+    executable = str(lsof) if lsof.is_file() else shutil.which("lsof")
+    if not executable:
+        raise runtime.HarnessError(
+            "v2 clean requires lsof before deleting a quarantined worktree"
+        )
+    try:
+        completed = subprocess.run(
+            [executable, "-nP", "-F0", "+D", str(root)],
+            cwd=str(root.parent),
+            text=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise runtime.HarnessError(
+            "v2 clean lsof quarantine inspection timed out"
+        ) from exc
+    if completed.stdout:
+        excerpt = completed.stdout[:512].decode("utf-8", "replace")
+        raise runtime.HarnessError(
+            "v2 clean quarantine is still used by a process: " + excerpt
+        )
+    if completed.returncode != 1 or completed.stderr:
+        detail = (completed.stderr or completed.stdout)[:512].decode(
+            "utf-8", "replace"
+        )
+        raise runtime.HarnessError(
+            "v2 clean could not prove quarantine process liveness: " + detail
+        )
+
+
+def _freeze_clean_delete_manifest(
+    *,
+    task_dir: Path,
+    role: str,
+    root: Path,
+    staging: Path,
+    intent: Mapping[str, Any],
+    expected_tree: str,
+    expected_revision: Optional[str],
+    allow_disposable_ignored: bool,
+) -> Dict[str, Any]:
+    manifest_path = task_dir / f"clean-delete-{role}.json"
+    if _immutable_artifact_exists(
+        manifest_path, label=f"{role} deletion manifest"
+    ):
+        document = runtime.load_json(manifest_path)
+        if document.get("manifest_sha256") != verifier.document_hash(
+            document, "manifest_sha256"
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {role} deletion manifest hash mismatch"
+            )
+        for key, expected in (
+            ("schema_version", 2),
+            ("role", role),
+            ("intent_sha256", intent["intent_sha256"]),
+            ("root_path", str(root)),
+            ("staging_path", str(staging)),
+            ("expected_tree", expected_tree),
+            ("expected_revision", expected_revision),
+        ):
+            if document.get(key) != expected:
+                raise runtime.HarnessError(
+                    f"v2 clean {role} deletion manifest {key} is stale"
+                )
+        return document
+
+    _require_quarantine_idle(root.parent)
+    ignored_before = set(_ignored_paths(root))
+    unknown = sorted(
+        path
+        for path in ignored_before
+        if not (
+            allow_disposable_ignored
+            and _disposable_ignored_path(root, path)
+        )
+    )
+    if unknown:
+        shown = ", ".join(unknown[:20])
+        raise runtime.HarnessError(
+            f"refusing clean: {role} ignored bytes are not archived: {shown}"
+    )
+    visible_before = _clean_visible_paths(root)
+    managed_node_modules = runtime.managed_node_modules_link(root)
+    if _visible_tree(root, task_dir / "runtime") != expected_tree:
+        raise runtime.HarnessError(
+            f"refusing clean: {role} bytes changed after durable evidence"
+        )
+    entries_before = _clean_tree_snapshot(root)
+    # A second exact-tree proof catches visible writes racing the first
+    # snapshot. It may add Git objects inside a standalone clone, so freeze the
+    # final control metadata only after this proof.
+    if _visible_tree(root, task_dir / "runtime") != expected_tree:
+        raise runtime.HarnessError(
+            f"refusing clean: {role} bytes changed during manifest freeze"
+        )
+    _verify_tree_matches_raw_bytes(
+        root,
+        expected_tree,
+        label=f"{role} freeze",
+    )
+    entries = _clean_tree_snapshot(root)
+    before_working = {
+        str(entry["path"]): entry
+        for entry in entries_before
+        if not (
+            str(entry["path"]) == ".git"
+            or str(entry["path"]).startswith(".git/")
+        )
+    }
+    final_working = {
+        str(entry["path"]): entry
+        for entry in entries
+        if not (
+            str(entry["path"]) == ".git"
+            or str(entry["path"]).startswith(".git/")
+        )
+    }
+    if set(before_working) != set(final_working) or any(
+        not _clean_entry_matches(before_working[path], final_working[path])
+        for path in before_working
+    ):
+        raise runtime.HarnessError(
+            f"refusing clean: {role} filesystem changed during freeze"
+        )
+    leaf_paths = {
+        str(entry["path"])
+        for entry in entries
+        if entry["kind"] != "directory"
+    }
+    classified: List[Dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        relative = str(entry["path"])
+        if entry["kind"] == "directory":
+            classification = "directory"
+        elif relative == ".git" or relative.startswith(".git/"):
+            classification = "git-control"
+        elif relative == "node_modules" and managed_node_modules:
+            classification = "managed-node-modules"
+        elif relative in ignored_before:
+            classification = "disposable"
+        elif relative in visible_before:
+            classification = "archived"
+        else:
+            raise runtime.HarnessError(
+                f"v2 clean found an unclassified late entry: {role}:{relative}"
+            )
+        classified.append(
+            {
+                **entry,
+                "classification": classification,
+                "staging_name": f"entry-{index:08d}",
+            }
+        )
+    if not ignored_before.issubset(leaf_paths):
+        raise runtime.HarnessError(
+            f"v2 clean {role} ignored path set differs from filesystem"
+        )
+    if set(_ignored_paths(root)) != ignored_before:
+        raise runtime.HarnessError(
+            f"refusing clean: {role} ignored bytes changed during freeze"
+        )
+    if _clean_visible_paths(root) != visible_before:
+        raise runtime.HarnessError(
+            f"refusing clean: {role} visible path set changed during freeze"
+        )
+    _require_quarantine_idle(root.parent)
+    root_metadata = root.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise runtime.HarnessError(
+            f"v2 clean {role} quarantine root is not a directory"
+        )
+    document: Dict[str, Any] = {
+        "schema_version": 2,
+        "role": role,
+        "intent_sha256": intent["intent_sha256"],
+        "root_path": str(root),
+        "staging_path": str(staging),
+        "expected_tree": expected_tree,
+        "expected_revision": expected_revision,
+        "root_device": root_metadata.st_dev,
+        "root_inode": root_metadata.st_ino,
+        "entries": classified,
+        "manifest_sha256": "",
+    }
+    document["manifest_sha256"] = verifier.document_hash(
+        document, "manifest_sha256"
+    )
+    runtime.atomic_create_json(manifest_path, document)
+    return document
+
+
+def _open_clean_parent_fd(root_fd: int, relative_parent: str) -> Optional[int]:
+    current = os.dup(root_fd)
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if relative_parent:
+            for component in relative_parent.split("/"):
+                try:
+                    following = os.open(
+                        component, flags, dir_fd=current
+                    )
+                except FileNotFoundError:
+                    os.close(current)
+                    return None
+                os.close(current)
+                current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def _stage_frozen_clean_tree(
+    root: Path,
+    staging: Path,
+    manifest: Mapping[str, Any],
+    *,
+    original_path: Path,
+    task_dir: Path,
+    role: str,
+    ready: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if original_path.exists() or original_path.is_symlink():
+        raise runtime.HarnessError(
+            "v2 clean original path reappeared after quarantine"
+        )
+    if not root.is_dir() or root.is_symlink():
+        raise runtime.HarnessError(
+            f"v2 clean {role} quarantine root is missing or unsafe"
+        )
+    _ensure_private_durable_directory(
+        staging, label=f"{role} leaf staging directory"
+    )
+    _require_quarantine_idle(root.parent)
+    expected_entries = {
+        str(entry["path"]): entry for entry in manifest["entries"]
+    }
+    current_entries = {
+        str(entry["path"]): entry for entry in _clean_tree_snapshot(root)
+    }
+    extras = sorted(set(current_entries) - set(expected_entries))
+    if extras:
+        raise runtime.HarnessError(
+            f"v2 clean {role} quarantine gained unmanifested entries: "
+            + ", ".join(extras[:20])
+        )
+    for relative, current in current_entries.items():
+        if not _clean_entry_matches(expected_entries[relative], current):
+            raise runtime.HarnessError(
+                f"v2 clean {role} quarantine entry changed: {relative}"
+            )
+
+    flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    root_fd = os.open(root, flags)
+    staging_fd = os.open(staging, flags)
+    staged_paths: List[str] = []
+    missing_paths: List[str] = []
+    try:
+        leaves = sorted(
+            (
+                entry
+                for entry in manifest["entries"]
+                if entry["kind"] != "directory"
+            ),
+            key=lambda entry: (
+                entry["path"] == ".git",
+                -str(entry["path"]).count("/"),
+                str(entry["path"]),
+            ),
+        )
+        expected_staging = {
+            str(entry["staging_name"]): entry for entry in leaves
+        }
+        staging_names = sorted(
+            entry.name for entry in os.scandir(staging_fd)
+        )
+        unknown_staging = sorted(
+            set(staging_names) - set(expected_staging)
+        )
+        if unknown_staging:
+            raise runtime.HarnessError(
+                f"v2 clean {role} staging has unknown entries: "
+                + ", ".join(unknown_staging[:20])
+            )
+        for entry in leaves:
+            relative = str(entry["path"])
+            parent, _, name = relative.rpartition("/")
+            parent_fd = _open_clean_parent_fd(root_fd, parent)
+            staged_name = str(entry["staging_name"])
+            try:
+                try:
+                    source = (
+                        _clean_entry_snapshot_at(
+                            parent_fd,
+                            name,
+                            relative,
+                            int(entry["device"]),
+                        )
+                        if parent_fd is not None
+                        else None
+                    )
+                except FileNotFoundError:
+                    source = None
+                try:
+                    staged = _clean_entry_snapshot_at(
+                        staging_fd,
+                        staged_name,
+                        relative,
+                        int(entry["device"]),
+                    )
+                except FileNotFoundError:
+                    staged = None
+                if source is not None and staged is not None:
+                    raise runtime.HarnessError(
+                        f"v2 clean {role} found source and staged "
+                        f"copies: {relative}"
+                    )
+                if source is not None:
+                    if not _clean_entry_matches(entry, source):
+                        raise runtime.HarnessError(
+                            f"v2 clean {role} source changed before "
+                            f"staging: {relative}"
+                        )
+                    os.rename(
+                        name,
+                        staged_name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=staging_fd,
+                    )
+                    os.fsync(parent_fd)
+                    os.fsync(staging_fd)
+                    staged = _clean_entry_snapshot_at(
+                        staging_fd,
+                        staged_name,
+                        relative,
+                        int(entry["device"]),
+                    )
+                if staged is None:
+                    missing_paths.append(relative)
+                else:
+                    if not _clean_entry_matches(entry, staged):
+                        raise runtime.HarnessError(
+                            f"v2 clean {role} staged entry changed: "
+                            f"{relative}"
+                        )
+                    staged_paths.append(relative)
+            finally:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+    finally:
+        os.close(staging_fd)
+        os.close(root_fd)
+
+    after_entries = _clean_tree_snapshot(root)
+    for entry in after_entries:
+        expected = expected_entries.get(str(entry["path"]))
+        if (
+            expected is None
+            or entry["kind"] != "directory"
+            or not _clean_entry_matches(expected, entry)
+        ):
+            raise runtime.HarnessError(
+                f"v2 clean {role} root changed during staging"
+            )
+    leaves = {
+        str(entry["path"])
+        for entry in manifest["entries"]
+        if entry["kind"] != "directory"
+    }
+    if set(staged_paths) | set(missing_paths) != leaves:
+        raise runtime.HarnessError(
+            f"v2 clean {role} staged leaf set is incomplete"
+        )
+    document = {
+        "schema_version": 1,
+        "role": role,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "ready_sha256": ready["ready_sha256"],
+        "staged": sorted(staged_paths),
+        "missing": sorted(missing_paths),
+        "stage_sha256": "",
+    }
+    document["stage_sha256"] = verifier.document_hash(
+        document, "stage_sha256"
+    )
+    stage_path = task_dir / f"clean-stage-{role}.json"
+    if _immutable_artifact_exists(
+        stage_path, label=f"{role} stage completion"
+    ):
+        if runtime.load_json(stage_path) != document:
+            raise runtime.HarnessError(
+                f"v2 clean {role} stage completion is stale"
+            )
+    else:
+        runtime.atomic_create_json(stage_path, document)
+    return document
+
+
+def _load_clean_stage(
+    *,
+    task_dir: Path,
+    role: str,
+    manifest: Mapping[str, Any],
+    ready: Mapping[str, Any],
+) -> Dict[str, Any]:
+    path = task_dir / f"clean-stage-{role}.json"
+    if not _immutable_artifact_exists(
+        path, label=f"{role} stage completion"
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} stage completion is missing"
+        )
+    document = runtime.load_json(path)
+    if (
+        document.get("stage_sha256")
+        != verifier.document_hash(document, "stage_sha256")
+        or document.get("manifest_sha256")
+        != manifest["manifest_sha256"]
+        or document.get("ready_sha256") != ready["ready_sha256"]
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} stage completion is stale"
+        )
+    leaves = {
+        str(entry["path"])
+        for entry in manifest["entries"]
+        if entry["kind"] != "directory"
+    }
+    staged = document.get("staged")
+    missing = document.get("missing")
+    if (
+        not isinstance(staged, list)
+        or not isinstance(missing, list)
+        or set(staged) & set(missing)
+        or set(staged) | set(missing) != leaves
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} stage leaf set is malformed"
+        )
+    return document
+
+
+def _validate_frozen_clean_tree(
+    root: Path,
+    staging: Path,
+    manifest: Mapping[str, Any],
+    stage: Mapping[str, Any],
+    *,
+    original_path: Path,
+    require_complete: bool,
+) -> None:
+    if original_path.exists() or original_path.is_symlink():
+        raise runtime.HarnessError(
+            "v2 clean original path reappeared before global validation"
+        )
+    expected_entries = {
+        str(entry["path"]): entry for entry in manifest["entries"]
+    }
+    expected_directories = {
+        str(entry["path"]): entry
+        for entry in manifest["entries"]
+        if entry["kind"] == "directory"
+    }
+    expected_staged = {
+        str(entry["staging_name"]): entry
+        for entry in manifest["entries"]
+        if str(entry["path"]) in set(stage["staged"])
+    }
+    if root.exists() or root.is_symlink():
+        if not root.is_dir() or root.is_symlink():
+            raise runtime.HarnessError(
+                "v2 clean quarantine root is unsafe"
+            )
+        metadata = root.lstat()
+        if (
+            metadata.st_dev != int(manifest["root_device"])
+            or metadata.st_ino != int(manifest["root_inode"])
+        ):
+            raise runtime.HarnessError(
+                "v2 clean quarantine root identity changed"
+            )
+        current_entries = _clean_tree_snapshot(root)
+        for entry in current_entries:
+            expected = expected_entries.get(str(entry["path"]))
+            if (
+                expected is None
+                or entry["kind"] != "directory"
+                or not _clean_entry_matches(expected, entry)
+            ):
+                raise runtime.HarnessError(
+                    "v2 clean quarantine changed after all-roots staging"
+                )
+        if require_complete and {
+            str(entry["path"]) for entry in current_entries
+        } != set(expected_directories):
+            raise runtime.HarnessError(
+                "v2 clean quarantine directories are incomplete before "
+                "global validation"
+            )
+    elif require_complete:
+        raise runtime.HarnessError(
+            "v2 clean quarantine root disappeared before global validation"
+        )
+    if staging.exists() or staging.is_symlink():
+        if not staging.is_dir() or staging.is_symlink():
+            raise runtime.HarnessError("v2 clean staging path is unsafe")
+        staging_names = sorted(entry.name for entry in os.scandir(staging))
+        extras = sorted(set(staging_names) - set(expected_staged))
+        if extras:
+            raise runtime.HarnessError(
+                "v2 clean staging gained unmanifested entries: "
+                + ", ".join(extras[:20])
+            )
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        staging_fd = os.open(staging, flags)
+        try:
+            for staged_name in staging_names:
+                entry = expected_staged[staged_name]
+                current = _clean_entry_snapshot_at(
+                    staging_fd,
+                    staged_name,
+                    str(entry["path"]),
+                    int(entry["device"]),
+                )
+                if not _clean_entry_matches(entry, current):
+                    raise runtime.HarnessError(
+                        "v2 clean staged payload changed before global "
+                        "validation"
+                    )
+        finally:
+            os.close(staging_fd)
+        if require_complete and set(staging_names) != set(expected_staged):
+            raise runtime.HarnessError(
+                "v2 clean staged payload set is incomplete before global "
+                "validation"
+            )
+    elif require_complete and expected_staged:
+        raise runtime.HarnessError(
+            "v2 clean staging path disappeared before global validation"
+        )
+
+
+def _purge_frozen_clean_tree(
+    root: Path,
+    staging: Path,
+    manifest: Mapping[str, Any],
+    stage: Mapping[str, Any],
+    *,
+    original_path: Path,
+) -> None:
+    _validate_frozen_clean_tree(
+        root,
+        staging,
+        manifest,
+        stage,
+        original_path=original_path,
+        require_complete=False,
+    )
+    expected_entries = {
+        str(entry["path"]): entry for entry in manifest["entries"]
+    }
+    expected_staged = {
+        str(entry["staging_name"]): entry
+        for entry in manifest["entries"]
+        if str(entry["path"]) in set(stage["staged"])
+    }
+    if staging.exists() or staging.is_symlink():
+        staging_names = sorted(entry.name for entry in os.scandir(staging))
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        staging_fd = os.open(staging, flags)
+        try:
+            for staged_name in staging_names:
+                entry = expected_staged[staged_name]
+                current = _clean_entry_snapshot_at(
+                    staging_fd,
+                    staged_name,
+                    str(entry["path"]),
+                    int(entry["device"]),
+                )
+                if not _clean_entry_matches(entry, current):
+                    raise runtime.HarnessError(
+                        "v2 clean staged payload changed before purge"
+                    )
+            for staged_name in staging_names:
+                os.unlink(staged_name, dir_fd=staging_fd)
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
+
+    if root.exists():
+        flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+        flags |= int(getattr(os, "O_CLOEXEC", 0))
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        root_fd = os.open(root, flags)
+        try:
+            directories = sorted(
+                (
+                    entry
+                    for entry in manifest["entries"]
+                    if entry["kind"] == "directory"
+                ),
+                key=lambda entry: (
+                    -str(entry["path"]).count("/"),
+                    str(entry["path"]),
+                ),
+            )
+            for entry in directories:
+                relative = str(entry["path"])
+                parent, _, name = relative.rpartition("/")
+                parent_fd = _open_clean_parent_fd(root_fd, parent)
+                if parent_fd is None:
+                    continue
+                try:
+                    try:
+                        current = _clean_entry_snapshot_at(
+                            parent_fd,
+                            name,
+                            relative,
+                            int(entry["device"]),
+                        )
+                    except FileNotFoundError:
+                        continue
+                    if not _clean_entry_matches(entry, current):
+                        raise runtime.HarnessError(
+                            f"v2 clean directory changed: {relative}"
+                        )
+                    os.rmdir(name, dir_fd=parent_fd)
+                finally:
+                    os.close(parent_fd)
+            leftovers = sorted(entry.name for entry in os.scandir(root_fd))
+            if leftovers:
+                raise runtime.HarnessError(
+                    "v2 clean retained unmanifested root entries: "
+                    + ", ".join(leftovers[:20])
+                )
+            root_metadata = os.fstat(root_fd)
+            if (
+                root_metadata.st_dev != int(manifest["root_device"])
+                or root_metadata.st_ino != int(manifest["root_inode"])
+            ):
+                raise runtime.HarnessError(
+                    "v2 clean quarantine root identity changed"
+                )
+        finally:
+            os.close(root_fd)
+        parent_fd = os.open(root.parent, flags)
+        try:
+            os.rmdir(root.name, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+    if staging.exists():
+        os.rmdir(staging)
+    if root.parent.exists():
+        os.rmdir(root.parent)
+    if original_path.exists() or original_path.is_symlink():
+        raise runtime.HarnessError(
+            "v2 clean original path reappeared during purge"
+        )
+
+
+def _quarantine_clean_root(
+    *,
+    original: Path,
+    quarantine: Path,
+    expected_device: int,
+    expected_inode: int,
+    git_owner: Optional[Path],
+) -> bool:
+    original_exists = original.exists() or original.is_symlink()
+    quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+    if original_exists and quarantine_exists:
+        raise runtime.HarnessError(
+            "v2 clean found both original and quarantined roots"
+        )
+    if not original_exists and not quarantine_exists:
+        return False
+
+    if quarantine.parent.exists() or quarantine.parent.is_symlink():
+        metadata = quarantine.parent.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise runtime.HarnessError("v2 clean quarantine parent is unsafe")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise runtime.HarnessError(
+                "v2 clean quarantine parent is not private"
+            )
+    else:
+        quarantine.parent.mkdir(mode=0o700)
+    os.chmod(quarantine.parent, 0o700)
+
+    if original_exists:
+        # Refuse before the rename when the invoking shell, an editor, or any
+        # other process still has cwd/fds inside the original tree.
+        _require_quarantine_idle(original)
+        metadata = original.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_dev != expected_device
+            or metadata.st_ino != expected_inode
+        ):
+            raise runtime.HarnessError(
+                "v2 clean original root identity changed before quarantine"
+            )
+        parent_metadata = quarantine.parent.lstat()
+        if parent_metadata.st_dev != metadata.st_dev:
+            raise runtime.HarnessError(
+                "v2 clean quarantine crosses a filesystem boundary"
+            )
+        if any(quarantine.parent.iterdir()):
+            raise runtime.HarnessError(
+                "v2 clean quarantine parent was not empty before move"
+            )
+        if git_owner is not None:
+            runtime.run_capture(
+                [
+                    "git",
+                    "worktree",
+                    "move",
+                    "--",
+                    str(original),
+                    str(quarantine),
+                ],
+                git_owner,
+            )
+        else:
+            os.rename(original, quarantine)
+
+    if original.exists() or original.is_symlink():
+        raise runtime.HarnessError(
+            "v2 clean original root remained after quarantine"
+        )
+    metadata = quarantine.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_dev != expected_device
+        or metadata.st_ino != expected_inode
+    ):
+        raise runtime.HarnessError(
+            "v2 clean quarantined root identity is stale"
+        )
+    if git_owner is not None:
+        worktrees = {
+            line.removeprefix("worktree ")
+            for line in runtime.git(
+                git_owner, "worktree", "list", "--porcelain"
+            ).splitlines()
+            if line.startswith("worktree ")
+        }
+        if str(quarantine) not in worktrees or str(original) in worktrees:
+            raise runtime.HarnessError(
+                "v2 clean Git worktree registration did not move to quarantine"
+            )
+    return True
+
+
+def _prune_quarantined_worktree(
+    owner: Path,
+    *,
+    original: Path,
+    quarantine: Path,
+    admin_path: Path,
+) -> None:
+    common = Path(
+        runtime.git(
+            owner,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        )
+    ).resolve()
+    if admin_path.parent != common / "worktrees":
+        raise runtime.HarnessError("v2 clean Git admin prune target is unsafe")
+    if admin_path.exists() or admin_path.is_symlink():
+        # The filesystem root is already gone. Non-force remove now performs an
+        # exact metadata cleanup and cannot recursively delete task bytes.
+        runtime.run_capture(
+            ["git", "worktree", "remove", "--", str(quarantine)],
+            owner,
+        )
+    if admin_path.exists() or admin_path.is_symlink():
+        raise runtime.HarnessError("v2 clean Git admin path survived prune")
+    worktrees = {
+        line.removeprefix("worktree ")
+        for line in runtime.git(
+            owner, "worktree", "list", "--porcelain"
+        ).splitlines()
+        if line.startswith("worktree ")
+    }
+    if str(original) in worktrees or str(quarantine) in worktrees:
+        raise runtime.HarnessError(
+            "v2 clean removed root remains registered as a worktree"
+        )
+
+
+def _verify_clean_root_revision(
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    role: str,
+) -> None:
+    expected_revision = record.get("expected_revision")
+    if expected_revision is None:
+        return
+    if not root.is_dir() or root.is_symlink():
+        raise runtime.HarnessError(
+            f"v2 clean {role} revision root is missing or unsafe"
+        )
+    current_revision = runtime.git(
+        root, "rev-parse", "HEAD", check=False
+    )
+    if current_revision != expected_revision:
+        raise runtime.HarnessError(
+            f"refusing clean: {role} revision changed"
+        )
+
+
+def _prevalidate_frozen_root_cleanup(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    role: str,
+    record: Mapping[str, Any],
+    git_owner: Optional[Path],
+) -> None:
+    original = Path(str(record["path"]))
+    quarantine = Path(str(record["quarantine_path"]))
+    original_exists = original.exists() or original.is_symlink()
+    quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+    if original_exists and quarantine_exists:
+        raise runtime.HarnessError(
+            f"v2 clean {role} found both original and quarantine roots"
+        )
+    started = _immutable_artifact_exists(
+        task_dir / f"clean-delete-started-{role}.json",
+        label=f"{role} delete-start binding",
+    )
+    if started:
+        if original_exists:
+            raise runtime.HarnessError(
+                f"v2 clean {role} original root reappeared after "
+                "deletion started"
+            )
+        for required in (
+            f"clean-delete-{role}.json",
+            f"clean-delete-ready-{role}.json",
+            f"clean-git-control-{role}-pre.json",
+            f"clean-git-control-{role}-pre-complete.json",
+            f"clean-git-control-{role}-final.json",
+            f"clean-git-control-{role}-final-complete.json",
+        ):
+            if not _immutable_artifact_exists(
+                task_dir / required,
+                label=f"{role} resume evidence",
+            ):
+                raise runtime.HarnessError(
+                    f"v2 clean {role} resume evidence is incomplete"
+                )
+        _archive_git_control(
+            task_dir=task_dir,
+            intent=intent,
+            archive_role=f"{role}-pre",
+            repo_root=original,
+            record=record,
+            git_owner=git_owner,
+            live=False,
+        )
+        _archive_git_control(
+            task_dir=task_dir,
+            intent=intent,
+            archive_role=f"{role}-final",
+            repo_root=quarantine,
+            record=record,
+            git_owner=git_owner,
+            live=False,
+        )
+        return
+    candidate = original if original_exists else quarantine
+    if candidate.exists() or candidate.is_symlink():
+        _verify_clean_root_revision(candidate, record, role=role)
+    elif not _immutable_artifact_exists(
+        task_dir / f"clean-delete-{role}.json",
+        label=f"{role} deletion manifest",
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} root disappeared before its deletion manifest"
+        )
+    _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-pre",
+        repo_root=original,
+        record=record,
+        git_owner=git_owner,
+        live=original_exists,
+    )
+
+
+def _prepare_frozen_root_cleanup(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    role: str,
+    record: Mapping[str, Any],
+    git_owner: Optional[Path],
+    allow_disposable_ignored: bool,
+) -> Dict[str, Any]:
+    original = Path(str(record["path"]))
+    quarantine = Path(str(record["quarantine_path"]))
+    staging = Path(str(record["delete_staging_path"]))
+    manifest_path = task_dir / f"clean-delete-{role}.json"
+    started_path = task_dir / f"clean-delete-started-{role}.json"
+    started = _immutable_artifact_exists(
+        started_path, label=f"{role} delete-start binding"
+    )
+    pre_control = _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-pre",
+        repo_root=original,
+        record=record,
+        git_owner=git_owner,
+        live=(
+            not started
+            and (original.exists() or original.is_symlink())
+        ),
+    )
+    present = _quarantine_clean_root(
+        original=original,
+        quarantine=quarantine,
+        expected_device=int(record["device"]),
+        expected_inode=int(record["inode"]),
+        git_owner=None if started else git_owner,
+    )
+    if not present and not _immutable_artifact_exists(
+        manifest_path, label=f"{role} deletion manifest"
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} root disappeared before its deletion manifest"
+        )
+    if present and not started:
+        _verify_clean_root_revision(quarantine, record, role=role)
+    manifest = _freeze_clean_delete_manifest(
+        task_dir=task_dir,
+        role=role,
+        root=quarantine,
+        staging=staging,
+        intent=intent,
+        expected_tree=str(record["expected_tree"]),
+        expected_revision=record.get("expected_revision"),
+        allow_disposable_ignored=allow_disposable_ignored,
+    )
+    final_control = _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-final",
+        repo_root=quarantine,
+        record=record,
+        git_owner=git_owner,
+        live=present and not started,
+    )
+    ready = _bind_clean_delete_ready(
+        task_dir=task_dir,
+        intent=intent,
+        role=role,
+        delete_manifest=manifest,
+        pre_control=pre_control,
+        final_control=final_control,
+    )
+    if (
+        manifest.get("root_device") != record["device"]
+        or manifest.get("root_inode") != record["inode"]
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} manifest root identity is stale"
+        )
+    return {
+        "role": role,
+        "record": record,
+        "git_owner": git_owner,
+        "task_dir": task_dir,
+        "intent": intent,
+        "original": original,
+        "quarantine": quarantine,
+        "staging": staging,
+        "manifest": manifest,
+        "pre_control": pre_control,
+        "final_control": final_control,
+        "ready": ready,
+    }
+
+
+def _start_frozen_root_cleanup(
+    prepared: Mapping[str, Any],
+) -> Dict[str, Any]:
+    role = str(prepared["role"])
+    record = prepared["record"]
+    if not isinstance(record, Mapping):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared record is malformed"
+        )
+    original = Path(str(prepared["original"]))
+    quarantine = Path(str(prepared["quarantine"]))
+    staging = Path(str(prepared["staging"]))
+    manifest = prepared["manifest"]
+    if not isinstance(manifest, Mapping):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared manifest is malformed"
+        )
+    git_owner = prepared.get("git_owner")
+    if git_owner is not None and not isinstance(git_owner, Path):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared Git owner is malformed"
+        )
+    task_dir = prepared.get("task_dir")
+    intent = prepared.get("intent")
+    if not isinstance(task_dir, Path) or not isinstance(intent, Mapping):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared recovery evidence is malformed"
+        )
+    ready = prepared.get("ready")
+    if not isinstance(ready, Mapping):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared ready binding is malformed"
+        )
+    started_path = task_dir / f"clean-delete-started-{role}.json"
+    started = _immutable_artifact_exists(
+        started_path, label=f"{role} delete-start binding"
+    )
+    _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-pre",
+        repo_root=original,
+        record=record,
+        git_owner=git_owner,
+        live=False,
+    )
+    _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-final",
+        repo_root=quarantine,
+        record=record,
+        git_owner=git_owner,
+        live=(
+            not started
+            and (quarantine.exists() or quarantine.is_symlink())
+        ),
+    )
+    _bind_clean_delete_ready(
+        task_dir=task_dir,
+        intent=intent,
+        role=role,
+        delete_manifest=manifest,
+        pre_control=prepared["pre_control"],
+        final_control=prepared["final_control"],
+    )
+    if not started and (quarantine.exists() or quarantine.is_symlink()):
+        _verify_clean_root_revision(quarantine, record, role=role)
+    started_document = _mark_clean_delete_started(
+        task_dir=task_dir,
+        role=role,
+        ready=ready,
+    )
+    if started and runtime.load_json(started_path) != started_document:
+        raise runtime.HarnessError(
+            f"v2 clean {role} delete-start binding changed"
+        )
+    return started_document
+
+
+def _stage_prepared_root_cleanup(
+    prepared: Mapping[str, Any],
+) -> Dict[str, Any]:
+    role = str(prepared["role"])
+    record = prepared["record"]
+    task_dir = prepared["task_dir"]
+    ready = prepared["ready"]
+    if (
+        not isinstance(record, Mapping)
+        or not isinstance(task_dir, Path)
+        or not isinstance(ready, Mapping)
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared stage evidence is malformed"
+        )
+    root_stage = _stage_frozen_clean_tree(
+        Path(str(prepared["quarantine"])),
+        Path(str(prepared["staging"])),
+        prepared["manifest"],
+        original_path=Path(str(prepared["original"])),
+        task_dir=task_dir,
+        role=role,
+        ready=ready,
+    )
+    admin_stage = None
+    if prepared.get("git_owner") is not None:
+        admin_stage = _stage_linked_admin(
+            task_dir=task_dir,
+            role=role,
+            record=record,
+            ready=ready,
+        )
+    return {
+        "role": role,
+        "root": root_stage,
+        "admin": admin_stage,
+    }
+
+
+def _load_prepared_root_stage(
+    prepared: Mapping[str, Any],
+) -> Dict[str, Any]:
+    role = str(prepared["role"])
+    task_dir = prepared["task_dir"]
+    ready = prepared["ready"]
+    if not isinstance(task_dir, Path) or not isinstance(ready, Mapping):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared stage evidence is malformed"
+        )
+    root_stage = _load_clean_stage(
+        task_dir=task_dir,
+        role=role,
+        manifest=prepared["manifest"],
+        ready=ready,
+    )
+    admin_stage = None
+    if prepared.get("git_owner") is not None:
+        admin_stage = _load_admin_stage(
+            task_dir=task_dir,
+            role=role,
+            ready=ready,
+        )
+    return {
+        "role": role,
+        "root": root_stage,
+        "admin": admin_stage,
+    }
+
+
+def _bind_all_roots_started(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    prepared: Sequence[Mapping[str, Any]],
+    started: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    path = task_dir / "clean-delete-all-started.json"
+    document = {
+        "schema_version": 1,
+        "intent_sha256": intent["intent_sha256"],
+        "roots": [
+            {
+                "role": str(root["role"]),
+                "ready_sha256": root["ready"]["ready_sha256"],
+                "started_sha256": start["started_sha256"],
+            }
+            for root, start in zip(prepared, started)
+        ],
+        "all_started_sha256": "",
+    }
+    document["all_started_sha256"] = verifier.document_hash(
+        document, "all_started_sha256"
+    )
+    if _immutable_artifact_exists(
+        path, label="all-roots delete-start barrier"
+    ):
+        if runtime.load_json(path) != document:
+            raise runtime.HarnessError(
+                "v2 clean all-roots delete-start barrier is stale"
+            )
+    else:
+        runtime.atomic_create_json(path, document)
+    return document
+
+
+def _bind_all_roots_staged(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    all_started: Mapping[str, Any],
+    stages: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    path = task_dir / "clean-delete-all-staged.json"
+    roots = []
+    for stage in stages:
+        root = stage["root"]
+        admin = stage.get("admin")
+        roots.append(
+            {
+                "role": stage["role"],
+                "stage_sha256": root["stage_sha256"],
+                "admin_stage_sha256": (
+                    admin["admin_stage_sha256"]
+                    if isinstance(admin, Mapping)
+                    else None
+                ),
+            }
+        )
+    document = {
+        "schema_version": 1,
+        "intent_sha256": intent["intent_sha256"],
+        "all_started_sha256": all_started[
+            "all_started_sha256"
+        ],
+        "roots": roots,
+        "all_staged_sha256": "",
+    }
+    document["all_staged_sha256"] = verifier.document_hash(
+        document, "all_staged_sha256"
+    )
+    if _immutable_artifact_exists(
+        path, label="all-roots staged barrier"
+    ):
+        if runtime.load_json(path) != document:
+            raise runtime.HarnessError(
+                "v2 clean all-roots staged barrier is stale"
+            )
+    else:
+        runtime.atomic_create_json(path, document)
+    return document
+
+
+def _validate_prepared_root_cleanup(
+    prepared: Mapping[str, Any],
+    stage: Mapping[str, Any],
+    *,
+    require_complete: bool,
+) -> Dict[str, Any]:
+    role = str(prepared["role"])
+    record = prepared.get("record")
+    task_dir = prepared.get("task_dir")
+    intent = prepared.get("intent")
+    manifest = prepared.get("manifest")
+    ready = prepared.get("ready")
+    root_stage = stage.get("root")
+    if (
+        not isinstance(record, Mapping)
+        or not isinstance(task_dir, Path)
+        or not isinstance(intent, Mapping)
+        or not isinstance(manifest, Mapping)
+        or not isinstance(ready, Mapping)
+        or not isinstance(root_stage, Mapping)
+    ):
+        raise runtime.HarnessError(
+            f"v2 clean {role} global validation evidence is malformed"
+        )
+    git_owner = prepared.get("git_owner")
+    if git_owner is not None and not isinstance(git_owner, Path):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared Git owner is malformed"
+        )
+
+    _validate_frozen_clean_tree(
+        Path(str(prepared["quarantine"])),
+        Path(str(prepared["staging"])),
+        manifest,
+        root_stage,
+        original_path=Path(str(prepared["original"])),
+        require_complete=require_complete,
+    )
+    admin_stage = stage.get("admin")
+    if git_owner is not None:
+        if not isinstance(admin_stage, Mapping):
+            raise runtime.HarnessError(
+                f"v2 clean {role} Git admin stage evidence is missing"
+            )
+        _validate_staged_git_admin(
+            task_dir=task_dir,
+            role=role,
+            record=record,
+            admin_stage=admin_stage,
+            require_complete=require_complete,
+        )
+    elif admin_stage is not None:
+        raise runtime.HarnessError(
+            f"v2 clean {role} unexpected Git admin stage evidence"
+        )
+
+    pre_control = _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-pre",
+        repo_root=Path(str(prepared["original"])),
+        record=record,
+        git_owner=git_owner,
+        live=False,
+    )
+    final_control = _archive_git_control(
+        task_dir=task_dir,
+        intent=intent,
+        archive_role=f"{role}-final",
+        repo_root=Path(str(prepared["quarantine"])),
+        record=record,
+        git_owner=git_owner,
+        live=False,
+    )
+    document = {
+        "schema_version": 1,
+        "role": role,
+        "ready_sha256": ready["ready_sha256"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "stage_sha256": root_stage["stage_sha256"],
+        "admin_stage_sha256": (
+            admin_stage["admin_stage_sha256"]
+            if isinstance(admin_stage, Mapping)
+            else None
+        ),
+        "pre_control_sha256": pre_control["manifest_sha256"],
+        "final_control_sha256": final_control["manifest_sha256"],
+        "validation_sha256": "",
+    }
+    document["validation_sha256"] = verifier.document_hash(
+        document, "validation_sha256"
+    )
+    return document
+
+
+def _bind_all_roots_validated(
+    *,
+    task_dir: Path,
+    intent: Mapping[str, Any],
+    all_staged: Mapping[str, Any],
+    validations: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    path = task_dir / "clean-delete-all-validated.json"
+    document = {
+        "schema_version": 1,
+        "intent_sha256": intent["intent_sha256"],
+        "all_staged_sha256": all_staged["all_staged_sha256"],
+        "roots": [dict(validation) for validation in validations],
+        "all_validated_sha256": "",
+    }
+    document["all_validated_sha256"] = verifier.document_hash(
+        document, "all_validated_sha256"
+    )
+    if _immutable_artifact_exists(
+        path, label="all-roots validated barrier"
+    ):
+        if runtime.load_json(path) != document:
+            raise runtime.HarnessError(
+                "v2 clean all-roots validated barrier is stale"
+            )
+    else:
+        runtime.atomic_create_json(path, document)
+    return document
+
+
+def _finalize_frozen_root_cleanup(
+    prepared: Mapping[str, Any],
+    stage: Mapping[str, Any],
+) -> None:
+    role = str(prepared["role"])
+    record = prepared["record"]
+    if not isinstance(record, Mapping):
+        raise runtime.HarnessError(
+            f"v2 clean {role} prepared record is malformed"
+        )
+    _purge_frozen_clean_tree(
+        Path(str(prepared["quarantine"])),
+        Path(str(prepared["staging"])),
+        prepared["manifest"],
+        stage["root"],
+        original_path=Path(str(prepared["original"])),
+    )
+    git_owner = prepared.get("git_owner")
+    if git_owner is not None:
+        if not isinstance(git_owner, Path):
+            raise runtime.HarnessError(
+                f"v2 clean {role} prepared Git owner is malformed"
+            )
+        admin_stage = stage.get("admin")
+        if not isinstance(admin_stage, Mapping):
+            raise runtime.HarnessError(
+                f"v2 clean {role} Git admin stage evidence is missing"
+            )
+        _purge_staged_git_admin(
+            task_dir=prepared["task_dir"],
+            role=role,
+            record=record,
+            admin_stage=admin_stage,
+        )
+        admin_path = Path(str(record["git_admin_path"]))
+        _prune_quarantined_worktree(
+            git_owner,
+            original=Path(str(prepared["original"])),
+            quarantine=Path(str(prepared["quarantine"])),
+            admin_path=admin_path,
+        )
+
+
+def _finalize_all_prepared_roots(
+    prepared: Sequence[Mapping[str, Any]],
+    stages: Sequence[Mapping[str, Any]],
+) -> None:
+    # Revalidate every recoverability archive and every staged root/admin as
+    # one coordinated set immediately before the first irreversible unlink.
+    # This closes deterministic late-mutation windows between publishing the
+    # durable all-validated barrier and entering finalization. A malicious
+    # same-UID process can still race any point-in-time filesystem check.
+    if len(prepared) != len(stages) or any(
+        str(root.get("role")) != str(stage.get("role"))
+        for root, stage in zip(prepared, stages)
+    ):
+        raise runtime.HarnessError(
+            "v2 clean coordinated finalization set is malformed"
+        )
+    for root, stage in zip(prepared, stages):
+        _validate_prepared_root_cleanup(
+            root,
+            stage,
+            require_complete=False,
+        )
+    for root, stage in zip(prepared, stages):
+        _finalize_frozen_root_cleanup(root, stage)
+
+
 def _execute_clean_intent(
     contract: Mapping[str, Any],
     task_dir: Path,
@@ -3334,102 +6809,173 @@ def _execute_clean_intent(
             "path": str(path),
             "snapshot_ref": reference,
             "snapshot_commit": commit,
+            "snapshot_head": head_revision,
         }
-        for path, reference, commit in _verification_snapshots_for_cleanup(
-            contract, task_dir
+        for (
+            path,
+            reference,
+            commit,
+            head_revision,
+        ) in _verification_snapshots_for_cleanup(
+            contract, task_dir, validate_worktrees=False
         )
     ]
-    if intent.get("verification_snapshots") != expected_snapshots:
+    intent_snapshots = intent.get("verification_snapshots")
+    if not isinstance(intent_snapshots, list) or [
+        {
+            "path": entry.get("path"),
+            "snapshot_ref": entry.get("snapshot_ref"),
+            "snapshot_commit": entry.get("snapshot_commit"),
+            "snapshot_head": entry.get("expected_revision"),
+        }
+        for entry in intent_snapshots
+        if isinstance(entry, Mapping)
+    ] != expected_snapshots:
         raise runtime.HarnessError(
             "v2 clean intent snapshot set differs from task evidence"
         )
 
-    server_raw = intent.get("server_worktree")
-    source_raw = intent.get("server_source")
-    server_mode = intent.get("server_mode")
-    if server_raw is not None:
-        server_worktree = Path(str(server_raw))
-        server_source = Path(str(source_raw))
-        expected_server = worktree.parent / "murmur-server"
-        if server_worktree.resolve() != expected_server.resolve():
-            raise runtime.HarnessError("v2 clean server path escaped task root")
-        if server_worktree.exists() or server_worktree.is_symlink():
-            if not server_worktree.is_dir() or server_worktree.is_symlink():
-                raise runtime.HarnessError("v2 clean server path is unsafe")
-            if runtime.git_bytes(
-                server_worktree, "status", "--porcelain"
-            ).strip():
-                raise runtime.HarnessError(
-                    "refusing clean: pinned server checkout became dirty"
-                )
-            if server_mode == "local-shared-clone":
-                common = Path(
-                    runtime.git(
-                        server_worktree,
-                        "rev-parse",
-                        "--path-format=absolute",
-                        "--git-common-dir",
-                    )
-                ).resolve()
-                if common != (server_worktree / ".git").resolve():
-                    raise runtime.HarnessError(
-                        "v2 clean server clone shares mutable Git metadata"
-                    )
-                shutil.rmtree(server_worktree)
-            elif server_mode == "linked-worktree":
-                runtime.run_capture(
-                    ["git", "worktree", "remove", str(server_worktree)],
-                    server_source,
-                )
-            else:
-                raise runtime.HarnessError(
-                    "v2 clean intent server mode is unsupported"
-                )
+    client_record = {
+        "path": str(worktree),
+        "device": intent["worktree_device"],
+        "inode": intent["worktree_inode"],
+        "quarantine_path": intent["quarantine_path"],
+        "delete_staging_path": intent["delete_staging_path"],
+        "expected_tree": tree_sha,
+        "expected_revision": intent["worktree_revision"],
+        "git_admin_path": intent["git_admin_path"],
+        "git_admin_staging_path": intent[
+            "git_admin_staging_path"
+        ],
+    }
+    cleanup_jobs: List[Dict[str, Any]] = [
+        {
+            "role": "client",
+            "record": client_record,
+            "git_owner": primary,
+            "allow_disposable_ignored": True,
+        }
+    ]
 
-    for entry in expected_snapshots:
-        snapshot = Path(entry["path"])
-        if snapshot.exists() or snapshot.is_symlink():
-            if not snapshot.is_dir() or snapshot.is_symlink():
+    server_record = intent.get("server_cleanup")
+    if isinstance(server_record, Mapping):
+        server_mode = intent.get("server_mode")
+        runtime_doc = runtime.load_json(task_dir / "runtime.json")
+        for key, expected in (
+            ("server_worktree", intent.get("server_worktree")),
+            ("server_source", intent.get("server_source")),
+            ("server_checkout_mode", server_mode),
+            ("server_revision", server_record.get("expected_revision")),
+        ):
+            if runtime_doc.get(key) != expected:
                 raise runtime.HarnessError(
-                    "v2 verification snapshot became unsafe before cleanup"
+                    f"v2 clean runtime {key} differs from durable intent"
                 )
-            common = Path(
-                runtime.git(
-                    snapshot,
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-common-dir",
-                )
-            ).resolve()
-            if common != (snapshot / ".git").resolve():
-                raise runtime.HarnessError(
-                    "v2 verification snapshot shares mutable Git metadata"
-                )
-            shutil.rmtree(snapshot)
-
-    if worktree.exists() or worktree.is_symlink():
-        if not worktree.is_dir() or worktree.is_symlink():
-            raise runtime.HarnessError("v2 clean client worktree is unsafe")
-        ignored = _non_disposable_ignored_paths(worktree)
-        if ignored:
-            shown = ", ".join(ignored[:20])
-            suffix = "" if len(ignored) <= 20 else f" (+{len(ignored) - 20} more)"
-            raise runtime.HarnessError(
-                "refusing clean: ignored task bytes are not archived: "
-                + shown
-                + suffix
-            )
-        current_tree = _visible_tree(worktree, task_dir / "runtime")
-        if current_tree != tree_sha:
-            raise runtime.HarnessError(
-                "refusing clean: task bytes changed after the durable archive"
-            )
-        node_modules = worktree / "node_modules"
-        if runtime.managed_node_modules_link(worktree):
-            node_modules.unlink()
-        runtime.run_capture(
-            ["git", "worktree", "remove", "--force", str(worktree)], primary
+        server_owner = (
+            Path(str(intent["server_source"]))
+            if server_mode == "linked-worktree"
+            else None
         )
+        cleanup_jobs.append(
+            {
+                "role": "server",
+                "record": server_record,
+                "git_owner": server_owner,
+                "allow_disposable_ignored": False,
+            }
+        )
+
+    for index, snapshot_record in enumerate(intent_snapshots):
+        if not isinstance(snapshot_record, Mapping):
+            raise runtime.HarnessError(
+                "v2 clean snapshot record is malformed"
+            )
+        if snapshot_record.get("present") is False:
+            snapshot_path = Path(str(snapshot_record["path"]))
+            if snapshot_path.exists() or snapshot_path.is_symlink():
+                raise runtime.HarnessError(
+                    "v2 clean absent verification snapshot appeared after intent"
+                )
+            continue
+        cleanup_jobs.append(
+            {
+                "role": f"snapshot-{index:04d}",
+                "record": snapshot_record,
+                "git_owner": None,
+                "allow_disposable_ignored": False,
+            }
+        )
+
+    # Refuse every known revision drift before moving any root. Each root is
+    # then quarantined and frozen before deletion starts, so a failure on an
+    # auxiliary checkout cannot destroy the client first.
+    for job in cleanup_jobs:
+        _prevalidate_frozen_root_cleanup(
+            task_dir=task_dir,
+            intent=intent,
+            role=str(job["role"]),
+            record=job["record"],
+            git_owner=job["git_owner"],
+        )
+    prepared = [
+        _prepare_frozen_root_cleanup(
+            task_dir=task_dir,
+            intent=intent,
+            role=str(job["role"]),
+            record=job["record"],
+            git_owner=job["git_owner"],
+            allow_disposable_ignored=bool(
+                job["allow_disposable_ignored"]
+            ),
+        )
+        for job in cleanup_jobs
+    ]
+    started = [
+        _start_frozen_root_cleanup(root) for root in prepared
+    ]
+    all_started = _bind_all_roots_started(
+        task_dir=task_dir,
+        intent=intent,
+        prepared=prepared,
+        started=started,
+    )
+    all_staged_path = task_dir / "clean-delete-all-staged.json"
+    if _immutable_artifact_exists(
+        all_staged_path, label="all-roots staged barrier"
+    ):
+        stages = [
+            _load_prepared_root_stage(root) for root in prepared
+        ]
+    else:
+        stages = [
+            _stage_prepared_root_cleanup(root)
+            for root in prepared
+        ]
+    all_staged = _bind_all_roots_staged(
+        task_dir=task_dir,
+        intent=intent,
+        all_started=all_started,
+        stages=stages,
+    )
+    validated_path = task_dir / "clean-delete-all-validated.json"
+    require_complete = not _immutable_artifact_exists(
+        validated_path, label="all-roots validated barrier"
+    )
+    validations = [
+        _validate_prepared_root_cleanup(
+            root,
+            stage,
+            require_complete=require_complete,
+        )
+        for root, stage in zip(prepared, stages)
+    ]
+    _bind_all_roots_validated(
+        task_dir=task_dir,
+        intent=intent,
+        all_staged=all_staged,
+        validations=validations,
+    )
+    _finalize_all_prepared_roots(prepared, stages)
 
     runtime.delete_local_task_branch(
         primary,
@@ -3456,6 +7002,11 @@ def _execute_clean_intent(
 
 def cmd_clean(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_v2_task(args.task_id, Path.cwd())
+    # The operator must invoke clean from the driver/primary, not from a shell
+    # whose cwd is inside a cleanup root; the pre-intent lsof gate rejects that
+    # parent shell without mutation. Move this child outside every cleanup root
+    # so its own inherited cwd never creates a false positive.
+    os.chdir(Path(str(contract["repo_realpath"])).resolve())
     lock = acquire_v2_run_lock(task_dir, "clean")
     try:
         state = load_v2_state(task_dir)
@@ -3489,6 +7040,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
                     + shown
                     + suffix
                 )
+            _require_quarantine_idle(worktree)
             dirty_after_commit = bool(runtime.changed_paths(worktree))
             clean_close = (
                 state.get("status") == "COMMITTED" and not dirty_after_commit
@@ -3510,20 +7062,26 @@ def cmd_clean(args: argparse.Namespace) -> int:
                 contract, task_dir
             )
             primary = Path(str(contract["repo_realpath"])).resolve()
-            archive_ref, snapshot, tree = _archive_all_visible_bytes(
+            archive_ref, snapshot, tree, worktree_revision = (
+                _archive_all_visible_bytes(
                 primary, worktree, contract, task_dir
+                )
             )
             intent = _clean_intent_document(
                 contract,
+                worktree=worktree,
                 final_status="CLOSED" if clean_close else "ABANDONED",
                 previous_status=str(state.get("status")),
                 archive_ref=archive_ref,
                 snapshot_sha=snapshot,
                 tree_sha=tree,
+                worktree_revision=worktree_revision,
                 server=server,
                 verification_snapshots=verification_snapshots,
             )
-            runtime.atomic_write_json(task_dir / "clean-intent.json", intent)
+            # The immutable intent is the recovery authority before any root is
+            # quarantined. Its directory entry must survive power loss.
+            runtime.atomic_create_json(task_dir / "clean-intent.json", intent)
             _checkpoint_event(
                 task_dir,
                 "clean-intent",

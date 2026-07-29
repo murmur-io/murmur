@@ -665,7 +665,7 @@ def protocol_manifest_cases(test: Tests) -> None:
         test.raises(
             "PROTOCOL a symlinked future Python module fails closed",
             lambda: verifier.protocol_relative_paths(fixture),
-            "Python module is missing or unsafe",
+            "protocol path is not a regular file",
         )
 
 
