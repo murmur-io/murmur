@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verify exact per-commit Harness v1/v2 receipts on a pull-request branch.
+"""Verify current and historical exact Harness receipts on a pull-request branch.
 
-Unversioned receipts are legacy v1.  Version 2 requires an exact evidence hash
+Historical unversioned receipts are v1. Version 2 requires an exact evidence hash
 and an equal transitional Attestation alias.  Every branch-authored non-merge
 commit is covered; clean catch-up merges from the base branch remain supported
 only when their tree equals Git's deterministic merge result.  Receipt policy

@@ -30,9 +30,9 @@ promoted). `success-pattern` entries capture what a *clean* run did right, not j
 
 ## The loop
 
-1. **Read** — mutation tasks use the harness, whose `task_runner.py::learning_prompt` prepends
-   role-relevant sections from canonical `.codex/learnings/` and binds that tree in the instruction
-   hash. A direct read-only Claude dispatch must include a relevant section explicitly.
+1. **Read** — mutation tasks use the harness, whose protocol hash binds canonical
+   `.codex/learnings/`. The developer and reviewer read the relevant canonical section; a direct
+   read-only Claude dispatch must include it explicitly.
 2. **Work** — the agent implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry (via `/learn`, or an
    extractor pass) citing the artifact that revealed it.

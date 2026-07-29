@@ -107,7 +107,7 @@ Full runbook: **[`.agents/skills/release-murmur`](.agents/skills/release-murmur/
 ## Agents, skills, rules & hooks (this repo's `.codex/`)
 
 - **Rules** (`.codex/rules/`): `rust-tauri`, `angular-zoneless`, `lock-model`, `agentic-workflow` — binding local references; read the relevant one before changing that surface.
-- **Harness + hooks** (`.agents/harness/`, `scripts/agent-harness`, `.codex/hooks/`): the neutral runner owns isolated worktrees, bounded repair, checks, independent reviews, hash-bound PASS attestations, and the exact `commit`/`close` lifecycle. Hooks are fast defense-in-depth; CI is the remote truth. Run `scripts/agent-harness selftest` and `scripts/agent-config-audit`.
+- **Harness + hooks** (`.agents/harness/`, `scripts/agent-harness`, `.codex/hooks/`): the verifier-only runner owns isolated worktrees, exact-diff checks, independent reviews, hash-bound PASS receipts, guarded `commit`, resumable evidence, and lossless `clean`. It has no writer or automatic repair loop. Hooks are fast defense-in-depth; CI is the remote truth. Run `scripts/agent-harness selftest` and `scripts/agent-config-audit`.
 - **Skills** (`.agents/skills/`): **invoke these PROACTIVELY the moment a task matches — the user should NOT have to type the slash command:**
   - cutting a build / version bump / publishing a release → **`release-murmur`**
   - starting, iterating, or debugging the dev app → **`tauri-dev`**
@@ -120,24 +120,22 @@ Full runbook: **[`.agents/skills/release-murmur`](.agents/skills/release-murmur/
   - recording or curating the lessons loop → **`murmur-learn`**, **`murmur-curate-learnings`**
 - **Agents** (`.codex/agents/*.toml`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `ci-cd-engineer` (designs & maintains CI — the local `scripts/ci.sh` gate + the GitHub Actions macOS PR-gate that wraps it; CD/notarized release stays with `release-engineer`), `murmur-researcher` — spawn as custom subagents; the implementer never owns the verdict.
 
-When a task mutates the repository, use `scripts/agent-harness`: one isolated writer, deterministic checks, fresh independent reviewers, bounded repair and a hash-bound attestation. The implementer never owns the verdict.
+Use `scripts/agent-harness` for risky/multi-step work that needs a hash-bound receipt. The implementer edits the isolated worktree but never owns the verdict. For protected Harness/control-plane changes, which cannot self-certify, use a dedicated worktree outside the runner-owned `../.murmur-agent-tasks` root (for example `../.murmur-control-plane/<task-id>`), the complete control-plane selftests, a fresh independent review, and the base-anchored CI gate.
 
 ## Opt-in harness (`/harness`)
 
 The harness is **opt-in**. Normal commits run freely; only `secret-scan` and
 direct-push-to-`murmur` protection are always on. Reach for rigor deliberately:
 
-- **Codex has no skills mechanism** — invoke the harness directly:
-  `scripts/agent-harness init <task-id> --prompt "…" --owned <path> && scripts/agent-harness run <task-id> && scripts/agent-harness commit <task-id> -m "…"`.
+- Invoke the harness directly:
+  `scripts/agent-harness open <task-id> --prompt "…" --owned <path>`, implement in the printed worktree, then `plan`, `verify`/`resume`, `commit`, and finally `clean` after merge.
 - Use it for lock/crypto/egress/protocol changes or anything you want a fresh
   adversarial reviewer to verify. Skip it for docs/chores/low-risk edits.
 - Guard behavior is identical across vendors (same `hook_guard.py`): a commit in
   a worktree with **no** active task is allowed; a worktree **with** a task
   enforces the full hash-bound attestation.
-- **Choose the writer/reviewer pair** with `--agent`/`--reviewer` (both `codex|claude`).
-  All four pairs are allowed, including same-vendor; the shipped default is
-  `claude→claude`. The reviewer is always a fresh, independent session with no
-  writer context — same-vendor is a procedurally independent adversarial review,
-  not self-grading, though not model-family-diverse. `lock`/`egress`/`protocol`
-  tasks auto-escalate the reviewer to the opposite vendor (opt out with
-  `--allow-same-vendor-high-risk`).
+- Choose the fresh reviewer with `--reviewer codex|claude`; the default is
+  `codex`. The reviewer has no developer-session context and no local tools.
+  `lock`/`egress`/`protocol` specialist reviews prefer the opposite vendor; when
+  that vendor is unavailable, bind the explicit
+  `--allow-same-vendor-high-risk` exception instead of silently spending it.

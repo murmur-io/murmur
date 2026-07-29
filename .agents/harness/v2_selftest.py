@@ -23,7 +23,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import cli as harness_cli
-import task_runner as legacy
+import runtime
 import verifier
 
 
@@ -221,7 +221,7 @@ def _open_args(task_id: str, base: str, branch: str) -> argparse.Namespace:
         prompt_file=None,
         owned=["owned.txt"],
         claim=[],
-        reviewer="codex",
+        reviewer=None,
         allow_same_vendor_high_risk=False,
         base=base,
         branch=branch,
@@ -274,7 +274,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
         root = Path(raw)
         _primary, driver, base = _standalone_driver(root)
         branch = "agent/v2/forced-add-failure"
-        original_run_capture = legacy.run_capture
+        original_run_capture = runtime.run_capture
 
         def fail_worktree_add(
             argv: Sequence[str],
@@ -284,7 +284,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
             env: Mapping[str, str] | None = None,
         ) -> subprocess.CompletedProcess:
             if list(argv[:3]) == ["git", "worktree", "add"]:
-                raise legacy.HarnessError("forced worktree-add failure")
+                raise runtime.HarnessError("forced worktree-add failure")
             return original_run_capture(
                 argv,
                 cwd,
@@ -292,7 +292,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
                 env=env,
             )
 
-        legacy.run_capture = fail_worktree_add
+        runtime.run_capture = fail_worktree_add
         try:
             test.raises(
                 "OPEN reports a forced worktree-add failure",
@@ -303,7 +303,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
                 "forced worktree-add failure",
             )
         finally:
-            legacy.run_capture = original_run_capture
+            runtime.run_capture = original_run_capture
         test.equal(
             "OPEN deletes its unchanged branch after worktree-add failure",
             harness_cli._local_branch_oid(driver, branch),
@@ -321,7 +321,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
         valuable_oid = _git(driver, "rev-parse", "HEAD")
         _git(driver, "checkout", "-q", "--detach", base)
         branch = "agent/v2/moved-during-failure"
-        original_run_capture = legacy.run_capture
+        original_run_capture = runtime.run_capture
 
         def move_then_fail_worktree_add(
             argv: Sequence[str],
@@ -337,7 +337,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
                     f"refs/heads/{branch}",
                     valuable_oid,
                 )
-                raise legacy.HarnessError("forced moved-branch failure")
+                raise runtime.HarnessError("forced moved-branch failure")
             return original_run_capture(
                 argv,
                 cwd,
@@ -345,7 +345,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
                 env=env,
             )
 
-        legacy.run_capture = move_then_fail_worktree_add
+        runtime.run_capture = move_then_fail_worktree_add
         try:
             test.raises(
                 "OPEN reports failure after its branch moves",
@@ -356,7 +356,7 @@ def open_branch_ownership_cases(test: Tests) -> None:
                 "forced moved-branch failure",
             )
         finally:
-            legacy.run_capture = original_run_capture
+            runtime.run_capture = original_run_capture
         test.equal(
             "OPEN preserves a created branch that no longer has the expected OID",
             harness_cli._local_branch_oid(driver, branch),
@@ -402,8 +402,8 @@ def standalone_driver_open_cases(test: Tests) -> None:
         task_dir = harness_cli.v2_task_dir(common, task_id)
         task_root = root / ".murmur-agent-tasks" / "v2" / task_id
         worktree = task_root / "meetnotes"
-        contract = legacy.load_json(task_dir / "task.json")
-        runtime = legacy.load_json(task_dir / "runtime.json")
+        contract = runtime.load_json(task_dir / "task.json")
+        runtime_doc = runtime.load_json(task_dir / "runtime.json")
         metadata_valid = True
         try:
             loaded, loaded_dir, loaded_common = harness_cli.load_v2_task(
@@ -489,6 +489,11 @@ def standalone_driver_open_cases(test: Tests) -> None:
             contract["allow_same_vendor_high_risk"],
             False,
         )
+        test.equal(
+            "OPEN defaults to Codex reviewer without spending Claude tokens",
+            contract["reviewer"],
+            "codex",
+        )
         tampered_contract = dict(contract)
         tampered_contract["allow_same_vendor_high_risk"] = True
         test.true(
@@ -498,7 +503,7 @@ def standalone_driver_open_cases(test: Tests) -> None:
         )
         test.equal(
             "OPEN runtime records exact safe task root",
-            runtime["task_root"],
+            runtime_doc["task_root"],
             str(task_root.resolve()),
         )
         test.true("OPEN writes valid task metadata and state", metadata_valid)
@@ -515,7 +520,7 @@ def standalone_driver_open_cases(test: Tests) -> None:
         )
         exception_args.allow_same_vendor_high_risk = True
         _invoke_open(driver, exception_args)
-        exception_contract = legacy.load_json(
+        exception_contract = runtime.load_json(
             harness_cli.v2_task_dir(common, exception_task_id) / "task.json"
         )
         test.equal(
@@ -542,7 +547,7 @@ def standalone_driver_open_cases(test: Tests) -> None:
         task_dir = harness_cli.v2_task_dir(
             (driver / ".git").resolve(), task_id
         )
-        runtime = legacy.load_json(task_dir / "runtime.json")
+        runtime_doc = runtime.load_json(task_dir / "runtime.json")
         server_worktree = (
             root
             / ".murmur-agent-tasks"
@@ -578,9 +583,9 @@ def standalone_driver_open_cases(test: Tests) -> None:
         test.equal(
             "OPEN runtime records the local shared clone",
             (
-                runtime["server_worktree"],
-                runtime["server_revision"],
-                runtime["server_checkout_mode"],
+                runtime_doc["server_worktree"],
+                runtime_doc["server_revision"],
+                runtime_doc["server_checkout_mode"],
             ),
             (
                 str(server_worktree.resolve()),
@@ -630,7 +635,7 @@ def standalone_driver_open_cases(test: Tests) -> None:
             task_dir: Path, status: str, **updates: Any
         ) -> Dict[str, Any]:
             del task_dir, status, updates
-            raise legacy.HarnessError(
+            raise runtime.HarnessError(
                 "forced failure after server provisioning"
             )
 
@@ -833,7 +838,7 @@ def _profile(
     checks, reviews, risks = verifier.derive_profile(
         list(paths),
         list(claims),
-        legacy.load_config(),
+        runtime.load_config(),
         reviewer="claude",
     )
     return (
@@ -953,7 +958,7 @@ def profile_cases(test: Tests) -> None:
     _checks, default_reviews, _risks = verifier.derive_profile(
         ["src-tauri/src/storage/meeting_store.rs"],
         [],
-        legacy.load_config(),
+        runtime.load_config(),
         reviewer="codex",
     )
     test.equal(
@@ -964,7 +969,7 @@ def profile_cases(test: Tests) -> None:
     _checks, same_vendor_reviews, _risks = verifier.derive_profile(
         ["src-tauri/src/storage/meeting_store.rs"],
         [],
-        legacy.load_config(),
+        runtime.load_config(),
         reviewer="codex",
         allow_same_vendor_high_risk=True,
     )
@@ -991,7 +996,7 @@ def profile_cases(test: Tests) -> None:
         harness_cli._protected_v2_paths([".agents/harness"]),
         [".agents/harness"],
     )
-    harness_python = legacy.load_config()["canonical_checks"][
+    harness_python = runtime.load_config()["canonical_checks"][
         "harness-python"
     ]
     harness_python_result = subprocess.run(
@@ -1006,35 +1011,35 @@ def profile_cases(test: Tests) -> None:
         harness_python_result.returncode,
         0,
     )
-    canonical_v2_selftest = legacy.load_config()["canonical_checks"][
+    canonical_v2_selftest = runtime.load_config()["canonical_checks"][
         "harness-v2-selftest"
     ]
     test.true(
         "PROFILE canonical v2 selftest inherits the outer sandbox",
-        legacy.command_is_inherited_sandbox_meta_check(
+        runtime.command_is_inherited_sandbox_meta_check(
             canonical_v2_selftest
         ),
     )
     test.equal(
         "PROFILE npm-lock check does not request the Sherpa archive",
-        legacy.command_needs_sherpa_archive(
+        runtime.command_needs_sherpa_archive(
             "python3 -B .agents/harness/checks/npm-lock-evidence.py"
         ),
         False,
     )
     test.true(
         "PROFILE performance contracts request the Sherpa archive",
-        legacy.command_needs_sherpa_archive(
+        runtime.command_needs_sherpa_archive(
             "bash .agents/harness/checks/perf-contracts.sh"
         ),
     )
     test.true(
         "PROFILE client Rust checks request the Sherpa archive",
-        legacy.command_needs_sherpa_archive(
+        runtime.command_needs_sherpa_archive(
             "(cd src-tauri && cargo test --lib)"
         ),
     )
-    review_schema = legacy.load_schema("v2-review")
+    review_schema = runtime.load_schema("v2-review")
     schema_probe_ids = set(
         review_schema["properties"]["probe_requests"]["items"]["properties"][
             "probe_id"
@@ -1047,7 +1052,7 @@ def profile_cases(test: Tests) -> None:
     )
     test.equal(
         "PROFILE every static probe id has exactly one canonical command",
-        set(legacy.load_config()["canonical_checks"]),
+        set(runtime.load_config()["canonical_checks"]),
         verifier.ALLOWED_PROBES,
     )
 
@@ -1057,8 +1062,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
     with tempfile.TemporaryDirectory(prefix="murmur-v2-npm-lock-valid-") as raw:
         repo = Path(raw) / "repo"
         _init_repo(repo)
-        manifest = legacy.load_json(ROOT / "package.json")
-        lock = legacy.load_json(ROOT / "package-lock.json")
+        manifest = runtime.load_json(ROOT / "package.json")
+        lock = runtime.load_json(ROOT / "package-lock.json")
         lock["version"] = manifest["version"]
         lock["packages"][""]["version"] = manifest["version"]
         manifest["optionalDependencies"] = {"nanoid": "^3.3.15"}
@@ -1075,12 +1080,12 @@ def npm_lock_evidence_cases(test: Tests) -> None:
         lock["packages"][""]["peerDependenciesMeta"] = copy.deepcopy(
             manifest["peerDependenciesMeta"]
         )
-        legacy.atomic_write_json(repo / "package.json", manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        runtime.atomic_write_json(repo / "package.json", manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", lock)
         _git(repo, "add", "package.json", "package-lock.json")
         _git(repo, "commit", "-q", "-m", "add coherent package fixture")
         base_sha = _git(repo, "rev-parse", "HEAD")
-        before = legacy.git_bytes(repo, "status", "--porcelain", "-z")
+        before = runtime.git_bytes(repo, "status", "--porcelain", "-z")
         completed = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(repo),
@@ -1092,7 +1097,7 @@ def npm_lock_evidence_cases(test: Tests) -> None:
             },
             check=False,
         )
-        after = legacy.git_bytes(repo, "status", "--porcelain", "-z")
+        after = runtime.git_bytes(repo, "status", "--porcelain", "-z")
         try:
             evidence = json.loads(completed.stdout)
         except json.JSONDecodeError:
@@ -1146,8 +1151,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
         committed_lock["packages"]["node_modules/base-binding-fixture"] = {
             "version": "1.0.0"
         }
-        legacy.atomic_write_json(repo / "package.json", committed_manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", committed_lock)
+        runtime.atomic_write_json(repo / "package.json", committed_manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", committed_lock)
         _git(repo, "add", "package.json", "package-lock.json")
         _git(repo, "commit", "-q", "-m", "commit task dependency change")
         committed_run = subprocess.run(
@@ -1176,7 +1181,7 @@ def npm_lock_evidence_cases(test: Tests) -> None:
             and "base-binding-fixture" in changed_names
             and committed_evidence.get("base_package_json_sha256")
             == hashlib.sha256(
-                legacy.git_bytes(repo, "show", f"{base_sha}:package.json")
+                runtime.git_bytes(repo, "show", f"{base_sha}:package.json")
             ).hexdigest(),
         )
 
@@ -1192,8 +1197,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
             removed_lock["packages"]["node_modules/rxjs"],
             rxjs_package_before,
         )
-        legacy.atomic_write_json(repo / "package.json", removed_manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", removed_lock)
+        runtime.atomic_write_json(repo / "package.json", removed_manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", removed_lock)
         removed_run = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(repo),
@@ -1244,8 +1249,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
                 }
             },
         }
-        legacy.atomic_write_json(repo / "package.json", manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        runtime.atomic_write_json(repo / "package.json", manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", lock)
         _git(repo, "add", "package.json", "package-lock.json")
         _git(repo, "commit", "-q", "-m", "add package fixture")
         base_sha = _git(repo, "rev-parse", "HEAD")
@@ -1274,10 +1279,10 @@ def npm_lock_evidence_cases(test: Tests) -> None:
             and b"duplicate JSON key" in duplicate_run.stderr,
         )
 
-        legacy.atomic_write_json(repo / "package.json", manifest)
+        runtime.atomic_write_json(repo / "package.json", manifest)
         broken_lock = copy.deepcopy(lock)
         broken_lock["packages"][""]["dependencies"] = {}
-        legacy.atomic_write_json(repo / "package-lock.json", broken_lock)
+        runtime.atomic_write_json(repo / "package-lock.json", broken_lock)
         mismatch_run = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(repo),
@@ -1296,8 +1301,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
         optional_manifest["optionalDependencies"] = {
             "optional-example": "1.0.0"
         }
-        legacy.atomic_write_json(repo / "package.json", optional_manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        runtime.atomic_write_json(repo / "package.json", optional_manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", lock)
         optional_mismatch_run = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(repo),
@@ -1318,8 +1323,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
         peer_manifest["peerDependenciesMeta"] = {
             "peer-example": {"optional": True}
         }
-        legacy.atomic_write_json(repo / "package.json", peer_manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", lock)
+        runtime.atomic_write_json(repo / "package.json", peer_manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", lock)
         peer_mismatch_run = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(repo),
@@ -1339,8 +1344,8 @@ def npm_lock_evidence_cases(test: Tests) -> None:
         peer_lock["packages"][""]["peerDependencies"] = {
             "peer-example": "1.0.0"
         }
-        legacy.atomic_write_json(repo / "package.json", peer_manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", peer_lock)
+        runtime.atomic_write_json(repo / "package.json", peer_manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", peer_lock)
         peer_meta_mismatch_run = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(repo),
@@ -1358,7 +1363,7 @@ def npm_lock_evidence_cases(test: Tests) -> None:
 
 
 def reviewer_tool_guard_cases(test: Tests) -> None:
-    isolated_cwd = legacy.reviewer_execution_cwd()
+    isolated_cwd = runtime.reviewer_execution_cwd()
     test.true(
         "REVIEWER isolated cwd and every ancestor are immutable root-owned directories",
         all(
@@ -1371,18 +1376,18 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
     with tempfile.TemporaryDirectory(prefix="murmur-reviewer-cwd-") as raw:
         mutable_cwd = Path(raw)
         mutable_cwd.chmod(0o777)
-        original_reviewer_cwd = legacy.REVIEWER_CWD
-        legacy.REVIEWER_CWD = mutable_cwd
+        original_reviewer_cwd = runtime.REVIEWER_CWD
+        runtime.REVIEWER_CWD = mutable_cwd
         try:
             test.raises(
                 "REVIEWER mutable temporary cwd is rejected",
-                legacy.reviewer_execution_cwd,
+                runtime.reviewer_execution_cwd,
                 "mutable by the invoking user",
             )
         finally:
-            legacy.REVIEWER_CWD = original_reviewer_cwd
+            runtime.REVIEWER_CWD = original_reviewer_cwd
 
-    codex_environment = legacy.reviewer_model_environment(
+    codex_environment = runtime.reviewer_model_environment(
         {"HOME": "/Users/selftest", "PATH": "/usr/bin:/bin", "SHELL": "/bin/zsh"},
         vendor="codex",
         cwd=isolated_cwd,
@@ -1403,7 +1408,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
         "/Users/selftest/.codex",
     )
 
-    decision = legacy.REVIEWER_TOOL_DENIAL
+    decision = runtime.REVIEWER_TOOL_DENIAL
     output = decision["hookSpecificOutput"]
     test.equal(
         "REVIEWER guard denies every intercepted local tool",
@@ -1414,12 +1419,12 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
         "REVIEWER guard never reflects model-controlled tool input",
         "tool_input" not in json.dumps(decision, sort_keys=True),
     )
-    command = legacy.reviewer_tool_guard_command()
+    command = runtime.reviewer_tool_guard_command()
     test.true(
         "REVIEWER inline guard has no mutable worktree dependency",
         command.startswith("/usr/bin/printf ")
         and "reviewer_tool_guard" not in command
-        and str(legacy.HARNESS_ROOT) not in command,
+        and str(runtime.HARNESS_ROOT) not in command,
     )
     completed = subprocess.run(
         command,
@@ -1495,7 +1500,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
         )
         test.equal(
             "REVIEWER sanitized Claude 2.1.220 StructuredOutput projection is admissible",
-            legacy.reviewer_tool_activity(
+            runtime.reviewer_tool_activity(
                 claude_21220_projection, "claude"
             ),
             [],
@@ -1513,7 +1518,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
         test.true(
             "REVIEWER Claude log without init telemetry is rejected",
             "missing Claude init telemetry"
-            in legacy.reviewer_tool_activity(missing_init, "claude"),
+            in runtime.reviewer_tool_activity(missing_init, "claude"),
         )
 
         valid_claude_init = {
@@ -1542,7 +1547,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
             )
             test.true(
                 f"REVIEWER Claude {tool_name} tool use is rejected",
-                bool(legacy.reviewer_tool_activity(tool_log, "claude")),
+                bool(runtime.reviewer_tool_activity(tool_log, "claude")),
             )
 
         extra_tools = tool_fixture(
@@ -1558,7 +1563,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
             "REVIEWER unexpected Claude init tool surface is rejected",
             any(
                 "unexpected-tools" in item
-                for item in legacy.reviewer_tool_activity(
+                for item in runtime.reviewer_tool_activity(
                     extra_tools, "claude"
                 )
             ),
@@ -1576,7 +1581,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
             "REVIEWER unexpected Claude MCP surface is rejected",
             any(
                 "unexpected-mcp" in item
-                for item in legacy.reviewer_tool_activity(
+                for item in runtime.reviewer_tool_activity(
                     unexpected_mcp, "claude"
                 )
             ),
@@ -1597,7 +1602,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
         )
         test.equal(
             "REVIEWER Codex reasoning and prose remain admissible",
-            legacy.reviewer_tool_activity(codex_prose, "codex"),
+            runtime.reviewer_tool_activity(codex_prose, "codex"),
             [],
         )
         for label, item_type in (
@@ -1615,7 +1620,7 @@ def reviewer_tool_guard_cases(test: Tests) -> None:
             )
             test.true(
                 f"REVIEWER Codex {item_type} event fails closed",
-                bool(legacy.reviewer_tool_activity(codex_tool, "codex")),
+                bool(runtime.reviewer_tool_activity(codex_tool, "codex")),
             )
 
 
@@ -1712,9 +1717,9 @@ def focused_review_evidence_cases(test: Tests) -> None:
                     "resource_wait_ms": 0,
                     "log_sha256": "0" * 64,
                     "stdout_path": str(path),
-                    "stdout_sha256": legacy.sha256_file(path),
+                    "stdout_sha256": runtime.sha256_file(path),
                     "stderr_path": str(stderr),
-                    "stderr_sha256": legacy.sha256_file(stderr),
+                    "stderr_sha256": runtime.sha256_file(stderr),
                 },
             }
 
@@ -2147,8 +2152,8 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 }
             },
         }
-        legacy.atomic_write_json(repo / "package.json", package_manifest)
-        legacy.atomic_write_json(repo / "package-lock.json", package_lock)
+        runtime.atomic_write_json(repo / "package.json", package_manifest)
+        runtime.atomic_write_json(repo / "package-lock.json", package_lock)
         _git(repo, "add", ".")
         _git(repo, "commit", "-q", "-m", "add exact v2 protocol")
         base = _git(repo, "rev-parse", "HEAD")
@@ -2191,19 +2196,18 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             "claims": [],
             "reviewer": "fake",
             "expected_change": True,
-            "degraded_provenance": [],
-            "created_at": legacy.utc_now(),
+            "created_at": runtime.utc_now(),
         }
         contract["contract_sha256"] = verifier.document_hash(
             contract, "contract_sha256"
         )
-        legacy.validate_schema(
+        runtime.validate_schema(
             contract,
-            legacy.load_schema("v2-task"),
+            runtime.load_schema("v2-task"),
             label="v2 probe precedence contract",
         )
-        legacy.atomic_write_json(task_dir / "task.json", contract)
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(
             task_dir / "runtime.json",
             {
                 "schema_version": 2,
@@ -2230,7 +2234,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
         saved_proof_gaps = os.environ.get(
             "MURMUR_HARNESS_FAKE_REVIEW_PROOF_GAPS_JSON"
         )
-        original_load_config = legacy.load_config
+        original_load_config = runtime.load_config
         selftest_config = copy.deepcopy(original_load_config())
         selftest_config["canonical_checks"]["ng-lint"] = (
             "python3 -c 'print(\"PLANNED_\" + \"NG_LINT_STREAM\")'"
@@ -2241,7 +2245,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
         selftest_config["canonical_checks"]["npm-lock"] = (
             "python3 -c 'print(\"PLANNED_\" + \"NPM_LOCK_STREAM\")'"
         )
-        legacy.load_config = lambda: copy.deepcopy(selftest_config)
+        runtime.load_config = lambda: copy.deepcopy(selftest_config)
         os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
         os.environ[
             "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
@@ -2255,9 +2259,9 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 )
             state = harness_cli.load_v2_state(task_dir)
             attempt_dir = task_dir / "attempts" / str(state["attempt_id"])
-            plan = legacy.load_json(attempt_dir / "plan.json")
+            plan = runtime.load_json(attempt_dir / "plan.json")
             probe_path = attempt_dir / "probes" / "ng-lint.json"
-            probe_record = legacy.load_json(probe_path)
+            probe_record = runtime.load_json(probe_path)
             probe_before = probe_path.read_bytes()
             probe_mtime_before = probe_path.stat().st_mtime_ns
             test.equal(
@@ -2267,7 +2271,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             )
             verifier.validate_probe_checkpoint(
                 probe_record,
-                verifier.canonical_check("ng-lint", legacy.load_config()),
+                verifier.canonical_check("ng-lint", runtime.load_config()),
                 plan,
                 task_dir,
                 allow_test_adapter=True,
@@ -2302,7 +2306,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 ["combined", "specialist"],
             )
             check_records = [
-                legacy.load_json(path)
+                runtime.load_json(path)
                 for path in sorted((attempt_dir / "checks").glob("*.json"))
             ]
             bound_prompt = verifier.combined_review_prompt(
@@ -2371,7 +2375,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 lambda: verifier.validate_probe_checkpoint(
                     provenance_free,
                     verifier.canonical_check(
-                        "ng-lint", legacy.load_config()
+                        "ng-lint", runtime.load_config()
                     ),
                     plan,
                     task_dir,
@@ -2386,7 +2390,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 lambda: verifier.validate_probe_checkpoint(
                     corrupt_stream,
                     verifier.canonical_check(
-                        "ng-lint", legacy.load_config()
+                        "ng-lint", runtime.load_config()
                     ),
                     plan,
                     task_dir,
@@ -2406,7 +2410,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 lambda: verifier.validate_probe_checkpoint(
                     forged_source,
                     verifier.canonical_check(
-                        "ng-lint", legacy.load_config()
+                        "ng-lint", runtime.load_config()
                     ),
                     plan,
                     task_dir,
@@ -2417,11 +2421,11 @@ def probe_precedence_flow_cases(test: Tests) -> None:
 
             legacy_probe_record = copy.deepcopy(probe_record)
             legacy_probe_record.pop("execution_number")
-            legacy.atomic_write_json(probe_path, legacy_probe_record)
+            runtime.atomic_write_json(probe_path, legacy_probe_record)
             verifier.validate_probe_checkpoint(
                 legacy_probe_record,
                 verifier.canonical_check(
-                    "ng-lint", legacy.load_config()
+                    "ng-lint", runtime.load_config()
                 ),
                 plan,
                 task_dir,
@@ -2460,7 +2464,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 evidence_only,
                 "NEEDS_EVIDENCE",
             )
-            refreshed_probe = legacy.load_json(probe_path)
+            refreshed_probe = runtime.load_json(probe_path)
             test.true(
                 "PROBE rephrased request reuses one diff-bound execution",
                 refreshed_probe["evidence"]["execution_id"]
@@ -2631,7 +2635,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 "PROBE fresh invalid request is durably checkpointed",
                 (
                     unrelated_review_path.is_file(),
-                    legacy.load_json(unrelated_review_path)["result"][
+                    runtime.load_json(unrelated_review_path)["result"][
                         "probe_requests"
                     ][0]["probe_id"],
                     unrelated_state["reason"],
@@ -2678,20 +2682,20 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 "worktree_path": str(package_worktree.resolve()),
                 "branch": package_branch,
                 "owned_paths": ["package.json", "package-lock.json"],
-                "created_at": legacy.utc_now(),
+                "created_at": runtime.utc_now(),
             }
             package_contract["contract_sha256"] = verifier.document_hash(
                 package_contract, "contract_sha256"
             )
-            legacy.validate_schema(
+            runtime.validate_schema(
                 package_contract,
-                legacy.load_schema("v2-task"),
+                runtime.load_schema("v2-task"),
                 label="v2 package probe precedence contract",
             )
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 package_task_dir / "task.json", package_contract
             )
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 package_task_dir / "runtime.json",
                 {
                     "schema_version": 2,
@@ -2708,10 +2712,10 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             package_manifest["version"] = "1.0.1"
             package_lock["version"] = "1.0.1"
             package_lock["packages"][""]["version"] = "1.0.1"
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 package_worktree / "package.json", package_manifest
             )
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 package_worktree / "package-lock.json", package_lock
             )
             with contextlib.redirect_stdout(io.StringIO()):
@@ -2726,7 +2730,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 / "attempts"
                 / str(package_state["attempt_id"])
             )
-            package_plan = legacy.load_json(
+            package_plan = runtime.load_json(
                 package_attempt / "plan.json"
             )
             test.equal(
@@ -2740,11 +2744,11 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     ["npm-lock", "ng-lint", "ng-build"],
                 ),
             )
-            npm_record = legacy.load_json(
+            npm_record = runtime.load_json(
                 package_attempt / "checks" / "npm-lock.json"
             )
             package_check_records = [
-                legacy.load_json(path)
+                runtime.load_json(path)
                 for path in sorted(
                     (package_attempt / "checks").glob("*.json")
                 )
@@ -2805,7 +2809,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 "PROBE package-only fresh invalid review remains auditable",
                 (
                     package_invalid_review.is_file(),
-                    legacy.load_json(package_invalid_review)["result"][
+                    runtime.load_json(package_invalid_review)["result"][
                         "probe_requests"
                     ][0]["probe_id"],
                     package_state["reason"],
@@ -2835,7 +2839,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             os.environ[
                 "MURMUR_HARNESS_FAKE_REVIEW_PROBE_RATIONALE"
             ] = "retryable probe must consume its bounded budget"
-            original_run_check = legacy.run_check
+            original_run_check = runtime.run_check
             retryable_probe_runs = 0
 
             def retryable_probe_run_check(
@@ -2867,7 +2871,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     }
                 return evidence
 
-            legacy.run_check = retryable_probe_run_check
+            runtime.run_check = retryable_probe_run_check
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     retryable_first = harness_cli.verify_task(
@@ -2884,7 +2888,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 retryable_projection = (
                     retryable_attempt / "probes" / "ng-lint.json"
                 )
-                rolled_back_projection = legacy.load_json(
+                rolled_back_projection = runtime.load_json(
                     retryable_projection
                 )
                 (
@@ -2907,7 +2911,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 # The append-only event must repair the projection and refuse
                 # a third process.
                 rolled_back_projection.pop("execution_number")
-                legacy.atomic_write_json(
+                runtime.atomic_write_json(
                     retryable_projection, rolled_back_projection
                 )
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -2916,11 +2920,11 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         task_dir,
                         allow_test_adapter=True,
                     )
-                numberless_latest = legacy.load_json(
+                numberless_latest = runtime.load_json(
                     retryable_projection
                 )
                 numberless_latest.pop("execution_number")
-                legacy.atomic_write_json(
+                runtime.atomic_write_json(
                     retryable_projection, numberless_latest
                 )
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -2930,14 +2934,14 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         allow_test_adapter=True,
                     )
             finally:
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             retryable_state = harness_cli.load_v2_state(task_dir)
             retryable_attempt = (
                 task_dir
                 / "attempts"
                 / str(retryable_state["attempt_id"])
             )
-            retryable_record = legacy.load_json(
+            retryable_record = runtime.load_json(
                 retryable_attempt / "probes" / "ng-lint.json"
             )
             retryable_events = []
@@ -2990,7 +2994,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 ),
             )
             retryable_projection.unlink()
-            legacy.run_check = retryable_probe_run_check
+            runtime.run_check = retryable_probe_run_check
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     retryable_without_projection = (
@@ -3001,14 +3005,14 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         )
                     )
             finally:
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             test.equal(
                 "PROBE deleting latest projection cannot lower event high-water",
                 (
                     retryable_without_projection,
                     retryable_probe_runs,
                     harness_cli.load_v2_state(task_dir)["status"],
-                    legacy.load_json(retryable_projection)[
+                    runtime.load_json(retryable_projection)[
                         "execution_number"
                     ],
                 ),
@@ -3044,7 +3048,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 )
                 if phase.endswith("-probe"):
                     post_probe_crashes += 1
-                    raise legacy.HarnessError(
+                    raise runtime.HarnessError(
                         "synthetic post-probe checkpoint crash"
                     )
                 return evidence
@@ -3057,7 +3061,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         allow_test_adapter=True,
                     )
 
-            legacy.run_check = crash_after_probe_run
+            runtime.run_check = crash_after_probe_run
             try:
                 test.raises(
                     "PROBE first post-process crash consumes reservation one",
@@ -3089,7 +3093,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         allow_test_adapter=True,
                     )
             finally:
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             crash_reservations = []
             for line in (task_dir / "events.jsonl").read_text(
                 encoding="utf-8"
@@ -3132,10 +3136,10 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 )
             )
             event_documents = full_event_documents[:truncate_at]
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "events.jsonl",
                 b"".join(
-                    legacy.canonical_json(event) + b"\n"
+                    runtime.canonical_json(event) + b"\n"
                     for event in event_documents
                 ),
             )
@@ -3149,10 +3153,10 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 post_probe_crashes,
                 2,
             )
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "events.jsonl",
                 b"".join(
-                    legacy.canonical_json(event) + b"\n"
+                    runtime.canonical_json(event) + b"\n"
                     for event in full_event_documents
                 ),
             )
@@ -3198,7 +3202,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     }
                 return evidence
 
-            legacy.run_check = deterministic_probe_failure
+            runtime.run_check = deterministic_probe_failure
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     deterministic_first = harness_cli.verify_task(
@@ -3207,7 +3211,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         allow_test_adapter=True,
                     )
             finally:
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID", None)
             with contextlib.redirect_stdout(io.StringIO()):
                 deterministic_resume = harness_cli.verify_task(
@@ -3281,16 +3285,16 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         "passed": True,
                     }
                 rewritten_events.append(event)
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "events.jsonl",
                 b"".join(
-                    legacy.canonical_json(event) + b"\n"
+                    runtime.canonical_json(event) + b"\n"
                     for event in rewritten_events
                 ),
             )
             if last_state_document is None:
                 raise AssertionError("missing state fixture")
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 task_dir / "state.json", last_state_document
             )
             unexpected_legacy_probe_runs = 0
@@ -3333,11 +3337,11 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 original_reserve_probe(*args, **kwargs)
                 migration_reservations += 1
                 if migration_reservations == 1:
-                    raise legacy.HarnessError(
+                    raise runtime.HarnessError(
                         "synthetic migration reservation crash"
                     )
 
-            legacy.run_check = count_unexpected_legacy_probe
+            runtime.run_check = count_unexpected_legacy_probe
             try:
                 harness_cli._reserve_probe_execution = (
                     crash_after_first_migration_reservation
@@ -3360,7 +3364,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 harness_cli._reserve_probe_execution = (
                     original_reserve_probe
                 )
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             test.equal(
                 "PROBE legacy migration resumes without a second process",
                 (
@@ -3371,13 +3375,13 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 ("NEEDS_EVIDENCE", 1, 0),
             )
 
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "events.jsonl", legacy_events_snapshot
             )
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "state.json", legacy_state_snapshot
             )
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 legacy_projection, legacy_projection_snapshot
             )
             ambiguous_events = [
@@ -3388,7 +3392,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             ]
             ambiguous_events.append(
                 {
-                    "at": legacy.utc_now(),
+                    "at": runtime.utc_now(),
                     "event": "probe-checkpoint",
                     "attempt_id": legacy_attempt,
                     "probe_id": "ng-lint",
@@ -3396,14 +3400,14 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     "passed": False,
                 }
             )
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "events.jsonl",
                 b"".join(
-                    legacy.canonical_json(event) + b"\n"
+                    runtime.canonical_json(event) + b"\n"
                     for event in ambiguous_events
                 ),
             )
-            legacy.run_check = count_unexpected_legacy_probe
+            runtime.run_check = count_unexpected_legacy_probe
             try:
                 test.raises(
                     "PROBE ambiguous multi-event legacy history fails closed",
@@ -3411,24 +3415,24 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     "multiple legacy probe events cannot be migrated safely",
                 )
             finally:
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             test.equal(
                 "PROBE failed legacy tail cannot be replaced by green projection",
                 unexpected_legacy_probe_runs,
                 0,
             )
 
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "events.jsonl", legacy_events_snapshot
             )
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 task_dir / "state.json", legacy_state_snapshot
             )
-            legacy.atomic_write_bytes(
+            runtime.atomic_write_bytes(
                 legacy_projection, legacy_projection_snapshot
             )
             legacy_projection.unlink()
-            legacy.run_check = count_unexpected_legacy_probe
+            runtime.run_check = count_unexpected_legacy_probe
             try:
                 test.raises(
                     "PROBE numberless event without projection fails closed",
@@ -3436,7 +3440,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     "legacy probe event has no recoverable projection",
                 )
             finally:
-                legacy.run_check = original_run_check
+                runtime.run_check = original_run_check
             test.equal(
                 "PROBE legacy missing projection never resets to slot zero",
                 (
@@ -3477,20 +3481,20 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 "contract_sha256": "",
                 "worktree_path": str(closure_worktree.resolve()),
                 "branch": closure_branch,
-                "created_at": legacy.utc_now(),
+                "created_at": runtime.utc_now(),
             }
             closure_contract["contract_sha256"] = verifier.document_hash(
                 closure_contract, "contract_sha256"
             )
-            legacy.validate_schema(
+            runtime.validate_schema(
                 closure_contract,
-                legacy.load_schema("v2-task"),
+                runtime.load_schema("v2-task"),
                 label="v2 probe closure contract",
             )
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 closure_task_dir / "task.json", closure_contract
             )
-            legacy.atomic_write_json(
+            runtime.atomic_write_json(
                 closure_task_dir / "runtime.json",
                 {
                     "schema_version": 2,
@@ -3534,7 +3538,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 / "attempts"
                 / str(closure_state["attempt_id"])
             )
-            closure_probe = legacy.load_json(
+            closure_probe = runtime.load_json(
                 closure_attempt / "probes" / "ng-lint.json"
             )
             source_result_path = Path(
@@ -3545,7 +3549,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 )
             )
             source_result_bytes = source_result_path.read_bytes()
-            source_result_sha256 = legacy.sha256_file(
+            source_result_sha256 = runtime.sha256_file(
                 source_result_path
             )
             os.environ.pop(
@@ -3560,7 +3564,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
             closure_final_state = harness_cli.load_v2_state(
                 closure_task_dir
             )
-            closure_final_review = legacy.load_json(
+            closure_final_review = runtime.load_json(
                 closure_attempt / "reviews" / "combined.json"
             )
             verified_closure = verifier.verify_v2_evidence(
@@ -3588,7 +3592,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 closure_final_review["result_path"]
                 != str(source_result_path)
                 and source_result_path.read_bytes() == source_result_bytes
-                and legacy.sha256_file(source_result_path)
+                and runtime.sha256_file(source_result_path)
                 == source_result_sha256
                 and closure_probe["request_contexts"][0][
                     "review_result_sha256"
@@ -3596,7 +3600,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 == source_result_sha256,
             )
         finally:
-            legacy.load_config = original_load_config
+            runtime.load_config = original_load_config
             if saved_verdict is None:
                 os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_VERDICT", None)
             else:
@@ -3686,9 +3690,9 @@ def retry_cases(test: Tests) -> None:
 
 def _wait_until_missing(pid: int, timeout_seconds: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
-    while legacy._pid_is_alive(pid) and time.monotonic() < deadline:
+    while runtime._pid_is_alive(pid) and time.monotonic() < deadline:
         time.sleep(0.05)
-    return not legacy._pid_is_alive(pid)
+    return not runtime._pid_is_alive(pid)
 
 
 def guardian_and_artifact_cases(test: Tests) -> None:
@@ -3713,7 +3717,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
             "exec('while not pid_path.exists() and "
             "time.monotonic()<deadline:\\n time.sleep(0.01)')"
         )
-        leaked = legacy.run_logged_process(
+        leaked = runtime.run_logged_process(
             [sys.executable, "-c", leader],
             cwd=root,
             timeout_seconds=5,
@@ -3764,8 +3768,8 @@ def guardian_and_artifact_cases(test: Tests) -> None:
         )
         driver = (
             "import pathlib,sys;"
-            "import task_runner;"
-            f"task_runner.run_logged_process([sys.executable,'-c',{parent_kill_managed!r}],"
+            "import runtime;"
+            f"runtime.run_logged_process([sys.executable,'-c',{parent_kill_managed!r}],"
             f"cwd=pathlib.Path({str(root)!r}),timeout_seconds=30,"
             f"log_path=pathlib.Path({str(root / 'parent-kill.log')!r}),"
             "term_grace_seconds=0.1)"
@@ -3818,7 +3822,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
                     len(guardian_results) == 1,
                 )
                 guardian_result = (
-                    legacy.load_json(guardian_results[0])
+                    runtime.load_json(guardian_results[0])
                     if len(guardian_results) == 1
                     else {}
                 )
@@ -3846,7 +3850,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
         # Reusing the same semantic label must allocate a fresh UUID namespace
         # and leave every byte of the prior execution untouched.
         log_base = root / "resume.log"
-        first_logged = legacy.run_logged_process(
+        first_logged = runtime.run_logged_process(
             [sys.executable, "-c", "print('first')"],
             cwd=root,
             timeout_seconds=5,
@@ -3856,7 +3860,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
             key: Path(str(first_logged[key])).read_bytes()
             for key in ("log", "guardian_path")
         }
-        second_logged = legacy.run_logged_process(
+        second_logged = runtime.run_logged_process(
             [sys.executable, "-c", "print('second')"],
             cwd=root,
             timeout_seconds=5,
@@ -3882,7 +3886,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
         )
         task_dir = common / "agent-harness" / "v2" / "tasks" / "artifacts"
         task_dir.mkdir(parents=True)
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(
             task_dir / "task.json",
             {"worktree_path": str(repo.resolve())},
         )
@@ -3896,7 +3900,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
             "import subprocess,sys;"
             f"subprocess.Popen([sys.executable,'-c',{background_child!r}])"
         )
-        background_check = legacy.run_check(
+        background_check = runtime.run_check(
             repo,
             task_dir,
             {
@@ -3919,7 +3923,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
             and not background_check["passed"]
             and background_check["outcome"] == "FAIL",
         )
-        first_check = legacy.run_check(repo, task_dir, declared, "v2-resume")
+        first_check = runtime.run_check(repo, task_dir, declared, "v2-resume")
         first_check_paths = [
             Path(str(first_check[key]))
             for key in (
@@ -3931,7 +3935,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
             )
         ]
         first_check_bytes = {path: path.read_bytes() for path in first_check_paths}
-        second_check = legacy.run_check(repo, task_dir, declared, "v2-resume")
+        second_check = runtime.run_check(repo, task_dir, declared, "v2-resume")
         second_check_paths = [
             Path(str(second_check[key]))
             for key in (
@@ -3961,7 +3965,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
         model_worktree = root / "model-worktree"
         model_worktree.mkdir()
         model_dir = root / "model-evidence"
-        first_model = legacy.invoke_model(
+        first_model = runtime.invoke_model(
             "fake",
             role="reviewer",
             prompt="selftest",
@@ -3977,7 +3981,7 @@ def guardian_and_artifact_cases(test: Tests) -> None:
             for key in ("result_path", "invocation_path", "log")
         ]
         first_model_bytes = {path: path.read_bytes() for path in first_model_paths}
-        second_model = legacy.invoke_model(
+        second_model = runtime.invoke_model(
             "fake",
             role="reviewer",
             prompt="selftest",
@@ -4047,7 +4051,7 @@ def readonly_review_wall_timeout_cases(test: Tests) -> None:
             "protocol_sha256": "3" * 64,
         }
         original_path = os.environ.get("PATH")
-        original_load_config = legacy.load_config
+        original_load_config = runtime.load_config
         base_config = original_load_config()
 
         def timeout_config() -> Dict[str, Any]:
@@ -4057,7 +4061,7 @@ def readonly_review_wall_timeout_cases(test: Tests) -> None:
                 "review_retry_max_delay_seconds": 0,
             }
 
-        legacy.load_config = timeout_config
+        runtime.load_config = timeout_config
         os.environ["PATH"] = str(fake_bin) + os.pathsep + (original_path or "")
         try:
             record = verifier.invoke_readonly_review(
@@ -4073,7 +4077,7 @@ def readonly_review_wall_timeout_cases(test: Tests) -> None:
                 sleep=lambda _delay: None,
             )
         finally:
-            legacy.load_config = original_load_config
+            runtime.load_config = original_load_config
             if original_path is None:
                 os.environ.pop("PATH", None)
             else:
@@ -4101,22 +4105,22 @@ def readonly_review_wall_timeout_cases(test: Tests) -> None:
             "import subprocess,sys;"
             f"subprocess.Popen([sys.executable,'-c',{background_child!r}])"
         )
-        background_process_result = legacy.run_logged_process(
+        background_process_result = runtime.run_logged_process(
             [sys.executable, "-c", background_leader],
             cwd=root,
             timeout_seconds=5,
             log_path=root / "model-background.log",
             term_grace_seconds=0.1,
         )
-        original_run_logged_process = legacy.run_logged_process
-        legacy.run_logged_process = (
+        original_run_logged_process = runtime.run_logged_process
+        runtime.run_logged_process = (
             lambda *_args, **_kwargs: dict(background_process_result)
         )
         os.environ["PATH"] = str(fake_bin) + os.pathsep + (original_path or "")
         try:
             test.raises(
                 "GUARDIAN model cannot accept structured PASS with background descendant",
-                lambda: legacy.invoke_model(
+                lambda: runtime.invoke_model(
                     "claude",
                     role="reviewer",
                     prompt="background lifecycle violation",
@@ -4130,7 +4134,7 @@ def readonly_review_wall_timeout_cases(test: Tests) -> None:
                 "failed",
             )
         finally:
-            legacy.run_logged_process = original_run_logged_process
+            runtime.run_logged_process = original_run_logged_process
             if original_path is None:
                 os.environ.pop("PATH", None)
             else:
@@ -4216,7 +4220,7 @@ def state_and_lock_cases(test: Tests) -> None:
         test.equal("STATE loader recovers OPEN from ledger", recovered["status"], "OPEN")
         test.equal(
             "STATE loader safely rebuilds projection",
-            legacy.load_json(task_dir / "state.json"),
+            runtime.load_json(task_dir / "state.json"),
             recovered,
         )
         stale_projection = {
@@ -4225,7 +4229,7 @@ def state_and_lock_cases(test: Tests) -> None:
             "updated_at": "2000-01-01T00:00:00Z",
         }
         stale_projection.pop("state_revision")
-        legacy.atomic_write_json(task_dir / "state.json", stale_projection)
+        runtime.atomic_write_json(task_dir / "state.json", stale_projection)
         test.equal(
             "STATE stale divergent projection is repaired from ledger",
             harness_cli.load_v2_state(task_dir),
@@ -4236,7 +4240,7 @@ def state_and_lock_cases(test: Tests) -> None:
             "updated_at": "2999-01-01T00:00:00Z",
             "state_revision": recovered["state_revision"] + 1,
         }
-        legacy.atomic_write_json(task_dir / "state.json", future_projection)
+        runtime.atomic_write_json(task_dir / "state.json", future_projection)
         test.raises(
             "STATE projection newer than ledger fails closed",
             lambda: harness_cli.load_v2_state(task_dir),
@@ -4246,7 +4250,7 @@ def state_and_lock_cases(test: Tests) -> None:
             **recovered,
             "status": "VERIFYING",
         }
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(
             task_dir / "state.json", same_revision_projection
         )
         test.raises(
@@ -4254,7 +4258,7 @@ def state_and_lock_cases(test: Tests) -> None:
             lambda: harness_cli.load_v2_state(task_dir),
             "same revision",
         )
-        legacy.atomic_write_json(task_dir / "state.json", recovered)
+        runtime.atomic_write_json(task_dir / "state.json", recovered)
 
         lock_dir = root / "lock-task"
         lock_dir.mkdir()
@@ -4314,8 +4318,8 @@ def standalone_driver_lane_cases(test: Tests) -> None:
             task_dir.mkdir(parents=True)
             task_dirs.append(task_dir)
         primary_task, driver_task = task_dirs
-        primary_root = legacy.shared_resource_root_for_task(primary_task)
-        driver_root = legacy.shared_resource_root_for_task(driver_task)
+        primary_root = runtime.shared_resource_root_for_task(primary_task)
+        driver_root = runtime.shared_resource_root_for_task(driver_task)
         test.equal(
             "LANE standalone driver and primary resolve one resource root",
             driver_root,
@@ -4331,15 +4335,15 @@ def standalone_driver_lane_cases(test: Tests) -> None:
         holder_code = (
             "import pathlib,sys,time;"
             f"sys.path.insert(0,{str(Path(__file__).resolve().parent)!r});"
-            "import task_runner;"
-            "lease=task_runner.acquire_cargo_lane("
+            "import runtime;"
+            "lease=runtime.acquire_cargo_lane("
             "pathlib.Path(sys.argv[1]),2,command='standalone-driver-holder');"
             "print('ready',flush=True);"
             "marker=pathlib.Path(sys.argv[2]);deadline=time.monotonic()+10;"
             "\nwhile not marker.exists() and time.monotonic()<deadline:"
             "\n time.sleep(0.01)"
             "\n"
-            "task_runner.release_cargo_lane(lease)"
+            "runtime.release_cargo_lane(lease)"
         )
         holder = subprocess.Popen(
             [
@@ -4389,9 +4393,9 @@ def standalone_driver_lane_cases(test: Tests) -> None:
                 list(
                     (
                         driver_root
-                        / legacy.resource_lane.QUEUE_DIRECTORY
+                        / runtime.resource_lane.QUEUE_DIRECTORY
                     ).glob(
-                        f"*{legacy.resource_lane.TICKET_SUFFIX}"
+                        f"*{runtime.resource_lane.TICKET_SUFFIX}"
                     )
                 ),
                 [],
@@ -4440,11 +4444,11 @@ def fifo_lane_cases(test: Tests) -> None:
             )
             task_dir.mkdir(parents=True)
             task_dirs[label] = task_dir
-        resource_root = legacy.shared_resource_root_for_task(
+        resource_root = runtime.shared_resource_root_for_task(
             task_dirs["holder"]
         )
         queue_root = (
-            resource_root / legacy.resource_lane.QUEUE_DIRECTORY
+            resource_root / runtime.resource_lane.QUEUE_DIRECTORY
         )
         runner = ROOT / "scripts" / "agent-resource-run"
         library = str(Path(__file__).resolve().parent)
@@ -4452,24 +4456,24 @@ def fifo_lane_cases(test: Tests) -> None:
         holder_code = (
             "import pathlib,sys,time;"
             f"sys.path.insert(0,{library!r});"
-            "import task_runner;"
-            "lease=task_runner.acquire_cargo_lane("
+            "import runtime;"
+            "lease=runtime.acquire_cargo_lane("
             "pathlib.Path(sys.argv[1]),5,command='fifo-holder');"
             "print('ready',flush=True);"
             "marker=pathlib.Path(sys.argv[2]);deadline=time.monotonic()+10;"
             "\nwhile not marker.exists() and time.monotonic()<deadline:"
             "\n time.sleep(0.01)"
-            "\ntask_runner.release_cargo_lane(lease)"
+            "\nruntime.release_cargo_lane(lease)"
         )
         task_waiter_code = (
             "import os,pathlib,sys,time;"
             f"sys.path.insert(0,{library!r});"
-            "import task_runner;"
-            "lease=task_runner.acquire_cargo_lane("
+            "import runtime;"
+            "lease=runtime.acquire_cargo_lane("
             "pathlib.Path(sys.argv[1]),5,command='fifo-'+sys.argv[3]);"
             "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600);"
             "os.write(fd,(sys.argv[3]+'\\n').encode());os.close(fd);"
-            "time.sleep(0.05);task_runner.release_cargo_lane(lease)"
+            "time.sleep(0.05);runtime.release_cargo_lane(lease)"
         )
         append_code = (
             "import os,sys,time;"
@@ -4484,7 +4488,7 @@ def fifo_lane_cases(test: Tests) -> None:
             return len(
                 list(
                     queue_root.glob(
-                        f"*{legacy.resource_lane.TICKET_SUFFIX}"
+                        f"*{runtime.resource_lane.TICKET_SUFFIX}"
                     )
                 )
             )
@@ -4615,10 +4619,10 @@ def fifo_lane_cases(test: Tests) -> None:
         stale_code = (
             "import pathlib,sys,time;"
             f"sys.path.insert(0,{library!r});"
-            "import task_runner;"
-            "root=task_runner.shared_resource_root_for_task("
+            "import runtime;"
+            "root=runtime.shared_resource_root_for_task("
             "pathlib.Path(sys.argv[1]));"
-            "ticket=task_runner.resource_lane.join_lane_queue("
+            "ticket=runtime.resource_lane.join_lane_queue("
             "root,task='stale',command='killed-waiter');"
             "print('queued',flush=True);"
             "\nwhile True:\n time.sleep(1)"
@@ -4712,7 +4716,7 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
             / "sherpa-test"
             / "meetnotes"
         )
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(
             task_dir / "task.json",
             {
                 "task_id": "sherpa-test",
@@ -4722,7 +4726,7 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
 
         fixture = b"checksum-pinned-sherpa-fixture\n"
         fixture_sha = hashlib.sha256(fixture).hexdigest()
-        machine = legacy.platform.machine().lower()
+        machine = runtime.platform.machine().lower()
         architecture = {
             "aarch64": "arm64",
             "arm64": "arm64",
@@ -4733,7 +4737,7 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
         legacy_directory.mkdir(parents=True)
         legacy_candidate = legacy_directory / filename
         legacy_candidate.write_bytes(fixture)
-        config = copy.deepcopy(legacy.load_config())
+        config = copy.deepcopy(runtime.load_config())
         config["shared_artifacts"]["sherpa_onnx"] = {
             "directory": "target/sherpa-onnx-prebuilt",
             "archives": {
@@ -4743,10 +4747,10 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
                 }
             },
         }
-        original_load_config = legacy.load_config
+        original_load_config = runtime.load_config
         try:
-            legacy.load_config = lambda: copy.deepcopy(config)
-            resolved, actual_sha = legacy.verified_sherpa_archive(
+            runtime.load_config = lambda: copy.deepcopy(config)
+            resolved, actual_sha = runtime.verified_sherpa_archive(
                 snapshot,
                 task_dir=task_dir,
             )
@@ -4785,7 +4789,7 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
             shared_candidate.write_bytes(b"corrupt\n")
             test.raises(
                 "SHERPA corrupt shared cache fails closed despite valid legacy source",
-                lambda: legacy.verified_sherpa_archive(
+                lambda: runtime.verified_sherpa_archive(
                     snapshot,
                     task_dir=task_dir,
                 ),
@@ -4795,7 +4799,7 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
             shared_candidate.symlink_to(legacy_candidate)
             test.raises(
                 "SHERPA symlinked shared archive fails closed",
-                lambda: legacy.verified_sherpa_archive(
+                lambda: runtime.verified_sherpa_archive(
                     snapshot,
                     task_dir=task_dir,
                 ),
@@ -4806,7 +4810,7 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
             shared_directory.symlink_to(legacy_directory, target_is_directory=True)
             test.raises(
                 "SHERPA symlinked shared cache directory fails closed",
-                lambda: legacy.verified_sherpa_archive(
+                lambda: runtime.verified_sherpa_archive(
                     snapshot,
                     task_dir=task_dir,
                 ),
@@ -4825,14 +4829,14 @@ def sherpa_workspace_cache_cases(test: Tests) -> None:
             snapshot_candidate.write_bytes(fixture)
             test.raises(
                 "SHERPA never promotes a manually seeded verification snapshot",
-                lambda: legacy.verified_sherpa_archive(
+                lambda: runtime.verified_sherpa_archive(
                     snapshot,
                     task_dir=task_dir,
                 ),
                 "workspace shared cache",
             )
         finally:
-            legacy.load_config = original_load_config
+            runtime.load_config = original_load_config
 
 
 def verification_snapshot_cases(test: Tests) -> None:
@@ -4878,14 +4882,14 @@ def verification_snapshot_cases(test: Tests) -> None:
             "expected_change": True,
             "created_at": "2026-01-01T00:00:00Z",
         }
-        legacy.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(task_dir / "task.json", contract)
         paths, diff, tree = verifier.snapshot_scoped_diff(
             worktree, contract, task_dir
         )
         plan = {
             "base_sha": base,
             "changed_paths": paths,
-            "diff_sha256": legacy.sha256_bytes(diff),
+            "diff_sha256": runtime.sha256_bytes(diff),
             "tree_sha": tree,
             "plan_sha256": "d" * 64,
         }
@@ -4932,7 +4936,7 @@ def verification_snapshot_cases(test: Tests) -> None:
             (
                 _git(resumed_snapshot, "rev-parse", "HEAD"),
                 resumed_paths,
-                legacy.sha256_bytes(resumed_diff),
+                runtime.sha256_bytes(resumed_diff),
                 resumed_tree,
             ),
             (
@@ -4944,7 +4948,7 @@ def verification_snapshot_cases(test: Tests) -> None:
         )
 
         base_tree = _git(primary, "rev-parse", f"{base}^{{tree}}")
-        evidence = legacy.run_check(
+        evidence = runtime.run_check(
             resumed_snapshot,
             task_dir,
             {
@@ -4959,7 +4963,7 @@ def verification_snapshot_cases(test: Tests) -> None:
         )
         expected_sandbox_mode = (
             "inherited"
-            if legacy.inherited_outer_sandbox_is_active()
+            if runtime.inherited_outer_sandbox_is_active()
             else "direct"
         )
         test.equal(
@@ -5040,14 +5044,14 @@ def snapshot_node_modules_manifest_cases(test: Tests) -> None:
             "expected_change": True,
             "created_at": "2026-01-01T00:00:00Z",
         }
-        legacy.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(task_dir / "task.json", contract)
         paths, diff, tree = verifier.snapshot_scoped_diff(
             worktree, contract, task_dir
         )
         plan = {
             "base_sha": base,
             "changed_paths": paths,
-            "diff_sha256": legacy.sha256_bytes(diff),
+            "diff_sha256": runtime.sha256_bytes(diff),
             "tree_sha": tree,
             "plan_sha256": "d" * 64,
         }
@@ -5070,7 +5074,7 @@ def snapshot_node_modules_manifest_cases(test: Tests) -> None:
                 "assert json.loads(lock.read_text())['lockfileVersion']==3"
             )
         )
-        evidence = legacy.run_check(
+        evidence = runtime.run_check(
             snapshot,
             task_dir,
             {
@@ -5082,7 +5086,7 @@ def snapshot_node_modules_manifest_cases(test: Tests) -> None:
         )
         expected_sandbox_mode = (
             "inherited"
-            if legacy.inherited_outer_sandbox_is_active()
+            if runtime.inherited_outer_sandbox_is_active()
             else "direct"
         )
         test.equal(
@@ -5110,7 +5114,7 @@ def snapshot_node_modules_manifest_cases(test: Tests) -> None:
         physical_manifest.symlink_to(physical_lock.name)
         test.raises(
             "SNAPSHOT rejects a symlinked physical owner manifest",
-            lambda: legacy.run_check(
+            lambda: runtime.run_check(
                 snapshot,
                 task_dir,
                 {
@@ -5145,11 +5149,11 @@ def checkpoint_cases(test: Tests) -> None:
             "owned_paths": ["owned.txt"],
             "expected_change": True,
         }
-        legacy.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(task_dir / "task.json", contract)
         paths, diff, tree = verifier.snapshot_scoped_diff(repo, contract, task_dir)
         plan = {
             "changed_paths": paths,
-            "diff_sha256": legacy.sha256_bytes(diff),
+            "diff_sha256": runtime.sha256_bytes(diff),
             "tree_sha": tree,
             "plan_sha256": "1" * 64,
             "protocol_sha256": "2" * 64,
@@ -5159,9 +5163,9 @@ def checkpoint_cases(test: Tests) -> None:
             "command": "test -f owned.txt",
             "timeout_seconds": 10,
         }
-        legacy.atomic_write_json(task_dir / "selftest-contract.json", contract)
-        legacy.atomic_write_json(task_dir / "selftest-plan.json", plan)
-        legacy.atomic_write_json(task_dir / "selftest-check.json", declared)
+        runtime.atomic_write_json(task_dir / "selftest-contract.json", contract)
+        runtime.atomic_write_json(task_dir / "selftest-plan.json", plan)
+        runtime.atomic_write_json(task_dir / "selftest-check.json", declared)
         code = (
             "import json,pathlib,sys;"
             f"sys.path.insert(0,{str(Path(__file__).resolve().parent)!r});"
@@ -5217,11 +5221,11 @@ def checkpoint_cases(test: Tests) -> None:
             before_mtime,
         )
 
-        retryable = legacy.load_json(record_path)
+        retryable = runtime.load_json(record_path)
         retryable["evidence"]["passed"] = False
         retryable["evidence"]["outcome"] = "BLOCKED"
         retryable["evidence"]["timed_out"] = True
-        legacy.atomic_write_json(record_path, retryable)
+        runtime.atomic_write_json(record_path, retryable)
         record, did_run = harness_cli._run_or_resume_check(
             contract,
             task_dir,
@@ -5241,8 +5245,8 @@ def checkpoint_cases(test: Tests) -> None:
         lane_code = (
             "import pathlib,sys,time;"
             f"sys.path.insert(0,{str(Path(__file__).resolve().parent)!r});"
-            "import task_runner;"
-            "lock=task_runner.acquire_cargo_lane("
+            "import runtime;"
+            "lock=runtime.acquire_cargo_lane("
             "pathlib.Path(sys.argv[1]),2,command='lane-holder');"
             "print('ready',flush=True);"
             "marker=pathlib.Path(sys.argv[2]);deadline=time.monotonic()+10;"
@@ -5251,7 +5255,7 @@ def checkpoint_cases(test: Tests) -> None:
             "\nif marker.exists():"
             "\n time.sleep(0.05)"
             "\n"
-            "task_runner.release_cargo_lane(lock)"
+            "runtime.release_cargo_lane(lock)"
         )
         holder = subprocess.Popen(
             [
@@ -5279,7 +5283,7 @@ def checkpoint_cases(test: Tests) -> None:
 
             wait_stderr = ReleaseOnVisibleWait()
             with contextlib.redirect_stderr(wait_stderr):
-                waited = legacy.run_check(
+                waited = runtime.run_check(
                     repo,
                     task_dir,
                     {
@@ -5364,13 +5368,13 @@ def protocol_and_runtime_cases(test: Tests) -> None:
             "cli_version": "2.1.214",
             "invocation_id": "invocation-real",
             "argv": ["/usr/local/bin/claude", "--print"],
-            "cwd": str(legacy.reviewer_execution_cwd()),
+            "cwd": str(runtime.reviewer_execution_cwd()),
             "wall_timeout_seconds": 30,
             "removed_env_names": [],
-            "created_at": legacy.utc_now(),
+            "created_at": runtime.utc_now(),
         }
-        legacy.atomic_write_json(invocation_path, invocation)
-        legacy.verify_model_invocation(
+        runtime.atomic_write_json(invocation_path, invocation)
+        runtime.verify_model_invocation(
             evidence_root,
             vendor="claude",
             role="reviewer",
@@ -5379,16 +5383,16 @@ def protocol_and_runtime_cases(test: Tests) -> None:
             model="claude-test",
             cli_version="2.1.214",
             invocation_path_raw=str(invocation_path),
-            invocation_sha256=legacy.sha256_file(invocation_path),
+            invocation_sha256=runtime.sha256_file(invocation_path),
             expected_path=invocation_path,
             instructions_sha256="a" * 64,
             require_cwd_binding=True,
         )
         tampered = {**invocation, "role": "writer"}
-        legacy.atomic_write_json(invocation_path, tampered)
+        runtime.atomic_write_json(invocation_path, tampered)
         test.raises(
             "PROVENANCE forged reviewer invocation role is rejected",
-            lambda: legacy.verify_model_invocation(
+            lambda: runtime.verify_model_invocation(
                 evidence_root,
                 vendor="claude",
                 role="reviewer",
@@ -5397,7 +5401,7 @@ def protocol_and_runtime_cases(test: Tests) -> None:
                 model="claude-test",
                 cli_version="2.1.214",
                 invocation_path_raw=str(invocation_path),
-                invocation_sha256=legacy.sha256_file(invocation_path),
+                invocation_sha256=runtime.sha256_file(invocation_path),
                 expected_path=invocation_path,
                 instructions_sha256="a" * 64,
                 require_cwd_binding=True,
@@ -5405,10 +5409,10 @@ def protocol_and_runtime_cases(test: Tests) -> None:
             "role",
         )
         tampered_cwd = {**invocation, "cwd": str(evidence_root.resolve())}
-        legacy.atomic_write_json(invocation_path, tampered_cwd)
+        runtime.atomic_write_json(invocation_path, tampered_cwd)
         test.raises(
             "PROVENANCE reviewer invocation outside isolated cwd is rejected",
-            lambda: legacy.verify_model_invocation(
+            lambda: runtime.verify_model_invocation(
                 evidence_root,
                 vendor="claude",
                 role="reviewer",
@@ -5417,7 +5421,7 @@ def protocol_and_runtime_cases(test: Tests) -> None:
                 model="claude-test",
                 cli_version="2.1.214",
                 invocation_path_raw=str(invocation_path),
-                invocation_sha256=legacy.sha256_file(invocation_path),
+                invocation_sha256=runtime.sha256_file(invocation_path),
                 expected_path=invocation_path,
                 instructions_sha256="a" * 64,
                 require_cwd_binding=True,
@@ -5438,7 +5442,7 @@ def protocol_and_runtime_cases(test: Tests) -> None:
         )
         test.equal(
             "PROVENANCE real log exposes session mismatch",
-            legacy.extract_model_metadata(
+            runtime.extract_model_metadata(
                 log_path, "claude", "session-real"
             )["session_id"],
             "session-from-another-run",
@@ -5540,19 +5544,18 @@ def commit_recovery_cases(test: Tests) -> None:
             "claims": [],
             "reviewer": "fake",
             "expected_change": True,
-            "degraded_provenance": [{"event": "timeout"}],
-            "created_at": legacy.utc_now(),
+            "created_at": runtime.utc_now(),
         }
         contract["contract_sha256"] = verifier.document_hash(
             contract, "contract_sha256"
         )
-        legacy.validate_schema(
+        runtime.validate_schema(
             contract,
-            legacy.load_schema("v2-task"),
+            runtime.load_schema("v2-task"),
             label="v2 commit crash contract",
         )
-        legacy.atomic_write_json(task_dir / "task.json", contract)
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(
             task_dir / "runtime.json",
             {
                 "schema_version": 2,
@@ -5610,22 +5613,7 @@ def commit_recovery_cases(test: Tests) -> None:
             )
             return
         evidence_path = Path(str(passed_state["evidence_path"]))
-        original_evidence = legacy.load_json(evidence_path)
-        laundered = copy.deepcopy(original_evidence)
-        laundered["degraded_provenance"] = []
-        laundered["evidence_sha256"] = verifier.document_hash(
-            laundered, "evidence_sha256"
-        )
-        legacy.atomic_write_json(evidence_path, laundered)
-        test.raises(
-            "EVIDENCE degraded provenance cannot be laundered",
-            lambda: verifier.verify_v2_evidence(
-                contract, task_dir, allow_test_adapter=True
-            ),
-            "degraded_provenance is stale",
-        )
-        legacy.atomic_write_json(evidence_path, original_evidence)
-
+        original_evidence = runtime.load_json(evidence_path)
         forged_summary = copy.deepcopy(original_evidence)
         forged_summary["findings"].append(
             {
@@ -5639,7 +5627,7 @@ def commit_recovery_cases(test: Tests) -> None:
         forged_summary["evidence_sha256"] = verifier.document_hash(
             forged_summary, "evidence_sha256"
         )
-        legacy.atomic_write_json(evidence_path, forged_summary)
+        runtime.atomic_write_json(evidence_path, forged_summary)
         test.raises(
             "EVIDENCE rehashed top-level findings cannot diverge from review records",
             lambda: verifier.verify_v2_evidence(
@@ -5647,7 +5635,7 @@ def commit_recovery_cases(test: Tests) -> None:
             ),
             "findings differs from its bound review records",
         )
-        legacy.atomic_write_json(evidence_path, original_evidence)
+        runtime.atomic_write_json(evidence_path, original_evidence)
 
         forged_probe_summary = copy.deepcopy(original_evidence)
         forged_probe_summary["probe_requests"].append(
@@ -5660,7 +5648,7 @@ def commit_recovery_cases(test: Tests) -> None:
         forged_probe_summary["evidence_sha256"] = verifier.document_hash(
             forged_probe_summary, "evidence_sha256"
         )
-        legacy.atomic_write_json(evidence_path, forged_probe_summary)
+        runtime.atomic_write_json(evidence_path, forged_probe_summary)
         test.raises(
             "EVIDENCE rehashed top-level probe requests cannot diverge from review records",
             lambda: verifier.verify_v2_evidence(
@@ -5668,11 +5656,11 @@ def commit_recovery_cases(test: Tests) -> None:
             ),
             "probe_requests differs from its bound review records",
         )
-        legacy.atomic_write_json(evidence_path, original_evidence)
+        runtime.atomic_write_json(evidence_path, original_evidence)
 
         original_review = original_evidence["reviews"][0]
         original_result_path = Path(str(original_review["result_path"]))
-        original_review_result = legacy.load_json(original_result_path)
+        original_review_result = runtime.load_json(original_result_path)
         for severity in ("MAJOR", "BLOCKER"):
             severe_result = copy.deepcopy(original_review_result)
             severe_result["findings"] = [
@@ -5683,12 +5671,12 @@ def commit_recovery_cases(test: Tests) -> None:
                     "required_fix": "reject the v2 PASS",
                 }
             ]
-            legacy.atomic_write_json(original_result_path, severe_result)
+            runtime.atomic_write_json(original_result_path, severe_result)
             severe_evidence = copy.deepcopy(original_evidence)
             severe_evidence["reviews"][0]["result"] = severe_result
             severe_evidence["reviews"][0][
                 "result_sha256"
-            ] = legacy.sha256_file(original_result_path)
+            ] = runtime.sha256_file(original_result_path)
             outcomes = verifier.aggregate_review_outcomes(
                 severe_evidence["reviews"]
             )
@@ -5696,7 +5684,7 @@ def commit_recovery_cases(test: Tests) -> None:
             severe_evidence["evidence_sha256"] = verifier.document_hash(
                 severe_evidence, "evidence_sha256"
             )
-            legacy.atomic_write_json(evidence_path, severe_evidence)
+            runtime.atomic_write_json(evidence_path, severe_evidence)
             test.raises(
                 f"EVIDENCE bound {severity} review cannot verify PASS",
                 lambda: verifier.verify_v2_evidence(
@@ -5713,19 +5701,19 @@ def commit_recovery_cases(test: Tests) -> None:
                 "how_to_prove": "run an allowlisted probe",
             }
         ]
-        legacy.atomic_write_json(original_result_path, gap_result)
+        runtime.atomic_write_json(original_result_path, gap_result)
         gap_evidence = copy.deepcopy(original_evidence)
         gap_evidence["reviews"][0]["result"] = gap_result
         gap_evidence["reviews"][0][
             "result_sha256"
-        ] = legacy.sha256_file(original_result_path)
+        ] = runtime.sha256_file(original_result_path)
         gap_evidence.update(
             verifier.aggregate_review_outcomes(gap_evidence["reviews"])
         )
         gap_evidence["evidence_sha256"] = verifier.document_hash(
             gap_evidence, "evidence_sha256"
         )
-        legacy.atomic_write_json(evidence_path, gap_evidence)
+        runtime.atomic_write_json(evidence_path, gap_evidence)
         test.raises(
             "EVIDENCE bound proof gap cannot verify PASS",
             lambda: verifier.verify_v2_evidence(
@@ -5741,19 +5729,19 @@ def commit_recovery_cases(test: Tests) -> None:
                 "rationale": "bound empirical proof is still required",
             }
         ]
-        legacy.atomic_write_json(original_result_path, probe_result)
+        runtime.atomic_write_json(original_result_path, probe_result)
         probe_evidence = copy.deepcopy(original_evidence)
         probe_evidence["reviews"][0]["result"] = probe_result
         probe_evidence["reviews"][0][
             "result_sha256"
-        ] = legacy.sha256_file(original_result_path)
+        ] = runtime.sha256_file(original_result_path)
         probe_evidence.update(
             verifier.aggregate_review_outcomes(probe_evidence["reviews"])
         )
         probe_evidence["evidence_sha256"] = verifier.document_hash(
             probe_evidence, "evidence_sha256"
         )
-        legacy.atomic_write_json(evidence_path, probe_evidence)
+        runtime.atomic_write_json(evidence_path, probe_evidence)
         test.raises(
             "EVIDENCE bound probe request cannot verify PASS",
             lambda: verifier.verify_v2_evidence(
@@ -5761,10 +5749,10 @@ def commit_recovery_cases(test: Tests) -> None:
             ),
             "unresolved proof gaps",
         )
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(
             original_result_path, original_review_result
         )
-        legacy.atomic_write_json(evidence_path, original_evidence)
+        runtime.atomic_write_json(evidence_path, original_evidence)
 
         message = "selftest crash-resumable commit"
         child_code = (
@@ -5951,8 +5939,8 @@ def commit_recovery_cases(test: Tests) -> None:
                 (
                     "import pathlib,sys;"
                     f"sys.path.insert(0,{fixture_python!r});"
-                    "import task_runner as legacy,verifier;"
-                    f"doc=legacy.load_json(pathlib.Path({str(task_dir / 'task.json')!r}));"
+                    "import runtime,verifier;"
+                    f"doc=runtime.load_json(pathlib.Path({str(task_dir / 'task.json')!r}));"
                     "verifier.validate_hashed_document("
                     "doc,'v2-task','contract_sha256','fresh task')"
                 ),
@@ -5975,9 +5963,9 @@ def commit_recovery_cases(test: Tests) -> None:
                 (
                     "import pathlib,sys;"
                     f"sys.path.insert(0,{fixture_python!r});"
-                    "import cli,task_runner as legacy;"
+                    "import cli,runtime;"
                     f"task=pathlib.Path({str(task_dir)!r});"
-                    "contract=legacy.load_json(task/'task.json');"
+                    "contract=runtime.load_json(task/'task.json');"
                     "receipt=cli.verify_v2_committed("
                     "contract,task,allow_test_adapter=True);"
                     "print(receipt['commit_sha'])"
@@ -6041,225 +6029,9 @@ def commit_recovery_cases(test: Tests) -> None:
         )
 
 
-def _v1_contract(
-    *,
-    task_id: str,
-    repo: Path,
-    common: Path,
-    worktree: Path,
-    base: str,
-    branch: str,
-) -> Dict[str, Any]:
-    contract: Dict[str, Any] = {
-        "schema_version": 1,
-        "task_id": task_id,
-        "description": "v1 import selftest",
-        "kind": "harness",
-        "base_sha": base,
-        "contract_sha256": "",
-        "instructions_sha256": "0" * 64,
-        "dependency_revisions": {},
-        "repo_realpath": str(repo.resolve()),
-        "git_common_dir": str(common.resolve()),
-        "worktree_path": str(worktree.resolve()),
-        "branch": branch,
-        "owned_paths": ["owned.txt"],
-        "risk_flags": [],
-        "writer": "fake",
-        "reviewer": "fake",
-        "max_repair_rounds": 2,
-        "checks": [],
-        "final_checks": [],
-        "expected_change": True,
-        "created_at": legacy.utc_now(),
-    }
-    contract["contract_sha256"] = legacy.contract_hash(contract)
-    legacy.validate_schema(
-        contract, legacy.load_schema("task"), label="v1 import selftest task"
-    )
-    return contract
-
-
-def import_cases(test: Tests) -> None:
-    with tempfile.TemporaryDirectory(prefix="murmur-v2-import-") as raw:
-        root = Path(raw)
-        repo = root / "repo"
-        base = _init_repo(repo)
-        common = Path(
-            _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        )
-        task_id = "legacy-ghost"
-        branch = f"agent/{task_id}"
-        worktree = root / "task" / "meetnotes"
-        worktree.parent.mkdir()
-        _git(repo, "worktree", "add", "-q", "-b", branch, str(worktree), base)
-        (worktree / "owned.txt").write_text("base\nlegacy bytes\n", encoding="utf-8")
-        _git(worktree, "add", "owned.txt")
-        tree = _git(worktree, "write-tree")
-        snapshot = _git(
-            repo,
-            "-c",
-            "user.name=QueaT",
-            "-c",
-            "user.email=kgm004a@gmail.com",
-            "commit-tree",
-            tree,
-            "-p",
-            base,
-            "-m",
-            "legacy archive",
-        )
-        _git(worktree, "reset", "--quiet", "HEAD", "--", ".")
-        source_dir = common / "agent-harness" / "tasks" / task_id
-        source_dir.mkdir(parents=True)
-        contract = _v1_contract(
-            task_id=task_id,
-            repo=repo,
-            common=common,
-            worktree=worktree,
-            base=base,
-            branch=branch,
-        )
-        legacy.atomic_write_json(source_dir / "task.json", contract)
-        legacy.append_jsonl(
-            source_dir / "events.jsonl",
-            {
-                "at": legacy.utc_now(),
-                "event": "state",
-                "status": "INITIALIZED",
-                "round": 0,
-                "phase": "init",
-            },
-        )
-        archive_ref = legacy.task_archive_ref(contract)
-        _git(repo, "update-ref", archive_ref, snapshot)
-        legacy.atomic_write_json(
-            source_dir / "archive.json",
-            {
-                "schema_version": 1,
-                "task_id": task_id,
-                "archive_ref": archive_ref,
-                "snapshot_sha": snapshot,
-                "original_head_sha": base,
-                "tree_sha": tree,
-                "created_at": legacy.utc_now(),
-            },
-        )
-        _git(repo, "worktree", "remove", "--force", str(worktree))
-        source_before = harness_cli._directory_digest(source_dir)
-        args = argparse.Namespace(
-            task_id=task_id,
-            invalidate_pass=False,
-            claim=[],
-            reviewer="fake",
-            allow_same_vendor_high_risk=True,
-        )
-        previous_cwd = Path.cwd()
-        previous_selftest = os.environ.get("MURMUR_HARNESS_SELFTEST")
-        os.environ["MURMUR_HARNESS_SELFTEST"] = "1"
-        try:
-            os.chdir(repo)
-            with contextlib.redirect_stdout(io.StringIO()):
-                harness_cli.cmd_import_v1(args)
-            target_dir = harness_cli.v2_task_dir(common, task_id)
-            imported = legacy.load_json(target_dir / "imports" / "v1.json")
-            imported_contract = legacy.load_json(target_dir / "task.json")
-            test.equal(
-                "IMPORT binds an explicit same-vendor high-risk exception",
-                imported_contract["allow_same_vendor_high_risk"],
-                True,
-            )
-            tampered_import = dict(imported_contract)
-            tampered_import["allow_same_vendor_high_risk"] = False
-            test.true(
-                "IMPORT same-vendor policy is contract-hash-bound",
-                verifier.document_hash(tampered_import, "contract_sha256")
-                != imported_contract["contract_sha256"],
-            )
-            test.equal(
-                "IMPORT ghost state has no fabricated state hash",
-                imported["source_state_sha256"],
-                None,
-            )
-            test.equal(
-                "IMPORT reconstructs archived missing worktree",
-                harness_cli.load_v2_state(target_dir)["status"],
-                "OPEN",
-            )
-            test.equal(
-                "IMPORT reconstructed exact archived bytes",
-                (worktree / "owned.txt").read_text(encoding="utf-8"),
-                "base\nlegacy bytes\n",
-            )
-            test.equal(
-                "IMPORT v1 task directory is byte-identical",
-                harness_cli._directory_digest(source_dir),
-                source_before,
-            )
-            with contextlib.redirect_stdout(io.StringIO()):
-                harness_cli.cmd_import_v1(args)
-            test.equal(
-                "IMPORT repeat is idempotent and source remains byte-identical",
-                harness_cli._directory_digest(source_dir),
-                source_before,
-            )
-
-            missing_id = "legacy-missing"
-            missing_worktree = root / "missing" / "meetnotes"
-            missing_branch = f"agent/{missing_id}"
-            missing_dir = common / "agent-harness" / "tasks" / missing_id
-            missing_dir.mkdir(parents=True)
-            missing_contract = _v1_contract(
-                task_id=missing_id,
-                repo=repo,
-                common=common,
-                worktree=missing_worktree,
-                base=base,
-                branch=missing_branch,
-            )
-            legacy.atomic_write_json(missing_dir / "task.json", missing_contract)
-            legacy.append_jsonl(
-                missing_dir / "events.jsonl",
-                {
-                    "at": legacy.utc_now(),
-                    "event": "state",
-                    "status": "BLOCKED",
-                    "round": 1,
-                    "phase": "writer",
-                },
-            )
-            missing_before = harness_cli._directory_digest(missing_dir)
-            with contextlib.redirect_stdout(io.StringIO()):
-                harness_cli.cmd_import_v1(
-                    argparse.Namespace(
-                        task_id=missing_id,
-                        invalidate_pass=False,
-                        claim=[],
-                        reviewer="fake",
-                    )
-                )
-            missing_target = harness_cli.v2_task_dir(common, missing_id)
-            test.equal(
-                "IMPORT irrecoverable missing worktree is history-only",
-                harness_cli.load_v2_state(missing_target)["status"],
-                "NEEDS_EVIDENCE",
-            )
-            test.equal(
-                "IMPORT history-only path preserves all v1 bytes",
-                harness_cli._directory_digest(missing_dir),
-                missing_before,
-            )
-        finally:
-            os.chdir(previous_cwd)
-            if previous_selftest is None:
-                os.environ.pop("MURMUR_HARNESS_SELFTEST", None)
-            else:
-                os.environ["MURMUR_HARNESS_SELFTEST"] = previous_selftest
-
-
 def plan_and_probe_cases(test: Tests) -> None:
-    base = legacy.git(ROOT, "rev-parse", "HEAD")
-    tree = legacy.git(ROOT, "rev-parse", "HEAD^{tree}")
+    base = runtime.git(ROOT, "rev-parse", "HEAD")
+    tree = runtime.git(ROOT, "rev-parse", "HEAD^{tree}")
     contract = {
         "task_id": "plan-selftest",
         "contract_sha256": "a" * 64,
@@ -6273,7 +6045,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         ["src/app/features/detail/detail.ts"],
         b"angular diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     angular_again, _bundle = verifier.build_plan(
         contract,
@@ -6281,7 +6053,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         ["src/app/features/detail/detail.ts"],
         b"angular diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     legacy_sensitive, _bundle = verifier.build_plan(
         contract,
@@ -6289,7 +6061,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         ["src-tauri/src/storage/meeting_store.rs"],
         b"legacy sensitive diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     test.equal(
         "PLAN contract without same-vendor field retains cross-vendor semantics",
@@ -6312,7 +6084,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         ["src-tauri/src/lib.rs"],
         b"rust diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     test.equal(
         "PLAN Rust diff lazily requires sibling server",
@@ -6325,7 +6097,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         ["src/app/features/detail/detail.ts"],
         b"changed angular diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     test.true(
         "PLAN changed diff invalidates attempt binding",
@@ -6338,7 +6110,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         ["package.json", "package-lock.json"],
         b"package diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     test.equal(
         "PROBE package plan exposes only its own canonical checks",
@@ -6356,7 +6128,7 @@ def plan_and_probe_cases(test: Tests) -> None:
         [".agents/harness/cli.py"],
         b"harness diff",
         tree,
-        legacy.load_config(),
+        runtime.load_config(),
     )
     test.true(
         "PROBE harness plan contextually permits config-audit",
@@ -6365,7 +6137,7 @@ def plan_and_probe_cases(test: Tests) -> None:
 
     test.raises(
         "PROBE broker rejects arbitrary shell ids",
-        lambda: verifier.canonical_check("sh -c arbitrary", legacy.load_config()),
+        lambda: verifier.canonical_check("sh -c arbitrary", runtime.load_config()),
         "not allowlisted",
     )
     request = {
@@ -6426,14 +6198,13 @@ def clean_cases(test: Tests) -> None:
             "claims": [],
             "reviewer": "fake",
             "expected_change": True,
-            "degraded_provenance": [],
-            "created_at": legacy.utc_now(),
+            "created_at": runtime.utc_now(),
         }
         contract["contract_sha256"] = verifier.document_hash(
             contract, "contract_sha256"
         )
-        legacy.atomic_write_json(task_dir / "task.json", contract)
-        legacy.atomic_write_json(
+        runtime.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(
             task_dir / "runtime.json",
             {
                 "schema_version": 2,
@@ -6889,7 +6660,6 @@ def main() -> int:
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
-    import_cases(test)
     plan_and_probe_cases(test)
     clean_cases(test)
     lock_review_scope_prompt_cases(test)

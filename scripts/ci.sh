@@ -83,8 +83,8 @@ rust_gate() {
   unset GH_TOKEN GITHUB_TOKEN
 
   # ── Development-agent control plane: fail before paying for any product build. The audit checks
-  #    both Claude and Codex wiring/config parity; the selftest proves lifecycle, isolation, scope,
-  #    stale-attestation rejection and the known hook bypasses with fake agents only. ──
+  #    both Claude and Codex reviewer wiring/config parity; the selftest proves lifecycle,
+  #    isolation, scope, stale-receipt rejection, fault recovery, and known hook bypasses. ──
   echo "── development agent config audit ──"
   scripts/agent-config-audit --ci
 
@@ -93,9 +93,6 @@ rust_gate() {
 
   echo "── development agent harness: deterministic self-test ──"
   scripts/agent-harness selftest --ci
-
-  echo "── development agent eval harness: deterministic self-test ──"
-  scripts/agent-harness eval selftest
 
   # ── User-facing vocabulary. WARN mode: it reports, and it FAILS only on a REGRESSION
   #    above the recorded baseline. The baseline may shrink and never grow, so copy debt

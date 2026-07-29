@@ -11,7 +11,7 @@ Your final message **is** the deliverable: exactly what you changed, what you ra
 
 ## The CI model (internalize this first)
 
-- **`scripts/ci.sh` is the SINGLE SOURCE OF TRUTH** for what "green" means. It runs, in order: remote enforcement → config/hook/harness/meta-eval control-plane gates → `swiftc -typecheck` of the ScreenCaptureKit sidecar → `cargo clippy --all-targets -- -D warnings` → `cargo test` → `cargo audit` → `cargo deny check` → `cargo build` → `npx ng lint` → `npx ng build` → the headless `e2e-core.sh` + `e2e-mix.sh`.
+- **`scripts/ci.sh` is the SINGLE SOURCE OF TRUTH** for what "green" means. It runs, in order: receipt/remote enforcement → config/hook/Harness selftests → `swiftc` checks → Rust clippy/tests/supply-chain/build → Angular lint/build → Playwright and headless audio E2E.
 - **GitHub Actions WRAPS ci.sh — it does not re-implement it.** `.github/workflows/ci.yml` calls
   `bash scripts/ci.sh` on a `macos-14` runner. The single `gate` job runs the COMPLETE script,
   including audio E2E, for PRs, weekly `schedule`, and `workflow_dispatch`;

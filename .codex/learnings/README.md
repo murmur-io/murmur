@@ -7,10 +7,11 @@ repo** so a lesson learned once is never re-paid.
 
 One file per agent (`<agent-name>.md`), each with two tiers:
 
-### `## Recurring patterns` — curated, injected into every harness dispatch
+### `## Recurring patterns` — curated, bound into every harness dispatch
 Short binding imperatives ("Guard async effect results with a newest-request token").
-Keep it **≤ ~20 bullets** — the harness prepends a bounded, role-relevant selection to each
-writer/reviewer prompt, so it spends prompt budget every run. A
+Keep it **≤ ~20 bullets**. The complete canonical tree is included in the
+Harness protocol hash; reviewers inspect the relevant agent file when applying
+the repository rules. A
 pattern earns a place here only after it has bitten (or been confirmed) at least twice.
 
 ### `## Run journal` — append-only, newest first
@@ -29,9 +30,9 @@ promoted). `success-pattern` entries capture what a *clean* run did right, not j
 
 ## The loop
 
-1. **Read** — `task_runner.py::learning_prompt` prepends role-relevant canonical
-   `## Recurring patterns`; `instructions_sha256` also binds the complete `.codex/learnings/` tree.
-2. **Work** — the agent implements; the adversarial-verifier / lock-security-reviewer gate it.
+1. **Read** — the developer and reviewer read the relevant canonical
+   `## Recurring patterns`; the Harness protocol hash binds the complete `.codex/learnings/` tree.
+2. **Work** — the developer implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry with the
    `murmur-learn` skill, citing the artifact that revealed it.
 4. **Curate** — periodically, `murmur-curate-learnings <agent>` promotes 2+ similar journal entries

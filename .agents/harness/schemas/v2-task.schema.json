@@ -19,14 +19,13 @@
     "claims",
     "reviewer",
     "expected_change",
-    "degraded_provenance",
     "created_at"
   ],
   "properties": {
     "schema_version": { "const": 2 },
     "task_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$" },
     "description": { "type": "string", "minLength": 1 },
-    "kind": { "enum": ["bug", "feature", "refactor", "docs", "harness", "import"] },
+    "kind": { "enum": ["bug", "feature", "refactor", "docs", "harness"] },
     "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "contract_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "repo_realpath": { "type": "string", "minLength": 1 },
@@ -47,23 +46,6 @@
     "reviewer": { "enum": ["codex", "claude", "fake"] },
     "allow_same_vendor_high_risk": { "type": "boolean" },
     "expected_change": { "const": true },
-    "degraded_provenance": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": true
-      }
-    },
-    "supersedes": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["generation", "task_id", "contract_sha256"],
-      "properties": {
-        "generation": { "const": 1 },
-        "task_id": { "type": "string" },
-        "contract_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
-      }
-    },
     "created_at": { "type": "string", "format": "date-time" }
   }
 }

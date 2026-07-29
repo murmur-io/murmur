@@ -16,13 +16,13 @@ Claude Code is one adapter to the vendor-neutral development harness in
 The active development loop is:
 
 ```text
-task contract -> sibling worktree -> writer -> deterministic checks
-              -> fresh spec/adversarial/risk reviews -> bounded repair
-              -> hash-bound attestation -> guarded commit -> required remote CI
+task contract -> isolated worktree -> developer edit -> exact-diff plan
+              -> deterministic checks -> fresh combined/risk reviews
+              -> hash-bound receipt -> guarded commit -> required remote CI
 ```
 
 Run it with `scripts/agent-harness`; task evidence is stored once under the
-shared Git common directory at `.git/agent-harness/tasks/<task-id>/`. Legacy
+shared Git common directory at `.git/agent-harness/v2/tasks/<task-id>/`. Legacy
 `.claude/tmp/` verdicts and trace helpers are historical evidence only and have
 no authority over commits.
 
@@ -36,7 +36,6 @@ Quick verification:
 ```bash
 scripts/agent-harness doctor
 scripts/agent-harness selftest --ci
-scripts/agent-harness eval selftest
 scripts/agent-config-audit --ci
 ```
 
