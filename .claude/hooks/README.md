@@ -14,7 +14,7 @@ hook payload and exit contract; policy must not be reimplemented in an adapter.
 | `autoformat.sh` | edits | Optional single-file Rust formatting when `MURMUR_AUTOFMT=1`. |
 
 The authoritative task state is under the shared Git common directory:
-`.git/agent-harness/tasks/<task-id>/`. Task discovery matches the current linked
+`.git/agent-harness/v2/tasks/<task-id>/`. Task discovery matches the current linked
 worktree; there is no concurrency-unsafe global current-task pointer.
 
 ## Verification

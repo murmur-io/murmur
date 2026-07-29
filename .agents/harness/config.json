@@ -1,11 +1,6 @@
 {
-  "schema_version": 1,
-  "default_writer": "claude",
-  "default_reviewer": "claude",
-  "max_repair_rounds": 2,
-  "task_timeout_seconds": 21600,
-  "agent_timeout_seconds": 3600,
-  "writer_timeout_seconds": 5400,
+  "schema_version": 2,
+  "default_reviewer": "codex",
   "reviewer_timeout_seconds": 2400,
   "review_retry_max_delay_seconds": 60,
   "v2_max_parallel_reviews": 3,
@@ -25,10 +20,6 @@
       "recommended_version": "2.1.214"
     }
   },
-  "required_reviews": [
-    "spec",
-    "adversarial"
-  ],
   "risk_reviews": {
     "lock": "lock-security",
     "egress": "egress-security",
@@ -51,7 +42,7 @@
     "ng-build": "npx ng build",
     "playwright": "npm run test:e2e -- --workers=1",
     "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh",
-    "harness-python": "python3 -B -c 'import ast, importlib, pathlib, sys; names=(\"task_runner\",\"cli\",\"verifier\",\"process_guardian\",\"config_audit\",\"hook_guard\",\"resource_policy\",\"v2_selftest\",\"v2_fault_selftest\",\"metrics\",\"metrics_selftest\"); root=pathlib.Path(\".agents/harness\"); [ast.parse((root / (name + \".py\")).read_text(encoding=\"utf-8\"), filename=str(root / (name + \".py\"))) for name in names]; sys.path.insert(0, str(root)); [importlib.import_module(name) for name in names]'",
+    "harness-python": "python3 -B -c 'import ast, importlib, pathlib, sys; names=(\"runtime\",\"cli\",\"verifier\",\"process_guardian\",\"config_audit\",\"hook_guard\",\"resource_policy\",\"v2_selftest\",\"v2_fault_selftest\",\"metrics\",\"metrics_selftest\"); root=pathlib.Path(\".agents/harness\"); [ast.parse((root / (name + \".py\")).read_text(encoding=\"utf-8\"), filename=str(root / (name + \".py\"))) for name in names]; sys.path.insert(0, str(root)); [importlib.import_module(name) for name in names]'",
     "harness-v2-selftest": "python3 .agents/harness/v2_selftest.py",
     "receipt-selftest": "scripts/verify-harness-attestation --selftest",
     "hook-selftest": "bash .codex/hooks/selftest.sh",

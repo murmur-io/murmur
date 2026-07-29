@@ -1,6 +1,6 @@
 ---
 name: ship-feature
-description: Ship a Murmur feature through scope, isolated implementation, fresh adversarial and required security review, project gates, a QueaT commit, and a PR to `murmur`. Use the Harness v2 shadow candidate only for risky, multi-step, or explicitly requested work; ordinary low-risk fixes keep the normal isolated-worktree route.
+description: Ship a Murmur feature through scope, isolated implementation, fresh adversarial and required security review, project gates, a QueaT commit, and a PR to `murmur`. Use the verifier-only Harness for risky, multi-step, or explicitly requested work; ordinary low-risk fixes keep the normal isolated-worktree route.
 ---
 
 # /ship-feature — ship a Murmur feature end-to-end
@@ -36,10 +36,13 @@ isolated feature worktree, fresh independent review, the relevant project gates,
 and a normal QueaT commit. Do not add a Harness receipt merely because this
 skill was invoked.
 
-Use the Harness v2 shadow candidate for lock/crypto/egress/protocol work,
-multi-step changes, or when the operator explicitly requests the receipt. V2
-must not own protected control-plane paths; those still require the v1
-`--kind harness` plus `seal-prepared` bootstrap.
+Use the Harness for lock/crypto/egress/protocol work, multi-step changes, or
+when the operator explicitly requests the receipt. It must not own protected
+control-plane paths. Change those in a dedicated worktree outside the
+runner-owned `../.murmur-agent-tasks` root, for example
+`../.murmur-control-plane/<task-id>`. Run the complete control-plane
+selftests, obtain a fresh independent review, and rely on the base-anchored
+CI gate.
 
 ### 2a. Create the v2 executable task contract when that route applies
 For a multi-part change, write a short plan: the exact files/symbols, the IPC seam (new Tauri
@@ -137,7 +140,7 @@ on the author's say-so. Actual lock/egress/protocol paths add the corresponding 
 specialist automatically.
 
 For a bug fix, require a focused regression test and the green language suite.
-Do not demand a prose reconstruction of historical RED from the writer. Empirical
+Do not demand a prose reconstruction of historical RED from the developer. Empirical
 RED is required only when a runner-owned artifact actually performed and
 recorded that proof.
 
@@ -198,7 +201,7 @@ Harness-Lane: B
 ```
 
 Lane B is valid only before any receipt exists on an ordinary non-v2
-`agent/*` branch. Never use it on `agent/v2/*`, after a v1/v2 receipt, or to
+`agent/*` branch. Never use it on `agent/v2/*`, after any receipt, or to
 paper over a failed receipt check; repair or re-verify the receipted lifecycle
 instead.
 
