@@ -22,7 +22,6 @@
     "findings",
     "proof_gaps",
     "probe_requests",
-    "degraded_provenance",
     "telemetry",
     "verdict",
     "reason",
@@ -63,10 +62,6 @@
       "items": { "type": "object", "additionalProperties": true }
     },
     "probe_requests": {
-      "type": "array",
-      "items": { "type": "object", "additionalProperties": true }
-    },
-    "degraded_provenance": {
       "type": "array",
       "items": { "type": "object", "additionalProperties": true }
     },

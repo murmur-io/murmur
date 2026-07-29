@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HOOK_NAMES = ("block-bash", "secret-scan", "finish-guard")
 WRAPPER_NAMES = (*HOOK_NAMES, "selftest")
 REQUIRED_RULES = ("rust-tauri.md", "angular-zoneless.md", "lock-model.md", "agentic-workflow.md")
-ADVERSARIAL_PROMPT_MARKER = "control-plane-audit: shipped-bug-classes-v1"
+ADVERSARIAL_PROMPT_MARKER = "control-plane-audit: shipped-bug-classes"
 ADVERSARIAL_BUG_MARKERS = (
     "SEALED_CONTENT_LEAK",
     "FFI_LAUNCH_ABORT",
@@ -243,26 +243,21 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
 
     config = documents.get(".agents/harness/config.json")
     audit.require(
-        isinstance(config, dict) and config.get("schema_version") == 1,
-        "harness config schema_version=1",
-        "harness config must be an object with schema_version=1",
+        isinstance(config, dict) and config.get("schema_version") == 2,
+        "harness config schema_version=2",
+        "harness config must be an object with schema_version=2",
     )
     audit.require(
-        isinstance(config, dict) and config.get("default_writer") in ("codex", "claude"),
-        "harness default_writer is a real model vendor",
-        "harness default_writer must be codex or claude",
-    )
-    audit.require(
-        isinstance(config, dict) and config.get("default_reviewer") in ("codex", "claude"),
-        "harness default_reviewer is a real model vendor",
-        "harness default_reviewer must be codex or claude",
+        isinstance(config, dict) and config.get("default_reviewer") == "codex",
+        "harness defaults to the Codex reviewer",
+        "harness default_reviewer must be codex; Claude remains explicit opt-in",
     )
     audit.require(
         isinstance(config, dict)
-        and isinstance(config.get("task_timeout_seconds"), int)
-        and 1 <= config["task_timeout_seconds"] <= 86_400,
-        "harness has a bounded task-wide wall deadline",
-        "harness task_timeout_seconds must be between 1 and 86400",
+        and isinstance(config.get("reviewer_timeout_seconds"), int)
+        and 1 <= config["reviewer_timeout_seconds"] <= 86_400,
+        "harness has a bounded reviewer deadline",
+        "harness reviewer_timeout_seconds must be between 1 and 86400",
     )
     canonical = config.get("canonical_checks", {}) if isinstance(config, dict) else {}
     risk_evidence = config.get("risk_required_evidence", {}) if isinstance(config, dict) else {}
@@ -461,7 +456,7 @@ def _agent_and_rule_manifest(audit: Audit) -> None:
 
 
 def _adversarial_prompt_contract(audit: Audit) -> None:
-    path = ROOT / ".agents" / "harness" / "prompts" / "adversarial-reviewer.md"
+    path = ROOT / ".agents" / "harness" / "prompts" / "combined-reviewer.md"
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
@@ -504,10 +499,7 @@ def _codex_permission_profiles(audit: Audit) -> None:
         "Codex named permission profiles are not shadowed by legacy sandbox_mode",
         ".codex/config.toml must not combine named profiles with sandbox_mode",
     )
-    for profile, workspace_access in (
-        ("murmur_harness_writer", "write"),
-        ("murmur_harness_reviewer", "read"),
-    ):
+    for profile, workspace_access in (("murmur_harness_reviewer", "read"),):
         filesystem = _toml_table(text, f"permissions.{profile}.filesystem")
         workspace = _toml_table(text, f'permissions.{profile}.filesystem.":workspace_roots"')
         network = _toml_table(text, f"permissions.{profile}.network")
@@ -540,19 +532,19 @@ def _codex_permission_profiles(audit: Audit) -> None:
             f"Codex {profile} must disable command network",
         )
 
-    runner = ROOT / ".agents" / "harness" / "task_runner.py"
+    runner = ROOT / ".agents" / "harness" / "runtime.py"
     try:
         runner_text = runner.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        audit.error(f"cannot read task runner for Codex profile audit: {exc}")
+        audit.error(f"cannot read Harness runtime for Codex profile audit: {exc}")
         return
     audit.require(
         'default_permissions="{permission_profile}"' in runner_text
         and 'permissions.{permission_profile}.filesystem={filesystem_profile}' in runner_text
         and 'permissions.{permission_profile}.network.enabled=false' in runner_text
-        and '"murmur_harness_writer" if role == "writer" else "murmur_harness_reviewer"' in runner_text,
-        "task runner selects and inlines Codex writer/reviewer permission profiles",
-        "task runner must select and inline the Codex permission profile per role",
+        and 'permission_profile = "murmur_harness_reviewer"' in runner_text,
+        "Harness runtime selects and inlines the Codex reviewer permission profile",
+        "Harness runtime must select and inline the Codex reviewer permission profile",
     )
     audit.require(
         re.search(
@@ -561,15 +553,8 @@ def _codex_permission_profiles(audit: Audit) -> None:
         )
         is not None
         and '"autoAllowBashIfSandboxed": False' in runner_text
-        and re.search(
-            r'if role == "writer":\s*'
-            r'tools = "Read,Grep,Glob,Edit,Write,Bash"\s*'
-            r'else:\s*tools = ""',
-            runner_text,
-        )
-        is not None
-        and "reviewer_execution_cwd() if role == \"reviewer\" else worktree"
-        in runner_text,
+        and 'tools = ""' in runner_text
+        and "model_cwd = reviewer_execution_cwd()" in runner_text,
         "Claude reviewer has an empty tool surface and isolated non-project cwd",
         "Claude reviewer must pass empty --tools/--allowedTools values, override "
         "project sandbox Bash auto-approval, and run outside the project tree",
@@ -586,32 +571,6 @@ def _codex_permission_profiles(audit: Audit) -> None:
         "Codex reviewer has a runner-owned deny-all tool boundary",
         "Codex reviewer must deny every local tool with the protocol-bound "
         "PreToolUse guard and disable hosted/networked tool surfaces",
-    )
-
-
-def _eval_adapter_security(audit: Audit) -> None:
-    path = ROOT / ".agents" / "harness" / "eval_runner.py"
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        audit.error(f"cannot read eval runner security envelope: {exc}")
-        return
-    audit.require(
-        "permissions.murmur_eval.filesystem=" in text
-        and 'default_permissions="murmur_eval"' in text
-        and '":minimal"="read"' in text
-        and "permissions.murmur_eval.network.enabled=false" in text,
-        "Codex eval adapter uses an inline minimal/network-off profile",
-        "Codex eval adapter must use an inline minimal/network-off permission profile",
-    )
-    audit.require(
-        '"failIfUnavailable": True' in text
-        and '"allowUnsandboxedCommands": False' in text
-        and '"denyRead": ["~/"]' in text
-        and '"deniedDomains": ["*"]' in text
-        and '"CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"' in text,
-        "Claude eval adapter fails closed with home/network/env isolation",
-        "Claude eval adapter must fail closed with home/network/env isolation",
     )
 
 
@@ -890,6 +849,34 @@ def _harness_v2_contract(audit: Audit) -> None:
         "Harness v2 dispatcher, verifier, prompt, selftest, and schemas exist",
         "Harness v2 executable/schema surface is incomplete",
     )
+    obsolete = (
+        ".agents/harness/task_runner.py",
+        ".agents/harness/eval_runner.py",
+        ".agents/harness/evals",
+        ".agents/harness/prompts/implementer.md",
+        ".agents/harness/prompts/spec-reviewer.md",
+        ".agents/harness/prompts/adversarial-reviewer.md",
+        ".agents/harness/schemas/task.schema.json",
+        ".agents/harness/schemas/model-result.schema.json",
+        ".agents/harness/schemas/review.schema.json",
+        ".agents/harness/schemas/attestation.schema.json",
+        ".agents/harness/schemas/commit.schema.json",
+    )
+
+    def retired_surface_is_absent(path: str) -> bool:
+        candidate = ROOT / path
+        if not candidate.is_dir():
+            return not candidate.exists()
+        return not any(
+            child.is_file() or child.is_symlink()
+            for child in candidate.rglob("*")
+        )
+
+    audit.require(
+        all(retired_surface_is_absent(path) for path in obsolete),
+        "retired Harness v1 executable, writer, repair, and eval surfaces are absent",
+        "remove every retired Harness v1 executable, writer, repair, and eval surface",
+    )
     config = _load_json(ROOT / ".agents" / "harness" / "config.json", audit)
     canonical = config.get("canonical_checks", {}) if isinstance(config, dict) else {}
     required_checks = {
@@ -927,7 +914,7 @@ def _harness_v2_contract(audit: Audit) -> None:
         return
     audit.require(
         ".agents/harness/cli.py" in wrapper,
-        "agent-harness wrapper dispatches through the generation-aware v2 CLI",
+        "agent-harness wrapper dispatches through the single verifier-only CLI",
         "scripts/agent-harness must execute .agents/harness/cli.py",
     )
     audit.require(
@@ -939,8 +926,8 @@ def _harness_v2_contract(audit: Audit) -> None:
                 "metrics_selftest.py",
             )
         ),
-        "generation-aware selftest aggregates legacy, v2, fault, and metrics suites",
-        "Harness v2 CLI selftest must retain all deterministic sub-suites",
+        "Harness selftest aggregates lifecycle, fault, and metrics suites",
+        "Harness CLI selftest must retain all deterministic sub-suites",
     )
     audit.require(
         "scripts/verify-harness-attestation --selftest" in ci
@@ -1131,11 +1118,10 @@ def _harness_v2_contract(audit: Audit) -> None:
     audit.require(
         "_v2_verifier_module" in finish_guard
         and "validate_hashed_document" in finish_guard
-        and "supersedes" in finish_guard
-        and "Harness v2 owns the durable commit intent and receipt" in finish_guard,
-        "finish guard resolves v1/v2 manifests, exact import collisions, and delegates v2 commits",
-        "finish guard must validate v2 manifests, fail closed on ambiguous supersedes "
-        "bindings, and delegate durable v2 commits to agent-harness",
+        and "the Harness owns the durable commit intent and receipt" in finish_guard,
+        "finish guard validates task manifests and delegates durable commits",
+        "finish guard must validate task manifests and delegate durable commits "
+        "to agent-harness",
     )
 
 
@@ -1145,7 +1131,6 @@ def run_audit() -> Audit:
     _bash_syntax(audit)
     _agent_and_rule_manifest(audit)
     _codex_permission_profiles(audit)
-    _eval_adapter_security(audit)
     _hook_parity(documents, audit)
     _adversarial_prompt_contract(audit)
     _semantic_lint(audit)
