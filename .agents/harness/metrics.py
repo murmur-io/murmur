@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small read-only rollup over append-only Harness v1/v2 event ledgers."""
+"""Small read-only rollup over append-only Harness event ledgers."""
 
 from __future__ import annotations
 
@@ -40,11 +40,11 @@ def _timestamp(value: Any) -> Optional[float]:
     return parsed.timestamp() if parsed.tzinfo is not None else None
 
 
-def _ledger_paths(task: Path, generation: int) -> Tuple[List[Path], int]:
+def _ledger_paths(task: Path) -> Tuple[List[Path], int]:
     candidates = [task / "events.jsonl"]
     unsafe = 0
     attempts = task / "attempts"
-    if generation == 2 and _is_real(attempts, stat.S_IFDIR):
+    if _is_real(attempts, stat.S_IFDIR):
         try:
             children = sorted(attempts.iterdir(), key=lambda item: item.name)
         except OSError:
@@ -80,7 +80,7 @@ def _ledger_paths(task: Path, generation: int) -> Tuple[List[Path], int]:
                 )
             elif review_runs.exists() or review_runs.is_symlink():
                 unsafe += 1
-    elif generation == 2 and (attempts.exists() or attempts.is_symlink()):
+    elif attempts.exists() or attempts.is_symlink():
         unsafe += 1
     ledgers: List[Path] = []
     for path in candidates:
@@ -127,54 +127,49 @@ def _read(path: Path) -> Dict[str, Any]:
 def _discover(common: Path) -> Tuple[List[Dict[str, Any]], int]:
     records: List[Dict[str, Any]] = []
     unsafe = 0
-    for generation, root in (
-        (1, common / "agent-harness" / "tasks"),
-        (2, common / "agent-harness" / "v2" / "tasks"),
-    ):
-        if not _is_real(root, stat.S_IFDIR):
-            if root.exists() or root.is_symlink():
-                unsafe += 1
-            continue
-        try:
-            entries = sorted(root.iterdir(), key=lambda item: item.name)
-        except OSError:
+    root = common / "agent-harness" / "v2" / "tasks"
+    if not _is_real(root, stat.S_IFDIR):
+        if root.exists() or root.is_symlink():
             unsafe += 1
+        return records, unsafe
+    try:
+        entries = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return records, unsafe + 1
+    for task in entries:
+        if not _is_real(task, stat.S_IFDIR):
+            unsafe += int(task.is_symlink())
             continue
-        for task in entries:
-            if not _is_real(task, stat.S_IFDIR):
-                unsafe += int(task.is_symlink())
-                continue
-            paths, skipped = _ledger_paths(task, generation)
-            unsafe += skipped
-            reads = [_read(path) for path in paths]
-            events = [event for read in reads for event in read["events"]]
-            status: Optional[str] = None
-            last_at: Optional[str] = None
-            last_epoch: Optional[float] = None
-            for event in events:
-                epoch = _timestamp(event.get("at"))
-                if epoch is not None and (last_epoch is None or epoch >= last_epoch):
-                    last_epoch, last_at = epoch, event["at"]
-                if event.get("event") == "state":
-                    nested = event.get("state")
-                    candidate = (
-                        nested.get("status")
-                        if isinstance(nested, Mapping)
-                        else event.get("status")
-                    )
-                    if isinstance(candidate, str) and candidate:
-                        status = candidate
-            records.append(
-                {
-                    "task_id": task.name,
-                    "generation": generation,
-                    "status": status,
-                    "last_event_at": last_at,
-                    "last_epoch": last_epoch,
-                    "reads": reads,
-                    "events": events,
-                }
-            )
+        paths, skipped = _ledger_paths(task)
+        unsafe += skipped
+        reads = [_read(path) for path in paths]
+        events = [event for read in reads for event in read["events"]]
+        status: Optional[str] = None
+        last_at: Optional[str] = None
+        last_epoch: Optional[float] = None
+        for event in events:
+            epoch = _timestamp(event.get("at"))
+            if epoch is not None and (last_epoch is None or epoch >= last_epoch):
+                last_epoch, last_at = epoch, event["at"]
+            if event.get("event") == "state":
+                nested = event.get("state")
+                candidate = (
+                    nested.get("status")
+                    if isinstance(nested, Mapping)
+                    else event.get("status")
+                )
+                if isinstance(candidate, str) and candidate:
+                    status = candidate
+        records.append(
+            {
+                "task_id": task.name,
+                "status": status,
+                "last_event_at": last_at,
+                "last_epoch": last_epoch,
+                "reads": reads,
+                "events": events,
+            }
+        )
     return records, unsafe
 
 
@@ -263,7 +258,7 @@ def _model_key(task_key: str, event: Mapping[str, Any], ordinal: int) -> Tuple[s
 def _model_groups(records: Sequence[Mapping[str, Any]]) -> List[List[Mapping[str, Any]]]:
     groups: Dict[Tuple[str, ...], List[Mapping[str, Any]]] = {}
     for record in records:
-        task_key = f"v{record['generation']}:{record['task_id']}"
+        task_key = str(record["task_id"])
         for ordinal, event in enumerate(record["events"]):
             if event.get("event") not in {
                 "model-process-exit",
@@ -397,18 +392,15 @@ def collect_metrics(common_dir: Path, *, limit: int = 20) -> Dict[str, Any]:
         key=lambda record: (
             record["last_epoch"] is not None,
             record["last_epoch"] or 0,
-            record["generation"],
             record["task_id"],
         ),
         reverse=True,
     )
     selected = records[:limit]
     status_counts: Dict[str, int] = {}
-    generation_counts = {"v1": 0, "v2": 0}
     for record in selected:
         status = record["status"] or "UNKNOWN"
         status_counts[status] = status_counts.get(status, 0) + 1
-        generation_counts[f"v{record['generation']}"] += 1
     status_observations = [
         ("available", record["status"])
         if record["status"] is not None
@@ -440,13 +432,11 @@ def collect_metrics(common_dir: Path, *, limit: int = 20) -> Dict[str, Any]:
         },
         "tasks": {
             "count": len(selected),
-            "by_generation": generation_counts,
             "by_status": dict(sorted(status_counts.items())),
             "status_coverage": _coverage(status_observations),
             "records": [
                 {
                     "task_id": record["task_id"],
-                    "generation": record["generation"],
                     "status": record["status"] or "UNKNOWN",
                     "last_event_at": record["last_event_at"],
                     "event_ledgers": len(record["reads"]),
@@ -513,12 +503,11 @@ def render_text(report: Mapping[str, Any]) -> str:
         [
             (
                 f"Harness metrics: {selection['selected_tasks']}/"
-                f"{selection['discovered_tasks']} most recent task generations "
+                f"{selection['discovered_tasks']} most recent tasks "
                 f"(limit {selection['limit']})"
             ),
             (
                 f"tasks: status {json.dumps(tasks['by_status'], sort_keys=True)}; "
-                f"generation {json.dumps(tasks['by_generation'], sort_keys=True)}; "
                 f"coverage {_coverage_text(tasks['status_coverage'])}"
             ),
             (

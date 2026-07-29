@@ -1,6 +1,6 @@
 ---
 name: ci-maintenance
-description: Run, understand, and debug Murmur's CI — the local `scripts/ci.sh` gate and the GitHub Actions macOS PR-gate that wraps it. The map of every gate step (remote enforcement → control-plane audits/evals → swiftc → clippy → cargo test → cargo audit → cargo deny → cargo build → ng lint → ng build → E2E), how to reproduce a red CI run locally with the exact command CI uses, and every repo-specific gotcha (heavy always-compiled ML build, MISTRALRS_METAL_PRECOMPILE, clippy-in-loop timeout, macOS-only steps, the MURMUR_CI_SKIP_E2E toggle). Use whenever the user wants to run/fix/understand CI, triage a red pipeline, or check why the gate failed.
+description: Run, understand, and debug Murmur's CI — the local `scripts/ci.sh` gate and the GitHub Actions macOS PR-gate that wraps it. The map of every gate step (receipt/remote enforcement → control-plane audits/selftests → swiftc → clippy → cargo test → cargo audit → cargo deny → cargo build → ng lint → ng build → E2E), how to reproduce a red CI run locally with the exact command CI uses, and every repo-specific gotcha (heavy always-compiled ML build, MISTRALRS_METAL_PRECOMPILE, clippy-in-loop timeout, macOS-only steps, the MURMUR_CI_SKIP_E2E toggle). Use whenever the user wants to run/fix/understand CI, triage a red pipeline, or check why the gate failed.
 ---
 
 # /ci-maintenance — run & debug Murmur's CI gate
@@ -17,7 +17,7 @@ Murmur's "CI" is two layers of the SAME gate:
 `scripts/ci.sh` runs, in order:
 
 1. **Remote enforcement audit** — deterministic evaluator selftest locally, live public policy on PRs, privileged policy on trusted schedule/dispatch.
-2. **Control-plane gates** — config audit, hook selftest, harness selftest, and deterministic meta-eval.
+2. **Control-plane gates** — config audit, hook selftest, and the verifier-only Harness lifecycle/fault/metrics selftests.
 3. **`swiftc -typecheck`** the ScreenCaptureKit sidecar (`src-tauri/sysaudio/sysaudio.swift`). macOS-only; skipped with a note if `swiftc` is absent.
 4. **`cargo clippy --all-targets -- -D warnings`** (in `src-tauri/`).
 5. **`cargo test`** (in `src-tauri/`) — the full test binary, including the deterministic FTS metric floor.

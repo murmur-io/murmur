@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import cli as harness_cli
-import task_runner as legacy
+import runtime
 import verifier
 
 
@@ -143,13 +143,12 @@ def _fixture(root: Path) -> Dict[str, Any]:
         "claims": [],
         "reviewer": "fake",
         "expected_change": True,
-        "degraded_provenance": [],
-        "created_at": legacy.utc_now(),
+        "created_at": runtime.utc_now(),
     }
     contract["contract_sha256"] = verifier.document_hash(
         contract, "contract_sha256"
     )
-    legacy.atomic_write_json(task_dir / "task.json", contract)
+    runtime.atomic_write_json(task_dir / "task.json", contract)
     paths, diff, tree_sha = verifier.snapshot_scoped_diff(
         worktree, contract, task_dir
     )
@@ -158,7 +157,7 @@ def _fixture(root: Path) -> Dict[str, Any]:
         "task_id": contract["task_id"],
         "contract_sha256": contract["contract_sha256"],
         "base_sha": base,
-        "diff_sha256": legacy.sha256_bytes(diff),
+        "diff_sha256": runtime.sha256_bytes(diff),
         "tree_sha": tree_sha,
         "protocol_sha256": "2" * 64,
         "changed_paths": paths,
@@ -238,7 +237,7 @@ def snapshot_aba_and_reconstruction_cases(test: Tests) -> None:
             )
             test.true(
                 "SNAPSHOT source B really differs while the slow check is running",
-                legacy.sha256_bytes(b_diff) != plan["diff_sha256"]
+                runtime.sha256_bytes(b_diff) != plan["diff_sha256"]
                 and b_tree != plan["tree_sha"],
             )
             test.equal(
@@ -252,7 +251,7 @@ def snapshot_aba_and_reconstruction_cases(test: Tests) -> None:
             )
             test.true(
                 "SNAPSHOT source A-B-A returns to the exact planned identity",
-                legacy.sha256_bytes(restored_diff) == plan["diff_sha256"]
+                runtime.sha256_bytes(restored_diff) == plan["diff_sha256"]
                 and restored_tree == plan["tree_sha"],
             )
             release.write_text("continue", encoding="utf-8")
@@ -276,7 +275,7 @@ def snapshot_aba_and_reconstruction_cases(test: Tests) -> None:
         test.true(
             "SNAPSHOT evidence identity remains bound to A",
             snapshot_paths == plan["changed_paths"]
-            and legacy.sha256_bytes(snapshot_diff) == plan["diff_sha256"]
+            and runtime.sha256_bytes(snapshot_diff) == plan["diff_sha256"]
             and snapshot_tree == plan["tree_sha"],
         )
 
@@ -348,7 +347,7 @@ def cached_artifact_tamper_case(test: Tests) -> None:
             "timeout_seconds": 5,
         }
         counter = 0
-        original_run_check = legacy.run_check
+        original_run_check = runtime.run_check
 
         def synthetic_run_check(
             _worktree: Path,
@@ -384,21 +383,21 @@ def cached_artifact_tamper_case(test: Tests) -> None:
                 "resource_wait_ms": 0,
                 "execution_id": f"synthetic-{counter}",
                 "log_path": str(log_path),
-                "log_sha256": legacy.sha256_file(log_path),
+                "log_sha256": runtime.sha256_file(log_path),
                 "stdout_path": str(stdout_path),
-                "stdout_sha256": legacy.sha256_file(stdout_path),
+                "stdout_sha256": runtime.sha256_file(stdout_path),
                 "stderr_path": str(stderr_path),
-                "stderr_sha256": legacy.sha256_file(stderr_path),
+                "stderr_sha256": runtime.sha256_file(stderr_path),
                 "sandbox_profile_path": str(sandbox_path),
-                "sandbox_profile_sha256": legacy.sha256_file(sandbox_path),
+                "sandbox_profile_sha256": runtime.sha256_file(sandbox_path),
                 "guardian_path": str(guardian_path),
-                "guardian_sha256": legacy.sha256_file(guardian_path),
+                "guardian_sha256": runtime.sha256_file(guardian_path),
                 "leader_exited_with_live_group": False,
                 "passed": True,
                 "outcome": "PASS",
             }
 
-        legacy.run_check = synthetic_run_check
+        runtime.run_check = synthetic_run_check
         try:
             first, first_did_run = harness_cli._run_or_resume_check(
                 contract,
@@ -431,7 +430,7 @@ def cached_artifact_tamper_case(test: Tests) -> None:
                 checkpoint_number=2,
             )
         finally:
-            legacy.run_check = original_run_check
+            runtime.run_check = original_run_check
         test.true(
             "CACHE initial exact-diff checkpoint executes once",
             first_did_run and counter == 2,
@@ -480,7 +479,7 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
             snapshot,
             task_dir,
         )
-        expected_prompt_sha = legacy.sha256_bytes(prompt.encode("utf-8"))
+        expected_prompt_sha = runtime.sha256_bytes(prompt.encode("utf-8"))
         verifier.validate_review_checkpoint(
             record,
             review,
@@ -524,7 +523,7 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
             "prompt hash changed",
         )
 
-        policy = legacy.read_prompt("combined-reviewer")
+        policy = runtime.read_prompt("combined-reviewer")
         drifted_prompt = verifier.combined_review_prompt(
             contract,
             plan,
@@ -535,7 +534,7 @@ def prompt_policy_tamper_cases(test: Tests) -> None:
             task_dir,
             policy_text=policy + "\nFAULT POLICY DRIFT\n",
         )
-        drifted_prompt_sha = legacy.sha256_bytes(
+        drifted_prompt_sha = runtime.sha256_bytes(
             drifted_prompt.encode("utf-8")
         )
         test.true(
@@ -562,7 +561,7 @@ def review_stream_binding_cases(test: Tests) -> None:
         stream = task_dir / "stdout.log"
         payload = b"HEAD:" + (b"x" * 5_000) + b":TAIL"
         stream.write_bytes(payload)
-        digest = legacy.sha256_file(stream)
+        digest = runtime.sha256_file(stream)
         summary = verifier._bounded_stream_summary(  # noqa: SLF001
             task_dir,
             str(stream),

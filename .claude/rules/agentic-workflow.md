@@ -3,18 +3,16 @@
 The implementer never owns the verdict. Use independent, adversarial evidence
 for every risky or multi-step change.
 
-## Verifier-only Harness v2 shadow candidate
+## Verifier-only Harness
 
-Harness v2 is an opt-in Phase-1 candidate for risky, multi-step, or
-operator-requested work. It is not the default until the historical replay and
-real-task shadow budgets pass:
+The Harness is opt-in for risky, multi-step, or operator-requested work:
 
 ```text
 open -> implement in isolated worktree -> plan -> verify/resume
      -> exact PASS -> commit -> push/PR/CI/merge -> clean
 ```
 
-It has no writer dispatch and no automatic repair loop. One assigned writer
+It has no implementation-model dispatch and no automatic repair loop. One developer
 owns the isolated worktree and declared paths. The runner owns the exact-diff
 snapshot, deterministic checks, fresh tool-free reviews, typed probes, receipt,
 commit, and cleanup.
@@ -22,8 +20,11 @@ commit, and cleanup.
 Run orchestration from a dedicated standalone driver clone, never a linked
 worktree backed by the user's primary `.git`. After `open`, run the task's own
 `scripts/agent-harness`; executable protocol drift is a hard refusal.
-V2 cannot own protected control-plane paths. Those continue through v1
-`--kind harness` plus `seal-prepared` during the shadow.
+The Harness cannot certify its own protected control-plane paths. Change those
+in a dedicated worktree outside the runner-owned `../.murmur-agent-tasks`
+root, for example `../.murmur-control-plane/<task-id>`. Run the complete
+control-plane selftests, obtain a fresh independent review, and let the
+base-anchored CI gate decide.
 
 ```bash
 scripts/agent-harness open <task-id> --prompt "<scope>" \
@@ -43,10 +44,9 @@ operator-approved archived handoff.
 
 The current exact changed paths, not caller-provided risk labels, select the
 canonical profile. Rust, Angular, UI behavior, and protocol surfaces get their
-required checks. Protected harness/control-plane surfaces are refused by v2
-and stay on the externally anchored v1 bootstrap. Runtime/performance are
-explicit `--claim` values. Actual lock/egress/protocol paths add the mandatory
-security specialist.
+required checks. Protected harness/control-plane surfaces are refused.
+Runtime/performance are explicit `--claim` values. Actual
+lock/egress/protocol paths add the mandatory security specialist.
 
 Reviewers are fresh and tool-free, with at most three independent reviews in
 parallel. They receive only the runner-built immutable diff/evidence bundle;
@@ -62,17 +62,12 @@ commit intent recovers a process death after `git commit` without creating a
 second commit. `clean --abandon` archives every visible tracked/untracked task
 byte before removing the isolated worktree.
 
-Legacy v1 `init/run/seal-prepared/verify-attestation/commit/close/reap/gc/eval`
-remains available for existing task lifecycle compatibility. Finish valid v1
-PASS/COMMITTED tasks in v1. Use `import-v1` to adopt a nonterminal v1 diff
-without rerunning its writer; import must preserve v1 artifacts and never
-fabricate PASS.
-
-Receipt policy is monotonic. `agent/v2/*` is reserved for v2 and every
-branch-authored non-merge commit there needs a v2 receipt. A legacy receipted
-history may upgrade v1 -> v2, but no history may downgrade v2 -> v1 or from
-any receipt back to `Harness-Lane: B`. Lane B remains only an explicit
-pre-receipt opt-out on an ordinary non-v2 `agent/*` branch.
+`agent/v2/*` is reserved for Harness receipts and every branch-authored
+non-merge commit there needs one. The CI verifier retains read-only support for
+historical v1 receipt trailers so old Git history remains auditable; there is
+no executable v1 lifecycle. No receipted history may return to
+`Harness-Lane: B`. Lane B remains only an explicit pre-receipt opt-out on an
+ordinary non-v2 `agent/*` branch.
 
 ## One shared resource lane
 
@@ -105,7 +100,7 @@ false:
   is not runtime proof.
 - A bug regression must fail on the unpatched code and pass on the new code. A
   test that also passes before the fix did not capture the bug. Empirical RED
-  counts only when a runner-owned artifact performed and recorded it; writer
+  counts only when a runner-owned artifact performed and recorded it; developer
   prose or a reconstruction is never proof.
 - Hunt known shipped failures: seal content loss, sealed-content/asset leaks,
   macOS FFI aborts, stale IPC effects, standalone import cycles, overlay opacity
@@ -113,7 +108,7 @@ false:
 - Any lock/crypto/content-read change requires the lock security specialist.
 
 The verifier records findings; it never edits the implementation. Repair
-belongs to the assigned writer, followed by a new exact-diff verify.
+belongs to the developer, followed by a new exact-diff verify.
 
 ## Trust code, not docs
 

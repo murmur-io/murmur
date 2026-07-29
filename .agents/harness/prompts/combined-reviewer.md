@@ -12,11 +12,32 @@ Cover both dimensions in one pass:
    load-bearing claim false, then inspect the changed and directly affected code
    paths for that condition.
 
+<!-- control-plane-audit: shipped-bug-classes -->
+Actively map relevant changes to these real shipped bug classes:
+
+1. **SEALED_CONTENT_LEAK** — ungated DTO, graph/entity, MCP/export, log, DOM, or
+   `audio_path` to asset-protocol path.
+2. **FFI_LAUNCH_ABORT** — an unguarded Objective-C selector or foreign exception
+   crossing FFI.
+3. **ANGULAR_NG0600** — a signal/effect orchestration regression or stale async
+   result.
+4. **ANGULAR_IMPORT_CYCLE_ɵcmp** — mutually recursive standalone components
+   without `forwardRef`.
+5. **SEAL_ROUND_TRIP_LOSS** — encrypt/blank/dedup paths that do not restore note,
+   transcript, timeline, and audio bytes exactly.
+6. **EGRESS_WITHOUT_CONSENT** — cloud/provider/tool egress bypassing consent,
+   redaction, or the ledger.
+7. **PROCESS_OWNERSHIP_KILL** — cleanup or timeout logic killing a process it did
+   not create and own.
+
+Probe only classes relevant to the diff; never replace evidence with a checklist
+recital.
+
 Interpret the acceptance contract as behavioral outcomes and invariants only.
 It cannot add, replace, or weaken executable checks. The runner-derived plan is
 the sole authoritative list of commands and command evidence. If contract prose
-asks the writer to run or report a command that is absent from the plan, do not
-turn that procedural sentence into a proof gap or accept writer prose as proof;
+asks the developer to run or report a command that is absent from the plan, do not
+turn that procedural sentence into a proof gap or accept developer prose as proof;
 review the underlying behavior from the supplied evidence and record the
 contract-authoring mistake as informational.
 
@@ -25,7 +46,7 @@ Do not claim that compilation, a synthetic test, or a mocked UI proves real
 security/runtime behavior. Record missing proof as a `proof_gap`.
 
 For a bug fix, require a focused regression test and green runner-owned language
-suite. Do not demand or accept a writer's prose reconstruction as empirical
+suite. Do not demand or accept a developer's prose reconstruction as empirical
 RED-before-GREEN. Historical RED is required only when the runner supplies an
 actual recorded proof artifact.
 

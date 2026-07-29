@@ -1,15 +1,14 @@
 ---
 name: harness
-description: Shadow-test a risky or multi-step Murmur change through the verifier-only Harness v2 candidate — isolated worktree, exact-diff plan, deterministic checks, fresh adversarial and risk reviews, crash-resumable PASS receipt, guarded commit, and lossless cleanup. Use proactively for lock, crypto, egress, protocol, or any change needing independent verification. Skip it for docs, chores, and low-risk edits.
+description: Verify a risky or multi-step Murmur change through the verifier-only Harness — isolated worktree, exact-diff plan, deterministic checks, fresh adversarial and risk reviews, crash-resumable PASS receipt, guarded commit, and lossless cleanup. Use proactively for lock, crypto, egress, protocol, or any change needing independent verification. Skip it for docs, chores, and low-risk edits.
 ---
 
 # `/harness` — opt-in verifier-only rigor
 
 Murmur's harness is opt-in. Use it when a change deserves an independently
-earned, hash-bound verdict. Ordinary low-risk commits remain outside it. V2 is
-still a shadow candidate, not the repository default.
+earned, hash-bound verdict. Ordinary low-risk commits remain outside it.
 
-Harness v2 does not dispatch a writer or repair code. You or the assigned
+The Harness does not dispatch an implementation model or repair code. You or the assigned
 implementer edits one isolated worktree; the runner derives and verifies the
 exact diff. The implementer never owns PASS.
 
@@ -42,7 +41,7 @@ scripts/agent-harness open <task-id> \
 
 # 2. Implement only in the printed worktree and declared scope.
 
-# The prompt is behavioral acceptance only. It must not demand that the writer
+# The prompt is behavioral acceptance only. It must not demand that the developer
 # run or report commands; the derived plan is the sole executable evidence.
 
 # 3. Inspect the exact derived plan, then verify.
@@ -64,9 +63,12 @@ scripts/agent-harness clean <task-id>
 The plan, not the caller, chooses canonical checks from changed paths. Rust,
 Angular behavior, and protocol surfaces get their required deterministic
 gates. Runtime/performance require explicit claims. Actual
-lock/egress/protocol paths add the required cross-vendor specialist. V2
-refuses protected harness/control-plane paths; use the externally anchored v1
-`--kind harness` and `seal-prepared` flow for those during the shadow.
+lock/egress/protocol paths add the required cross-vendor specialist. The
+Harness refuses protected harness/control-plane paths. Change those in a
+dedicated worktree outside the runner-owned `../.murmur-agent-tasks` root,
+for example `../.murmur-control-plane/<task-id>`. Run the complete
+control-plane selftests, obtain a fresh independent review, and rely on the
+base-anchored CI gate.
 
 Reviewers are fresh, tool-free sessions. They receive only the runner-built
 immutable diff/evidence bundle and have no filesystem or shell tools. A
@@ -86,18 +88,12 @@ If verification returns:
 For abandonment, run `clean <task-id> --abandon`. It archives every visible
 tracked/untracked byte before removing only that task's worktree.
 
-## Compatibility
+## Historical receipts
 
-Legacy-only `init`, `run`, `seal-prepared`, `verify-attestation`, `close`,
-`reap`, `gc`, and `eval` still dispatch to v1; generation-aware `status` and
-`commit` preserve existing v1 tasks. Finish a valid v1 PASS in v1. Adopt a
-nonterminal v1 diff with `import-v1`; import preserves source artifacts and
-never fabricates PASS.
-
-Receipt policy is monotonic. `agent/v2/*` is reserved for v2 receipts. A
-legacy receipted history may upgrade v1 -> v2, but cannot downgrade v2 -> v1
-or return to `Harness-Lane: B`. Lane B is valid only as a pre-receipt opt-out
-on an ordinary non-v2 `agent/*` branch.
+There is no executable v1 lifecycle. The CI receipt verifier retains read-only
+support for historical v1 trailers so old Git history stays auditable.
+`agent/v2/*` is reserved for current Harness receipts, and no receipted history
+may return to `Harness-Lane: B`.
 
 For a Claude multi-task program, establish a session `/goal` requiring the next
 manifest action within 60 seconds of the previous stable outcome. Scheduling
