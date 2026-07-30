@@ -537,9 +537,11 @@ mod tests {
     impl redact::NameRedactor for FixtureNameRedactor {
         fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
             let scrubbed = text.replace("Alice", "⟪NAME_1⟫");
-            let pairs = (scrubbed != text)
-                .then(|| vec![("⟪NAME_1⟫".to_string(), "Alice".to_string())])
-                .unwrap_or_default();
+            let pairs = if scrubbed != text {
+                vec![("⟪NAME_1⟫".to_string(), "Alice".to_string())]
+            } else {
+                Vec::new()
+            };
             (scrubbed, pairs)
         }
     }
