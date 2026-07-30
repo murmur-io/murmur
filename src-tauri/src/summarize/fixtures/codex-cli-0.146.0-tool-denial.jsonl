@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019fad9d-55bc-73e0-9fdd-73a3051da73e"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"The command was blocked before execution: `Murmur Codex provider has no local tools.`"}}
+{"type":"turn.completed","usage":{"input_tokens":18253,"cached_input_tokens":15360,"cache_write_input_tokens":0,"output_tokens":109,"reasoning_output_tokens":30}}

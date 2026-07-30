@@ -36,16 +36,23 @@ import { NOTE_ASSIST_NEW_ACTION_IDS } from "../notes/note-brain-popover/note-ass
 import { ErrorCopyService } from "../../core/copy/error-copy.service";
 
 /**
- * The four provider-backed connection ids — the ones `list_models` serves a
+ * The provider-backed connection ids — the ones `list_models` serves a
  * catalog for and a per-role model select makes sense on. `local`/`off` are
  * reasoner-only targets (no SummarizerProvider, no per-role model select — the
  * local model is the global GGUF registry selection).
  */
 const PROVIDER_CONNECTION_IDS: readonly string[] = [
   "claude_code",
+  "codex_cli",
   "anthropic",
   "ollama",
   "gateway",
+];
+/** Static, authoritative catalogs: a foreign id is never a valid custom model on these. */
+const CURATED_PROVIDER_CONNECTION_IDS: readonly string[] = [
+  "claude_code",
+  "codex_cli",
+  "anthropic",
 ];
 
 /**
@@ -850,7 +857,7 @@ export class SettingsStore {
 
   /**
    * FE mirror of the backend's egress classification (`egress_is_cloud`,
-   * summarize/mod.rs): claude_code / anthropic / gateway always send content
+   * summarize/mod.rs): claude_code / codex_cli / anthropic / gateway always send content
    * off-device (gateway even on loopback — it can forward to the cloud);
    * ollama is local ONLY when its base URL host is loopback (see
    * `ollamaIsRemote`). Reuse this wherever the FE decides "is this cloud" so
@@ -859,7 +866,7 @@ export class SettingsStore {
   readonly providerIsCloud = computed(() => {
     const id = this._providerIdValue();
     if (id === "ollama") return this.ollamaIsRemote();
-    return true; // claude_code | anthropic | gateway | any future id
+    return true; // claude_code | codex_cli | anthropic | gateway | any future id
   });
 
   /**
@@ -900,6 +907,11 @@ export class SettingsStore {
           return {
             connection: "Claude Code",
             destination: "Anthropic (via the claude CLI)",
+          };
+        case "codex_cli":
+          return {
+            connection: "Codex",
+            destination: "OpenAI (via the Codex CLI)",
           };
         case "anthropic":
           return { connection: "Anthropic API", destination: "api.anthropic.com" };
@@ -991,7 +1003,7 @@ export class SettingsStore {
 
   /**
    * Per-connection model catalogs from `list_models` (backend constant for
-   * claude_code/anthropic, live endpoints for ollama/gateway). A key that is
+   * claude_code/codex_cli/anthropic, live endpoints for ollama/gateway). A key that is
    * PRESENT with an empty array = "fetch tried, no catalog" → the pickers fall
    * back to a free-text input (the gateway keep-manually-typed pattern).
    */
@@ -1002,11 +1014,21 @@ export class SettingsStore {
   /** Connections with a `list_models` fetch currently in flight. */
   private readonly _modelsLoading = signal<ReadonlySet<string>>(new Set());
   readonly modelsLoading = this._modelsLoading.asReadonly();
+  /** Last catalog attempts that failed (distinct from a successful empty catalog). */
+  private readonly _modelCatalogFailures = signal<ReadonlySet<string>>(
+    new Set(),
+  );
+  /** One shared promise per connection prevents a selection race from observing a fake failure. */
+  private readonly _modelLoadPromises = new Map<string, Promise<boolean>>();
+  /** A stale loaded role-model repair that completed before load() armed persistence. */
+  private _catalogRepairPending = false;
 
   /** Fetch a connection's catalog once; later calls are no-ops (Refresh re-fetches). */
-  async ensureModels(connection: string): Promise<void> {
-    if (this._modelCatalogs()[connection] !== undefined) return;
-    await this.refreshModels(connection);
+  async ensureModels(connection: string): Promise<boolean> {
+    if (this._modelCatalogs()[connection] !== undefined) {
+      return !this._modelCatalogFailures().has(connection);
+    }
+    return this.refreshModels(connection);
   }
 
   /**
@@ -1015,23 +1037,90 @@ export class SettingsStore {
    * shows the free-text fallback instead of a dead select — same contract as
    * `refreshGatewayModels`. Button-driven or load-driven, never an effect.
    */
-  async refreshModels(connection: string): Promise<void> {
-    if (!PROVIDER_CONNECTION_IDS.includes(connection)) return;
-    if (this._modelsLoading().has(connection)) return;
+  refreshModels(connection: string): Promise<boolean> {
+    if (!PROVIDER_CONNECTION_IDS.includes(connection)) {
+      return Promise.resolve(false);
+    }
+    const active = this._modelLoadPromises.get(connection);
+    if (active) return active;
+    const load = this.loadModels(connection);
+    this._modelLoadPromises.set(connection, load);
+    void load.then(
+      () => this._modelLoadPromises.delete(connection),
+      () => this._modelLoadPromises.delete(connection),
+    );
+    return load;
+  }
+
+  private async loadModels(connection: string): Promise<boolean> {
     this._modelsLoading.set(new Set(this._modelsLoading()).add(connection));
     let models: string[] = [];
+    let loaded = true;
     try {
       models = await this.ipc.listModels(connection);
     } catch {
       // Fall through with [] — free-text fallback.
+      loaded = false;
     }
     this._modelCatalogs.set({ ...this._modelCatalogs(), [connection]: models });
+    const failures = new Set(this._modelCatalogFailures());
+    if (loaded) failures.delete(connection);
+    else failures.add(connection);
+    this._modelCatalogFailures.set(failures);
     const next = new Set(this._modelsLoading());
     next.delete(connection);
     this._modelsLoading.set(next);
+    if (loaded && CURATED_PROVIDER_CONNECTION_IDS.includes(connection)) {
+      this.repairForeignRoleModels(connection, models);
+    }
+    return loaded;
   }
 
-  /** The Default-model picker's catalog (claude_code/anthropic Default AI only). */
+  /**
+   * A role config can outlive its previous connection (older clients/manual edits). For curated
+   * catalogs, never preserve a foreign id as "custom": clear it to the selected connection's
+   * explicit default and persist the repair. Remote Ollama/Gateway ids remain user-extensible.
+   */
+  private repairForeignRoleModels(
+    connection: string,
+    models: readonly string[],
+  ): void {
+    const repairs: {
+      roleNotesModel?: string;
+      roleAskModel?: string;
+      roleLiveModel?: string;
+    } = {};
+    if (
+      this.form.controls.roleNotesConnection.value === connection &&
+      this.form.controls.roleNotesModel.value &&
+      !models.includes(this.form.controls.roleNotesModel.value)
+    ) {
+      repairs.roleNotesModel = "";
+    }
+    if (
+      this.form.controls.roleAskConnection.value === connection &&
+      this.form.controls.roleAskModel.value &&
+      !models.includes(this.form.controls.roleAskModel.value)
+    ) {
+      repairs.roleAskModel = "";
+    }
+    if (
+      this.form.controls.roleLiveConnection.value === connection &&
+      this.form.controls.roleLiveModel.value &&
+      !models.includes(this.form.controls.roleLiveModel.value)
+    ) {
+      repairs.roleLiveModel = "";
+    }
+    if (Object.keys(repairs).length === 0) return;
+    this.form.patchValue(repairs);
+    if (this.autoSaveReady) {
+      void this.save();
+    } else {
+      this._catalogRepairPending = true;
+    }
+  }
+
+  /** The Default-model picker's catalog (CLI/direct Default AI connections only). */
   readonly defaultModelCatalog = computed(
     () => this.modelCatalogs()[this._providerIdValue()] ?? [],
   );
@@ -1565,7 +1654,7 @@ export class SettingsStore {
       });
       this._loadedBrainBackend = (cfg.brainBackend ?? "cloud") as BrainBackend;
       // Prefetch the model catalogs the loaded config already renders selects
-      // for: the Default-model picker (claude_code/anthropic only — ollama/
+      // for: the Default-model picker (claude_code/codex_cli/anthropic — ollama/
       // gateway keep their model on the connection card, so prefetching their
       // REMOTE catalogs here would be network egress with zero UI payoff;
       // lock-security stage-4 boundary condition) and any concrete per-role
@@ -1573,7 +1662,9 @@ export class SettingsStore {
       // leaves an empty catalog and the pickers fall back to free-text inputs.
       for (const conn of new Set(
         [
-          cfg.providerId === "claude_code" || cfg.providerId === "anthropic"
+          cfg.providerId === "claude_code" ||
+          cfg.providerId === "codex_cli" ||
+          cfg.providerId === "anthropic"
             ? cfg.providerId
             : "",
           cfg.roleNotesConnection ?? "",
@@ -1641,6 +1732,10 @@ export class SettingsStore {
       // Only a SUCCESSFUL load arms auto-save — arming after a failed load
       // would let the pristine defaults overwrite the user's stored config.
       this.autoSaveReady = true;
+      if (this._catalogRepairPending) {
+        this._catalogRepairPending = false;
+        await this.save();
+      }
     } catch (e) {
       this._loadError.set(this.errorCopy.humanize(e));
     }

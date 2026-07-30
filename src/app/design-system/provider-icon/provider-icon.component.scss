@@ -1,0 +1,31 @@
+:host {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--space-6);
+  height: var(--space-6);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+}
+
+svg {
+  width: var(--space-5);
+  height: var(--space-5);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.45;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+:host([data-provider-icon="codex_cli"]) {
+  color: var(--text-primary);
+  background: var(--accent-soft);
+}
+
+:host([data-provider-icon="claude_code"]) svg {
+  stroke-width: 1.25;
+}

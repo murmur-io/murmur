@@ -300,7 +300,7 @@ mod tests {
     /// (availability of local models is irrelevant on a cloud target).
     #[test]
     fn route_cloud_targets_the_resolved_connection() {
-        for provider in ["claude_code", "anthropic", "ollama", "gateway"] {
+        for provider in ["claude_code", "codex_cli", "anthropic", "ollama", "gateway"] {
             let c = AppConfig {
                 provider_id: provider.to_string(),
                 brain_backend: BrainBackend::Cloud,
