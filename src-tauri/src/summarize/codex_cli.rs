@@ -1006,9 +1006,7 @@ impl CodexRuntimeHome {
         if !metadata.file_type().is_file() || validate_auth_metadata(&metadata).is_err() {
             return None;
         }
-        let Some(parent) = self.path.parent() else {
-            return None;
-        };
+        let parent = self.path.parent()?;
         let recovery = parent.join(format!("{RECOVERY_DIR_PREFIX}{}", uuid::Uuid::new_v4()));
         if create_private_directory(&recovery).is_err() {
             return None;
@@ -1094,7 +1092,7 @@ fn sweep_codex_recovery_dirs_in(root: &Path) {
             ))
         })
         .collect::<Vec<_>>();
-    recoveries.sort_by(|left, right| right.0.cmp(&left.0));
+    recoveries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let now = std::time::SystemTime::now();
     for (index, (modified, path)) in recoveries.into_iter().enumerate() {
         let too_old = now
@@ -1397,7 +1395,7 @@ fn normalize_note_markdown(text: &str, require_frontmatter: bool) -> crate::erro
                 .iter()
                 .filter(|(_, line)| line.trim().starts_with("```"))
                 .count();
-            if internal_fences.is_multiple_of(2) {
+            if internal_fences % 2 == 0 {
                 note_end = *closing_offset;
             }
         }
@@ -1428,7 +1426,7 @@ fn normalize_custom_markdown_without_frontmatter(text: &str, lines: &[(usize, &s
         .iter()
         .filter(|(_, line)| line.trim().starts_with("```"))
         .count();
-    if !internal_fences.is_multiple_of(2) {
+    if internal_fences % 2 != 0 {
         return text.to_string();
     }
     let body_start = lines
@@ -1706,9 +1704,11 @@ mod tests {
     impl crate::summarize::redact::NameRedactor for IntegratedNameRedactor {
         fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
             let redacted = text.replace(INTEGRATED_PRIVATE_NAME, "⟪NAME_1⟫");
-            let pairs = (redacted != text)
-                .then(|| vec![("⟪NAME_1⟫".to_string(), INTEGRATED_PRIVATE_NAME.to_string())])
-                .unwrap_or_default();
+            let pairs = if redacted != text {
+                vec![("⟪NAME_1⟫".to_string(), INTEGRATED_PRIVATE_NAME.to_string())]
+            } else {
+                Vec::new()
+            };
             (redacted, pairs)
         }
     }
