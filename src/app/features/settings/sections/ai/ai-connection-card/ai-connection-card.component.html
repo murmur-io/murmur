@@ -1,6 +1,7 @@
 <div class="conn-card" [formGroup]="form">
   <div class="conn-row">
     <div class="conn-main">
+      <mur-provider-icon [provider]="card().id" />
       <span class="conn-name">{{ card().name }}</span>
       @if (card().status?.available) {
         <span class="pill is-success">
@@ -100,6 +101,19 @@
             </span>
             <mur-toggle formControlName="claudeCodeInheritEnv" />
           </label>
+        }
+        @case ("codex_cli") {
+          <div class="codex-setup">
+            <span class="toggle-title">Uses your installed Codex CLI</span>
+            <span class="text-secondary toggle-sub">
+              Test checks the installed CLI file and its private sign-in file
+              without contacting OpenAI. If the card says setup is needed, run
+              <code>codex login</code> in Terminal. Murmur then uses that
+              ChatGPT or API login for requests. Each request is ephemeral;
+              Codex tools, workspace reads, web search and connectors are
+              disabled.
+            </span>
+          </div>
         }
         @case ("anthropic") {
           <div class="key-status">
@@ -339,4 +353,3 @@
     </div>
   }
 </div>
-  

@@ -102,6 +102,11 @@
   flex-direction: column;
   gap: var(--space-1);
 }
+.codex-setup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
 .toggle-title {
   color: var(--text-primary);
   font-size: 0.95rem;

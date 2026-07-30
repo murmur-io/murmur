@@ -62,7 +62,10 @@ export class AiSetupBlockComponent {
   readonly localLines = computed(() => {
     const models = this.store.brainModels();
     return [
-      { role: "Notes & Ask", model: models.find((m) => m.selectedHeavy) ?? null },
+      {
+        role: "Notes & Ask",
+        model: models.find((m) => m.selectedHeavy) ?? null,
+      },
       {
         role: "Live reactions",
         model: models.find((m) => m.selectedLight) ?? null,
@@ -98,11 +101,23 @@ export class AiSetupBlockComponent {
     }
   });
 
-  /** Prefetch the newly-picked engine's model catalog (claude_code/anthropic). */
-  onEngineChanged(e: Event): void {
+  /** Prefetch the newly-picked engine's model catalog and clear an incompatible stale model id. */
+  async onEngineChanged(e: Event): Promise<void> {
     const id = (e.target as HTMLSelectElement).value;
-    if (id === "claude_code" || id === "anthropic") {
-      void this.store.ensureModels(id);
+    if (id === "claude_code" || id === "codex_cli" || id === "anthropic") {
+      const catalogLoaded = await this.store.ensureModels(id);
+      if (this.form.controls.providerId.value !== id) return;
+      // Keep the user's stored model on transport/IPC failure. A successful empty catalog is
+      // different: it proves the new provider has no matching id, so the explicit default wins.
+      if (!catalogLoaded) return;
+      const model = this.form.controls.providerModel.value;
+      const catalog = this.store.modelCatalogs()[id] ?? [];
+      if (model && !catalog.includes(model)) {
+        // An engine switch must not silently opt the user into the first (usually highest-cost)
+        // model or retain a foreign id when catalog loading failed. Empty is an explicit,
+        // supported choice: let the selected provider pick its default.
+        this.form.controls.providerModel.setValue("");
+      }
     }
   }
 

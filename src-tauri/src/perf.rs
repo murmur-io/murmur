@@ -615,14 +615,14 @@ pub(crate) fn acquire_external_egress_lease(
 ) -> Result<RecordingWorkLease> {
     if crate::summarize::claude_code::has_unproven_process_group() {
         return Err(AppError::Unavailable(
-            "external egress is blocked by an unproven Claude CLI process group".into(),
+            "external egress is blocked by an unproven cloud CLI process group".into(),
         ));
     }
     acquire_work_lease(token)
 }
 
 /// Reserve one local/manual worker under the exact recording identity before its thread exists.
-/// Unlike the external-egress adapter, this carries no Claude-process prerequisite and makes no
+/// Unlike the external-egress adapter, this carries no cloud-CLI process prerequisite and makes no
 /// egress claim; it only closes the Live/Draining/Postprocess dispatch race.
 pub(crate) fn acquire_recording_work_lease(
     token: &RecordingSessionToken,
