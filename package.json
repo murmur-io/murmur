@@ -15,7 +15,7 @@
     "@angular/compiler": "^22.0.8",
     "@angular/core": "^22.0.8",
     "@angular/forms": "^22.0.8",
-    "@angular/platform-browser": "^22.0.8",
+    "@angular/platform-browser": "^22.1.0",
     "@angular/router": "^22.0.8",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.1",
