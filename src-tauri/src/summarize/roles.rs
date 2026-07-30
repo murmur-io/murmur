@@ -57,12 +57,13 @@ pub const CONN_AFM: &str = "apple";
 /// copy of these labels is `CONNECTION_LABELS` in `src/app/core/copy/labels.ts` (it used to live
 /// in `settings.store.ts` AND again in `record.component.ts`; P3 collapsed all three into the one
 /// copy module, which is the only place the FE may name a connection). The `connection_labels_
-/// mirror_the_frontend_copy_module` test below pins the four provider rows.
+/// mirror_the_frontend_copy_module` test below pins the provider rows.
 ///
 /// An unknown id falls back to itself, so a newly-added provider is never blank.
 pub fn connection_display_name(connection: &str) -> &str {
     match connection {
         "claude_code" => "Claude Code",
+        "codex_cli" => "Codex",
         "anthropic" => "Anthropic API",
         "ollama" => "Ollama",
         "gateway" => "Kong AI Gateway",
@@ -96,7 +97,7 @@ impl Role {
 }
 
 /// A resolved (connection, model, effort) triple for one role. `connection` is a provider id
-/// (`claude_code` / `anthropic` / `ollama` / `gateway`) or a reasoner-only target
+/// (`claude_code` / `codex_cli` / `anthropic` / `ollama` / `gateway`) or a reasoner-only target
 /// ([`CONN_LOCAL`] / [`CONN_OFF`]). An empty `model`/`effort` means "inherit that connection's
 /// own default" (the factory arms already resolve those — e.g. anthropic → `anthropic_model`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,15 +169,17 @@ fn explicit_target(role: Role, cfg: &AppConfig) -> RoleTarget {
 /// The LEGACY default-provider triple — what every pre-role `make_provider(&cfg.provider_id, …)`
 /// call site effectively targeted.
 ///
-/// `model` carries `provider_model` ONLY for the arms that historically read it (`claude_code`,
-/// `anthropic`); the `ollama`/`gateway` arms have always resolved their model from
+/// `model` carries `provider_model` for the CLI/direct arms that read it (`claude_code`,
+/// `codex_cli`, `anthropic`); the `ollama`/`gateway` arms have always resolved their model from
 /// `ollama_model`/`gateway_model` and IGNORED `provider_model` (the Brain&AI picker is inert
 /// there), so their fallback model is `""` = inherit-connection-default. Carrying
 /// `provider_model` verbatim would make a stale Claude id from the picker suddenly reach an
 /// ollama/gateway request — a real behavior change for existing configs.
 fn legacy_default_target(cfg: &AppConfig) -> RoleTarget {
     let model = match cfg.provider_id.as_str() {
-        crate::summarize::PROVIDER_CLAUDE_CODE | crate::summarize::PROVIDER_ANTHROPIC => {
+        crate::summarize::PROVIDER_CLAUDE_CODE
+        | crate::summarize::PROVIDER_CODEX_CLI
+        | crate::summarize::PROVIDER_ANTHROPIC => {
             cfg.provider_model.clone()
         }
         _ => String::new(),
@@ -270,8 +273,9 @@ mod tests {
 
     #[test]
     fn connection_display_name_is_human_friendly() {
-        // The four real providers render as their user-facing labels (matches the FE).
+        // The real providers render as their user-facing labels (matches the FE).
         assert_eq!(connection_display_name("claude_code"), "Claude Code");
+        assert_eq!(connection_display_name("codex_cli"), "Codex");
         assert_eq!(connection_display_name("anthropic"), "Anthropic API");
         assert_eq!(connection_display_name("ollama"), "Ollama");
         assert_eq!(connection_display_name("gateway"), "Kong AI Gateway");
@@ -282,7 +286,7 @@ mod tests {
     }
 
     /// The DOCUMENTED MIRROR guard. `src/app/core/copy/labels.ts::CONNECTION_LABELS` carries the
-    /// same four strings; this test is the Rust half of "they change together or they drift".
+    /// same strings; this test is the Rust half of "they change together or they drift".
     /// A rename that lands here without landing there (or vice versa) makes the pipeline's
     /// "Summarizing with …" line disagree with the Settings summary for the same connection.
     #[test]
@@ -290,6 +294,7 @@ mod tests {
         // Keep in lockstep with src/app/core/copy/labels.ts::CONNECTION_LABELS.
         const FRONTEND_LABELS: &[(&str, &str)] = &[
             ("claude_code", "Claude Code"),
+            ("codex_cli", "Codex"),
             ("anthropic", "Anthropic API"),
             ("ollama", "Ollama"),
             ("gateway", "Kong AI Gateway"),
@@ -353,12 +358,12 @@ mod tests {
     /// zero-behavior-change proof at the resolution layer.
     #[test]
     fn resolve_identity_matrix_with_keys_absent() {
-        for provider_id in ["claude_code", "anthropic", "ollama", "gateway"] {
-            // The legacy arms read `provider_model` only for claude_code/anthropic; ollama and
+        for provider_id in ["claude_code", "codex_cli", "anthropic", "ollama", "gateway"] {
+            // The legacy arms read `provider_model` for claude_code/codex_cli/anthropic; ollama and
             // gateway resolve their model from ollama_model/gateway_model (provider_model is
             // inert there), so their fallback model is "" = inherit-connection-default.
             let legacy_model = match provider_id {
-                "claude_code" | "anthropic" => "picker-model",
+                "claude_code" | "codex_cli" | "anthropic" => "picker-model",
                 _ => "",
             };
             let notes_want = target(provider_id, legacy_model, "high");
@@ -473,7 +478,7 @@ mod tests {
     /// pre-role Ask provider paths (chat_meeting, the ask_vault floor) ignored `brain_backend`.
     #[test]
     fn provider_target_is_default_triple_under_fallback_for_all_backends() {
-        for provider_id in ["claude_code", "anthropic", "ollama", "gateway"] {
+        for provider_id in ["claude_code", "codex_cli", "anthropic", "ollama", "gateway"] {
             for backend in [
                 BrainBackend::Cloud,
                 BrainBackend::Local,

@@ -14,6 +14,7 @@
 //! `meta.language`, `meta.duration_s`) pass verbatim. A new string field is caught by
 //! `every_string_field_of_summarize_request_is_scrubbed_or_exempt`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -594,6 +595,7 @@ fn redact_names_batch(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderEgressClass {
     SplitSystemUser,
+    CodexStdin,
     Ollama,
 }
 
@@ -602,6 +604,7 @@ fn provider_egress_class(provider_id: &str) -> Result<ProviderEgressClass> {
         crate::summarize::PROVIDER_CLAUDE_CODE
         | crate::summarize::PROVIDER_ANTHROPIC
         | crate::summarize::PROVIDER_GATEWAY => Ok(ProviderEgressClass::SplitSystemUser),
+        crate::summarize::PROVIDER_CODEX_CLI => Ok(ProviderEgressClass::CodexStdin),
         crate::summarize::PROVIDER_OLLAMA => Ok(ProviderEgressClass::Ollama),
         _ => Err(AppError::InvalidArg(
             "cloud provider has no registered egress rendering class; dispatch refused".into(),
@@ -609,9 +612,9 @@ fn provider_egress_class(provider_id: &str) -> Result<ProviderEgressClass> {
     }
 }
 
-/// Render the exact two byte streams the wrapped provider sends for a note summary. Anthropic,
-/// Gateway, and Claude Code use a system/user split; remote Ollama sends the same combined prompt
-/// its provider implementation builds with `render_prompt`.
+/// Render the exact byte streams the wrapped provider sends for a note summary. Anthropic,
+/// Gateway, and Claude Code use a system/user split. Codex and remote Ollama each send one
+/// provider-specific combined stdin/prompt stream.
 fn rendered_summarize_egress(
     class: ProviderEgressClass,
     req: &SummarizeRequest,
@@ -620,6 +623,10 @@ fn rendered_summarize_egress(
         ProviderEgressClass::Ollama => (
             String::new(),
             crate::summarize::template::render_prompt(req),
+        ),
+        ProviderEgressClass::CodexStdin => (
+            String::new(),
+            crate::summarize::codex_cli::render_summarize_stdin(req),
         ),
         ProviderEgressClass::SplitSystemUser => {
             let system = if req.template.trim().is_empty() {
@@ -633,7 +640,7 @@ fn rendered_summarize_egress(
     }
 }
 
-/// Return the exact two text fields sent by a raw completion.
+/// Return the exact byte streams sent by a raw completion.
 ///
 /// Unlike note summarization, Ollama completion does **not** concatenate the channels:
 /// `OllamaProvider::complete` serializes them as distinct `/api/generate` JSON fields
@@ -643,11 +650,16 @@ fn rendered_complete_egress<'a>(
     class: ProviderEgressClass,
     system: &'a str,
     user: &'a str,
-) -> (&'a str, &'a str) {
+) -> (Cow<'a, str>, Cow<'a, str>) {
     match class {
-        ProviderEgressClass::SplitSystemUser => (system, user),
+        ProviderEgressClass::SplitSystemUser => (Cow::Borrowed(system), Cow::Borrowed(user)),
+        ProviderEgressClass::CodexStdin => (
+            Cow::Borrowed(""),
+            Cow::Owned(crate::summarize::codex_cli::render_prompt(system, user)),
+        ),
         ProviderEgressClass::Ollama => {
-            crate::summarize::ollama::completion_prompt_parts(system, user)
+            let (system, user) = crate::summarize::ollama::completion_prompt_parts(system, user);
+            (Cow::Borrowed(system), Cow::Borrowed(user))
         }
     }
 }
@@ -1175,7 +1187,7 @@ impl SummarizerProvider for RedactingProvider {
         // Compute this before dispatch: even a provider failure must leave one content-free receipt
         // bound to the exact scrubbed bytes that were attempted.
         let redactions =
-            count_rendered_redactions(&map, &name_pairs, rendered_system, rendered_user);
+            count_rendered_redactions(&map, &name_pairs, &rendered_system, &rendered_user);
         let _egress_lease =
             crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (out, meta) = match self.inner.complete_with_meta(&rsys, &ruser).await {
@@ -1279,7 +1291,7 @@ impl SummarizerProvider for RedactingProvider {
         // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
         // Count before dispatch so the error receipt remains exact even when no response meta exists.
         let redactions =
-            count_rendered_redactions(&map, &name_pairs, rendered_system, rendered_user);
+            count_rendered_redactions(&map, &name_pairs, &rendered_system, &rendered_user);
         let _egress_lease =
             crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (value, meta) = match self
@@ -1361,6 +1373,36 @@ mod tests {
         let (red, map) = redact("We decided to ship on Friday.");
         assert_eq!(red, "We decided to ship on Friday.");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn codex_ledger_rendering_matches_the_single_stdin_payload() {
+        let class = provider_egress_class(crate::summarize::PROVIDER_CODEX_CLI).unwrap();
+        assert_eq!(class, ProviderEgressClass::CodexStdin);
+        let (system, stdin) = rendered_complete_egress(class, "system", "user");
+        assert!(system.is_empty());
+        assert_eq!(
+            stdin,
+            crate::summarize::codex_cli::render_prompt("system", "user")
+        );
+    }
+
+    #[test]
+    fn codex_summary_ledger_rendering_is_the_provider_stdin() {
+        let mut req = sample_req("Anna decided to ship on Friday.");
+        req.template = "Write a concise note.".into();
+        req.related_context = Some("Prior decision: use the shared provider seam.".into());
+        req.user_notes = Some("Keep the exact ledger payload.".into());
+        req.live_bullets = Some("Decision captured.".into());
+        req.glossary = Some("Murmur = local-first meeting notes".into());
+
+        let (system, stdin) = rendered_summarize_egress(ProviderEgressClass::CodexStdin, &req);
+
+        assert!(system.is_empty());
+        assert_eq!(
+            stdin,
+            crate::summarize::codex_cli::render_summarize_stdin(&req)
+        );
     }
 
     // ── name-redaction seam ──────────────────────────────────────────────────
