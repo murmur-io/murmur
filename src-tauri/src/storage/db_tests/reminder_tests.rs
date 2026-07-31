@@ -6,6 +6,7 @@ use crate::storage::models::{
     Folder, Meeting, MeetingStatus, NoteRecord, ReminderDraft, ReminderOrigin, ReminderRepeatUnit,
     ReminderSourceAnchor, ReminderState,
 };
+use crate::storage::reminder_store::ReminderSuggestionPromotion;
 
 fn reminder_db() -> Db {
     register_vec_extension();
@@ -788,26 +789,26 @@ fn smart_suggestions_promote_once_and_siblings_can_promote_sequentially() {
     });
 
     assert!(db
-        .promote_pending_reminder_suggestion(
-            &rows[0].id,
-            "meeting",
-            "m1",
-            &hash,
-            "r-smart-1",
-            &first_draft,
-            20,
-        )
+        .promote_pending_reminder_suggestion(ReminderSuggestionPromotion {
+            suggestion_id: &rows[0].id,
+            expected_source_kind: "meeting",
+            expected_source_id: "m1",
+            expected_content_hash: &hash,
+            reminder_id: "r-smart-1",
+            draft: &first_draft,
+            now: 20,
+        })
         .unwrap());
     assert!(!db
-        .promote_pending_reminder_suggestion(
-            &rows[0].id,
-            "meeting",
-            "m1",
-            &hash,
-            "r-replay",
-            &first_draft,
-            21,
-        )
+        .promote_pending_reminder_suggestion(ReminderSuggestionPromotion {
+            suggestion_id: &rows[0].id,
+            expected_source_kind: "meeting",
+            expected_source_id: "m1",
+            expected_content_hash: &hash,
+            reminder_id: "r-replay",
+            draft: &first_draft,
+            now: 21,
+        })
         .unwrap());
     assert!(db
         .reminder_audit_cache_matches("meeting", "m1", &hash, "stub-local")
@@ -820,15 +821,15 @@ fn smart_suggestions_promote_once_and_siblings_can_promote_sequentially() {
     let mut second_draft = draft(2_000_000_100_000);
     second_draft.title = "Second accepted task".into();
     assert!(db
-        .promote_pending_reminder_suggestion(
-            &after_first[0].id,
-            "meeting",
-            "m1",
-            &hash,
-            "r-smart-2",
-            &second_draft,
-            22,
-        )
+        .promote_pending_reminder_suggestion(ReminderSuggestionPromotion {
+            suggestion_id: &after_first[0].id,
+            expected_source_kind: "meeting",
+            expected_source_id: "m1",
+            expected_content_hash: &hash,
+            reminder_id: "r-smart-2",
+            draft: &second_draft,
+            now: 22,
+        })
         .unwrap());
     assert!(db
         .list_pending_reminder_suggestions("meeting", "m1", &hash, "stub-local", 32)
@@ -1144,15 +1145,15 @@ fn smart_decision_fingerprints_are_purged_while_accepted_reminders_survive() {
         .find(|row| row.title == "Dismissed task")
         .unwrap();
     assert!(db
-        .promote_pending_reminder_suggestion(
-            &accepted.id,
-            "meeting",
-            "m1",
-            &hash,
-            "r-accepted",
-            &draft(2_000_000_000_000),
-            20,
-        )
+        .promote_pending_reminder_suggestion(ReminderSuggestionPromotion {
+            suggestion_id: &accepted.id,
+            expected_source_kind: "meeting",
+            expected_source_id: "m1",
+            expected_content_hash: &hash,
+            reminder_id: "r-accepted",
+            draft: &draft(2_000_000_000_000),
+            now: 20,
+        })
         .unwrap());
     assert!(db
         .dismiss_pending_reminder_suggestion(&dismissed.id, "meeting", "m1", &hash)

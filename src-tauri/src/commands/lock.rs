@@ -94,6 +94,7 @@ fn emit_reminder_visibility_invalidated_fail_closed(app: &AppHandle) {
 /// Run the initial seal under an already-closed MCP response gate. Reopen admission only once the
 /// folder is durably marked locked and absent from the session unlock set. If sealing fails before
 /// that logical transition, dropping the incomplete revocation deliberately leaves the gate closed.
+#[cfg(test)]
 pub(crate) fn lock_folder_with_visibility_revocation(
     state: &AppState,
     folder_id: &str,
@@ -129,6 +130,7 @@ fn lock_folder_with_visibility_revocation_and_notice(
 
 /// Inner of [`lock_folder`] taking `&AppState` (so the lifecycle stress test can drive it without a
 /// `tauri::State`). Holds the [`AppState::lifecycle`] guard for the whole seal.
+#[cfg(test)]
 pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
     lock_folder_inner_with_visibility_notice(state, folder_id, || {})
 }
@@ -827,6 +829,7 @@ pub(crate) fn relock_all_with_visibility_gate(
 /// restore-plaintext (Step 1) and clear-`content_blob` (Step 2). All three off-thread callers and
 /// the `relock_all` command funnel through here, so the guard lives HERE (the `relock_all` command
 /// must NOT take it separately — a std `Mutex` is non-reentrant and would self-deadlock).
+#[cfg(test)]
 pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     relock_all_inner_with_visibility_notice(state, || {})
 }
