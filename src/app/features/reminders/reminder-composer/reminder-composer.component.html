@@ -1,0 +1,163 @@
+@if (service.request() && listenerState() === "ready") {
+  <div class="composer-backdrop">
+    <button
+      type="button"
+      class="composer-scrim"
+      aria-label="Close reminder composer"
+      [disabled]="busy()"
+      (click)="close()"
+    ></button>
+    <section
+      #panel
+      class="composer-panel"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      [attr.aria-labelledby]="'reminder-composer-title'"
+    >
+      <header class="composer-head">
+        <div>
+          <p class="composer-eyebrow">Murmur reminders</p>
+          <h2 id="reminder-composer-title">{{ heading() }}</h2>
+        </div>
+        <button
+          type="button"
+          class="composer-close"
+          aria-label="Close reminder composer"
+          [disabled]="busy()"
+          (click)="close()"
+        >
+          ×
+        </button>
+      </header>
+
+      <form class="composer-form" (submit)="submit($event)">
+        <label class="field">
+          <span>Title</span>
+          <input
+            #titleInput
+            type="text"
+            maxlength="240"
+            required
+            autocomplete="off"
+            [value]="title()"
+            [disabled]="busy()"
+            (input)="setTitle($any($event.target).value)"
+          />
+        </label>
+
+        <label class="field">
+          <span>Details <small>optional</small></span>
+          <textarea
+            maxlength="4000"
+            rows="3"
+            [value]="details()"
+            [disabled]="busy()"
+            (input)="setDetails($any($event.target).value)"
+          ></textarea>
+        </label>
+
+        <div class="due-grid">
+          <label class="field">
+            <span>Date</span>
+            <input
+              type="date"
+              required
+              [value]="date()"
+              [disabled]="busy()"
+              (input)="setDate($any($event.target).value)"
+            />
+          </label>
+          <label class="field">
+            <span>Time</span>
+            <input
+              type="time"
+              required
+              [value]="time()"
+              [disabled]="busy()"
+              (input)="setTime($any($event.target).value)"
+            />
+          </label>
+        </div>
+
+        <div class="repeat-row">
+          <label class="repeat-toggle">
+            <input
+              type="checkbox"
+              [checked]="repeats()"
+              [disabled]="busy()"
+              (change)="setRepeats($any($event.target).checked)"
+            />
+            <span>Repeat</span>
+          </label>
+          @if (repeats()) {
+            <span>every</span>
+            <input
+              class="repeat-number"
+              type="number"
+              min="1"
+              max="365"
+              required
+              aria-label="Repeat every"
+              [value]="repeatEvery()"
+              [disabled]="busy()"
+              (input)="setRepeatEvery($any($event.target).value)"
+            />
+            <select
+              aria-label="Repeat unit"
+              [value]="repeatUnit()"
+              [disabled]="busy()"
+              (change)="setRepeatUnit($any($event.target).value)"
+            >
+              <option value="days">days</option>
+              <option value="weeks">weeks</option>
+              <option value="months">months</option>
+              <option value="years">years</option>
+            </select>
+          }
+        </div>
+
+        <div class="sources-field">
+          <div class="sources-label">
+            <span>Sources <small>optional</small></span>
+            <span>{{ sources().length }} / 20</span>
+          </div>
+          <mur-source-picker
+            [selected]="sources()"
+            (selectedChange)="setSources($event)"
+            [allowedKinds]="allowedKinds"
+            [disabled]="busy()"
+            [selectionLimit]="20"
+            triggerLabel="+ Add source"
+            placeholder="Find a note or meeting…"
+          />
+          @if (sourceLimitReached()) {
+            <p class="field-hint">Maximum 20 sources.</p>
+          }
+        </div>
+
+        @if (error(); as message) {
+          <p class="composer-error" role="alert">{{ message }}</p>
+        }
+
+        <footer class="composer-actions">
+          <button
+            type="button"
+            class="btn btn-ghost"
+            [disabled]="busy()"
+            (click)="close()"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            class="btn btn-primary"
+            [disabled]="!valid() || busy()"
+          >
+            {{ submitLabel() }}
+          </button>
+        </footer>
+      </form>
+    </section>
+  </div>
+}

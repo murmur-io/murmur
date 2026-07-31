@@ -654,6 +654,15 @@
             </div>
           }
 
+          @if (!embedded() && !doc.locked) {
+            <app-smart-reminder-card
+              sourceKind="note"
+              [sourceId]="doc.id"
+              [sourceTitle]="title() || doc.title"
+              [sourceRevision]="doc.updatedAt"
+            />
+          }
+
         </article>
       }
     }

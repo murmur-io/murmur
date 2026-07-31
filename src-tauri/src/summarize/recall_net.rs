@@ -218,6 +218,47 @@ pub fn append_possible_missed_items(note_markdown: &str, segments: &[Segment]) -
         return note_markdown.to_string();
     }
 
+    let MissedItemScan { picked, overflow } = scan_possible_missed_items(note_markdown, segments);
+    if picked.is_empty() {
+        return note_markdown.to_string();
+    }
+
+    let mut out = note_markdown.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(MISSED_HEADING);
+    out.push_str("\n\n");
+    out.push_str(MISSED_PREAMBLE);
+    out.push_str("\n\n");
+    for quote in &picked {
+        out.push_str("- \"");
+        out.push_str(quote);
+        out.push_str("\"\n");
+    }
+    // NO SILENT CAP: say how many cue-bearing lines the cap hid.
+    if overflow > 0 {
+        let cap = MAX_MISSED;
+        out.push_str(&format!(
+            "- _(+{overflow} more cue-bearing line(s) not shown — this scan shows at most {cap}.)_\n"
+        ));
+    }
+    out
+}
+
+/// Return the same conservative EN/PL transcript commitments the recall-net renderer may surface.
+///
+/// This is a bounded, deterministic, zero-egress helper for callers that need the candidates
+/// without mutating or rendering the note. An already-rendered [`MISSED_HEADING`] does not suppress
+/// extraction here; idempotency remains a renderer concern.
+pub fn possible_missed_item_candidates(note_markdown: &str, segments: &[Segment]) -> Vec<String> {
+    scan_possible_missed_items(note_markdown, segments).picked
+}
+
+struct MissedItemScan {
+    picked: Vec<String>,
+    overflow: usize,
+}
+
+fn scan_possible_missed_items(note_markdown: &str, segments: &[Segment]) -> MissedItemScan {
     // What the note ALREADY captured: one content-token set per parsed checklist item. Note that
     // `parse_action_items` drops assistant-directed lines ("Klaudku, …") — the candidate side below
     // filters the identical class out of the transcript, so the two sides stay consistent.
@@ -265,29 +306,10 @@ pub fn append_possible_missed_items(note_markdown: &str, segments: &[Segment]) -
         picked.push((quote_of(text), toks));
     }
 
-    if picked.is_empty() {
-        return note_markdown.to_string();
+    MissedItemScan {
+        picked: picked.into_iter().map(|(quote, _)| quote).collect(),
+        overflow,
     }
-
-    let mut out = note_markdown.trim_end().to_string();
-    out.push_str("\n\n");
-    out.push_str(MISSED_HEADING);
-    out.push_str("\n\n");
-    out.push_str(MISSED_PREAMBLE);
-    out.push_str("\n\n");
-    for (quote, _) in &picked {
-        out.push_str("- \"");
-        out.push_str(quote);
-        out.push_str("\"\n");
-    }
-    // NO SILENT CAP: say how many cue-bearing lines the cap hid.
-    if overflow > 0 {
-        let cap = MAX_MISSED;
-        out.push_str(&format!(
-            "- _(+{overflow} more cue-bearing line(s) not shown — this scan shows at most {cap}.)_\n"
-        ));
-    }
-    out
 }
 
 /// Whether `note_markdown` already carries the appended section (line-exact heading match, so a

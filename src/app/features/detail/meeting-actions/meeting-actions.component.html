@@ -4,7 +4,7 @@
       <div class="act-head-text">
         <h3 class="act-title">Action items</h3>
         <span class="act-sub"
-          >Send them to Reminders, or write them into your note</span
+          >Send them to Apple Reminders, or write them into your note</span
         >
       </div>
       <button
@@ -63,11 +63,11 @@
                   type="button"
                   class="btn btn-ghost act-add"
                   [disabled]="busyIdx().has(it.idx)"
-                  [attr.aria-label]="'Add to Reminders: ' + it.text"
+                  [attr.aria-label]="'Add to Apple Reminders: ' + it.text"
                   (click)="addToReminders(it)"
                 >
                   {{
-                    busyIdx().has(it.idx) ? "Adding…" : "Add to Reminders"
+                    busyIdx().has(it.idx) ? "Adding…" : "Add to Apple Reminders"
                   }}
                 </button>
               }
@@ -82,4 +82,11 @@
     </ul>
   </div>
 }
+
+<app-smart-reminder-card
+  sourceKind="meeting"
+  [sourceId]="meetingId()"
+  [sourceTitle]="meetingTitle() ?? 'Meeting'"
+  [sourceRevision]="sourceRevision()"
+/>
   

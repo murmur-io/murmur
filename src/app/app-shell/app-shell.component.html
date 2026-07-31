@@ -121,6 +121,9 @@
                 >
                   <mur-icon [icon]="item.icon" />
                   <span class="nav-label">{{ item.label }}</span>
+                  @if (item.path === "/reminders" && reminderCount() > 0) {
+                    <span class="count nav-reminder-count">{{ reminderCount() }}</span>
+                  }
                 </a>
               }
             }
@@ -231,6 +234,9 @@
         >
           <mur-icon [icon]="item.icon" />
           <span class="nav-label">{{ item.label }}</span>
+          @if (item.path === "/reminders" && reminderCount() > 0) {
+            <span class="count nav-reminder-count">{{ reminderCount() }}</span>
+          }
         </a>
       }
 
@@ -373,3 +379,5 @@
   (dismiss)="docPreview.close()"
 />
 
+<!-- The one opaque app-wide Murmur reminder composer host. -->
+<app-reminder-composer />
