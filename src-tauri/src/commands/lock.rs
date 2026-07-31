@@ -50,21 +50,67 @@ pub fn lock_folder(
         &app,
         crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
     );
-    lock_folder_with_visibility_revocation(state.inner(), &folder_id, mcp_revocation)?;
+    let result = lock_folder_with_visibility_revocation_and_notice(
+        state.inner(),
+        &folder_id,
+        mcp_revocation,
+        || emit_reminder_visibility_invalidated_fail_closed(&app),
+    );
+    result?;
     // The seal purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
+/// A lock authority transition must synchronously revoke every FE reminder-title cache. If the
+/// content-free Tauri event bus itself fails, tear down the renderer and terminate the app instead
+/// of leaving a stale source title that could reappear when a merely hidden window is shown again.
+fn emit_reminder_visibility_invalidated_fail_closed(app: &AppHandle) {
+    if crate::events::emit_reminder_visibility_invalidated(app) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(error) = window.hide() {
+            tracing::error!(
+                target: "reminders",
+                error = %error,
+                "failed to hide Murmur after reminder visibility invalidation failure"
+            );
+        }
+        if let Err(error) = window.destroy() {
+            tracing::error!(
+                target: "reminders",
+                error = %error,
+                "failed to destroy Murmur renderer after reminder visibility invalidation failure"
+            );
+        }
+    }
+    // `exit` remains the terminal fallback even if the window manager rejected both operations.
+    // The database is already fail-closed; exiting prevents any surviving renderer cache from
+    // being presented after the visibility authority changed.
+    app.exit(1);
+}
+
 /// Run the initial seal under an already-closed MCP response gate. Reopen admission only once the
 /// folder is durably marked locked and absent from the session unlock set. If sealing fails before
 /// that logical transition, dropping the incomplete revocation deliberately leaves the gate closed.
+#[cfg(test)]
 pub(crate) fn lock_folder_with_visibility_revocation(
     state: &AppState,
     folder_id: &str,
     mcp_revocation: crate::mcp::VisibilityRevocation,
 ) -> Result<(), AppError> {
-    let result = lock_folder_inner(state, folder_id.to_string());
+    lock_folder_with_visibility_revocation_and_notice(state, folder_id, mcp_revocation, || {})
+}
+
+fn lock_folder_with_visibility_revocation_and_notice(
+    state: &AppState,
+    folder_id: &str,
+    mcp_revocation: crate::mcp::VisibilityRevocation,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
+    let result =
+        lock_folder_inner_with_visibility_notice(state, folder_id.to_string(), visibility_revoked);
     let logically_revoked = state
         .db
         .folder_by_id(folder_id)
@@ -84,7 +130,16 @@ pub(crate) fn lock_folder_with_visibility_revocation(
 
 /// Inner of [`lock_folder`] taking `&AppState` (so the lifecycle stress test can drive it without a
 /// `tauri::State`). Holds the [`AppState::lifecycle`] guard for the whole seal.
+#[cfg(test)]
 pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
+    lock_folder_inner_with_visibility_notice(state, folder_id, || {})
+}
+
+pub(crate) fn lock_folder_inner_with_visibility_notice(
+    state: &AppState,
+    folder_id: String,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
     let folder = state
         .db
@@ -103,6 +158,10 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         // Always replay that idempotent tail. Only release the CK when primary plaintext/audio residue
         // proves the keyed portion itself was interrupted.
         bump_seal_epoch(state);
+        // The durable gate is already closed. Blank every renderer cache before attempting the
+        // fallible session-authority cleanup below; its canonical refresh waits on this lifecycle
+        // guard and therefore cannot observe the intermediate state.
+        visibility_revoked();
         {
             let mut unlocked = state
                 .unlocked_folders
@@ -310,7 +369,11 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // with intact plaintext — never lost content.
     state
         .db
-        .set_folder_locked(&folder_id, true, Some(&wrapped))?;
+        .publish_fresh_folder_lock_and_purge_reminder_derived(&folder_id, &wrapped)?;
+    // `locked=1` is now a durable visibility gate. Notify before any subsequent fallible step,
+    // including the session-set mutex: a poisoned mutex must return an error with renderer caches
+    // already blanked (or the main window hidden if the event bus failed).
+    visibility_revoked();
     {
         let mut unlocked = state
             .unlocked_folders
@@ -663,6 +726,10 @@ pub fn relock_folder(
             "folder visibility changed before relock preparation".into(),
         ));
     }
+    // Verify EVERY non-empty plaintext family before deleting an export or blanking the first DB
+    // column. Retained blobs must match byte-identically; missing blobs are encrypt+verified into an
+    // immutable repair plan. The lifecycle guard prevents either side changing afterward.
+    let verified = verify_relock_retained_blobs(state.inner(), &folder_id)?;
     // Remove every managed plaintext export before revoking visibility. A user-modified export or
     // collision sibling fails here while the folder is still open, never after `locked` is visible.
     prepare_folder_exports_before_relock(state.inner(), &folder_id)?;
@@ -681,9 +748,16 @@ pub fn relock_folder(
     // Epoch + session membership now authoritatively hide this folder. New MCP responses may be
     // admitted against that post-revocation snapshot while physical cleanup continues.
     crate::mcp::finish_visibility_revocation(mcp_revocation);
+    // Emit while the lifecycle guard is still held. The FE discards cached titles synchronously;
+    // its canonical refresh cannot pass the same guard until physical reblank has completed.
+    emit_reminder_visibility_invalidated_fail_closed(&app);
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
+    // Any interrupted-fresh-seal rows now receive only ciphertexts that the preflight already
+    // decrypt-verified against their exact plaintext. This is after export cleanup and logical
+    // revocation, but before the first broad reblank.
+    verified.apply_repairs(&state.db)?;
     let mut one = std::collections::HashSet::new();
     one.insert(folder_id.clone());
     // Brain-v3 audit Fix 4: strip the just-re-sealed items' `[[Title]]` markers from VISIBLE sources
@@ -697,7 +771,7 @@ pub fn relock_folder(
     remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline plaintext and drop the decrypted session WAV
     // (the .enc + the *_blob columns stay; the folder is still locked=1 on disk).
-    reblank_folder_extras(state.inner(), &folder_id)?;
+    reblank_folder_extras_after_verification(state.inner(), &folder_id, verified.ck())?;
     drain_lock_marker_export_cleanup(&state.db)?;
     // The folder has remained logically hidden throughout. A failure above retains the cached KEK
     // for a repair retry; success leaves it available for other still-unlocked folders.
@@ -731,7 +805,9 @@ pub(crate) fn relock_all_with_visibility_gate(
         crate::mcp::VisibilityRevokingEntrypoint::RelockAll,
     );
     let prior_epoch = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst);
-    let result = relock_all_inner(state);
+    let result = relock_all_inner_with_visibility_notice(state, || {
+        emit_reminder_visibility_invalidated_fail_closed(app);
+    });
     // `relock_all_inner` deliberately keeps logical revocation even when a later vault/DB cleanup
     // fails. Reopen only if the epoch advanced and the unlock authority is observably empty.
     let logically_revoked = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst)
@@ -753,7 +829,15 @@ pub(crate) fn relock_all_with_visibility_gate(
 /// restore-plaintext (Step 1) and clear-`content_blob` (Step 2). All three off-thread callers and
 /// the `relock_all` command funnel through here, so the guard lives HERE (the `relock_all` command
 /// must NOT take it separately — a std `Mutex` is non-reentrant and would self-deadlock).
+#[cfg(test)]
 pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
+    relock_all_inner_with_visibility_notice(state, || {})
+}
+
+fn relock_all_inner_with_visibility_notice(
+    state: &AppState,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
     // Snapshot the session set, then revoke every gated read BEFORE any fallible filesystem work.
     // This ordering is load-bearing for screen-share: an external edit or unlink failure may retain
@@ -779,16 +863,45 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.clear();
     }
+    // This callback is deliberately inside the lifecycle interval and immediately after the
+    // in-memory visibility authority is cleared. A FE re-fetch therefore blocks until every
+    // fallible reblank step has either completed or failed closed, while cached titles disappear
+    // at the exact logical transition.
+    visibility_revoked();
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
-    for folder_id in &session_unlocked {
+    // Resolve every target and preflight ALL non-empty plaintext before the first export removal or
+    // DB blank. Retained blobs are authenticated; missing blobs are encrypt+verified into immutable
+    // repair plans. Visibility is already revoked fail-closed, while the cached KEK remains held for
+    // an authenticated retry if any retained blob is corrupt or stale.
+    let locked: std::collections::HashSet<String> =
+        state.db.locked_folder_ids()?.into_iter().collect();
+    let mut verified_relocks = Vec::with_capacity(locked.len());
+    for folder_id in &locked {
+        verified_relocks.push((
+            folder_id.clone(),
+            verify_relock_retained_blobs(state, folder_id)?,
+        ));
+    }
+    let mut export_cleanup: std::collections::HashSet<String> =
+        session_unlocked.iter().cloned().collect();
+    for (folder_id, verified) in &verified_relocks {
+        if verified.ck().is_some() {
+            export_cleanup.insert(folder_id.clone());
+        }
+    }
+    for folder_id in &export_cleanup {
         prepare_folder_exports_before_relock(state, folder_id)?;
+    }
+    // Every folder plan was fully built before this first plaintext blank. Applying a repair stores
+    // only ciphertext already decrypt-verified byte-identical; any later failure retains the cached
+    // KEK and leaves completed rows recoverable for an idempotent retry.
+    for (_, verified) in &verified_relocks {
+        verified.apply_repairs(&state.db)?;
     }
     // Re-blank every sealed note across all locked folders. The tx also purges ALL memory rollups
     // (may paraphrase the re-sealed facts) — their exported vault `.md`s are removed here.
-    let locked: std::collections::HashSet<String> =
-        state.db.locked_folder_ids()?.into_iter().collect();
     // Brain-v3 audit Fix 4: BEFORE the relock purge drops the naming edges, strip the just-re-sealed
     // items' `[[Title]]` markers from every VISIBLE source note (a source in a DIFFERENT still-open
     // folder that was materialized while this folder was session-unlocked) + re-export those sources'
@@ -799,8 +912,8 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline + drop the decrypted session WAVs for every
     // locked folder too (the .enc + *_blob columns stay).
-    for fid in &locked {
-        reblank_folder_extras(state, fid)?;
+    for (folder_id, verified) in &verified_relocks {
+        reblank_folder_extras_after_verification(state, folder_id, verified.ck())?;
     }
     // Zeroize the cached KEK copy only after all seal/reblank work succeeded. If an earlier step
     // returned an error, visibility is still revoked but the KEK remains available for repair.
@@ -977,21 +1090,22 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
         } else {
             Some(folder.path.as_str())
         };
-        let exported_markdown = match render_markdown_with_attachments_for_export_under_lifecycle_authorized(
-            state,
-            &crate::storage::AttachmentOwner::Meeting {
-                meeting_id: latest.meeting_id.clone(),
-                provider_id: latest.provider_id.clone(),
-            },
-            &latest.markdown,
-            std::path::Path::new(vault),
-        ) {
-            Ok(markdown) => markdown,
-            Err(e) => {
-                tracing::warn!(target: "export", error = %e, "meeting image re-export after unlock failed");
-                continue;
-            }
-        };
+        let exported_markdown =
+            match render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+                state,
+                &crate::storage::AttachmentOwner::Meeting {
+                    meeting_id: latest.meeting_id.clone(),
+                    provider_id: latest.provider_id.clone(),
+                },
+                &latest.markdown,
+                std::path::Path::new(vault),
+            ) {
+                Ok(markdown) => markdown,
+                Err(e) => {
+                    tracing::warn!(target: "export", error = %e, "meeting image re-export after unlock failed");
+                    continue;
+                }
+            };
         if let Ok(path) = crate::export::write_note(
             std::path::Path::new(vault),
             sub,
@@ -1109,12 +1223,7 @@ pub(crate) async fn discard_unrecoverable_folder_lock_with_candidates_for_test(
     folder_id: String,
     candidates: Zeroizing<Vec<[u8; 32]>>,
 ) -> Result<FolderNode, AppError> {
-    discard_unrecoverable_folder_lock_with_enumeration(
-        state,
-        folder_id,
-        Some(Ok(candidates)),
-    )
-    .await
+    discard_unrecoverable_folder_lock_with_enumeration(state, folder_id, Some(Ok(candidates))).await
 }
 
 /// Execute the destructive-discard state machine with either the production

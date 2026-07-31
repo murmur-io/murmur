@@ -67,6 +67,7 @@ import {
   type PropertySchemaField,
 } from "./property-field-types";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
 
 /** The autosave indicator state. */
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -183,6 +184,7 @@ const NOTE_CHAT_OPEN_KEY = "murmur-note-chat-open";
     NoteSharePanelComponent,
     NoteChatComponent,
     MurToggleComponent,
+    SmartReminderCardComponent,
     FormsModule,
   ],
   templateUrl: "./note-editor.component.html",

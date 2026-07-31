@@ -130,6 +130,14 @@ import type {
   OrgFeedUpdatedPayload,
   ActiveSharesReport,
   ContentDeletedPayload,
+  ReminderDraft,
+  ReminderSourceAnchor,
+  ReminderSourceUpdatedPayload,
+  ReminderSuggestionView,
+  ReminderSummary,
+  RemindersSnapshot,
+  RemindersUpdatedPayload,
+  ReminderView,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -180,6 +188,14 @@ export const EVENT_ORG_FEED_UPDATED = "murmur://org-feed-updated";
 // Delete fan-out fix — a note/meeting delete FULLY succeeded (local rows gone + any org shares
 // revoked); lets OTHER open surfaces (the tab-strip) prune themselves. Content-free (id + kind only).
 export const EVENT_CONTENT_DELETED = "murmur://content-deleted";
+/** Count-only invalidation for the first-class Murmur reminder inbox. */
+export const EVENT_REMINDERS_UPDATED = "murmur://reminders-updated";
+/** Kind + opaque source id only; Smart cards re-audit through the gated command. */
+export const EVENT_REMINDER_SOURCE_UPDATED =
+  "murmur://reminder-source-updated";
+/** No-payload privacy barrier: every cached reminder source title must be discarded immediately. */
+export const EVENT_REMINDER_VISIBILITY_INVALIDATED =
+  "murmur://reminder-visibility-invalidated";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -1208,6 +1224,65 @@ export class IpcService {
   /** Add a macOS Reminder for an action item (best-effort, TCC-gated). */
   addReminder(text: string, dueDate: string | null): Promise<void> {
     return invoke<void>("add_reminder", { text, dueDate });
+  }
+
+  /** Content-free startup/sidebar count; does not read reminder titles or details. */
+  getReminderSummary(): Promise<ReminderSummary> {
+    return invoke<ReminderSummary>("get_reminder_summary");
+  }
+
+  /** Canonical Inbox / Upcoming / Completed snapshot. */
+  listReminders(): Promise<RemindersSnapshot> {
+    return invoke<RemindersSnapshot>("list_reminders");
+  }
+
+  createMurmurReminder(draft: ReminderDraft): Promise<ReminderView> {
+    return invoke<ReminderView>("create_reminder", { draft });
+  }
+
+  updateMurmurReminder(
+    reminderId: string,
+    draft: ReminderDraft,
+  ): Promise<ReminderView> {
+    return invoke<ReminderView>("update_reminder", { reminderId, draft });
+  }
+
+  deleteMurmurReminder(reminderId: string): Promise<void> {
+    return invoke<void>("delete_reminder", { reminderId });
+  }
+
+  completeMurmurReminder(
+    reminderId: string,
+    expectedDueAt: number,
+  ): Promise<void> {
+    return invoke<void>("complete_reminder", { reminderId, expectedDueAt });
+  }
+
+  dismissMurmurReminderOccurrence(occurrenceId: string): Promise<void> {
+    return invoke<void>("dismiss_reminder_occurrence", { occurrenceId });
+  }
+
+  auditReminderSuggestions(
+    source: ReminderSourceAnchor,
+  ): Promise<ReminderSuggestionView[]> {
+    return invoke<ReminderSuggestionView[]>("audit_reminder_suggestions", {
+      sourceKind: source.kind,
+      sourceId: source.id,
+    });
+  }
+
+  acceptReminderSuggestion(
+    suggestionId: string,
+    draft: ReminderDraft,
+  ): Promise<ReminderView> {
+    return invoke<ReminderView>("accept_reminder_suggestion", {
+      suggestionId,
+      draft,
+    });
+  }
+
+  dismissReminderSuggestion(suggestionId: string): Promise<void> {
+    return invoke<void>("dismiss_reminder_suggestion", { suggestionId });
   }
 
   /** Pin a meeting moment → ^block-ref in the note + an obsidian:// deep link. */
@@ -2938,5 +3013,37 @@ export class IpcService {
     return listen<ContentDeletedPayload>(EVENT_CONTENT_DELETED, (e) =>
       cb(e.payload),
     );
+  }
+
+  /** Count-only reminder invalidation. Canonical rows are always refetched. */
+  onRemindersUpdated(
+    cb: (p: RemindersUpdatedPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<RemindersUpdatedPayload>(EVENT_REMINDERS_UPDATED, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /**
+   * One canonical Smart-audit source changed. The event carries no title,
+   * content, hash, or revision; the mounted card filters by opaque identity and
+   * re-enters `auditReminderSuggestions`, whose lock gate remains authoritative.
+   */
+  onReminderSourceUpdated(
+    cb: (p: ReminderSourceUpdatedPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<ReminderSourceUpdatedPayload>(
+      EVENT_REMINDER_SOURCE_UPDATED,
+      (e) => cb(e.payload),
+    );
+  }
+
+  /**
+   * Lock authority changed. The event intentionally carries no ids or content:
+   * consumers synchronously purge all cached source metadata, then re-fetch
+   * through the ordinary lock-gated commands.
+   */
+  onReminderVisibilityInvalidated(cb: () => void): Promise<UnlistenFn> {
+    return listen<void>(EVENT_REMINDER_VISIBILITY_INVALIDATED, () => cb());
   }
 }
