@@ -34,12 +34,12 @@ const SCROLL_LOAD_THRESHOLD_PX = 56;
 /** Keyboard ↑/↓: pull the next page once the active row is within this many rows of the end. */
 const KEYBOARD_LOAD_AHEAD_ROWS = 3;
 
-/** The `NoteCitation.kind`s the picker offers — the Brain scopes to these only. */
-const ALLOWED_KINDS: ReadonlySet<string> = new Set<LinkKind>([
+/** Backward-compatible default: the Brain may scope to all local document kinds. */
+const DEFAULT_ALLOWED_KINDS: readonly LinkKind[] = [
   "meeting",
   "note",
   "document",
-]);
+];
 
 /**
  * Design System — `<mur-source-picker>`: the "scope the Brain to these sources"
@@ -82,6 +82,18 @@ export class SourcePickerComponent {
   readonly placeholder = input("Add a note or meeting…");
   /** Label on the trigger button. */
   readonly triggerLabel = input("+ Source");
+  /** Disable every source mutation while a parent operation owns the draft. */
+  readonly disabled = input(false);
+  /** Optional hard cap. Removal remains available at the cap unless disabled. */
+  readonly selectionLimit = input<number | null>(null);
+  /**
+   * Candidate kinds this instance may expose. Defaults to the historical Brain
+   * picker set; callers such as Reminders can narrow it to note + meeting.
+   */
+  readonly allowedKinds = input<readonly LinkKind[]>(DEFAULT_ALLOWED_KINDS);
+  private readonly allowedKindSet = computed<ReadonlySet<LinkKind>>(
+    () => new Set(this.allowedKinds()),
+  );
 
   /** Whether the popover is open. */
   readonly open = signal(false);
@@ -99,6 +111,15 @@ export class SourcePickerComponent {
   private readonly selectedKeys = computed(
     () => new Set(this.selected().map((s) => s.kind + s.id)),
   );
+  readonly selectionLimitReached = computed(() => {
+    const limit = this.selectionLimit();
+    return (
+      limit !== null &&
+      Number.isInteger(limit) &&
+      limit >= 0 &&
+      this.selected().length >= limit
+    );
+  });
 
   /** Rows annotated with whether they are already picked (no template method). */
   readonly rows = computed(() =>
@@ -137,7 +158,8 @@ export class SourcePickerComponent {
     this._chipsExpanded.update((v) => !v);
   }
 
-  private readonly triggerEl = viewChild<ElementRef<HTMLButtonElement>>("trigger");
+  private readonly triggerEl =
+    viewChild<ElementRef<HTMLButtonElement>>("trigger");
   private readonly popoverEl = viewChild<ElementRef<HTMLDivElement>>("popover");
   private readonly searchEl = viewChild<ElementRef<HTMLInputElement>>("search");
   private readonly listEl = viewChild<ElementRef<HTMLDivElement>>("list");
@@ -155,7 +177,7 @@ export class SourcePickerComponent {
     // with a `requestSeq` stale guard. Gated on `open()` so a closed picker
     // isn't querying.
     effect(() => {
-      if (!this.open()) {
+      if (!this.open() || this.disabled()) {
         return;
       }
       const q = this.query();
@@ -184,12 +206,20 @@ export class SourcePickerComponent {
         { injector: this.injector },
       );
     });
+    effect(() => {
+      if (this.open() && (this.disabled() || this.selectionLimitReached())) {
+        this.close();
+      }
+    });
     this.destroyRef.onDestroy(() => this.debounce.cancel(DEBOUNCE_KEY));
   }
 
   // --- Popover open/close ---------------------------------------------------
 
   toggle(): void {
+    if (this.disabled() || this.selectionLimitReached()) {
+      return;
+    }
     if (this.open()) {
       this.close();
     } else {
@@ -230,11 +260,17 @@ export class SourcePickerComponent {
   // --- Search input + keyboard nav -----------------------------------------
 
   onQuery(value: string): void {
+    if (this.disabled()) {
+      return;
+    }
     this.query.set(value);
     this.activeIndex.set(0);
   }
 
   onKeydown(event: KeyboardEvent): void {
+    if (this.disabled()) {
+      return;
+    }
     switch (event.key) {
       case "ArrowDown":
         event.preventDefault();
@@ -280,7 +316,9 @@ export class SourcePickerComponent {
       if (seq !== this.requestSeq) {
         return; // superseded by a newer query.
       }
-      const kept = rows.filter((c) => ALLOWED_KINDS.has(c.kind));
+      const kept = rows.filter((c) =>
+        this.allowedKindSet().has(c.kind as LinkKind),
+      );
       // `hasMore` tracks the RAW backend page (unfiltered) — a full page means
       // more rows exist upstream even if this page's kept rows are few.
       this.hasMore = rows.length === PAGE_SIZE;
@@ -323,7 +361,9 @@ export class SourcePickerComponent {
       }
       this.rawOffset += page.length;
       this.hasMore = page.length === PAGE_SIZE;
-      const kept = page.filter((c) => ALLOWED_KINDS.has(c.kind));
+      const kept = page.filter((c) =>
+        this.allowedKindSet().has(c.kind as LinkKind),
+      );
       // Dedupe on append: a row that shifted pages mid-scroll must not repeat —
       // the template's `track c.kind + c.id` requires unique keys.
       const seen = new Set(this.candidates().map((c) => c.kind + c.id));
@@ -357,7 +397,8 @@ export class SourcePickerComponent {
       return;
     }
     const nearBottom =
-      el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_LOAD_THRESHOLD_PX;
+      el.scrollTop + el.clientHeight >=
+      el.scrollHeight - SCROLL_LOAD_THRESHOLD_PX;
     if (nearBottom) {
       void this.loadMore();
     }
@@ -366,8 +407,11 @@ export class SourcePickerComponent {
   // --- Selection ------------------------------------------------------------
 
   pick(candidate: NoteCitation): void {
+    if (this.disabled() || this.selectionLimitReached()) {
+      return;
+    }
     const kind = candidate.kind as LinkKind;
-    if (!ALLOWED_KINDS.has(kind)) {
+    if (!this.allowedKindSet().has(kind)) {
       return;
     }
     const key = candidate.kind + candidate.id;
@@ -386,6 +430,9 @@ export class SourcePickerComponent {
   }
 
   remove(ref: SourceRef): void {
+    if (this.disabled()) {
+      return;
+    }
     this.selected.update((list) =>
       list.filter((s) => !(s.kind === ref.kind && s.id === ref.id)),
     );

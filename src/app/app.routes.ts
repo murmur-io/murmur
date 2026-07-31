@@ -57,6 +57,13 @@ export const routes: Routes = [
           ),
       },
       {
+        path: "reminders",
+        loadComponent: () =>
+          import("./features/reminders/reminders/reminders.component").then(
+            (m) => m.RemindersComponent,
+          ),
+      },
+      {
         // New-note gateway: creates a note then replaces the URL with /notes/:id.
         path: "notes/new",
         loadComponent: () =>

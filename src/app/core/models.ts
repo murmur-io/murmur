@@ -1547,6 +1547,87 @@ export interface ActionItem {
   dueDate: string | null;
 }
 
+// ── First-class Murmur reminders ──────────────────────────────────────────
+
+/** Calendar recurrence units accepted by the reminder composer/backend. */
+export type ReminderRepeatUnit = "days" | "weeks" | "months" | "years";
+
+export type ReminderState = "active" | "completed";
+export type ReminderOrigin = "manual" | "smart";
+
+/** The only identity persisted for a reminder source. */
+export interface ReminderSourceAnchor {
+  kind: SourceKind;
+  id: string;
+}
+
+/** Live-gated metadata for a currently visible reminder source. */
+export interface ReminderSourceView extends ReminderSourceAnchor {
+  title: string;
+}
+
+/** Create/update payload. Source titles are deliberately never sent. */
+export interface ReminderDraft {
+  title: string;
+  details: string | null;
+  /** UTC epoch milliseconds derived from a calendar-valid local date/time. */
+  dueAt: number;
+  repeatEvery: number | null;
+  repeatUnit: ReminderRepeatUnit | null;
+  sources: ReminderSourceAnchor[];
+}
+
+export interface ReminderView {
+  id: string;
+  title: string;
+  details: string | null;
+  dueAt: number;
+  repeatEvery: number | null;
+  repeatUnit: ReminderRepeatUnit | null;
+  state: ReminderState;
+  origin: ReminderOrigin;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+  sources: ReminderSourceView[];
+}
+
+export interface ReminderInboxItem {
+  occurrenceId: string;
+  dueAt: number;
+  reminder: ReminderView;
+}
+
+export interface RemindersSnapshot {
+  inbox: ReminderInboxItem[];
+  upcoming: ReminderView[];
+  completed: ReminderView[];
+  dueInboxCount: number;
+}
+
+/** Content-free startup/nav projection. */
+export interface ReminderSummary {
+  dueInboxCount: number;
+}
+
+/** Count-only invalidation event; consumers refetch canonical rows. */
+export type RemindersUpdatedPayload = ReminderSummary;
+
+/**
+ * Content-free invalidation for one mounted Smart-reminder source. Canonical
+ * writes publish only the kind + opaque id; consumers re-enter the gated audit
+ * command for any source-derived content.
+ */
+export type ReminderSourceUpdatedPayload = ReminderSourceAnchor;
+
+/** Review-only Smart candidate; it is not a reminder until explicitly accepted. */
+export interface ReminderSuggestionView {
+  id: string;
+  title: string;
+  suggestedDueAt: number | null;
+  source: ReminderSourceView;
+}
+
 export interface PinResult {
   url: string;
   blockId: string;
