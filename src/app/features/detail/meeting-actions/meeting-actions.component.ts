@@ -11,6 +11,7 @@ import {
 import { IpcService } from "../../../core/ipc.service";
 import type { ActionItem } from "../../../core/models";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { SmartReminderCardComponent } from "../../reminders/smart-reminder-card/smart-reminder-card.component";
 
 /**
  * "Action items" — a glass panel listing the action-item checklist parsed from a
@@ -31,8 +32,7 @@ import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 @Component({
   selector: "app-meeting-actions",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  // Hide the host entirely when there are no items (no empty panel).
-  host: { "[hidden]": "items().length === 0" },
+  imports: [SmartReminderCardComponent],
   templateUrl: "./meeting-actions.component.html",
   styleUrl: "./meeting-actions.component.scss",
 })
@@ -43,6 +43,8 @@ export class MeetingActionsComponent implements OnInit {
 
   /** The meeting whose note's action items are listed + patched. */
   readonly meetingId = input.required<string>();
+  readonly meetingTitle = input<string | null>(null);
+  readonly sourceRevision = input<string | null>(null);
 
   /** The parsed action items; empty before load (and while none exist). */
   readonly items = signal<ActionItem[]>([]);
