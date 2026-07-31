@@ -1,0 +1,93 @@
+.smart-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  border-color: var(--border-strong);
+}
+
+.smart-head,
+.smart-error,
+.suggestion-row,
+.suggestion-actions {
+  display: flex;
+  align-items: center;
+}
+
+.smart-head,
+.smart-error,
+.suggestion-row {
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.smart-head h3,
+.smart-intro,
+.smart-status,
+.smart-error,
+.suggestion-list {
+  margin: 0;
+}
+
+.smart-kicker {
+  color: var(--accent-hover);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.smart-intro,
+.smart-status {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.smart-error {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.suggestion-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.suggestion-row {
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+
+.suggestion-row > div:first-child {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.suggestion-row strong {
+  color: var(--text-primary);
+}
+
+.suggestion-row span {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.suggestion-actions {
+  flex: none;
+  gap: var(--space-2);
+}
+
+@media (max-width: 720px) {
+  .smart-head,
+  .suggestion-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

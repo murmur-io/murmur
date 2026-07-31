@@ -542,6 +542,83 @@ pub fn emit_audit_updated(app: &AppHandle, pending: u32) {
     }
 }
 
+/// Content-free reminder invalidation ping. The app-process scheduler and every reminder mutation
+/// emit only the unread due count; reminder titles/details never enter the event bus or logs.
+pub const EVENT_REMINDERS_UPDATED: &str = "murmur://reminders-updated";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemindersUpdatedPayload {
+    pub due_inbox_count: u64,
+}
+
+pub fn emit_reminders_updated(app: &AppHandle, due_inbox_count: u64) {
+    if let Err(e) = app.emit(
+        EVENT_REMINDERS_UPDATED,
+        RemindersUpdatedPayload { due_inbox_count },
+    ) {
+        tracing::warn!(
+            target: "reminders",
+            error = %e,
+            "failed to emit reminders-updated notice"
+        );
+    }
+}
+
+/// Content-free invalidation for one meeting/note Smart-reminder card. Canonical mutations enqueue
+/// this durable ping in SQLCipher; the background drain emits only the source kind + opaque id so
+/// the FE can re-fetch through the normal gated command.
+pub const EVENT_REMINDER_SOURCE_UPDATED: &str = "murmur://reminder-source-updated";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSourceUpdatedPayload {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Best-effort emit. The boolean is the durable outbox acknowledgement decision: `true` means the
+/// worker may CAS-delete that exact queue revision; `false` leaves it for replay.
+pub fn emit_reminder_source_updated(app: &AppHandle, kind: &str, id: &str) -> bool {
+    match app.emit(
+        EVENT_REMINDER_SOURCE_UPDATED,
+        ReminderSourceUpdatedPayload {
+            kind: kind.to_string(),
+            id: id.to_string(),
+        },
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "reminders",
+                error = %e,
+                "failed to emit reminder-source-updated notice"
+            );
+            false
+        }
+    }
+}
+
+/// Global, content-free privacy invalidation emitted while the lock lifecycle guard is held,
+/// immediately after visibility authority is revoked. Unlike source-edit invalidations this has no
+/// source id: consumers must synchronously discard every cached reminder source title before
+/// re-fetching through the canonical gated commands.
+pub const EVENT_REMINDER_VISIBILITY_INVALIDATED: &str = "murmur://reminder-visibility-invalidated";
+
+pub fn emit_reminder_visibility_invalidated(app: &AppHandle) -> bool {
+    match app.emit(EVENT_REMINDER_VISIBILITY_INVALIDATED, ()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                target: "reminders",
+                error = %e,
+                "failed to emit reminder visibility invalidation"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +635,36 @@ mod tests {
         assert_eq!(EVENT_AUDIT_UPDATED, "murmur://audit-updated");
         let json = serde_json::to_string(&AuditUpdatedPayload { pending: 4 }).unwrap();
         assert_eq!(json, r#"{"pending":4}"#);
+    }
+
+    #[test]
+    fn reminders_updated_event_is_count_only() {
+        assert_eq!(EVENT_REMINDERS_UPDATED, "murmur://reminders-updated");
+        let json = serde_json::to_string(&RemindersUpdatedPayload { due_inbox_count: 2 }).unwrap();
+        assert_eq!(json, r#"{"dueInboxCount":2}"#);
+    }
+
+    #[test]
+    fn reminder_source_updated_event_is_opaque_id_and_kind_only() {
+        assert_eq!(
+            EVENT_REMINDER_SOURCE_UPDATED,
+            "murmur://reminder-source-updated"
+        );
+        let json = serde_json::to_string(&ReminderSourceUpdatedPayload {
+            kind: "meeting".into(),
+            id: "m1".into(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"kind":"meeting","id":"m1"}"#);
+    }
+
+    #[test]
+    fn reminder_visibility_invalidated_event_is_content_free() {
+        assert_eq!(
+            EVENT_REMINDER_VISIBILITY_INVALIDATED,
+            "murmur://reminder-visibility-invalidated"
+        );
+        assert_eq!(serde_json::to_string(&()).unwrap(), "null");
     }
 
     /// The FE listens on this exact event name; a rename silently drops the tab-strip fan-out.

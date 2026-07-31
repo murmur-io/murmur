@@ -1010,6 +1010,12 @@ impl Db {
             .map_err(map_err)?;
         }
 
+        // First-class Murmur Reminders. This runs after the meetings/notes/segments/documents
+        // substrates exist because its derived-suggestion invalidation triggers attach to all four.
+        // The durable reminder rows are an independent SQLCipher domain; only the future Smart
+        // audit cache/pending-suggestion tables are source-derived and trigger-purged.
+        Self::migrate_reminders(&conn)?;
+
         // Note image attachments — canonical bytes live inside SQLCipher. Folder-locked owners
         // additionally use the per-folder `data_blob` seal managed by the lock lifecycle.
         // Runs after documents + org_items exist so every FK target is available.
@@ -7963,3 +7969,7 @@ mod lock_tests;
 #[cfg(test)]
 #[path = "db_tests/graph_tests.rs"]
 mod graph_tests;
+
+#[cfg(test)]
+#[path = "db_tests/reminder_tests.rs"]
+mod reminder_tests;

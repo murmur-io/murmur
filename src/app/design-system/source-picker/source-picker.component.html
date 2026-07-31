@@ -54,9 +54,16 @@
             type="button"
             class="sp-chip-remove"
             [attr.aria-label]="'Remove ' + (c.title || c.id)"
+            [disabled]="disabled()"
             (click)="remove(c)"
           >
-            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 16 16"
+              fill="none"
+              aria-hidden="true"
+            >
               <path
                 d="M4 4l8 8M12 4l-8 8"
                 stroke="currentColor"
@@ -75,7 +82,9 @@
             [attr.aria-expanded]="chipsExpanded()"
             (click)="toggleChips()"
           >
-            {{ chipsExpanded() ? "Show less" : "+" + hiddenChipCount() + " more" }}
+            {{
+              chipsExpanded() ? "Show less" : "+" + hiddenChipCount() + " more"
+            }}
           </button>
         </li>
       }
@@ -88,6 +97,7 @@
     class="btn btn-ghost sp-trigger"
     [attr.aria-expanded]="open()"
     aria-haspopup="listbox"
+    [disabled]="disabled() || selectionLimitReached()"
     (click)="toggle()"
   >
     {{ triggerLabel() }}
@@ -100,91 +110,97 @@
        ancestor (the `.card` backdrop-filter / drawer transform containing-block
        trap that made the picker "look dead"). display:contents → no extra box. -->
   <div class="sp-overlay" appTeleportToBody>
-  <!-- Scrim: a click OUTSIDE the popover closes it. Transparent (only the panel
+    <!-- Scrim: a click OUTSIDE the popover closes it. Transparent (only the panel
        carries the opaque overlay — T3). role=button + Enter/Space/Esc satisfy the
        a11y lints (mirrors the quick-search scrim). -->
-  <div
-    class="sp-scrim"
-    role="button"
-    tabindex="0"
-    aria-label="Close source picker"
-    (click)="close()"
-    (keydown.enter)="close()"
-    (keydown.space)="close(); $event.preventDefault()"
-    (keydown.escape)="close()"
-  ></div>
+    <div
+      class="sp-scrim"
+      role="button"
+      tabindex="0"
+      aria-label="Close source picker"
+      (click)="close()"
+      (keydown.enter)="close()"
+      (keydown.space)="close(); $event.preventDefault()"
+      (keydown.escape)="close()"
+    ></div>
 
-  <!-- OPAQUE floating popover (T3): --surface-overlay + backdrop-filter:none via
+    <!-- OPAQUE floating popover (T3): --surface-overlay + backdrop-filter:none via
        the global .menu primitive. Positioned in JS (afterNextRender) under the
        trigger; re-positioned on scroll/resize via the shared directive. -->
-  <div
-    #popover
-    class="sp-pop menu"
-    appRepositionOnScroll
-    (reposition)="reposition()"
-  >
-    <input
-      #search
-      type="text"
-      class="sp-search"
-      role="combobox"
-      aria-autocomplete="list"
-      aria-controls="sp-listbox"
-      [attr.aria-expanded]="candidates().length > 0"
-      [placeholder]="placeholder()"
-      [value]="query()"
-      (input)="onQuery($any($event.target).value)"
-      (keydown)="onKeydown($event)"
-    />
-
     <div
-      #list
-      id="sp-listbox"
-      class="sp-list"
-      role="listbox"
-      aria-label="Source candidates"
-      (scroll)="onScroll()"
+      #popover
+      class="sp-pop menu"
+      appRepositionOnScroll
+      (reposition)="reposition()"
     >
-      @for (r of rows(); track r.candidate.kind + r.candidate.id; let i = $index) {
-        <button
-          type="button"
-          class="sp-row menu-item"
-          role="option"
-          [class.is-active]="i === activeIndex()"
-          [class.is-picked]="r.picked"
-          [attr.aria-selected]="i === activeIndex()"
-          (click)="pick(r.candidate)"
-        >
-          <span class="sp-title">{{ r.candidate.title }}</span>
-          @if (r.picked) {
-            <svg
-              class="sp-check"
-              width="14"
-              height="14"
-              viewBox="0 0 16 16"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M3.5 8.5l3 3 6-6.5"
-                stroke="currentColor"
-                stroke-width="1.6"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
+      <input
+        #search
+        type="text"
+        class="sp-search"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls="sp-listbox"
+        [attr.aria-expanded]="candidates().length > 0"
+        [placeholder]="placeholder()"
+        [value]="query()"
+        [disabled]="disabled()"
+        (input)="onQuery($any($event.target).value)"
+        (keydown)="onKeydown($event)"
+      />
+
+      <div
+        #list
+        id="sp-listbox"
+        class="sp-list"
+        role="listbox"
+        aria-label="Source candidates"
+        (scroll)="onScroll()"
+      >
+        @for (
+          r of rows();
+          track r.candidate.kind + r.candidate.id;
+          let i = $index
+        ) {
+          <button
+            type="button"
+            class="sp-row menu-item"
+            role="option"
+            [class.is-active]="i === activeIndex()"
+            [class.is-picked]="r.picked"
+            [attr.aria-selected]="i === activeIndex()"
+            [disabled]="disabled() || (!r.picked && selectionLimitReached())"
+            (click)="pick(r.candidate)"
+          >
+            <span class="sp-title">{{ r.candidate.title }}</span>
+            @if (r.picked) {
+              <svg
+                class="sp-check"
+                width="14"
+                height="14"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M3.5 8.5l3 3 6-6.5"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            } @else {
+              <span class="sp-kind">{{ r.candidate.kind }}</span>
+            }
+          </button>
+        } @empty {
+          @if (loading()) {
+            <p class="sp-empty">Searching…</p>
           } @else {
-            <span class="sp-kind">{{ r.candidate.kind }}</span>
+            <p class="sp-empty">No matching notes or meetings.</p>
           }
-        </button>
-      } @empty {
-        @if (loading()) {
-          <p class="sp-empty">Searching…</p>
-        } @else {
-          <p class="sp-empty">No matching notes or meetings.</p>
         }
-      }
+      </div>
     </div>
-  </div>
   </div>
 }

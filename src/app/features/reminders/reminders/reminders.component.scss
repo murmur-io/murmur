@@ -1,0 +1,248 @@
+:host {
+  display: block;
+  width: 100%;
+}
+
+.reminders-page {
+  width: min(var(--content-max), 100%);
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5) var(--space-8);
+}
+
+.page-head,
+.reminder-title-row,
+.reminder-meta,
+.reminder-actions,
+.source-chips,
+.delete-confirm,
+.delete-confirm > div {
+  display: flex;
+  align-items: center;
+}
+
+.page-head {
+  justify-content: space-between;
+  gap: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.page-head h1,
+.page-head p,
+.reminder-group h2,
+.reminder-card h3,
+.reminder-details,
+.delete-confirm span {
+  margin: 0;
+}
+
+.page-eyebrow {
+  color: var(--accent-hover);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.page-subtitle {
+  color: var(--text-secondary);
+}
+
+.segments {
+  display: inline-flex;
+  gap: var(--space-1);
+  margin-bottom: var(--space-5);
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-raised);
+  box-shadow: var(--glass-highlight);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+}
+
+.segments button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.segments button.active {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.error-banner {
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+}
+
+.reminder-groups,
+.reminder-group,
+.reminder-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.reminder-groups {
+  gap: var(--space-5);
+}
+
+.reminder-group {
+  gap: var(--space-3);
+}
+
+.reminder-group h2 {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.reminder-list {
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reminder-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  overflow: hidden;
+}
+
+.reminder-main {
+  min-width: 0;
+}
+
+.reminder-title-row {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.reminder-meta,
+.source-chips,
+.reminder-actions {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.reminder-meta {
+  margin-top: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+
+.reminder-details {
+  margin-top: var(--space-3);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+.smart-badge,
+.source-chip {
+  border-radius: var(--radius-pill);
+}
+
+.smart-badge {
+  padding: var(--space-1) var(--space-2);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.source-chips {
+  margin-top: var(--space-3);
+}
+
+.source-chip {
+  max-width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.source-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.reminder-actions {
+  justify-content: flex-end;
+  align-self: start;
+}
+
+.danger-action {
+  color: var(--danger);
+}
+
+.delete-confirm {
+  grid-column: 1 / -1;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.delete-confirm > div {
+  gap: var(--space-2);
+}
+
+.loading-orb {
+  width: var(--space-5);
+  height: var(--space-5);
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: var(--radius-pill);
+  animation: spin var(--transition) linear infinite;
+}
+
+.empty-icon {
+  display: grid;
+  place-items: center;
+  width: var(--space-7);
+  height: var(--space-7);
+  border-radius: var(--radius-lg);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+
+@media (max-width: 760px) {
+  .reminders-page {
+    padding-inline: var(--space-3);
+  }
+
+  .page-head,
+  .delete-confirm {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .reminder-card {
+    grid-template-columns: 1fr;
+  }
+
+  .reminder-actions {
+    justify-content: flex-start;
+  }
+}

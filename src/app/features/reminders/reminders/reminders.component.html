@@ -1,0 +1,206 @@
+<section class="reminders-page">
+  <header class="page-head">
+    <div>
+      <p class="page-eyebrow">Workspace</p>
+      <h1>Reminders</h1>
+      <p class="page-subtitle">
+        Follow-ups connected to the notes and meetings that shaped them.
+      </p>
+    </div>
+    <button type="button" class="btn btn-primary" (click)="newReminder()">
+      New reminder
+    </button>
+  </header>
+
+  <nav class="segments" aria-label="Reminder views">
+    <button
+      type="button"
+      [class.active]="segment() === 'inbox'"
+      [attr.aria-pressed]="segment() === 'inbox'"
+      (click)="selectSegment('inbox')"
+    >
+      Inbox
+      @if (counts().inbox > 0) {
+        <span class="count">{{ counts().inbox }}</span>
+      }
+    </button>
+    <button
+      type="button"
+      [class.active]="segment() === 'upcoming'"
+      [attr.aria-pressed]="segment() === 'upcoming'"
+      (click)="selectSegment('upcoming')"
+    >
+      Upcoming
+      @if (counts().upcoming > 0) {
+        <span class="count">{{ counts().upcoming }}</span>
+      }
+    </button>
+    <button
+      type="button"
+      [class.active]="segment() === 'completed'"
+      [attr.aria-pressed]="segment() === 'completed'"
+      (click)="selectSegment('completed')"
+    >
+      Completed
+      @if (counts().completed > 0) {
+        <span class="count">{{ counts().completed }}</span>
+      }
+    </button>
+  </nav>
+
+  @if (store.error(); as message) {
+    <div class="banner error-banner" role="alert">
+      <span>{{ message }}</span>
+      <button type="button" class="btn btn-ghost" (click)="store.refresh()">
+        Retry
+      </button>
+    </div>
+  }
+
+  @if (rows().length === 0 && store.loading()) {
+    <div class="empty-state">
+      <span class="loading-orb" aria-hidden="true"></span>
+      <p>Loading reminders…</p>
+    </div>
+  } @else if (rows().length === 0 && !store.error()) {
+    <div class="empty-state">
+      <div class="empty-icon" aria-hidden="true">✓</div>
+      <h2>{{ emptyCopy().title }}</h2>
+      <p>{{ emptyCopy().body }}</p>
+      @if (segment() !== "completed") {
+        <button type="button" class="btn btn-primary" (click)="newReminder()">
+          Create a reminder
+        </button>
+      }
+    </div>
+  } @else {
+    <div class="reminder-groups" [attr.aria-busy]="store.loading()">
+      @for (group of groups(); track group.id) {
+        <section
+          class="reminder-group"
+          [attr.aria-labelledby]="'group-' + group.id"
+        >
+          <h2 [id]="'group-' + group.id">{{ group.label }}</h2>
+          <ul class="reminder-list">
+            @for (row of group.rows; track row.key) {
+              <li class="card reminder-card">
+                <div class="reminder-main">
+                  <div class="reminder-title-row">
+                    <h3>{{ row.reminder.title }}</h3>
+                    @if (row.reminder.origin === "smart") {
+                      <span
+                        class="smart-badge"
+                        title="Created from a reviewed Smart suggestion"
+                      >
+                        ✦ Smart
+                      </span>
+                    }
+                  </div>
+                  <div class="reminder-meta">
+                    <span>{{ row.dueLabel }}</span>
+                    @if (row.recurrenceLabel; as recurrence) {
+                      <span>↻ {{ recurrence }}</span>
+                    }
+                  </div>
+                  @if (row.reminder.details; as details) {
+                    <p class="reminder-details">{{ details }}</p>
+                  }
+                  @if (row.reminder.sources.length > 0) {
+                    <div class="source-chips" aria-label="Reminder sources">
+                      @for (
+                        source of row.reminder.sources;
+                        track source.kind + source.id
+                      ) {
+                        <button
+                          type="button"
+                          class="source-chip"
+                          (click)="openSource(source)"
+                        >
+                          {{ source.kind === "meeting" ? "Meeting" : "Note" }} ·
+                          {{ source.title }}
+                        </button>
+                      }
+                    </div>
+                  }
+                </div>
+
+                <div class="reminder-actions">
+                  @if (segment() !== "completed") {
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      [disabled]="
+                        store.busy().has(row.key) ||
+                        store.busy().has(row.reminder.id)
+                      "
+                      (click)="complete(row)"
+                    >
+                      Complete
+                    </button>
+                    @if (row.occurrenceId) {
+                      <button
+                        type="button"
+                        class="btn btn-ghost"
+                        [disabled]="
+                          store.busy().has(row.occurrenceId) ||
+                          store.busy().has(row.reminder.id)
+                        "
+                        (click)="dismiss(row)"
+                      >
+                        Dismiss
+                      </button>
+                    }
+                  }
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    [disabled]="store.busy().has(row.reminder.id)"
+                    (click)="edit(row.reminder)"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost danger-action"
+                    [disabled]="store.busy().has(row.reminder.id)"
+                    (click)="askDelete(row.reminder.id)"
+                  >
+                    Delete
+                  </button>
+                </div>
+
+                @if (confirmingDelete() === row.reminder.id) {
+                  <div
+                    class="delete-confirm"
+                    role="alertdialog"
+                    aria-label="Delete reminder"
+                  >
+                    <span>Delete this reminder permanently?</span>
+                    <div>
+                      <button
+                        type="button"
+                        class="btn btn-ghost"
+                        [disabled]="store.busy().has(row.reminder.id)"
+                        (click)="cancelDelete()"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-danger"
+                        [disabled]="store.busy().has(row.reminder.id)"
+                        (click)="delete(row.reminder.id)"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                }
+              </li>
+            }
+          </ul>
+        </section>
+      }
+    </div>
+  }
+</section>
