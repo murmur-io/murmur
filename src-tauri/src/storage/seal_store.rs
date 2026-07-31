@@ -325,6 +325,9 @@ impl Db {
         // folder's titles in its evidence with no matching id, so a scoped purge cannot cover it.
         // Cheap re-derivable rows; the next pass re-stages anything still true.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
+        // Smart-reminder audit candidates/cache are disposable source-derived plaintext too.
+        // Accepted reminders live in separate tables and deliberately survive this purge.
+        Self::purge_all_reminder_derived_tx(&tx)?;
 
         // Documents anchored on this folder: drop sealed ciphertext + plaintext + their chunks/vectors.
         tx.execute(
@@ -478,6 +481,10 @@ impl Db {
 
     /// Re-blank the plaintext `markdown` of every note in `folder_ids` that still has a sealed
     /// `content_blob` (relock / relock-all). Idempotent; leaves the blob intact.
+    /// The caller MUST first authenticate every retained blob-backed non-empty plaintext and
+    /// encrypt+decrypt-verify every blob-less non-empty plaintext in every target folder under the
+    /// cached folder CK, while holding the lock lifecycle guard. Any prepared missing seal must be
+    /// persisted before this low-level transaction, which deliberately has no key access of its own.
     ///
     /// Returns the `exported_path`s of the memory rollups purged in the same transaction
     /// (`purge_memory_rollups_tx` — a relock re-asserts the sealed shape, so sealed-derived rollup
@@ -528,7 +535,11 @@ impl Db {
             let mut dids = tx
                 .prepare("SELECT id FROM documents WHERE folder_id = ?1")
                 .map_err(map_err)?;
+            let mut note_ids_stmt = tx
+                .prepare("SELECT id FROM documents WHERE folder_id = ?1 AND kind = 'note'")
+                .map_err(map_err)?;
             let mut document_ids: Vec<String> = Vec::new();
+            let mut authored_note_ids: Vec<String> = Vec::new();
             for id in folder_ids {
                 let rows = dids
                     .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
@@ -536,8 +547,40 @@ impl Db {
                 for r in rows {
                     document_ids.push(r.map_err(map_err)?);
                 }
+                let note_rows = note_ids_stmt
+                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .map_err(map_err)?;
+                for row in note_rows {
+                    authored_note_ids.push(row.map_err(map_err)?);
+                }
             }
             drop(dids);
+            drop(note_ids_stmt);
+            // A relock changes visibility authority even for a title-only source whose canonical
+            // text was already empty, so content-column UPDATE triggers may legitimately stay
+            // silent. Queue every governed reminder source explicitly in this same reblank
+            // transaction; the event contains only kind + opaque id.
+            {
+                let mut queue = tx
+                    .prepare(
+                        "INSERT INTO reminder_source_invalidation_queue
+                           (source_kind,source_id,revision)
+                         VALUES (?1,?2,1)
+                         ON CONFLICT(source_kind,source_id)
+                         DO UPDATE SET revision=revision+1",
+                    )
+                    .map_err(map_err)?;
+                for meeting_id in &meeting_ids {
+                    queue
+                        .execute(rusqlite::params!["meeting", meeting_id])
+                        .map_err(map_err)?;
+                }
+                for note_id in &authored_note_ids {
+                    queue
+                        .execute(rusqlite::params!["note", note_id])
+                        .map_err(map_err)?;
+                }
+            }
             Self::purge_doc_chunks_tx(&tx, &document_ids)?;
             // Phase F0 LOCK-SAFETY: purge the correction-log rows of every meeting in these (now
             // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
@@ -578,6 +621,9 @@ impl Db {
             // meeting/document id can match; a relock invalidates the pass's visibility
             // snapshot). Resolved rows were blanked on resolve and survive.
             Self::purge_all_pending_audit_findings_tx(&tx)?;
+            // A relock withdraws the visibility snapshot that authorized every pending Smart
+            // candidate. Purge the whole derived audit domain in this same re-blank transaction.
+            Self::purge_all_reminder_derived_tx(&tx)?;
 
             // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is
             // a meeting OR document/note in these (re-blanked / sealed) folders in this SAME relock tx —
@@ -626,6 +672,25 @@ impl Db {
              WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        #[cfg(debug_assertions)]
+        let runtime_derived_before = if crate::commands::reminder_runtime_probe_requested()
+            && std::env::var_os("MURMUR_HARNESS_PHASE_TWO_NONCE").is_some()
+        {
+            let count: i64 = tx
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM reminder_audit_cache) +
+                       (SELECT COUNT(*) FROM reminder_pending_suggestions)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            Some(usize::try_from(count).map_err(|_| {
+                crate::error::AppError::Storage("runtime reminder count is negative".into())
+            })?)
+        } else {
+            None
+        };
         tx.execute(
             "UPDATE notes SET markdown = '' \
                WHERE content_blob IS NOT NULL \
@@ -777,6 +842,9 @@ impl Db {
             .map_err(map_err)?;
         if any_locked {
             Self::purge_all_pending_audit_findings_tx(&tx)?;
+            // Startup reconciliation must not leave candidates derived during a crashed unlocked
+            // session at rest. Canonical promoted reminders remain untouched.
+            Self::purge_all_reminder_derived_tx(&tx)?;
         }
         // brain2 realtime notes LOCK-SAFETY: re-blank the typed-notes plaintext of every meeting in a
         // locked folder ONLY WHERE its `manual_notes_blob` exists (the sealed copy is present) — so a
@@ -946,7 +1014,28 @@ impl Db {
             }
             out
         };
+        #[cfg(debug_assertions)]
+        let runtime_derived_after = if runtime_derived_before.is_some() {
+            let count: i64 = tx
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM reminder_audit_cache) +
+                       (SELECT COUNT(*) FROM reminder_pending_suggestions)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            Some(usize::try_from(count).map_err(|_| {
+                crate::error::AppError::Storage("runtime reminder count is negative".into())
+            })?)
+        } else {
+            None
+        };
         tx.commit().map_err(map_err)?;
+        #[cfg(debug_assertions)]
+        if let (Some(before), Some(after)) = (runtime_derived_before, runtime_derived_after) {
+            crate::commands::record_reminder_runtime_startup_reconcile(before, after)?;
+        }
         Ok((audio, rollup_exports, note_md_exports))
     }
 
