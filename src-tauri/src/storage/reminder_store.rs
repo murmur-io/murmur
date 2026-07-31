@@ -38,6 +38,20 @@ pub(crate) struct ReminderSourceInvalidation {
     pub revision: i64,
 }
 
+/// Exact one-shot capability and user-edited draft promoted by the Smart Reminder accept flow.
+/// Grouping the CAS anchors keeps callers from swapping or omitting one of the source bindings.
+pub(crate) struct ReminderSuggestionPromotion<'a> {
+    pub suggestion_id: &'a str,
+    pub expected_source_kind: &'a str,
+    pub expected_source_id: &'a str,
+    pub expected_content_hash: &'a str,
+    pub reminder_id: &'a str,
+    pub draft: &'a ReminderDraft,
+    pub now: i64,
+}
+
+type ReminderOccurrenceScheduleRow = (String, i64, i64, Option<i64>, Option<String>, String);
+
 /// Exact canonical Smart-audit fingerprint shared by the gated command read and the transactional
 /// storage CAS. Every meaning-bearing segment field is framed explicitly; floating-point values
 /// use their stored IEEE bit pattern, preserving `None` vs zero and avoiding formatter drift.
@@ -813,16 +827,19 @@ impl Db {
     /// domain. The candidate row is the one-shot capability: it is consumed in the same transaction
     /// as the `origin='smart'` insert, so replay cannot create another row. The cache and sibling
     /// candidates remain authoritative so the user can accept several suggestions from one audit.
-    pub fn promote_pending_reminder_suggestion(
+    pub(crate) fn promote_pending_reminder_suggestion(
         &self,
-        suggestion_id: &str,
-        expected_source_kind: &str,
-        expected_source_id: &str,
-        expected_content_hash: &str,
-        reminder_id: &str,
-        draft: &ReminderDraft,
-        now: i64,
+        promotion: ReminderSuggestionPromotion<'_>,
     ) -> Result<bool> {
+        let ReminderSuggestionPromotion {
+            suggestion_id,
+            expected_source_kind,
+            expected_source_id,
+            expected_content_hash,
+            reminder_id,
+            draft,
+            now,
+        } = promotion;
         validate_source(expected_source_kind, expected_source_id)?;
         validate_hash(expected_content_hash)?;
         if reminder_id.is_empty() || reminder_id.chars().count() > MAX_SOURCE_ID_CHARS {
@@ -1255,7 +1272,7 @@ impl Db {
     pub fn dismiss_reminder_occurrence(&self, occurrence_id: &str, now: i64) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        let row: Option<(String, i64, i64, Option<i64>, Option<String>, String)> = tx
+        let row: Option<ReminderOccurrenceScheduleRow> = tx
             .query_row(
                 "SELECT o.reminder_id, o.due_at, r.due_at, r.repeat_every, r.repeat_unit, r.state
                    FROM reminder_due_occurrences o
