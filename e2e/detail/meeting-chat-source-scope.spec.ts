@@ -56,6 +56,23 @@ test("meeting chat pre-fills this meeting + its links and sends chat_meeting wit
   const chat = page.locator("app-meeting-chat");
   await expect(chat).toBeVisible({ timeout: 10_000 });
 
+  // Regression: once the detail entrance animation completes, it must not retain
+  // a transform. Otherwise it captures the fixed drawer and its bottom follows the
+  // long document instead of the viewport.
+  await expect
+    .poll(() =>
+      page
+        .locator(".detail")
+        .evaluate((element) => getComputedStyle(element).transform),
+    )
+    .toBe("none");
+  const drawerBounds = await page.locator(".ask-drawer").boundingBox();
+  const viewport = page.viewportSize();
+  expect(drawerBounds).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(drawerBounds?.y).toBe(0);
+  expect(drawerBounds?.height).toBe(viewport?.height);
+
   // Pre-fill: this meeting (by its TITLE, not id) + its active linked note.
   await expect(chat.locator(".sp-chip-title")).toHaveText([
     "Q2 Roadmap Planning",
