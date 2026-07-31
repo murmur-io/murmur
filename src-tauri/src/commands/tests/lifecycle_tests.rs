@@ -12559,6 +12559,10 @@
                 ids.contains(&"claude-opus-4-8".to_string()),
                 "curated list must include the default Opus id"
             );
+            assert!(
+                ids.contains(&"claude-sonnet-5".to_string()),
+                "curated list must include the current Sonnet id"
+            );
         }
     }
 
