@@ -1591,15 +1591,30 @@ fn spawn_recording_terminal_watchdog(app: AppHandle, meeting_id: String) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let trigger = {
                 let state = app.state::<AppState>();
-                let slot = state
+                let mut slot = state
                     .recorder
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let Some(active) = slot.as_ref() else {
+                let Some(active) = slot.as_mut() else {
                     return;
                 };
                 if active.meeting_id != meeting_id {
                     return;
+                }
+                let mic_is_muted = active.is_muted();
+                if crate::audio::system::mic_must_be_restored(
+                    mic_is_muted,
+                    active.system.as_mut(),
+                ) {
+                    // The helper was healthy when mute was accepted but can fail later. Restore
+                    // the mic within this backend-owned 100 ms heartbeat; renderer health is not
+                    // required, so a hidden/reloaded webview cannot leave the recording silent.
+                    active.set_muted(false);
+                    tracing::warn!(
+                        target: "audio",
+                        "system audio became unavailable while mic-muted; microphone restored"
+                    );
+                    crate::events::emit_mic_auto_unmuted(&app);
                 }
                 if let Some(fault) = active.fault() {
                     Some(RecordingTerminalTrigger::CaptureFault {

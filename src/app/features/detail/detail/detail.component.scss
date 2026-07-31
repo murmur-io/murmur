@@ -2,7 +2,10 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-5);
-  animation: rise 380ms var(--transition) both;
+  /* Do not retain rise's final transform: a transformed ancestor becomes the
+     containing block for the fixed Ask drawer, pinning it to document content
+     instead of the viewport after the entrance animation finishes. */
+  animation: rise 380ms var(--transition) backwards;
 }
 
 /* --- Back link --- */
