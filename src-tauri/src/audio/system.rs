@@ -112,6 +112,16 @@ fn helper_exit_proves_finalized(success: bool, code: Option<i32>) -> bool {
 }
 
 fn terminate_and_reap(child: &mut Child) -> Option<std::process::ExitStatus> {
+    // A health probe may already have observed and reaped an exited helper. Do not send a signal
+    // to its now-stale numeric pid; return the cached Child status directly.
+    match child.try_wait() {
+        Ok(Some(status)) => return Some(status),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(target: "audio", error = %error, "system-audio child state unavailable; closing lifetime pipe without a signal");
+            return None;
+        }
+    }
     let _ = Command::new("/bin/kill")
         .arg("-TERM")
         .arg(child.id().to_string())
@@ -229,6 +239,14 @@ impl SystemAudioRecorder {
             .unwrap_or(self.started_at)
     }
 
+    /// Whether system audio can currently cover a muted microphone.
+    /// A historical first frame alone is not enough: the helper may have exited
+    /// later, leaving the recording mic-only again. Fail closed on process-state
+    /// errors as well as a missing first-frame marker.
+    pub(crate) fn can_cover_muted_mic(&mut self) -> bool {
+        self.first_frame_at.get().is_some() && matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// SIGTERM the sidecar so it finalizes the WAV, wait for it, and always return owned teardown
     /// metadata. A failed helper can still leave a valid partial WAV; the recording coordinator
     /// must adopt or proof-delete that exact artifact.
@@ -288,6 +306,16 @@ impl SystemAudioRecorder {
             helper_finalized,
         }
     }
+}
+
+/// Whether a muted microphone must be restored because system audio is not positively live.
+/// Shared by the click-time guard and the 100 ms backend watchdog so helper death after a
+/// successful mute cannot silence the rest of the recording.
+pub(crate) fn mic_must_be_restored(
+    mic_is_muted: bool,
+    system: Option<&mut SystemAudioRecorder>,
+) -> bool {
+    mic_is_muted && !system.is_some_and(SystemAudioRecorder::can_cover_muted_mic)
 }
 
 /// C1 — best-effort teardown for a recorder that is DROPPED without a clean [`SystemAudioRecorder::stop`]
@@ -395,6 +423,32 @@ mod tests {
             !process_present(pid),
             "dropping without stop() must SIGTERM + reap the child — no orphan, no zombie"
         );
+    }
+
+    #[test]
+    fn mic_mute_readiness_requires_a_live_helper_with_a_real_system_audio_frame() {
+        let (mut rec, _) = recorder_over_dummy_child();
+        assert!(
+            mic_must_be_restored(true, Some(&mut rec)),
+            "spawning a helper alone must not authorize muting the only proven audio source"
+        );
+        rec.first_frame_at
+            .set(std::time::Instant::now())
+            .expect("set synthetic first-frame anchor");
+        assert!(
+            !mic_must_be_restored(true, Some(&mut rec)),
+            "a live helper plus its first-frame marker authorizes system-audio fallback"
+        );
+
+        // The mic is now conceptually muted. Kill the helper only AFTER that successful
+        // authorization, then exercise the same predicate used by the live watchdog.
+        let mut mic_muted = true;
+        let _ = rec.child.kill();
+        let _ = rec.child.wait();
+        if mic_must_be_restored(mic_muted, Some(&mut rec)) {
+            mic_muted = false;
+        }
+        assert!(!mic_muted, "helper death after mute must restore the mic");
     }
 
     #[test]

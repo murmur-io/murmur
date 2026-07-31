@@ -379,6 +379,16 @@ pub fn emit_recording_capped(app: &AppHandle) {
 /// that finalizes the exact durable prefix instead of leaving a red-but-still-owned session.
 pub const EVENT_RECORDING_CAPTURE_FAULT: &str = "murmur://recording-capture-fault";
 
+/// System audio disappeared while the microphone was muted. The backend has already restored the
+/// mic before emitting this content-free event; renderers only resync their control and explain it.
+pub const EVENT_MIC_AUTO_UNMUTED: &str = "murmur://mic-auto-unmuted";
+
+pub fn emit_mic_auto_unmuted(app: &AppHandle) {
+    if let Err(error) = app.emit(EVENT_MIC_AUTO_UNMUTED, ()) {
+        tracing::warn!(target: "audio", error = %error, "failed to emit mic-auto-unmuted notice");
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingCaptureFaultPayload {

@@ -177,11 +177,22 @@ pub(crate) fn recording_status_dto(
 /// no real mic audio is captured (privacy). No-op if not recording.
 #[tauri::command]
 pub fn set_mic_muted(state: State<'_, AppState>, muted: bool) -> Result<(), AppError> {
-    let recorder = state
+    let mut recorder = state
         .recorder
         .lock()
         .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-    if let Some(r) = recorder.as_ref() {
+    if let Some(r) = recorder.as_mut() {
+        // Never silence the only audio source we have actually observed. System capture is
+        // best-effort at Start and can degrade to mic-only on a Mac with missing TCC access or a
+        // device-specific helper failure. A real frame plus a currently-live helper is the
+        // minimum positive proof that "others" is still being recorded; without both the UI
+        // must keep the mic live.
+        if crate::audio::system::mic_must_be_restored(muted, r.system.as_mut()) {
+            return Err(AppError::Audio(
+                "microphone stayed on because system audio has not produced a frame; check Audio Recording or Screen Recording access"
+                    .into(),
+            ));
+        }
         r.set_muted(muted);
     }
     Ok(())
