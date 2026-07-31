@@ -28,6 +28,7 @@ pub mod pipeline;
 pub mod proactive;
 pub mod prompts;
 pub mod reason;
+pub(crate) mod reminder_audit;
 pub mod rerank;
 pub mod router;
 pub mod screenshare;
@@ -72,6 +73,7 @@ pub fn run() {
     // strictly before any ggml-Metal device can be initialized. SAFETY: single-threaded at
     // startup, before any thread that could read the env. (Mirror guard in `Transcriber::load`.)
     std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+    commands::prepare_reminder_runtime_probe_environment();
 
     // Acquire global process ownership BEFORE touching even the shared log, encrypted library, or
     // recovery ledger. Lease expiry alone cannot prove a mic-only recorder died: a stalled spool
@@ -160,7 +162,7 @@ pub fn run() {
         previous_panic_hook(info);
     }));
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -171,7 +173,16 @@ pub fn run() {
                     }
                 })
                 .build(),
-        )
+        );
+    if commands::reminder_runtime_probe_requested() {
+        // The exact Harness task drives real product commands through the normal Tauri IPC bridge.
+        // The fixed script claims one webview per process; its content-free control endpoint only
+        // sequences the runner-owned restart and validates counters/receipts.
+        builder = builder.append_invoke_initialization_script(
+            commands::reminder_runtime_probe_initialization_script(),
+        );
+    }
+    builder
         .invoke_handler(tauri::generate_handler![
             commands::set_focus_meeting,
             commands::start_recording,
@@ -354,6 +365,19 @@ pub fn run() {
             commands::get_action_items,
             commands::list_open_commitments,
             commands::patch_note_tasks,
+            // First-class Murmur reminder store. `add_reminder` immediately below remains the
+            // separate Apple Reminders osascript integration.
+            commands::list_reminders,
+            commands::get_reminder_summary,
+            commands::create_reminder,
+            commands::update_reminder,
+            commands::delete_reminder,
+            commands::complete_reminder,
+            commands::dismiss_reminder_occurrence,
+            commands::audit_reminder_suggestions,
+            commands::accept_reminder_suggestion,
+            commands::dismiss_reminder_suggestion,
+            commands::reminder_runtime_probe_control,
             commands::add_reminder,
             commands::pin_moment,
             commands::link_meeting_entities,
@@ -460,7 +484,7 @@ pub fn run() {
             commands::remove_lock,
             commands::discard_unrecoverable_folder_lock,
             commands::discard_unrecoverable_meeting_lock,
-            update::check_for_update,
+            commands::check_for_update_guarded,
             update::app_info,
             update::open_release_page,
         ])
@@ -575,6 +599,10 @@ pub fn run() {
                         return Ok(());
                     }
                 };
+                // Start background reminder work only after every synchronous fatal startup
+                // preflight has accepted this process. A rejected DB/recovery launch must not
+                // materialize occurrences or emit events while its fatal dialog is exiting.
+                commands::spawn_reminder_scheduler(app.handle().clone());
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     // This affine owner is deliberately retained across BOTH detection/claim and the
@@ -739,7 +767,7 @@ pub fn run() {
             // Pass the AppHandle so the server resolves the ONE managed AppState for every request:
             // DB, live session unlock set, seal epoch, and lifecycle guard cannot drift into an
             // independently-opened/snapshotted authority.
-            {
+            if !commands::reminder_runtime_probe_requested() {
                 let state = app.state::<AppState>();
                 let require_token = state
                     .config
@@ -749,6 +777,14 @@ pub fn run() {
                     // reasoner-dispatch poison posture (unreadable config never relaxes auth).
                     .unwrap_or(true);
                 crate::mcp::spawn(app.handle().clone(), require_token);
+            } else {
+                // The canonical runtime smoke treats the real MCP listener as its readiness
+                // witness. In this isolated debug process only, the IPC privacy probe starts MCP
+                // after it has proved relock/restart masking and the no-egress configuration matrix.
+                tracing::info!(
+                    target: "reminders",
+                    "native reminder runtime privacy probe is pending"
+                );
             }
             // Brain v2 L1.1 — TOPIC-CHUNK startup backfill: index topic segments for every VISIBLE
             // meeting that has a transcript, content-hash idempotent (an already-indexed vault is a

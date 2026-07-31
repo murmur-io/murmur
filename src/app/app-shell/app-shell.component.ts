@@ -33,6 +33,8 @@ import { DocumentPreviewComponent } from "../features/brain/document-preview/doc
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { MeetingsSidebarTreeComponent } from "../features/folders/meetings-sidebar-tree/meetings-sidebar-tree.component";
 import { NotesSidebarTreeComponent } from "../features/notes/notes-sidebar-tree/notes-sidebar-tree.component";
+import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
+import { RemindersStore } from "../features/reminders/reminders.store";
 import { ChromeService } from "../services/chrome.service";
 import { DocumentPreviewService } from "../services/document-preview.service";
 import { FolderLockFlowService } from "../services/folder-lock-flow.service";
@@ -89,6 +91,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
     items: [
       { path: "/library", label: "Meetings", icon: "meetings" },
       { path: "/notes", label: "Notes", icon: "notes" },
+      { path: "/reminders", label: "Reminders", icon: "reminders" },
     ],
   },
   {
@@ -118,6 +121,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { path: "/record", label: "Record", icon: "record" },
   { path: "/library", label: "Meetings", icon: "meetings" },
   { path: "/notes", label: "Notes", icon: "notes" },
+  { path: "/reminders", label: "Reminders", icon: "reminders" },
   { path: "/analytics", label: "Analytics", icon: "analytics" },
   { path: "/graph", label: "Graph", icon: "graph" },
   { path: "/people", label: "People", icon: "people" },
@@ -165,6 +169,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     MurSidebarSectionComponent,
     LockSharesDialogComponent,
     DocumentPreviewComponent,
+    ReminderComposerComponent,
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto
@@ -204,6 +209,8 @@ export class AppShellComponent {
   private readonly chrome = inject(ChromeService);
   private readonly tabs = inject(TabsService);
   private readonly injector = inject(Injector);
+  private readonly reminders = inject(RemindersStore);
+  readonly reminderCount = this.reminders.dueInboxCount;
 
   /**
    * Shared lock×shares flow (probe → warn/revoke dialog → lock) — rendered
@@ -225,6 +232,10 @@ export class AppShellComponent {
    * "open a document" surface calls {@link DocumentPreviewService.open}.
    */
   readonly docPreview = inject(DocumentPreviewService);
+
+  constructor() {
+    void this.reminders.initSummary();
+  }
 
   /**
    * The current URL, updated on every completed navigation. Seeded from

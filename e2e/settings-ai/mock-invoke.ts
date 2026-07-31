@@ -24,11 +24,21 @@ const BASE_MOCK = path.resolve(
  * @example
  *   await mockTauri(page, { brain_posture: () => "hybrid" });
  *   await mockTauri(page, {}, { list_brain_models: REGISTRY });
+ *   await mockTauri(page, {}, {}, ["murmur://privacy-event"]);
+ *   await mockTauri(page, {}, {}, [], ["murmur://delayed-event"]);
+ *   await mockTauri(page, {}, {}, [], [], { "murmur://event": [2] });
+ *   await mockTauri(page, {}, {}, [], [], {}, { "murmur://event": [1] });
+ *   await mockTauri(page, {}, {}, [], [], {}, {}, { "murmur://event": [1, 2] });
  */
 export async function mockTauri(
   page: Page,
   overrides: Record<string, (args: any) => unknown> = {},
   constants: Record<string, unknown> = {},
+  rejectedEventListeners: string[] = [],
+  delayedEventListeners: string[] = [],
+  delayedEventListenerOrdinals: Record<string, number[]> = {},
+  rejectedEventListenerOrdinals: Record<string, number[]> = {},
+  heldRejectedEventListenerOrdinals: Record<string, number[]> = {},
 ): Promise<void> {
   await page.addInitScript({ path: BASE_MOCK });
   const serialized = {
@@ -42,16 +52,175 @@ export async function mockTauri(
       Object.entries(overrides).map(([k, v]) => [k, v.toString()]),
     ),
   };
-  await page.addInitScript((ov: Record<string, string>) => {
-    const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } }).__TAURI_INTERNALS__;
-    const orig = internals.invoke.bind(internals);
-    const names = Object.keys(ov);
-    internals.invoke = (cmd: string, args: unknown) => {
-      if (names.includes(cmd)) {
-        const fn = new Function("args", `return (${ov[cmd]})(args);`);
-        return Promise.resolve(fn(args ?? {}));
-      }
-      return orig(cmd, args);
-    };
-  }, serialized);
+  await page.addInitScript(
+    (config: {
+      overrides: Record<string, string>;
+      rejectedEventListeners: string[];
+      delayedEventListeners: string[];
+      delayedEventListenerOrdinals: Record<string, number[]>;
+      rejectedEventListenerOrdinals: Record<string, number[]>;
+      heldRejectedEventListenerOrdinals: Record<string, number[]>;
+    }) => {
+      const internals = (
+        window as unknown as {
+          __TAURI_INTERNALS__: {
+            invoke: (c: string, a: unknown) => Promise<unknown>;
+          };
+        }
+      ).__TAURI_INTERNALS__;
+      const orig = internals.invoke.bind(internals);
+      const names = Object.keys(config.overrides);
+      const pendingEventListeners = new Map<string, Array<() => void>>();
+      const releasedEventListeners = new Set<string>();
+      const releasedHeldRejections = new Set<string>();
+      const eventListenerCounts = new Map<string, number>();
+      const eventUnregisterCounts = new Map<string, number>();
+      const eventPluginInternals = (
+        window as unknown as {
+          __TAURI_EVENT_PLUGIN_INTERNALS__: {
+            unregisterListener: (event: string, eventId: number) => void;
+          };
+        }
+      ).__TAURI_EVENT_PLUGIN_INTERNALS__;
+      const unregisterListener =
+        eventPluginInternals.unregisterListener.bind(eventPluginInternals);
+      const currentLocalDate = (daysAgo: number): string => {
+        const date = new Date();
+        date.setHours(12, 0, 0, 0);
+        date.setDate(date.getDate() - daysAgo);
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
+      };
+      const refreshDemoAnalyticsWindow = (value: unknown): unknown => {
+        if (
+          typeof value !== "object" ||
+          value === null ||
+          !("perDay" in value) ||
+          !Array.isArray(value.perDay)
+        ) {
+          return value;
+        }
+        const perDay = value.perDay;
+        return {
+          ...value,
+          perDay: perDay.map((entry, index) =>
+            typeof entry === "object" && entry !== null
+              ? {
+                  ...entry,
+                  date: currentLocalDate(perDay.length - index - 1),
+                }
+              : entry,
+          ),
+        };
+      };
+      eventPluginInternals.unregisterListener = (
+        event: string,
+        eventId: number,
+      ) => {
+        eventUnregisterCounts.set(
+          event,
+          (eventUnregisterCounts.get(event) ?? 0) + 1,
+        );
+        unregisterListener(event, eventId);
+      };
+      (
+        window as unknown as {
+          __demoEventListenerRegistrationCount: (event: string) => number;
+          __demoEventListenerUnregisterCount: (event: string) => number;
+        }
+      ).__demoEventListenerRegistrationCount = (event: string) =>
+        eventListenerCounts.get(event) ?? 0;
+      (
+        window as unknown as {
+          __demoEventListenerUnregisterCount: (event: string) => number;
+        }
+      ).__demoEventListenerUnregisterCount = (event: string) =>
+        eventUnregisterCounts.get(event) ?? 0;
+      (
+        window as unknown as {
+          __demoReleaseEventListeners: (event: string) => void;
+        }
+      ).__demoReleaseEventListeners = (event: string) => {
+        releasedEventListeners.add(event);
+        const pending = pendingEventListeners.get(event) ?? [];
+        pendingEventListeners.delete(event);
+        for (const release of pending) {
+          release();
+        }
+      };
+      (
+        window as unknown as {
+          __demoReleaseRejectedEventListeners: (event: string) => void;
+        }
+      ).__demoReleaseRejectedEventListeners = (event: string) => {
+        releasedHeldRejections.add(event);
+      };
+      internals.invoke = (cmd: string, args: unknown) => {
+        const event =
+          typeof args === "object" && args !== null && "event" in args
+            ? String((args as { event: unknown }).event)
+            : "";
+        const listenerOrdinal =
+          cmd === "plugin:event|listen"
+            ? (eventListenerCounts.get(event) ?? 0) + 1
+            : 0;
+        if (listenerOrdinal > 0) {
+          eventListenerCounts.set(event, listenerOrdinal);
+        }
+        if (
+          cmd === "plugin:event|listen" &&
+          (config.rejectedEventListeners.includes(event) ||
+            (config.rejectedEventListenerOrdinals[event] ?? []).includes(
+              listenerOrdinal,
+            ) ||
+            ((config.heldRejectedEventListenerOrdinals[event] ?? []).includes(
+              listenerOrdinal,
+            ) &&
+              !releasedHeldRejections.has(event)))
+        ) {
+          return Promise.reject(new Error(`mock listen rejected for ${event}`));
+        }
+        if (
+          cmd === "plugin:event|listen" &&
+          (config.delayedEventListeners.includes(event) ||
+            (config.delayedEventListenerOrdinals[event] ?? []).includes(
+              listenerOrdinal,
+            )) &&
+          !releasedEventListeners.has(event)
+        ) {
+          return new Promise((resolve, reject) => {
+            const pending = pendingEventListeners.get(event) ?? [];
+            pending.push(() => {
+              orig(cmd, args).then(resolve, reject);
+            });
+            pendingEventListeners.set(event, pending);
+          });
+        }
+        if (names.includes(cmd)) {
+          const fn = new Function(
+            "args",
+            `return (${config.overrides[cmd]})(args);`,
+          );
+          return Promise.resolve(fn(args ?? {}));
+        }
+        if (cmd === "get_analytics") {
+          // The screenshot fixture has a fixed historical anchor. Keep only the
+          // shared test helper's fallback window relative to today so the 30-day
+          // chart remains non-uniform when the calendar advances.
+          return orig(cmd, args).then(refreshDemoAnalyticsWindow);
+        }
+        return orig(cmd, args);
+      };
+    },
+    {
+      overrides: serialized,
+      rejectedEventListeners,
+      delayedEventListeners,
+      delayedEventListenerOrdinals,
+      rejectedEventListenerOrdinals,
+      heldRejectedEventListenerOrdinals,
+    },
+  );
 }
