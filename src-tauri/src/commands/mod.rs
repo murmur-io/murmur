@@ -8238,6 +8238,7 @@ pub(crate) fn enqueue_marker_cleanup_for_folders(
 /// RE-BLANK (relock): re-blank the plaintext transcript + timeline of every governed meeting and
 /// remove the decrypted session WAV, re-pointing audio_path back at the `.enc`. The `*_blob`
 /// columns + the `.enc` stay (the folder is still `locked=1`). Idempotent.
+#[cfg(test)]
 pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppError> {
     let verified = verify_relock_retained_blobs(state, folder_id)?;
     if verified.has_repairs() {
@@ -8268,6 +8269,7 @@ impl VerifiedRelockPlan {
         self.ck.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_repairs(&self) -> bool {
         !self.attachment_seals.is_empty()
             || !self.note_seals.is_empty()

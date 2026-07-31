@@ -382,8 +382,13 @@ def read_json_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
-def enhanced_task_dir(root: Path) -> Path:
+def harness_task_dir(root: Path, task_id: str) -> Path:
     """Resolve the exact task evidence directory in canonical and verify snapshots."""
+
+    if not task_id or len(task_id) > 160 or not all(
+        char.isalnum() or char in "-_" for char in task_id
+    ):
+        raise RuntimeProofError("Harness task id is invalid")
 
     harness_runtime = os.environ.get("MURMUR_HARNESS_RUNTIME_DIR")
     if harness_runtime:
@@ -395,7 +400,7 @@ def enhanced_task_dir(root: Path) -> Path:
         expected_runtime = task_dir / "runtime" / "checks" / "runtime-smoke"
         if (
             runtime_root != expected_runtime
-            or task_dir.name != ENHANCED_RUNTIME_TASK_ID
+            or task_dir.name != task_id
         ):
             raise RuntimeProofError(
                 "Harness runtime evidence directory is outside the exact task"
@@ -406,12 +411,12 @@ def enhanced_task_dir(root: Path) -> Path:
         / "agent-harness"
         / "v2"
         / "tasks"
-        / ENHANCED_RUNTIME_TASK_ID
+        / task_id
     )
 
 
-def validate_task_provenance(root: Path) -> dict[str, Any]:
-    task_dir = enhanced_task_dir(root)
+def validate_task_provenance(root: Path, expected_task_id: str) -> dict[str, Any]:
+    task_dir = harness_task_dir(root, expected_task_id)
     task_path = task_dir / "task.json"
     task_fingerprint = fingerprint_file(task_path, label="Harness task contract")
     task = read_json_object(task_path, "Harness task contract")
@@ -422,13 +427,13 @@ def validate_task_provenance(root: Path) -> dict[str, Any]:
     driver = Path(str(task.get("repo_realpath", ""))).resolve()
     if (
         task.get("schema_version") != 2
-        or task.get("task_id") != ENHANCED_RUNTIME_TASK_ID
+        or task.get("task_id") != expected_task_id
         or task_dir
         != git_common
         / "agent-harness"
         / "v2"
         / "tasks"
-        / ENHANCED_RUNTIME_TASK_ID
+        / expected_task_id
         or not driver.is_dir()
         or (driver / ".git").resolve() != git_common
         or not isinstance(branch, str)
@@ -441,6 +446,8 @@ def validate_task_provenance(root: Path) -> dict[str, Any]:
         raise RuntimeProofError("Harness task contract is not bound to this exact worktree")
 
     proof_mode = "canonical"
+    attempt_id: str | None = None
+    attempt_plan_sha256: str | None = None
     if root == canonical_worktree:
         if common_dir(root) != git_common or git_branch(root) != branch:
             raise RuntimeProofError(
@@ -449,9 +456,19 @@ def validate_task_provenance(root: Path) -> dict[str, Any]:
     else:
         state_path = task_dir / "state.json"
         state = read_json_object(state_path, "Harness task state")
-        attempt_id = state.get("attempt_id")
-        if not valid_lowercase_hex(attempt_id, 64):
+        snapshot_prefix = "verify-"
+        snapshot_attempt_id = (
+            root.name.removeprefix(snapshot_prefix)
+            if root.name.startswith(snapshot_prefix)
+            else ""
+        )
+        state_attempt_id = state.get("attempt_id")
+        if (
+            not valid_lowercase_hex(snapshot_attempt_id, 64)
+            or state_attempt_id != snapshot_attempt_id
+        ):
             raise RuntimeProofError("Harness verify snapshot has no valid attempt id")
+        attempt_id = snapshot_attempt_id
         attempt_dir = task_dir / "attempts" / attempt_id
         plan_path = attempt_dir / "plan.json"
         plan = read_json_object(plan_path, "Harness attempt plan")
@@ -465,13 +482,13 @@ def validate_task_provenance(root: Path) -> dict[str, Any]:
             or state.get("schema_version") != 2
             or state.get("status") != "VERIFYING"
             or state.get("phase") != "checks"
-            or state.get("task_id") != ENHANCED_RUNTIME_TASK_ID
+            or state.get("task_id") != expected_task_id
             or Path(str(state.get("plan_path", ""))).resolve() != plan_path
             or state.get("diff_sha256") != plan.get("diff_sha256")
             or state.get("plan_sha256") != plan.get("plan_sha256")
             or state.get("protocol_sha256") != plan.get("protocol_sha256")
             or plan.get("schema_version") != 2
-            or plan.get("task_id") != ENHANCED_RUNTIME_TASK_ID
+            or plan.get("task_id") != expected_task_id
             or plan.get("base_sha") != task.get("base_sha")
             or plan.get("contract_sha256") != task.get("contract_sha256")
             or not valid_lowercase_hex(plan.get("tree_sha"), 40)
@@ -482,6 +499,7 @@ def validate_task_provenance(root: Path) -> dict[str, Any]:
                 "Harness verify snapshot is not bound to its exact attempt plan"
             )
         proof_mode = "verified-snapshot"
+        attempt_plan_sha256 = str(plan["plan_sha256"])
     return {
         "path": str(task_path),
         "sha256": task_fingerprint["sha256"],
@@ -489,7 +507,69 @@ def validate_task_provenance(root: Path) -> dict[str, Any]:
         "baseSha": task["base_sha"],
         "contractSha256": task["contract_sha256"],
         "mode": proof_mode,
+        "attemptId": attempt_id,
+        "attemptPlanSha256": attempt_plan_sha256,
     }
+
+
+def active_harness_task(marker: str | None, task_id: str) -> str | None:
+    """Resolve a complete Harness marker/task pair, rejecting either half fail-closed."""
+
+    if marker is None and not task_id:
+        return None
+    if marker != "1" or not task_id:
+        raise RuntimeProofError(
+            "Harness runtime requires both MURMUR_HARNESS=1 and MURMUR_HARNESS_TASK"
+        )
+    return task_id
+
+
+def unchanged_harness_provenance(
+    expected: dict[str, Any], current: dict[str, Any]
+) -> bool:
+    """Bind snapshot work to the exact attempt as well as the task and plan."""
+
+    if expected != current:
+        return False
+    if expected.get("mode") == "verified-snapshot":
+        return valid_lowercase_hex(expected.get("attemptId"), 64) and valid_lowercase_hex(
+            expected.get("attemptPlanSha256"), 64
+        )
+    return expected.get("attemptId") is None and expected.get("attemptPlanSha256") is None
+
+
+def assert_fail_closed_harness_regressions() -> None:
+    """Keep both marker mismatch directions and attempt substitution permanently RED."""
+
+    for marker, task_id in (("1", ""), (None, "some-task")):
+        try:
+            active_harness_task(marker, task_id)
+        except RuntimeProofError:
+            pass
+        else:
+            raise RuntimeProofError("Harness marker/task mismatch regression")
+    if active_harness_task("1", "some-task") != "some-task":
+        raise RuntimeProofError("Harness marker/task binding regression")
+    first = {
+        "mode": "verified-snapshot",
+        "attemptId": "a" * 64,
+        "attemptPlanSha256": "b" * 64,
+    }
+    substituted = {**first, "attemptId": "c" * 64}
+    if unchanged_harness_provenance(first, substituted):
+        raise RuntimeProofError("Harness attempt-substitution regression")
+
+
+def verified_snapshot_owns_cargo_lane(
+    provenance: dict[str, Any] | None, inherited_seatbelt: bool
+) -> bool:
+    """Never bypass resource arbitration without both exact provenance and kernel confinement."""
+
+    return bool(
+        provenance is not None
+        and provenance.get("mode") == "verified-snapshot"
+        and inherited_seatbelt
+    )
 
 
 def validate_restart_intent(
@@ -1229,15 +1309,16 @@ def main() -> int:
     started_at = utc_now()
 
     root = repo_root()
-    harness_task = os.environ.get("MURMUR_HARNESS_TASK", "")
-    enhanced_required = harness_task == ENHANCED_RUNTIME_TASK_ID
-    if enhanced_required and os.environ.get("MURMUR_HARNESS") != "1":
-        return emit(
-            "FAIL",
-            "the enhanced runtime proof requires an exact Harness-owned task environment",
-            None,
-            started_at,
+    harness_task_value = os.environ.get("MURMUR_HARNESS_TASK", "")
+    try:
+        assert_fail_closed_harness_regressions()
+        harness_task = active_harness_task(
+            os.environ.get("MURMUR_HARNESS"), harness_task_value
         )
+    except RuntimeProofError as exc:
+        return emit("FAIL", str(exc), None, started_at)
+    harness_owned_runtime = harness_task is not None
+    enhanced_required = harness_task == ENHANCED_RUNTIME_TASK_ID
     try:
         mode, timeout = selected_timeout(
             root,
@@ -1250,13 +1331,13 @@ def main() -> int:
 
     runtime_root = runtime_dir(root)
     preflight_task: dict[str, Any] | None = None
-    if enhanced_required:
+    if harness_owned_runtime:
         try:
-            preflight_task = validate_task_provenance(root)
+            preflight_task = validate_task_provenance(root, harness_task)
             task_directory = Path(preflight_task["path"]).parent.resolve()
             if not path_is_within(runtime_root.resolve(), task_directory):
                 raise RuntimeProofError(
-                    "enhanced runtime evidence directory is outside its exact Harness task"
+                    "runtime evidence directory is outside the exact Harness task"
                 )
         except (OSError, ValueError, RuntimeError) as exc:
             return emit("FAIL", str(exc), None, started_at)
@@ -1372,20 +1453,29 @@ def main() -> int:
     staged_binary = temp_root / "Murmur-runtime-bin"
     runner_source = Path(__file__).resolve()
     wrapper_source = root / "scripts" / "harness-runtime-smoke"
-    outer_harness_owns_cargo_lane = (
-        enhanced_required
+    verified_snapshot = bool(
+        harness_owned_runtime
         and preflight_task is not None
         and preflight_task.get("mode") == "verified-snapshot"
     )
-    if outer_harness_owns_cargo_lane:
+    # Executed negative regression: a verified snapshot with no inherited Seatbelt can never
+    # select the outer-owned lane, even if every provenance field is otherwise valid.
+    if verified_snapshot_owns_cargo_lane(preflight_task, False):
+        return emit("FAIL", "resource-lane selector failed closed", log_path, started_at)
+    inherited_seatbelt = False
+    if verified_snapshot:
         try:
-            if not inherited_network_sandbox_is_active():
+            inherited_seatbelt = inherited_network_sandbox_is_active()
+            if not inherited_seatbelt:
                 raise RuntimeProofError(
                     "verified snapshot lacks a kernel-enforced outbound network restriction"
                 )
             network_enforcement = "inherited-harness-seatbelt"
         except RuntimeProofError as exc:
             return emit("FAIL", str(exc), log_path, started_at)
+    outer_harness_owns_cargo_lane = verified_snapshot_owns_cargo_lane(
+        preflight_task, inherited_seatbelt
+    )
 
     try:
         isolated_home = temp_root / "home"
@@ -1476,10 +1566,17 @@ def main() -> int:
 
             app_env = env.copy()
             app_command = [str(app_binary.resolve())]
+            if harness_owned_runtime:
+                task_provenance = validate_task_provenance(root, harness_task)
+                if preflight_task is None or not unchanged_harness_provenance(
+                    preflight_task, task_provenance
+                ):
+                    raise RuntimeProofError(
+                        "Harness task or attempt provenance changed during build"
+                    )
             if enhanced_required:
                 if sqlcipher_binary is None:
                     raise RuntimeProofError("SQLCipher disappeared after preflight")
-                task_provenance = validate_task_provenance(root)
                 runner_fingerprint = fingerprint_file(
                     runner_source, label="runtime runner source"
                 )
@@ -1762,9 +1859,6 @@ def main() -> int:
                 current_stage = fingerprint_file(staged_binary, label="staged app binary")
                 if not same_fingerprint(current_stage, staged_identity):
                     raise RuntimeProofError("staged app binary changed after execution")
-                current_task = validate_task_provenance(root)
-                if current_task["sha256"] != task_provenance["sha256"]:
-                    raise RuntimeProofError("Harness task contract changed during execution")
                 if (
                     fingerprint_file(runner_source, label="runtime runner source")["sha256"]
                     != challenge["runnerSourceSha256"]
@@ -1782,6 +1876,15 @@ def main() -> int:
                 pass_reason = (
                     "Angular served and the directly supervised real Rust MCP listener stayed alive"
                 )
+
+            if harness_owned_runtime:
+                current_task = validate_task_provenance(root, harness_task)
+                if task_provenance is None or not unchanged_harness_provenance(
+                    task_provenance, current_task
+                ):
+                    raise RuntimeProofError(
+                        "Harness task or attempt provenance changed during execution"
+                    )
 
         text = log_path.read_text(errors="replace")
         fatal_markers = ("thread 'main' panicked", "fatal runtime error", "Abort trap", "SIGABRT")

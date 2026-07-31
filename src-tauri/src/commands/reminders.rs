@@ -20,6 +20,7 @@ use crate::storage::models::{
     ReminderState, ReminderSuggestionView, ReminderSummary, ReminderView, RemindersSnapshot,
     StoredReminder, StoredReminderSuggestion,
 };
+use crate::storage::reminder_store::ReminderSuggestionPromotion;
 use crate::transcribe::types::Segment;
 
 /// Escape a string for embedding inside an AppleScript `"…"` literal: backslash + double-quote are
@@ -2674,15 +2675,18 @@ fn accept_reminder_suggestion_under_lifecycle(
 
     let reminder_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp_millis();
-    if !state.db.promote_pending_reminder_suggestion(
-        &suggestion.id,
-        &suggestion.source_kind,
-        &suggestion.source_id,
-        &current_hash,
-        &reminder_id,
-        &draft,
-        now,
-    )? {
+    if !state
+        .db
+        .promote_pending_reminder_suggestion(ReminderSuggestionPromotion {
+            suggestion_id: &suggestion.id,
+            expected_source_kind: &suggestion.source_kind,
+            expected_source_id: &suggestion.source_id,
+            expected_content_hash: &current_hash,
+            reminder_id: &reminder_id,
+            draft: &draft,
+            now,
+        })?
+    {
         return Err(AppError::InvalidArg(
             "reminder suggestion is stale or was already accepted".into(),
         ));
@@ -4413,15 +4417,15 @@ mod smart_audit_command_tests {
         assert_eq!(rows.len(), 3);
         assert!(state
             .db
-            .promote_pending_reminder_suggestion(
-                &rows[0].id,
-                "meeting",
-                "m1",
-                &content_hash,
-                "accepted-before-fresh-lock",
-                &reminder_draft(),
-                11,
-            )
+            .promote_pending_reminder_suggestion(ReminderSuggestionPromotion {
+                suggestion_id: &rows[0].id,
+                expected_source_kind: "meeting",
+                expected_source_id: "m1",
+                expected_content_hash: &content_hash,
+                reminder_id: "accepted-before-fresh-lock",
+                draft: &reminder_draft(),
+                now: 11,
+            })
             .unwrap());
         assert!(state
             .db
