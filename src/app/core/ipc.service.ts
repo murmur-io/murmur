@@ -177,6 +177,7 @@ export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
 export const EVENT_RECORDING_CAPTURE_FAULT =
   "murmur://recording-capture-fault";
+export const EVENT_MIC_AUTO_UNMUTED = "murmur://mic-auto-unmuted";
 // Brain v2 L5 — a scheduled brief was STAGED (propose-accept; run id + label + size only).
 export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
 // Vault Audit — the audit state changed (a run finished / findings purged by a seal or delete).
@@ -246,8 +247,10 @@ export class IpcService {
 
   /**
    * Mute / unmute the local microphone on the LIVE recorder. Muting silences
-   * only the mic — captured system audio ("others") keeps recording. No-op when
-   * not recording.
+   * only the mic — captured system audio ("others") keeps recording. Muting is
+   * rejected until the backend has observed a real system-audio frame, so a Mac
+   * that degraded to mic-only can never be silenced completely. No-op when not
+   * recording.
    */
   setMicMuted(muted: boolean): Promise<void> {
     return invoke<void>("set_mic_muted", { muted });
@@ -2831,6 +2834,11 @@ export class IpcService {
       EVENT_RECORDING_CAPTURE_FAULT,
       (event) => cb(event.payload),
     );
+  }
+
+  /** System audio vanished while muted; Rust already restored the microphone. */
+  onMicAutoUnmuted(cb: () => void): Promise<UnlistenFn> {
+    return listen<void>(EVENT_MIC_AUTO_UNMUTED, () => cb());
   }
 
   // ── Phase H — brain / in-meeting voice assistant event streams ─────────

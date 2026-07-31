@@ -10,7 +10,7 @@ use crate::summarize::meta::CallMeta;
 /// Single source of truth for the FE model dropdowns, served through the `list_models` command —
 /// this list previously lived hardcoded in the Settings template. Order is display order (most
 /// capable first). Static compile-time data — no I/O, no egress.
-pub const CLAUDE_MODELS: &[&str] = &["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
+pub const CLAUDE_MODELS: &[&str] = &["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"];
 
 /// Curated Codex model ids offered for the `codex_cli` connection.
 ///

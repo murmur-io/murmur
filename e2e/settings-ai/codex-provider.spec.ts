@@ -241,7 +241,7 @@ test("a delayed Codex catalog cannot overwrite a newer engine selection", async 
         );
       }
       if (args.connection === "anthropic") {
-        return ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
+        return ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"];
       }
       return [];
     },
