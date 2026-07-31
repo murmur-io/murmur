@@ -15,6 +15,7 @@ pub mod models;
 pub(crate) mod notes_store;
 pub(crate) mod org_store;
 pub(crate) mod recording_store;
+pub(crate) mod reminder_store;
 pub(crate) mod seal_store;
 pub(crate) mod settings_store;
 pub mod usage;

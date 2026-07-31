@@ -5918,6 +5918,7 @@
         let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         unseal_folder_extras(&state, &fid, &ck, None).unwrap();
         state.unlocked_folders.lock().unwrap().insert(fid.clone());
 
@@ -7602,6 +7603,7 @@
         let wrapped = state.db.folder_wrapped_key(folder_id).unwrap().unwrap();
         let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).unwrap();
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         for n in state.db.notes_in_folder(folder_id).unwrap() {
             if let Some(blob) = &n.content_blob {
                 let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");

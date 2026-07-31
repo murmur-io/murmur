@@ -460,6 +460,14 @@ pub(crate) fn require_current_document_content_snapshot(
     snapshot: &DocumentContentSnapshot,
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    require_current_document_content_snapshot_under_lifecycle(state, note_id, snapshot)
+}
+
+pub(crate) fn require_current_document_content_snapshot_under_lifecycle(
+    state: &AppState,
+    note_id: &str,
+    snapshot: &DocumentContentSnapshot,
+) -> Result<(), AppError> {
     require_current_content_visibility_snapshot_under_lifecycle(state, snapshot.visibility)?;
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
         return Err(AppError::InvalidArg(format!("no note {note_id}")));
@@ -7490,6 +7498,26 @@ pub(crate) fn repair_locked_folder_at_rest(
     folder_id: &str,
     ck: &[u8; 32],
 ) -> Result<(), AppError> {
+    // Attachments can carry both a session plaintext BLOB and a tracked plaintext vault export.
+    // Authenticate every governed row before the first note export is deleted or any plaintext
+    // column is blanked below. Missing ciphertext is repairable only when the exact canonical bytes
+    // still exist in SQLCipher; a blob-less/blank row fails closed so an exported image is never
+    // mistaken for a disposable duplicate.
+    let attachments = db.attachments_in_folder(folder_id)?;
+    let mut attachment_seals = Vec::new();
+    for attachment in &attachments {
+        if let Some(blob) =
+            verify_or_prepare_attachment_relock_blob(ck, folder_id, attachment, true)?
+        {
+            attachment_seals.push((attachment.id.clone(), blob));
+        }
+    }
+    if !attachment_seals.is_empty() {
+        // Store only replacements already decrypt-verified against the exact SQLCipher plaintext.
+        // `store_attachment_seals` does not blank `data`; later failures remain retryable.
+        db.store_attachment_seals(&attachment_seals)?;
+    }
+
     // Meeting-note exports must be removed while their recorded path still exists. `seal_note`
     // clears that cleanup authority, so delete/prove absent first on both initial seal and repair.
     for note in db.notes_in_folder(folder_id)? {
@@ -7567,6 +7595,11 @@ pub(crate) fn repair_locked_folder_at_rest(
             db.set_meeting_sys_master_path(&meeting_id, Some(&path))?;
         }
     }
+    // Startup reconciliation checks the repair predicate before its global cleanup pass. Complete
+    // the attachment half here now that every row was authenticated above: blank only rows with a
+    // recoverable blob, then delete tracked exports with retry metadata preserved on failure.
+    let attachment_exports = db.blank_attachments_in_folder(folder_id)?;
+    delete_attachment_exports_with_retry(db, attachment_exports)?;
     Ok(())
 }
 
@@ -7585,6 +7618,17 @@ pub(crate) fn locked_folder_requires_authenticated_repair(
         }
     }
     if !db.note_exported_path_rows_in_folder(folder_id)?.is_empty() {
+        return Ok(true);
+    }
+    if db
+        .attachments_in_folder(folder_id)?
+        .iter()
+        .any(|attachment| {
+            !attachment.data.is_empty()
+                || attachment.data_blob.is_none()
+                || attachment.exported_path.is_some()
+        })
+    {
         return Ok(true);
     }
     for document in db.raw_documents_in_folder(folder_id)? {
@@ -8194,21 +8238,332 @@ pub(crate) fn enqueue_marker_cleanup_for_folders(
 /// RE-BLANK (relock): re-blank the plaintext transcript + timeline of every governed meeting and
 /// remove the decrypted session WAV, re-pointing audio_path back at the `.enc`. The `*_blob`
 /// columns + the `.enc` stay (the folder is still `locked=1`). Idempotent.
+#[cfg(test)]
 pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    let verified = verify_relock_retained_blobs(state, folder_id)?;
+    if verified.has_repairs() {
+        prepare_folder_exports_before_relock(state, folder_id)?;
+        verified.apply_repairs(&state.db)?;
+    }
+    reblank_folder_extras_after_verification(state, folder_id, verified.ck())
+}
+
+/// Authenticate every retained ciphertext whose current session plaintext is about to be
+/// destroyed by relock, and prove that it decrypts byte-identical to that plaintext. A non-empty
+/// plaintext with no blob is an interrupted-fresh-seal repair: build and decrypt-verify its
+/// replacement ciphertext in memory, but do not blank anything yet. Relock-all constructs one plan
+/// per folder before applying the FIRST repair/blank, so one corrupt/stale blob leaves every good
+/// plaintext column untouched.
+pub(crate) struct VerifiedRelockPlan {
+    ck: Option<Zeroizing<[u8; 32]>>,
+    attachment_seals: Vec<(String, Vec<u8>)>,
+    note_seals: Vec<(String, String, Vec<u8>)>,
+    segment_seals: Vec<(String, i64, Vec<u8>)>,
+    timeline_seals: Vec<(String, Vec<u8>)>,
+    manual_note_seals: Vec<(String, Vec<u8>)>,
+    document_seals: Vec<(String, Vec<u8>)>,
+}
+
+impl VerifiedRelockPlan {
+    pub(crate) fn ck(&self) -> Option<&[u8; 32]> {
+        self.ck.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_repairs(&self) -> bool {
+        !self.attachment_seals.is_empty()
+            || !self.note_seals.is_empty()
+            || !self.segment_seals.is_empty()
+            || !self.timeline_seals.is_empty()
+            || !self.manual_note_seals.is_empty()
+            || !self.document_seals.is_empty()
+    }
+
+    /// Persist only ciphertexts already decrypt-verified against their exact captured plaintext.
+    /// Each low-level `seal_*` call stores that recoverable blob and blanks the matching plaintext;
+    /// a later DB failure therefore leaves completed rows recoverable and the cached KEK available
+    /// for an idempotent retry.
+    pub(crate) fn apply_repairs(&self, db: &Db) -> Result<(), AppError> {
+        // Persist attachment replacements before any of the existing `seal_*` calls below can
+        // blank a plaintext column. The batch itself retains `data`, so a later failure remains
+        // recoverable and an idempotent retry can authenticate the newly retained blobs.
+        if !self.attachment_seals.is_empty() {
+            db.store_attachment_seals(&self.attachment_seals)?;
+        }
+        for (meeting_id, provider_id, blob) in &self.note_seals {
+            db.seal_note(meeting_id, provider_id, blob)?;
+        }
+        for (meeting_id, idx, blob) in &self.segment_seals {
+            db.seal_segment(meeting_id, *idx, blob)?;
+        }
+        for (meeting_id, blob) in &self.timeline_seals {
+            db.seal_timeline(meeting_id, blob)?;
+        }
+        for (meeting_id, blob) in &self.manual_note_seals {
+            db.seal_manual_notes(meeting_id, blob)?;
+        }
+        for (document_id, blob) in &self.document_seals {
+            db.seal_document(document_id, blob)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn verify_relock_retained_blobs(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<VerifiedRelockPlan, AppError> {
+    let notes = state.db.notes_in_folder(folder_id)?;
+    let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+    let documents = state.db.raw_documents_in_folder(folder_id)?;
+    let attachments = state.db.attachments_in_folder(folder_id)?;
+    let mut meeting_content = Vec::with_capacity(meeting_ids.len());
+    for meeting_id in &meeting_ids {
+        meeting_content.push((
+            meeting_id.clone(),
+            state.db.raw_segments(meeting_id)?,
+            state.db.raw_timeline(meeting_id)?,
+            state.db.raw_manual_notes(meeting_id)?,
+        ));
+    }
+    let mut needs_verification = notes.iter().any(|note| !note.markdown.is_empty())
+        || documents.iter().any(|document| !document.text.is_empty())
+        || attachments.iter().any(|attachment| {
+            !attachment.data.is_empty()
+                || attachment.data_blob.is_none()
+                || attachment.exported_path.is_some()
+        });
+    if !needs_verification {
+        needs_verification = meeting_content
+            .iter()
+            .any(|(_, segments, timeline, manual)| {
+                segments.iter().any(|segment| !segment.text.is_empty())
+                    || timeline
+                        .as_ref()
+                        .is_some_and(|timeline| !timeline.data.is_empty())
+                    || manual
+                        .as_ref()
+                        .is_some_and(|manual| !manual.text.is_empty())
+            });
+    }
+    if !needs_verification {
+        return Ok(VerifiedRelockPlan {
+            ck: None,
+            attachment_seals: Vec::new(),
+            note_seals: Vec::new(),
+            segment_seals: Vec::new(),
+            timeline_seals: Vec::new(),
+            manual_note_seals: Vec::new(),
+            document_seals: Vec::new(),
+        });
+    }
+
+    if state.db.folder_wrapped_key(folder_id)?.is_none() {
+        return Err(AppError::Locked(
+            "relock found plaintext without a wrapped folder key; content retained for authenticated repair"
+                .into(),
+        ));
+    }
+    let ck = session_folder_ck(state, folder_id)?;
+    let mut attachment_seals = Vec::new();
+    let mut note_seals = Vec::new();
+    let mut segment_seals = Vec::new();
+    let mut timeline_seals = Vec::new();
+    let mut manual_note_seals = Vec::new();
+    let mut document_seals = Vec::new();
+    for attachment in &attachments {
+        if attachment.data.is_empty()
+            && attachment.data_blob.is_some()
+            && attachment.exported_path.is_none()
+        {
+            continue;
+        }
+        if let Some(blob) =
+            verify_or_prepare_attachment_relock_blob(&ck, folder_id, attachment, true)?
+        {
+            attachment_seals.push((attachment.id.clone(), blob));
+        }
+    }
+    for note in &notes {
+        if !note.markdown.is_empty() {
+            if let Some(blob) = verify_or_prepare_relock_blob(
+                &ck,
+                note.content_blob.as_deref(),
+                &aad_content(folder_id, &note.meeting_id, &note.provider_id, "note"),
+                note.markdown.as_bytes(),
+                "note",
+            )? {
+                note_seals.push((note.meeting_id.clone(), note.provider_id.clone(), blob));
+            }
+        }
+    }
+    for (meeting_id, segments, timeline, manual) in &meeting_content {
+        for segment in segments {
+            if !segment.text.is_empty() {
+                if let Some(blob) = verify_or_prepare_relock_blob(
+                    &ck,
+                    segment.text_blob.as_deref(),
+                    &aad_content(folder_id, meeting_id, AAD_NO_PROVIDER, "segment"),
+                    segment.text.as_bytes(),
+                    "segment",
+                )? {
+                    segment_seals.push((meeting_id.clone(), segment.idx, blob));
+                }
+            }
+        }
+        if let Some(timeline) = timeline {
+            if !timeline.data.is_empty() {
+                if let Some(blob) = verify_or_prepare_relock_blob(
+                    &ck,
+                    timeline.data_blob.as_deref(),
+                    &aad_content(folder_id, meeting_id, AAD_NO_PROVIDER, "timeline"),
+                    timeline.data.as_bytes(),
+                    "timeline",
+                )? {
+                    timeline_seals.push((meeting_id.clone(), blob));
+                }
+            }
+        }
+        if let Some(manual) = manual {
+            if !manual.text.is_empty() {
+                if let Some(blob) = verify_or_prepare_relock_blob(
+                    &ck,
+                    manual.blob.as_deref(),
+                    &aad_content(folder_id, meeting_id, AAD_NO_PROVIDER, "manual_notes"),
+                    manual.text.as_bytes(),
+                    "manual notes",
+                )? {
+                    manual_note_seals.push((meeting_id.clone(), blob));
+                }
+            }
+        }
+    }
+    for document in &documents {
+        if !document.text.is_empty() {
+            if let Some(blob) = verify_or_prepare_relock_blob(
+                &ck,
+                document.blob.as_deref(),
+                &aad_document(folder_id, &document.id),
+                document.text.as_bytes(),
+                "document",
+            )? {
+                document_seals.push((document.id.clone(), blob));
+            }
+        }
+    }
+    Ok(VerifiedRelockPlan {
+        ck: Some(ck),
+        attachment_seals,
+        note_seals,
+        segment_seals,
+        timeline_seals,
+        manual_note_seals,
+        document_seals,
+    })
+}
+
+/// Verify the attachment recovery copy for relock/startup without consulting an unlocked-content
+/// reader. SQLCipher protects the canonical metadata; `byte_len + sha256` binds the decrypted bytes
+/// to that metadata, while the attachment AAD binds the seal to its exact folder/owner/id.
+fn verify_or_prepare_attachment_relock_blob(
+    ck: &[u8; 32],
+    folder_id: &str,
+    attachment: &crate::storage::AttachmentRecord,
+    require_recoverable_empty: bool,
+) -> Result<Option<Vec<u8>>, AppError> {
+    use sha2::{Digest, Sha256};
+
+    let verify_metadata = |plaintext: &[u8]| -> Result<(), AppError> {
+        let digest: [u8; 32] = Sha256::digest(plaintext).into();
+        if plaintext.len() as u64 != attachment.byte_len || digest != attachment.sha256 {
+            return Err(AppError::Storage(
+                "attachment bytes do not match their authenticated metadata during relock".into(),
+            ));
+        }
+        Ok(())
+    };
+    let aad = attachment_aad(folder_id, &attachment.owner, &attachment.id);
+
+    if !attachment.data.is_empty() {
+        verify_metadata(&attachment.data)?;
+        return verify_or_prepare_relock_blob(
+            ck,
+            attachment.data_blob.as_deref(),
+            &aad,
+            &attachment.data,
+            "attachment",
+        );
+    }
+
+    let Some(blob) = attachment.data_blob.as_deref() else {
+        if require_recoverable_empty {
+            return Err(AppError::Storage(
+                "attachment has neither plaintext nor a recoverable seal during relock".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    let restored = crate::crypto::decrypt(ck, blob, &aad)?;
+    verify_metadata(&restored)?;
+    Ok(None)
+}
+
+fn verify_or_prepare_relock_blob(
+    ck: &[u8; 32],
+    retained_blob: Option<&[u8]>,
+    aad: &[u8],
+    plaintext: &[u8],
+    family: &'static str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    if let Some(blob) = retained_blob {
+        verify_relock_plaintext_copy(ck, blob, aad, plaintext, family)?;
+        return Ok(None);
+    }
+    let blob = crate::crypto::encrypt(ck, plaintext, aad)?;
+    verify_relock_plaintext_copy(ck, &blob, aad, plaintext, family)?;
+    Ok(Some(blob))
+}
+
+fn verify_relock_plaintext_copy(
+    ck: &[u8; 32],
+    blob: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+    family: &'static str,
+) -> Result<(), AppError> {
+    let restored = crate::crypto::decrypt(ck, blob, aad)?;
+    if restored != plaintext {
+        return Err(AppError::Storage(format!(
+            "{family} retained seal does not match session plaintext"
+        )));
+    }
+    Ok(())
+}
+
+fn reblank_folder_extras_after_verification(
+    state: &AppState,
+    folder_id: &str,
+    verified_ck: Option<&[u8; 32]>,
+) -> Result<(), AppError> {
     // SEAL-NET KEY (2026-07-16 lock review of #356): resolve the folder CK from the SESSION-CACHED
     // KEK only — never a keychain/biometric prompt (this runs on relock / app-close / screen-share).
     // Both relock paths retain the KEK until every filesystem reblank succeeds, then zeroize it as
     // the final session-state commit. A failed reblank therefore remains retryable and never claims
     // a locked state while a known plaintext audio path survives.
-    let seal_ck: Option<Zeroizing<[u8; 32]>> = (|| {
-        let kek = state.master_kek.lock().ok()?.clone()?;
-        let wrapped = state.db.folder_wrapped_key(folder_id).ok().flatten()?;
-        let bytes = Zeroizing::new(
-            crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).ok()?,
-        );
-        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-        Some(Zeroizing::new(arr))
-    })();
+    let resolved_ck: Option<Zeroizing<[u8; 32]>> = if verified_ck.is_none() {
+        (|| {
+            let kek = state.master_kek.lock().ok()?.clone()?;
+            let wrapped = state.db.folder_wrapped_key(folder_id).ok().flatten()?;
+            let bytes = Zeroizing::new(
+                crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).ok()?,
+            );
+            let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+            Some(Zeroizing::new(arr))
+        })()
+    } else {
+        None
+    };
+    let seal_ck = verified_ck.or(resolved_ck.as_deref());
     for mid in state.db.meeting_ids_in_folder(folder_id)? {
         for s in state.db.raw_segments(&mid)? {
             if s.text_blob.is_some() && !s.text.is_empty() {
@@ -8229,7 +8584,7 @@ pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result
         }
         let playback_aad = aad_audio_role(&mid, folder_id, StreamRole::Playback);
         if let Some(enc) = reblank_audio(
-            seal_ck.as_deref(),
+            seal_ck,
             state.db.get_meeting(&mid)?.and_then(|m| m.audio_path),
             &playback_aad,
         )? {
@@ -8237,11 +8592,11 @@ pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result
         }
         let (mic, sys) = state.db.get_meeting_master_paths(&mid)?;
         let mic_aad = aad_audio_role(&mid, folder_id, StreamRole::Mic);
-        if let Some(enc) = reblank_audio(seal_ck.as_deref(), mic, &mic_aad)? {
+        if let Some(enc) = reblank_audio(seal_ck, mic, &mic_aad)? {
             state.db.set_meeting_mic_master_path(&mid, Some(&enc))?;
         }
         let sys_aad = aad_audio_role(&mid, folder_id, StreamRole::Sys);
-        if let Some(enc) = reblank_audio(seal_ck.as_deref(), sys, &sys_aad)? {
+        if let Some(enc) = reblank_audio(seal_ck, sys, &sys_aad)? {
             state.db.set_meeting_sys_master_path(&mid, Some(&enc))?;
         }
         // FAIL-CLOSED sweep (2026-07-16 reviews: #352 adversarial MEDIUM, then the #356 lock-review
@@ -8257,7 +8612,7 @@ pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result
             .iter()
             .any(|s| s.text_blob.is_none());
         if has_unsealed {
-            if let Some(ck) = seal_ck.as_ref() {
+            if let Some(ck) = seal_ck {
                 seal_meeting_extras(&state.db, folder_id, &mid, ck)?;
                 tracing::warn!(target: "lock", meeting_id = %mid, "relock authenticated and sealed exact crash-window transcript rows in place under the folder CK");
             } else {

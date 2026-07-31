@@ -452,7 +452,11 @@
   }
 
   <!-- ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none). -->
-  <app-meeting-actions [meetingId]="meetingId()" />
+  <app-meeting-actions
+    [meetingId]="meetingId()"
+    [meetingTitle]="meetingTitle()"
+    [sourceRevision]="noteRaw()"
+  />
 
   <!-- "Ask about this meeting" moved OUT of this in-flow Note panel into the
        detail shell's summoned right-side drawer (2026-07 slideout), so the

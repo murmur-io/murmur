@@ -1219,6 +1219,225 @@ pub struct ActionItem {
     pub due_date: Option<String>,
 }
 
+// ── Murmur Reminders ────────────────────────────────────────────────────────────────────────────
+
+/// A reminder's recurrence cadence. Stored as a stable lowercase string and surfaced unchanged
+/// over IPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReminderRepeatUnit {
+    Days,
+    Weeks,
+    Months,
+    Years,
+}
+
+impl ReminderRepeatUnit {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Days => "days",
+            Self::Weeks => "weeks",
+            Self::Months => "months",
+            Self::Years => "years",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "days" => Ok(Self::Days),
+            "weeks" => Ok(Self::Weeks),
+            "months" => Ok(Self::Months),
+            "years" => Ok(Self::Years),
+            other => Err(crate::error::AppError::Storage(format!(
+                "unknown reminder repeat unit: {other}"
+            ))),
+        }
+    }
+}
+
+/// Reminder provenance. `Smart` means the user explicitly promoted a reviewed local suggestion;
+/// it never means that an audit created a reminder automatically.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReminderOrigin {
+    Manual,
+    Smart,
+}
+
+impl ReminderOrigin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Smart => "smart",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "smart" => Ok(Self::Smart),
+            other => Err(crate::error::AppError::Storage(format!(
+                "unknown reminder origin: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReminderState {
+    Active,
+    Completed,
+}
+
+impl ReminderState {
+    pub(crate) fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            other => Err(crate::error::AppError::Storage(format!(
+                "unknown reminder state: {other}"
+            ))),
+        }
+    }
+}
+
+/// An opaque anchor to a Murmur-authored note or meeting. Titles are deliberately NOT stored here:
+/// the command layer resolves them only through the source's current visibility gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSourceAnchor {
+    pub kind: String,
+    pub id: String,
+}
+
+/// User-editable input shared by create/update and Smart-suggestion promotion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderDraft {
+    pub title: String,
+    pub details: Option<String>,
+    /// UTC epoch milliseconds. The composer derives this from a calendar-valid local date/time.
+    pub due_at: i64,
+    pub repeat_every: Option<u32>,
+    pub repeat_unit: Option<ReminderRepeatUnit>,
+    #[serde(default)]
+    pub sources: Vec<ReminderSourceAnchor>,
+}
+
+/// Canonical SQLCipher-backed reminder row plus its opaque source anchors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReminder {
+    pub id: String,
+    pub title: String,
+    pub details: Option<String>,
+    pub due_at: i64,
+    pub repeat_every: Option<u32>,
+    pub repeat_unit: Option<ReminderRepeatUnit>,
+    pub state: ReminderState,
+    pub origin: ReminderOrigin,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+    pub sources: Vec<ReminderSourceAnchor>,
+}
+
+/// Live-gated source metadata. A sealed/deleted source contributes no entry; the reminder itself is
+/// independent user data and remains usable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSourceView {
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderView {
+    pub id: String,
+    pub title: String,
+    pub details: Option<String>,
+    pub due_at: i64,
+    pub repeat_every: Option<u32>,
+    pub repeat_unit: Option<ReminderRepeatUnit>,
+    pub state: ReminderState,
+    pub origin: ReminderOrigin,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+    pub sources: Vec<ReminderSourceView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderInboxItem {
+    pub occurrence_id: String,
+    pub due_at: i64,
+    pub reminder: ReminderView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemindersSnapshot {
+    pub inbox: Vec<ReminderInboxItem>,
+    pub upcoming: Vec<ReminderView>,
+    pub completed: Vec<ReminderView>,
+    pub due_inbox_count: u64,
+}
+
+/// Content-free shell badge projection. Fetching it never resolves reminder/source titles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSummary {
+    pub due_inbox_count: u64,
+}
+
+/// Storage projection for one unread due occurrence. The command layer joins the referenced
+/// reminder to its live-gated source metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReminderOccurrence {
+    pub id: String,
+    pub reminder_id: String,
+    pub due_at: i64,
+}
+
+/// One disposable Smart-audit suggestion row. The title is source-derived plaintext, so storage
+/// purges this domain on every source edit/seal/relock; it is never treated as user-owned reminder
+/// data until an explicit atomic promotion succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReminderSuggestion {
+    pub id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub content_hash: String,
+    pub engine_id: String,
+    pub candidate_key: String,
+    pub title: String,
+    pub suggested_due_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// Content-free lookup anchor for accept/dismiss authorization. Command code may read this before
+/// taking the lifecycle mutex because it contains no suggestion title, due time, or source title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderSuggestionGateAnchor {
+    pub id: String,
+    pub source_kind: String,
+    pub source_id: String,
+}
+
+/// IPC-safe Smart suggestion. Source metadata is resolved through the current visibility gate by
+/// the command layer; storage never persists a source title in the derived audit tables.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderSuggestionView {
+    pub id: String,
+    pub title: String,
+    pub suggested_due_at: Option<i64>,
+    pub source: ReminderSourceView,
+}
+
 /// One OPEN action item ("commitment") rolled up across the whole library, carrying its meeting
 /// context. Produced by the deterministic `Db::list_open_commitments` aggregation: only OPEN
 /// (`- [ ]`, not `- [x]`) items from VISIBLE meetings contribute — a sealed-and-not-unlocked

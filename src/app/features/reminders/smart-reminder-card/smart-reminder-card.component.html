@@ -1,0 +1,74 @@
+<section class="smart-card card" aria-label="Reminders for this source">
+  <header class="smart-head">
+    <div>
+      <span class="smart-kicker">✦ Smart reminders</span>
+      <h3>Don’t let this slip</h3>
+    </div>
+    <button
+      type="button"
+      class="btn btn-ghost"
+      [disabled]="!listenerReady()"
+      (click)="newReminder()"
+    >
+      New reminder
+    </button>
+  </header>
+
+  @if (error(); as message) {
+    <div class="smart-error" role="alert">
+      <span>{{ message }}</span>
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="!listenerReady()"
+        (click)="retry()"
+      >
+        Retry
+      </button>
+    </div>
+  }
+
+  @if (loading() && rows().length === 0) {
+    <p class="smart-status">Reviewing this source locally…</p>
+  } @else if (rows().length > 0) {
+    <p class="smart-intro">
+      Review these local suggestions. Murmur never creates them automatically.
+    </p>
+    <ul class="suggestion-list">
+      @for (row of rows(); track row.suggestion.id) {
+        <li class="suggestion-row">
+          <div>
+            <strong>{{ row.suggestion.title }}</strong>
+            @if (row.dueLabel; as due) {
+              <span>{{ due }}</span>
+            } @else {
+              <span>Choose a date before creating</span>
+            }
+          </div>
+          <div class="suggestion-actions">
+            <button
+              type="button"
+              class="btn btn-primary"
+              [disabled]="busy().has(row.suggestion.id)"
+              (click)="editAndCreate(row.suggestion)"
+            >
+              Edit &amp; create
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost"
+              [disabled]="busy().has(row.suggestion.id)"
+              (click)="dismiss(row.suggestion.id)"
+            >
+              {{ busy().has(row.suggestion.id) ? "Dismissing…" : "Dismiss" }}
+            </button>
+          </div>
+        </li>
+      }
+    </ul>
+  } @else if (!error()) {
+    <p class="smart-status">
+      No reminder suggestions here. You can still create one manually.
+    </p>
+  }
+</section>
