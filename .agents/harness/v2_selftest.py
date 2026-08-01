@@ -6899,6 +6899,313 @@ def commit_recovery_cases(test: Tests) -> None:
         )
 
 
+def multi_commit_cases(test: Tests) -> None:
+    """One task, several commits — with the crash recovery still intact.
+
+    A task used to be permanently one commit, so every post-CI fix needed a new
+    task id (and therefore a new empty Cargo target dir). These assertions pin
+    the replacement rules:
+
+      * `plan`/`verify` accept a COMMITTED task, against the ADVANCED base;
+      * `commit` is idempotent on the DIFF, not on the status — no new exact
+        diff means the recorded receipt is re-verified and returned;
+      * a COMMITTED task whose worktree holds a NEW diff is sent back through
+        plan/verify instead of committing bytes no gate has seen;
+      * the durable commit-intent recovery still refuses to produce a second
+        commit after a process death — now on the SECOND commit of the task,
+        where the old `HEAD != contract.base_sha` discriminator would have
+        misread an ordinary commit as a crash;
+      * a HEAD moved by anything other than `cmd_commit` is still refused.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-multicommit-") as raw:
+        root = Path(raw)
+        primary = root / "primary"
+        primary.mkdir(parents=True)
+        _git(primary, "init", "-q", "-b", "murmur")
+        _git(primary, "config", "user.name", "QueaT")
+        _git(primary, "config", "user.email", "kgm004a@gmail.com")
+        for relative in verifier.protocol_relative_paths(ROOT):
+            source = ROOT / relative
+            target = primary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        seed = primary / "docs" / "multi-commit.md"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        seed.write_text("base\n", encoding="utf-8")
+        _git(primary, "add", ".")
+        _git(primary, "commit", "-q", "-m", "base")
+        base = _git(primary, "rev-parse", "HEAD")
+
+        repo = root / "task" / "meetnotes"
+        repo.parent.mkdir()
+        task_branch = "agent/v2/multi-commit"
+        _git(primary, "worktree", "add", "-q", "-b", task_branch, str(repo), base)
+        owned = repo / "docs" / "multi-commit.md"
+        common = Path(
+            _git(
+                primary,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_id = "multi-commit"
+        task_dir = harness_cli.v2_task_dir(common, task_id)
+        task_dir.mkdir(parents=True)
+        contract: Dict[str, Any] = {
+            "schema_version": 2,
+            "task_id": task_id,
+            "description": "one task carries several commits",
+            "kind": "docs",
+            "base_sha": base,
+            "contract_sha256": "",
+            "repo_realpath": str(primary.resolve()),
+            "git_common_dir": str(common.resolve()),
+            "worktree_path": str(repo.resolve()),
+            "branch": task_branch,
+            "owned_paths": ["docs/multi-commit.md"],
+            "claims": [],
+            "reviewer": "fake",
+            "expected_change": True,
+            "created_at": runtime.utc_now(),
+        }
+        contract["contract_sha256"] = verifier.document_hash(
+            contract, "contract_sha256"
+        )
+        runtime.validate_schema(
+            contract,
+            runtime.load_schema("v2-task"),
+            label="v2 multi-commit contract",
+        )
+        runtime.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(
+            task_dir / "runtime.json",
+            {
+                "schema_version": 2,
+                "task_root": str(root),
+                "shared_node_modules": None,
+                "server_worktree": None,
+                "server_source": str(root / "murmur-server"),
+                "server_revision": None,
+            },
+        )
+        harness_cli.set_v2_state(task_dir, "OPEN", phase="open")
+
+        def verify() -> str:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return harness_cli.verify_task(
+                    contract, task_dir, allow_test_adapter=True
+                )
+
+        def commit(message: str) -> int:
+            previous = Path.cwd()
+            try:
+                os.chdir(repo)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return harness_cli.cmd_v2_commit(
+                        argparse.Namespace(
+                            task_id=task_id,
+                            message=message,
+                            _allow_test_adapter=True,
+                        )
+                    )
+            finally:
+                os.chdir(previous)
+
+        def commit_in_child(message: str, kill: bool) -> subprocess.CompletedProcess:
+            child = (
+                "import argparse,os,pathlib,sys;"
+                f"sys.path.insert(0,{str(Path(__file__).resolve().parent)!r});"
+                "import cli;"
+                "os.chdir(sys.argv[1]);"
+                "cli.cmd_v2_commit(argparse.Namespace("
+                f"task_id={task_id!r},message={message!r},"
+                "_allow_test_adapter=True))"
+            )
+            environment = {**os.environ, "MURMUR_HARNESS_SELFTEST": "1"}
+            if kill:
+                environment[
+                    "MURMUR_HARNESS_SELFTEST_KILL_AFTER_GIT_COMMIT"
+                ] = "1"
+            else:
+                environment.pop(
+                    "MURMUR_HARNESS_SELFTEST_KILL_AFTER_GIT_COMMIT", None
+                )
+            return subprocess.run(
+                [sys.executable, "-c", child, str(repo)],
+                env=environment,
+                capture_output=True,
+                check=False,
+            )
+
+        # ── First commit: the ordinary single-commit lifecycle. ──
+        owned.write_text("base\nfirst\n", encoding="utf-8")
+        test.equal("MULTI first verify reaches PASS", verify(), "PASSED")
+        test.equal("MULTI first commit succeeds", commit("first change"), 0)
+        first_commit = _git(repo, "rev-parse", "HEAD")
+        test.equal(
+            "MULTI first commit is the only child of base",
+            _git(repo, "rev-list", "--count", f"{base}..HEAD"),
+            "1",
+        )
+        test.equal(
+            "MULTI the task base advances to the first commit",
+            harness_cli.load_v2_state(task_dir).get("base_sha"),
+            first_commit,
+        )
+        test.true(
+            "MULTI the fulfilled intent slot is emptied for the next commit",
+            not (task_dir / "commit-intent.json").exists(),
+        )
+        test.true(
+            "MULTI the fulfilled intent is archived under its commit",
+            (task_dir / "commits" / first_commit / "commit-intent.json").is_file()
+            and (task_dir / "commits" / first_commit / "commit.json").is_file(),
+        )
+
+        # ── Idempotence is keyed on the diff, not on the status. ──
+        test.equal(
+            "MULTI re-commit with no new diff is a no-op",
+            commit("first change"),
+            0,
+        )
+        test.equal(
+            "MULTI the no-op created no second commit",
+            _git(repo, "rev-list", "--count", f"{base}..HEAD"),
+            "1",
+        )
+
+        # ── A COMMITTED task with a NEW diff must be re-verified, never
+        #    committed straight from the COMMITTED state. ──
+        owned.write_text("base\nfirst\nsecond\n", encoding="utf-8")
+        test.raises(
+            "MULTI a new diff on a committed task demands re-verification",
+            lambda: commit("second change"),
+            "run plan and verify again",
+        )
+
+        # ── Second commit: plan/verify no longer refuse a COMMITTED task. ──
+        test.equal("MULTI second verify reaches PASS", verify(), "PASSED")
+        plan_path = Path(
+            str(harness_cli.load_v2_state(task_dir).get("plan_path", ""))
+        )
+        test.equal(
+            "MULTI the second plan is anchored on the first commit, not the task base",
+            runtime.load_json(plan_path).get("base_sha"),
+            first_commit,
+        )
+        test.equal("MULTI second commit succeeds", commit("second change"), 0)
+        second_commit = _git(repo, "rev-parse", "HEAD")
+        test.equal(
+            "MULTI the task now carries two commits",
+            _git(repo, "rev-list", "--count", f"{base}..HEAD"),
+            "2",
+        )
+        test.equal(
+            "MULTI the second commit is the exact child of the first",
+            _git(repo, "rev-parse", "HEAD^"),
+            first_commit,
+        )
+        second_receipt = runtime.load_json(task_dir / "commit.json")
+        test.equal(
+            "MULTI the receipt binds the second commit and its real parent",
+            (second_receipt["commit_sha"], second_receipt["parent_sha"]),
+            (second_commit, first_commit),
+        )
+        test.equal(
+            "MULTI both receipts survive under commits/<sha>/",
+            sorted(
+                path.name for path in (task_dir / "commits").iterdir()
+            ),
+            sorted({first_commit, second_commit}),
+        )
+        test.equal(
+            "MULTI verify_v2_committed accepts the latest commit",
+            harness_cli.verify_v2_committed(
+                contract, task_dir, allow_test_adapter=True
+            )["commit_sha"],
+            second_commit,
+        )
+
+        # ── Third commit, killed after `git commit`: the durable intent must
+        #    still recover WITHOUT producing a duplicate, now that the base has
+        #    advanced twice and `HEAD != contract.base_sha` is true for
+        #    perfectly ordinary reasons. ──
+        owned.write_text("base\nfirst\nsecond\nthird\n", encoding="utf-8")
+        test.equal("MULTI third verify reaches PASS", verify(), "PASSED")
+        killed = commit_in_child("third change", kill=True)
+        test.equal(
+            "MULTI third commit child receives a real SIGKILL after git commit",
+            killed.returncode,
+            -signal.SIGKILL,
+        )
+        third_commit = _git(repo, "rev-parse", "HEAD")
+        test.equal(
+            "MULTI the crash left exactly three commits",
+            _git(repo, "rev-list", "--count", f"{base}..HEAD"),
+            "3",
+        )
+        test.equal(
+            "MULTI the crash preserved PASSED until the receipt is finalized",
+            harness_cli.load_v2_state(task_dir)["status"],
+            "PASSED",
+        )
+        test.true(
+            "MULTI the durable intent for the third commit is on disk",
+            (task_dir / "commit-intent.json").is_file(),
+        )
+        test.equal(
+            "MULTI resuming the third commit succeeds", commit("third change"), 0
+        )
+        test.equal(
+            "MULTI the resume created NO fourth commit",
+            _git(repo, "rev-list", "--count", f"{base}..HEAD"),
+            "3",
+        )
+        test.equal(
+            "MULTI the resume preserved the exact committed HEAD",
+            _git(repo, "rev-parse", "HEAD"),
+            third_commit,
+        )
+        test.equal(
+            "MULTI the resumed receipt binds the third commit",
+            runtime.load_json(task_dir / "commit.json")["commit_sha"],
+            third_commit,
+        )
+        test.equal(
+            "MULTI the base advanced to the recovered third commit",
+            harness_cli.load_v2_state(task_dir).get("base_sha"),
+            third_commit,
+        )
+
+        # ── A head moved by anything other than the runner is still refused. ──
+        owned.write_text("base\nfirst\nsecond\nthird\nfourth\n", encoding="utf-8")
+        test.equal("MULTI fourth verify reaches PASS", verify(), "PASSED")
+        _git(repo, "add", "-A")
+        _git(
+            repo,
+            "-c",
+            "user.name=QueaT",
+            "-c",
+            "user.email=kgm004a@gmail.com",
+            "commit",
+            "-q",
+            "-m",
+            "hand-made commit outside the runner",
+        )
+        test.raises(
+            "MULTI a head moved outside cmd_commit is refused, not recovered",
+            lambda: commit("fourth change"),
+            "does not match a durable commit intent",
+        )
+        test.equal(
+            "MULTI the refusal left the hand-made head untouched",
+            _git(repo, "rev-list", "--count", f"{base}..HEAD"),
+            "4",
+        )
+
+
 def plan_and_probe_cases(test: Tests) -> None:
     base = runtime.git(ROOT, "rev-parse", "HEAD")
     tree = runtime.git(ROOT, "rev-parse", "HEAD^{tree}")
@@ -8524,6 +8831,7 @@ def main() -> int:
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
+    multi_commit_cases(test)
     plan_and_probe_cases(test)
     local_settings_policy_cases(test)
     clean_cases(test)

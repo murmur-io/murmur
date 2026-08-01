@@ -709,6 +709,33 @@ def _protected_changed_paths(paths: Sequence[str]) -> List[str]:
     )
 
 
+def task_base_sha(contract: Mapping[str, Any], task_dir: Path) -> str:
+    """Return the parent the NEXT exact diff must be computed against.
+
+    A task used to be exactly one commit, so `contract["base_sha"]` was both the
+    task's identity and its only parent. It is still the identity — the contract
+    is a hash-bound document and nothing here rewrites it — but it is no longer
+    the only parent: after each accepted commit the task's working base advances
+    to that commit, recorded in the append-only state ledger. The next diff is
+    therefore `parent..worktree`, never `original_base..worktree`, which is what
+    keeps every commit's plan, evidence and receipt bound to the exact bytes that
+    commit introduced.
+    """
+
+    # Read the append-only ledger directly rather than the projection: this must
+    # answer even before a task has transitioned once, and it must not repair or
+    # validate a projection as a side effect of asking "which parent". Every
+    # caller loads and validates the full state through `load_v2_state` anyway,
+    # so a malformed ledger still fails closed one step later — and
+    # `last_state_event` itself raises on a corrupt ledger rather than guessing.
+    event_state = last_state_event(task_dir)
+    if isinstance(event_state, Mapping):
+        advanced = event_state.get("base_sha")
+        if isinstance(advanced, str) and runtime.SHA1_RE.fullmatch(advanced):
+            return advanced
+    return str(contract["base_sha"])
+
+
 def snapshot_scoped_diff(
     worktree: Path,
     contract: Mapping[str, Any],
@@ -721,7 +748,7 @@ def snapshot_scoped_diff(
     later receipt commit must reproduce.
     """
 
-    if runtime.git(worktree, "rev-parse", "HEAD") != contract["base_sha"]:
+    if runtime.git(worktree, "rev-parse", "HEAD") != task_base_sha(contract, task_dir):
         raise runtime.HarnessError(
             "task HEAD changed; clean and re-open against the actual parent before verification"
         )
@@ -2538,19 +2565,26 @@ def verify_v2_evidence(
     if runtime.git(worktree, "branch", "--show-current") != contract["branch"]:
         raise runtime.HarnessError("v2 task branch changed")
     current_head = runtime.git(worktree, "rev-parse", "HEAD")
+    base_sha = task_base_sha(contract, task_dir)
     if attested_commit_sha is not None:
         parents = runtime.git(
             worktree, "show", "-s", "--format=%P", attested_commit_sha
         ).split()
-        if parents != [contract["base_sha"]]:
+        # One parent, and it must be the parent the immutable PASS evidence was
+        # computed against — enforced below by the `("parent_sha",
+        # evidence_parent)` comparison against the hash-bound evidence document.
+        # Comparing against the CONTRACT base instead would have been wrong for
+        # every commit after the first: the contract base is the task's identity,
+        # not the parent of this commit.
+        if len(parents) != 1:
             raise runtime.HarnessError(
-                "v2 attested commit is not the exact child of task base"
+                "v2 attested task commit must have exactly one parent"
             )
         if runtime.git_bytes(worktree, "status", "--porcelain").strip():
             raise runtime.HarnessError(
                 "v2 committed evidence requires a clean worktree/index"
             )
-        evidence_parent = contract["base_sha"]
+        evidence_parent = parents[0]
         encoded_paths = runtime.git_bytes(
             worktree,
             "diff",
@@ -2590,12 +2624,12 @@ def verify_v2_evidence(
                 "out-of-scope paths in v2 attested commit: "
                 + ", ".join(violations)
             )
-    elif current_head == contract["base_sha"]:
+    elif current_head == base_sha:
         paths, diff, tree_sha = snapshot_scoped_diff(worktree, contract, task_dir)
         evidence_parent = current_head
     elif allow_committed_head:
         evidence_parent = runtime.git(worktree, "rev-parse", "HEAD^")
-        if evidence_parent != contract["base_sha"]:
+        if evidence_parent != base_sha:
             raise runtime.HarnessError(
                 "v2 recovery commit is not the single exact child of task base"
             )
@@ -2713,7 +2747,11 @@ def verify_v2_evidence(
     for key, value in (
         ("task_id", contract["task_id"]),
         ("contract_sha256", contract["contract_sha256"]),
-        ("base_sha", contract["base_sha"]),
+        # The plan's base is the parent THIS diff was computed against, which is
+        # the contract base for the task's first commit and the previous commit
+        # afterwards. `evidence_parent` is derived above from git, never read
+        # from the plan, so this stays a real cross-check.
+        ("base_sha", evidence_parent),
         ("claims", list(contract.get("claims", []))),
         (
             "server_required",
