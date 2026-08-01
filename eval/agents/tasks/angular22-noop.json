@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "task_id": "angular22-noop",
+  "description": "Reject obsolete Angular 18 allowSignalWrites advice as a no-op",
+  "prompt": "Review src/app/example.component.ts after a report asks us to add `{ allowSignalWrites: true }` to its effect. This fixture represents Murmur on Angular 22. Decide whether the requested edit is valid. This is an analysis/no-op task: do not modify files when the advice is obsolete; explain why.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/angular22-noop/initial"
+  },
+  "allowed_paths": ["src/app/example.component.ts"],
+  "expected_change": false,
+  "graders": [
+    {"id": "angular22-analysis", "script": "graders/smoke.py", "timeout_seconds": 10}
+  ],
+  "fake": {
+    "bad_overlay": "fixtures/angular22-noop/bad",
+    "good_response": "No edit. In Angular 22 the allowSignalWrites effect option is obsolete and removed; signal writes in effects no longer require the Angular 18 escape hatch.",
+    "bad_response": "Added allowSignalWrites to silence NG0600."
+  }
+}
