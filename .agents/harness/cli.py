@@ -670,14 +670,7 @@ def prepare_plan(
     if "runtime" in contract.get("claims", []):
         runtime.runtime_preflight(worktree)
     state = load_v2_state(task_dir)
-    # COMMITTED is deliberately NOT a refusal: a task may carry more than one
-    # commit. After a commit the task's base has advanced to it (see
-    # verifier.task_base_sha), so planning again describes `parent..worktree` —
-    # the next change on the same branch, not a re-plan of what already shipped.
-    # This is the whole point: one feature used to consume eleven task ids
-    # because every post-CI fix needed a brand-new task, and a new task id means
-    # a new empty Cargo target dir.
-    if state.get("status") in verifier.V2_TERMINAL_STATES:
+    if state.get("status") in verifier.V2_TERMINAL_STATES | {"COMMITTED"}:
         raise runtime.HarnessError(
             f"cannot plan v2 task in state {state.get('status')}"
         )
@@ -1764,10 +1757,7 @@ def verify_task(
     lock = acquire_v2_run_lock(task_dir, "verify")
     try:
         state = load_v2_state(task_dir)
-        # COMMITTED is not a refusal — see prepare_plan. Verifying a committed
-        # task means verifying the NEXT diff on the same branch against the
-        # advanced base; the previous commit keeps its own receipt.
-        if state.get("status") in verifier.V2_TERMINAL_STATES:
+        if state.get("status") in verifier.V2_TERMINAL_STATES | {"COMMITTED"}:
             raise runtime.HarnessError(
                 f"cannot verify v2 task in state {state.get('status')}"
             )
@@ -2593,78 +2583,6 @@ def cmd_v2_guard_commit(
     return evidence
 
 
-def _recoverable_commit_intent(
-    worktree: Path,
-    task_dir: Path,
-    current_head: str,
-    base_sha: str,
-) -> Optional[Dict[str, Any]]:
-    """Return the durable intent iff HEAD is exactly the commit it describes.
-
-    The discriminator used to be `HEAD != base_sha`: the head moved, therefore a
-    process died between `git commit` and the receipt. That inference held only
-    while a task was permanently one commit. It does not survive a task that may
-    carry several, so recovery is now identified by the INTENT itself — HEAD's
-    parent and its message hash must both match the durable document written
-    before `git commit` ran. Everything the old path enforced afterwards
-    (`_validate_v2_commit_head`: parent, tree, diff hash, message, message hash,
-    author and committer, clean worktree) is unchanged and still runs, so this
-    only decides WHICH branch to take, never whether the commit is admissible.
-
-    Returning None while HEAD has moved is a refusal, not a fallthrough: the
-    caller raises rather than trying to reinterpret an unknown head.
-    """
-
-    path = task_dir / "commit-intent.json"
-    if not path.is_file():
-        return None
-    if current_head == base_sha:
-        # Nothing has been committed on top of the base yet.
-        return None
-    intent = runtime.load_json(path)
-    verifier.validate_hashed_document(
-        intent,
-        "v2-commit-intent",
-        "intent_sha256",
-        "v2 commit intent",
-    )
-    parent = runtime.git(worktree, "rev-parse", "HEAD^", check=False)
-    if not parent or parent != intent.get("parent_sha"):
-        return None
-    message = runtime.git(worktree, "log", "-1", "--format=%B").rstrip("\n")
-    if runtime.sha256_bytes(message.encode("utf-8")) != intent.get(
-        "message_sha256"
-    ):
-        return None
-    return intent
-
-
-def _retire_commit_intent(task_dir: Path, commit_sha: str) -> None:
-    """Archive the fulfilled intent so the NEXT commit starts from a clean slot.
-
-    `commit-intent.json` is a single slot. Leaving a fulfilled intent in it makes
-    the next commit on the same task collide with it inside `_commit_intent`, so
-    it is moved under `commits/<sha>/` together with a copy of its receipt. The
-    move is last and idempotent: a crash before it leaves a fulfilled intent in
-    place, which the next `_commit_intent` recognises as superseded (its parent
-    is no longer the current base) and replaces.
-    """
-
-    archive = task_dir / "commits" / commit_sha
-    archive.mkdir(parents=True, exist_ok=True)
-    intent_path = task_dir / "commit-intent.json"
-    receipt_path = task_dir / "commit.json"
-    if receipt_path.is_file():
-        runtime.atomic_write_json(
-            archive / "commit.json", runtime.load_json(receipt_path)
-        )
-    if intent_path.is_file():
-        runtime.atomic_write_json(
-            archive / "commit-intent.json", runtime.load_json(intent_path)
-        )
-        intent_path.unlink()
-
-
 def _commit_intent(
     contract: Mapping[str, Any],
     task_dir: Path,
@@ -2696,19 +2614,11 @@ def _commit_intent(
             "intent_sha256",
             "v2 commit intent",
         )
-        if existing == intent:
-            return existing
-        if existing.get("parent_sha") == intent["parent_sha"]:
-            # Same parent, different content: this is the operator changing the
-            # message (or the evidence) mid-recovery. Still a hard refusal.
+        if existing != intent:
             raise runtime.HarnessError(
                 "existing v2 commit intent differs; resume with the exact original message"
             )
-        # A different parent means the slot holds a FULFILLED intent whose
-        # archival did not complete (crash between the receipt and
-        # `_retire_commit_intent`). The head has since advanced past it, so it
-        # can no longer describe a pending commit and is superseded here rather
-        # than blocking every later commit on the task.
+        return existing
     runtime.validate_schema(
         intent,
         runtime.load_schema("v2-commit-intent"),
@@ -2793,28 +2703,7 @@ def _cmd_v2_commit_locked(
         getattr(args, "_allow_test_adapter", False)
     )
     state = load_v2_state(task_dir)
-    worktree = Path(str(contract["worktree_path"]))
     if state.get("status") == "COMMITTED":
-        # Idempotence is keyed on the DIFF, not on the status. A committed task
-        # with nothing new in its worktree has no exact diff left to certify, so
-        # re-running commit re-verifies the recorded receipt and returns it —
-        # and `verify_v2_committed` re-derives sha256(parent..commit) and refuses
-        # unless it still equals the receipt's `diff_sha256`, which is where the
-        # "unchanged diff" half of that rule is actually enforced.
-        #
-        # A committed task with a NEW diff is no longer refused outright: it is
-        # sent back through plan/verify, because a commit may only certify
-        # evidence that a gate could have refused. Committing straight from here
-        # would ship bytes no check ever saw.
-        pending = runtime.changed_paths(worktree)
-        if pending:
-            shown = ", ".join(pending[:10])
-            suffix = "" if len(pending) <= 10 else f" (+{len(pending) - 10} more)"
-            raise runtime.HarnessError(
-                "v2 task already carries commit "
-                f"{state.get('commit_sha', 'unknown')} and its worktree holds a new "
-                f"exact diff ({shown}{suffix}); run plan and verify again before commit"
-            )
         receipt = verify_v2_committed(
             contract,
             task_dir,
@@ -2835,6 +2724,7 @@ def _cmd_v2_commit_locked(
         return 0
     if state.get("status") != "PASSED":
         raise runtime.HarnessError("only a PASSED v2 task can be committed")
+    worktree = Path(str(contract["worktree_path"]))
     identity = runtime.load_config().get("commit_identity", {})
     name = identity.get("name") if isinstance(identity, Mapping) else None
     email = identity.get("email") if isinstance(identity, Mapping) else None
@@ -2842,16 +2732,7 @@ def _cmd_v2_commit_locked(
         raise runtime.HarnessError("v2 commit identity contract changed")
     expected_identity = {"name": name, "email": email}
     current_head = runtime.git(worktree, "rev-parse", "HEAD")
-    base_sha = verifier.task_base_sha(contract, task_dir)
-    recovery = _recoverable_commit_intent(
-        worktree, task_dir, current_head, base_sha
-    )
-    if recovery is None and current_head != base_sha:
-        raise runtime.HarnessError(
-            "v2 task HEAD moved after PASS and does not match a durable commit "
-            "intent; clean and re-open against the actual parent"
-        )
-    if recovery is None:
+    if current_head == contract["base_sha"]:
         evidence = cmd_v2_guard_commit(
             contract,
             task_dir,
@@ -2879,7 +2760,13 @@ def _cmd_v2_commit_locked(
         ):
             os.kill(os.getpid(), signal.SIGKILL)
     else:
-        intent = recovery
+        intent = runtime.load_json(task_dir / "commit-intent.json")
+        verifier.validate_hashed_document(
+            intent,
+            "v2-commit-intent",
+            "intent_sha256",
+            "v2 commit intent",
+        )
         evidence = verifier.verify_v2_evidence(
             contract,
             task_dir,
@@ -2926,16 +2813,9 @@ def _cmd_v2_commit_locked(
         commit_sha=commit_sha,
         parent_sha=parent_sha,
         tree_sha=tree_sha,
-        # The task's working base advances to the commit just accepted, so the
-        # next exact diff on this branch is `commit..worktree`. The CONTRACT's
-        # base_sha is untouched: it is the task's hash-bound identity, and the
-        # attestation model already chains per commit (each commit carries
-        # `Harness-Base` = its own parent plus its own `Harness-Diff-Sha256`).
-        base_sha=commit_sha,
         evidence_path=load_v2_state(task_dir).get("evidence_path"),
         evidence_sha256=evidence["evidence_sha256"],
     )
-    _retire_commit_intent(task_dir, commit_sha)
     print(
         json.dumps(
             {
