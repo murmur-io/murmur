@@ -121,9 +121,14 @@ domain modules under `commands/` and `storage/`; search symbols such as
 line citation is only a hint. The sourcing audit is
 `docs/research/2026-07-02-claude-setup-audit.md`.
 
-For Claude multi-task programs, use a session-scoped `/goal` that requires the
-next manifest action within 60 seconds after the prior stable outcome. Task
-scheduling stays outside the verifier.
+Task scheduling stays outside the verifier. For a multi-task program, run
+`scripts/agent-program run <manifest.json>`: it dispatches one headless session
+per entry, runs that entry's gate, stops on the first red, and records state so
+`resume` continues. This used to be a sentence asking for "the next manifest
+action within 60 seconds" — a scheduler written as an instruction to remember,
+which is unobservable, cannot resume, and fails silently. Sequential is
+deliberate: one Cargo lane machine-wide, and two sessions on one checkout
+conflict. Parallelism belongs to the reviewers inside a task.
 
 ## Honesty and ownership
 

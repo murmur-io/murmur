@@ -1,0 +1,26 @@
+:root {
+  --surface-base: #07070b;
+  --surface-raised: rgba(255, 255, 255, 0.045);
+  --surface-overlay: #1b1b24;
+  --surface-solid: #111118;
+  --surface-input: rgba(255, 255, 255, 0.035);
+  --surface-hover: rgba(255, 255, 255, 0.06);
+  --scrim: rgba(0, 0, 0, 0.5);
+
+  --text-primary: #f6f6fa;
+  --text-secondary: #a6a6b6;
+  --text-muted: #6c6c7d;
+  --text-on-accent: #ffffff;
+
+  --accent: #6e76ff;
+  --accent-hover: #8a90ff;
+  --accent-soft: rgba(110, 118, 255, 0.16);
+  --accent-ring: rgba(110, 118, 255, 0.5);
+
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-subtle: rgba(255, 255, 255, 0.055);
+
+  --danger: #ff6b6b;
+  --success: #4ade80;
+}
