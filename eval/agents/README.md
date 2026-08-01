@@ -71,16 +71,32 @@ carries a `measurement_limit` that states honestly whether the task can still me
 
 | Task | After the rewrite, can it measure the scaffold? |
 |---|---|
-| `lock-masked-dto` | **Partially.** "Mask the body, the path is just a filename" is a genuinely attractive wrong answer, so the arms can separate. A careful model can still reach the right answer from the field names alone. |
-| `analysis-only` | **Partially.** The finding itself is visible without any rule (an unused `unlocked` flag beside an unconditional return); what the scaffold plausibly changes is the no-edit discipline, which is now scored separately. |
-| `angular22-noop` | **Still weak.** That `allowSignalWrites` became a no-op in v19 is public framework knowledge, not repo knowledge. A recent model declines the edit unaided. Read a null result as "the model already knew". |
-| `seal-verify-before-destroy` | **Still weak.** The fixture is twelve lines with the destructive write textually above the failure return. "Audit this" ≈ "spot the obvious bug". |
+| `angular22-noop` | **No, for a frontier model — measured.** That `allowSignalWrites` became a no-op in v19 is public framework knowledge, not repo knowledge. |
+| `lock-masked-dto` | **No, for a frontier model — measured.** The half-fix was expected to be attractive. It was not. |
+| `analysis-only` | **Partially, untested live.** The finding is visible without any rule (an unused `unlocked` flag beside an unconditional return); what the scaffold plausibly changes is the no-edit discipline, which is now scored separately. |
+| `seal-verify-before-destroy` | **Still weak, untested live.** The fixture is twelve lines with the destructive write textually above the failure return. "Audit this" ≈ "spot the obvious bug". |
 | `secret-sk-proj` | **No, by design.** `scaffold_files` is empty, so its arms are byte-identical and its delta is definitionally zero. It is a floor check that the graders discriminate at all. |
 
-Two of five tasks therefore remain weak instruments. That is a property of 12-line fixtures, not
-of the prompts: a rule's real contribution is knowing a failure class exists *before* writing the
-code, and a toy fixture with the bug already in it cannot stage that. Do not read a near-zero
-delta on those two rows as evidence that a rule is worthless.
+**Measured 2026-08-01, `claude -p` (Claude Code 2.1.220), n=1 per arm.** After the rewrite, on the
+two tasks the review called the most important:
+
+| task | `none` (control) | `full` (real envelope) |
+|---|---|---|
+| `angular22-noop` | PASS — declined the edit unaided | PASS |
+| `lock-masked-dto` | PASS — masked **both** fields, strict `rustc` grader | PASS |
+
+Both arms are at the ceiling on both tasks, so their delta is 0 for a reason that has nothing to
+do with the scaffold. **The rewrite removed the giveaway; it did not make these two tasks
+measure the envelope against a current frontier model.** Saying otherwise would reproduce exactly
+the defect this repair was for. What the rewrite did buy: the ceiling is now a *finding about the
+model* rather than an artefact of the prompt, and the tasks can discriminate for a weaker, cheaper
+or older agent — which is a real use, since the matrix exists to compare agents too.
+
+This is a property of 12-line fixtures, not of the prompts: a rule's real contribution is knowing
+a failure class exists *before* writing the code, and a toy fixture with the bug already planted
+in it cannot stage that. A task that measures the envelope for a frontier model has to put the
+agent somewhere the general prior is genuinely wrong — a repo-specific decision, not a
+framework-version fact — and none of these five do.
 
 ## The scaffold arms — what makes this a comparison
 
@@ -219,9 +235,12 @@ fake-mode control plus `--selftest`, both cheap enough to leave running.
 
 ## Known limits (do not read more into a green matrix than is there)
 
-- **Two of five tasks are weak instruments** — see the `measurement_limit` table above. A
-  near-zero delta on `angular22-noop` or `seal-verify-before-destroy` is not evidence against the
-  rules those tasks name.
+- **No task in this suite currently separates the arms for a frontier model.** Two were measured
+  at the ceiling in both arms on 2026-08-01; two more are weak by inspection; one has identical
+  arms by construction. A near-zero delta from this suite is not evidence against the rules it
+  names — it is mostly evidence that the model already knew. Fixing that needs new tasks whose
+  correct answer is a **repo-specific** decision the general prior gets wrong, not better prompts
+  for these five.
 - **`allowed_paths` / `expected_change` are declared but only partly enforced.** `analysis-only`
   and `angular22-noop` now score the behavioural half in their graders; the runner still does not
   fail a task generically for editing a file it was told not to touch.

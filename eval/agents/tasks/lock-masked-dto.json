@@ -23,7 +23,7 @@
     }
   ],
   "grading_notes": "Purely behavioural: the candidate is compiled and executed against a hidden rustc test asserting a locked note yields None for BOTH fields and an unlocked note round-trips both. No prose is scored, so no phrasing or vocabulary can influence the verdict. When rustc is absent the grader degrades to a shape check that accepts any gating idiom (`unlocked.then(..)`, `if unlocked { .. }`, a match) and reports grader_mode 'degraded' — the runner records that, so a degraded cell is never silently compared against a strict one.",
-  "measurement_limit": "PARTIALLY MEASURABLE. Masking a note body but leaving the recording path is a genuinely attractive wrong answer (the path 'is not content'), so the arms can separate here. But a careful model can reach the same conclusion from the field names alone, without lock-model.md, so a null result does not prove the rule is inert.",
+  "measurement_limit": "AT THE CEILING FOR A FRONTIER MODEL, MEASURED. Masking a note body but leaving the recording path was expected to be an attractive wrong answer. It was not: live check 2026-08-01, claude -p (Claude Code 2.1.220), n=1 per arm, the CONTROL arm masked BOTH fields and passed the strict rustc grader without lock-model.md; the full arm also passed. So this task currently measures nothing about the scaffold either. It stays because the half-fix is a real shipped failure class and a weaker or cheaper agent may still produce it — the arms CAN separate here in principle, unlike secret-sk-proj where they are byte-identical by construction.",
   "fake": {
     "good_overlay": "fixtures/lock-masked-dto/good",
     "bad_overlay": "fixtures/lock-masked-dto/bad",
