@@ -4,15 +4,25 @@
 This is the INPUT half of the compounding-lessons loop.  Reviewer findings were
 already recorded in the evidence store and nothing ever read them back out, so
 every lesson the project paid for stayed inside an attempt directory nobody
-opens.  This module appends one journal CANDIDATE per MAJOR/BLOCKER finding of a
-NEEDS_FIX verdict to the canonical `.claude/learnings/main-loop.md`.
+opens.  This module renders one journal CANDIDATE per MAJOR/BLOCKER finding of a
+NEEDS_FIX verdict into the task's own evidence store.
 
-Three properties make it safe to run unattended:
+Four properties make it safe to run unattended:
 
-* It only ever appends inside `## Run journal`.  `## Recurring patterns` stays
-  byte-identical, because those bullets are binding imperatives bound into the
-  protocol hash — auto-promotion is precisely how a hallucinated finding would
-  become a rule.  Promotion stays the human's job (`/curate-learnings`).
+* It writes NO working tree.  The candidates land in ``<task_dir>/`` under the
+  Git common directory, never in a checkout.  An earlier revision appended
+  straight into ``contract["repo_realpath"]``/`.claude/learnings/main-loop.md`;
+  that path is always the standalone driver clone, which ``cmd_open`` requires
+  to be pristine (``standalone driver must be clean before open``) and holds at
+  a detached HEAD.  Every NEEDS_FIX therefore bricked the next ``open``, and the
+  only recovery available in a detached clone -- ``git restore`` -- destroyed
+  exactly the lesson this module exists to capture.
+* It produces a hand-off, not a rule.  Entries carry the journal's four-field
+  shape so the operator can paste them into `.claude/learnings/<agent>.md` from
+  their real checkout, where `/learn` and `/curate-learnings` run.
+  `## Recurring patterns` is never written by any code path -- those bullets are
+  binding imperatives, and auto-promotion is precisely how a hallucinated
+  finding would become a rule.
 * A finding is adversarial free text.  Every interpolated value is flattened to
   a single line, stripped of leading markdown structure, and truncated, so a
   finding can never open a section or forge a sibling entry.
@@ -24,19 +34,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-import subprocess
-import sys
-from typing import Any, List, Mapping, Optional, Set, Tuple
+from typing import Any, List, Mapping, Set, Tuple
 
 import runtime
 import verifier
 
 
 CONFIG_FLAG = "learning_extract"
-LEARNINGS_RELATIVE = Path(".claude") / "learnings" / "main-loop.md"
-MIRROR_RELATIVE = Path(".codex") / "learnings" / "main-loop.md"
-SYNC_SCRIPT_RELATIVE = Path("scripts") / "agent-sync-learnings"
-SYNC_TIMEOUT_SECONDS = 60
+CANDIDATES_NAME = "learning-candidates.md"
 # `verifier.V2_STATES` has no FAILED member: the real terminal verdict set is
 # PASSED | NEEDS_FIX | NEEDS_EVIDENCE | PAUSED_RETRYABLE.  Only NEEDS_FIX means
 # "a gate read the diff and refused it", which is the only verdict whose
@@ -59,6 +64,27 @@ LESSON = (
     "`## Recurring patterns` unread."
 )
 STATUS = "auto-candidate (uncurated)"
+PREAMBLE = (
+    "# Learning candidates\n"
+    "\n"
+    "Auto-extracted by `harness verify` from the severe findings of a NEEDS_FIX\n"
+    "verdict. These are raw reviewer output, NOT lessons, and nothing reads them\n"
+    "back: this file is task-local evidence under the Git common directory and\n"
+    "touches no working tree.\n"
+    "\n"
+    "To file them, from YOUR primary checkout (never the standalone driver):\n"
+    "rewrite an entry by hand as one imperative, record it with\n"
+    "`/learn <agent>: <lesson>`, promote a matured pattern with\n"
+    "`/curate-learnings <agent>`, then run `scripts/agent-sync-learnings`.\n"
+    "\n"
+    "## Run journal\n"
+)
+
+
+def candidates_path(task_dir: Path) -> Path:
+    """Return the task-local candidates file. Never inside a working tree."""
+
+    return task_dir / CANDIDATES_NAME
 
 
 def _sanitize(value: Any, limit: int) -> str:
@@ -126,8 +152,8 @@ def _journal_bounds(text: str) -> Tuple[int, int]:
     """Locate the `## Run journal` body: after its header, before the next section.
 
     The journal is the last section today, but the bound is computed rather than
-    assumed — the canonical tree is reconciled and regenerated, and an appender
-    that writes past a section boundary corrupts whatever moves below it.
+    assumed — an appender that writes past a section boundary corrupts whatever
+    moves below it.
     """
 
     header = JOURNAL_HEADER.search(text)
@@ -154,63 +180,41 @@ def _recorded_keys(section: str) -> Set[Tuple[str, str]]:
     }
 
 
-def _sync_mirror(repo_root: Path) -> Optional[Path]:
-    """Regenerate `.codex/learnings/` so the parity audit stays green.
+def candidate_count(task_dir: Path) -> int:
+    """Count filed candidates, so `status` can surface an unfiled lesson.
 
-    Guarded by existence rather than assumed: a tree without the sync helper
-    simply keeps its canonical write, and the config audit — not this module —
-    is what reports drift.
+    A file the operator never hears about is the same dead end as the evidence
+    store this module exists to drain, so `cmd_status` prints this.
     """
 
-    script = repo_root / SYNC_SCRIPT_RELATIVE
-    if script.is_symlink() or not script.is_file():
-        return None
+    path = candidates_path(task_dir)
+    if path.is_symlink() or not path.is_file():
+        return 0
     try:
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=SYNC_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    mirror = repo_root / MIRROR_RELATIVE
-    return mirror if mirror.is_file() else None
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return 0
+    return len(ENTRY_HEADER.findall(text))
 
 
 def append_learning_candidates(
     contract: Mapping[str, Any],
     evidence: Mapping[str, Any],
     config: Mapping[str, Any],
+    task_dir: Path,
 ) -> List[Path]:
-    """Append one `## Run journal` candidate per severe finding of a NEEDS_FIX.
-
-    Takes the contract because the evidence document carries no repo path:
-    ``repo_realpath`` is the only route from a task to the canonical learnings
-    tree, and the task directory lives under the git *common* dir, not the repo.
+    """File one candidate per severe finding of a NEEDS_FIX into the task store.
 
     Returns the paths actually written — empty whenever the flag is off, the
-    verdict is not extractable, the journal is absent, the attempt date is
-    unusable, or every finding was already filed.
+    verdict is not extractable, the attempt date is unusable, or every finding
+    was already filed.
     """
 
     if not bool(config.get(CONFIG_FLAG, False)):
         return []
     if str(evidence.get("verdict", "")) not in EXTRACT_VERDICTS:
         return []
-    repo_realpath = contract.get("repo_realpath")
-    if not isinstance(repo_realpath, str) or not repo_realpath:
-        return []
-    repo_root = Path(repo_realpath)
-    journal = repo_root / LEARNINGS_RELATIVE
-    # A missing journal is a no-op, never an error and never a creation: this
-    # runs against the operator's primary tree, where inventing a control-plane
-    # file would be a surprise the verify never asked for.
-    if journal.is_symlink() or not journal.is_file():
+    if not isinstance(task_dir, Path) or not task_dir.is_dir():
         return []
     date = str(evidence.get("created_at", ""))[:10]
     if DATE.fullmatch(date) is None:
@@ -227,7 +231,10 @@ def append_learning_candidates(
     if not findings:
         return []
 
-    text = journal.read_text(encoding="utf-8")
+    journal = candidates_path(task_dir)
+    if journal.is_symlink():
+        return []
+    text = journal.read_text(encoding="utf-8") if journal.is_file() else PREAMBLE
     start, end = _journal_bounds(text)
     # Two reviewers of the same diff routinely raise the same defect, so the
     # seen-set is seeded from the file and then grows within the batch.
@@ -251,8 +258,4 @@ def append_learning_candidates(
         head += "\n"
     updated = head + "".join(entries) + text[end:]
     runtime.atomic_write_bytes(journal, updated.encode("utf-8"))
-    written = [journal]
-    mirror = _sync_mirror(repo_root)
-    if mirror is not None:
-        written.append(mirror)
-    return written
+    return [journal]

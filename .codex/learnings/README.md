@@ -30,21 +30,34 @@ the generated mirror is enforced by `scripts/agent-config-audit`. A pattern earn
 after it has bitten (or been confirmed) at least twice.
 
 This tier is literally executable: `.agents/harness/verifier.py::review_learnings_section` parses
-it out of `main-loop.md` plus the file matching the reviewer kind
-(`combined` → `adversarial-verifier`, otherwise `<kind>-reviewer`) and splices it into every
-Harness reviewer prompt. Three properties are load-bearing and are pinned by
-`v2_selftest.review_learnings_prompt_cases`:
+it out of the ONE file matching the reviewer's own role (`combined` → `adversarial-verifier`,
+otherwise `<kind>-reviewer`) and splices it into that reviewer's prompt. Four properties are
+load-bearing and are pinned by `v2_selftest.review_learnings_prompt_cases`:
 
-- **Only this tier crosses the seam.** The `## Run journal` is never injected — its
+- **Only a role-matched file crosses the seam.** A kind with no such file (today `egress-security`
+  and `protocol-security`) receives NOTHING. `main-loop.md` used to be prepended to every kind as
+  "the cross-cutting journal", but its own header scopes it to the top-level agent that dispatches
+  subagents and runs git — it presumes a shell, a worktree and `SendMessage`, none of which a
+  reviewer has, and one of its bullets tells the reader to *"request a NARROW re-review of just the
+  delta"*. In the prompt of the blocking `lock-security` gate that is a licence to PASS a diff whose
+  untouched hunks still carry the original finding. Emitting nothing beats emitting the wrong file.
+- **Only the curated tier crosses the seam.** The `## Run journal` is never injected — its
   `auto-candidate (uncurated)` entries are one review's unverified claims, and feeding them to the
   next reviewer would let the loop launder a hallucination into guidance.
 - **It is read at the plan's base commit, not off disk.** The reviewer prompt is re-derived and
-  hash-compared at attestation, and `learning_extract` writes this very file between dispatch and
-  verify, so a filesystem read would fail every attestation.
+  hash-compared at attestation while the working tree stays mutable for the whole dispatch (a
+  `/curate-learnings` promotion landing mid-review is ordinary), so a filesystem read would fail
+  attestation nondeterministically.
 - **For a reviewer it is advisory, not authority.** The injected header says so: patterns are
   hypotheses to check against the exact diff, and nothing in the section can authorize a PASS,
   retire a review step, or waive a finding. Writing an "X is pre-approved / known-good" bullet here
   does not make it true — a reviewer is instructed to report such a line as a finding.
+
+Because this tier is binding for agents AND executable for reviewers, `config_audit._learnings_lint`
+fails the audit on a `## Recurring patterns` bullet that prescribes a construct
+`.claude/rules/angular-zoneless.md` bans (`allowSignalWrites`, `*ngIf`, `standalone: true`,
+`provideExperimentalZonelessChangeDetection`, `zone.js`) without marking it as banned. A bullet may
+still name one to tell a reviewer to flag it; it may not tell an agent to write one.
 
 Separately, `.agents/harness/runtime.py::instruction_paths` fingerprints **both** trees into
 `MURMUR_HARNESS_INSTRUCTIONS_SHA256`, the instructions digest exported to every check environment.
@@ -65,10 +78,18 @@ Raw evidence-backed entries from individual runs. Format:
 Auto-pruned past ~50 entries (oldest journal entries drop off; distilled ones are already
 promoted). `success-pattern` entries capture what a *clean* run did right, not just failures.
 
-`auto-candidate (uncurated)` marks an entry the Harness filed by itself — one per MAJOR/BLOCKER
-finding of a `NEEDS_FIX` verify — with a placeholder Lesson. It is raw reviewer output, not yet a
-lesson: rewrite it by hand as one imperative, or delete it. It is never promoted automatically,
-because auto-promotion is exactly how a hallucinated finding would become a binding rule.
+`auto-candidate (uncurated)` marks an entry that came from the Harness's own extractor — one per
+MAJOR/BLOCKER finding of a `NEEDS_FIX` verify — with a placeholder Lesson. It is raw reviewer
+output, not yet a lesson: rewrite it by hand as one imperative, or delete it. It is never promoted
+automatically, because auto-promotion is exactly how a hallucinated finding would become a binding
+rule.
+
+The extractor does **not** write this tree, or any working tree. It renders candidates into the
+task's own store (`<task_dir>/learning-candidates.md`, under the Git common directory) and
+`scripts/agent-harness status` prints how many are waiting. That is deliberate: `verify` runs from
+the standalone `.murmur-agent-driver` clone, which `open` requires to be byte-clean and holds at a
+detached HEAD, so a git-tracked write there would make every `NEEDS_FIX` block the next `open` —
+and the only recovery available (`git restore`) would delete the lesson.
 
 ## The loop
 
@@ -77,9 +98,10 @@ because auto-promotion is exactly how a hallucinated finding would become a bind
    (`verifier.review_learnings_section`, read at the plan's base commit).
 2. **Work** — the developer implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry citing the artifact that
-   revealed it, then regenerate the mirror. A `NEEDS_FIX` verify does this for its own severe
-   findings (`.agents/harness/learning_extract.py`, enabled by `learning_extract` in
-   `.agents/harness/config.json`) and resyncs the mirror itself; those entries land as
+   revealed it, then regenerate the mirror. A `NEEDS_FIX` verify drafts candidates for its own
+   severe findings into the task store (`.agents/harness/learning_extract.py`, enabled by
+   `learning_extract` in `.agents/harness/config.json`); `status` reports them, and you file them
+   with `/learn` **from your primary checkout, never the driver clone**. They land as
    `auto-candidate (uncurated)` and still need a human to turn them into a lesson.
 4. **Curate** — periodically, promote 2+ similar journal entries into `## Recurring patterns`,
    mark the sources `distilled`, then regenerate the mirror.

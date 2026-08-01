@@ -511,6 +511,99 @@ def _learnings_parity(audit: Audit) -> None:
             audit.fingerprints[f"learnings:{name}"] = _sha256(left_bytes)
 
 
+# Constructs the binding rulesets ban outright (`.claude/rules/angular-zoneless.md`
+# "Banned -> replacement").  A learnings bullet may still NAME one — telling a
+# reviewer to flag it is the whole point — so a bullet is only an error when it
+# names one with nothing in it marking the construct as wrong.
+LEARNINGS_BANNED_CONSTRUCTS = (
+    "allowsignalwrites",
+    "*ngif",
+    "*ngfor",
+    "*ngswitch",
+    "standalone: true",
+    "provideexperimentalzonelesschangedetection",
+    "zone.js",
+)
+LEARNINGS_PROHIBITIVE_MARKERS = (
+    "never",
+    "no-op",
+    "deprecated",
+    "banned",
+    "refuse",
+    "delete",
+    "remove",
+    "gone",
+    "forbidden",
+    "avoid",
+    "reintroduce",
+    "do not",
+    "don't",
+    "flag ",
+)
+
+
+def _recurring_bullets(text: str) -> List[Tuple[int, str]]:
+    """Slice `## Recurring patterns` into (1-based start line, bullet) blocks."""
+
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == "## Recurring patterns":
+            start = index + 1
+            break
+    if start is None:
+        return []
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if lines[index].startswith("## "):
+            end = index
+            break
+    bullets: List[Tuple[int, str]] = []
+    for index in range(start, end):
+        line = lines[index]
+        if line[:1] in {"-", "*"} or not bullets:
+            bullets.append((index + 1, line))
+        else:
+            number, body = bullets[-1]
+            bullets[-1] = (number, body + "\n" + line)
+    return bullets
+
+
+def _learnings_lint(audit: Audit) -> None:
+    # CLAUDE.md and AGENTS.md now declare `## Recurring patterns` binding imperatives
+    # that "outrank the agent's own general guidance", and verifier.py splices the same
+    # tier into reviewer prompts.  `_semantic_lint` never looks at learnings/, so before
+    # this a bullet could instruct an agent to write exactly what `.claude/rules/` bans
+    # and stay green through `ng lint`, `ng build` and the audit alike — which is how a
+    # bullet telling agents to pass `{ allowSignalWrites: true }` survived the v22
+    # migration that deleted the flag repo-wide.
+    directory = ROOT / ".claude" / "learnings"
+    offenders = 0
+    for path in sorted(directory.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            audit.error(f"cannot lint learnings file {path.relative_to(ROOT)}: {exc}")
+            offenders += 1
+            continue
+        for number, bullet in _recurring_bullets(text):
+            lowered = bullet.lower()
+            if any(marker in lowered for marker in LEARNINGS_PROHIBITIVE_MARKERS):
+                continue
+            for construct in LEARNINGS_BANNED_CONSTRUCTS:
+                if construct in lowered:
+                    offenders += 1
+                    audit.error(
+                        "binding learnings bullet prescribes a repo-banned construct "
+                        f"({construct}): {path.relative_to(ROOT)}:{number}"
+                    )
+    audit.require(
+        offenders == 0,
+        "binding learnings agree with the banned-construct rules",
+        f"{offenders} binding learnings bullet(s) contradict .claude/rules/",
+    )
+
+
 def _adversarial_prompt_contract(audit: Audit) -> None:
     path = ROOT / ".agents" / "harness" / "prompts" / "combined-reviewer.md"
     try:
@@ -1187,6 +1280,7 @@ def run_audit() -> Audit:
     _bash_syntax(audit)
     _agent_and_rule_manifest(audit)
     _learnings_parity(audit)
+    _learnings_lint(audit)
     _codex_permission_profiles(audit)
     _hook_parity(documents, audit)
     _adversarial_prompt_contract(audit)
