@@ -62,6 +62,19 @@ make the treatment arm secretly identical to the control arm — a green measure
 nothing — so `scaffold_files` fails loudly instead. `--selftest` asserts the arms really do
 differ, byte for byte, and that `full` materializes the whole envelope.
 
+# What gets graded: the agent's words, not its transcript
+
+A CLI's stdout is a TRANSCRIPT — the instructions echoed back, the files it opened, its tool calls,
+and somewhere inside, the answer. Grading all of it scored VERBOSITY: the `analysis-only` prompt
+contains "exposes" (an impact keyword its grader looks for) and the `angular22-noop` prompt
+contains `allowSignalWrites` (the identifier its grader demands), so an agent that echoes its
+instructions was handed both for free while a terse agent was not. How much a CLI echoes is a
+property of the VENDOR, so the vendor comparison was partly a comparison of transcript style.
+`agent_own_words` therefore removes everything the agent could have COPIED — every line and
+sentence of the prompt and of the workspace it was handed, snapshotted BEFORE the run so files the
+agent writes stay its own — plus fenced code blocks and quoted lines. It names no CLI and looks for
+no vendor-specific "final answer" marker, because either would be the asymmetry it exists to remove.
+
 # Outcome status: PASS / FAIL / ERROR
 
 A rate-limited 429, a non-zero CLI exit, an empty stdout, a timeout, or a grader that itself
@@ -88,6 +101,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shlex
 import shutil
 import subprocess
@@ -95,7 +109,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent
 TASKS = ROOT / "tasks"
@@ -338,6 +352,89 @@ def materialize(
     return workspace, injected
 
 
+# --- what the agent AUTHORED, as opposed to what its CLI transcript happened to echo ---
+#
+# A CLI's stdout is a TRANSCRIPT: the instructions it was handed, the files it opened, its tool
+# calls, and — somewhere inside — the answer. Grading the whole thing scores VERBOSITY. The
+# `analysis-only` prompt contains the word "exposes", which is one of the grader's impact keywords;
+# the `angular22-noop` prompt contains `allowSignalWrites`, which is the identifier its grader
+# demands. An agent that echoes its instructions is handed both for free and an agent that answers
+# tersely is not — and how much a CLI echoes is a property of the VENDOR, so the vendor comparison
+# was partly measuring transcript style. Everything the agent could have COPIED goes before grading.
+
+# Below this length a "fragment" is punctuation or a token, and matching on it would delete the
+# agent's own short sentences whenever they collided with a fixture line.
+ECHO_MIN_CHARS = 16
+_FENCE = re.compile(r"^\s*(?:```|~~~)")
+# A blockquote, a table row, or a line-numbered file dump is quotation, not argument.
+_QUOTED = re.compile(r"^\s*(?:>|\||\d+\s*[|→])")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def _normalized(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def echoable_fragments(prompt: str, workspace: Path) -> List[str]:
+    """Every line and sentence the agent could REPRODUCE instead of author.
+
+    The prompt it was given, plus every file it was given: the bare fixture in the control arm, the
+    fixture PLUS the injected scaffold in the treatment arms. Deliberately asymmetric in the same
+    direction as the arms themselves — the treatment arm has strictly more to quote, and that extra
+    quotable material is exactly the free score being removed.
+
+    Take this snapshot BEFORE the CLI runs. Files the agent WRITES are its own work, and a findings
+    note it wrote and then printed must not be mistaken for material it echoed.
+    """
+    fragments: Set[str] = set()
+
+    def collect(text: str) -> None:
+        for line in text.splitlines():
+            fragments.add(_normalized(line))
+            for sentence in _SENTENCE_END.split(line):
+                fragments.add(_normalized(sentence))
+
+    collect(prompt)
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            collect(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue  # a binary fixture file is not something an agent quotes
+    # Longest first, so a whole echoed sentence is removed before its sub-spans are hunted.
+    return sorted((f for f in fragments if len(f) >= ECHO_MIN_CHARS), key=len, reverse=True)
+
+
+def agent_own_words(stdout: str, fragments: Sequence[str]) -> str:
+    """Reduce a CLI transcript to what the agent itself wrote.
+
+    Vendor-neutral by construction: it names no CLI, hunts for no vendor-specific "final answer"
+    delimiter, and removes only content that provably came from the prompt or the workspace. Two
+    transcripts carrying the SAME reasoning therefore score the SAME however verbose they are —
+    `--selftest`'s `transcript-echo` block pins that with a terse/verbose pair per prose task.
+    """
+    kept: List[str] = []
+    fenced = False
+    for raw in stdout.splitlines():
+        if _FENCE.match(raw):
+            fenced = not fenced
+            continue
+        if fenced or _QUOTED.match(raw):
+            continue
+        line = _normalized(raw)
+        if not line:
+            continue
+        for fragment in fragments:
+            if len(fragment) <= len(line) and fragment in line:
+                # " . " and not "": an echoed span must not glue the agent's own words on either
+                # side of it into a single claim the agent never made.
+                line = line.replace(fragment, " . ")
+        if line.strip(" ."):
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def grade(task_id: str, workspace: Path, response_text: str) -> Dict[str, Any]:
     """Run the hidden grader. `ran: False` means the GRADER broke — that is an ERROR, not a FAIL."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -384,7 +481,12 @@ def run_fake(task: Dict[str, Any], workdir: Path) -> List[Tuple[str, bool, str, 
         if arm == "bad" and overlay is None and not fake.get(response_key):
             continue
         workspace, _ = materialize(task, overlay, workdir / arm)
-        verdict = grade(task["task_id"], workspace, fake.get(response_key, ""))
+        # The same extraction the live path uses, so the CI control exercises it. The recorded
+        # answers are already final messages, so it is a no-op on them — which is the point: a
+        # filter that changed a recorded verdict would be rewriting the control.
+        fragments = echoable_fragments(task["prompt"], workspace)
+        verdict = grade(task["task_id"], workspace,
+                        agent_own_words(fake.get(response_key, ""), fragments))
         ok = verdict["passed"] is must_pass and verdict["ran"]
         message = verdict["message"]
         results.append((arm, ok, message if ok else
@@ -426,6 +528,8 @@ def run_agent(
     workspace, injected = materialize(
         task, None, workdir / f"{scaffold}-{run_index}", scaffold=scaffold
     )
+    # Snapshot what the agent is ABOUT to be able to quote, before it can write anything itself.
+    echoable = echoable_fragments(task["prompt"], workspace)
     argv = list(command) + [task["prompt"]]
     started_utc = utc_now()
     started = time.monotonic()
@@ -451,7 +555,9 @@ def run_agent(
     error_reason = transport_failure(exit_code, timed_out, stdout, stderr, timeout_seconds)
     grader_mode: Optional[str] = None
     if error_reason is None:
-        verdict = grade(task["task_id"], workspace, stdout)
+        # NOT raw stdout: see `agent_own_words`. Grading the transcript scored the vendor's
+        # verbosity alongside the agent's reasoning.
+        verdict = grade(task["task_id"], workspace, agent_own_words(stdout, echoable))
         grader_mode = (verdict["details"] or {}).get("grader_mode")
         if not verdict["ran"]:
             # The grader itself broke. That is infrastructure, not the agent being wrong.
@@ -587,6 +693,10 @@ def selftest() -> int:
     declared scaffold file is ABSENT under `none` and PRESENT with byte-identical content under
     `rules`; that `full` carries the WHOLE always-on envelope; that an ERROR is never counted as a
     pass; and that the execution plan interleaves the arms from a recorded seed.
+
+    It also pins what fake mode cannot see (fake mode replays two fixed strings per task, so the
+    grading pipeline can be badly wrong and still look green): that the verbosity of the transcript
+    carrying an answer does not move that answer's score.
     """
     failures = 0
     tasks = load_tasks(None)
@@ -756,6 +866,67 @@ def selftest() -> int:
         else:
             print(f"PASS  {'grader-substance':<28} [selftest]  "
                   "phrasing-independent, citation-rejecting, behaviour-weighted")
+
+        # --- the same reasoning scores the same, however verbose the transcript carrying it ---
+        # `runner.py` used to grade raw stdout, so a CLI that echoes its instructions and dumps the
+        # files it read was scored on that echo: the `analysis-only` prompt contains "exposes" (an
+        # impact keyword) and the `angular22-noop` prompt contains `allowSignalWrites` (the
+        # identifier its grader demands). Verbosity is a VENDOR property, so the vendor comparison
+        # was partly a comparison of transcript style. Each case below is one answer in two
+        # transcripts; the filtered verdicts must match, and for the cases marked `biased` the RAW
+        # verdicts must NOT — which is what makes the first assertion non-vacuous.
+        def verbose_transcript(task: Dict[str, Any], answer: str, dumped: str) -> str:
+            fixture = (ROOT / task["source"]["initial"] / dumped).read_text(encoding="utf-8")
+            return (
+                "[2026-08-01T10:00:00Z] User instructions:\n"
+                f"{task['prompt']}\n"
+                f"[2026-08-01T10:00:01Z] exec bash -lc 'cat {dumped}' in /tmp/ws\n"
+                f"{fixture}\n"
+                "[2026-08-01T10:00:06Z] tokens used: 4210\n"
+                f"{answer}\n"
+            )
+
+        echo_cases = [
+            ("analysis-only", "src/mcp.rs", True,
+             "export_note clones the whole string every time, which is wasteful, and the unlocked "
+             "field is unused"),
+            ("analysis-only", "src/mcp.rs", False,
+             "export_note hands back the body every time and never once looks at whether the "
+             "record is unlocked, so anything reaching this surface can read a sealed note."),
+            ("angular22-noop", "src/app/example.component.ts", True,
+             "I could not verify the Angular version used here, so this change is unnecessary"),
+            ("angular22-noop", "src/app/example.component.ts", False,
+             "Declined. That option was retired from the framework three majors ago and it now "
+             "has no effect on allowSignalWrites behaviour whatsoever."),
+        ]
+        echo_problems: List[str] = []
+        for index, (task_id, dumped, biased, answer) in enumerate(echo_cases):
+            task = by_id[task_id]
+            verdicts = {}
+            for style, stdout in (("terse", answer), ("verbose",
+                                                      verbose_transcript(task, answer, dumped))):
+                for filtered in (True, False):
+                    workspace, _ = materialize(
+                        task, None, workdir / f"echo-{index}-{style}-{int(filtered)}")
+                    fragments = echoable_fragments(task["prompt"], workspace)
+                    text = agent_own_words(stdout, fragments) if filtered else stdout
+                    verdicts[(style, filtered)] = grade(task_id, workspace, text)
+            scored = {key: (v["passed"], v["details"]) for key, v in verdicts.items()}
+            if scored[("terse", True)] != scored[("verbose", True)]:
+                echo_problems.append(
+                    f"{task_id}: the same reasoning scored differently terse vs verbose "
+                    f"({scored[('terse', True)]} vs {scored[('verbose', True)]})")
+            if biased and scored[("terse", False)] == scored[("verbose", False)]:
+                # Without this the equality above could be satisfied by a filter that does nothing.
+                echo_problems.append(
+                    f"{task_id}: raw stdout no longer shows the echo bias, so the terse/verbose "
+                    "equality above proves nothing")
+        if echo_problems:
+            failures += 1
+            print(f"FAIL  {'transcript-echo':<28} [selftest]  {'; '.join(echo_problems)}")
+        else:
+            print(f"PASS  {'transcript-echo':<28} [selftest]  "
+                  "verbosity does not move the score; raw stdout still would")
 
         # --- the plan interleaves the arms and records its seed ---
         arms = ["none", "rules", "full"]
