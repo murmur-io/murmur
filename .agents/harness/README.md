@@ -66,6 +66,13 @@ The behavioral prompt cannot add shell commands. The derived plan is the sole
 executable evidence profile. Reviewers are fresh, read-only, and tool-free.
 They may request only a typed, allowlisted probe that the runner executes.
 
+`review_authority` in `config.json` decides which review can forbid a PASS. The
+three risk specialists are `blocking`. The `combined` generalist is `advisory`:
+it still runs, and its findings, proof gaps, and probe requests are still
+recorded in the receipt, but they no longer gate the verdict and no longer spend
+a probe execution — see `docs/research/2026-08-01-reviewer-corpus-measurement.md`.
+Any unconfigured or unknown review kind is blocking.
+
 Green checkpoints for an unchanged exact diff survive interruption.
 `NEEDS_FIX` means edit the worktree and verify the new diff.
 `NEEDS_EVIDENCE`, `PAUSED_RETRYABLE`, and `INTERRUPTED` resume without throwing
