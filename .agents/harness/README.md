@@ -149,21 +149,43 @@ scripts/agent-harness metrics --limit 200 \
 
 `--store` accepts a `.git` dir, the `agent-harness` store, its `v2` dir, or the
 task root itself, and reports what each argument resolved to — an unresolvable
-store prints `UNRESOLVED` rather than contributing a silent zero. Records are
-deduped by `(store, task, attempt, reviewer)`: the corpus contains checkpoints
-that fire twice against the same rewritten record, and counting events would
-double their tokens and minutes.
+store prints `UNRESOLVED` rather than contributing a silent zero, and a store
+that resolves to an already-counted task root prints `DUPLICATE (already
+counted)` and contributes nothing. That last case is easy to hit: run the
+command above *from* the driver clone and `../.murmur-agent-driver/.git/...`
+resolves back to the store `repo_context` already supplied, which would double
+every absolute count while leaving every rate identical. Records are deduped by
+`(store, task, attempt, reviewer)`: the corpus contains checkpoints that fire
+twice against the same rewritten record, and counting events would double their
+tokens and minutes.
 
-`tokens` are `input + output`, normalized across both vendor usage dialects
-(`cached_input_tokens` vs `cache_read_input_tokens`, and so on). Cache and
-reasoning counters are reported separately and never added: `reasoning_output_tokens`
-is a *subset* of `output_tokens` — strictly smaller in all 199 corpus records that
-report it — so summing it inflates the total. Every column carries its own
-coverage, and a pruned record stays `missing` rather than becoming a zero.
+`tokens` are billable tokens, and what counts as billable is decided per **usage
+dialect**, not per field name — the two vendors disagree about what
+`input_tokens` means:
 
-USD is opt-in and never inferred. Add an optional top-level `pricing` block to
-`.agents/harness/config.json` and the USD columns appear; omit it and they do not
-exist at all:
+| dialect | detected by | billable |
+| --- | --- | --- |
+| Anthropic | `cache_read_input_tokens` / `cache_creation_input_tokens` | `input + cache_read + cache_creation + output` (disjoint counters) |
+| OpenAI | `cached_input_tokens` / `cache_write_input_tokens` | `input + output` (`cached` is a *subset* of `input`) |
+
+A cached Anthropic prompt lives almost entirely in the cache pair: across the 31
+`claude` reviews in the corpus, `input_tokens` totals **70** against 2.70M cache
+tokens, so billing `input + output` alone scored them at 25% of what they
+consumed while `codex` was billed at ~100% — enough to invert a cross-vendor
+comparison. The dialect is read off the usage keys (with `vendor` only as a
+fallback) and reported as `token dialects` so the normalization is visible.
+`reasoning_output_tokens` is never billable in either dialect: it is a *subset*
+of `output_tokens`, strictly smaller in all 199 corpus records that report it.
+Every column carries its own coverage, and a pruned record stays `missing`
+rather than becoming a zero.
+
+`observed USD` is the vendor's own `attempts[].telemetry.cost_usd`, summed and
+reported with coverage. It is measured rather than derived, so it beats any rate
+card where it exists — today that is every `claude` record and no `codex` one.
+
+The rate card is opt-in and never inferred. Add an optional top-level `pricing`
+block to `.agents/harness/config.json` and the `rate-card USD` columns appear;
+omit it and they do not exist at all:
 
 ```json
 "pricing": {
@@ -173,8 +195,10 @@ exist at all:
 ```
 
 Rates are keyed by **vendor**, not model: every `codex` record in the corpus
-carries `"model": "unspecified"`. No block ships, because the harness has no
-authoritative price to state.
+carries `"model": "unspecified"`. They price exactly the tokens `tokens` counts,
+which makes them a coarse *upper* bound for the Anthropic dialect (cache reads
+bill at the fresh-input rate) — prefer `observed USD`. No block ships, because
+the harness has no authoritative price to state.
 
 ## Self-verification
 
