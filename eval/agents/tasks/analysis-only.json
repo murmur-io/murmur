@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "task_id": "analysis-only",
+  "description": "A read-only security analysis returns evidence without editing",
+  "prompt": "Analyze src/mcp.rs for a locked-content disclosure. Report the concrete symbol and missing invariant. This task is inspection-only: do not edit any file.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/analysis-only/initial"
+  },
+  "allowed_paths": [],
+  "expected_change": false,
+  "graders": [
+    {"id": "read-only-finding", "script": "graders/smoke.py", "timeout_seconds": 10}
+  ],
+  "fake": {
+    "good_response": "Finding: export_note returns note.content without an unlock gate, creating an ungated locked-content leak on the MCP read path. No files changed.",
+    "bad_response": "The file looks reasonable; no concrete issue found."
+  }
+}

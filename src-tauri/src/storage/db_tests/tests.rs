@@ -11533,3 +11533,56 @@ fn s2_stopword_only_overlap_does_not_hit() {
         hits.iter().map(|h| h.meeting.id.clone()).collect::<Vec<_>>()
     );
 }
+
+/// RED before the sweep existed: `unique_temp_path` never removed anything, so every fixture any
+/// test ever minted stayed in `TMPDIR` forever (1,599 `.sqlite` + 216 `-wal` + 216 `-shm` measured
+/// live, and 67.8 GB accumulated in the harness evidence store).
+#[test]
+fn sweep_removes_stale_fixtures_of_both_prefix_families() {
+    let root = unique_temp_path("murmur-sweep-scope", "dir");
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["murmur-old.sqlite", "murmur-old.sqlite-wal", "meetnotes-old.sqlite"] {
+        std::fs::write(root.join(name), b"x").unwrap();
+    }
+    // Callers pass ext = "dir"; directories must be reclaimed too, not just files.
+    std::fs::create_dir_all(root.join("murmur-old.dir")).unwrap();
+    std::fs::write(root.join("murmur-old.dir/inner"), b"x").unwrap();
+    // A foreign temp file must survive: the sweep is namespaced, not a blanket TMPDIR wipe.
+    std::fs::write(root.join("unrelated.sqlite"), b"x").unwrap();
+
+    sweep_stale_temp_fixtures(&root, std::time::Duration::ZERO);
+
+    for name in [
+        "murmur-old.sqlite",
+        "murmur-old.sqlite-wal",
+        "meetnotes-old.sqlite",
+        "murmur-old.dir",
+    ] {
+        assert!(
+            !root.join(name).exists(),
+            "{name} is a stale murmur/meetnotes fixture and must be swept"
+        );
+    }
+    assert!(
+        root.join("unrelated.sqlite").exists(),
+        "the sweep must never touch files outside the murmur-/meetnotes- namespace"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The age guard is what makes the sweep safe next to a CONCURRENT test process: an entry younger
+/// than `min_age` is always left alone, so live fixtures can never be deleted out from under a run.
+#[test]
+fn sweep_leaves_fixtures_younger_than_min_age() {
+    let root = unique_temp_path("murmur-sweep-age", "dir");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("murmur-live.sqlite"), b"x").unwrap();
+
+    sweep_stale_temp_fixtures(&root, STALE_FIXTURE_AGE);
+
+    assert!(
+        root.join("murmur-live.sqlite").exists(),
+        "a fixture younger than STALE_FIXTURE_AGE belongs to a possibly-live process"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
