@@ -27,7 +27,7 @@
 //! inputs (a `Db`, the unlocked set, the buffer, an injected `now`), so the whole contract is
 //! headless-testable without the audio loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
@@ -103,9 +103,29 @@ const W_ENTITY_MEETING: f32 = 0.9;
 /// the only signal.
 const W_FACT: f32 = 0.8;
 
-/// A rare-term FTS hit (BM25) — the weakest specificity; additionally decayed by meeting age and
-/// divided by (1 + rank), so only a rank-0 hit on a recent meeting clears [`SCORE_THRESHOLD`].
-const W_TERM: f32 = 0.5;
+/// Base weight for the rare-term FTS leg (BM25) — the weakest specificity signal there is.
+///
+/// Deliberately BELOW [`SCORE_THRESHOLD`]: a single matching token, however rare and however
+/// recent the meeting, must not be able to fire a hint on its own. It was `0.5` against a `0.4`
+/// threshold, so one 5-character word on one same-day meeting scored 0.5 and surfaced — the
+/// mechanism behind hints that felt unrelated to what was being said. Relatedness is now carried
+/// by CORROBORATION (distinct terms landing on the same past meeting), applied as a multiplier in
+/// `gather_candidates`: 1 term → 0.28, 2 → 0.448, 3+ → 0.56, all before recency and rank decay.
+const W_TERM_BASE: f32 = 0.28;
+
+/// Document-frequency ceiling for a term: if a token matches this many visible meetings it is a
+/// corpus stopword and carries no relatedness signal, so it is dropped before scoring rather than
+/// being allowed to corroborate itself across unrelated meetings.
+const DF_MAX: i64 = 12;
+
+/// Accumulated term-leg evidence for ONE past meeting: how well it matched (`best_rank`) and how
+/// many DISTINCT delta terms landed on it (`distinct_terms`, the corroboration signal).
+struct TermEvidence {
+    title: String,
+    started_at: String,
+    best_rank: usize,
+    distinct_terms: usize,
+}
 
 /// Recency half-life in days for the decaying legs. 90 days keeps a last-quarter discussion
 /// surfaceable while pushing year-old term noise under the threshold. Tuning this (and the
@@ -443,7 +463,17 @@ pub fn gather_candidates(
         }
     }
 
-    // (b) Term leg — top-N rare tokens of the delta through gated FTS/BM25.
+    // (b) Term leg — top-N rare tokens of the delta through gated FTS/BM25, AGGREGATED PER MEETING.
+    //
+    // This used to push one candidate per (term, rank). A single 5-character token hitting one
+    // recent meeting at rank 0 therefore scored `W_TERM * recency` = 0.5 against a 0.4 threshold
+    // and fired a hint on its own — which is why the suggestions read as unrelated to what was
+    // being said. One word is not evidence of relatedness; several distinct words landing on the
+    // SAME past meeting is.
+    //
+    // So: collect per meeting, keep the best rank, count DISTINCT terms, and require corroboration.
+    // A lone term now tops out below the threshold; two distinct terms clear it comfortably.
+    let mut per_meeting: HashMap<String, TermEvidence> = HashMap::new();
     for term in extract_rare_terms(delta, MAX_TERMS) {
         let hits = match db.search_visible(&term, FTS_LIMIT, unlocked) {
             Ok(h) => h,
@@ -452,18 +482,52 @@ pub fn gather_candidates(
                 continue;
             }
         };
+        // A term matching (almost) everything visible carries no signal — it is this corpus's
+        // equivalent of a stopword, and it is exactly what produces confidently-unrelated hints.
+        // `FTS_LIMIT` caps `hits`, so saturation is measured against that cap.
+        if hits.len() as i64 >= FTS_LIMIT && FTS_LIMIT > 1 {
+            let breadth = db
+                .search_visible(&term, DF_MAX, unlocked)
+                .map(|all| all.len())
+                .unwrap_or(0);
+            if breadth >= DF_MAX as usize {
+                tracing::debug!(target: "proactive", "term dropped as high-document-frequency");
+                continue;
+            }
+        }
         for (rank, hit) in hits.iter().enumerate() {
             if hit.meeting.id == current_meeting_id {
                 continue;
             }
-            candidates.push(HintCandidate {
-                kind: HintKind::PastMeeting,
-                title: meeting_title(&hit.meeting),
-                target_id: hit.meeting.id.clone(),
-                meeting_id: Some(hit.meeting.id.clone()),
-                score: W_TERM * recency(&hit.meeting.started_at, now) / (1.0 + rank as f32),
-            });
+            let entry = per_meeting
+                .entry(hit.meeting.id.clone())
+                .or_insert_with(|| TermEvidence {
+                    title: meeting_title(&hit.meeting),
+                    started_at: hit.meeting.started_at.clone(),
+                    best_rank: rank,
+                    distinct_terms: 0,
+                });
+            entry.best_rank = entry.best_rank.min(rank);
+            entry.distinct_terms += 1;
         }
+    }
+    for (meeting_id, evidence) in per_meeting {
+        // Corroboration is the whole point: 1 term → 1.0x, 2 → 1.6x, 3+ → 2.0x. With
+        // `W_TERM_BASE` at 0.28 a single rank-0 hit on a same-day meeting reaches 0.28 and is
+        // correctly rejected, while two distinct terms reach 0.448 and clear.
+        let corroboration = match evidence.distinct_terms {
+            0 | 1 => 1.0,
+            2 => 1.6,
+            _ => 2.0,
+        };
+        candidates.push(HintCandidate {
+            kind: HintKind::PastMeeting,
+            title: evidence.title,
+            target_id: meeting_id.clone(),
+            meeting_id: Some(meeting_id),
+            score: W_TERM_BASE * recency(&evidence.started_at, now) * corroboration
+                / (1.0 + evidence.best_rank as f32),
+        });
     }
 
     candidates
@@ -1146,10 +1210,12 @@ mod tests {
         );
     }
 
-    /// The weakest leg end-to-end: a term-only FTS hit clears the threshold ONLY at rank 0 on a
-    /// recent meeting; rank ≥1 falls under it.
+    /// INVERTED 2026-08-01. This used to assert that a rank-0 term hit on a recent meeting CLEARS
+    /// the threshold — i.e. that one matching word was enough to fire a hint. That is precisely
+    /// the behaviour that made live "Related meeting" cards read as unrelated to what was being
+    /// said, and the reason the leg is now corroboration-based.
     #[test]
-    fn term_leg_scores_rank_zero_above_threshold_and_rank_one_below() {
+    fn a_single_term_never_clears_the_threshold_on_its_own() {
         let db = tmp_db("term");
         seed_note(
             &db,
@@ -1169,16 +1235,48 @@ mod tests {
         let hit = candidates
             .iter()
             .find(|c| c.kind == HintKind::PastMeeting && c.target_id == "m-t")
-            .expect("the rare term must surface the meeting through gated FTS");
+            .expect("the rare term must still SURFACE the meeting as a candidate");
         assert!(
-            hit.score >= SCORE_THRESHOLD,
-            "rank-0 recent term hit clears: {}",
+            hit.score < SCORE_THRESHOLD,
+            "one term is not evidence of relatedness; it must stay a candidate but not fire: {}",
             hit.score
         );
-        // Rank 1 with the same recency is halved — under the threshold by construction.
+    }
+
+    /// The other half of the same contract: distinct terms landing on the SAME past meeting are
+    /// what relatedness actually looks like, and they produce ONE candidate, not one per term.
+    #[test]
+    fn two_distinct_terms_on_one_meeting_produce_a_single_candidate_that_clears() {
+        let db = tmp_db("term-corroborated");
+        seed_note(
+            &db,
+            "m-t",
+            "Q3 planning",
+            "the Kwantyfikator initiative kickoff with Grzegorzewski present",
+            None,
+        );
+
+        let candidates = gather_candidates(
+            &db,
+            &HashSet::new(),
+            "m-cur",
+            "wracamy do tematu Kwantyfikator oraz Grzegorzewski",
+            now(),
+        );
+        let hits: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.kind == HintKind::PastMeeting && c.target_id == "m-t")
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the term leg must emit ONE aggregated candidate per meeting, got {}",
+            hits.len()
+        );
         assert!(
-            hit.score / 2.0 < SCORE_THRESHOLD,
-            "a rank-1 term hit must fall under"
+            hits[0].score >= SCORE_THRESHOLD,
+            "two distinct corroborating terms must clear: {}",
+            hits[0].score
         );
     }
 
