@@ -85,6 +85,34 @@ for ledger in (evidence_store).rglob('events.jsonl'):
 No sampling: 348 ledgers, 216 review checkpoints, 100% of `record_path`s resolved. The corpus
 spans 2026-07-28 → 2026-07-31 and both vendors (`codex` and `claude`).
 
+### This is now a command, not an archaeology expedition
+
+The join above shipped as `scripts/agent-harness metrics --store <evidence-store>`
+(`.agents/harness/metrics.py`, `_review_rows` → `_review_outcomes` / `_task_outcomes`). Re-running
+it against the same store with the corpus restricted to `created_at < 2026-08-01` reproduces this
+table cell-for-cell for `egress-security` (65 / 69% / 17 findings / 5 BLOCKER / 38.8 min / 13%) and
+`lock-security` (53 / 75% / 11 / 6 / 33.0 min / 11%), and reproduces the headline **76%**
+generalist share of model time. Two arithmetic corrections fall out of that replay:
+
+1. **216 is an event count; there are 214 distinct reviews.** Two `combined` checkpoints —
+   `continuity-research-docs-20260728` and `dependency-rollup-v2-final-r2-20260728` — fire twice
+   against the same rewritten record. They contribute exactly the 2 reviews, 8 findings and 5.4
+   minutes by which this table exceeds a record-deduplicated count. The command deduplicates by
+   `(store, task, attempt, reviewer)` and prints how many events it skipped.
+2. **12.47M double-counts reasoning tokens.** `12,474,552` is
+   `input + output + reasoning_output_tokens` over the 216 events. `reasoning_output_tokens` is a
+   *subset* of `output_tokens` — measured strictly smaller in all 199 corpus records that report
+   it — so it must not be added. Billable is `input + output`: **12,280,942** over the 214 distinct
+   reviews at this cutoff.
+
+Neither correction moves the verdict; the generalist's share of model time is unchanged.
+
+The full store has since grown past this snapshot (232 reviews, 12.84M billable tokens, 343.4 min),
+and the growth is concentrated in nine `claude` `egress-security` reviews run on 2026-08-01 that
+alone account for 75 of that reviewer's now-92 findings and roughly 40 of its 78.9 minutes. A
+`combined`-vs-specialist comparison drawn from the current store is therefore also a
+`codex`-vs-`claude` comparison; this table is the clean snapshot.
+
 ## What this does NOT establish
 
 - **False-positive rate.** "MAJOR" is the reviewer's own label. Classifying each of the 90

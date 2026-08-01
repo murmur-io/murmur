@@ -119,13 +119,62 @@ status    inspect state and lock ownership
 commit    create the exact PASS receipt commit
 clean     archive and close/abandon the task
 doctor    audit dependencies, ghosts, and orphan worktrees
-metrics   summarize current Harness event ledgers
+metrics   summarize event ledgers plus reviewer PASS-rate and cost per accepted task
 selftest  run lifecycle, fault, and metrics tests
 ```
 
 There is no executable Harness v1. `scripts/verify-harness-attestation` retains
 read-only support for historical v1 commit trailers so old Git history remains
 auditable.
+
+### `metrics` outcome tables
+
+`metrics` reads only what the runner already wrote. It walks every ledger, and on
+each `review-checkpoint` it loads the record at `record_path` and joins it to that
+attempt's `checks/*.json`. The record — not the checkpoint event — carries
+`duration_ms`, `result.findings`, `result.proof_gaps`, `vendor`, and
+`attempts[].telemetry.usage`, so the record side is authoritative for review
+outcomes. The event-derived `models:`/`reviews:` lines above them count model
+invocations instead, including any that never produced a record; the two are
+deliberately not the same number.
+
+```bash
+# this repo's own store
+scripts/agent-harness metrics
+# the driver clone that actually ran the reviews (repeatable; --limit is per run,
+# and the default of 20 silently truncates a large store)
+scripts/agent-harness metrics --limit 200 \
+  --store ../.murmur-agent-driver/.git/agent-harness
+```
+
+`--store` accepts a `.git` dir, the `agent-harness` store, its `v2` dir, or the
+task root itself, and reports what each argument resolved to — an unresolvable
+store prints `UNRESOLVED` rather than contributing a silent zero. Records are
+deduped by `(store, task, attempt, reviewer)`: the corpus contains checkpoints
+that fire twice against the same rewritten record, and counting events would
+double their tokens and minutes.
+
+`tokens` are `input + output`, normalized across both vendor usage dialects
+(`cached_input_tokens` vs `cache_read_input_tokens`, and so on). Cache and
+reasoning counters are reported separately and never added: `reasoning_output_tokens`
+is a *subset* of `output_tokens` — strictly smaller in all 199 corpus records that
+report it — so summing it inflates the total. Every column carries its own
+coverage, and a pruned record stays `missing` rather than becoming a zero.
+
+USD is opt-in and never inferred. Add an optional top-level `pricing` block to
+`.agents/harness/config.json` and the USD columns appear; omit it and they do not
+exist at all:
+
+```json
+"pricing": {
+  "codex":  { "input_per_mtok": 0.0, "output_per_mtok": 0.0 },
+  "claude": { "input_per_mtok": 0.0, "output_per_mtok": 0.0 }
+}
+```
+
+Rates are keyed by **vendor**, not model: every `codex` record in the corpus
+carries `"model": "unspecified"`. No block ships, because the harness has no
+authoritative price to state.
 
 ## Self-verification
 
