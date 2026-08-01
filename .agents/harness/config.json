@@ -27,18 +27,33 @@
     "protocol": "protocol-security"
   },
   "review_authority": {
-    "combined": "advisory",
+    "combined": "blocking",
     "lock-security": "blocking",
     "egress-security": "blocking",
     "protocol-security": "blocking"
   },
   "risk_required_evidence": {
-    "lock": ["rust-lib"],
-    "egress": ["rust-lib"],
-    "protocol": ["rust-lib", "protocol-server"],
-    "runtime": ["tauri-boot"],
-    "ui": ["ng-lint", "ng-build", "playwright"],
-    "performance": ["perf-contracts"]
+    "lock": [
+      "rust-lib"
+    ],
+    "egress": [
+      "rust-lib"
+    ],
+    "protocol": [
+      "rust-lib",
+      "protocol-server"
+    ],
+    "runtime": [
+      "tauri-boot"
+    ],
+    "ui": [
+      "ng-lint",
+      "ng-build",
+      "playwright"
+    ],
+    "performance": [
+      "perf-contracts"
+    ]
   },
   "canonical_checks": {
     "rust-lib": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo test --lib -- --test-threads=1)",
@@ -82,6 +97,9 @@
       "src-tauri/src/commands/mod.rs",
       "src-tauri/src/commands/meetings.rs",
       "src-tauri/src/commands/notes.rs",
+      "src-tauri/src/commands/documents.rs",
+      "src-tauri/src/commands/links.rs",
+      "src-tauri/src/commands/reminders.rs",
       "src-tauri/src/mcp.rs",
       "src/app/**/lock*",
       "src/app/**/share*",
