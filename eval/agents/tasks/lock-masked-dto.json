@@ -8,6 +8,7 @@
     "initial": "fixtures/lock-masked-dto/initial"
   },
   "allowed_paths": ["src/lock_dto.rs"],
+  "scaffold_files": [".claude/rules/lock-model.md"],
   "expected_change": true,
   "graders": [
     {"id": "locked-field-mask", "script": "graders/smoke.py", "timeout_seconds": 30}

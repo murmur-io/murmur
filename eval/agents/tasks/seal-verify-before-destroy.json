@@ -8,6 +8,7 @@
     "initial": "fixtures/seal-verify-before-destroy/initial"
   },
   "allowed_paths": ["src/seal.rs"],
+  "scaffold_files": [".claude/rules/rust-tauri.md", ".claude/rules/lock-model.md"],
   "expected_change": true,
   "graders": [
     {
