@@ -5,6 +5,8 @@ allowed-tools: ["Read", "Edit", "Bash"]
 ---
 
 Curate the compounding-lessons loop for one agent (see `.claude/learnings/README.md`).
+`.claude/learnings/` is the canonical tree for both vendors; `.codex/learnings/` is a generated
+byte mirror — promote into canonical, then regenerate the mirror.
 
 Input: `$ARGUMENTS` — the agent name (a file in `.claude/learnings/`). If unknown, list valid ones
 and stop.
@@ -20,5 +22,7 @@ Steps:
      full, merge or drop the weakest existing bullet and say which.
    - Mark each source journal entry `**Status:** distilled (<today>)` (date from `date +%F`).
 4. Do NOT invent lessons that aren't in the journal. Curation promotes evidence, it doesn't author.
-5. Report: which bullets you added/merged and which journal entries you marked distilled — concise,
+5. Run `scripts/agent-sync-learnings` to regenerate the `.codex/learnings/` mirror — skipping it
+   leaves `scripts/agent-config-audit` red.
+6. Report: which bullets you added/merged and which journal entries you marked distilled — concise,
    not a full file dump.

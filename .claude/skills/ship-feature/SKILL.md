@@ -73,7 +73,7 @@ Dispatch implementation to the matching custom role (`rust-tauri-dev` and/or
 Iterate with `/tauri-dev` (`MURMUR_DEV_DEK` recipe, `cargo test --lib` loop).
 
 **Prior lessons are executable input.** Read the binding `.codex/rules/` file for each surface
-before editing and apply relevant curated `## Recurring patterns` from `.codex/learnings/`.
+before editing and apply relevant curated `## Recurring patterns` from `.claude/learnings/`.
 Harness v2 verifies the resulting diff; it does not inject implementation context or repair it.
 
 **Rust / Tauri rules:**
@@ -173,7 +173,7 @@ never the inner loop.)
 
 ### 5b. Extract the lesson (close the loop)
 If verification caught anything real — or the run confirmed a non-obvious approach that worked —
-append ONE `## Run journal` entry to the relevant `.codex/learnings/<agent>.md` (or run
+append ONE `## Run journal` entry to the relevant `.claude/learnings/<agent>.md` (or run
 `/learn <agent>: <lesson>`), citing the artifact that revealed it. Periodically `/curate-learnings`
 promotes repeat offenders into `## Recurring patterns`. This is what makes "every bug a permanent
 lesson" instead of a re-paid one.
