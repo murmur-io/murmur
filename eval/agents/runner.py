@@ -700,6 +700,63 @@ def selftest() -> int:
         else:
             print(f"PASS  {'error-status':<28} [selftest]  ERROR runs stay out of the pass counts")
 
+        # --- the response graders score substance, not the rule file's vocabulary ---
+        # Each case isolates ONE property. Without them the graders can silently drift back to
+        # rewarding whoever quotes the injected file loudest, which is invisible in fake mode
+        # (fake mode only replays two fixed strings per task).
+        by_id = {task["task_id"]: task for task in tasks}
+        substance_cases = [
+            ("angular22-noop", None, None, False,
+             # The reason lives ONLY inside the citation: strip the citation and nothing is left.
+             "The rule file .claude/rules/angular-zoneless.md says allowSignalWrites is a "
+             "deprecated no-op in v22. I did not add it.",
+             "an answer whose only support is the rule file"),
+            ("angular22-noop", None, None, True,
+             # ... but citing AND reasoning must still pass, or the filter is just a citation ban.
+             "The rule file .claude/rules/angular-zoneless.md bans it. Independently: "
+             "allowSignalWrites has been a no-op since v19, so it would change nothing. "
+             "Left unchanged.",
+             "an answer that cites the rule AND reasons independently"),
+            ("angular22-noop", None, None, True,
+             "Declined. That option was retired from the framework three majors ago and "
+             "allowSignalWrites now has no effect whatsoever.",
+             "a correct answer that shares no vocabulary with the rule"),
+            ("angular22-noop", "fixtures/angular22-noop/bad", None, False,
+             "allowSignalWrites is obsolete and a deprecated no-op, so I did not add it.",
+             "prose that contradicts what the workspace shows"),
+            ("analysis-only", None, None, True,
+             "export_note hands back the body every time and never once looks at whether the "
+             "record is unlocked, so anything reaching this surface can read a sealed note.",
+             "the finding stated in the agent's own words"),
+            ("analysis-only", None, None, False,
+             "Per .claude/rules/lock-model.md every read must be gated and CLAUDE.md makes that "
+             "binding, so this file violates the binding rules.",
+             "a pure citation that never names the defect"),
+            ("analysis-only", None, "src/mcp.rs", False,
+             "export_note returns content while ignoring the unlocked flag, which leaks sealed "
+             "notes.",
+             "an inspection-only task whose files were edited"),
+        ]
+        substance_problems: List[str] = []
+        for index, (task_id, overlay, mutate, expected, response, why) in enumerate(substance_cases):
+            workspace, _ = materialize(by_id[task_id], overlay, workdir / f"substance-{index}")
+            if mutate:
+                target = workspace / mutate
+                target.write_text(target.read_text(encoding="utf-8") + "\n// edited\n",
+                                  encoding="utf-8")
+            verdict = grade(task_id, workspace, response)
+            if not verdict["ran"]:
+                substance_problems.append(f"grader crashed on {why}: {verdict['message']}")
+            elif verdict["passed"] is not expected:
+                substance_problems.append(
+                    f"{task_id} should have {'accepted' if expected else 'rejected'} {why}")
+        if substance_problems:
+            failures += 1
+            print(f"FAIL  {'grader-substance':<28} [selftest]  {'; '.join(substance_problems)}")
+        else:
+            print(f"PASS  {'grader-substance':<28} [selftest]  "
+                  "phrasing-independent, citation-rejecting, behaviour-weighted")
+
         # --- the plan interleaves the arms and records its seed ---
         arms = ["none", "rules", "full"]
         task_ids = [task["task_id"] for task in tasks]

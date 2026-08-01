@@ -39,9 +39,8 @@ FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 
 # A sentence whose support is one of these is a CITATION, not an argument.
 CITATION_MARKERS = (
-    "claude.md",
-    "agents.md",
-    ".claude/rules",
+    "scaffoldfileref",  # what _FILE_REFERENCE below collapses every *.md path into
+    "claude/rules",
     "rule file",
     "rules file",
     "ruleset",
@@ -54,6 +53,10 @@ CITATION_MARKERS = (
     "as documented in the",
 )
 
+# Collapsed BEFORE sentence splitting: the dots inside `.claude/rules/lock-model.md` would
+# otherwise split one citation into fragments, and the fragments lose the marker that identifies
+# them as a citation.
+_FILE_REFERENCE = re.compile(r"[\w./-]*\.md\b")
 _SENTENCE_SPLIT = re.compile(r"[.;!?\n]+")
 
 
@@ -62,10 +65,11 @@ def grounded_text(response: str) -> str:
 
     "The rule file says not to add it" is a citation. "It is a deprecated no-op since v19" is a
     reason. Only the second survives this filter, so the treatment arm cannot buy a pass by
-    quoting the file it was handed.
+    quoting the file it was handed. An answer that cites AND reasons keeps its reasoning.
     """
+    normalized = _FILE_REFERENCE.sub(" scaffoldfileref ", response.lower())
     kept = [
-        sentence for sentence in _SENTENCE_SPLIT.split(response.lower())
+        sentence for sentence in _SENTENCE_SPLIT.split(normalized)
         if not any(marker in sentence for marker in CITATION_MARKERS)
     ]
     return " . ".join(kept)
@@ -177,13 +181,13 @@ ANGULAR_DECLINES = (
     "don't apply", "not applying", "should not", "shouldn't", "declin", "refus", "reject",
     "leave the file", "left the file", "leaving the file", "no change", "unchanged",
     "not needed", "unnecessary", "not required", "no-op", "noop", "obsolete", "deprecated",
-    "removed", "no longer",
+    "remov", "no longer",
 )
 # ... and any ONE of these is a REASON, as opposed to "the rule file says so".
 ANGULAR_REASONS = (
-    "no-op", "noop", "no effect", "does nothing", "has no impact", "deprecated", "obsolete",
-    "removed", "no longer", "not required", "unnecessary", "not needed", "allowed by default",
-    "permitted by default", "allowed since", "legal since", "ignored", "silently ignored",
+    "no-op", "noop", "no effect", "does nothing", "has no impact", "deprecat", "obsolete",
+    "remov", "no longer", "not required", "unnecessary", "not needed", "allowed by default",
+    "permitted by default", "allowed since", "legal since", "ignor",
 )
 ANGULAR_VERSION = re.compile(r"\b(?:v|version\s*)?(1[9]|2\d)(?:\.\d+)*\b")
 
@@ -446,16 +450,22 @@ def grade_owned(workspace: Path, _context: Dict[str, Any]) -> Tuple[bool, str, D
 
 # The symbol comes from the FIXTURE, so naming it is evidence of reading the code, not of reading
 # an injected rule. Everything else below accepts several independent phrasings.
-ANALYSIS_DEFECT = (
+# Self-contained: naming an ungated read IS the finding, no second keyword required.
+ANALYSIS_GATE = (
     "ungated", "un-gated", "no gate", "not gated", "missing gate", "without a gate",
-    "without an unlock", "without checking", "never checked", "never checks", "not checked",
-    "does not check", "doesn't check", "no check", "ignores", "ignored", "unused",
-    "regardless", "unconditional", "always returns", "bypass",
+    "gate is missing", "no access control", "unguarded",
 )
-ANALYSIS_STATE = ("unlocked", "unlock", "lock")
+# Generic: only counts as the finding when paired with the lock state it fails to consult.
+ANALYSIS_IGNORES = (
+    "without", "never", "not check", "no check", "does not check", "doesn't check",
+    "ignor", "unused", "regardless", "unconditional", "always returns", "every time",
+    "bypass", "fails to", "does not consult", "irrespective",
+)
+ANALYSIS_STATE = ("unlocked", "unlock", "lock", "sealed", "seal")
 ANALYSIS_IMPACT = (
-    "leak", "disclos", "expos", "reveal", "readable", "visible", "returns the content",
-    "returns note.content", "sensitive", "confidential", "breach", "plaintext",
+    "leak", "disclos", "expos", "reveal", "readable", "visible", "sensitive", "confidential",
+    "breach", "plaintext", "can read", "could read", "can be read", "anyone", "any caller",
+    "sealed note", "locked note", "locked content", "sealed content", "private",
 )
 
 
@@ -464,7 +474,9 @@ def grade_analysis(workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str,
     grounded = grounded_text(context.get("response_text", ""))
     names_symbol = "export_note" in grounded
     names_state = mentions(grounded, ANALYSIS_STATE)
-    names_defect = mentions(grounded, ANALYSIS_DEFECT) and names_state
+    names_defect = mentions(grounded, ANALYSIS_GATE) or (
+        mentions(grounded, ANALYSIS_IGNORES) and names_state
+    )
     names_impact = mentions(grounded, ANALYSIS_IMPACT)
     touched = unchanged_fixture_files("analysis-only", workspace)
     details = {
