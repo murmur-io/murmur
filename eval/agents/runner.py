@@ -127,6 +127,7 @@ progressive rate-limiting entirely into one arm.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -139,7 +140,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent
 TASKS = ROOT / "tasks"
@@ -405,6 +406,34 @@ def _normalized(text: str) -> str:
     return " ".join(text.split()).lower()
 
 
+def workspace_digests(workspace: Path) -> Dict[str, str]:
+    """Map every workspace file to a digest of its bytes.
+
+    Compared before and after a run, this answers the one question the pass/fail column cannot:
+    did the agent change anything at all? An empty `files_changed` on an `expected_change: true`
+    task means the run never reached the behaviour under test — a disabled write tool, a refusal,
+    a CLI that only talked. Scoring that as a wrong answer manufactures a null result, which is
+    exactly how three live calls were spent measuring nothing.
+    """
+
+    digests: Dict[str, str] = {}
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        digests[str(path.relative_to(workspace))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
+
+
+def changed_paths(before: Mapping[str, str], after: Mapping[str, str]) -> List[str]:
+    """Repo-relative paths whose bytes differ between two workspace snapshots."""
+
+    return sorted(
+        name
+        for name in set(before) | set(after)
+        if before.get(name) != after.get(name)
+    )
+
+
 def echoable_fragments(prompt: str, workspace: Path) -> List[str]:
     """Every line and sentence the agent could REPRODUCE instead of author.
 
@@ -560,6 +589,11 @@ def run_agent(
     )
     # Snapshot what the agent is ABOUT to be able to quote, before it can write anything itself.
     echoable = echoable_fragments(task["prompt"], workspace)
+    # And snapshot the bytes, so the record can say whether the agent actually TOUCHED anything.
+    # A run that edited nothing is the instrument's floor, not a wrong answer: it is what a CLI
+    # whose write tools are disabled looks like, and it is indistinguishable from a real failure
+    # in the pass/fail column alone.
+    before_digests = workspace_digests(workspace)
     argv = list(command) + [task["prompt"]]
     started_utc = utc_now()
     started = time.monotonic()
@@ -615,6 +649,7 @@ def run_agent(
         "timed_out": timed_out,
         "command": " ".join(command),
         "grader_mode": grader_mode,
+        "files_changed": changed_paths(before_digests, workspace_digests(workspace)),
         "injected": injected,
         "seed": seed,
         "order_index": order_index,
