@@ -49,18 +49,45 @@ vibes" — untestable by construction.
           from the repo root at their real repo-relative paths, plus a generated `CLAUDE.md` /
           `AGENTS.md` that declares them binding (the repo's real `CLAUDE.md` reaches its rules the
           same way, through `@.claude/rules/*.md` imports — the generated loader is an ABLATION of
-          that mechanism, not new advice: it names files, never answers).
+          that mechanism, not new advice: it names files, never answers). This is the FOCUSED arm:
+          an oracle picked the per-task subset, so it answers "does THIS rule carry the effect?",
+          not "does production behave this way?".
+  full    the repo's REAL always-on envelope: the actual `CLAUDE.md`, the actual `AGENTS.md` and
+          EVERY `.claude/rules/*.md`, at their real repo-relative paths, with no generated loader
+          and no per-task selection. Production never loads a subset, so `rules` cannot answer
+          "will this help a real session"; `full` is the arm whose result transfers.
 
 A declared file that is missing on disk is a hard error. A silently-absent scaffold file would
 make the treatment arm secretly identical to the control arm — a green measurement that means
-nothing — so `scaffold_files` fails loudly instead. `--selftest` asserts the two arms really do
-differ, byte for byte, on every task that declares a file.
+nothing — so `scaffold_files` fails loudly instead. `--selftest` asserts the arms really do
+differ, byte for byte, and that `full` materializes the whole envelope.
+
+# Outcome status: PASS / FAIL / ERROR
+
+A rate-limited 429, a non-zero CLI exit, an empty stdout, a timeout, or a grader that itself
+crashed are TRANSPORT failures, not behavioural ones. Scoring them as "the agent got it wrong"
+silently deflates whichever arm happened to run while the API was unhappy. Every run therefore
+carries a `status`:
+
+  PASS   the grader ran and accepted the result
+  FAIL   the grader ran and rejected it — this is a real behavioural datum
+  ERROR  the run never produced a gradeable result; EXCLUDED from pass counts and reported
+         separately. An arm with a non-trivial ERROR rate is flagged NOT COMPARABLE.
+
+# Ordering
+
+`matrix.py` interleaves the arms within each (agent, task, repeat) cell and picks the within-cell
+order from a RECORDED seed (`--seed`, deterministic, never an unseeded RNG). Running every `none`
+first and every `rules` afterwards would fold a mid-matrix model point-release, a warming cache or
+progressive rate-limiting entirely into one arm.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import random
 import shlex
 import shutil
 import subprocess
@@ -76,7 +103,14 @@ GRADER = ROOT / "graders" / "smoke.py"
 # `eval/agents/` -> `eval/` -> the worktree root that owns CLAUDE.md and .claude/rules/.
 REPO_ROOT = ROOT.parent.parent
 
-SCAFFOLD_ARMS = ("none", "rules")
+SCAFFOLD_ARMS = ("none", "rules", "full")
+
+STATUS_PASS = "PASS"
+STATUS_FAIL = "FAIL"
+STATUS_ERROR = "ERROR"
+
+# An arm that lost this share of its runs to transport failures is not comparable to another arm.
+NOT_COMPARABLE_ERROR_RATE = 0.10
 
 # Entry points an agent CLI reads on its own from the working directory. Generated ONLY in the
 # `rules` arm, and only when the task declares at least one scaffold file. Claude Code follows the
@@ -89,6 +123,105 @@ LOADER_HEADER = (
     "Read them and follow them before you act.\n"
     "\n"
 )
+
+# The real always-on envelope, in load order. `full` copies exactly these; nothing is generated.
+FULL_ENVELOPE_ROOT_FILES = ("CLAUDE.md", "AGENTS.md")
+FULL_ENVELOPE_RULES_DIR = PurePosixPath(".claude/rules")
+
+# Strings a CLI emits when the TRANSPORT failed rather than the agent. Deliberately narrow: these
+# are API error shapes, not words a normal answer uses, so a correct response cannot trip them.
+TRANSPORT_MARKERS = (
+    "rate_limit_error",
+    "overloaded_error",
+    "429 too many requests",
+    "usage limit reached",
+    "quota exceeded",
+    "insufficient_quota",
+    "internal_server_error",
+    "api error: 5",
+)
+
+_CLI_VERSIONS: Dict[str, Optional[str]] = {}
+_REPO_PROVENANCE: Optional[Dict[str, Any]] = None
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def repo_provenance() -> Dict[str, Any]:
+    """git SHA + dirty flag for the worktree under measurement. Best effort, never fatal."""
+    global _REPO_PROVENANCE
+    if _REPO_PROVENANCE is None:
+        def git(*arguments: str) -> Optional[str]:
+            try:
+                done = subprocess.run(["git", "-C", str(REPO_ROOT), *arguments],
+                                      capture_output=True, text=True, timeout=15, check=False)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            return done.stdout.strip() if done.returncode == 0 else None
+
+        sha = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain")
+        _REPO_PROVENANCE = {"repo_sha": sha, "repo_dirty": None if status is None else bool(status)}
+    return dict(_REPO_PROVENANCE)
+
+
+def cli_version(command: Sequence[str]) -> Optional[str]:
+    """`<argv0> --version`, cached. A CLI that has no --version simply records None."""
+    if not command:
+        return None
+    key = command[0]
+    if key not in _CLI_VERSIONS:
+        try:
+            done = subprocess.run([key, "--version"], capture_output=True, text=True,
+                                  timeout=30, check=False, stdin=subprocess.DEVNULL)
+            text = (done.stdout or done.stderr).strip().splitlines()
+            _CLI_VERSIONS[key] = text[0][:200] if done.returncode == 0 and text else None
+        except (OSError, subprocess.SubprocessError):
+            _CLI_VERSIONS[key] = None
+    return _CLI_VERSIONS[key]
+
+
+def declared_model(command: Sequence[str]) -> Optional[str]:
+    """Best effort: the model is only knowable when the operator named it on the command line."""
+    argv = list(command)
+    for index, token in enumerate(argv):
+        if token in ("--model", "-m") and index + 1 < len(argv):
+            return argv[index + 1]
+        if token.startswith("--model="):
+            return token.split("=", 1)[1]
+    return os.environ.get("ANTHROPIC_MODEL") or None
+
+
+def guard_workspace_root(workdir: Path) -> None:
+    """Refuse a scratch root that would leak a real scaffold into BOTH arms.
+
+    Agent CLIs discover `CLAUDE.md` / `AGENTS.md` by walking UP from the working directory. A
+    TMPDIR inside this repo (or under any other directory holding those files) would hand the real
+    envelope to the control arm too, so the measured delta would collapse to zero for a reason that
+    has nothing to do with the scaffold. Detect it and refuse — never warn and continue.
+    """
+    resolved = workdir.resolve()
+    repo = REPO_ROOT.resolve()
+    if resolved == repo or repo in resolved.parents:
+        raise SystemExit(
+            f"refusing to run: the scratch root {resolved} is inside the repo {repo}\n"
+            "  an agent CLI walks UP from its working directory, so the repo's real CLAUDE.md\n"
+            "  would contaminate the control arm as well. Point TMPDIR outside the repo."
+        )
+    home = Path.home().resolve()
+    for ancestor in (resolved, *resolved.parents):
+        if ancestor == home:
+            # The user-level scaffold (~/.claude/CLAUDE.md and friends) is a documented constant
+            # across arms — see the README's "Known limits". Everything below it is not.
+            break
+        for name in LOADER_FILES:
+            if (ancestor / name).is_file():
+                raise SystemExit(
+                    f"refusing to run: {ancestor / name} sits above the scratch root {resolved}\n"
+                    "  upward discovery would inject it into every arm. Point TMPDIR elsewhere."
+                )
 
 
 def load_tasks(only: Optional[List[str]]) -> List[Dict[str, Any]]:
@@ -131,15 +264,48 @@ def scaffold_sources(task: Dict[str, Any]) -> List[Tuple[str, Path]]:
     return resolved
 
 
-def inject_scaffold(task: Dict[str, Any], workspace: Path) -> List[str]:
-    """Copy the task's declared scaffold files into `workspace` at their repo-relative paths."""
+def full_envelope_sources() -> List[Tuple[str, Path]]:
+    """The production always-on envelope: CLAUDE.md + AGENTS.md + every `.claude/rules/*.md`."""
+    resolved: List[Tuple[str, Path]] = []
+    for name in FULL_ENVELOPE_ROOT_FILES:
+        source = REPO_ROOT / name
+        if not source.is_file():
+            raise SystemExit(
+                f"full arm: {source} is missing — the always-on envelope cannot be reproduced"
+            )
+        resolved.append((name, source))
+    rules_dir = REPO_ROOT / FULL_ENVELOPE_RULES_DIR
+    rules = sorted(rules_dir.glob("*.md")) if rules_dir.is_dir() else []
+    if not rules:
+        raise SystemExit(
+            f"full arm: no rule files under {rules_dir} — the always-on envelope cannot be "
+            "reproduced, and a 'full' arm without rules is secretly a second control arm"
+        )
+    resolved.extend((str(PurePosixPath(FULL_ENVELOPE_RULES_DIR) / rule.name), rule) for rule in rules)
+    return resolved
+
+
+def arm_sources(task: Dict[str, Any], scaffold: str) -> List[Tuple[str, Path]]:
+    if scaffold == "none":
+        return []
+    if scaffold == "rules":
+        return scaffold_sources(task)
+    if scaffold == "full":
+        return full_envelope_sources()
+    raise SystemExit(f"unknown scaffold arm: {scaffold}")
+
+
+def inject_scaffold(task: Dict[str, Any], workspace: Path, scaffold: str = "rules") -> List[str]:
+    """Copy the arm's scaffold files into `workspace` at their repo-relative paths."""
     injected: List[str] = []
-    for relative, source in scaffold_sources(task):
+    for relative, source in arm_sources(task, scaffold):
         target = workspace / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         injected.append(relative)
-    if not injected:
+    if scaffold != "rules" or not injected:
+        # `full` ships the REAL CLAUDE.md/AGENTS.md; generating a loader on top would replace the
+        # very artefact under measurement.
         return injected
     declared = list(injected)  # the loader lists the DECLARED files only, never another loader
     for name in LOADER_FILES:
@@ -155,8 +321,10 @@ def inject_scaffold(task: Dict[str, Any], workspace: Path) -> List[str]:
 
 def materialize(
     task: Dict[str, Any], overlay: Optional[str], into: Path, scaffold: str = "none"
-) -> Path:
+) -> Tuple[Path, List[str]]:
     """Lay down the task's `initial/` tree, then apply an overlay and the scaffold arm on top."""
+    if scaffold not in SCAFFOLD_ARMS:
+        raise SystemExit(f"unknown scaffold arm: {scaffold}")
     workspace = into / task["task_id"]
     shutil.copytree(ROOT / task["source"]["initial"], workspace)
     if overlay:
@@ -166,14 +334,12 @@ def materialize(
                 target = workspace / source.relative_to(overlay_root)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
-    if scaffold == "rules":
-        inject_scaffold(task, workspace)
-    elif scaffold != "none":
-        raise SystemExit(f"unknown scaffold arm: {scaffold}")
-    return workspace
+    injected = inject_scaffold(task, workspace, scaffold) if scaffold != "none" else []
+    return workspace, injected
 
 
-def grade(task_id: str, workspace: Path, response_text: str) -> Tuple[bool, str]:
+def grade(task_id: str, workspace: Path, response_text: str) -> Dict[str, Any]:
+    """Run the hidden grader. `ran: False` means the GRADER broke — that is an ERROR, not a FAIL."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         json.dump({"response_text": response_text}, handle)
         context = Path(handle.name)
@@ -183,18 +349,31 @@ def grade(task_id: str, workspace: Path, response_text: str) -> Tuple[bool, str]
              "--workspace", str(workspace), "--context", str(context)],
             capture_output=True, text=True, timeout=120, check=False,
         )
+    except subprocess.TimeoutExpired:
+        return {"ran": False, "passed": False, "message": "grader timed out", "details": {}}
     finally:
         context.unlink(missing_ok=True)
     if completed.returncode != 0:
-        return False, f"grader failed: {completed.stderr.strip()[:200]}"
-    verdict = json.loads(completed.stdout)
-    return bool(verdict["pass"]), str(verdict["message"])
+        return {"ran": False, "passed": False,
+                "message": f"grader failed: {completed.stderr.strip()[:200]}", "details": {}}
+    try:
+        verdict = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {"ran": False, "passed": False,
+                "message": f"grader emitted non-JSON: {completed.stdout.strip()[:200]}",
+                "details": {}}
+    return {
+        "ran": True,
+        "passed": bool(verdict["pass"]),
+        "message": str(verdict["message"]),
+        "details": verdict.get("details") or {},
+    }
 
 
-def run_fake(task: Dict[str, Any], workdir: Path) -> List[Tuple[str, bool, str]]:
+def run_fake(task: Dict[str, Any], workdir: Path) -> List[Tuple[str, bool, str, Dict[str, Any]]]:
     """Assert the grader accepts the recorded good answer and rejects the recorded bad one."""
     fake = task.get("fake") or {}
-    results: List[Tuple[str, bool, str]] = []
+    results: List[Tuple[str, bool, str, Dict[str, Any]]] = []
     for arm, overlay_key, response_key, must_pass in (
         ("good", "good_overlay", "good_response", True),
         ("bad", "bad_overlay", "bad_response", False),
@@ -204,11 +383,32 @@ def run_fake(task: Dict[str, Any], workdir: Path) -> List[Tuple[str, bool, str]]
         overlay = fake.get(overlay_key)
         if arm == "bad" and overlay is None and not fake.get(response_key):
             continue
-        workspace = materialize(task, overlay, workdir / arm)
-        passed, message = grade(task["task_id"], workspace, fake.get(response_key, ""))
-        ok = passed is must_pass
-        results.append((arm, ok, message if ok else f"expected {'PASS' if must_pass else 'FAIL'}: {message}"))
+        workspace, _ = materialize(task, overlay, workdir / arm)
+        verdict = grade(task["task_id"], workspace, fake.get(response_key, ""))
+        ok = verdict["passed"] is must_pass and verdict["ran"]
+        message = verdict["message"]
+        results.append((arm, ok, message if ok else
+                        f"expected {'PASS' if must_pass else 'FAIL'}: {message}", verdict["details"]))
     return results
+
+
+def transport_failure(
+    exit_code: Optional[int], timed_out: bool, stdout: str, stderr: str, timeout_seconds: float
+) -> Optional[str]:
+    """Name the TRANSPORT failure, or None when the run produced a gradeable result."""
+    if timed_out:
+        return f"agent timed out after {timeout_seconds:.0f}s"
+    if exit_code != 0:
+        tail = (stderr or stdout).strip().splitlines()
+        detail = tail[-1][:120] if tail else ""
+        return f"agent CLI exited {exit_code}" + (f": {detail}" if detail else "")
+    if not stdout.strip():
+        return "agent produced no stdout"
+    lowered = f"{stdout}\n{stderr}".lower()
+    for marker in TRANSPORT_MARKERS:
+        if marker in lowered:
+            return f"transport failure reported by the CLI ({marker})"
+    return None
 
 
 def run_agent(
@@ -219,12 +419,18 @@ def run_agent(
     run_index: int = 0,
     agent_label: str = "agent",
     timeout_seconds: float = 900.0,
+    seed: int = 0,
+    order_index: int = 0,
 ) -> Dict[str, Any]:
     """Hand `initial/` (+ the scaffold arm) and the prompt to a real CLI, then grade the result."""
-    workspace = materialize(task, None, workdir / f"{scaffold}-{run_index}", scaffold=scaffold)
+    workspace, injected = materialize(
+        task, None, workdir / f"{scaffold}-{run_index}", scaffold=scaffold
+    )
     argv = list(command) + [task["prompt"]]
+    started_utc = utc_now()
     started = time.monotonic()
     timed_out = False
+    stderr = ""
     try:
         completed = subprocess.run(
             argv, cwd=str(workspace),
@@ -233,7 +439,7 @@ def run_agent(
             # TTY read is a hung matrix, not a measurement.
             stdin=subprocess.DEVNULL,
         )
-        stdout, exit_code = completed.stdout, completed.returncode
+        stdout, stderr, exit_code = completed.stdout, completed.stderr, completed.returncode
     except subprocess.TimeoutExpired as expired:
         timed_out = True
         stdout = expired.stdout.decode("utf-8", "replace") if isinstance(expired.stdout, bytes) else (expired.stdout or "")
@@ -241,28 +447,129 @@ def run_agent(
     except FileNotFoundError as missing:
         raise SystemExit(f"agent command not found: {argv[0]} ({missing})") from missing
     seconds = round(time.monotonic() - started, 3)
-    if timed_out:
-        passed, message = False, f"agent timed out after {timeout_seconds:.0f}s"
+
+    error_reason = transport_failure(exit_code, timed_out, stdout, stderr, timeout_seconds)
+    grader_mode: Optional[str] = None
+    if error_reason is None:
+        verdict = grade(task["task_id"], workspace, stdout)
+        grader_mode = (verdict["details"] or {}).get("grader_mode")
+        if not verdict["ran"]:
+            # The grader itself broke. That is infrastructure, not the agent being wrong.
+            error_reason = verdict["message"]
+            status, passed, message = STATUS_ERROR, False, verdict["message"]
+        else:
+            passed = verdict["passed"]
+            status = STATUS_PASS if passed else STATUS_FAIL
+            message = verdict["message"]
     else:
-        passed, message = grade(task["task_id"], workspace, stdout)
-    return {
+        status, passed, message = STATUS_ERROR, False, error_reason
+
+    record = {
         "task_id": task["task_id"],
         "agent_label": agent_label,
         "scaffold": scaffold,
         "run_index": run_index,
         "arm": "agent",
+        "status": status,
         "passed": passed,
+        "error_reason": error_reason,
         "message": message,
         "seconds": seconds,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "command": " ".join(command),
+        "grader_mode": grader_mode,
+        "injected": injected,
+        "seed": seed,
+        "order_index": order_index,
+        "started_utc": started_utc,
+        "cli_version": cli_version(command),
+        "model": declared_model(command),
     }
+    record.update(repo_provenance())
+    return record
+
+
+def summarize(records: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Pass counts NEVER include ERROR runs: `scored` is the honest denominator."""
+    passes = sum(1 for record in records if record.get("status") == STATUS_PASS)
+    failures = sum(1 for record in records if record.get("status") == STATUS_FAIL)
+    errors = sum(1 for record in records if record.get("status") == STATUS_ERROR)
+    return {"pass": passes, "fail": failures, "error": errors,
+            "scored": passes + failures, "total": len(records)}
+
+
+def not_comparable(summary: Dict[str, int]) -> bool:
+    """An arm that lost a non-trivial share of its runs to transport cannot be compared."""
+    if summary["total"] == 0:
+        return False
+    if summary["scored"] == 0:
+        return True
+    return summary["error"] / summary["total"] >= NOT_COMPARABLE_ERROR_RATE
+
+
+def plan_matrix(
+    agent_labels: Sequence[str],
+    scaffolds: Sequence[str],
+    task_ids: Sequence[str],
+    repeat: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Deterministic, ARM-INTERLEAVED execution order.
+
+    Running every `none` before every `rules` folds any time-varying factor — a mid-matrix model
+    point-release, a warming cache, progressive rate-limiting — entirely into one arm. Here the
+    arms of a single (agent, task, repeat) cell run back to back, and WHICH of them goes first is
+    drawn from the recorded seed, so the ordering bias is randomised but reproducible.
+    """
+    plan: List[Dict[str, Any]] = []
+    for label in agent_labels:
+        for task_id in task_ids:
+            for index in range(repeat):
+                arms = list(scaffolds)
+                random.Random(f"{seed}|{label}|{task_id}|{index}").shuffle(arms)
+                for scaffold in arms:
+                    plan.append({
+                        "agent_label": label,
+                        "task_id": task_id,
+                        "run_index": index,
+                        "scaffold": scaffold,
+                        "seed": seed,
+                        "order_index": len(plan),
+                    })
+    return plan
+
+
+class RecordSink:
+    """Writes the JSON array after EVERY record.
+
+    A matrix is paid for in live model calls; a Ctrl-C or a crash two thirds of the way through
+    must not throw away what has already been bought. The write is atomic (temp + replace), so a
+    kill mid-write leaves the previous complete file rather than a truncated one.
+    """
+
+    def __init__(self, path: Optional[Path]) -> None:
+        self.path = path
+        self.records: List[Dict[str, Any]] = []
+
+    def append(self, record: Dict[str, Any]) -> None:
+        self.records.append(record)
+        self.flush()
+
+    def flush(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(self.records, indent=2, sort_keys=True) + "\n"
+        temporary = self.path.with_name(self.path.name + ".partial")
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, self.path)
 
 
 def write_json(path: Path, records: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sink = RecordSink(path)
+    sink.records = list(records)
+    sink.flush()
 
 
 def tree_bytes(root: Path) -> Dict[str, bytes]:
@@ -276,8 +583,10 @@ def tree_bytes(root: Path) -> Dict[str, bytes]:
 def selftest() -> int:
     """Prove the scaffold arms differ. This is what stops the feature from silently rotting.
 
-    Deterministic, no model calls: materialize every task in both arms and assert each declared
-    scaffold file is ABSENT under `none` and PRESENT with byte-identical content under `rules`.
+    Deterministic, no model calls: materialize every task in all three arms and assert each
+    declared scaffold file is ABSENT under `none` and PRESENT with byte-identical content under
+    `rules`; that `full` carries the WHOLE always-on envelope; that an ERROR is never counted as a
+    pass; and that the execution plan interleaves the arms from a recorded seed.
     """
     failures = 0
     tasks = load_tasks(None)
@@ -286,8 +595,10 @@ def selftest() -> int:
         for task in tasks:
             task_id = task["task_id"]
             declared = scaffold_sources(task)
-            control = tree_bytes(materialize(task, None, workdir / task_id / "none", scaffold="none"))
-            treated = tree_bytes(materialize(task, None, workdir / task_id / "rules", scaffold="rules"))
+            control_ws, _ = materialize(task, None, workdir / task_id / "none", scaffold="none")
+            treated_ws, _ = materialize(task, None, workdir / task_id / "rules", scaffold="rules")
+            control = tree_bytes(control_ws)
+            treated = tree_bytes(treated_ws)
             problems: List[str] = []
             for relative, source in declared:
                 if relative in control:
@@ -318,6 +629,29 @@ def selftest() -> int:
                         problems.append(f"scaffold mutated the fixture file {relative}")
             elif treated != control:
                 problems.append("no scaffold declared, yet the arms differ")
+
+            # --- the `full` arm must reproduce the REAL always-on envelope, not a subset ---
+            full_ws, full_injected = materialize(task, None, workdir / task_id / "full",
+                                                 scaffold="full")
+            full_tree = tree_bytes(full_ws)
+            envelope = full_envelope_sources()
+            for relative, source in envelope:
+                if relative not in full_tree:
+                    problems.append(f"full arm is missing the envelope file {relative}")
+                elif full_tree[relative] != source.read_bytes():
+                    problems.append(f"full arm's {relative} is not the repo's bytes")
+                if relative in control:
+                    problems.append(f"{relative} leaked into the control arm")
+            if full_injected != [relative for relative, _ in envelope]:
+                problems.append(f"full arm injected {full_injected}, expected the whole envelope")
+            real_claude = (REPO_ROOT / "CLAUDE.md").read_bytes()
+            if full_tree.get("CLAUDE.md") != real_claude:
+                # A generated loader here would replace the artefact under measurement.
+                problems.append("full arm did not ship the repo's real CLAUDE.md")
+            for relative, payload in control.items():
+                if full_tree.get(relative) != payload:
+                    problems.append(f"full arm mutated the fixture file {relative}")
+
             declared_note = ", ".join(relative for relative, _ in declared) or "none declared"
             if problems:
                 failures += 1
@@ -335,8 +669,114 @@ def selftest() -> int:
             failures += 1
             print(f"FAIL  {'missing-file-guard':<28} [selftest]  a missing scaffold file was tolerated")
 
+        # --- ERROR is never folded into a pass count ---
+        synthetic = [
+            {"status": STATUS_PASS}, {"status": STATUS_FAIL}, {"status": STATUS_ERROR},
+            {"status": STATUS_ERROR},
+        ]
+        counted = summarize(synthetic)
+        status_problems: List[str] = []
+        if counted != {"pass": 1, "fail": 1, "error": 2, "scored": 2, "total": 4}:
+            status_problems.append(f"summarize() miscounted: {counted}")
+        if counted["scored"] != counted["pass"] + counted["fail"]:
+            status_problems.append("ERROR runs leaked into the scored denominator")
+        if not not_comparable(counted):
+            status_problems.append("a 50% ERROR rate was not flagged as not comparable")
+        if not_comparable(summarize([{"status": STATUS_PASS}] * 20)):
+            status_problems.append("an error-free arm was flagged as not comparable")
+        errored = run_error_record("selftest", "none", "synthetic transport failure")
+        if errored["status"] != STATUS_ERROR or errored["passed"]:
+            status_problems.append("an ERROR record claims a pass")
+        if status_problems:
+            failures += 1
+            print(f"FAIL  {'error-status':<28} [selftest]  {'; '.join(status_problems)}")
+        else:
+            print(f"PASS  {'error-status':<28} [selftest]  ERROR runs stay out of the pass counts")
+
+        # --- the plan interleaves the arms and records its seed ---
+        arms = ["none", "rules", "full"]
+        task_ids = [task["task_id"] for task in tasks]
+        plan = plan_matrix(["claude", "codex"], arms, task_ids, 2, seed=7)
+        order_problems: List[str] = []
+        if len(plan) != 2 * len(task_ids) * 2 * len(arms):
+            order_problems.append(f"plan has {len(plan)} entries")
+        if any(entry["seed"] != 7 for entry in plan):
+            order_problems.append("the seed is not recorded on every planned run")
+        if [entry["order_index"] for entry in plan] != list(range(len(plan))):
+            order_problems.append("order_index is not the execution order")
+        cells: Dict[Tuple[str, str, int], List[int]] = {}
+        for position, entry in enumerate(plan):
+            key = (entry["agent_label"], entry["task_id"], entry["run_index"])
+            cells.setdefault(key, []).append(position)
+        for key, positions in cells.items():
+            if positions != list(range(positions[0], positions[0] + len(arms))):
+                order_problems.append(f"cell {key} is not contiguous: {positions}")
+            if len({plan[position]["scaffold"] for position in positions}) != len(arms):
+                order_problems.append(f"cell {key} does not contain every arm")
+        # The exact defect being repaired: every `none` preceding every `rules`.
+        last_none = max(i for i, e in enumerate(plan) if e["scaffold"] == "none")
+        first_rules = min(i for i, e in enumerate(plan) if e["scaffold"] == "rules")
+        if last_none < first_rules:
+            order_problems.append("every 'none' run still precedes every 'rules' run")
+        if [e["scaffold"] for e in plan] == [
+            e["scaffold"] for e in plan_matrix(["claude", "codex"], arms, task_ids, 2, seed=8)
+        ]:
+            order_problems.append("the seed does not change the within-cell arm order")
+        if [e["scaffold"] for e in plan] != [
+            e["scaffold"] for e in plan_matrix(["claude", "codex"], arms, task_ids, 2, seed=7)
+        ]:
+            order_problems.append("the same seed did not reproduce the same order")
+        if order_problems:
+            failures += 1
+            print(f"FAIL  {'arm-interleaving':<28} [selftest]  {'; '.join(order_problems)}")
+        else:
+            print(f"PASS  {'arm-interleaving':<28} [selftest]  "
+                  "arms alternate within each cell, order seeded and recorded")
+
+        # --- a scratch root inside the repo must abort ---
+        guard_problems: List[str] = []
+        try:
+            guard_workspace_root(ROOT / "fixtures")
+        except SystemExit:
+            pass
+        else:
+            guard_problems.append("a scratch root inside the repo was tolerated")
+        try:
+            guard_workspace_root(workdir)
+        except SystemExit as refused:
+            guard_problems.append(f"a clean scratch root was refused: {refused}")
+        if guard_problems:
+            failures += 1
+            print(f"FAIL  {'tmpdir-guard':<28} [selftest]  {'; '.join(guard_problems)}")
+        else:
+            print(f"PASS  {'tmpdir-guard':<28} [selftest]  "
+                  "a scratch root under a CLAUDE.md is refused")
+
+        # --- records are written incrementally, not only at the end ---
+        sink_path = workdir / "incremental.json"
+        sink = RecordSink(sink_path)
+        sink.append({"task_id": "first", "status": STATUS_PASS})
+        after_one = json.loads(sink_path.read_text(encoding="utf-8")) if sink_path.exists() else []
+        sink.append({"task_id": "second", "status": STATUS_ERROR})
+        after_two = json.loads(sink_path.read_text(encoding="utf-8"))
+        if len(after_one) != 1 or len(after_two) != 2:
+            failures += 1
+            print(f"FAIL  {'incremental-json':<28} [selftest]  "
+                  f"records are not flushed per run ({len(after_one)}, {len(after_two)})")
+        else:
+            print(f"PASS  {'incremental-json':<28} [selftest]  "
+                  "each record is on disk before the next run starts")
+
     print(f"\n{len(tasks)} task(s), {failures} failure(s)")
     return 1 if failures else 0
+
+
+def run_error_record(task_id: str, scaffold: str, reason: str) -> Dict[str, Any]:
+    """The shape an ERROR takes when there is nothing to grade."""
+    return {
+        "task_id": task_id, "scaffold": scaffold, "status": STATUS_ERROR, "passed": False,
+        "error_reason": reason, "message": reason,
+    }
 
 
 def main() -> int:
@@ -346,10 +786,13 @@ def main() -> int:
     parser.add_argument("--agent-command", help="CLI to invoke in --mode agent, e.g. 'claude -p'")
     parser.add_argument("--agent-label", help="label recorded in --json (default: the command's argv[0])")
     parser.add_argument("--scaffold", choices=SCAFFOLD_ARMS, default="none",
-                        help="'none' = bare fixture (control); 'rules' = fixture + declared scaffold files")
+                        help="'none' = bare fixture (control); 'rules' = fixture + the task's "
+                             "declared files; 'full' = the repo's real always-on envelope")
     parser.add_argument("--repeat", type=int, default=1, help="runs per task in --mode agent (default 1)")
     parser.add_argument("--json", dest="json_path", type=Path, help="write one JSON record per run")
     parser.add_argument("--timeout", type=float, default=900.0, help="per-run agent wall timeout in seconds")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="recorded in every JSON record; matrix.py draws its arm order from it")
     parser.add_argument("--selftest", action="store_true",
                         help="assert the scaffold arms differ (deterministic, no model calls)")
     args = parser.parse_args()
@@ -365,19 +808,28 @@ def main() -> int:
     tasks = load_tasks(args.task)
     command = shlex.split(args.agent_command) if args.agent_command else []
     label = args.agent_label or (command[0] if command else "fake")
-    records: List[Dict[str, Any]] = []
+    sink = RecordSink(args.json_path)
     failures = 0
+    errors = 0
     with tempfile.TemporaryDirectory(prefix="murmur-scaffold-eval-") as tmp:
         workdir = Path(tmp)
+        if args.mode == "agent":
+            guard_workspace_root(workdir)
         for task in tasks:
             if args.mode == "fake":
-                for arm, ok, message in run_fake(task, workdir / task["task_id"]):
+                for arm, ok, message, details in run_fake(task, workdir / task["task_id"]):
                     failures += 0 if ok else 1
                     print(f"{'PASS' if ok else 'FAIL'}  {task['task_id']:<28} [{arm}]  {message}")
-                    records.append({
+                    sink.append({
                         "task_id": task["task_id"], "agent_label": label, "scaffold": "none",
-                        "run_index": 0, "arm": arm, "passed": ok, "message": message,
+                        "run_index": 0, "arm": arm,
+                        "status": STATUS_PASS if ok else STATUS_FAIL, "passed": ok,
+                        "error_reason": None, "message": message,
                         "seconds": 0.0, "exit_code": 0, "timed_out": False, "command": "",
+                        "grader_mode": details.get("grader_mode"), "injected": [],
+                        "seed": args.seed, "order_index": len(sink.records),
+                        "started_utc": utc_now(), "cli_version": None, "model": None,
+                        **repo_provenance(),
                     })
                 continue
 
@@ -385,28 +837,36 @@ def main() -> int:
                 print(f"note: {task['task_id']} declares no scaffold files — "
                       "its 'rules' arm is identical to its 'none' arm", file=sys.stderr)
             passes = 0
+            scored = 0
             for index in range(args.repeat):
                 record = run_agent(
                     task, workdir / task["task_id"], command,
                     scaffold=args.scaffold, run_index=index, agent_label=label,
-                    timeout_seconds=args.timeout,
+                    timeout_seconds=args.timeout, seed=args.seed, order_index=len(sink.records),
                 )
-                records.append(record)
-                passes += 1 if record["passed"] else 0
-                failures += 0 if record["passed"] else 1
+                sink.append(record)
+                if record["status"] == STATUS_ERROR:
+                    errors += 1
+                else:
+                    scored += 1
+                    passes += 1 if record["passed"] else 0
+                    failures += 0 if record["passed"] else 1
                 arm = f"agent/{args.scaffold}"
                 if args.repeat > 1:
                     arm = f"{arm} {index + 1}/{args.repeat}"
-                verdict = "PASS" if record["passed"] else "FAIL"
-                print(f"{verdict}  {task['task_id']:<28} [{arm}]  {record['message']}")
+                print(f"{record['status']:<5}  {task['task_id']:<28} [{arm}]  {record['message']}")
             if args.repeat > 1:
-                print(f"      {task['task_id']:<28} [agent/{args.scaffold}]  {passes}/{args.repeat} passed")
+                print(f"      {task['task_id']:<28} [agent/{args.scaffold}]  "
+                      f"{passes}/{scored} passed" + (f", {args.repeat - scored} error(s)"
+                                                     if scored != args.repeat else ""))
 
-    if args.json_path:
-        write_json(args.json_path, records)
-
-    print(f"\n{len(tasks)} task(s), {failures} failure(s)")
-    return 1 if failures else 0
+    summary = f"\n{len(tasks)} task(s), {failures} failure(s)"
+    if errors:
+        summary += f", {errors} error(s) excluded from the pass counts"
+    print(summary)
+    if failures:
+        return 1
+    return 2 if errors else 0
 
 
 if __name__ == "__main__":
