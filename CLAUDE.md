@@ -115,5 +115,58 @@ Full runbook: **[`.claude/skills/release-murmur`](.claude/skills/release-murmur/
   - adding or changing a check in the CI gate → **`add-ci-gate`**
   - writing / tuning a GitHub Actions workflow → **`github-actions`**
 - **Agents** (`.claude/agents/`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `ci-cd-engineer` (designs & maintains CI — the local `scripts/ci.sh` gate + the GitHub Actions macOS PR-gate that wraps it; CD/notarized release stays with `release-engineer`), `murmur-researcher` — dispatch as subagents; the implementer never owns the verdict.
+  **Every dispatched agent MUST read `.claude/learnings/<agent-name>.md` first when that file
+  exists** (today: `adversarial-verifier`, `angular-zoneless-dev`, `lock-security-reviewer`,
+  `murmur-researcher`, `release-engineer`, `rust-tauri-dev`). Its `## Recurring patterns` are
+  binding imperatives distilled from failures this project already paid for, and they outrank the
+  agent's own general guidance. That journal was written to stop a lesson being re-paid, but
+  `.claude/learnings/README.md` says of itself: *"compatibility mirror, not executable input …
+  never claim they were injected unless the dispatch explicitly included them"* — and no agent
+  definition referenced it, so 939 lines of bought-and-paid-for lessons were reaching nobody. This
+  line is the dispatch making it explicit.
 
-Use `scripts/agent-harness` for risky/multi-step work that needs a hash-bound receipt. The implementer edits the isolated worktree but never owns the verdict. For protected Harness/control-plane changes, which cannot self-certify, use a dedicated worktree outside the runner-owned `../.murmur-agent-tasks` root (for example `../.murmur-control-plane/<task-id>`), the complete control-plane selftests, a fresh independent review, and the base-anchored CI gate.
+## The development loop (binding — this is the default, not a suggestion)
+
+**Track A — every change. Plan and implement in ONE session; do not hand a plan to a fresh agent
+to implement.** Splitting those two loses every implicit decision made while exploring; divide work
+by context boundary, not by task type.
+
+```bash
+git checkout -b <slug>
+# plan AND implement here
+scripts/agent-config-audit --ci                        # 0.1s — run it every time
+(cd src-tauri && cargo test --lib) && npx ng lint && npx ng build
+git commit && gh pr create -R murmur-io/murmur
+# CI red? ANOTHER COMMIT ON THE SAME BRANCH — never a new task id.
+```
+
+`agent-config-audit` is first because it is the cheapest check in the repo and the only one that
+sees a whole class of defect the others cannot. Measured on PR #535: `cargo test --lib`, `ng lint`
+and `ng build` were all green while the diff contained (a) `.claude/`↔`.codex/` binding-rule drift
+and (b) a Bash-hook change that silently disabled secret scanning and the commit finish-guard. The
+audit caught both, in **0.1 s**, but it only ran remotely — so the feedback arrived one CI
+round-trip later instead of before the commit. Run it unconditionally; deciding whether a diff
+"touches the control plane" costs more thought than the check costs time.
+
+GitHub Actions running `scripts/ci.sh` is the **only** merge authority.
+
+**Escalate to `scripts/agent-harness` only when the diff touches a path in
+`.agents/harness/config.json` `risk_classification.{lock,egress,protocol}`.** That test is
+mechanical — never a judgement call about whether the work "feels risky", which is how one feature
+came to consume eleven task ids. When you do escalate, pass the real plan:
+**`--prompt-file plan.md`, never `--prompt "<one sentence>"`** — the combined reviewer checks the
+diff against the acceptance contract it is given, so a one-line contract produces a one-line review.
+
+The implementer edits the isolated worktree but never owns the verdict. For protected
+Harness/control-plane changes, which cannot self-certify, use a dedicated worktree outside the
+runner-owned `../.murmur-agent-tasks` root (for example `../.murmur-control-plane/<task-id>`), the
+complete control-plane selftests, a fresh independent review, and the base-anchored CI gate.
+
+**Track B — the scaffold improves only through oracles.** When a bug class reaches a user, the fix
+is not done until a deterministic oracle for it exists in `src-tauri/src/**/tests/` or `e2e/**`.
+The four shipped classes and their oracles: seal content loss →
+`db_tests/lock_tests.rs::seal_transcript_timeline_round_trips_byte_identical`; sealed-content leak →
+`commands/tests/lock_read_gate_tests.rs`; macOS FFI abort at launch →
+`scripts/harness-runtime-smoke.py`; packaged-WebKit CSP style loss →
+`e2e/render/csp-style-src.spec.ts`. A rule or skill you cannot express as an oracle is a rule whose
+effect you are not measuring.
