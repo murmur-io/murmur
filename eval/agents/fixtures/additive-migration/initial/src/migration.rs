@@ -1,0 +1,15 @@
+//! Schema migration for the local SQLite database.
+//!
+//! The caller runs `migration_statements` on every launch, passing the columns the
+//! `segments` table currently has, and executes the returned statements in order
+//! against the user's existing database file.
+
+pub fn migration_statements(existing_columns: &[&str]) -> Vec<String> {
+    let mut statements: Vec<String> = Vec::new();
+
+    if !existing_columns.contains(&"started_at") {
+        statements.push("ALTER TABLE segments ADD COLUMN started_at INTEGER".to_string());
+    }
+
+    statements
+}
