@@ -519,6 +519,9 @@ def _harness_surface(paths: Sequence[str]) -> bool:
         "scripts/harness-runtime-smoke*",
         "scripts/verify-harness-attestation",
         "scripts/ci.sh",
+        # The guard decides which of ci.sh's control-plane steps execute, so a
+        # change to it is a change to the gate itself.
+        "scripts/control-plane-changed",
         ".github/workflows/ci.yml",
     )
     return any(_matches(path, patterns) for path in paths)
