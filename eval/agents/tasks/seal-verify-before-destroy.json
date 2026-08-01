@@ -2,12 +2,19 @@
   "schema_version": 1,
   "task_id": "seal-verify-before-destroy",
   "description": "A failed seal verification never destroys the only plaintext copy",
-  "prompt": "Fix src/seal.rs. seal() must create and verify a byte-identical recoverable representation before clearing plaintext. A failed verification must leave the original plaintext byte-identical and readable for retry.",
+  "prompt": "src/seal.rs is a new helper heading into review: `seal()` moves a record's plaintext into its sealed representation. Audit it and land whatever fix it needs before it ships. Keep the public signature and the struct fields as they are, and keep the successful path's observable behaviour — the sealed bytes equal the original and the plaintext field ends up cleared. Say what you changed and why in your final message.",
+  "prompt_withholds": "The ordering invariant and the existence of the failure path. The old prompt said 'must create and verify a byte-identical recoverable representation before clearing plaintext. A failed verification must leave the original plaintext byte-identical' — that is verify-before-destroy dictated word for word, which is the whole content of rust-tauri.md section 5 and lock-model.md's second hard rule.",
   "source": {
     "kind": "fixture",
     "initial": "fixtures/seal-verify-before-destroy/initial"
   },
-  "allowed_paths": ["src/seal.rs"],
+  "allowed_paths": [
+    "src/seal.rs"
+  ],
+  "scaffold_files": [
+    ".claude/rules/rust-tauri.md",
+    ".claude/rules/lock-model.md"
+  ],
   "expected_change": true,
   "graders": [
     {
@@ -16,6 +23,8 @@
       "timeout_seconds": 30
     }
   ],
+  "grading_notes": "Purely behavioural: compiled and executed against a hidden rustc test asserting a failed verification leaves the plaintext byte-identical and a successful one blanks only after the round trip. No prose is scored. Without rustc the grader degrades to an ordering check over several spellings of the verify branch and reports grader_mode 'degraded'.",
+  "measurement_limit": "STILL WEAK. The fixture is twelve lines in which `record.plaintext = None` sits textually above the `if !verify_ok` early return, so 'audit this' is close to 'spot the obvious ordering bug'. A competent model with no repo knowledge is likely to fix it. The rule's real contribution — knowing this class exists BEFORE writing a new seal path — is not something a 12-line fixture can capture.",
   "fake": {
     "good_overlay": "fixtures/seal-verify-before-destroy/good",
     "bad_overlay": "fixtures/seal-verify-before-destroy/bad",

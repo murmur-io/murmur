@@ -1,0 +1,10 @@
+<div class="quick-actions">
+  <p class="quick-actions-title">Quick actions</p>
+  @for (action of actions(); track action.id) {
+    <button type="button" class="menu-item" (click)="chosen.emit(action.id)">
+      {{ action.label }}
+    </button>
+  } @empty {
+    <p class="empty-state">Nothing to do for this note.</p>
+  }
+</div>

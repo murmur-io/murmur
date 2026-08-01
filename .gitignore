@@ -7,6 +7,8 @@
 .playwright-mcp/
 /settings-audio-controls.png
 .claude/worktrees/
+# Per-machine Claude override — audited by config_audit._local_settings, never committed
+.claude/settings.local.json
 .codex/worktrees/
 .codex/tmp/
 .codex/claude-settings.local.migrated.json
