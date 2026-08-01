@@ -2,16 +2,28 @@
   "schema_version": 1,
   "task_id": "lock-masked-dto",
   "description": "Locked DTOs mask content and asset paths",
-  "prompt": "Fix src/lock_dto.rs. `to_dto` must preserve content and audio_path only for an unlocked note. A locked note must return None for both sensitive fields so the frontend cannot hand an asset path to convertFileSrc.",
+  "prompt": "src/lock_dto.rs builds the DTO the frontend receives for one note. `to_dto` takes an `unlocked` flag and ignores it, so every note is serialized as if the user had unlocked it. Make `to_dto` honour the flag, so that a note the user has not unlocked cannot be read through this DTO. An unlocked note must still serialize exactly as it does today; keep the struct definitions and the function signature unchanged.",
+  "prompt_withholds": "Which fields must be masked, and why the asset path is one of them. The old prompt said 'must return None for both sensitive fields so the frontend cannot hand an asset path to convertFileSrc' — that is the convertFileSrc leak invariant verbatim, i.e. exactly the fact .claude/rules/lock-model.md exists to supply. The half-fix (mask the body, keep audio_path) is only a plausible wrong answer once the prompt stops naming the answer.",
   "source": {
     "kind": "fixture",
     "initial": "fixtures/lock-masked-dto/initial"
   },
-  "allowed_paths": ["src/lock_dto.rs"],
+  "allowed_paths": [
+    "src/lock_dto.rs"
+  ],
+  "scaffold_files": [
+    ".claude/rules/lock-model.md"
+  ],
   "expected_change": true,
   "graders": [
-    {"id": "locked-field-mask", "script": "graders/smoke.py", "timeout_seconds": 30}
+    {
+      "id": "locked-field-mask",
+      "script": "graders/smoke.py",
+      "timeout_seconds": 30
+    }
   ],
+  "grading_notes": "Purely behavioural: the candidate is compiled and executed against a hidden rustc test asserting a locked note yields None for BOTH fields and an unlocked note round-trips both. No prose is scored, so no phrasing or vocabulary can influence the verdict. When rustc is absent the grader degrades to a shape check that accepts any gating idiom (`unlocked.then(..)`, `if unlocked { .. }`, a match) and reports grader_mode 'degraded' — the runner records that, so a degraded cell is never silently compared against a strict one.",
+  "measurement_limit": "AT THE CEILING FOR A FRONTIER MODEL, MEASURED. Masking a note body but leaving the recording path was expected to be an attractive wrong answer. It was not: live check 2026-08-01, claude -p (Claude Code 2.1.220), n=1 per arm, the CONTROL arm masked BOTH fields and passed the strict rustc grader without lock-model.md; the full arm also passed. So this task currently measures nothing about the scaffold either. It stays because the half-fix is a real shipped failure class and a weaker or cheaper agent may still produce it — the arms CAN separate here in principle, unlike secret-sk-proj where they are byte-identical by construction.",
   "fake": {
     "good_overlay": "fixtures/lock-masked-dto/good",
     "bad_overlay": "fixtures/lock-masked-dto/bad",
