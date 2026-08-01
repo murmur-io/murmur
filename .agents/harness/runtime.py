@@ -1017,6 +1017,40 @@ def _safe_tool_path(real_home: Path) -> str:
 
 
 def _check_runtime_paths(task_dir: Path) -> Dict[str, Path]:
+    """Per-task check runtime. `cargo_home`/`cargo_target` MUST stay per-task.
+
+    Pointing these at a shared build root is the obvious way to stop paying a
+    cold ML compile per task id, and it is wrong. Reproduced on this machine
+    (cargo 1.96.0, ZERO concurrency, recorded in
+    `docs/research/2026-08-01-harness-plan-verification.md` §8.1): two checkouts
+    with the same package name, version and workspace-RELATIVE layout, built
+    through one `CARGO_TARGET_DIR`, produce one metadata hash, one artifact
+    filename and one fingerprint entry — so `build A; build B; build A` reports
+    task A `Fresh` while the rlib on disk was compiled from task B's source.
+    Cargo hashes relative paths by design (`cargo/core/compiler/fingerprint`),
+    which makes N git worktrees of one repo the maximal-collision case, with
+    source mtime as the only discriminator. A harness whose sole product is a
+    hash-bound verdict would then attest "checks passed for diff A" over a
+    binary built from diff B.
+
+    The workspace-wide flock (`acquire_cargo_lane`, shared with
+    `scripts/agent-resource-run`) does NOT cover this: it serialises concurrent
+    Cargo processes, and the defect above is sequential.
+
+    Two repo-specific amplifiers, both still present:
+      * `src-tauri/Cargo.toml` takes a PATH dependency on
+        `../../murmur-server/crates/murmur-protocol` while `cli.py` gives every
+        task its own pinned `murmur-server` worktree — same name, same version,
+        same relative path, different content per task, on the E2EE wire crate.
+      * `src-tauri/build.rs::stage_brain_sidecar` reads `CARGO_TARGET_DIR` and
+        copies whatever `murmur-brain` it finds into the gitignored
+        `src-tauri/binaries/murmur-brain`, invisible to the exact-diff snapshot.
+
+    The supported way to share compile work is a content-addressed cache
+    (sccache as `RUSTC_WRAPPER`) restored into a PRIVATE target dir. `tmp` also
+    stays per-task. `v2_selftest.py::build_root_isolation_cases` pins this.
+    """
+
     root = task_dir / "runtime" / "checks"
     paths = {
         "root": root,
