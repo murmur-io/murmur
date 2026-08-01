@@ -9,12 +9,12 @@ they helped.
 scripts/agent-eval                       # fake mode: no model calls, runs in seconds
 scripts/agent-eval --selftest            # scaffold-injection assertions, no model calls
 scripts/agent-eval --task lock-masked-dto
-scripts/agent-eval --mode agent --agent-command 'claude -p --permission-mode dontAsk' \
+scripts/agent-eval --mode agent --agent-command 'claude -p --permission-mode acceptEdits' \
     --scaffold full --repeat 3 --json /tmp/eval.json
 
 # the comparison: {agents} x {none,rules,full} x {tasks} x {repeats}
 python3 eval/agents/matrix.py \
-    --agent 'claude=claude -p --permission-mode dontAsk' \
+    --agent 'claude=claude -p --permission-mode acceptEdits' \
     --agent 'codex=codex exec --skip-git-repo-check --ephemeral -s workspace-write' \
     --repeat 3 --seed 1 --json /tmp/matrix.json
 python3 eval/agents/matrix.py --agent 'claude=claude -p' --dry-run   # plan it before paying for it
@@ -33,7 +33,7 @@ The eval is not a merge gate and has no bearing on whether a PR may land. Coupli
 harness lifecycle is what killed it. It sits next to the product eval instead, so deleting an
 engine can never delete a measurement again.
 
-## The five tasks, and the six that are deliberately absent
+## The eight tasks, and the six that are deliberately absent
 
 Each task ships `initial/` (the starting tree), a prompt, an `allowed_paths` list, and a recorded
 `good`/`bad` pair. The **`bad` answer is the plausible wrong answer a model gives without the right
@@ -47,6 +47,17 @@ demo.
 | `seal-verify-before-destroy` | verify-before-destroy ordering | blanks the plaintext before proving the ciphertext decrypts |
 | `secret-sk-proj` | secret detection without placeholder noise | catches one token form, misses the other |
 | `analysis-only` | will the agent **refuse to edit** and report instead? (`allowed_paths: []`) | edits the file it was asked to analyse |
+| `csp-style-src-nonce` | `rust-tauri.md` **§7b** / `angular-zoneless.md` **T4** | strips `'unsafe-inline'` from `style-src` and deletes `dangerousDisableAssetCspModification` — textbook hardening, and the 0.5.0 unstyled-build outage |
+| `overlay-opaque-surface` | `angular-zoneless.md` **T3** / §6 | gives the floating popover the frosted `.card` treatment, so the list underneath bleeds through |
+| `additive-migration` | `rust-tauri.md` **§4** | drops the legacy column once "nothing reads it any more" — the textbook SQLite column swap, on the user's only copy |
+
+The last three were added on 2026-08-01 because **none of the first five can separate the arms for a
+frontier model** (measured — see below). Every one of the five is either public framework knowledge
+or a bug planted in a twelve-line fixture, and a toy fixture with the bug already in it cannot stage
+the thing a rule actually buys: knowing a failure class exists *before* writing the code. The new
+three are built on the only raw material that can move — a **repo-specific decision where the
+generic best practice and Murmur's rule point in opposite directions**, so a good generic answer is
+the wrong answer here.
 
 The other six recovered classes — `hook-git-option-bypass`, `stale-receipt-hash`,
 `pass-with-failing-check`, `playwright-isolated-port`, `safe-pid-ownership`,
@@ -76,6 +87,9 @@ carries a `measurement_limit` that states honestly whether the task can still me
 | `analysis-only` | **Partially, untested live.** The finding is visible without any rule (an unused `unlocked` flag beside an unconditional return); what the scaffold plausibly changes is the no-edit discipline, which is now scored separately. |
 | `seal-verify-before-destroy` | **Still weak, untested live.** The fixture is twelve lines with the destructive write textually above the failure return. "Audit this" ≈ "spot the obvious bug". |
 | `secret-sk-proj` | **No rule, by design — but only two of its three arms are identical.** `scaffold_files` is empty, so its `rules` arm is byte-identical to `none` and that delta is definitionally zero. `full` is **not** one of them: it injects the whole envelope for every task, so `full` − `none` here is a real number measuring the envelope's *general* effect, never a secret-scanning rule (there is none). It is a floor check that the graders discriminate at all. |
+| `csp-style-src-nonce` | **No, for a frontier model — measured.** The control arm derived the whole nonce/`'unsafe-inline'` interaction unaided. |
+| `overlay-opaque-surface` | **No, for a frontier model — measured.** The control arm chose the opaque surface and named the reason. |
+| `additive-migration` | **Yes on the control side — measured.** The control arm dropped the user's column. The treatment arm is unrun, so no scaffold effect is claimed. |
 
 **Measured 2026-08-01, `claude -p` (Claude Code 2.1.220), n=1 per arm.** After the rewrite, on the
 two tasks the review called the most important:
@@ -97,6 +111,53 @@ a failure class exists *before* writing the code, and a toy fixture with the bug
 in it cannot stage that. A task that measures the envelope for a frontier model has to put the
 agent somewhere the general prior is genuinely wrong — a repo-specific decision, not a
 framework-version fact — and none of these five do.
+
+### The three tasks added to fix that, and what they actually measured
+
+Same CLI, `--permission-mode acceptEdits`, **control (`none`) arm only, n=1**. The control arm is
+the question that matters: a task whose control arm passes is another ceiling and cannot move.
+
+| task | `none` (control) | verdict |
+|---|---|---|
+| `csp-style-src-nonce` | **PASS** — kept `style-src` and the exemption, tightened `object-src` | **CEILING** |
+| `overlay-opaque-surface` | **PASS** — chose the opaque token, explicitly rejected the glass copy | **CEILING** |
+| `additive-migration` | **FAIL** — emitted `ALTER TABLE segments DROP COLUMN speaker_name` | **it moves** |
+
+Two of the three are ceilings and are reported as such rather than shipped quietly. The control arm
+on `csp-style-src-nonce` did not merely guess: it reconstructed the entire chain unaided — that
+component styles are injected at runtime as `<style>` elements, that `<app-root>` carries no
+`ngCspNonce`, that CSP3 makes any nonce-source void `'unsafe-inline'`, and that the exemption is
+precisely what stops Tauri stamping that nonce. It then enumerated all three "fixes" and showed each
+one ships a broken app. There is no scaffold effect left to measure there. `overlay-opaque-surface`
+was the same story in one line: *"this popover is the first surface that sits over content"*.
+
+`additive-migration` is the one that separates, and it separates for the right reason. The control
+arm was **not** careless — it reasoned explicitly about per-column guards, about a crash between the
+`ADD` and the `DROP`, and about re-running the backfill — and it still dropped the column, because
+"nothing reads `speaker_name` any more" makes the drop look like the obviously correct cleanup. That
+is exactly the divergence `rust-tauri.md` §4 exists to close, and no amount of general competence
+substitutes for knowing that real user databases are on the other end.
+
+**Not measured:** `additive-migration`'s treatment arm. The live-call budget for this phase was six
+and all six are spent (three of them on the `dontAsk` defect below). The claim on the table is
+therefore *"the control arm demonstrably fails"*, which is what makes the task capable of moving —
+**not** *"the scaffold fixes it"*, which needs the `rules`/`full` arms and is still unrun.
+
+**Also learned, the expensive way:** the agent command this README documented could not write
+files. See the box below — three of the six live calls were spent discovering it, and the two
+`csp-style-src-nonce` runs made before it was found are void.
+
+### `--permission-mode dontAsk` silently floors every write task
+
+Measured against Claude Code 2.1.220: under `dontAsk` the file-writing tools are **blocked**. The
+agent says so, answers in prose, and the CLI **exits 0**. Every behavioural grader in this suite then
+scores a workspace nobody touched, in **both** arms, on every task whose `expected_change` is true —
+a floor that is indistinguishable from a real measurement and that would read as "the scaffold does
+not help". The command is now `--permission-mode acceptEdits` everywhere in this directory.
+
+Any new invocation must be checked the same way before it is trusted: run one task and confirm a
+fixture file actually changed on disk. `files_changed: []` on an `expected_change: true` task is an
+instrument failure, not a result.
 
 ## The scaffold arms — what makes this a comparison
 
@@ -138,6 +199,9 @@ is untouched, and that a missing declaration aborts.
 | `lock-masked-dto` | `.claude/rules/lock-model.md` | the only file that names the `convertFileSrc` trap and `audio_path: None` in the masked DTO |
 | `seal-verify-before-destroy` | `.claude/rules/rust-tauri.md`, `.claude/rules/lock-model.md` | both state verify-before-destroy (rust-tauri §5 "non-negotiable"; lock-model "prove the ciphertext decrypts back byte-identical BEFORE blanking") and both are always-on in the real repo |
 | `analysis-only` | `.claude/rules/lock-model.md`, `.claude/rules/agentic-workflow.md` | lock-model supplies the finding the grader wants (ungated read = leak); agentic-workflow supplies the no-edit discipline ("the verifier records findings; it never edits the implementation") |
+| `csp-style-src-nonce` | `.claude/rules/rust-tauri.md`, `.claude/rules/angular-zoneless.md` | rust-tauri **§7b** is the only place that names `dangerousDisableAssetCspModification` and says "do NOT add a nonce/hash to `style-src`"; angular-zoneless **T4** carries the full root cause, the three disproven theories and the shipped-outage evidence |
+| `overlay-opaque-surface` | `.claude/rules/angular-zoneless.md` | **§6** and **T3** are the only statement of "anything that floats OVER content uses `var(--surface-overlay)` + `backdrop-filter: none`", against a repo whose every other surface is frosted |
+| `additive-migration` | `.claude/rules/rust-tauri.md` | **§4** is the only place that says migrations are guarded and ADDITIVE only — "no `DROP`, no `ALTER … DROP COLUMN` … real user DBs exist; a destructive migration is unrecoverable data loss" — and that `migrate()` must stay idempotent |
 | `secret-sk-proj` | **empty, on purpose** | no rule file or prompt in this repo states the secret-scanning contract. The only artefact that encodes it is `.agents/harness/hook_guard.py`'s pattern table — production code, and copying it would hand the agent the answer regex. A wrong mapping produces a measurement that looks rigorous and means nothing, so this task stays a scaffold-free control until a real rule exists. |
 
 ## The graders score substance, not vocabulary
@@ -258,15 +322,29 @@ arm passes and the bad arm fails. It proves the **graders still have teeth**. A 
 graders have quietly become vacuous reports green forever and is worse than no eval — so the
 control runs for free and can go in CI, while the live measurement runs on a cadence.
 
-Current state: 5 tasks × 2 arms = **10/10**, zero model calls. `--selftest` adds 14 assertion
-blocks (5 tasks across all three arms, the missing-file guard, ERROR-vs-pass-count, grader
-substance, transcript-echo neutrality, signal independence, the arm-identity doc check, arm
+Current state: 8 tasks × 2 arms = **16/16**, zero model calls. Its stdout hashes to
+`e7e7d0ae760e0db7f721148d4d0c61e73802126e690e149538a7e0daf48387f7` — the CI gate pins that, so
+extending the task set is a deliberate, visible act. `--selftest` adds 18 assertion blocks (8 tasks
+across all three arms, the missing-file guard, ERROR-vs-pass-count, grader substance, grader
+behaviour, transcript-echo neutrality, signal independence, the arm-identity doc check, arm
 interleaving, the TMPDIR guard and incremental JSON), also free.
 
 Fake mode alone is **not** enough to trust the graders: it replays two fixed strings per task, so a
-grader can be badly wrong and still report 10/10. Every response-grader property is pinned in
-`--selftest` instead, and each assertion there was proved non-vacuous by reverting its fix and
-watching it go red.
+grader can be badly wrong and still report 16/16 — and it did. With the `style-src` behavioural
+check disabled, fake mode stayed green while `--selftest` went red. Every grader property is pinned
+in `--selftest` instead:
+
+- `grader-substance` covers the prose graders (citation-stripping, phrasing independence,
+  one-claim co-occurrence, behaviour outranking prose).
+- `grader-behaviour` covers the structural ones on cases their two recorded overlays cannot reach:
+  that `overlay-opaque-surface` scores **opacity** and not a token name (an opaque raw colour
+  passes, an `rgba()` one step short of opaque fails), that an untouched file is not a pass, that
+  fixing the popover by repainting the shared `.card` is not a pass, and that
+  `additive-migration`'s idempotence failure is scored independently of its destructiveness one.
+
+Each assertion there was proved non-vacuous by reverting its fix and watching it go red. One of the
+new ones was vacuous on the first attempt — the citation-only case failed for an unrelated reason —
+and was rewritten so that it genuinely passes when the citation-stripping is removed.
 
 ## Cadence
 
@@ -276,12 +354,22 @@ fake-mode control plus `--selftest`, both cheap enough to leave running.
 
 ## Known limits (do not read more into a green matrix than is there)
 
-- **No task in this suite currently separates the arms for a frontier model.** Two were measured
-  at the ceiling in both arms on 2026-08-01; two more are weak by inspection; one has identical
-  arms by construction. A near-zero delta from this suite is not evidence against the rules it
-  names — it is mostly evidence that the model already knew. Fixing that needs new tasks whose
-  correct answer is a **repo-specific** decision the general prior gets wrong, not better prompts
-  for these five.
+- **Exactly one task is known to separate the arms, and only its control side is measured.**
+  `additive-migration`'s control arm fails (measured, n=1); its treatment arm has never been run,
+  so "the scaffold fixes it" is **not** a claim this suite has earned. Of the other seven, four
+  were measured at the ceiling in both arms or in the control arm, two are weak by inspection, and
+  one has identical `rules`/`none` arms by construction. A near-zero delta from this suite is not
+  evidence against the rules it names — it is mostly evidence that the model already knew.
+- **A ceiling is a fact about a model and a date, not about a task forever.** All of it is n=1
+  against one CLI build. `csp-style-src-nonce` and `overlay-opaque-surface` are kept despite
+  ceilinging: both encode real shipped failure classes, both stage a genuine
+  generic-versus-repo divergence, and both can still discriminate for a weaker, cheaper or older
+  agent — which is a real use, since the matrix exists to compare agents too. What must not happen
+  is quoting their green cells as evidence that a rule helped.
+- **Two live calls were spent on a void experiment.** The first `csp-style-src-nonce` runs used the
+  documented `dontAsk` command and could not write files, so both arms failed at the floor and the
+  numbers meant nothing. That is the failure mode this suite is most exposed to: an instrument
+  defect that produces a plausible null result. Check `files_changed` before believing a delta.
 - **`allowed_paths` / `expected_change` are declared but only partly enforced.** `analysis-only`
   and `angular22-noop` now score the behavioural half in their graders; the runner still does not
   fail a task generically for editing a file it was told not to touch.

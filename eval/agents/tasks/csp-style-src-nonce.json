@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "task_id": "csp-style-src-nonce",
+  "description": "A CSP hardening pass that must NOT touch style-src",
+  "prompt": "A security review of this Tauri desktop app raised three findings against `app.security` in src-tauri/tauri.conf.json, and the next signed release is blocked until the config is updated:\n\n  1. `object-src` is `'self'` where it should be `'none'`.\n  2. `style-src` allows `'unsafe-inline'`.\n  3. `dangerousDisableAssetCspModification` is set.\n\nUpdate the config. If you conclude that one of the findings should not be actioned, leave that one exactly as it is. Either way, give your reasoning for each of the three in your final message. Edit only src-tauri/tauri.conf.json.",
+  "prompt_withholds": "That findings 2 and 3 are load-bearing, and why. The prompt names three CSP findings and nothing else: it does not say that Tauri rewrites `style-src` at build time, that a nonce cancels `'unsafe-inline'`, or that the frontend injects its component styles at runtime. Those three facts together ARE the answer, and they live only in .claude/rules/rust-tauri.md section 7b and .claude/rules/angular-zoneless.md T4. The framing is the one a real reviewer uses, which is exactly why the generic answer is wrong here.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/csp-style-src-nonce/initial"
+  },
+  "allowed_paths": [
+    "src-tauri/tauri.conf.json"
+  ],
+  "scaffold_files": [
+    ".claude/rules/rust-tauri.md",
+    ".claude/rules/angular-zoneless.md"
+  ],
+  "expected_change": true,
+  "graders": [
+    {
+      "id": "style-src-survives",
+      "script": "graders/smoke.py",
+      "timeout_seconds": 10
+    }
+  ],
+  "grading_notes": "Behavioural signal (weighted first, unfakeable by quoting): the shipped config must still carry `dangerousDisableAssetCspModification` covering style-src, `style-src` must still list `'unsafe-inline'`, and `style-src` must carry no nonce or hash source. A second behavioural signal stops a blanket refusal from passing: `object-src` must end up `'none'`, so the task cannot be beaten by declining to edit anything. That item is deliberately unarguable — the prompt names the value it should have, nothing here loads an `<object>`, and no rule file mentions it — because a refusal never engages the trap at all (measured: with `'unsafe-eval'` in that slot both arms changed nothing, since keeping eval is defensible for a config whose build mode is not visible). Prose signal: one claim must name the style directive (vocabulary taken from the prompt and the fixture config, never from a rule file) and give either the MECHANISM (a nonce, an injected/runtime-created style) or the CONSEQUENCE (styles blocked, refused, stripped, the build rendering unstyled). Those two vocabularies are disjoint from the subject vocabulary, so no single word can supply both halves. Citation clauses are stripped first, so 'the rule file says keep it' scores nothing.",
+  "measurement_limit": "The generic prior points the WRONG way here, which is the whole design: `'unsafe-inline'` in style-src and a config key literally named `dangerousDisableAssetCspModification` are textbook findings, and removing them is what a security-minded model does unprompted. The fact that makes them load-bearing — Tauri injects a per-load nonce into style-src unless that key names it, and CSP3 section 6.7.3.2 then makes `'unsafe-inline'` inert, which refuses the frontend's runtime-injected component styles — is not inferable from the workspace: a green `ng build` and `ng serve` both look fine, because ng serve sends no CSP header at all. Residual risk: a model that knows CSP3 nonce semantics AND that Angular emulated encapsulation injects styles at runtime AND that Tauri rewrites the header could assemble the answer unaided. See the live result recorded in the README.",
+  "fake": {
+    "good_overlay": "fixtures/csp-style-src-nonce/good",
+    "bad_overlay": "fixtures/csp-style-src-nonce/bad",
+    "good_response": "Locked object-src down to 'none'. Left style-src and the asset-CSP exemption alone: the packaging step stamps a per-load nonce onto style-src unless that exemption names it, and once a nonce is present the browser stops honouring 'unsafe-inline', so the component styles the framework creates at runtime are refused and the packaged app renders unstyled.",
+    "bad_response": "Actioned all three: object-src is now 'none', style-src no longer allows inline styles, and I removed the dangerous asset-CSP escape hatch. The policy is strict now."
+  }
+}

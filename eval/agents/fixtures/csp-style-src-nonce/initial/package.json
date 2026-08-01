@@ -1,0 +1,25 @@
+{
+  "name": "murmur",
+  "version": "1.1.0",
+  "private": true,
+  "scripts": {
+    "start": "ng serve --port 1420",
+    "build": "ng build --configuration production",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@angular/common": "^22.0.5",
+    "@angular/compiler": "^22.0.5",
+    "@angular/core": "^22.0.5",
+    "@angular/platform-browser": "^22.0.5",
+    "@angular/router": "^22.0.5",
+    "@tauri-apps/api": "^2.9.0",
+    "rxjs": "~7.8.2"
+  },
+  "devDependencies": {
+    "@angular/build": "^22.0.4",
+    "@angular/cli": "^22.0.4",
+    "@tauri-apps/cli": "^2.9.1",
+    "typescript": "~5.9.3"
+  }
+}

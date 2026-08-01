@@ -1,0 +1,22 @@
+:host {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 40;
+  display: block;
+}
+
+.quick-actions {
+  min-width: 240px;
+  max-width: 320px;
+  padding: var(--space-3);
+}
+
+.quick-actions-title {
+  margin: 0 0 var(--space-2);
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}

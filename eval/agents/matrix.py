@@ -13,16 +13,23 @@ a bare PASS/FAIL — models are non-deterministic and a single run cannot distin
 luck.
 
     python3 eval/agents/matrix.py \\
-        --agent 'claude=claude -p --permission-mode dontAsk' \\
+        --agent 'claude=claude -p --permission-mode acceptEdits' \\
         --agent 'codex=codex exec --skip-git-repo-check --ephemeral -s workspace-write' \\
         --repeat 3 --json eval/agents/results/matrix.json
 
 Invocation flags come from `.agents/harness/runtime.py::invoke_model`, which is the authority on
 how each vendor is driven headlessly — but this runner deliberately keeps its own invocation
 simple. The harness reviewer profile is TOOL-FREE by design; an eval agent must be able to read and
-edit files, so only the non-interactivity carries over: `-p/--print` and `--permission-mode dontAsk`
-for Claude, `exec --ephemeral --skip-git-repo-check` (plus a writable sandbox) for Codex. The
-runner additionally closes stdin, so a CLI that tries to ask a question dies instead of hanging.
+edit files, so only the non-interactivity carries over: `-p/--print` and `--permission-mode
+acceptEdits` for Claude, `exec --ephemeral --skip-git-repo-check` (plus a writable sandbox) for
+Codex. The runner additionally closes stdin, so a CLI that tries to ask a question dies instead
+of hanging.
+
+`acceptEdits`, NOT `dontAsk` — measured 2026-08-01 against Claude Code 2.1.220. Under `dontAsk`
+the file-writing tools are blocked: the agent answers in prose, the CLI exits 0, and every
+behavioural grader scores an untouched workspace. That floors both arms of every write task and
+is indistinguishable from a real result. Verify any new invocation by running one task and
+confirming a fixture file actually changed.
 
 `--dry-run` prints the planned cross-product and exits without spending a single model call. Use it
 before every real matrix; live calls are the expensive part of this suite.
@@ -187,7 +194,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--agent", action="append", required=True, metavar="LABEL=COMMAND",
-                        help="repeatable, e.g. --agent 'claude=claude -p --permission-mode dontAsk'")
+                        help="repeatable, e.g. --agent 'claude=claude -p --permission-mode acceptEdits'")
     parser.add_argument("--scaffold", action="append", choices=runner.SCAFFOLD_ARMS,
                         help="repeatable; default runs every arm (none, rules, full)")
     parser.add_argument("--task", action="append", help="run only this task id (repeatable)")

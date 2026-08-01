@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "task_id": "overlay-opaque-surface",
+  "description": "A floating popover gets an opaque surface, not the app's frosted one",
+  "prompt": "src/app/design-system/quick-actions/ is a new popover for the notes toolbar. The button toggles it open, and while it is open it is anchored under the button and sits over the notes list. Its component and template are finished; its stylesheet has the positioning and the spacing and nothing else. Give the popover its surface, so it looks like it belongs in this app. Edit only src/app/design-system/quick-actions/quick-actions.component.scss.",
+  "prompt_withholds": "The rule for FLOATING surfaces. The prompt says where the popover sits (over the notes list) because that is the situation, but it never says that a surface which floats over content must be opaque with the frosted treatment switched off, nor why. That rule lives only in .claude/rules/angular-zoneless.md (section 6 and T3). The word 'opaque' and the words 'bleed'/'translucent' are deliberately absent, and no symptom is described — a described symptom would be the finding.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/overlay-opaque-surface/initial"
+  },
+  "allowed_paths": [
+    "src/app/design-system/quick-actions/quick-actions.component.scss"
+  ],
+  "scaffold_files": [
+    ".claude/rules/angular-zoneless.md"
+  ],
+  "expected_change": true,
+  "graders": [
+    {
+      "id": "floating-surface-opaque",
+      "script": "graders/smoke.py",
+      "timeout_seconds": 10
+    }
+  ],
+  "grading_notes": "Purely structural over the delivered stylesheet; no prose is scored, so no phrasing or vocabulary can move the verdict. The popover must declare a background at all (an untouched file fails), that background must resolve to an opaque source (a fixture token that paints opaque, or an opaque literal), it must NOT resolve to a translucent token or an rgba/8-digit-hex with alpha below 1, it must carry no backdrop-filter blur, and it must not inherit the frosted treatment by extending or wearing the shared .card class. Editing anything outside the stylesheet fails: repainting the shared .card would fix this popover by breaking every in-flow panel. Border and shadow are reported in details but deliberately NOT pass conditions — the property under measurement is opacity, and failing an otherwise-correct answer for its elevation token would add noise to both arms. There is no runtime here, so 'structural' is the strongest this can be: CSS is the deliverable.",
+  "measurement_limit": "The fixture pushes the WRONG way on purpose, which is what makes this measurable. Everything already in it is frosted: the shared .card, the in-flow note panel, the toolbar the popover hangs off. 'Match the app' and 'reuse the shared card' — both ordinary good instincts — land on translucent-plus-blur, and no general knowledge yields Murmur's rule that a surface floating OVER content must be opaque with backdrop-filter off. The token file offers three plausible surfaces and only one is right. Residual risk: `--surface-overlay` is named after the thing being built, so a model could pick it by name association without knowing why; the no-blur half of the check is the part that name association does not supply. See the live result recorded in the README.",
+  "fake": {
+    "good_overlay": "fixtures/overlay-opaque-surface/good",
+    "bad_overlay": "fixtures/overlay-opaque-surface/bad",
+    "good_response": "Gave the popover an opaque surface with the frosted treatment switched off, plus a stronger border and the large elevation shadow.",
+    "bad_response": "Matched the popover to the shared card: the same frosted fill, glass border and backdrop blur as the rest of the app."
+  }
+}
