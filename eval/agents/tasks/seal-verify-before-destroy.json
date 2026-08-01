@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "task_id": "seal-verify-before-destroy",
+  "description": "A failed seal verification never destroys the only plaintext copy",
+  "prompt": "Fix src/seal.rs. seal() must create and verify a byte-identical recoverable representation before clearing plaintext. A failed verification must leave the original plaintext byte-identical and readable for retry.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/seal-verify-before-destroy/initial"
+  },
+  "allowed_paths": ["src/seal.rs"],
+  "expected_change": true,
+  "graders": [
+    {
+      "id": "verify-before-destroy",
+      "script": "graders/smoke.py",
+      "timeout_seconds": 30
+    }
+  ],
+  "fake": {
+    "good_overlay": "fixtures/seal-verify-before-destroy/good",
+    "bad_overlay": "fixtures/seal-verify-before-destroy/bad",
+    "good_response": "Verification now succeeds before plaintext is cleared; failures preserve the original bytes.",
+    "bad_response": "The seal is written and plaintext is cleared before the verification result is checked."
+  }
+}

@@ -357,12 +357,22 @@ and NOT a hide-until-ready/`window.show()` timing bug. 0.4.0 "worked" only becau
 build masked the always-present CSP conflict.
 
 **How to diagnose this class fast (no full Tauri build):** (1) the RESIZE test — resize the broken
-window; if styles do NOT snap in, it's CSP-blocked, not a paint/timing bug. (2) Reproduce on the
-real engine: serve `dist/meetnotes/browser` and load it in Playwright **WebKit** with the
-`style-src` nonce added to a `Content-Security-Policy` header; check per-`<style>` `el.sheet === null`
-(blocked) and read the console for the CSP refusal. A green `ng build` / a Chromium check will NOT
-reproduce it — only WebKit + the real CSP does. Verify the actual fix in the REAL packaged WKWebView
-build (notarized `.dmg`), never just `ng serve`.
+window; if styles do NOT snap in, it's CSP-blocked, not a paint/timing bug. (2) Reproduce it with
+the real header: serve the app and inject a `Content-Security-Policy` response header carrying a
+nonce in `style-src`, then check per-`<style>` `el.sheet === null` (blocked) and read the console
+for the CSP refusal. **This is now a standing regression test — `e2e/render/csp-style-src.spec.ts`
+— which also carries a control asserting the blocking really happens, so the guard cannot go
+vacuous.** A green `ng build` does not reproduce it. Verify the actual fix in the REAL packaged
+WKWebView build (notarized `.dmg`), never just `ng serve`.
+
+**CORRECTION (2026-08-01, measured).** This rule used to say "a Chromium check will NOT reproduce
+it — only WebKit + the real CSP does." **That is false.** The regression spec above passes 4/4
+across **both** Playwright projects: Chromium blocks the un-nonced runtime `<style>` exactly as
+WebKit does. The rule is spec-mandated — CSP3 §6.7.3.2 step 2, "if source list contains a
+nonce-source … return No" — so every conforming engine enforces it. The discriminator was never
+the engine; it was the **header**. `ng serve` sends no `Content-Security-Policy` at all, which is
+the only reason development never reproduced it. Do not go hunting for a WebKit-specific quirk —
+supply the header and any engine will show you the bug.
 
 ---
 
