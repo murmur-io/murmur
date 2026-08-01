@@ -22,8 +22,8 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
-### [2026-07-02 .codex audit] Setup-audit fan-out
-- **Pattern:** the `.codex` audit surfaced the phantom `block-bash` hook (docs-drift in the
+### [2026-07-02 .claude audit] Setup-audit fan-out
+- **Pattern:** the `.claude` audit surfaced the phantom `block-bash` hook (docs-drift in the
   trust-code-not-docs layer) and thousands-of-lines file:line drift.
 - **Caught by:** operator (this run) + cross-check across two independent code audits.
 - **Lesson:** for meta/setup research, verify claimed artifacts EXIST (grep the file), not just that

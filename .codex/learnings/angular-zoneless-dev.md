@@ -122,5 +122,5 @@
 ### [2026-07-02 seed] Distilled from angular-zoneless.md traps T1–T4
 - **Pattern:** the four Murmur-specific FE traps + the signals/IPC/template hard rules.
 - **Caught by:** operator (seeding the loop).
-- **Lesson:** the bullets above; full detail in `.codex/rules/angular-zoneless.md`.
+- **Lesson:** the bullets above; full detail in `.claude/rules/angular-zoneless.md`.
 - **Status:** distilled (2026-07-02)

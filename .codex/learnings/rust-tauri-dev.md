@@ -34,9 +34,49 @@
 - **Test loop = `cargo test --lib` from `src-tauri/`.** NEVER `cargo clippy --all-targets` in the
   loop (openssl/sqlcipher profile thrash → timeout; also blocked by `block-bash.sh`). Full gate =
   `scripts/ci.sh`, run ONCE at the end. Let a slow cold ML build finish; don't bail.
+- **ONE `cargo` process machine-wide, ever — concurrency FREEZES the Mac.** The app test binary
+  statically links the ML tree (candle/whisper/onnx); several concurrent `cargo test --lib` links
+  (multiple agents + your own runs) pin the macOS memory compressor → the whole UI freezes (swap
+  stays 0 — it's compression). Iterate with TARGETED filters (`cargo test --lib links` = full
+  compile + subset run, catches build errors, low RAM), NEVER the full 1900-test suite locally; let
+  CI run the full gate. `CARGO_BUILD_JOBS=2 … -j2`. Root cause + the `[profile.dev.package."*"]
+  debug=false` fix: `docs/research/2026-07-18-build-ram-freeze.md`.
+- **`cargo clippy --lib -- -D warnings` before EVERY push — the cheap CI-parity gate.** Link-free
+  (typecheck only → low RAM, ~10-15s warm). Catches the `dead_code` class that BOTH `cargo test
+  --lib` and `cargo clippy --lib --tests` mask: a `const`/`fn` used ONLY in a `#[cfg(test)]` module
+  is "never used" in the lib-only build CI runs, but the test build sees the test using it and stays
+  green (this ate a CI cycle — PR-2's `MCP_DEFAULT_WINDOW_CHARS`, whose feature was ALSO inert:
+  the dead-code error was the real "you wired it wrong" signal).
+- **Grep the diff for post-1.77 std items BEFORE pushing** (RAM-free): `git diff origin/murmur --
+  src-tauri | grep '^+' | grep -oE 'is_none_or|LazyLock|LazyCell|split_at_checked|take_if|next_multiple_of'`.
+  MSRV 1.77; `ci.sh` clippy `-D warnings` implies `-D clippy::incompatible_msrv` (cargo test does
+  not catch it). `is_none_or`(1.82)→`map_or(true, …)`; lazy statics→the `OnceLock` accessor idiom.
+- **A guard held across a callee that re-takes it = self-deadlock (invisible to green tests).**
+  `accept_link_inner` held the non-reentrant `lifecycle_guard` across `materialize_accepted_link →
+  update_note_inner` (which re-acquires it) → a valid Accept hung forever; every accept TEST hit
+  only refusal paths, none a SUCCESSFUL accept, so cargo test stayed green. When you take
+  `lifecycle_guard`, SCOPE it in a `{ }` block around only the gate+db-write and DROP it before any
+  materialize/note-write callee (the `link_items_inner`/`unlink_items_inner` idiom); and add a test
+  that drives the SUCCESS path, not just the error paths.
 
 ## Run journal
 <!-- Append-only, newest first. -->
+
+### [2026-07-20 documents as link targets — PR #415] `documents.updated_at` is NULL → recency ORDER BY silently degrades
+- **Pattern:** added a documents leg to `list_link_candidates_visible` mirroring the notes leg,
+  incl. `ORDER BY d.updated_at DESC, d.id ASC`. But `insert_document` only writes `created_at`
+  (columns: `id,folder_id,name,text,kind,text_blob,created_at`) — it NEVER sets `updated_at`, so for
+  every real ingested document `updated_at IS NULL` and the empty-prefix "recency browse" collapsed to
+  the `d.id ASC` (UUID) tiebreaker. The notes leg is fine because `insert_note` sets
+  `updated_at = created_at`. Green tests hid it — each test query returned ≤1 doc, so intra-leg order
+  never mattered.
+- **Caught by:** adversarial-verifier (LOW finding, `.claude/tmp/link-documents-related/adversarial-verify.json`).
+- **Lesson:** documents and notes share the `documents` table but do NOT share column-population
+  invariants — a `document` row can have `NULL` `updated_at`/`title` where a `note` row never does.
+  Any ORDER BY / COALESCE / filter you copy from the notes leg to a documents leg must assume those
+  columns are NULL: order documents by `COALESCE(d.updated_at, d.created_at) DESC`, title by
+  `COALESCE(NULLIF(TRIM(d.title),''), d.name)`. A ≤1-row-per-query test set can't catch an intra-leg
+  ordering bug — seed 2+ same-leg rows with distinct timestamps when the ordering is load-bearing.
 
 ### [2026-07-05 password-links + Touch ID — #195/#196] cross-lang crypto salt + biometric MK cache
 - **Pattern:** (a) Password link-shares never decrypted — the Argon2id salt had NO protocol field, so
@@ -126,5 +166,41 @@
 ### [2026-07-02 seed] Distilled from rust-tauri.md + lock-model.md
 - **Pattern:** errors/commands/SQLCipher/additive-migrations/seal-verify/gate-reads/crash-safe-FFI.
 - **Caught by:** operator (seeding the loop).
-- **Lesson:** the bullets above; full detail in `.codex/rules/rust-tauri.md` + `lock-model.md`.
+- **Lesson:** the bullets above; full detail in `.claude/rules/rust-tauri.md` + `lock-model.md`.
 - **Status:** distilled (2026-07-02)
+
+### [2026-07-09 brain-p0-hotfixes] Scope resource bounds to the surface that needs them
+- **Pattern:** a wall-clock timeout added to `MistralReasoner` for the LIVE path was wired at the lowest seam (`reason_with_opts`) and silently applied to EVERY local generation — FullyLocal note-gen (legit 30–90s) and the Ask floor (200k-char prefill) would have started failing `Unavailable`, and first-gen Metal shader compile (CLT-only Macs, `MISTRALRS_METAL_PRECOMPILE=0`) could always eat the first call.
+- **Caught by:** adversarial-verifier (`.claude/tmp/brain-p0-hotfixes/adversarial-verify.json`, MAJOR) — builder's tests were green; the regression was on paths the new tests didn't cover.
+- **Lesson:** carry per-call bounds IN the options struct (`GenOptions.timeout: Option<Duration>`, default None = old behavior; presets opt in), never as a blanket const at the lowest layer. Before bounding a shared seam, enumerate every caller class (live / notes / floor / background extraction) and ask which of them legitimately exceeds the bound.
+- **Status:** journal
+
+### [2026-07-10 brain-l1-retrieval] MSRV-gated std items: no `LazyLock` — use the repo's `OnceLock` accessor pattern
+- **Pattern:** new module used `std::sync::LazyLock` for static regexes; `cargo test --lib` was green but the ci.sh clippy `-D warnings` stage failed with 36 MSRV errors (`LazyLock` stable since 1.80, crate MSRV 1.77).
+- **Caught by:** scripts/ci.sh clippy stage (and initially MASKED by piping ci.sh through `| tail` — the pipe's exit code hid the failure; always capture ci.sh exit directly).
+- **Lesson:** for lazy statics use the established repo pattern — `fn re_x() -> &'static Regex { static R: OnceLock<Regex> = OnceLock::new(); R.get_or_init(|| ...) }` (see redact.rs email_re). Check clippy.toml/Cargo.toml MSRV before reaching for newer std items.
+- **Status:** journal
+
+### [2026-07-10 brain-l2-memory] Derived artifacts EXPORTED OUTSIDE the DB need their own seal hooks
+- **Pattern:** memory rollups (LLM synthesis over facts) were written to `memory_rollups` AND exported as plaintext `.md` into the vault. Purge-on-seal covered the source facts but not the synthesis: "regenerates next pass" was false (weekly scopes never re-touched; entity scopes only on NEW facts — a seal removes facts and is invisible to that detector). Locking a folder left a plaintext paraphrase of its content in Obsidian forever.
+- **Caught by:** lock-security-reviewer + adversarial-verifier (both FAIL, independently reproduced end-to-end; builder's 1234 green tests never exercised seal-then-pass).
+- **Lesson:** any derived artifact that leaves the DB (vault export, cache file) must be (1) purged at EVERY seal path (rows in-tx, files at the command layer via recorded exported_path — same layering as sealed-note .md deletion, incl. screen-share relock + startup reconcile + delete_meeting), and (2) covered by a change-detector for regeneration (fact-set hash), never "new data arrived" heuristics — seals REMOVE data. Test shape: synthesize → export → seal → assert row AND file gone → later pass recreates nothing.
+- **Status:** journal
+
+### [2026-07-10 fix-lock-reseal] A doc comment promising future lifecycle behavior hid a CRITICAL loss bug — relock never re-seals
+- **Pattern:** `update_note_row`'s comment claimed "the seal blob is rebuilt on the next relock", but `seal_document` had exactly ONE call site reachable only from `lock_folder_inner`, which early-returns on an already-locked folder. Every write into a session-unlocked locked folder (notes editor autosave, re-summarize upsert, manual notes) left a STALE blob; relock then blanked the fresh plaintext against it — edits silently destroyed on screen-share auto-relock / "Lock all" / app exit. Three independent audit angles converged on it; the fix is seal-on-write (verify-before-destroy, fail-closed `AppError::Locked` when the session KEK is gone) at every write path into a locked folder, not re-seal-at-relock (the KEK is being wiped there).
+- **Caught by:** post-merge re-verification audit (lock-security × seal-purge-matrix × integration), NOT by any per-PR review — the hole sat at the seam BETWEEN #228's write paths and the pre-existing relock lifecycle, which no single-PR diff review could see.
+- **Lesson:** (1) never trust a comment that promises another code path will fix state up later — grep the call sites and prove reachability; (2) any WRITE path into a folder that can be `locked=1` needs the same seal discipline as the lock command itself (write = seal-on-write or refuse); (3) after a burst of concurrent PRs, run a whole-tree seam audit — per-PR gates compose, their blind spots don't.
+- **Status:** journal
+
+### [2026-07-12 brain-note-command-menu] A new action id silently absorbed by a `_ =>` catch-all — exhaustive-match a growing registry
+- **Pattern:** expanding the note-assistant from 3 to ~19 actions, `build_note_assist_prompt` used explicit arms per action + a `_ =>` catch-all that WAS the `spinoff_note` prompt. The newly-added `custom` (free-text "Ask Brain to edit…") had NO arm → fell through to `_ =>` → the user's instruction was silently dropped, the model drafted an unrelated new note, and because `note_assist_shape("custom") == "replace"`, Accept DESTRUCTIVELY overwrote the selection. `cargo test --lib` (1532) + `ng lint` + `ng build` were all green.
+- **Caught by:** adversarial-verifier (FAIL, RED-reproduced by calling `build_note_assist_prompt("custom", …)` and asserting the instruction was absent + the prompt was the spinoff one). The builder's own `..._weaves_instruction_and_variant` test was a FALSE-GREEN — its docstring claimed it covered `custom` but it only exercised `ask`, so it passed against the broken code.
+- **Lesson:** (1) when a `match` over a string/enum registry GROWS, never let a semantic action hide behind a catch-all — give the catch-all arm a NAMED guard (`"spinoff_note" =>`) and make the true default an explicit error or a safe no-op, so a forgotten new id fails loudly instead of masquerading as another action; (2) a test that names an action in its docstring MUST assert on THAT action's output (here: the instruction is present AND the prompt is NOT the spinoff one) — a happy-path assert on a sibling action binds nothing; (3) for a destructive-on-Accept `replace` action, the "wrong prompt" failure mode is silent data-loss, not just a bad suggestion — treat routing bugs on replace paths as loss bugs.
+- **Status:** journal
+
+### [2026-07-17 claude-code-hermetic-mcp] A "hermetic" subprocess LLM leaked via MCP — --disallowedTools is a DENYLIST that fails open
+- **Pattern:** the `claude_code` provider (default) spawned `claude -p ... --disallowedTools <10 built-in tools>` and claimed "hermetic, nothing leaves the Mac" (CLAUDE.md constraint #1). But `--disallowedTools` blocks only the named BUILT-IN tools — it does NOT cover MCP tools (`mcp__*`), and no `--strict-mcp-config` was passed. The `claude` CLI discovers MCP servers from FILES under `$HOME` (`~/.claude.json`, project `.mcp.json`), which `env_clear`/`harden_env` does not touch (they only strip env vars). So a user with ANY ambient MCP server registered in Claude Code (a self-referential `murmur` server at 127.0.0.1:8765, or Gmail/Drive/ClickUp/Slack) had every note-gen AND every `complete()` (Ask agentic loop, dossiers, briefs, auto-title, audit explanations, voice actions, memory/proactive) able to invoke those MCP tools, driven by meeting content on stdin — un-redacted, un-consented, un-ledgered egress that bypassed the WHOLE firewall (RedactingProvider + consent gate + egress ledger). Also a prompt-injection amplifier (anyone in a meeting can say words that steer the model to call an MCP tool) and the visible symptom: Ask hung on a `mcp__murmur__search_meetings` self-loop.
+- **Caught by:** a user hitting a broken Ask on a live test → a 3-agent parallel security audit → dual-verify. The adversarial verifier LIVE-probed the real CLI (v2.1.197): the OLD `--disallowedTools` shape returned ambient Murmur context ("kontekst Murmura załadowany"), the NEW shape did not — direct runtime proof.
+- **Lesson:** (1) when spawning an external LLM CLI for a "local/hermetic/nothing-leaves" provider, tool isolation must be an ALLOWLIST, not a denylist — pass `--allowedTools ""` (empty ⇒ no tool; fail-closed against FUTURE built-in tools too) AND `--strict-mcp-config` with no `--mcp-config` (⇒ zero ambient MCP servers). A denylist silently widens the moment the CLI ships a new built-in or the user adds an MCP server. (2) `env_clear` does NOT sandbox a subprocess's tool/MCP surface — MCP config is FILE-based under `$HOME`; the env and the tool surface are separate hardening axes. (3) route all spawns of the same binary through ONE builder seam (`build_claude_command`) and unit-test the exact args via `std::process::Command::get_args()` — drift-proof, so a future third spawn site can't re-open the hole. (4) LIVE-probe the real CLI when adding isolation flags: prove they don't ERROR the run (empty allowlist could have broken every note) AND that the old shape actually leaked. (5) env passthrough denylists (`NEVER_INHERIT_ENV`) should have a prefix catch-all (`MURMUR_*`) so a future secret var can't silently reach a cloud-bound child.
+- **Status:** journal
