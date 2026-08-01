@@ -1671,6 +1671,264 @@ def verdict_cases(test: Tests) -> None:
         "NEEDS_EVIDENCE",
     )
 
+    # Review authority: the generalist is advisory, the risk specialists still
+    # gate. `review_result_state` stays kind-agnostic above; only the
+    # aggregation call site filters by authority.
+    config = runtime.load_config()
+    green_check = {"id": "rust-lib", "evidence": {"passed": True, "outcome": "PASS"}}
+
+    def review(kind: str, result: Mapping[str, Any]) -> Dict[str, Any]:
+        return {"kind": kind, "vendor": "fake", "result": result}
+
+    test.equal(
+        "VERDICT advisory combined MAJOR does not forbid PASS",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", major), review("lock-security", base)],
+            config,
+        )[0],
+        "PASSED",
+    )
+    test.equal(
+        "VERDICT blocking specialist BLOCKER still forbids PASS",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", base), review("lock-security", blocker)],
+            config,
+        )[0],
+        "NEEDS_FIX",
+    )
+    test.equal(
+        "VERDICT advisory combined proof gap does not forbid PASS",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", gap), review("egress-security", base)],
+            config,
+        )[0],
+        "PASSED",
+    )
+    test.equal(
+        "VERDICT blocking specialist proof gap still forbids PASS",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", base), review("egress-security", gap)],
+            config,
+        )[0],
+        "NEEDS_EVIDENCE",
+    )
+    test.equal(
+        "VERDICT unknown review kind fails closed as blocking",
+        verifier.aggregate_verdict(
+            [green_check], [review("future-security", blocker)], config
+        )[0],
+        "NEEDS_FIX",
+    )
+    test.equal(
+        "VERDICT configured specialist authority is blocking",
+        [
+            verifier.review_authority(kind, config)
+            for kind in ("lock-security", "egress-security", "protocol-security")
+        ],
+        [verifier.BLOCKING_AUTHORITY] * 3,
+    )
+    test.equal(
+        "VERDICT combined authority is advisory",
+        verifier.review_authority("combined", config),
+        verifier.ADVISORY_AUTHORITY,
+    )
+    test.equal(
+        "VERDICT an authority-free config keeps every review blocking",
+        verifier.review_authority("combined", {}),
+        verifier.BLOCKING_AUTHORITY,
+    )
+    test.raises(
+        "VERDICT malformed review_authority is refused",
+        lambda: verifier.review_authority("combined", {"review_authority": []}),
+        "review_authority is malformed",
+    )
+    mixed = [review("combined", major), review("lock-security", blocker)]
+    test.equal(
+        "VERDICT advisory findings stay recorded in the receipt",
+        (
+            [
+                item["review"]
+                for item in verifier.aggregate_review_outcomes(mixed)["findings"]
+            ],
+            [
+                item["review"]
+                for item in verifier.advisory_findings(
+                    [green_check], mixed, config
+                )
+            ],
+        ),
+        (["combined", "lock-security"], ["combined"]),
+    )
+    test.equal(
+        "VERDICT an authority-free config projects no advisory finding",
+        verifier.advisory_findings([green_check], mixed, {}),
+        [],
+    )
+
+    # Demotion removes a gate; it must never remove the LAST one. A docs-only
+    # plan derives zero checks and only the generalist, so demoting it there
+    # would mint a PASS receipt on which nothing could have refused.
+    docs_checks, docs_reviews, docs_risks = verifier.derive_profile(
+        ["docs/architecture.md"], [], config, reviewer="codex"
+    )
+    test.equal(
+        "PROFILE a docs-only plan derives no check and only the generalist",
+        ([item["id"] for item in docs_checks], [item["kind"] for item in docs_reviews], docs_risks),
+        ([], ["combined"], []),
+    )
+    test.equal(
+        "VERDICT the sole reviewer of a check-free plan keeps its gate",
+        verifier.gating_review_kinds(docs_checks, docs_reviews, config),
+        ["combined"],
+    )
+    test.equal(
+        "VERDICT a check-free plan cannot pass over a generalist BLOCKER",
+        verifier.aggregate_verdict([], [review("combined", blocker)], config),
+        ("NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"),
+    )
+    test.equal(
+        "VERDICT a check-free plan cannot pass over a generalist proof gap",
+        verifier.aggregate_verdict([], [review("combined", gap)], config)[0],
+        "NEEDS_EVIDENCE",
+    )
+    test.equal(
+        "VERDICT a check-free plan records no finding as advisory",
+        verifier.advisory_findings([], [review("combined", blocker)], config),
+        [],
+    )
+    test.equal(
+        "VERDICT one deterministic check is enough to demote the generalist",
+        (
+            verifier.gating_review_kinds(
+                [green_check], [review("combined", blocker)], config
+            ),
+            verifier.aggregate_verdict(
+                [green_check], [review("combined", blocker)], config
+            )[0],
+        ),
+        ([], "PASSED"),
+    )
+    test.equal(
+        "VERDICT a specialist gate is enough to demote the generalist",
+        verifier.gating_review_kinds(
+            [], [review("combined", blocker), review("lock-security", base)], config
+        ),
+        ["lock-security"],
+    )
+    test.equal(
+        "VERDICT no check and no review still refuses to certify",
+        verifier.aggregate_verdict([], [], config),
+        ("NEEDS_EVIDENCE", "no blocking check or review evidence exists"),
+    )
+    # The PASS reason is the only prose `status` and the `verify` status JSON
+    # carry, so it may not claim every review passed when one was demoted.
+    test.equal(
+        "VERDICT a PASS reason names the advisory findings it did not gate on",
+        verifier.aggregate_verdict(
+            [green_check], [review("combined", blocker)], config
+        )[1],
+        "all blocking checks and reviews passed; 1 advisory finding(s) recorded "
+        "(1 MAJOR/BLOCKER)",
+    )
+    test.equal(
+        "VERDICT a finding-free PASS keeps its unqualified reason",
+        verifier.aggregate_verdict(
+            [green_check], [review("combined", base)], config
+        )[1],
+        "all planned checks and reviews passed",
+    )
+    # A demoted review's stamp is the only thing that may drop a receipt item;
+    # an unknown or missing stamp keeps its gate.
+    test.equal(
+        "VERDICT unstamped receipt items keep their gate",
+        verifier.blocking_review_items(
+            [
+                {"review": "combined", "severity": "BLOCKER"},
+                {"review": "future-security", "severity": "BLOCKER"},
+                {"severity": "BLOCKER"},
+                "malformed",
+            ],
+            ["combined"],
+        ),
+        [
+            {"review": "future-security", "severity": "BLOCKER"},
+            {"severity": "BLOCKER"},
+            "malformed",
+        ],
+    )
+    # A recorded finding nobody prints is a finding nobody reads: `status`
+    # speaks every advisory finding the verdict declined to gate on.
+    test.equal(
+        "STATUS prints every advisory finding the verdict did not gate on",
+        harness_cli.advisory_status_lines(
+            {
+                "status": "PASSED",
+                "advisory_findings": [
+                    {
+                        "review": "combined",
+                        "severity": "BLOCKER",
+                        "file": "src/app/foo.ts",
+                        "evidence": "drops the consent check",
+                        "required_fix": "do not merge",
+                    }
+                ],
+            }
+        ),
+        [
+            "advisory BLOCKER [combined] src/app/foo.ts: drops the consent check"
+        ],
+    )
+    test.equal(
+        "STATUS stays silent when nothing was demoted",
+        harness_cli.advisory_status_lines({"status": "PASSED"}),
+        [],
+    )
+    test.raises(
+        "STATUS refuses a malformed advisory projection",
+        lambda: harness_cli.advisory_status_lines(
+            {"advisory_findings": ["malformed"]}
+        ),
+        "advisory finding is malformed",
+    )
+    # The check-free surfaces a reviewer named — the Angular app shell, the
+    # Tauri build script, assets, and the landing page — keep a gate through
+    # the same rule, without trading their one semantic reviewer for a
+    # syntactic check that cannot see what the reviewer was hired to see.
+    for path in (
+        "src/index.html",
+        "src-tauri/build.rs",
+        "src/assets/logo.svg",
+        "landing/index.html",
+        "src-tauri/entitlements.plist",
+    ):
+        check_profile, review_profile, _ = verifier.derive_profile(
+            [path], [], config, reviewer="codex"
+        )
+        test.equal(
+            f"VERDICT {path} keeps a gate that can refuse a PASS",
+            (
+                bool(check_profile)
+                or bool(
+                    verifier.gating_review_kinds(
+                        check_profile, review_profile, config
+                    )
+                ),
+                verifier.aggregate_verdict(
+                    [
+                        {"id": item["id"], "evidence": {"passed": True}}
+                        for item in check_profile
+                    ],
+                    [review(item["kind"], blocker) for item in review_profile],
+                    config,
+                )[0],
+            ),
+            (True, "NEEDS_FIX"),
+        )
+
 
 def focused_review_evidence_cases(test: Tests) -> None:
     with tempfile.TemporaryDirectory(prefix="murmur-v2-focused-evidence-") as raw:
@@ -2245,6 +2503,14 @@ def probe_precedence_flow_cases(test: Tests) -> None:
         selftest_config["canonical_checks"]["npm-lock"] = (
             "python3 -c 'print(\"PLANNED_\" + \"NPM_LOCK_STREAM\")'"
         )
+        advisory_config = copy.deepcopy(selftest_config)
+        # This group pins the probe-precedence machinery, and only a BLOCKING
+        # reviewer can drive it. The fixture owns one non-risk path, so its only
+        # planned review is `combined`, which the corpus measurement demoted to
+        # advisory. Bind it back to blocking here so these assertions keep
+        # testing what they were written to test; the advisory path gets its own
+        # dedicated case at the end of this group.
+        selftest_config["review_authority"]["combined"] = "blocking"
         runtime.load_config = lambda: copy.deepcopy(selftest_config)
         os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
         os.environ[
@@ -3598,6 +3864,194 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                     "review_result_sha256"
                 ]
                 == source_result_sha256,
+            )
+
+            # Under the shipped authority the same reviewer is advisory: its
+            # probe request stays in the receipt, but it can no longer spend a
+            # runner-owned execution or force another full review round.
+            advisory_worktree = root / "advisory-task" / "meetnotes"
+            advisory_worktree.parent.mkdir()
+            advisory_branch = "agent/v2/probe-advisory"
+            _git(
+                repo,
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                advisory_branch,
+                str(advisory_worktree),
+                base,
+            )
+            advisory_task_id = "probe-advisory"
+            advisory_task_dir = harness_cli.v2_task_dir(
+                common, advisory_task_id
+            )
+            advisory_task_dir.mkdir(parents=True)
+            advisory_contract = {
+                **contract,
+                "task_id": advisory_task_id,
+                "description": (
+                    "prove an advisory probe request cannot gate a PASS"
+                ),
+                "contract_sha256": "",
+                "worktree_path": str(advisory_worktree.resolve()),
+                "branch": advisory_branch,
+                "created_at": runtime.utc_now(),
+            }
+            advisory_contract["contract_sha256"] = verifier.document_hash(
+                advisory_contract, "contract_sha256"
+            )
+            runtime.validate_schema(
+                advisory_contract,
+                runtime.load_schema("v2-task"),
+                label="v2 advisory probe contract",
+            )
+            runtime.atomic_write_json(
+                advisory_task_dir / "task.json", advisory_contract
+            )
+            runtime.atomic_write_json(
+                advisory_task_dir / "runtime.json",
+                {
+                    "schema_version": 2,
+                    "task_root": str(advisory_worktree.parent),
+                    "shared_node_modules": None,
+                    "server_worktree": None,
+                    "server_source": str(root / "murmur-server"),
+                    "server_revision": None,
+                },
+            )
+            harness_cli.set_v2_state(
+                advisory_task_dir, "OPEN", phase="open"
+            )
+            (advisory_worktree / owned_relative).write_text(
+                "/* base */\n/* advisory probe request */\n",
+                encoding="utf-8",
+            )
+            os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
+            os.environ[
+                "MURMUR_HARNESS_FAKE_REVIEW_PROBE_ID"
+            ] = "ng-lint"
+            runtime.load_config = lambda: copy.deepcopy(advisory_config)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    advisory_verdict = harness_cli.verify_task(
+                        advisory_contract,
+                        advisory_task_dir,
+                        allow_test_adapter=True,
+                    )
+                advisory_state = harness_cli.load_v2_state(
+                    advisory_task_dir
+                )
+                advisory_attempt = (
+                    advisory_task_dir
+                    / "attempts"
+                    / str(advisory_state["attempt_id"])
+                )
+                advisory_evidence_path = Path(
+                    str(advisory_state["evidence_path"])
+                )
+                advisory_evidence = runtime.load_json(advisory_evidence_path)
+                # This plan owns two deterministic gates of its own, so the
+                # generalist really is demoted here: its severe finding and its
+                # proof gap are recorded in the receipt and no longer forbid the
+                # PASS. The receipt gate must agree with the aggregation that
+                # produced it.
+                advisory_result_path = Path(
+                    str(advisory_evidence["reviews"][0]["result_path"])
+                )
+                advisory_result = runtime.load_json(advisory_result_path)
+                advisory_mutations = {
+                    "BLOCKER finding": {
+                        **copy.deepcopy(advisory_result),
+                        "findings": [
+                            {
+                                "severity": "BLOCKER",
+                                "file": owned_relative,
+                                "evidence": "bound advisory selftest finding",
+                                "required_fix": "record it without gating",
+                            }
+                        ],
+                    },
+                    "proof gap": {
+                        **copy.deepcopy(advisory_result),
+                        "proof_gaps": [
+                            {
+                                "claim": "exact runtime proof",
+                                "evidence_missing": "runner artifact",
+                                "how_to_prove": "run an allowlisted probe",
+                            }
+                        ],
+                    },
+                }
+                advisory_receipts: Dict[str, Any] = {}
+                for label, mutated in advisory_mutations.items():
+                    runtime.atomic_write_json(advisory_result_path, mutated)
+                    bound = copy.deepcopy(advisory_evidence)
+                    bound["reviews"][0]["result"] = copy.deepcopy(mutated)
+                    bound["reviews"][0]["result_sha256"] = runtime.sha256_file(
+                        advisory_result_path
+                    )
+                    bound.update(
+                        verifier.aggregate_review_outcomes(bound["reviews"])
+                    )
+                    bound["advisory_findings"] = verifier.advisory_findings(
+                        [*bound["checks"], *bound["probes"]],
+                        bound["reviews"],
+                        runtime.load_config(),
+                    )
+                    bound["evidence_sha256"] = verifier.document_hash(
+                        bound, "evidence_sha256"
+                    )
+                    runtime.atomic_write_json(advisory_evidence_path, bound)
+                    try:
+                        receipt = verifier.verify_v2_evidence(
+                            advisory_contract,
+                            advisory_task_dir,
+                            allow_test_adapter=True,
+                        )
+                        advisory_receipts[label] = (
+                            receipt["verdict"],
+                            [
+                                item["review"]
+                                for item in receipt["advisory_findings"]
+                            ],
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report, not raise
+                        advisory_receipts[label] = f"{type(exc).__name__}: {exc}"
+                runtime.atomic_write_json(
+                    advisory_result_path, advisory_result
+                )
+                runtime.atomic_write_json(
+                    advisory_evidence_path, advisory_evidence
+                )
+            finally:
+                runtime.load_config = lambda: copy.deepcopy(selftest_config)
+            test.equal(
+                "STATUS projects the receipt's advisory findings into task state",
+                advisory_state.get("advisory_findings"),
+                advisory_evidence["advisory_findings"],
+            )
+            test.equal(
+                "EVIDENCE a demoted finding and proof gap still verify PASS",
+                advisory_receipts,
+                {
+                    "BLOCKER finding": ("PASSED", ["combined"]),
+                    "proof gap": ("PASSED", []),
+                },
+            )
+            test.equal(
+                "PROBE advisory request is recorded but spends no execution",
+                (
+                    advisory_verdict,
+                    (
+                        advisory_attempt / "probes" / "ng-lint.json"
+                    ).exists(),
+                    [
+                        item["review"]
+                        for item in advisory_evidence["probe_requests"]
+                    ],
+                ),
+                ("PASSED", False, ["combined"]),
             )
         finally:
             runtime.load_config = original_load_config
@@ -5572,6 +6026,12 @@ def commit_recovery_cases(test: Tests) -> None:
             "MURMUR_HARNESS_FAKE_REVIEW_VERDICT"
         )
         os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "BLOCKED"
+        # The fixture owns a docs-only path, so its derived plan has no check
+        # and its single planned review is the `combined` generalist. The
+        # corpus measurement demoted that generalist, but demotion may not
+        # remove a plan's LAST gate, so here it still gates under the shipped
+        # config — which is exactly what the rest of this fixture needs and
+        # what keeps an evidence-free PASS receipt unreachable.
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 incomplete = harness_cli.verify_task(
@@ -5587,7 +6047,7 @@ def commit_recovery_cases(test: Tests) -> None:
                     "MURMUR_HARNESS_FAKE_REVIEW_VERDICT"
                 ] = previous_review_verdict
         test.equal(
-            "REVIEW incomplete result pauses as NEEDS_EVIDENCE",
+            "REVIEW incomplete blocking result pauses as NEEDS_EVIDENCE",
             incomplete,
             "NEEDS_EVIDENCE",
         )
@@ -5661,93 +6121,105 @@ def commit_recovery_cases(test: Tests) -> None:
         original_review = original_evidence["reviews"][0]
         original_result_path = Path(str(original_review["result_path"]))
         original_review_result = runtime.load_json(original_result_path)
-        for severity in ("MAJOR", "BLOCKER"):
-            severe_result = copy.deepcopy(original_review_result)
-            severe_result["findings"] = [
+        severe_results = {
+            severity: {
+                **copy.deepcopy(original_review_result),
+                "findings": [
+                    {
+                        "severity": severity,
+                        "file": "docs/commit-recovery.md",
+                        "evidence": "bound severe selftest finding",
+                        "required_fix": "reject the v2 PASS",
+                    }
+                ],
+            }
+            for severity in ("MAJOR", "BLOCKER")
+        }
+        gap_result = {
+            **copy.deepcopy(original_review_result),
+            "proof_gaps": [
                 {
-                    "severity": severity,
-                    "file": "docs/commit-recovery.md",
-                    "evidence": "bound severe selftest finding",
-                    "required_fix": "reject the v2 PASS",
+                    "claim": "exact runtime proof",
+                    "evidence_missing": "runner artifact",
+                    "how_to_prove": "run an allowlisted probe",
                 }
-            ]
-            runtime.atomic_write_json(original_result_path, severe_result)
-            severe_evidence = copy.deepcopy(original_evidence)
-            severe_evidence["reviews"][0]["result"] = severe_result
-            severe_evidence["reviews"][0][
-                "result_sha256"
-            ] = runtime.sha256_file(original_result_path)
-            outcomes = verifier.aggregate_review_outcomes(
-                severe_evidence["reviews"]
+            ],
+        }
+        probe_result = {
+            **copy.deepcopy(original_review_result),
+            "probe_requests": [
+                {
+                    "probe_id": "rust-lib",
+                    "rationale": "bound empirical proof is still required",
+                }
+            ],
+        }
+
+        def bind_review_result(result: Mapping[str, Any]) -> None:
+            """Rewrite the bound review artifact and its receipt in place."""
+
+            runtime.atomic_write_json(original_result_path, result)
+            bound = copy.deepcopy(original_evidence)
+            bound["reviews"][0]["result"] = copy.deepcopy(dict(result))
+            bound["reviews"][0]["result_sha256"] = runtime.sha256_file(
+                original_result_path
             )
-            severe_evidence.update(outcomes)
-            severe_evidence["evidence_sha256"] = verifier.document_hash(
-                severe_evidence, "evidence_sha256"
+            bound.update(verifier.aggregate_review_outcomes(bound["reviews"]))
+            bound["advisory_findings"] = verifier.advisory_findings(
+                [*bound["checks"], *bound["probes"]],
+                bound["reviews"],
+                runtime.load_config(),
             )
-            runtime.atomic_write_json(evidence_path, severe_evidence)
+            bound["evidence_sha256"] = verifier.document_hash(
+                bound, "evidence_sha256"
+            )
+            runtime.atomic_write_json(evidence_path, bound)
+
+        def verify_receipt() -> Dict[str, Any]:
+            return verifier.verify_v2_evidence(
+                contract, task_dir, allow_test_adapter=True
+            )
+
+        # This fixture's plan has no deterministic check, so under the shipped
+        # config the generalist is this plan's only gate and every one of these
+        # mutations must still forbid the receipt. That is the property the
+        # demotion may not break: nothing may mint a PASS on a plan where no
+        # gate could have refused.
+        test.equal(
+            "EVIDENCE a check-free plan keeps its generalist gate",
+            verifier.gating_review_kinds(
+                [], original_evidence["reviews"], runtime.load_config()
+            ),
+            ["combined"],
+        )
+        for severity, severe_result in severe_results.items():
+            bind_review_result(severe_result)
             test.raises(
-                f"EVIDENCE bound {severity} review cannot verify PASS",
-                lambda: verifier.verify_v2_evidence(
-                    contract, task_dir, allow_test_adapter=True
-                ),
+                f"EVIDENCE bound {severity} sole-gate review cannot verify PASS",
+                verify_receipt,
                 "unresolved MAJOR/BLOCKER",
             )
-
-        gap_result = copy.deepcopy(original_review_result)
-        gap_result["proof_gaps"] = [
-            {
-                "claim": "exact runtime proof",
-                "evidence_missing": "runner artifact",
-                "how_to_prove": "run an allowlisted probe",
-            }
-        ]
-        runtime.atomic_write_json(original_result_path, gap_result)
-        gap_evidence = copy.deepcopy(original_evidence)
-        gap_evidence["reviews"][0]["result"] = gap_result
-        gap_evidence["reviews"][0][
-            "result_sha256"
-        ] = runtime.sha256_file(original_result_path)
-        gap_evidence.update(
-            verifier.aggregate_review_outcomes(gap_evidence["reviews"])
-        )
-        gap_evidence["evidence_sha256"] = verifier.document_hash(
-            gap_evidence, "evidence_sha256"
-        )
-        runtime.atomic_write_json(evidence_path, gap_evidence)
+        bind_review_result(gap_result)
         test.raises(
-            "EVIDENCE bound proof gap cannot verify PASS",
-            lambda: verifier.verify_v2_evidence(
-                contract, task_dir, allow_test_adapter=True
-            ),
+            "EVIDENCE bound sole-gate proof gap cannot verify PASS",
+            verify_receipt,
             "unresolved proof gaps",
         )
-
-        probe_result = copy.deepcopy(original_review_result)
-        probe_result["probe_requests"] = [
-            {
-                "probe_id": "rust-lib",
-                "rationale": "bound empirical proof is still required",
-            }
-        ]
-        runtime.atomic_write_json(original_result_path, probe_result)
-        probe_evidence = copy.deepcopy(original_evidence)
-        probe_evidence["reviews"][0]["result"] = probe_result
-        probe_evidence["reviews"][0][
-            "result_sha256"
-        ] = runtime.sha256_file(original_result_path)
-        probe_evidence.update(
-            verifier.aggregate_review_outcomes(probe_evidence["reviews"])
-        )
-        probe_evidence["evidence_sha256"] = verifier.document_hash(
-            probe_evidence, "evidence_sha256"
-        )
-        runtime.atomic_write_json(evidence_path, probe_evidence)
+        bind_review_result(probe_result)
         test.raises(
-            "EVIDENCE bound probe request cannot verify PASS",
-            lambda: verifier.verify_v2_evidence(
-                contract, task_dir, allow_test_adapter=True
-            ),
+            "EVIDENCE bound sole-gate probe request cannot verify PASS",
+            verify_receipt,
             "unresolved proof gaps",
+        )
+        bind_review_result(severe_results["BLOCKER"])
+        recorded = runtime.load_json(evidence_path)
+        test.equal(
+            "EVIDENCE a sole-gate finding is recorded as gating, not advisory",
+            (
+                [item["severity"] for item in recorded["findings"]],
+                recorded["advisory_findings"],
+            ),
+            (["BLOCKER"], []),
         )
         runtime.atomic_write_json(
             original_result_path, original_review_result
