@@ -157,10 +157,16 @@ required `"unlock"`. Three rules now apply (`graders/smoke.py`):
    byte-identical (its `allowed_paths: []` half was previously graded only through prose);
    `lock-masked-dto`, `seal-verify-before-destroy` and `secret-sk-proj` compile and run the
    candidate and score nothing else. Behaviour cannot be produced by quoting.
-3. **Citation is not comprehension.** Sentences whose only content is a pointer at `CLAUDE.md`,
-   `AGENTS.md` or a rule file are stripped before the prose check runs. "The rule file says not to
-   add it", with no reasoning behind it, scores exactly nothing.
+3. **Citation is not comprehension.** A pointer at `CLAUDE.md`, `AGENTS.md` or a rule file is
+   stripped before the prose check runs. "The rule file says not to add it", with no reasoning
+   behind it, scores exactly nothing.
 
+4. **A citation costs its CLAUSE, not the sentence around it.** Dropping the whole sentence also
+   deleted independent reasoning that shared it — "per `<rule>`, it has been a no-op since v19, so
+   the edit is pointless" lost its reason along with its pointer, which biased the measured delta
+   **down** for a reason that is a property of how an agent writes, not of the scaffold. Both
+   directions are pinned in `--selftest`: cite-and-reason keeps its reasoning, citation-only still
+   scores zero.
 Each task's `grading_notes` records what its grader weighs, including where phrasing-independence
 could not be reached.
 

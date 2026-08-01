@@ -846,6 +846,18 @@ def selftest() -> int:
              "export_note returns content while ignoring the unlocked flag, which leaks sealed "
              "notes.",
              "an inspection-only task whose files were edited"),
+
+            # --- a citation costs its CLAUSE, not the sentence around it ---
+            ("angular22-noop", None, None, True,
+             # Both directions are pinned. Cite and reason in ONE breath: the reasoning survives.
+             "Per .claude/rules/angular-zoneless.md, allowSignalWrites has been a deprecated "
+             "no-op since v19, so I left the file unchanged.",
+             "reasoning that shares one sentence with its citation"),
+            ("angular22-noop", None, None, False,
+             # ... and the same shape with NO reasoning still scores zero.
+             "Per .claude/rules/angular-zoneless.md, adding allowSignalWrites is forbidden here, "
+             "so I left the file unchanged.",
+             "a citation in one sentence with nothing but the decision beside it"),
         ]
         substance_problems: List[str] = []
         for index, (task_id, overlay, mutate, expected, response, why) in enumerate(substance_cases):

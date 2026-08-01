@@ -12,9 +12,12 @@ now apply to every response grader here:
      repo-specific vocabulary that only the injected file supplies.
   2. Weight the BEHAVIOURAL signal — a file edited, a file correctly left alone, a field present
      or absent — above the prose, because behaviour cannot be produced by quoting.
-  3. Reject an answer whose only support is "the rule file says so". Sentences that merely cite
+  3. Reject an answer whose only support is "the rule file says so". CLAUSES that merely cite
      `CLAUDE.md` / `AGENTS.md` / `.claude/rules/*` are STRIPPED before the substance check runs, so
      a citation with no reasoning behind it scores exactly what it is worth: nothing.
+  4. A citation costs the CLAUSE it lives in, never the whole SENTENCE. Dropping the sentence also
+     deleted independent reasoning that shared it with the citation, so an answer that cited AND
+     reasoned in one breath lost its reasoning and the measured delta was biased DOWN.
 
 Graders that shell out to a real toolchain report `grader_mode: "strict"`; the structural
 fallbacks used when that toolchain is absent report `grader_mode: "degraded"`, and the runner
@@ -57,22 +60,49 @@ CITATION_MARKERS = (
 # otherwise split one citation into fragments, and the fragments lose the marker that identifies
 # them as a citation.
 _FILE_REFERENCE = re.compile(r"[\w./-]*\.md\b")
-_SENTENCE_SPLIT = re.compile(r"[.;!?\n]+")
+# A CLAIM is a sentence. This is the unit every co-occurrence check below is measured in, so a
+# spurious boundary SPLITS a finding in half and fails an answer that made it. A bare `[.;!?\n]+`
+# cut `note.content` and `src/mcp.rs` into pieces; a full stop only ends a sentence when whitespace
+# or the end of the response follows it.
+_SENTENCE_SPLIT = re.compile(r"[;!?\n]+|\.+(?=\s|$)")
+# A CLAUSE is a span inside one claim. Citations are removed at THIS granularity, not the
+# sentence's: "per <rule>, it has been a no-op since v19, so the edit is pointless" cites AND
+# reasons, and deleting the whole sentence would delete the reasoning with the pointer.
+_CLAUSE_SPLIT = re.compile(
+    r"\s*(?:[,:]|\band\b|\bbut\b|\bwhile\b|\bwhereas\b|\bhowever\b|\bthough\b|\byet\b)\s*"
+)
+
+
+def grounded_claims(response: str) -> List[str]:
+    """The response as CLAIMS, with every citing CLAUSE removed.
+
+    "The rule file says not to add it" is a citation. "It is a deprecated no-op since v19" is a
+    reason. Only the second survives, so the treatment arm cannot buy a pass by quoting the file
+    it was handed — while an answer that cites AND reasons in ONE sentence keeps its reasoning.
+
+    Dropping the whole sentence (what this used to do) biased the measured delta DOWN: it charged
+    an answer for the reasoning it stated next to its citation, and how often an agent writes in
+    that shape is a property of the agent, not of the scaffold.
+    """
+    normalized = _FILE_REFERENCE.sub(" scaffoldfileref ", response.lower())
+    claims: List[str] = []
+    for sentence in _SENTENCE_SPLIT.split(normalized):
+        kept = [
+            " ".join(clause.split())
+            for clause in _CLAUSE_SPLIT.split(sentence)
+            if clause.strip() and not any(marker in clause for marker in CITATION_MARKERS)
+        ]
+        claim = " ".join(part for part in kept if part)
+        if claim:
+            claims.append(claim)
+    return claims
 
 
 def grounded_text(response: str) -> str:
-    """Drop every sentence whose only content is a pointer at the injected scaffold.
+    """The surviving claims as one string, for checks that do not need claim boundaries."""
+    return " . ".join(grounded_claims(response))
 
-    "The rule file says not to add it" is a citation. "It is a deprecated no-op since v19" is a
-    reason. Only the second survives this filter, so the treatment arm cannot buy a pass by
-    quoting the file it was handed. An answer that cites AND reasons keeps its reasoning.
-    """
-    normalized = _FILE_REFERENCE.sub(" scaffoldfileref ", response.lower())
-    kept = [
-        sentence for sentence in _SENTENCE_SPLIT.split(normalized)
-        if not any(marker in sentence for marker in CITATION_MARKERS)
-    ]
-    return " . ".join(kept)
+
 
 
 def mentions(text: str, phrases: Iterable[str]) -> bool:
