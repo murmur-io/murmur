@@ -39,6 +39,8 @@ V2_STATES = {
 V2_TERMINAL_STATES = {"CLOSED", "ABANDONED"}
 V2_RESUMABLE_STATES = V2_STATES - V2_TERMINAL_STATES - {"COMMITTED"}
 SEVERE_FINDINGS = {"MAJOR", "BLOCKER"}
+BLOCKING_AUTHORITY = "blocking"
+ADVISORY_AUTHORITY = "advisory"
 ALLOWED_PROBES = {
     "rust-lib",
     "protocol-server",
@@ -1719,8 +1721,52 @@ def probe_request_contexts(
     return canonical_probe_request_contexts(list(contexts.values()))
 
 
+def review_authority(kind: str, config: Mapping[str, Any]) -> str:
+    """Return whether a review kind may forbid a PASS.
+
+    Measured on Murmur's own review corpus in
+    ``docs/research/2026-08-01-reviewer-corpus-measurement.md``: the ``combined``
+    generalist produced one BLOCKER across 98 reviews while consuming 76% of the
+    review model budget and refusing 74% of attempts, so its findings are
+    recorded but no longer gate. The three risk specialists produced 11 BLOCKERs
+    across 118 reviews at a quarter of the cost and stay blocking.
+
+    Every unconfigured, unknown, or malformed kind fails closed as blocking, so a
+    typo in the config and a future specialist kind both keep their gate, and an
+    attested config predating this map keeps verifying under its own rules.
+    """
+
+    mapping = config.get("review_authority", {})
+    if not isinstance(mapping, Mapping):
+        raise runtime.HarnessError("harness review_authority is malformed")
+    if mapping.get(kind) == ADVISORY_AUTHORITY:
+        return ADVISORY_AUTHORITY
+    return BLOCKING_AUTHORITY
+
+
+def blocking_review_items(items: Sequence[Any], config: Mapping[str, Any]) -> List[Any]:
+    """Keep the receipt-level items that a blocking reviewer owns.
+
+    Every item that ``aggregate_review_outcomes`` emits is stamped with the
+    ``review`` kind that produced it, and the receipt cross-check proves those
+    stamps match the bound review records before any gate reads them. A
+    malformed item, or one with a missing or unknown stamp, keeps its gate, so
+    this filter can only ever drop an item provably owned by an advisory review.
+    """
+
+    return [
+        item
+        for item in items
+        if not isinstance(item, Mapping)
+        or review_authority(str(item.get("review", "")), config)
+        == BLOCKING_AUTHORITY
+    ]
+
+
 def aggregate_verdict(
-    checks: Sequence[Mapping[str, Any]], reviews: Sequence[Mapping[str, Any]]
+    checks: Sequence[Mapping[str, Any]],
+    reviews: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
 ) -> Tuple[str, str]:
     if len(checks) == 0 and len(reviews) == 0:
         return "NEEDS_EVIDENCE", "no check or review evidence exists"
@@ -1730,7 +1776,14 @@ def aggregate_verdict(
             return "PAUSED_RETRYABLE", f"check {check.get('id')} is retryable"
         if not evidence.get("passed"):
             return "NEEDS_FIX", f"check {check.get('id')} failed"
-    review_states = [review_result_state(review.get("result", {})) for review in reviews]
+    # An advisory review still runs, is still bound into the receipt, and its
+    # findings and proof gaps are still recorded; it only loses the vote.
+    review_states = [
+        review_result_state(review.get("result", {}))
+        for review in reviews
+        if review_authority(str(review.get("kind", "")), config)
+        == BLOCKING_AUTHORITY
+    ]
     if "NEEDS_FIX" in review_states:
         return "NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"
     if "NEEDS_EVIDENCE" in review_states:
@@ -1741,7 +1794,11 @@ def aggregate_verdict(
 def aggregate_review_outcomes(
     reviews: Sequence[Mapping[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Derive the receipt-level review summary from the bound review records."""
+    """Derive the receipt-level review summary from the bound review records.
+
+    These three lists stay complete across every review of every authority:
+    demoting a reviewer must not delete its evidence from the receipt.
+    """
 
     return {
         "findings": [
@@ -1762,6 +1819,23 @@ def aggregate_review_outcomes(
     }
 
 
+def advisory_findings(
+    reviews: Sequence[Mapping[str, Any]], config: Mapping[str, Any]
+) -> List[Dict[str, Any]]:
+    """Project the findings that were recorded without gating the verdict.
+
+    A reader cannot tell a recorded observation from one that gated by looking
+    at ``findings`` alone, so the receipt carries this explicit projection.
+    """
+
+    return [
+        {"review": review["kind"], **finding}
+        for review in reviews
+        if review_authority(str(review["kind"]), config) == ADVISORY_AUTHORITY
+        for finding in review.get("result", {}).get("findings", [])
+    ]
+
+
 def build_evidence(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1769,9 +1843,10 @@ def build_evidence(
     checks: Sequence[Mapping[str, Any]],
     probes: Sequence[Mapping[str, Any]],
     reviews: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
 ) -> Dict[str, Any]:
     review_outcomes = aggregate_review_outcomes(reviews)
-    verdict, reason = aggregate_verdict([*checks, *probes], reviews)
+    verdict, reason = aggregate_verdict([*checks, *probes], reviews, config)
     evidence: Dict[str, Any] = {
         "schema_version": 2,
         "task_id": contract["task_id"],
@@ -1786,6 +1861,7 @@ def build_evidence(
         "probes": [dict(item) for item in probes],
         "reviews": [dict(item) for item in reviews],
         **review_outcomes,
+        "advisory_findings": advisory_findings(reviews, config),
         "telemetry": {
             "resource_wait_ms": sum(
                 int(record.get("evidence", {}).get("resource_wait_ms", 0) or 0)
@@ -2635,7 +2711,11 @@ def verify_v2_evidence(
                 f"v2 review {declared['kind']} result summary changed"
             )
         result_state = review_result_state(result)
-        if result_state != "PASSED":
+        if (
+            result_state != "PASSED"
+            and review_authority(str(declared["kind"]), profile_config)
+            == BLOCKING_AUTHORITY
+        ):
             if any(
                 finding.get("severity") in SEVERE_FINDINGS
                 for finding in result.get("findings", [])
@@ -2713,10 +2793,28 @@ def verify_v2_evidence(
             raise runtime.HarnessError(
                 f"v2 evidence {field} differs from its bound review records"
             )
-    if evidence.get("findings") and any(
-        item.get("severity") in SEVERE_FINDINGS for item in evidence["findings"]
+    # A receipt attested before review authority existed carries no
+    # `advisory_findings` key, and its attested config carries no authority map
+    # either, so every one of its reviews is blocking and the expected
+    # projection is empty. Every schema version that declares the key also
+    # requires it, so an absent key can only mean a pre-authority receipt.
+    if evidence.get("advisory_findings", []) != advisory_findings(
+        review_records, profile_config
+    ):
+        raise runtime.HarnessError(
+            "v2 evidence advisory_findings differs from its bound review records"
+        )
+    # The cross-check above proves every recorded item still carries the review
+    # kind that produced it, so the receipt gate can read that stamp.
+    if any(
+        isinstance(item, Mapping) and item.get("severity") in SEVERE_FINDINGS
+        for item in blocking_review_items(
+            evidence.get("findings", []), profile_config
+        )
     ):
         raise runtime.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
-    if evidence.get("proof_gaps") or evidence.get("probe_requests"):
+    if blocking_review_items(
+        evidence.get("proof_gaps", []), profile_config
+    ) or blocking_review_items(evidence.get("probe_requests", []), profile_config):
         raise runtime.HarnessError("v2 PASS contains unresolved proof gaps")
     return evidence

@@ -2074,10 +2074,22 @@ def verify_task(
         review_records = [
             records_by_kind[item["kind"]] for item in plan["reviews"]
         ]
+        # An advisory reviewer keeps its findings, proof gaps and probe requests
+        # in the receipt, but it may not spend a runner-owned probe execution or
+        # force another full review round: the corpus measurement behind
+        # `verifier.review_authority` attributes 148 of 215 proof gaps to the one
+        # generalist, so leaving this loop authority-blind would demote the
+        # verdict while keeping the escalation pressure that cost the most.
+        blocking_review_records = [
+            record
+            for record in review_records
+            if verifier.review_authority(str(record.get("kind", "")), config)
+            == verifier.BLOCKING_AUTHORITY
+        ]
         requested_probe_ids = sorted(
             {
                 str(request["probe_id"])
-                for review in review_records
+                for review in blocking_review_records
                 for request in review.get("result", {}).get("probe_requests", [])
             }
             | set(outstanding_probe_contexts)
@@ -2131,7 +2143,7 @@ def verify_task(
         # precedence before probe handling only when a probe was actually
         # requested.  Probe-free NEEDS_FIX reviews continue through the
         # pre-existing evidence/checkpoint path unchanged.
-        if requested_probe_ids and _reviews_require_fix(review_records):
+        if requested_probe_ids and _reviews_require_fix(blocking_review_records):
             set_v2_state(
                 task_dir,
                 "NEEDS_FIX",
@@ -2303,6 +2315,7 @@ def verify_task(
             check_records,
             probe_records,
             review_records,
+            config,
         )
         evidence_path = attempt_dir / "evidence.json"
         runtime.atomic_write_json(evidence_path, evidence)
