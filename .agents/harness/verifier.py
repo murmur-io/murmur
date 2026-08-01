@@ -1744,22 +1744,87 @@ def review_authority(kind: str, config: Mapping[str, Any]) -> str:
     return BLOCKING_AUTHORITY
 
 
-def blocking_review_items(items: Sequence[Any], config: Mapping[str, Any]) -> List[Any]:
-    """Keep the receipt-level items that a blocking reviewer owns.
+def gating_review_kinds(
+    checks: Sequence[Mapping[str, Any]],
+    reviews: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> List[str]:
+    """Return the review kinds that may forbid a PASS for this exact plan.
+
+    ``review_authority`` decides which reviews are redundant enough to demote.
+    Demotion removes a gate; it must never remove the LAST one. A plan whose
+    derived profile carries no deterministic check and no configured blocking
+    review — every docs-only, asset-only, and landing-only diff, whose only
+    planned review is the generalist — keeps every review gating, so a PASS
+    receipt always names at least one gate that could have refused it. Demoting
+    the generalist there would not buy a cheaper verdict, it would buy an
+    evidence-free one.
+    """
+
+    kinds = [str(review.get("kind", "")) for review in reviews]
+    gating = [
+        kind
+        for kind in kinds
+        if review_authority(kind, config) == BLOCKING_AUTHORITY
+    ]
+    if gating or checks:
+        return gating
+    return kinds
+
+
+def advisory_review_kinds(
+    checks: Sequence[Mapping[str, Any]],
+    reviews: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> List[str]:
+    """Return the planned review kinds this plan actually demoted."""
+
+    gating = set(gating_review_kinds(checks, reviews, config))
+    return [
+        str(review.get("kind", ""))
+        for review in reviews
+        if str(review.get("kind", "")) not in gating
+    ]
+
+
+def blocking_review_items(
+    items: Sequence[Any], advisory_kinds: Sequence[str]
+) -> List[Any]:
+    """Keep the receipt-level items that a gating reviewer owns.
 
     Every item that ``aggregate_review_outcomes`` emits is stamped with the
     ``review`` kind that produced it, and the receipt cross-check proves those
     stamps match the bound review records before any gate reads them. A
     malformed item, or one with a missing or unknown stamp, keeps its gate, so
-    this filter can only ever drop an item provably owned by an advisory review.
+    this filter can only ever drop an item provably owned by a demoted review.
     """
 
+    demoted = set(advisory_kinds)
     return [
         item
         for item in items
         if not isinstance(item, Mapping)
-        or review_authority(str(item.get("review", "")), config)
-        == BLOCKING_AUTHORITY
+        or str(item.get("review", "")) not in demoted
+    ]
+
+
+def advisory_findings(
+    checks: Sequence[Mapping[str, Any]],
+    reviews: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Project the findings that were recorded without gating the verdict.
+
+    A reader cannot tell a recorded observation from one that gated by looking
+    at ``findings`` alone, so the receipt carries this explicit projection.
+    """
+
+    demoted = set(advisory_review_kinds(checks, reviews, config))
+    return [
+        {"review": review["kind"], **finding}
+        for review in reviews
+        if str(review["kind"]) in demoted
+        for finding in review.get("result", {}).get("findings", [])
     ]
 
 
@@ -1768,26 +1833,45 @@ def aggregate_verdict(
     reviews: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
 ) -> Tuple[str, str]:
-    if len(checks) == 0 and len(reviews) == 0:
-        return "NEEDS_EVIDENCE", "no check or review evidence exists"
+    # A demoted review still runs, is still bound into the receipt, and its
+    # findings and proof gaps are still recorded; it only loses the vote.
+    gating = set(gating_review_kinds(checks, reviews, config))
+    # The guard that refuses to certify nothing has to count GATES, not
+    # transcripts: a recorded advisory review is evidence about the diff, never
+    # evidence that the diff was verified.
+    if len(checks) == 0 and len(gating) == 0:
+        return "NEEDS_EVIDENCE", "no blocking check or review evidence exists"
     for check in checks:
         evidence = check.get("evidence", {})
         if evidence.get("outcome") == "BLOCKED" or evidence.get("timed_out"):
             return "PAUSED_RETRYABLE", f"check {check.get('id')} is retryable"
         if not evidence.get("passed"):
             return "NEEDS_FIX", f"check {check.get('id')} failed"
-    # An advisory review still runs, is still bound into the receipt, and its
-    # findings and proof gaps are still recorded; it only loses the vote.
     review_states = [
         review_result_state(review.get("result", {}))
         for review in reviews
-        if review_authority(str(review.get("kind", "")), config)
-        == BLOCKING_AUTHORITY
+        if str(review.get("kind", "")) in gating
     ]
     if "NEEDS_FIX" in review_states:
         return "NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"
     if "NEEDS_EVIDENCE" in review_states:
         return "NEEDS_EVIDENCE", "a review has unresolved proof gaps or missing evidence"
+    # A PASS whose advisory reviewer filed findings must not tell the operator
+    # that every review passed: the reason line is the only prose `cmd_status`
+    # and the `verify` status JSON carry, so it names what was recorded but not
+    # gated.
+    recorded = advisory_findings(checks, reviews, config)
+    if recorded:
+        severe = sum(
+            1
+            for finding in recorded
+            if finding.get("severity") in SEVERE_FINDINGS
+        )
+        return "PASSED", (
+            "all blocking checks and reviews passed; "
+            f"{len(recorded)} advisory finding(s) recorded "
+            f"({severe} MAJOR/BLOCKER)"
+        )
     return "PASSED", "all planned checks and reviews passed"
 
 
@@ -1819,23 +1903,6 @@ def aggregate_review_outcomes(
     }
 
 
-def advisory_findings(
-    reviews: Sequence[Mapping[str, Any]], config: Mapping[str, Any]
-) -> List[Dict[str, Any]]:
-    """Project the findings that were recorded without gating the verdict.
-
-    A reader cannot tell a recorded observation from one that gated by looking
-    at ``findings`` alone, so the receipt carries this explicit projection.
-    """
-
-    return [
-        {"review": review["kind"], **finding}
-        for review in reviews
-        if review_authority(str(review["kind"]), config) == ADVISORY_AUTHORITY
-        for finding in review.get("result", {}).get("findings", [])
-    ]
-
-
 def build_evidence(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1861,7 +1928,9 @@ def build_evidence(
         "probes": [dict(item) for item in probes],
         "reviews": [dict(item) for item in reviews],
         **review_outcomes,
-        "advisory_findings": advisory_findings(reviews, config),
+        "advisory_findings": advisory_findings(
+            [*checks, *probes], reviews, config
+        ),
         "telemetry": {
             "resource_wait_ms": sum(
                 int(record.get("evidence", {}).get("resource_wait_ms", 0) or 0)
@@ -2513,6 +2582,18 @@ def verify_v2_evidence(
         raise runtime.HarnessError("v2 plan review profile is stale")
     if plan.get("actual_risk_flags") != expected_risks:
         raise runtime.HarnessError("v2 plan sensitive-risk profile is stale")
+    # Independently of whatever verdict the recorded evidence claims, a receipt
+    # may only certify a diff that at least one gate could have refused. The
+    # gate set is re-derived here from the exact paths and the attested config,
+    # never read from the receipt, so a hand-edited or re-hashed
+    # `verdict: PASSED` is refused by the same rule that produced it.
+    plan_gating_kinds = gating_review_kinds(
+        expected_checks, expected_reviews, profile_config
+    )
+    if not expected_checks and not plan_gating_kinds:
+        raise runtime.HarnessError(
+            "v2 PASS has no blocking check or review gate"
+        )
 
     evidence_path = Path(str(state.get("evidence_path", "")))
     try:
@@ -2711,11 +2792,7 @@ def verify_v2_evidence(
                 f"v2 review {declared['kind']} result summary changed"
             )
         result_state = review_result_state(result)
-        if (
-            result_state != "PASSED"
-            and review_authority(str(declared["kind"]), profile_config)
-            == BLOCKING_AUTHORITY
-        ):
+        if result_state != "PASSED" and str(declared["kind"]) in plan_gating_kinds:
             if any(
                 finding.get("severity") in SEVERE_FINDINGS
                 for finding in result.get("findings", [])
@@ -2793,28 +2870,34 @@ def verify_v2_evidence(
             raise runtime.HarnessError(
                 f"v2 evidence {field} differs from its bound review records"
             )
-    # A receipt attested before review authority existed carries no
-    # `advisory_findings` key, and its attested config carries no authority map
-    # either, so every one of its reviews is blocking and the expected
-    # projection is empty. Every schema version that declares the key also
-    # requires it, so an absent key can only mean a pre-authority receipt.
+    # The recorded gate set is re-derived from the same bound records the
+    # runner used, never trusted from the receipt. A receipt attested before
+    # review authority existed carries no `advisory_findings` key, and its
+    # attested config carries no authority map either, so every one of its
+    # reviews is blocking and the expected projection is empty. Every schema
+    # version that declares the key also requires it, so an absent key can only
+    # mean a pre-authority receipt.
+    gate_context = [*check_records, *probe_records]
     if evidence.get("advisory_findings", []) != advisory_findings(
-        review_records, profile_config
+        gate_context, review_records, profile_config
     ):
         raise runtime.HarnessError(
             "v2 evidence advisory_findings differs from its bound review records"
         )
+    demoted_kinds = advisory_review_kinds(
+        gate_context, review_records, profile_config
+    )
     # The cross-check above proves every recorded item still carries the review
     # kind that produced it, so the receipt gate can read that stamp.
     if any(
         isinstance(item, Mapping) and item.get("severity") in SEVERE_FINDINGS
         for item in blocking_review_items(
-            evidence.get("findings", []), profile_config
+            evidence.get("findings", []), demoted_kinds
         )
     ):
         raise runtime.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
     if blocking_review_items(
-        evidence.get("proof_gaps", []), profile_config
-    ) or blocking_review_items(evidence.get("probe_requests", []), profile_config):
+        evidence.get("proof_gaps", []), demoted_kinds
+    ) or blocking_review_items(evidence.get("probe_requests", []), demoted_kinds):
         raise runtime.HarnessError("v2 PASS contains unresolved proof gaps")
     return evidence
