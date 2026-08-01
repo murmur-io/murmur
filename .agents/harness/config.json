@@ -165,6 +165,7 @@
     "scripts/agent-remote-audit.py",
     "scripts/agent-sync-learnings",
     "scripts/ci.sh",
+    "scripts/control-plane-changed",
     "scripts/verify-harness-attestation"
   ]
 }
