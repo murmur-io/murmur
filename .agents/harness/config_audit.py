@@ -50,10 +50,45 @@ REQUIRED_DENIES = {
 }
 LOCAL_SETTINGS_RELATIVE = (".claude", "settings.local.json")
 LOCAL_POLICY_ACK_KEY = "_ack_policy_overrides"
-LOCAL_POLICY_KEYS = (
-    "sandbox.allowUnsandboxedCommands",
-    "sandbox.filesystem.allowWrite",
-    "permissions.deny",
+# Tracked `sandbox` scalar -> the local value that REVERSES the tracked posture.
+# Direction cannot be inferred from the value: `autoAllowBashIfSandboxed`
+# true -> false only ADDS permission prompts, so it has no reversal at all and
+# carries None.  `_local_settings` fails when the tracked document declares a
+# sandbox scalar missing from this table, so a future hardening in
+# `.claude/settings.json` cannot land silently unmodelled.
+SANDBOX_SCALAR_REVERSALS: Dict[str, Optional[bool]] = {
+    "allowUnsandboxedCommands": True,
+    "autoAllowBashIfSandboxed": None,
+    "enabled": False,
+    "failIfUnavailable": False,
+}
+# Least -> most permissive.  A local `permissions.defaultMode` ranked at or above
+# the tracked one (absent means Claude Code's own `default`) suppresses gating the
+# repository declared; an unrecognized mode cannot be proven safe, so it ranks last.
+PERMISSION_MODES: Tuple[str, ...] = (
+    "plan",
+    "default",
+    "acceptEdits",
+    "bypassPermissions",
+)
+# Shortest literal prefix a tracked deny must expose before it may be matched by
+# containment instead of by exact string.
+MIN_DENY_LITERAL = 4
+LOCAL_POLICY_KEYS: Tuple[str, ...] = tuple(
+    sorted(
+        {
+            "env",
+            "permissions.allow",
+            "permissions.defaultMode",
+            "sandbox.filesystem.allowWrite",
+            "sandbox.filesystem.denyWrite",
+        }
+        | {
+            f"sandbox.{name}"
+            for name, reversal in SANDBOX_SCALAR_REVERSALS.items()
+            if reversal is not None
+        }
+    )
 )
 CODEX_REQUIRED_DENY_PATHS = {
     "~/Desktop",
@@ -720,17 +755,140 @@ def _hook_parity(documents: Mapping[str, Any], audit: Audit) -> None:
     audit.fingerprints["parity-manifest"] = _sha256(_canonical_json(audit.fingerprints))
 
 
-def _covers_git_directory(entry: str) -> bool:
-    """True when a sandbox write grant reaches a Git directory.
+def _lexical(path: PurePosixPath) -> PurePosixPath:
+    """Collapse `.` and `..` without touching the filesystem."""
 
-    Compared on trailing path components only.  The tracked file declares
-    project-relative paths (`../meetnotes/.git`) while a machine-local override
-    declares absolute ones, and the audit must stay hermetic — resolving either
-    form would make the result depend on the machine it runs on.
+    parts: List[str] = []
+    for part in path.parts:
+        if part == ".":
+            continue
+        if part == ".." and parts and parts[-1] not in {"..", "/"}:
+            parts.pop()
+            continue
+        parts.append(part)
+    return PurePosixPath(*parts) if parts else PurePosixPath(".")
+
+
+def _expanded_home(entry: str) -> str:
+    """Expand a leading `~`/`$HOME`/`${HOME}` the way Claude Code would.
+
+    An undeterminable home degrades to the unexpanded text: the `.git` component
+    test still applies, only the ancestor test stops reaching through `~`.
     """
 
-    candidate = PurePosixPath(entry.replace("\\", "/").rstrip("/"))
-    return ".git" in candidate.parts
+    text = entry.strip().replace("\\", "/")
+    try:
+        home = Path.home().as_posix()
+    except (OSError, RuntimeError):
+        return text
+    for token in ("${HOME}", "$HOME", "~"):
+        if text == token:
+            return home
+        if text.startswith(token + "/"):
+            return home + text[len(token) :]
+    return text
+
+
+def _covers_git_directory(entry: str) -> Optional[str]:
+    """Why this sandbox write grant reaches a Git directory, or None.
+
+    Two ways in, and the second is the one a blocked operator reaches for. A
+    literal `.git` component is the obvious form; the failure message names it,
+    so deleting the `/.git` suffix both silences the rule and WIDENS the grant.
+    A sandbox write grant is a SUBTREE grant, so `/`, `$HOME`, and the repository
+    directory itself all still confer write on `<repo>/.git/hooks` — which runs
+    unsandboxed on the operator's next commit.
+
+    The component test is case-folded because the default macOS filesystem is
+    case-insensitive, so `.GIT` names the same directory.
+    """
+
+    text = _expanded_home(entry)
+    trimmed = text.rstrip("/") or "/"
+    candidate = PurePosixPath(trimmed)
+    if any(part.lower() == ".git" for part in candidate.parts):
+        return f"grants sandbox write to a Git directory: {entry}"
+    root = _lexical(PurePosixPath(ROOT.as_posix()))
+    target = _lexical(
+        candidate
+        if candidate.is_absolute()
+        else PurePosixPath((ROOT / trimmed).as_posix())
+    )
+    try:
+        root.relative_to(target)
+    except ValueError:
+        return None
+    return (
+        f"grants sandbox write to {entry}, which covers the repository root "
+        f"{root} and therefore {root.name}/.git"
+    )
+
+
+def _path_components(entry: str) -> Tuple[str, ...]:
+    """Meaningful trailing components of a filesystem policy entry.
+
+    Compared component-wise, never resolved: the tracked file declares
+    project-relative paths (`../meetnotes/.git`) while a machine-local override
+    declares the absolute form of the same directory, and the audit must stay
+    hermetic — resolving either form would make the result depend on the machine
+    it runs on.
+    """
+
+    text = _expanded_home(entry).rstrip("/")
+    return tuple(
+        part for part in PurePosixPath(text).parts if part not in {".", "..", "/"}
+    )
+
+
+def _deny_write_covered(
+    tracked: Tuple[str, ...], local: Sequence[Tuple[str, ...]]
+) -> bool:
+    """True when some local `denyWrite` entry still denies all of `tracked`.
+
+    A deny is a SUBTREE deny, so a local entry covers the tracked one when it
+    names the same directory or an ancestor of it.  On trailing components that
+    is exactly: some leading run of the tracked components is a trailing run of
+    the local ones.
+    """
+
+    if not tracked:
+        return True
+    return any(
+        entry[-size:] == tracked[:size]
+        for entry in local
+        for size in range(1, len(tracked) + 1)
+    )
+
+
+_GLOB_CHARACTER = re.compile(r"[*?\[]")
+
+
+def _permission_target(entry: str) -> str:
+    match = re.fullmatch(r"\s*([A-Za-z_]+)\((.*)\)\s*", entry, re.DOTALL)
+    return match.group(2) if match else entry.strip()
+
+
+def _deny_literal(entry: str) -> Optional[str]:
+    """Literal path prefix a deny rule protects, or None for a pure-glob rule.
+
+    `Read(~/.ssh/**)` protects everything under `~/.ssh/`, so a local
+    `Read(~/.ssh/*)`, `Read(~/.ssh/id_rsa)` or `Bash(cat ~/.ssh/id_rsa)` re-grants
+    it even though none of the three is the tracked string.  `Read(**/*.pem)`
+    exposes no literal prefix at all and can only ever be matched exactly.
+    """
+
+    target = _permission_target(entry)
+    match = _GLOB_CHARACTER.search(target)
+    literal = (target[: match.start()] if match else target).strip()
+    return literal if len(literal) >= MIN_DENY_LITERAL else None
+
+
+def _mode_rank(mode: str) -> int:
+    return (
+        PERMISSION_MODES.index(mode)
+        if mode in PERMISSION_MODES
+        else len(PERMISSION_MODES)
+    )
 
 
 def _mapping(document: Any, key: str) -> Mapping[str, Any]:
@@ -791,7 +949,29 @@ def _local_settings(documents: Mapping[str, Any], audit: Audit) -> None:
     (`--ci` only pins output stability), and threading one through would change
     every section signature — so the existence guard alone keeps this section
     from ever failing a job for a file that cannot be there.
+
+    The one check that runs BEFORE that guard reads only the tracked document:
+    it asserts the reversal model still covers every sandbox scalar the tracked
+    document declares, so a hardening added to `.claude/settings.json` cannot
+    become an unpoliced key that a local override may quietly flip.
     """
+
+    tracked = documents.get(".claude/settings.json")
+    tracked_sandbox = _mapping(tracked, "sandbox")
+    # Runs before the existence guard, and reads only the tracked document: it
+    # asserts this audit still MODELS the posture it claims to defend, which is
+    # exactly the thing CI must not be blind to.
+    unmodelled = sorted(
+        name
+        for name, value in tracked_sandbox.items()
+        if isinstance(value, bool) and name not in SANDBOX_SCALAR_REVERSALS
+    )
+    if unmodelled:
+        audit.error(
+            ".claude/settings.json declares sandbox scalars this audit does not model: "
+            + ", ".join(unmodelled)
+            + "; give each one a SANDBOX_SCALAR_REVERSALS direction"
+        )
 
     path = ROOT.joinpath(*LOCAL_SETTINGS_RELATIVE)
     if not path.is_file():
@@ -807,7 +987,6 @@ def _local_settings(documents: Mapping[str, Any], audit: Audit) -> None:
         if len(audit.errors) == reported:
             audit.error(f"{'/'.join(LOCAL_SETTINGS_RELATIVE)} must contain a JSON object")
         return
-    tracked = documents.get(".claude/settings.json")
     if not isinstance(tracked, dict):
         audit.error("cannot audit the local Claude override without tracked .claude/settings.json")
         return
@@ -815,43 +994,109 @@ def _local_settings(documents: Mapping[str, Any], audit: Audit) -> None:
     acknowledged = _policy_acknowledgements(local, audit)
     findings: List[Tuple[str, str]] = []
 
-    tracked_sandbox = _mapping(tracked, "sandbox")
+    # Every comparison below is DERIVED from the tracked document, never a second
+    # copy of its values: a policy change in .claude/settings.json moves the
+    # comparison with it instead of leaving a stale duplicate behind.
     local_sandbox = _mapping(local, "sandbox")
-    if tracked_sandbox.get("allowUnsandboxedCommands") is False and local_sandbox.get(
-        "allowUnsandboxedCommands"
-    ) is True:
-        findings.append(
-            (
-                "sandbox.allowUnsandboxedCommands",
-                "local Claude override sets sandbox.allowUnsandboxedCommands=true while "
-                ".claude/settings.json declares false",
-            )
-        )
-
-    for entry in _string_list(_mapping(local_sandbox, "filesystem"), "allowWrite"):
-        if _covers_git_directory(entry):
+    for name, reversal in sorted(SANDBOX_SCALAR_REVERSALS.items()):
+        if reversal is None:
+            continue
+        declared = not reversal
+        if tracked_sandbox.get(name) is declared and local_sandbox.get(name) is reversal:
             findings.append(
                 (
-                    "sandbox.filesystem.allowWrite",
-                    f"local Claude override grants sandbox write to a Git directory: {entry}",
+                    f"sandbox.{name}",
+                    f"local Claude override sets sandbox.{name}="
+                    f"{'true' if reversal else 'false'} while .claude/settings.json "
+                    f"declares {'true' if declared else 'false'}",
                 )
             )
 
-    # Derived from the tracked document, never a second copy of its list: a
-    # policy change in .claude/settings.json must move this comparison with it.
-    tracked_deny = set(_string_list(_mapping(tracked, "permissions"), "deny"))
+    local_filesystem = _mapping(local_sandbox, "filesystem")
+    for entry in _string_list(local_filesystem, "allowWrite"):
+        reach = _covers_git_directory(entry)
+        if reach is not None:
+            findings.append(
+                ("sandbox.filesystem.allowWrite", f"local Claude override {reach}")
+            )
+
+    # The sandbox-side deny list, and the same protection as the rule above seen
+    # from the other side. The array REPLACES rather than merges, so a local file
+    # that redeclares it without a tracked entry drops that entry outright.
+    tracked_filesystem = _mapping(tracked_sandbox, "filesystem")
+    if isinstance(local_filesystem.get("denyWrite"), list):
+        local_deny_write = [
+            _path_components(entry)
+            for entry in _string_list(local_filesystem, "denyWrite")
+        ]
+        dropped = [
+            entry
+            for entry in _string_list(tracked_filesystem, "denyWrite")
+            if not _deny_write_covered(_path_components(entry), local_deny_write)
+        ]
+        if dropped:
+            findings.append(
+                (
+                    "sandbox.filesystem.denyWrite",
+                    "local Claude override redeclares sandbox.filesystem.denyWrite "
+                    "without tracked entries: " + ", ".join(dropped),
+                )
+            )
+
+    tracked_permissions = _mapping(tracked, "permissions")
     local_permissions = _mapping(local, "permissions")
-    weakened = tracked_deny & set(_string_list(local_permissions, "allow"))
-    if isinstance(local_permissions.get("deny"), list):
-        weakened |= tracked_deny - set(_string_list(local_permissions, "deny"))
-    if weakened:
+    # Only the ALLOW side can weaken a deny. Claude Code unions deny lists across
+    # settings sources and deny beats allow, so a local deny list that does not
+    # restate a tracked entry has not dropped it — testing for that produced a
+    # failure on a strictly-tightening override and taught the operator to ack
+    # away the key that also covers this real re-grant.
+    local_allow = _string_list(local_permissions, "allow")
+    regrants: List[str] = []
+    for denied in _string_list(tracked_permissions, "deny"):
+        literal = _deny_literal(denied)
+        matches = [
+            allowed
+            for allowed in local_allow
+            if allowed == denied or (literal is not None and literal in allowed)
+        ]
+        if matches:
+            regrants.append(f"{', '.join(matches)} re-grants {denied}")
+    if regrants:
         findings.append(
             (
-                "permissions.deny",
-                "local Claude override weakens tracked permissions.deny entries: "
-                + ", ".join(sorted(weakened)),
+                "permissions.allow",
+                "local Claude override re-grants tracked permissions.deny entries: "
+                + "; ".join(regrants),
             )
         )
+
+    local_mode = local_permissions.get("defaultMode")
+    tracked_mode = tracked_permissions.get("defaultMode")
+    if isinstance(local_mode, str) and local_mode:
+        baseline = tracked_mode if isinstance(tracked_mode, str) and tracked_mode else "default"
+        if local_mode != baseline and _mode_rank(local_mode) >= _mode_rank(baseline):
+            findings.append(
+                (
+                    "permissions.defaultMode",
+                    f"local Claude override sets permissions.defaultMode={local_mode} "
+                    f"while the tracked posture is {baseline}",
+                )
+            )
+
+    # `env` overrides `env`, and .claude/settings.json's MURMUR_FINISH_GUARD is
+    # already asserted load-bearing by `_hook_parity`; hook_guard._finish_guard
+    # returns None outright when it reads "off".
+    tracked_env = _mapping(tracked, "env")
+    local_env = _mapping(local, "env")
+    for name in sorted(tracked_env):
+        if name in local_env and local_env[name] != tracked_env[name]:
+            findings.append(
+                (
+                    "env",
+                    f"local Claude override changes tracked env {name}: "
+                    f"{tracked_env[name]!r} -> {local_env[name]!r}",
+                )
+            )
 
     for key, message in findings:
         reason = acknowledged.get(key)
