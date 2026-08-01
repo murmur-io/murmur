@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
@@ -48,6 +48,13 @@ REQUIRED_DENIES = {
     "Read(~/.cargo/credentials*)",
     "Read(~/Library/Application Support/MeetNotes/**)",
 }
+LOCAL_SETTINGS_RELATIVE = (".claude", "settings.local.json")
+LOCAL_POLICY_ACK_KEY = "_ack_policy_overrides"
+LOCAL_POLICY_KEYS = (
+    "sandbox.allowUnsandboxedCommands",
+    "sandbox.filesystem.allowWrite",
+    "permissions.deny",
+)
 CODEX_REQUIRED_DENY_PATHS = {
     "~/Desktop",
     "~/Documents",
@@ -713,6 +720,149 @@ def _hook_parity(documents: Mapping[str, Any], audit: Audit) -> None:
     audit.fingerprints["parity-manifest"] = _sha256(_canonical_json(audit.fingerprints))
 
 
+def _covers_git_directory(entry: str) -> bool:
+    """True when a sandbox write grant reaches a Git directory.
+
+    Compared on trailing path components only.  The tracked file declares
+    project-relative paths (`../meetnotes/.git`) while a machine-local override
+    declares absolute ones, and the audit must stay hermetic — resolving either
+    form would make the result depend on the machine it runs on.
+    """
+
+    candidate = PurePosixPath(entry.replace("\\", "/").rstrip("/"))
+    return ".git" in candidate.parts
+
+
+def _mapping(document: Any, key: str) -> Mapping[str, Any]:
+    value = document.get(key) if isinstance(document, Mapping) else None
+    return value if isinstance(value, Mapping) else {}
+
+
+def _string_list(document: Mapping[str, Any], key: str) -> List[str]:
+    value = document.get(key)
+    return [entry for entry in value if isinstance(entry, str)] if isinstance(value, list) else []
+
+
+def _policy_acknowledgements(document: Mapping[str, Any], audit: Audit) -> Dict[str, str]:
+    """Parse the documented `"<key>: <reason>"` escape hatch.
+
+    An acknowledgement downgrades its key to a warning, so it has to carry a
+    recorded justification: a bare key, an empty reason, or a key this audit
+    does not police is itself a failure rather than a mute button.
+    """
+
+    raw = document.get(LOCAL_POLICY_ACK_KEY)
+    if raw is None:
+        return {}
+    if not isinstance(raw, list):
+        audit.error(f"{LOCAL_POLICY_ACK_KEY} must be an array of \"<key>: <reason>\" strings")
+        return {}
+    acknowledged: Dict[str, str] = {}
+    for entry in raw:
+        if not isinstance(entry, str):
+            audit.error(f"{LOCAL_POLICY_ACK_KEY} entries must be strings: {entry!r}")
+            continue
+        key, separator, reason = entry.partition(":")
+        key = key.strip()
+        reason = reason.strip()
+        if not separator or not reason:
+            audit.error(
+                f"{LOCAL_POLICY_ACK_KEY} entry records no reason: {entry!r}; "
+                'use "<key>: <why this machine needs it>"'
+            )
+            continue
+        if key not in LOCAL_POLICY_KEYS:
+            audit.error(
+                f"{LOCAL_POLICY_ACK_KEY} names an unaudited key: {key!r}; "
+                f"expected one of {', '.join(LOCAL_POLICY_KEYS)}"
+            )
+            continue
+        acknowledged[key] = reason
+    return acknowledged
+
+
+def _local_settings(documents: Mapping[str, Any], audit: Audit) -> None:
+    """Hold the untracked per-machine Claude override to the tracked posture.
+
+    `.claude/settings.local.json` is machine-local and git-ignored, so it is the
+    one file that can silently reverse the declared sandbox policy while every
+    parity check and fingerprint still passes.  Absence is the CI contract: the
+    file cannot exist on a runner, `run_audit` has no CI flag to branch on
+    (`--ci` only pins output stability), and threading one through would change
+    every section signature — so the existence guard alone keeps this section
+    from ever failing a job for a file that cannot be there.
+    """
+
+    path = ROOT.joinpath(*LOCAL_SETTINGS_RELATIVE)
+    if not path.is_file():
+        audit.checks.append("no local Claude settings override present")
+        return
+
+    reported = len(audit.errors)
+    local = _load_json(path, audit)
+    if not isinstance(local, dict):
+        # `_load_json` returns None for a read/parse failure it already reported
+        # and for a literal `null` document it did not; only the latter needs a
+        # message, so anything non-object that stayed silent gets one here.
+        if len(audit.errors) == reported:
+            audit.error(f"{'/'.join(LOCAL_SETTINGS_RELATIVE)} must contain a JSON object")
+        return
+    tracked = documents.get(".claude/settings.json")
+    if not isinstance(tracked, dict):
+        audit.error("cannot audit the local Claude override without tracked .claude/settings.json")
+        return
+
+    acknowledged = _policy_acknowledgements(local, audit)
+    findings: List[Tuple[str, str]] = []
+
+    tracked_sandbox = _mapping(tracked, "sandbox")
+    local_sandbox = _mapping(local, "sandbox")
+    if tracked_sandbox.get("allowUnsandboxedCommands") is False and local_sandbox.get(
+        "allowUnsandboxedCommands"
+    ) is True:
+        findings.append(
+            (
+                "sandbox.allowUnsandboxedCommands",
+                "local Claude override sets sandbox.allowUnsandboxedCommands=true while "
+                ".claude/settings.json declares false",
+            )
+        )
+
+    for entry in _string_list(_mapping(local_sandbox, "filesystem"), "allowWrite"):
+        if _covers_git_directory(entry):
+            findings.append(
+                (
+                    "sandbox.filesystem.allowWrite",
+                    f"local Claude override grants sandbox write to a Git directory: {entry}",
+                )
+            )
+
+    # Derived from the tracked document, never a second copy of its list: a
+    # policy change in .claude/settings.json must move this comparison with it.
+    tracked_deny = set(_string_list(_mapping(tracked, "permissions"), "deny"))
+    local_permissions = _mapping(local, "permissions")
+    weakened = tracked_deny & set(_string_list(local_permissions, "allow"))
+    if isinstance(local_permissions.get("deny"), list):
+        weakened |= tracked_deny - set(_string_list(local_permissions, "deny"))
+    if weakened:
+        findings.append(
+            (
+                "permissions.deny",
+                "local Claude override weakens tracked permissions.deny entries: "
+                + ", ".join(sorted(weakened)),
+            )
+        )
+
+    for key, message in findings:
+        reason = acknowledged.get(key)
+        if reason is None:
+            audit.error(message)
+        else:
+            audit.warn(f"{message} [acknowledged: {reason}]")
+    if not findings:
+        audit.checks.append("local Claude settings override preserves the declared posture")
+
+
 def _semantic_lint(audit: Audit) -> None:
     paths = [ROOT / "AGENTS.md", ROOT / "CLAUDE.md"]
     for directory, suffix in (
@@ -1156,6 +1306,7 @@ def run_audit() -> Audit:
     _agent_and_rule_manifest(audit)
     _codex_permission_profiles(audit)
     _hook_parity(documents, audit)
+    _local_settings(documents, audit)
     _adversarial_prompt_contract(audit)
     _semantic_lint(audit)
     _remote_workflow_contract(audit)

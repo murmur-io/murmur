@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import cli as harness_cli
+import config_audit
 import runtime
 import verifier
 
@@ -7110,6 +7111,269 @@ def egress_review_scope_prompt_cases(test: Tests) -> None:
     )
 
 
+LOCAL_SETTINGS_TRACKED_FIXTURE: Dict[str, Any] = {
+    # Deliberately NOT config_audit.REQUIRED_DENIES: the deny comparison has to
+    # be derived from whatever the tracked file declares, so a fixture-only
+    # entry proves the check reads the document instead of a module constant.
+    "permissions": {"deny": ["Read(~/fixture-only-secret/**)", "Read(**/fixture.pem)"]},
+    "sandbox": {
+        "allowUnsandboxedCommands": False,
+        "filesystem": {
+            "allowWrite": ["../.murmur-agent-tasks"],
+            "denyWrite": ["../meetnotes/.git"],
+        },
+    },
+}
+
+
+def _local_settings_audit(
+    root: Path, local: Optional[Mapping[str, Any]]
+) -> config_audit.Audit:
+    """Run `_local_settings` against a temp tree with `local` as the override."""
+
+    tracked = copy.deepcopy(LOCAL_SETTINGS_TRACKED_FIXTURE)
+    claude = root / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    runtime.atomic_write_json(claude / "settings.json", tracked)
+    override = claude / "settings.local.json"
+    if local is None:
+        if override.exists():
+            override.unlink()
+    else:
+        runtime.atomic_write_json(override, local)
+    audit = config_audit.Audit()
+    original_root = config_audit.ROOT
+    config_audit.ROOT = root
+    try:
+        config_audit._local_settings({".claude/settings.json": tracked}, audit)
+    finally:
+        config_audit.ROOT = original_root
+    return audit
+
+
+def local_settings_policy_cases(test: Tests) -> None:
+    """Pin the untracked Claude override against the tracked sandbox posture."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-local-settings-") as raw:
+        root = Path(raw)
+
+        absent = _local_settings_audit(root, None)
+        test.equal(
+            "absent local override raises nothing (the CI case)",
+            (absent.errors, absent.warnings),
+            ([], []),
+        )
+        test.true(
+            "absent local override still records a positive check",
+            any("no local Claude settings override" in check for check in absent.checks),
+        )
+
+        unsandboxed = _local_settings_audit(
+            root, {"sandbox": {"allowUnsandboxedCommands": True}}
+        )
+        test.true(
+            "re-enabled allowUnsandboxedCommands is a single failure",
+            len(unsandboxed.errors) == 1
+            and "sandbox.allowUnsandboxedCommands=true" in unsandboxed.errors[0],
+        )
+        test.equal(
+            "re-enabled allowUnsandboxedCommands never downgrades itself",
+            unsandboxed.warnings,
+            [],
+        )
+
+        git_entry = "/Users/fixture/Projects/meetnotes/.git"
+        git_write = _local_settings_audit(
+            root,
+            {
+                "sandbox": {
+                    "filesystem": {
+                        "allowWrite": [
+                            "/Users/fixture/.cargo",
+                            git_entry,
+                            "/Users/fixture/Projects/meetnotes/.git/agent-harness",
+                        ]
+                    }
+                }
+            },
+        )
+        test.equal("git write grants fail once per entry", len(git_write.errors), 2)
+        test.true(
+            "git write failure names the offending absolute entry verbatim",
+            any(error.endswith(git_entry) for error in git_write.errors),
+        )
+        lookalike = _local_settings_audit(
+            root,
+            {
+                "sandbox": {
+                    "filesystem": {
+                        "allowWrite": [
+                            "/Users/fixture/.gitconfig",
+                            "/Users/fixture/Projects/gitlab-runner",
+                            "/Users/fixture/Projects/.murmur-agent-tasks",
+                        ]
+                    }
+                }
+            },
+        )
+        test.equal(
+            "paths that merely start with 'git' are not Git directories",
+            (lookalike.errors, lookalike.warnings),
+            ([], []),
+        )
+
+        test.true(
+            "the deny fixture is not reachable through REQUIRED_DENIES",
+            "Read(~/fixture-only-secret/**)" not in config_audit.REQUIRED_DENIES,
+        )
+        regrant = _local_settings_audit(
+            root, {"permissions": {"allow": ["Read(~/fixture-only-secret/**)"]}}
+        )
+        test.true(
+            "a local allow that re-grants a tracked deny fails",
+            len(regrant.errors) == 1
+            and "Read(~/fixture-only-secret/**)" in regrant.errors[0],
+        )
+        truncated = _local_settings_audit(
+            root, {"permissions": {"deny": ["Read(~/fixture-only-secret/**)"]}}
+        )
+        test.true(
+            "a local deny list that drops a tracked entry fails",
+            len(truncated.errors) == 1 and "Read(**/fixture.pem)" in truncated.errors[0],
+        )
+        test.equal(
+            "omitting permissions entirely is not a weakening",
+            _local_settings_audit(root, {"sandbox": {"enabled": True}}).errors,
+            [],
+        )
+
+        acknowledged = _local_settings_audit(
+            root,
+            {
+                "_ack_policy_overrides": [
+                    "sandbox.allowUnsandboxedCommands: fixture release step needs codesign"
+                ],
+                "sandbox": {"allowUnsandboxedCommands": True},
+            },
+        )
+        test.equal("an acknowledged override clears the failure", acknowledged.errors, [])
+        test.true(
+            "an acknowledged override is recorded as one reasoned warning",
+            len(acknowledged.warnings) == 1
+            and "sandbox.allowUnsandboxedCommands=true" in acknowledged.warnings[0]
+            and "fixture release step needs codesign" in acknowledged.warnings[0],
+        )
+
+        scoped = _local_settings_audit(
+            root,
+            {
+                "_ack_policy_overrides": [
+                    "sandbox.allowUnsandboxedCommands: fixture release step needs codesign"
+                ],
+                "sandbox": {
+                    "allowUnsandboxedCommands": True,
+                    "filesystem": {"allowWrite": [git_entry]},
+                },
+            },
+        )
+        test.true(
+            "an acknowledgement downgrades only the key it names",
+            len(scoped.errors) == 1
+            and len(scoped.warnings) == 1
+            and git_entry in scoped.errors[0],
+        )
+
+        for label, entry in (
+            ("bare key", "sandbox.allowUnsandboxedCommands"),
+            ("empty reason", "sandbox.allowUnsandboxedCommands:   "),
+        ):
+            reasonless = _local_settings_audit(
+                root,
+                {
+                    "_ack_policy_overrides": [entry],
+                    "sandbox": {"allowUnsandboxedCommands": True},
+                },
+            )
+            test.equal(
+                f"a reasonless acknowledgement ({label}) mutes nothing",
+                reasonless.warnings,
+                [],
+            )
+            test.true(
+                f"a reasonless acknowledgement ({label}) fails twice over",
+                len(reasonless.errors) == 2
+                and any("records no reason" in error for error in reasonless.errors),
+            )
+
+        mistyped = _local_settings_audit(
+            root,
+            {
+                "_ack_policy_overrides": ["sandbox.allowUnsandboxed: typo"],
+                "sandbox": {"allowUnsandboxedCommands": True},
+            },
+        )
+        test.true(
+            "an acknowledgement naming an unaudited key cannot silence a rule",
+            len(mistyped.errors) == 2
+            and any("unaudited key" in error for error in mistyped.errors),
+        )
+
+        clean = _local_settings_audit(
+            root,
+            {
+                "permissions": {"allow": []},
+                "sandbox": {
+                    "enabled": True,
+                    "network": {"allowedDomains": ["github.com"]},
+                    "filesystem": {
+                        "allowWrite": ["/Users/fixture/.cargo"],
+                        "allowRead": ["/Users/fixture/.config/gh"],
+                    },
+                },
+            },
+        )
+        test.equal(
+            "a widening-only local override passes",
+            (clean.errors, clean.warnings),
+            ([], []),
+        )
+        test.true(
+            "a passing local override records a positive check",
+            any("preserves the declared posture" in check for check in clean.checks),
+        )
+
+        def audit_raw_override(text: str) -> config_audit.Audit:
+            (root / ".claude" / "settings.local.json").write_text(text, encoding="utf-8")
+            audit = config_audit.Audit()
+            original_root = config_audit.ROOT
+            config_audit.ROOT = root
+            try:
+                config_audit._local_settings(
+                    {
+                        ".claude/settings.json": copy.deepcopy(
+                            LOCAL_SETTINGS_TRACKED_FIXTURE
+                        )
+                    },
+                    audit,
+                )
+            finally:
+                config_audit.ROOT = original_root
+            return audit
+
+        unparseable = audit_raw_override("{ not json")
+        test.true(
+            "an unparseable local override fails instead of being skipped",
+            len(unparseable.errors) == 1 and "invalid JSON" in unparseable.errors[0],
+        )
+        for label, text in (("null", "null"), ("array", "[]")):
+            non_object = audit_raw_override(text)
+            test.true(
+                f"a non-object local override ({label}) fails exactly once",
+                len(non_object.errors) == 1
+                and "must contain a JSON object" in non_object.errors[0],
+            )
+
+
 def main() -> int:
     test = Tests()
     open_branch_ownership_cases(test)
@@ -7133,6 +7397,7 @@ def main() -> int:
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
     plan_and_probe_cases(test)
+    local_settings_policy_cases(test)
     clean_cases(test)
     lock_review_scope_prompt_cases(test)
     egress_review_scope_prompt_cases(test)
