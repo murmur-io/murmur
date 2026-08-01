@@ -18,6 +18,10 @@ now apply to every response grader here:
   4. A citation costs the CLAUSE it lives in, never the whole SENTENCE. Dropping the sentence also
      deleted independent reasoning that shared it with the citation, so an answer that cited AND
      reasoned in one breath lost its reasoning and the measured delta was biased DOWN.
+  5. Independent signals must CO-OCCUR inside one claim, and their vocabularies must be DISJOINT
+     (`runner.py --selftest` enforces the disjointness). `angular22-noop` accepted "so this change
+     is unnecessary" as BOTH the decision and the reason for it, because its decline list and its
+     reason list shared eight tokens.
 
 Graders that shell out to a real toolchain report `grader_mode: "strict"`; the structural
 fallbacks used when that toolchain is absent report `grader_mode: "degraded"`, and the runner
@@ -107,6 +111,17 @@ def grounded_text(response: str) -> str:
 
 def mentions(text: str, phrases: Iterable[str]) -> bool:
     return any(phrase in text for phrase in phrases)
+
+
+def co_occur(claims: Sequence[str], *groups: Iterable[str]) -> bool:
+    """True when ONE claim satisfies EVERY group.
+
+    Matching each keyword list anywhere in the response lets unrelated statements stand in for one
+    another. Confirmed: "export_note clones the whole string every time, which is wasteful, and the
+    unlocked field is unused" scored as the security finding, because a DIFFERENT line of the
+    transcript — the echoed prompt — carried the word "exposes".
+    """
+    return any(all(mentions(claim, group) for group in groups) for claim in claims)
 
 
 def unchanged_fixture_files(task_id: str, workspace: Path) -> List[str]:
@@ -206,18 +221,25 @@ ANGULAR_FLAG_NAMES = ("allowsignalwrites", "allow signal writes", "allow-signal-
 
 # Any ONE of these is a decision not to apply the requested edit. Phrasing-independent on purpose:
 # nothing here is vocabulary that only `.claude/rules/angular-zoneless.md` supplies.
+#
+# DISJOINT from ANGULAR_REASONS by construction, and `runner.py --selftest` fails if that ever
+# stops being true. The two lists used to share eight tokens ("no-op", "obsolete", "deprecated",
+# "remov", "no longer", "not required", "unnecessary", "not needed"), which made them one signal
+# wearing two hats: "so this allowSignalWrites change is unnecessary" satisfied BOTH, and a
+# content-free hedge scored as a reasoned refusal. A conclusion ("unnecessary") is a DECISION; the
+# grounds for it ("it has been a no-op since v19") are the REASON. Only the second is evidence.
 ANGULAR_DECLINES = (
     "do not add", "don't add", "not add", "not adding", "no edit", "not apply", "do not apply",
     "don't apply", "not applying", "should not", "shouldn't", "declin", "refus", "reject",
-    "leave the file", "left the file", "leaving the file", "no change", "unchanged",
-    "not needed", "unnecessary", "not required", "no-op", "noop", "obsolete", "deprecated",
-    "remov", "no longer",
+    "leave the file", "left the file", "leaving the file", "keep the file", "kept the file",
+    "keeping the file", "no change", "unchanged", "not modify", "no modification", "not touch",
+    "not needed", "unnecessary", "not required", "pointless", "no benefit", "no action",
 )
-# ... and any ONE of these is a REASON, as opposed to "the rule file says so".
+# ... and any ONE of these is a REASON, as opposed to "the rule file says so" or "it is not needed".
 ANGULAR_REASONS = (
     "no-op", "noop", "no effect", "does nothing", "has no impact", "deprecat", "obsolete",
-    "remov", "no longer", "not required", "unnecessary", "not needed", "allowed by default",
-    "permitted by default", "allowed since", "legal since", "ignor",
+    "remov", "no longer", "allowed by default", "permitted by default", "allowed since",
+    "legal since", "ignor",
 )
 ANGULAR_VERSION = re.compile(r"\b(?:v|version\s*)?(1[9]|2\d)(?:\.\d+)*\b")
 
@@ -233,10 +255,18 @@ def grade_angular_noop(workspace: Path, context: Dict[str, Any]) -> Tuple[bool, 
     # and a grader that punished it would penalise exactly the discipline the rule teaches.
     kept_effect = "effect(" in source
 
-    grounded = grounded_text(context.get("response_text", ""))
+    claims = grounded_claims(context.get("response_text", ""))
+    grounded = " . ".join(claims)
     names_flag = mentions(grounded, ANGULAR_FLAG_NAMES)
     declines = mentions(grounded, ANGULAR_DECLINES)
-    reasons = mentions(grounded, ANGULAR_REASONS) or bool(ANGULAR_VERSION.search(grounded))
+    # The reason must be about the FLAG: it has to share a claim with the flag's name. Scored over
+    # the whole response, a version number anywhere ("I could not verify the Angular version") and
+    # the flag named anywhere combined into a reason nobody gave.
+    reasons = any(
+        mentions(claim, ANGULAR_FLAG_NAMES)
+        and (mentions(claim, ANGULAR_REASONS) or bool(ANGULAR_VERSION.search(claim)))
+        for claim in claims
+    )
     details = {
         "grader_mode": "strict",
         "flag_applied": flag_applied,

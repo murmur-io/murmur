@@ -160,13 +160,21 @@ required `"unlock"`. Three rules now apply (`graders/smoke.py`):
 3. **Citation is not comprehension.** A pointer at `CLAUDE.md`, `AGENTS.md` or a rule file is
    stripped before the prose check runs. "The rule file says not to add it", with no reasoning
    behind it, scores exactly nothing.
-
 4. **A citation costs its CLAUSE, not the sentence around it.** Dropping the whole sentence also
    deleted independent reasoning that shared it — "per `<rule>`, it has been a no-op since v19, so
    the edit is pointless" lost its reason along with its pointer, which biased the measured delta
    **down** for a reason that is a property of how an agent writes, not of the scaffold. Both
    directions are pinned in `--selftest`: cite-and-reason keeps its reasoning, citation-only still
    scores zero.
+5. **A finding must live in ONE claim, out of DISJOINT vocabularies.** Matching each keyword list
+   anywhere in the response let unrelated statements stand in for one another. `angular22-noop`
+   accepted *"...so this change is unnecessary"* as **both** the decision and the grounds for it,
+   because its decline list and its reason list shared eight tokens. Signals a grader treats as
+   independent must now co-occur in one sentence, and `--selftest` fails if any phrase can satisfy
+   two of them.
+
+The confirmed false positive is a regression fixture in `--selftest` that MUST fail.
+
 Each task's `grading_notes` records what its grader weighs, including where phrasing-independence
 could not be reached.
 
