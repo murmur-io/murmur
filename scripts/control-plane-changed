@@ -32,10 +32,21 @@
 set -euo pipefail
 
 # Any path under these prefixes, or any of these exact files, is control plane.
+# This hardcoded list is the FLOOR, not the definition: `protected_paths` from
+# `.agents/harness/config.json` is unioned in below, so the guard's path set can
+# only ever be a superset of what the harness itself protects.
+#
+# `.github/` is here because `.github/workflows/ci.yml` is not merely CI plumbing:
+# `verifier.PROTOCOL_FILES` hashes its bytes into EVERY task's protocol bundle,
+# `verifier._harness_surface` matches it, and `config.json::protected_paths`
+# lists it. Splitting that workflow makes `protocol_bundle()` raise for every
+# task — breaking `agent-harness selftest --ci`, which is precisely the step
+# this guard decides whether to run.
 CONTROL_PLANE_PREFIXES=(
   ".agents/"
   ".claude/"
   ".codex/"
+  ".github/"
   "scripts/"
   "eval/agents/"
 )
@@ -64,19 +75,52 @@ run_everything() {
   exit 0
 }
 
+# `protected_paths` from the harness config, one per line. The guard and the
+# harness must not be able to disagree about what the control plane IS, and they
+# already did: `.github/workflows` was protected there and absent here, so a
+# workflow-only diff skipped the very selftests a workflow rename breaks.
+# Reading the list makes drift impossible in the direction that matters — an
+# entry added there can only ever ADD work here. Every failure mode (no python3,
+# unreadable/malformed config, missing key) yields an empty list and leaves the
+# hardcoded floor in charge, which is the same fail-safe posture as `default_base`.
+config_protected_paths() {
+  python3 -c 'import json,pathlib,sys
+try:
+    document = json.loads(pathlib.Path(".agents/harness/config.json").read_text(encoding="utf-8"))
+    entries = document.get("protected_paths")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, str) and entry and "\n" not in entry:
+                sys.stdout.write(entry.strip("/") + "\n")
+except Exception:
+    pass' 2>/dev/null || true
+}
+
 path_is_control_plane() {
-  local candidate="$1" prefix file
+  local candidate="$1" prefix file protected
   for prefix in "${CONTROL_PLANE_PREFIXES[@]}"; do
     case "$candidate" in "$prefix"*) return 0 ;; esac
   done
   for file in "${CONTROL_PLANE_FILES[@]}"; do
     [ "$candidate" = "$file" ] && return 0
   done
+  # A protected entry may name a file or a directory, so match the path exactly
+  # or as a directory prefix — never as a bare string prefix, which would let
+  # `scripts/agent-harness` claim `scripts/agent-harness-unrelated`.
+  for protected in "${CONTROL_PLANE_PROTECTED[@]+"${CONTROL_PLANE_PROTECTED[@]}"}"; do
+    [ "$candidate" = "$protected" ] && return 0
+    case "$candidate" in "$protected"/*) return 0 ;; esac
+  done
   return 1
 }
 
 decide() {
   local base_ref base_sha merge_base head_ref changed path
+
+  CONTROL_PLANE_PROTECTED=()
+  while IFS= read -r path; do
+    [ -n "$path" ] && CONTROL_PLANE_PROTECTED+=("$path")
+  done < <(config_protected_paths)
 
   command -v git >/dev/null 2>&1 || run_everything "git is not on PATH"
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -119,9 +163,18 @@ except Exception:
   # `git diff <commit>` already compares the WORKING TREE, so unstaged edits are
   # covered; untracked files are not, and a brand-new control-plane file is
   # exactly the case that must not slip through.
+  #
+  # `--no-renames` is load-bearing, not tidiness. With rename detection on (the
+  # default) git collapses a rename into ONE entry naming only the DESTINATION,
+  # so `git mv .agents/harness/x.py src/app/x.py` reports nothing but
+  # `src/app/x.py` and reads as a product-only diff — while it has in fact
+  # DELETED a control-plane file. A pure delete was already caught; renames were
+  # the hole, i.e. exactly the refactor shape where the selftests matter most.
+  # Every other exact-diff computation in this repo already passes it (see
+  # `verifier.snapshot_scoped_diff`, `verify_v2_evidence`, `verify_v2_committed`).
   if ! changed="$(
     {
-      git diff --name-only -z "$merge_base" -- 2>/dev/null || exit 1
+      git diff --name-only -z --no-renames "$merge_base" -- 2>/dev/null || exit 1
       git ls-files --others --exclude-standard -z 2>/dev/null || exit 1
     } | tr '\0' '\n'
   )"; then
@@ -271,6 +324,52 @@ selftest() {
          "$script" --quiet )
   }
   expect "bogus base override runs everything" 0 bogus_base
+
+  # 12. A control-plane file RENAMED OUT of the control plane runs everything.
+  #     `git diff --name-only` collapses a rename into a SINGLE entry naming only
+  #     the DESTINATION, so without `--no-renames` the deleted control-plane
+  #     source path is invisible and `git mv .agents/harness/x.py src/app/x.py`
+  #     reads as a product-only diff. A pure delete was already caught; the hole
+  #     was specific to renames, i.e. exactly the refactor shape where the
+  #     selftests are most wanted.
+  make_repo "$tmp/renamed"
+  printf 'harness helper\n' > "$tmp/renamed/.agents/harness/helper.py"
+  git -C "$tmp/renamed" add -A
+  git -C "$tmp/renamed" commit --quiet -m "helper"
+  git -C "$tmp/renamed" branch -f murmur-base HEAD
+  git -C "$tmp/renamed" mv .agents/harness/helper.py src/app/helper.py
+  git -C "$tmp/renamed" commit --quiet -m "move the helper out of the harness"
+  expect "control-plane file renamed out runs everything" 0 \
+    run_in "$tmp/renamed" "$script" --quiet
+
+  # 13. `.github/**` is control plane. `.github/workflows/ci.yml` is hashed into
+  #     every task's protocol bundle (verifier.PROTOCOL_FILES) and is listed in
+  #     config.json::protected_paths, so a workflow-only diff can absolutely
+  #     break `agent-harness selftest --ci` — the very step this guard gates.
+  make_repo "$tmp/workflow"
+  mkdir -p "$tmp/workflow/.github/workflows"
+  printf 'name: ci\n' > "$tmp/workflow/.github/workflows/ci.yml"
+  git -C "$tmp/workflow" add -A
+  git -C "$tmp/workflow" commit --quiet -m "workflow"
+  expect "workflow-only diff runs everything" 0 \
+    run_in "$tmp/workflow" "$script" --quiet
+
+  # 14. The path set is a SUPERSET of `protected_paths`, read from the same
+  #     config the harness itself enforces, so the two cannot drift apart again.
+  #     This fixture protects a path that no hardcoded prefix covers, so it fails
+  #     unless the derivation is live.
+  make_repo "$tmp/derived"
+  printf '%s\n' \
+    '{"default_base": "murmur-base", "protected_paths": ["docs/protocol.md"]}' \
+    > "$tmp/derived/.agents/harness/config.json"
+  git -C "$tmp/derived" commit --quiet -am "protect a docs path"
+  git -C "$tmp/derived" branch -f murmur-base HEAD
+  mkdir -p "$tmp/derived/docs"
+  printf 'protocol\n' > "$tmp/derived/docs/protocol.md"
+  git -C "$tmp/derived" add -A
+  git -C "$tmp/derived" commit --quiet -m "touch the protected docs path"
+  expect "config protected_paths entry runs everything" 0 \
+    run_in "$tmp/derived" "$script" --quiet
 
   echo "control-plane guard selftest: $((total - failures))/$total assertions passed"
   [ "$failures" = "0" ] || return 1
