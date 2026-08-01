@@ -143,6 +143,35 @@ and all six are spent (three of them on the `dontAsk` defect below). The claim o
 therefore *"the control arm demonstrably fails"*, which is what makes the task capable of moving —
 **not** *"the scaffold fixes it"*, which needs the `rules`/`full` arms and is still unrun.
 
+### First full run — 2026-08-01, after the echo filter was unbiased
+
+`matrix.py --task additive-migration --scaffold none --scaffold full --repeat 3 --seed 20260801`,
+six live calls, 1886 s, records in `results/additive-none-vs-full.json`:
+
+```
+task                claude/none  claude/full
+additive-migration  3/3          3/3          ->  +0% points
+```
+
+**Read this together with the n=1 result above, not instead of it.** Across four control-arm runs
+the model dropped the column once and preserved it three times. So the honest statement is neither
+"the task ceilings" nor "the task separates" — it is that the failure is **intermittent at roughly
+one run in four**, and a three-run arm cannot resolve a delta against a base rate that low. The
+single run that produced `it moves` was not wrong; it was one draw from a distribution nobody had
+sampled.
+
+That is the finding, and it is about the METHOD rather than about the rule: **a task whose control
+arm fails intermittently needs a repeat count set by its base rate**, and n=1 is capable of
+reporting either verdict for the same task on the same day. The task JSON's own
+`measurement_limit` predicted exactly this — "a cautious model may keep the old column unprompted,
+on general data-migration instinct rather than on anything from this repo".
+
+Before spending more calls here, raise `--repeat` until the control arm's failure rate stabilises
+(n=10 puts the standard error near 14 points at p=0.25, which is still coarse), or replace the task
+with one whose control arm fails reliably rather than occasionally. Do not quote the +0% above as
+evidence that the scaffold does not help: at n=3 per arm it is compatible with no effect and with a
+large effect alike.
+
 **Also learned, the expensive way:** the agent command this README documented could not write
 files. See the box below — three of the six live calls were spent discovering it, and the two
 `csp-style-src-nonce` runs made before it was found are void.
