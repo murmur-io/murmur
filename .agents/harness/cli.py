@@ -3992,8 +3992,14 @@ def cmd_metrics(args: argparse.Namespace) -> int:
 
     if args.limit < 1:
         raise runtime.HarnessError("metrics --limit must be positive")
+    stores = []
+    for value in args.store:
+        store = Path(value).expanduser()
+        if not store.is_dir():
+            raise runtime.HarnessError(f"metrics --store is not a directory: {value}")
+        stores.append(store.resolve())
     _, common = runtime.repo_context(Path.cwd())
-    report = harness_metrics.collect_metrics(common, limit=args.limit)
+    report = harness_metrics.collect_metrics(common, limit=args.limit, stores=stores)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
@@ -4085,6 +4091,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     metrics_parser.add_argument("--json", action="store_true")
     metrics_parser.add_argument("--limit", type=int, default=20)
+    # Repeatable. Defaults to this repo's own evidence store; point it at a
+    # driver clone's store to roll up the corpus that actually ran the reviews.
+    # Accepts the .git dir, the agent-harness store, its v2 dir, or the task root.
+    metrics_parser.add_argument("--store", action="append", default=[])
     metrics_parser.set_defaults(handler=cmd_metrics)
     selftest_parser = subparsers.add_parser(
         "selftest", help="run deterministic lifecycle and fault tests"
