@@ -15,6 +15,12 @@ now apply to every response grader here:
   3. Reject an answer whose only support is "the rule file says so". CLAUSES that merely cite
      `CLAUDE.md` / `AGENTS.md` / `.claude/rules/*` are STRIPPED before the substance check runs, so
      a citation with no reasoning behind it scores exactly what it is worth: nothing.
+
+# One claim, not one blob (2026-08-01)
+
+Two further rules were added after a review found both prose graders passing answers that had not
+made the finding at all:
+
   4. A citation costs the CLAUSE it lives in, never the whole SENTENCE. Dropping the sentence also
      deleted independent reasoning that shared it with the citation, so an answer that cited AND
      reasoned in one breath lost its reasoning and the measured delta was biased DOWN.
@@ -107,8 +113,6 @@ def grounded_claims(response: str) -> List[str]:
 def grounded_text(response: str) -> str:
     """The surviving claims as one string, for checks that do not need claim boundaries."""
     return " . ".join(grounded_claims(response))
-
-
 
 
 def mentions(text: str, phrases: Iterable[str]) -> bool:
@@ -524,6 +528,9 @@ ANALYSIS_IGNORES = (
     "bypass", "fails to", "does not consult", "irrespective",
 )
 ANALYSIS_STATE = ("unlocked", "unlock", "lock", "sealed", "seal")
+# DISJOINT from every defect list above — `runner.py --selftest` fails if that stops being true.
+# "sealed note" / "locked content" used to live here, and each of them contains an ANALYSIS_STATE
+# token, so one phrase satisfied both the defect and the impact signal.
 ANALYSIS_IMPACT = (
     "leak", "disclos", "expos", "reveal", "readable", "visible", "sensitive", "confidential",
     "breach", "plaintext", "can read", "could read", "can be read", "anyone", "any caller",
@@ -550,7 +557,6 @@ def grade_analysis(workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str,
         claims, ("export_note",), ANALYSIS_IGNORES, ANALYSIS_STATE, ANALYSIS_IMPACT
     )
     touched = unchanged_fixture_files("analysis-only", workspace)
-
     details = {
         "grader_mode": "strict",
         "names_symbol": names_symbol,
