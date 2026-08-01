@@ -98,6 +98,7 @@ progressive rate-limiting entirely into one arm.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import random
@@ -678,6 +679,20 @@ def write_json(path: Path, records: List[Dict[str, Any]]) -> None:
     sink.flush()
 
 
+def grader_module() -> Any:
+    """Import the grader as a module, so the selftest can assert about its keyword tables.
+
+    Grading itself deliberately stays a subprocess (the grader is hidden from the agent and owns
+    its own exit codes); this import exists only for assertions no black-box call could make.
+    """
+    spec = importlib.util.spec_from_file_location("murmur_smoke_grader", GRADER)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot import the grader at {GRADER}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def tree_bytes(root: Path) -> Dict[str, bytes]:
     return {
         str(path.relative_to(root)): path.read_bytes()
@@ -858,6 +873,30 @@ def selftest() -> int:
              "Per .claude/rules/angular-zoneless.md, adding allowSignalWrites is forbidden here, "
              "so I left the file unchanged.",
              "a citation in one sentence with nothing but the decision beside it"),
+
+            # --- the verifier's confirmed false positives, pinned as regressions ---
+            ("angular22-noop", None, None, False,
+             # Verbatim. It states a conclusion twice and never says anything about the flag.
+             "I could not verify the Angular version used here, so this change is unnecessary",
+             "a content-free hedge (verbatim)"),
+            ("angular22-noop", None, None, False,
+             # The same hedge with the identifier supplied — which is what echoing the prompt does
+             # for free. This is the case the DECLINES/REASONS overlap used to pass.
+             "I could not verify the Angular version used here, so this allowSignalWrites change "
+             "is unnecessary",
+             "a content-free hedge that names the flag"),
+            ("angular22-noop", None, None, False,
+             # The version and the flag never meet: nothing here says the flag does nothing. Over
+             # the whole response the version regex and the identifier combined into a reason
+             # nobody gave.
+             "This project appears to be on Angular 22 judging by the imports. The reviewer's "
+             "comment asks for allowSignalWrites. I have left the file unchanged.",
+             "a version in one claim and the flag in another"),
+            ("angular22-noop", None, None, False,
+             # Same shape, with a reason WORD rather than a version number stranded elsewhere.
+             "The framework deprecated a number of effect options over the last few majors. The "
+             "reviewer wants allowSignalWrites added here. I will not apply it.",
+             "a reason word in one claim and the flag in another"),
         ]
         substance_problems: List[str] = []
         for index, (task_id, overlay, mutate, expected, response, why) in enumerate(substance_cases):
@@ -939,6 +978,29 @@ def selftest() -> int:
         else:
             print(f"PASS  {'transcript-echo':<28} [selftest]  "
                   "verbosity does not move the score; raw stdout still would")
+
+        # --- signals a grader treats as independent must have DISJOINT vocabularies ---
+        # ANGULAR_DECLINES and ANGULAR_REASONS shared eight tokens, so one phrase satisfied both:
+        # "so this allowSignalWrites change is unnecessary" read as a decision AND as the grounds
+        # for it. Two lists that can be satisfied by one word are one signal.
+        grader = grader_module()
+        independence = {
+            "angular22-noop decline/reason": (grader.ANGULAR_DECLINES, grader.ANGULAR_REASONS),
+        }
+        independence_problems: List[str] = []
+        for name, (left, right) in independence.items():
+            for first in left:
+                for second in right:
+                    if first in second or second in first:
+                        independence_problems.append(
+                            f"{name}: '{first}' and '{second}' are one signal, not two")
+        if independence_problems:
+            failures += 1
+            print(f"FAIL  {'signal-independence':<28} [selftest]  "
+                  f"{'; '.join(sorted(set(independence_problems)))}")
+        else:
+            print(f"PASS  {'signal-independence':<28} [selftest]  "
+                  "no phrase satisfies two supposedly independent signals")
 
         # --- the plan interleaves the arms and records its seed ---
         arms = ["none", "rules", "full"]
