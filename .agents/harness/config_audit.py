@@ -340,6 +340,47 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
         "review authority names only real review kinds",
         "review_authority keys must be planned review kinds with blocking/advisory values",
     )
+    # `review_authority` decides whether a planned specialist can block. `risk_classification`
+    # decides whether it is PLANNED AT ALL — and it was unpinned, so both guards above could hold
+    # while a lock-touching diff quietly stopped selecting `lock-security`. Delete one glob and
+    # `verifier.actual_risks` reports no lock risk, the plan carries `combined` only, and the change
+    # reaches PASS with its Rust suite as the sole gate.
+    #
+    # Pinned as the SYMBOL HOMES rather than the whole list, so the globs stay free to grow. These
+    # are the files where the invariants actually live, and a diff touching them must always pull
+    # the matching specialist:
+    #   crypto.rs / storage/**   the seal itself and every content read
+    #   commands/mod.rs          `meeting_is_unlocked` and `seal_folder_extras` are DEFINED here
+    #   commands/meetings.rs     the masked DTO
+    #   secrets/**               the KEK/DEK custody path
+    #   summarize/**             the redaction firewall and every provider call
+    #   share/**                 the E2EE wire format, shared with the server repo
+    classification = (
+        config.get("risk_classification") if isinstance(config, dict) else None
+    )
+    invariant_homes = {
+        "lock": (
+            "src-tauri/src/crypto.rs",
+            "src-tauri/src/secrets/**",
+            "src-tauri/src/storage/**",
+            "src-tauri/src/commands/mod.rs",
+            "src-tauri/src/commands/meetings.rs",
+        ),
+        "egress": ("src-tauri/src/summarize/**",),
+        "protocol": ("src-tauri/src/share/**",),
+    }
+    missing = []
+    if isinstance(classification, dict):
+        for risk, globs in invariant_homes.items():
+            declared = classification.get(risk)
+            declared = set(declared) if isinstance(declared, list) else set()
+            missing += [f"{risk}:{glob}" for glob in globs if glob not in declared]
+    audit.require(
+        isinstance(classification, dict) and not missing,
+        "risk classification still covers every home of a gated invariant",
+        "risk_classification must keep the invariant homes: "
+        + (", ".join(missing) if missing else "<unreadable risk_classification>"),
+    )
     canonical = config.get("canonical_checks", {}) if isinstance(config, dict) else {}
     risk_evidence = config.get("risk_required_evidence", {}) if isinstance(config, dict) else {}
     required_check_ids = {
