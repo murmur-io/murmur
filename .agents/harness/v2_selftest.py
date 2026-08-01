@@ -1673,10 +1673,28 @@ def verdict_cases(test: Tests) -> None:
         "NEEDS_EVIDENCE",
     )
 
-    # Review authority: the generalist is advisory, the risk specialists still
-    # gate. `review_result_state` stays kind-agnostic above; only the
-    # aggregation call site filters by authority.
+    # Review authority: a kind the config demotes records but does not gate, a
+    # kind it binds gates, and an unnamed kind fails closed. `review_result_state`
+    # stays kind-agnostic above; only the aggregation call site filters by
+    # authority.
+    #
+    # Which kinds the SHIPPED config demotes is a measured decision that has
+    # already flipped once, so these assertions build their own fixtures:
+    # `demoted_config` demotes the generalist, `gating_config` binds it. Reading
+    # the shipped decision here would empty every one of them the day it
+    # changes — exactly what happened when `combined` went back to blocking. The
+    # shipped decision gets one explicit pin of its own, below.
     config = runtime.load_config()
+    demoted_config = copy.deepcopy(config)
+    demoted_config["review_authority"] = {
+        **config["review_authority"],
+        "combined": verifier.ADVISORY_AUTHORITY,
+    }
+    gating_config = copy.deepcopy(config)
+    gating_config["review_authority"] = {
+        **config["review_authority"],
+        "combined": verifier.BLOCKING_AUTHORITY,
+    }
     green_check = {"id": "rust-lib", "evidence": {"passed": True, "outcome": "PASS"}}
 
     def review(kind: str, result: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1687,16 +1705,25 @@ def verdict_cases(test: Tests) -> None:
         verifier.aggregate_verdict(
             [green_check],
             [review("combined", major), review("lock-security", base)],
-            config,
+            demoted_config,
         )[0],
         "PASSED",
+    )
+    test.equal(
+        "VERDICT blocking combined MAJOR forbids PASS",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", major), review("lock-security", base)],
+            gating_config,
+        )[0],
+        "NEEDS_FIX",
     )
     test.equal(
         "VERDICT blocking specialist BLOCKER still forbids PASS",
         verifier.aggregate_verdict(
             [green_check],
             [review("combined", base), review("lock-security", blocker)],
-            config,
+            demoted_config,
         )[0],
         "NEEDS_FIX",
     )
@@ -1705,38 +1732,65 @@ def verdict_cases(test: Tests) -> None:
         verifier.aggregate_verdict(
             [green_check],
             [review("combined", gap), review("egress-security", base)],
-            config,
+            demoted_config,
         )[0],
         "PASSED",
+    )
+    test.equal(
+        "VERDICT blocking combined proof gap forbids PASS",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", gap), review("egress-security", base)],
+            gating_config,
+        )[0],
+        "NEEDS_EVIDENCE",
     )
     test.equal(
         "VERDICT blocking specialist proof gap still forbids PASS",
         verifier.aggregate_verdict(
             [green_check],
             [review("combined", base), review("egress-security", gap)],
-            config,
+            demoted_config,
         )[0],
         "NEEDS_EVIDENCE",
     )
     test.equal(
         "VERDICT unknown review kind fails closed as blocking",
         verifier.aggregate_verdict(
-            [green_check], [review("future-security", blocker)], config
+            [green_check], [review("future-security", blocker)], demoted_config
         )[0],
         "NEEDS_FIX",
     )
+    # The shipped decision, pinned once. Every mechanism assertion in this group
+    # runs on its own fixture and stays green whichever way this pin goes, so a
+    # future demotion has to edit this line and the matching `config_audit`
+    # requirement on purpose. `config_audit` owns the enforcing copy; this one
+    # keeps the harness selftest honest about which config it ships with.
     test.equal(
-        "VERDICT configured specialist authority is blocking",
-        [
-            verifier.review_authority(kind, config)
-            for kind in ("lock-security", "egress-security", "protocol-security")
-        ],
-        [verifier.BLOCKING_AUTHORITY] * 3,
+        "VERDICT every shipped review kind is blocking",
+        {
+            kind: verifier.review_authority(kind, config)
+            for kind in (
+                "combined",
+                "lock-security",
+                "egress-security",
+                "protocol-security",
+            )
+        },
+        {
+            "combined": verifier.BLOCKING_AUTHORITY,
+            "lock-security": verifier.BLOCKING_AUTHORITY,
+            "egress-security": verifier.BLOCKING_AUTHORITY,
+            "protocol-security": verifier.BLOCKING_AUTHORITY,
+        },
     )
     test.equal(
-        "VERDICT combined authority is advisory",
-        verifier.review_authority("combined", config),
-        verifier.ADVISORY_AUTHORITY,
+        "VERDICT combined authority follows the config that names it",
+        (
+            verifier.review_authority("combined", demoted_config),
+            verifier.review_authority("combined", gating_config),
+        ),
+        (verifier.ADVISORY_AUTHORITY, verifier.BLOCKING_AUTHORITY),
     )
     test.equal(
         "VERDICT an authority-free config keeps every review blocking",
@@ -1759,11 +1813,17 @@ def verdict_cases(test: Tests) -> None:
             [
                 item["review"]
                 for item in verifier.advisory_findings(
-                    [green_check], mixed, config
+                    [green_check], mixed, demoted_config
+                )
+            ],
+            [
+                item["review"]
+                for item in verifier.advisory_findings(
+                    [green_check], mixed, gating_config
                 )
             ],
         ),
-        (["combined", "lock-security"], ["combined"]),
+        (["combined", "lock-security"], ["combined"], []),
     )
     test.equal(
         "VERDICT an authority-free config projects no advisory finding",
@@ -1773,9 +1833,13 @@ def verdict_cases(test: Tests) -> None:
 
     # Demotion removes a gate; it must never remove the LAST one. A docs-only
     # plan derives zero checks and only the generalist, so demoting it there
-    # would mint a PASS receipt on which nothing could have refused.
+    # would mint a PASS receipt on which nothing could have refused. Every
+    # assertion below runs on `demoted_config`, because the rule it pins only
+    # has anything to say about a config that demotes something: under a config
+    # where every kind gates, each of them would hold for a reason that has
+    # nothing to do with the last-gate rule.
     docs_checks, docs_reviews, docs_risks = verifier.derive_profile(
-        ["docs/architecture.md"], [], config, reviewer="codex"
+        ["docs/architecture.md"], [], demoted_config, reviewer="codex"
     )
     test.equal(
         "PROFILE a docs-only plan derives no check and only the generalist",
@@ -1784,32 +1848,38 @@ def verdict_cases(test: Tests) -> None:
     )
     test.equal(
         "VERDICT the sole reviewer of a check-free plan keeps its gate",
-        verifier.gating_review_kinds(docs_checks, docs_reviews, config),
+        verifier.gating_review_kinds(docs_checks, docs_reviews, demoted_config),
         ["combined"],
     )
     test.equal(
         "VERDICT a check-free plan cannot pass over a generalist BLOCKER",
-        verifier.aggregate_verdict([], [review("combined", blocker)], config),
+        verifier.aggregate_verdict(
+            [], [review("combined", blocker)], demoted_config
+        ),
         ("NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"),
     )
     test.equal(
         "VERDICT a check-free plan cannot pass over a generalist proof gap",
-        verifier.aggregate_verdict([], [review("combined", gap)], config)[0],
+        verifier.aggregate_verdict(
+            [], [review("combined", gap)], demoted_config
+        )[0],
         "NEEDS_EVIDENCE",
     )
     test.equal(
         "VERDICT a check-free plan records no finding as advisory",
-        verifier.advisory_findings([], [review("combined", blocker)], config),
+        verifier.advisory_findings(
+            [], [review("combined", blocker)], demoted_config
+        ),
         [],
     )
     test.equal(
         "VERDICT one deterministic check is enough to demote the generalist",
         (
             verifier.gating_review_kinds(
-                [green_check], [review("combined", blocker)], config
+                [green_check], [review("combined", blocker)], demoted_config
             ),
             verifier.aggregate_verdict(
-                [green_check], [review("combined", blocker)], config
+                [green_check], [review("combined", blocker)], demoted_config
             )[0],
         ),
         ([], "PASSED"),
@@ -1817,13 +1887,15 @@ def verdict_cases(test: Tests) -> None:
     test.equal(
         "VERDICT a specialist gate is enough to demote the generalist",
         verifier.gating_review_kinds(
-            [], [review("combined", blocker), review("lock-security", base)], config
+            [],
+            [review("combined", blocker), review("lock-security", base)],
+            demoted_config,
         ),
         ["lock-security"],
     )
     test.equal(
         "VERDICT no check and no review still refuses to certify",
-        verifier.aggregate_verdict([], [], config),
+        verifier.aggregate_verdict([], [], demoted_config),
         ("NEEDS_EVIDENCE", "no blocking check or review evidence exists"),
     )
     # The PASS reason is the only prose `status` and the `verify` status JSON
@@ -1831,7 +1903,7 @@ def verdict_cases(test: Tests) -> None:
     test.equal(
         "VERDICT a PASS reason names the advisory findings it did not gate on",
         verifier.aggregate_verdict(
-            [green_check], [review("combined", blocker)], config
+            [green_check], [review("combined", blocker)], demoted_config
         )[1],
         "all blocking checks and reviews passed; 1 advisory finding(s) recorded "
         "(1 MAJOR/BLOCKER)",
@@ -1839,7 +1911,7 @@ def verdict_cases(test: Tests) -> None:
     test.equal(
         "VERDICT a finding-free PASS keeps its unqualified reason",
         verifier.aggregate_verdict(
-            [green_check], [review("combined", base)], config
+            [green_check], [review("combined", base)], demoted_config
         )[1],
         "all planned checks and reviews passed",
     )
@@ -1899,7 +1971,9 @@ def verdict_cases(test: Tests) -> None:
     # The check-free surfaces a reviewer named — the Angular app shell, the
     # Tauri build script, assets, and the landing page — keep a gate through
     # the same rule, without trading their one semantic reviewer for a
-    # syntactic check that cannot see what the reviewer was hired to see.
+    # syntactic check that cannot see what the reviewer was hired to see. These
+    # too run on `demoted_config`: it is the config that could strip their only
+    # gate, so it is the config that proves the rule holds for real repo paths.
     for path in (
         "src/index.html",
         "src-tauri/build.rs",
@@ -1908,7 +1982,7 @@ def verdict_cases(test: Tests) -> None:
         "src-tauri/entitlements.plist",
     ):
         check_profile, review_profile, _ = verifier.derive_profile(
-            [path], [], config, reviewer="codex"
+            [path], [], demoted_config, reviewer="codex"
         )
         test.equal(
             f"VERDICT {path} keeps a gate that can refuse a PASS",
@@ -1916,7 +1990,7 @@ def verdict_cases(test: Tests) -> None:
                 bool(check_profile)
                 or bool(
                     verifier.gating_review_kinds(
-                        check_profile, review_profile, config
+                        check_profile, review_profile, demoted_config
                     )
                 ),
                 verifier.aggregate_verdict(
@@ -1925,7 +1999,7 @@ def verdict_cases(test: Tests) -> None:
                         for item in check_profile
                     ],
                     [review(item["kind"], blocker) for item in review_profile],
-                    config,
+                    demoted_config,
                 )[0],
             ),
             (True, "NEEDS_FIX"),
@@ -2809,14 +2883,22 @@ def probe_precedence_flow_cases(test: Tests) -> None:
         selftest_config["canonical_checks"]["npm-lock"] = (
             "python3 -c 'print(\"PLANNED_\" + \"NPM_LOCK_STREAM\")'"
         )
+        # Both authorities are pinned on fixtures, never inherited from the
+        # shipped config: this group needs one config where the generalist gates
+        # and one where it is demoted, and which of the two the repo ships is a
+        # decision that has already flipped once.
         advisory_config = copy.deepcopy(selftest_config)
+        advisory_config["review_authority"]["combined"] = (
+            verifier.ADVISORY_AUTHORITY
+        )
         # This group pins the probe-precedence machinery, and only a BLOCKING
         # reviewer can drive it. The fixture owns one non-risk path, so its only
-        # planned review is `combined`, which the corpus measurement demoted to
-        # advisory. Bind it back to blocking here so these assertions keep
-        # testing what they were written to test; the advisory path gets its own
-        # dedicated case at the end of this group.
-        selftest_config["review_authority"]["combined"] = "blocking"
+        # planned review is `combined`; bind it to blocking here so these
+        # assertions keep testing what they were written to test. The advisory
+        # path gets its own dedicated case at the end of this group.
+        selftest_config["review_authority"]["combined"] = (
+            verifier.BLOCKING_AUTHORITY
+        )
         runtime.load_config = lambda: copy.deepcopy(selftest_config)
         os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = "PASS"
         os.environ[
@@ -4182,7 +4264,7 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                 == source_result_sha256,
             )
 
-            # Under the shipped authority the same reviewer is advisory: its
+            # Under a config that demotes it, the same reviewer is advisory: its
             # probe request stays in the receipt, but it can no longer spend a
             # runner-owned execution or force another full review round.
             advisory_worktree = root / "advisory-task" / "meetnotes"

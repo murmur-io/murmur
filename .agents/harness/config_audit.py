@@ -303,18 +303,33 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
     )
     authority = config.get("review_authority") if isinstance(config, dict) else None
     risk_reviews = config.get("risk_reviews") if isinstance(config, dict) else None
+    # Demoting a reviewer is a measured decision, and the first one shipped was
+    # measured against the wrong threshold: it ranked reviewers by BLOCKER count
+    # while the gate that actually forbids a PASS reads
+    # `verifier.SEVERE_FINDINGS` (MAJOR + BLOCKER). Re-counted on that metric
+    # over the same 232-review corpus, the `combined` generalist had the HIGHEST
+    # density of PASS-forbidding findings, not the lowest: 116 severe findings
+    # over 105 reviews (1.10 each) against 30/74 (0.41) for egress-security and
+    # 7/53 (0.13) for lock-security. So every planned review kind ships blocking,
+    # and a future demotion has to change this pin deliberately rather than
+    # inherit one by editing a single config value.
     audit.require(
         isinstance(authority, dict)
         and isinstance(risk_reviews, dict)
         and all(
             authority.get(kind) == "blocking"
-            for kind in ("lock-security", "egress-security", "protocol-security")
+            for kind in (
+                "combined",
+                "lock-security",
+                "egress-security",
+                "protocol-security",
+            )
         )
         and all(
             authority.get(kind) == "blocking" for kind in risk_reviews.values()
         ),
-        "risk specialists retain blocking review authority",
-        "every risk_reviews specialist must stay blocking in review_authority",
+        "every planned review kind retains blocking review authority",
+        "review_authority must keep combined and every risk_reviews specialist blocking",
     )
     audit.require(
         isinstance(authority, dict)
