@@ -6899,6 +6899,48 @@ def commit_recovery_cases(test: Tests) -> None:
         )
 
 
+def build_root_isolation_cases(test: Tests) -> None:
+    """The per-task Cargo build root is load-bearing, not an accident.
+
+    Sharing `cargo_target`/`cargo_home` across tasks is the single largest
+    latency lever on paper and an attestation defect in practice: reproduced on
+    this machine with zero concurrency, two checkouts of one workspace-relative
+    layout collide in a shared `CARGO_TARGET_DIR` and cargo reports one task
+    `Fresh` over the other task's compiled artifact (see `_check_runtime_paths`
+    and `docs/research/2026-08-01-harness-plan-verification.md` §8.1). The
+    machine-wide flock cannot help — the defect is sequential.
+
+    These assertions exist so the next attempt fails RED here instead of
+    silently emitting a receipt that binds diff A to a binary built from diff B.
+    `xdg_cache`, `npm_cache` and `clang_cache` are deliberately NOT pinned: they
+    are content-addressed or invocation-hashed, and the supported route to
+    sharing compile work (sccache into a private target dir) must stay open.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-buildroot-") as raw:
+        root = Path(raw)
+        first_dir = root / "task-a"
+        second_dir = root / "task-b"
+        first = runtime._check_runtime_paths(first_dir)
+        second = runtime._check_runtime_paths(second_dir)
+        for key in ("cargo_home", "cargo_target", "tmp"):
+            test.true(
+                f"BUILDROOT {key} is private to its own task directory",
+                first[key].resolve().is_relative_to(first_dir.resolve()),
+            )
+            test.true(
+                f"BUILDROOT {key} is never shared between two tasks",
+                first[key].resolve() != second[key].resolve(),
+            )
+        test.true(
+            "BUILDROOT no task path escapes into the shared resource root",
+            all(
+                path.resolve().is_relative_to(first_dir.resolve())
+                for path in first.values()
+            ),
+        )
+
+
 def plan_and_probe_cases(test: Tests) -> None:
     base = runtime.git(ROOT, "rev-parse", "HEAD")
     tree = runtime.git(ROOT, "rev-parse", "HEAD^{tree}")
@@ -8524,6 +8566,7 @@ def main() -> int:
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
+    build_root_isolation_cases(test)
     plan_and_probe_cases(test)
     local_settings_policy_cases(test)
     clean_cases(test)
