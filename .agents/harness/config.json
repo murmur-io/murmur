@@ -25,6 +25,12 @@
     "egress": "egress-security",
     "protocol": "protocol-security"
   },
+  "review_authority": {
+    "combined": "advisory",
+    "lock-security": "blocking",
+    "egress-security": "blocking",
+    "protocol-security": "blocking"
+  },
   "risk_required_evidence": {
     "lock": ["rust-lib"],
     "egress": ["rust-lib"],
