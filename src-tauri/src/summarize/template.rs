@@ -394,6 +394,7 @@ pub fn build_template(
     note_language: &str,
     labeled: bool,
     diarized_others: bool,
+    me_name: &str,
 ) -> String {
     let mut t = format!(
         "{}\n\n{}",
@@ -407,6 +408,24 @@ pub fn build_template(
         } else {
             speaker_attribution_directive_collapsed()
         });
+        // Naming the `me` lane is the one attendee fact that is KNOWN rather than inferred, so it
+        // is the one that may be written into `participants` on a collapsed-lane recording. It
+        // comes from configuration (`AppConfig::user_display_name`), never from the transcript,
+        // which is why it does not weaken the directive above: the far side stays un-named.
+        //
+        // This is the whole reason `participants` came out empty or as bare lane labels. The list
+        // has exactly one producer — the model's own front-matter — and the collapsed directive
+        // (correctly) forbids it from guessing personal names. Without a supplied name there was
+        // simply nothing true it was allowed to write.
+        let me_name = me_name.trim();
+        if !me_name.is_empty() {
+            t.push_str(&format!(
+                "\n\nIDENTITY: the `me` lane is {me_name} (supplied by the user, not inferred \
+from the transcript). Write `{me_name}` instead of the bare label `me` in the `participants` \
+front-matter, and you may use it when attributing what the `me` lane said. This changes NOTHING \
+about the other lane: never name anyone on the `others` side unless a lane tag establishes it."
+            ));
+        }
     }
     t
 }
@@ -1751,7 +1770,7 @@ mod tests {
         // Unlabeled (the default solo-`me` meeting): byte-identical to the base prompt, whatever the
         // lane-shape flag says — no tags in the feed ⇒ nothing to attribute.
         for diarized in [false, true] {
-            let unlabeled = build_template("standard", "auto", false, diarized);
+            let unlabeled = build_template("standard", "auto", false, diarized, "");
             assert_eq!(
                 unlabeled, base,
                 "unlabeled must be byte-identical to the pre-Tier-0 prompt (diarized={diarized})"
@@ -1759,7 +1778,7 @@ mod tests {
             assert!(!unlabeled.contains("SPEAKER ATTRIBUTION"));
         }
         // Labeled + DIARIZED: the base prompt PLUS the attribution directive instructing owner/speaker.
-        let labeled = build_template("standard", "auto", true, true);
+        let labeled = build_template("standard", "auto", true, true, "");
         assert!(
             labeled.starts_with(&base),
             "labeled prompt extends the base prompt"
@@ -1780,9 +1799,48 @@ mod tests {
     /// exact feed shape (an ordinary dual-stream call, distinct set {me, others}) received the
     /// diarized directive — the prompt that told the model to name participants it could not
     /// possibly identify.
+    /// The `participants` front-matter has exactly ONE producer — the model's own output — and on
+    /// a collapsed lane the directive (correctly) forbids it from guessing personal names. That is
+    /// why the list came out empty or as bare lane labels: there was nothing true it was allowed
+    /// to write. A configured display name is the one attendee fact that is KNOWN, so it is the
+    /// one that may be supplied — and it must not leak into the other lane.
+    #[test]
+    fn a_configured_display_name_names_the_me_lane_and_only_the_me_lane() {
+        let p = build_template("standard", "auto", true, false, "Jakub Gawronski");
+        assert!(
+            p.contains("the `me` lane is Jakub Gawronski"),
+            "a configured name must reach the prompt"
+        );
+        assert!(
+            p.contains("supplied by the user, not inferred"),
+            "the prompt must say the name is configuration, not a transcript inference"
+        );
+        assert!(
+            p.contains("never name anyone on the `others` side"),
+            "naming the me lane must not license naming the far side"
+        );
+        // The forbidding directive survives untouched alongside it.
+        assert!(
+            p.contains(
+                "NEVER attribute a statement, decision, key point, or action item to a personal NAME"
+            ),
+            "the no-fabrication rule for the collapsed lane must remain in force"
+        );
+    }
+
+    /// Whitespace is not a name: it must behave exactly like the unset default.
+    #[test]
+    fn a_blank_display_name_is_treated_as_unset() {
+        assert!(!build_template("standard", "auto", true, false, "   ").contains("IDENTITY:"));
+    }
+
     #[test]
     fn collapsed_lane_prompt_forbids_personal_name_attribution() {
-        let p = build_template("standard", "auto", true, false);
+        let p = build_template("standard", "auto", true, false, "");
+        assert!(
+            !p.contains("IDENTITY:"),
+            "with no configured name the note must keep the bare `me` lane label"
+        );
         assert!(
             p.contains("SPEAKER ATTRIBUTION"),
             "a collapsed lane still gets an attribution directive, just the forbidding one"
@@ -1824,7 +1882,7 @@ mod tests {
     /// RED against a fix that over-corrects by forbidding names everywhere.
     #[test]
     fn diarized_lane_prompt_keeps_existing_attribution_directive() {
-        let p = build_template("standard", "auto", true, true);
+        let p = build_template("standard", "auto", true, true, "");
         assert!(
             p.ends_with(speaker_attribution_directive_diarized()),
             "the diarized prompt must end with the unchanged diarized directive; got:\n{p}"
@@ -2027,7 +2085,7 @@ Formatting rules:
         // Registered → build_template resolves it (pipeline's exact call) + appends the language
         // directive; unlabeled adds no speaker directive.
         set_saved_templates(vec![t.clone()]);
-        let built = build_template("tpl-client-call", "auto", false, false);
+        let built = build_template("tpl-client-call", "auto", false, false, "");
         assert!(
             built.starts_with(&body),
             "build_template renders the saved body"
