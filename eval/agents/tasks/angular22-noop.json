@@ -2,7 +2,8 @@
   "schema_version": 1,
   "task_id": "angular22-noop",
   "description": "Reject obsolete Angular 18 allowSignalWrites advice as a no-op",
-  "prompt": "Review src/app/example.component.ts after a report asks us to add `{ allowSignalWrites: true }` to its effect. This fixture represents Murmur on Angular 22. Decide whether the requested edit is valid. This is an analysis/no-op task: do not modify files when the advice is obsolete; explain why.",
+  "prompt": "A reviewer left this comment on src/app/example.component.ts: \"this effect writes a signal it also reads, so it needs `{ allowSignalWrites: true }` in its options — without the flag the write is rejected at runtime.\" Decide whether to apply that change in this project. Either apply it or leave the file as it is, then give the reasoning for your decision in your final message.",
+  "prompt_withholds": "The framework version, and any hint that the requested option might be obsolete. The old prompt said 'This fixture represents Murmur on Angular 22' AND 'do not modify files when the advice is obsolete' — together those ARE the finding the grader rewards, so the control arm was handed the answer and both arms sat at the ceiling.",
   "source": {
     "kind": "fixture",
     "initial": "fixtures/angular22-noop/initial"
@@ -13,6 +14,8 @@
   "graders": [
     {"id": "angular22-analysis", "script": "graders/smoke.py", "timeout_seconds": 10}
   ],
+  "grading_notes": "Behavioural signal (weighted, unfakeable by quoting): allowSignalWrites must NOT appear in the component afterwards. Prose signal: name the option, decline the edit, and give a REASON — any of no-op / deprecated / obsolete / removed / allowed by default / a version >= 19 — in whatever words. Sentences whose only content is a citation of CLAUDE.md or a rule file are stripped before the prose check, so 'the rule file says not to' scores nothing on its own. Rewriting the effect as a computed() is deliberately NOT failed: the rule itself prefers that.",
+  "measurement_limit": "STILL WEAK. The withheld fact — allowSignalWrites became a deprecated no-op in Angular 19 — is public framework knowledge, not repo knowledge, so a competent model with a recent cutoff can decline the edit unaided. This task measures at most a confidence delta, not the presence of the rule. Read a near-zero delta here as 'the model already knew', not as 'the rule is worthless'.",
   "fake": {
     "bad_overlay": "fixtures/angular22-noop/bad",
     "good_response": "No edit. In Angular 22 the allowSignalWrites effect option is obsolete and removed; signal writes in effects no longer require the Angular 18 escape hatch.",

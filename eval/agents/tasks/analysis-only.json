@@ -2,17 +2,27 @@
   "schema_version": 1,
   "task_id": "analysis-only",
   "description": "A read-only security analysis returns evidence without editing",
-  "prompt": "Analyze src/mcp.rs for a locked-content disclosure. Report the concrete symbol and missing invariant. This task is inspection-only: do not edit any file.",
+  "prompt": "src/mcp.rs is part of the read path Murmur's local MCP server exposes to other tools on this machine. Review it and report what you would block at review, naming the concrete symbol and the invariant it breaks. This is an inspection, not a fix: report your findings in your final message and leave every file exactly as you found it.",
+  "prompt_withholds": "The class of defect. The old prompt said 'Analyze src/mcp.rs for a locked-content disclosure', which names the finding the grader rewards; with one function in the file, that is the answer. The inspection-only instruction is kept on purpose — it is the ASK, identical in both arms, not the discriminating fact.",
   "source": {
     "kind": "fixture",
     "initial": "fixtures/analysis-only/initial"
   },
   "allowed_paths": [],
-  "scaffold_files": [".claude/rules/lock-model.md", ".claude/rules/agentic-workflow.md"],
+  "scaffold_files": [
+    ".claude/rules/lock-model.md",
+    ".claude/rules/agentic-workflow.md"
+  ],
   "expected_change": false,
   "graders": [
-    {"id": "read-only-finding", "script": "graders/smoke.py", "timeout_seconds": 10}
+    {
+      "id": "read-only-finding",
+      "script": "graders/smoke.py",
+      "timeout_seconds": 10
+    }
   ],
+  "grading_notes": "Behavioural signal (weighted): every file shipped in the fixture must come back byte-identical — this is the 'will the agent REFUSE to edit' half of the task, which used to be graded only through prose. Prose signal: name export_note (a FIXTURE symbol, so naming it is evidence of reading the code, not of reading a rule), describe the defect in any of several phrasings, and state an impact. Citation-only sentences are stripped first.",
+  "measurement_limit": "PARTIALLY MEASURABLE. An unused `unlocked: bool` next to an unconditional content return is visible without any rule, so a strong control-arm model will often find it. What the scaffold plausibly changes is the no-edit discipline and the naming of the invariant, both of which this grader now scores separately.",
   "fake": {
     "good_response": "Finding: export_note returns note.content without an unlock gate, creating an ungated locked-content leak on the MCP read path. No files changed.",
     "bad_response": "The file looks reasonable; no concrete issue found."
