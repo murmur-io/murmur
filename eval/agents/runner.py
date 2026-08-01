@@ -634,7 +634,14 @@ def selftest() -> int:
             full_ws, full_injected = materialize(task, None, workdir / task_id / "full",
                                                  scaffold="full")
             full_tree = tree_bytes(full_ws)
-            envelope = full_envelope_sources()
+            # Enumerated INDEPENDENTLY of full_envelope_sources(): asserting the arm against the
+            # same function that builds it would be circular, and would stay green if that
+            # function started returning half an envelope.
+            envelope = [(name, REPO_ROOT / name) for name in ("CLAUDE.md", "AGENTS.md")]
+            envelope += [(f".claude/rules/{rule.name}", rule)
+                         for rule in sorted((REPO_ROOT / ".claude" / "rules").glob("*.md"))]
+            if len(envelope) < 3:
+                problems.append(f"the repo's envelope looks empty: {envelope}")
             for relative, source in envelope:
                 if relative not in full_tree:
                     problems.append(f"full arm is missing the envelope file {relative}")
@@ -758,7 +765,7 @@ def selftest() -> int:
         sink.append({"task_id": "first", "status": STATUS_PASS})
         after_one = json.loads(sink_path.read_text(encoding="utf-8")) if sink_path.exists() else []
         sink.append({"task_id": "second", "status": STATUS_ERROR})
-        after_two = json.loads(sink_path.read_text(encoding="utf-8"))
+        after_two = json.loads(sink_path.read_text(encoding="utf-8")) if sink_path.exists() else []
         if len(after_one) != 1 or len(after_two) != 2:
             failures += 1
             print(f"FAIL  {'incremental-json':<28} [selftest]  "
