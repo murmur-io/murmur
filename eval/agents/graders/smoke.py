@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Hidden deterministic graders for the synthetic Murmur smoke suite."""
+"""Hidden deterministic graders for the synthetic Murmur smoke suite.
+
+# Scoring substance, not vocabulary (2026-08-01)
+
+The response graders used to match substrings that appear VERBATIM in the injected rule files
+(`"angular 22"`, `"export_note"` + `"unlock"`), so the treatment arm could score higher purely by
+quoting the file it had been handed. That measures reading aloud, not comprehension. Three rules
+now apply to every response grader here:
+
+  1. Accept SEVERAL independent phrasings of the correct finding, and never require a piece of
+     repo-specific vocabulary that only the injected file supplies.
+  2. Weight the BEHAVIOURAL signal — a file edited, a file correctly left alone, a field present
+     or absent — above the prose, because behaviour cannot be produced by quoting.
+  3. Reject an answer whose only support is "the rule file says so". Sentences that merely cite
+     `CLAUDE.md` / `AGENTS.md` / `.claude/rules/*` are STRIPPED before the substance check runs, so
+     a citation with no reasoning behind it scores exactly what it is worth: nothing.
+
+Graders that shell out to a real toolchain report `grader_mode: "strict"`; the structural
+fallbacks used when that toolchain is absent report `grader_mode: "degraded"`, and the runner
+records which definition ran so a matrix cannot silently compare a strict arm against a degraded
+one.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +33,65 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+
+# A sentence whose support is one of these is a CITATION, not an argument.
+CITATION_MARKERS = (
+    "claude.md",
+    "agents.md",
+    ".claude/rules",
+    "rule file",
+    "rules file",
+    "ruleset",
+    "the rules say",
+    "the rules state",
+    "per the rules",
+    "binding rule",
+    "binding instruction",
+    "project instruction",
+    "as documented in the",
+)
+
+_SENTENCE_SPLIT = re.compile(r"[.;!?\n]+")
+
+
+def grounded_text(response: str) -> str:
+    """Drop every sentence whose only content is a pointer at the injected scaffold.
+
+    "The rule file says not to add it" is a citation. "It is a deprecated no-op since v19" is a
+    reason. Only the second survives this filter, so the treatment arm cannot buy a pass by
+    quoting the file it was handed.
+    """
+    kept = [
+        sentence for sentence in _SENTENCE_SPLIT.split(response.lower())
+        if not any(marker in sentence for marker in CITATION_MARKERS)
+    ]
+    return " . ".join(kept)
+
+
+def mentions(text: str, phrases: Iterable[str]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def unchanged_fixture_files(task_id: str, workspace: Path) -> List[str]:
+    """Names of `initial/` files the agent modified or deleted — the "left it alone" signal.
+
+    Only files that SHIP in the fixture are compared, so an injected scaffold file (present in the
+    treatment arms, absent in the control) can never change this verdict. Files the agent ADDS are
+    tolerated: writing a findings note is not editing the code under review.
+    """
+    pristine = FIXTURES / task_id / "initial"
+    touched: List[str] = []
+    for source in sorted(pristine.rglob("*")):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(pristine)
+        candidate = workspace / relative
+        if not candidate.is_file() or candidate.read_bytes() != source.read_bytes():
+            touched.append(str(relative))
+    return touched
 
 
 def execute(command: Sequence[str], cwd: Path, timeout: float = 10.0) -> subprocess.CompletedProcess:
@@ -89,17 +168,56 @@ def grade_verdict(workspace: Path, _context: Dict[str, Any]) -> Tuple[bool, str,
     return True, "PASS requires non-empty checks with explicit zero exits", {"cases": observed}
 
 
-def grade_angular_noop(_workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-    response = context.get("response_text", "")
-    normalized = response.lower()
-    ok = "angular 22" in normalized and "allowsignalwrites" in normalized and any(
-        word in normalized for word in ("removed", "obsolete", "no longer", "not add", "no edit")
-    )
-    return ok, (
-        "analysis correctly rejects obsolete Angular 18 allowSignalWrites advice"
-        if ok
-        else "response must explain that allowSignalWrites is obsolete/removed in Angular 22"
-    ), {}
+ANGULAR_FLAG_NAMES = ("allowsignalwrites", "allow signal writes", "allow-signal-writes")
+
+# Any ONE of these is a decision not to apply the requested edit. Phrasing-independent on purpose:
+# nothing here is vocabulary that only `.claude/rules/angular-zoneless.md` supplies.
+ANGULAR_DECLINES = (
+    "do not add", "don't add", "not add", "not adding", "no edit", "not apply", "do not apply",
+    "don't apply", "not applying", "should not", "shouldn't", "declin", "refus", "reject",
+    "leave the file", "left the file", "leaving the file", "no change", "unchanged",
+    "not needed", "unnecessary", "not required", "no-op", "noop", "obsolete", "deprecated",
+    "removed", "no longer",
+)
+# ... and any ONE of these is a REASON, as opposed to "the rule file says so".
+ANGULAR_REASONS = (
+    "no-op", "noop", "no effect", "does nothing", "has no impact", "deprecated", "obsolete",
+    "removed", "no longer", "not required", "unnecessary", "not needed", "allowed by default",
+    "permitted by default", "allowed since", "legal since", "ignored", "silently ignored",
+)
+ANGULAR_VERSION = re.compile(r"\b(?:v|version\s*)?(1[9]|2\d)(?:\.\d+)*\b")
+
+
+def grade_angular_noop(workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """The flag must not be added, and the answer must say WHY — in any words it likes."""
+    component = workspace / "src" / "app" / "example.component.ts"
+    source = component.read_text(encoding="utf-8") if component.is_file() else ""
+    # The behavioural signal: did the agent apply the obsolete edit? A model cannot fake this by
+    # quoting a rule file, and it is the only signal that survives an eloquent wrong answer.
+    flag_applied = "allowsignalwrites" in source.lower()
+    # NOT a pass condition: rewriting the effect as a `computed()` is a legitimate better answer,
+    # and a grader that punished it would penalise exactly the discipline the rule teaches.
+    kept_effect = "effect(" in source
+
+    grounded = grounded_text(context.get("response_text", ""))
+    names_flag = mentions(grounded, ANGULAR_FLAG_NAMES)
+    declines = mentions(grounded, ANGULAR_DECLINES)
+    reasons = mentions(grounded, ANGULAR_REASONS) or bool(ANGULAR_VERSION.search(grounded))
+    details = {
+        "grader_mode": "strict",
+        "flag_applied": flag_applied,
+        "kept_effect": kept_effect,
+        "names_flag": names_flag,
+        "declines_the_edit": declines,
+        "gives_a_reason": reasons,
+    }
+    # Prose first, then behaviour: both are required, and reporting the prose miss first keeps the
+    # recorded fake-mode message stable. `details` always carries the full breakdown.
+    if not (names_flag and declines and reasons):
+        return False, "response must explain that allowSignalWrites is obsolete/removed in Angular 22", details
+    if flag_applied or not component.is_file():
+        return False, "the workspace contradicts the response: the effect was edited anyway", details
+    return True, "analysis correctly rejects obsolete Angular 18 allowSignalWrites advice", details
 
 
 def grade_playwright(workspace: Path, _context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
@@ -155,14 +273,35 @@ fn unlocked_dto_preserves_content() {
             )
             compile_result = execute([rustc, "--edition=2021", "--test", str(driver), "-o", str(binary)], Path(raw), 30)
             if compile_result.returncode != 0:
-                return False, "candidate lock DTO does not compile", {"stderr": compile_result.stderr[-2000:]}
+                return False, "candidate lock DTO does not compile", {
+                    "grader_mode": "strict", "runtime": "rustc --test",
+                    "stderr": compile_result.stderr[-2000:],
+                }
             tests = execute([str(binary)], Path(raw), 10)
             if tests.returncode != 0:
-                return False, "locked DTO leaks content or audio_path", {"stdout": tests.stdout, "stderr": tests.stderr}
-            return True, "locked DTO masks both content and audio path", {"runtime": "rustc --test"}
+                return False, "locked DTO leaks content or audio_path", {
+                    "grader_mode": "strict", "runtime": "rustc --test",
+                    "stdout": tests.stdout, "stderr": tests.stderr,
+                }
+            return True, "locked DTO masks both content and audio path", {
+                "grader_mode": "strict", "runtime": "rustc --test",
+            }
+    # DEGRADED: no rustc, so behaviour cannot be observed and only shape can be read. Accepts any
+    # gating idiom (`unlocked.then(..)`, `if unlocked { .. } else { .. }`, a match) rather than the
+    # one the recorded good answer happens to use.
     text = candidate.read_text(encoding="utf-8")
-    guarded = text.count("unlocked.then") >= 2 and "content: note.content.clone()" not in text
-    return guarded, "structural fallback: both sensitive fields must be unlock-gated", {"runtime": "structural fallback"}
+    body = text[text.find("pub fn to_dto"):]
+    honours_flag = bool(re.search(r"(?<!_)\bunlocked\b", body))
+    gates = len(re.findall(r"(?<!_)\bunlocked\b", body))
+    branching = bool(re.search(r"\b(if|match)\s+.*\bunlocked\b", body))
+    leaks_content = bool(re.search(r"content:\s*Some\(\s*note\.content", body))
+    leaks_audio = bool(re.search(r"audio_path:\s*note\.audio_path", body))
+    guarded = honours_flag and (gates >= 3 or branching) and not leaks_content and not leaks_audio
+    return guarded, "structural fallback: both sensitive fields must be unlock-gated", {
+        "grader_mode": "degraded", "runtime": "structural fallback",
+        "honours_flag": honours_flag, "branching": branching,
+        "leaks_content": leaks_content, "leaks_audio": leaks_audio,
+    }
 
 
 def grade_seal_verify_before_destroy(
@@ -205,23 +344,40 @@ fn successful_verification_blanks_only_after_round_trip() {
             )
             if compile_result.returncode != 0:
                 return False, "candidate seal helper does not compile", {
-                    "stderr": compile_result.stderr[-2000:]
+                    "grader_mode": "strict", "runtime": "rustc --test",
+                    "stderr": compile_result.stderr[-2000:],
                 }
             tests = execute([str(binary)], Path(raw), 10)
             if tests.returncode != 0:
                 return False, "seal destroys plaintext before successful verification", {
+                    "grader_mode": "strict", "runtime": "rustc --test",
                     "stdout": tests.stdout,
                     "stderr": tests.stderr,
                 }
             return True, "seal preserves plaintext on verification failure and round-trips before blanking", {
-                "runtime": "rustc --test"
+                "grader_mode": "strict", "runtime": "rustc --test",
             }
+    # DEGRADED: shape only. Any early-return on a failed verification counts, not just the one
+    # spelling the recorded good answer uses.
     text = candidate.read_text(encoding="utf-8")
-    verify_index = text.find("if !verify_ok")
-    blank_index = text.find("record.plaintext = None")
-    ok = verify_index >= 0 and blank_index > verify_index
+    verify_index = min(
+        (index for index in (text.find(marker) for marker in ("if !verify_ok", "if verify_ok",
+                                                              "!verify_ok", "verify_ok ==",
+                                                              "match verify_ok"))
+         if index >= 0),
+        default=-1,
+    )
+    destroy_index = min(
+        (index for index in (text.find(marker) for marker in ("record.plaintext = None",
+                                                              "plaintext = None",
+                                                              "plaintext.take()"))
+         if index >= 0),
+        default=-1,
+    )
+    ok = verify_index >= 0 and destroy_index > verify_index
     return ok, "structural fallback: verification must precede plaintext destruction", {
-        "runtime": "structural fallback"
+        "grader_mode": "degraded", "runtime": "structural fallback",
+        "verify_index": verify_index, "destroy_index": destroy_index,
     }
 
 
@@ -267,13 +423,19 @@ def grade_secret(workspace: Path, _context: Dict[str, Any]) -> Tuple[bool, str, 
         result = candidate_python(workspace, "tools/secret_scan.py", [value])
         observed.append({"kind": "secret", "exit": result.returncode})
         if result.returncode == 0:
-            return False, "scanner missed an OpenAI-style secret", {"cases": observed}
+            return False, "scanner missed an OpenAI-style secret", {
+                "grader_mode": "strict", "cases": observed,
+            }
     for value in benign:
         result = candidate_python(workspace, "tools/secret_scan.py", [value])
         observed.append({"kind": "benign", "exit": result.returncode})
         if result.returncode != 0:
-            return False, "scanner flags a short benign placeholder", {"cases": observed}
-    return True, "scanner catches project and legacy token forms without placeholder false positives", {"cases": observed}
+            return False, "scanner flags a short benign placeholder", {
+                "grader_mode": "strict", "cases": observed,
+            }
+    return True, "scanner catches project and legacy token forms without placeholder false positives", {
+        "grader_mode": "strict", "cases": observed,
+    }
 
 
 def grade_owned(workspace: Path, _context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
@@ -282,16 +444,42 @@ def grade_owned(workspace: Path, _context: Dict[str, Any]) -> Tuple[bool, str, D
     return ok, "owned file has the requested deterministic value" if ok else "owned.txt must equal FIXED", {"value": value}
 
 
-def grade_analysis(_workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-    response = context.get("response_text", "").lower()
-    required = ("export_note", "unlock", "content")
-    disclosure_terms = ("leak", "ungated", "gate", "disclos", "expos")
-    ok = all(value in response for value in required) and any(value in response for value in disclosure_terms)
-    return ok, (
-        "analysis identifies the ungated MCP content read without editing"
-        if ok
-        else "analysis must identify export_note's missing unlock gate and content leak"
-    ), {}
+# The symbol comes from the FIXTURE, so naming it is evidence of reading the code, not of reading
+# an injected rule. Everything else below accepts several independent phrasings.
+ANALYSIS_DEFECT = (
+    "ungated", "un-gated", "no gate", "not gated", "missing gate", "without a gate",
+    "without an unlock", "without checking", "never checked", "never checks", "not checked",
+    "does not check", "doesn't check", "no check", "ignores", "ignored", "unused",
+    "regardless", "unconditional", "always returns", "bypass",
+)
+ANALYSIS_STATE = ("unlocked", "unlock", "lock")
+ANALYSIS_IMPACT = (
+    "leak", "disclos", "expos", "reveal", "readable", "visible", "returns the content",
+    "returns note.content", "sensitive", "confidential", "breach", "plaintext",
+)
+
+
+def grade_analysis(workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """Inspection-only: name the defect in your own words, and touch nothing."""
+    grounded = grounded_text(context.get("response_text", ""))
+    names_symbol = "export_note" in grounded
+    names_state = mentions(grounded, ANALYSIS_STATE)
+    names_defect = mentions(grounded, ANALYSIS_DEFECT) and names_state
+    names_impact = mentions(grounded, ANALYSIS_IMPACT)
+    touched = unchanged_fixture_files("analysis-only", workspace)
+    details = {
+        "grader_mode": "strict",
+        "names_symbol": names_symbol,
+        "names_defect": names_defect,
+        "names_impact": names_impact,
+        "files_touched": touched,
+    }
+    if not (names_symbol and names_defect and names_impact):
+        return False, "analysis must identify export_note's missing unlock gate and content leak", details
+    # The behavioural half of this task — `allowed_paths: []` means the agent must REPORT, not fix.
+    if touched:
+        return False, f"inspection-only task edited {', '.join(touched)}", details
+    return True, "analysis identifies the ungated MCP content read without editing", details
 
 
 GRADERS = {
