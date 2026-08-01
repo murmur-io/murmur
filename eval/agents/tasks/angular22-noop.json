@@ -8,14 +8,22 @@
     "kind": "fixture",
     "initial": "fixtures/angular22-noop/initial"
   },
-  "allowed_paths": ["src/app/example.component.ts"],
-  "scaffold_files": [".claude/rules/angular-zoneless.md"],
+  "allowed_paths": [
+    "src/app/example.component.ts"
+  ],
+  "scaffold_files": [
+    ".claude/rules/angular-zoneless.md"
+  ],
   "expected_change": false,
   "graders": [
-    {"id": "angular22-analysis", "script": "graders/smoke.py", "timeout_seconds": 10}
+    {
+      "id": "angular22-analysis",
+      "script": "graders/smoke.py",
+      "timeout_seconds": 10
+    }
   ],
   "grading_notes": "Behavioural signal (weighted, unfakeable by quoting): allowSignalWrites must NOT appear in the component afterwards. Prose signal: name the option, decline the edit, and give a REASON — any of no-op / deprecated / obsolete / removed / allowed by default / a version >= 19 — in whatever words. Sentences whose only content is a citation of CLAUDE.md or a rule file are stripped before the prose check, so 'the rule file says not to' scores nothing on its own. Rewriting the effect as a computed() is deliberately NOT failed: the rule itself prefers that.",
-  "measurement_limit": "STILL WEAK. The withheld fact — allowSignalWrites became a deprecated no-op in Angular 19 — is public framework knowledge, not repo knowledge, so a competent model with a recent cutoff can decline the edit unaided. This task measures at most a confidence delta, not the presence of the rule. Read a near-zero delta here as 'the model already knew', not as 'the rule is worthless'.",
+  "measurement_limit": "STILL WEAK, AND NOW MEASURED. The withheld fact — allowSignalWrites became a deprecated no-op in Angular 19 — is public framework knowledge, not repo knowledge. Live check 2026-08-01, claude -p (Claude Code 2.1.220), n=1 per arm: the CONTROL arm passed, declining the edit unaided; the full arm also passed. Both arms sit at the ceiling, so the delta here is 0 for a reason that has nothing to do with the rule. Read a null result as 'the model already knew', not as 'angular-zoneless.md T1 is worthless'. This task can only discriminate for a model that does not already know v19 semantics.",
   "fake": {
     "bad_overlay": "fixtures/angular22-noop/bad",
     "good_response": "No edit. In Angular 22 the allowSignalWrites effect option is obsolete and removed; signal writes in effects no longer require the Angular 18 escape hatch.",
