@@ -7023,6 +7023,11 @@ impl Db {
 pub(crate) fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    // Reclaim fixtures abandoned by EARLIER test processes before minting a new one. Callers own a
+    // bare `PathBuf` at 73 sites across 36 files, so nothing here can drop-clean the CURRENT run —
+    // sweeping on entry bounds the steady state at one run's worth instead of unbounded growth.
+    SWEEP.call_once(|| sweep_stale_temp_fixtures(std::env::temp_dir().as_path(), STALE_FIXTURE_AGE));
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
@@ -7030,6 +7035,50 @@ pub(crate) fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{n}.{ext}"))
+}
+
+/// Only fixtures older than this are swept, so a CONCURRENT test process can never have its live
+/// files deleted: an entry younger than the longest possible test run is always left alone.
+#[cfg(test)]
+pub(crate) const STALE_FIXTURE_AGE: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Remove `murmur-*` / `meetnotes-*` fixtures under `dir` last modified more than `min_age` ago.
+///
+/// `unique_temp_path` leaked every file it ever handed out: 1,599 `.sqlite` plus 216 `-wal`,
+/// 216 `-shm` and assorted `.docx`/`.md`/`.wav` fixtures were live in one `TMPDIR`, and the
+/// harness's per-task private `TMPDIR` multiplied that into 67.8 GB of evidence-store scratch.
+/// Both prefix families are swept, and both files and directories (callers pass `ext = "dir"`).
+/// Every failure is ignored on purpose — a fixture another process is mid-write, a permission
+/// error, or a racing sweep must never fail the test that merely wanted a temp path.
+#[cfg(test)]
+pub(crate) fn sweep_stale_temp_fixtures(dir: &std::path::Path, min_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("murmur-") && !name.starts_with("meetnotes-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= min_age);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// One note row needed to seal/unseal a folder.
