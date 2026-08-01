@@ -94,6 +94,14 @@ rust_gate() {
   echo "── development agent harness: deterministic self-test ──"
   scripts/agent-harness selftest --ci
 
+  # ── Scaffold eval, control arm only. `--mode fake` runs NO model: it replays each task's
+  #    recorded good/bad answers through the real graders and asserts good passes and bad fails.
+  #    That is what keeps the graders honest — a grader that has lost its teeth accepts both arms
+  #    and the live `--mode agent` measurement silently starts reporting success for everything.
+  #    Free, deterministic, seconds; the live arm costs model calls and stays out of CI. ──
+  echo "── development agent scaffold eval (graders, no model) ──"
+  python3 eval/agents/runner.py --mode fake
+
   # ── User-facing vocabulary. WARN mode: it reports, and it FAILS only on a REGRESSION
   #    above the recorded baseline. The baseline may shrink and never grow, so copy debt
   #    can only be paid down. P5 of the UX program arms `--strict`, which forbids any
