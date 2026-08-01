@@ -1,0 +1,18 @@
+:root {
+  --glass-blur: 30px;
+  --glass-saturate: 135%;
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+
+  --shell-glass-bg: linear-gradient(
+    160deg,
+    rgba(255, 255, 255, 0.075) 0%,
+    rgba(255, 255, 255, 0.035) 55%,
+    rgba(255, 255, 255, 0.055) 100%
+  );
+  --shell-glass-veil: rgba(22, 22, 30, 0.44);
+  --shell-glass-border: rgba(255, 255, 255, 0.11);
+  --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  --shell-glass-blur: 36px;
+  --shell-glass-saturate: 135%;
+}
