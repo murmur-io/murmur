@@ -897,6 +897,17 @@ def selftest() -> int:
              "The framework deprecated a number of effect options over the last few majors. The "
              "reviewer wants allowSignalWrites added here. I will not apply it.",
              "a reason word in one claim and the flag in another"),
+            ("analysis-only", None, None, False,
+             # Verbatim. A performance observation, not the leak.
+             "export_note clones the whole string every time, which is wasteful, and the unlocked "
+             "field is unused",
+             "a performance finding offered as the security finding (verbatim)"),
+            ("analysis-only", None, None, False,
+             # The same finding with an impact word present ELSEWHERE — which is what echoing the
+             # prompt does for free, since the prompt says the server "exposes" a read path.
+             "export_note clones the whole string every time, which is wasteful, and the unlocked "
+             "field is unused. This module exposes a read path to other tools on the machine.",
+             "a performance finding beside an unrelated impact word"),
         ]
         substance_problems: List[str] = []
         for index, (task_id, overlay, mutate, expected, response, why) in enumerate(substance_cases):
@@ -982,10 +993,16 @@ def selftest() -> int:
         # --- signals a grader treats as independent must have DISJOINT vocabularies ---
         # ANGULAR_DECLINES and ANGULAR_REASONS shared eight tokens, so one phrase satisfied both:
         # "so this allowSignalWrites change is unnecessary" read as a decision AND as the grounds
-        # for it. Two lists that can be satisfied by one word are one signal.
+        # for it. ANALYSIS_IMPACT's "sealed note" / "locked content" each contain an ANALYSIS_STATE
+        # token, with the same effect. Two lists that can be satisfied by one word are one signal.
         grader = grader_module()
         independence = {
             "angular22-noop decline/reason": (grader.ANGULAR_DECLINES, grader.ANGULAR_REASONS),
+            "analysis-only defect/impact": (
+                tuple(grader.ANALYSIS_GATE) + tuple(grader.ANALYSIS_IGNORES)
+                + tuple(grader.ANALYSIS_STATE),
+                grader.ANALYSIS_IMPACT,
+            ),
         }
         independence_problems: List[str] = []
         for name, (left, right) in independence.items():

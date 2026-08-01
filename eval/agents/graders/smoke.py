@@ -19,9 +19,11 @@ now apply to every response grader here:
      deleted independent reasoning that shared it with the citation, so an answer that cited AND
      reasoned in one breath lost its reasoning and the measured delta was biased DOWN.
   5. Independent signals must CO-OCCUR inside one claim, and their vocabularies must be DISJOINT
-     (`runner.py --selftest` enforces the disjointness). `angular22-noop` accepted "so this change
-     is unnecessary" as BOTH the decision and the reason for it, because its decline list and its
-     reason list shared eight tokens.
+     (`runner.py --selftest` enforces the disjointness). Matching each keyword list anywhere in the
+     whole response let unrelated statements stand in for one another: `analysis-only` accepted a
+     performance observation as the security finding because the word "exposes" appeared elsewhere,
+     and `angular22-noop` accepted "so this change is unnecessary" as BOTH the decision and the
+     reason for it, because the two lists shared eight tokens.
 
 Graders that shell out to a real toolchain report `grader_mode: "strict"`; the structural
 fallbacks used when that toolchain is absent report `grader_mode: "degraded"`, and the runner
@@ -525,28 +527,39 @@ ANALYSIS_STATE = ("unlocked", "unlock", "lock", "sealed", "seal")
 ANALYSIS_IMPACT = (
     "leak", "disclos", "expos", "reveal", "readable", "visible", "sensitive", "confidential",
     "breach", "plaintext", "can read", "could read", "can be read", "anyone", "any caller",
-    "sealed note", "locked note", "locked content", "sealed content", "private",
+    "private",
 )
 
 
 def grade_analysis(workspace: Path, context: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
     """Inspection-only: name the defect in your own words, and touch nothing."""
-    grounded = grounded_text(context.get("response_text", ""))
+    claims = grounded_claims(context.get("response_text", ""))
+    grounded = " . ".join(claims)
     names_symbol = "export_note" in grounded
     names_state = mentions(grounded, ANALYSIS_STATE)
     names_defect = mentions(grounded, ANALYSIS_GATE) or (
         mentions(grounded, ANALYSIS_IGNORES) and names_state
     )
     names_impact = mentions(grounded, ANALYSIS_IMPACT)
+    # The finding is a SINGLE claim that names the symbol, says what it fails to do, and says what
+    # that costs. Scored across the whole response these three drifted apart: a performance remark
+    # ("export_note clones the whole string every time ... the unlocked field is unused") supplied
+    # the symbol and the defect, and any other line carrying "expos"/"leak" — the echoed prompt
+    # will do — supplied the impact. That reads as the security finding while missing it entirely.
+    states_finding = co_occur(claims, ("export_note",), ANALYSIS_GATE, ANALYSIS_IMPACT) or co_occur(
+        claims, ("export_note",), ANALYSIS_IGNORES, ANALYSIS_STATE, ANALYSIS_IMPACT
+    )
     touched = unchanged_fixture_files("analysis-only", workspace)
+
     details = {
         "grader_mode": "strict",
         "names_symbol": names_symbol,
         "names_defect": names_defect,
         "names_impact": names_impact,
+        "states_finding": states_finding,
         "files_touched": touched,
     }
-    if not (names_symbol and names_defect and names_impact):
+    if not states_finding:
         return False, "analysis must identify export_note's missing unlock gate and content leak", details
     # The behavioural half of this task — `allowed_paths: []` means the agent must REPORT, not fix.
     if touched:
