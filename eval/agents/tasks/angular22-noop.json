@@ -8,6 +8,7 @@
     "initial": "fixtures/angular22-noop/initial"
   },
   "allowed_paths": ["src/app/example.component.ts"],
+  "scaffold_files": [".claude/rules/angular-zoneless.md"],
   "expected_change": false,
   "graders": [
     {"id": "angular22-analysis", "script": "graders/smoke.py", "timeout_seconds": 10}

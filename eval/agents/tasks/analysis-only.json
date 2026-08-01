@@ -8,6 +8,7 @@
     "initial": "fixtures/analysis-only/initial"
   },
   "allowed_paths": [],
+  "scaffold_files": [".claude/rules/lock-model.md", ".claude/rules/agentic-workflow.md"],
   "expected_change": false,
   "graders": [
     {"id": "read-only-finding", "script": "graders/smoke.py", "timeout_seconds": 10}
