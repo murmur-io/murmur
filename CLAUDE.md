@@ -134,10 +134,19 @@ by context boundary, not by task type.
 ```bash
 git checkout -b <slug>
 # plan AND implement here
+scripts/agent-config-audit --ci                        # 0.1s — run it every time
 (cd src-tauri && cargo test --lib) && npx ng lint && npx ng build
 git commit && gh pr create -R murmur-io/murmur
 # CI red? ANOTHER COMMIT ON THE SAME BRANCH — never a new task id.
 ```
+
+`agent-config-audit` is first because it is the cheapest check in the repo and the only one that
+sees a whole class of defect the others cannot. Measured on PR #535: `cargo test --lib`, `ng lint`
+and `ng build` were all green while the diff contained (a) `.claude/`↔`.codex/` binding-rule drift
+and (b) a Bash-hook change that silently disabled secret scanning and the commit finish-guard. The
+audit caught both, in **0.1 s**, but it only ran remotely — so the feedback arrived one CI
+round-trip later instead of before the commit. Run it unconditionally; deciding whether a diff
+"touches the control plane" costs more thought than the check costs time.
 
 GitHub Actions running `scripts/ci.sh` is the **only** merge authority.
 
