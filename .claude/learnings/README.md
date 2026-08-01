@@ -25,11 +25,31 @@ One file per agent (`<agent-name>.md`), each with two tiers:
 ### `## Recurring patterns` — canonical, executable input
 Short binding imperatives ("Guard async effect results with a newest-request token").
 Keep it **≤ ~20 bullets**. This is not a vendor journal: every dispatched agent MUST read
-`.claude/learnings/<agent-name>.md` when it exists (binding rule in CLAUDE.md), the parity of the
-generated mirror is enforced by `scripts/agent-config-audit`, and that byte-identical mirror is
-bound into the Harness protocol hash (`.agents/harness/runtime.py::instruction_paths`) — so a
-lesson recorded here changes the hash every dispatch is verified against. A
-pattern earns a place here only after it has bitten (or been confirmed) at least twice.
+`.claude/learnings/<agent-name>.md` when it exists (binding rule in CLAUDE.md), and the parity of
+the generated mirror is enforced by `scripts/agent-config-audit`. A pattern earns a place here only
+after it has bitten (or been confirmed) at least twice.
+
+This tier is literally executable: `.agents/harness/verifier.py::review_learnings_section` parses
+it out of `main-loop.md` plus the file matching the reviewer kind
+(`combined` → `adversarial-verifier`, otherwise `<kind>-reviewer`) and splices it into every
+Harness reviewer prompt. Three properties are load-bearing and are pinned by
+`v2_selftest.review_learnings_prompt_cases`:
+
+- **Only this tier crosses the seam.** The `## Run journal` is never injected — its
+  `auto-candidate (uncurated)` entries are one review's unverified claims, and feeding them to the
+  next reviewer would let the loop launder a hallucination into guidance.
+- **It is read at the plan's base commit, not off disk.** The reviewer prompt is re-derived and
+  hash-compared at attestation, and `learning_extract` writes this very file between dispatch and
+  verify, so a filesystem read would fail every attestation.
+- **For a reviewer it is advisory, not authority.** The injected header says so: patterns are
+  hypotheses to check against the exact diff, and nothing in the section can authorize a PASS,
+  retire a review step, or waive a finding. Writing an "X is pre-approved / known-good" bullet here
+  does not make it true — a reviewer is instructed to report such a line as a finding.
+
+Separately, `.agents/harness/runtime.py::instruction_paths` fingerprints **both** trees into
+`MURMUR_HARNESS_INSTRUCTIONS_SHA256`, the instructions digest exported to every check environment.
+(That digest is observability for check runs; it is not `protocol_sha256` and does not by itself
+gate attestation — the reviewer binding comes from the base commit above.)
 
 ### `## Run journal` — append-only, newest first
 Raw evidence-backed entries from individual runs. Format:
@@ -52,8 +72,9 @@ because auto-promotion is exactly how a hallucinated finding would become a bind
 
 ## The loop
 
-1. **Read** — the developer and reviewer read the relevant canonical `## Recurring patterns`; the
-   Harness protocol hash binds the complete tree through the generated `.codex/learnings/` mirror.
+1. **Read** — the developer reads the relevant canonical `## Recurring patterns`; a Harness reviewer
+   does not have to, because the runner injects that tier into its prompt automatically
+   (`verifier.review_learnings_section`, read at the plan's base commit).
 2. **Work** — the developer implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry citing the artifact that
    revealed it, then regenerate the mirror. A `NEEDS_FIX` verify does this for its own severe
