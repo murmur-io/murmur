@@ -164,6 +164,25 @@ required `"unlock"`. Three rules now apply (`graders/smoke.py`):
 Each task's `grading_notes` records what its grader weighs, including where phrasing-independence
 could not be reached.
 
+### What is graded is the agent's words, not its transcript
+
+`runner.py` used to hand the grader the CLI's **entire stdout**. That stdout is a transcript: the
+instructions echoed back, the files the agent opened, its tool calls, and — somewhere inside — the
+answer. Two of the graded keywords are sitting in the prompts themselves: `analysis-only`'s prompt
+says the MCP server *"exposes"* a read path (an impact keyword) and `angular22-noop`'s prompt
+contains `allowSignalWrites` (the identifier its grader demands). An agent that echoed its
+instructions collected both for free; a terse one did not. **How much a CLI echoes is a property of
+the vendor**, so `claude` vs `codex` was partly a comparison of transcript verbosity.
+
+`agent_own_words` now removes everything the agent could have **copied** — every line and sentence
+of the prompt and of the workspace it was handed, plus fenced code blocks and quoted lines — before
+the grader sees it. The workspace snapshot is taken **before** the CLI runs, so a findings note the
+agent writes and then prints stays its own work. It names no CLI and looks for no vendor-specific
+"final answer" delimiter, since either would reintroduce the asymmetry it exists to remove.
+`--selftest`'s `transcript-echo` block runs one answer through a terse and a verbose transcript and
+requires an identical score — *and* requires the raw, unfiltered pair to still disagree, so the
+equality cannot be satisfied by a filter that does nothing.
+
 **Strict vs degraded.** `lock-masked-dto` and `seal-verify-before-destroy` compile and execute the
 candidate with `rustc`. Where `rustc` is absent they fall back to a structural read of the source,
 report `grader_mode: "degraded"`, and the runner records that per run — so a matrix can never
