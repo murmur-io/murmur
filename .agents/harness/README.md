@@ -66,13 +66,24 @@ The behavioral prompt cannot add shell commands. The derived plan is the sole
 executable evidence profile. Reviewers are fresh, read-only, and tool-free.
 They may request only a typed, allowlisted probe that the runner executes.
 
-`review_authority` in `config.json` decides which review can forbid a PASS. The
-three risk specialists are `blocking`. The `combined` generalist is `advisory`:
-it still runs, and its findings, proof gaps, and probe requests are still
-recorded in the receipt, but on any plan that keeps another gate they no longer
-gate the verdict and no longer spend a probe execution — see
-`docs/research/2026-08-01-reviewer-corpus-measurement.md`. Any unconfigured or
-unknown review kind is blocking.
+`review_authority` in `config.json` decides which review can forbid a PASS. A
+kind set to `advisory` still runs, and its findings, proof gaps, and probe
+requests are still recorded in the receipt, but on any plan that keeps another
+gate they no longer gate the verdict and no longer spend a probe execution. Any
+unconfigured or unknown review kind is blocking.
+
+**All four planned kinds currently ship `blocking`,** including the `combined`
+generalist, and `scripts/agent-config-audit` pins that. The generalist was
+briefly demoted on the corpus measurement in
+`docs/research/2026-08-01-reviewer-corpus-measurement.md`; that measurement
+ranked reviewers by BLOCKER count, while the gate that forbids a PASS reads
+`verifier.SEVERE_FINDINGS` (`MAJOR` + `BLOCKER`). Re-counted on that metric over
+the same 232-review corpus, the generalist had the highest density of
+PASS-forbidding findings, not the lowest — 116 over 105 reviews (1.10 each)
+against 0.41 for `egress-security` and 0.13 for `lock-security` — so the
+demotion was reverted. The demotion mechanism below stays live and tested on its
+own config fixtures; changing the shipped decision means editing both the config
+and its pin.
 
 Demotion removes a gate; it must never remove the last one. Every PASS names at
 least one gate that could have refused it, so `verifier.gating_review_kinds`

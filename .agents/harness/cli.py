@@ -2077,10 +2077,12 @@ def verify_task(
         ]
         # A demoted reviewer keeps its findings, proof gaps and probe requests
         # in the receipt, but it may not spend a runner-owned probe execution or
-        # force another full review round: the corpus measurement behind
+        # force another full review round: the review corpus behind
         # `verifier.review_authority` attributes 148 of 215 proof gaps to the one
         # generalist, so leaving this loop authority-blind would demote the
         # verdict while keeping the escalation pressure that cost the most.
+        # No kind is demoted in the shipped config today; this stays live so a
+        # future demotion cannot reintroduce that asymmetry.
         # `gating_review_kinds` reads the plan's own gate set, so a reviewer
         # that is this plan's ONLY gate is never demoted here either and keeps
         # the probe it needs to close the proof gap it is about to gate on.

@@ -169,7 +169,35 @@ The four shipped classes and their oracles: seal content loss →
 `commands/tests/lock_read_gate_tests.rs`; macOS FFI abort at launch →
 `scripts/harness-runtime-smoke.py`; packaged-WebKit CSP style loss →
 `e2e/render/csp-style-src.spec.ts`. A rule or skill you cannot express as an oracle is a rule whose
-effect you are not measuring. `scripts/agent-eval` measures the scaffold itself.
+effect you are not measuring.
+
+**Track C — a scaffold edit is not done until it is measured.** When a diff touches
+`.claude/rules/**`, `.codex/rules/**`, `.claude/skills/**`, `.agents/skills/**`, `CLAUDE.md`,
+`AGENTS.md`, or a reviewer prompt, run the comparison and put its table in the PR body:
+
+```bash
+python3 eval/agents/matrix.py \
+  --agent 'claude=claude -p --permission-mode acceptEdits' \
+  --scaffold none --scaffold full --repeat 3 --seed 1 \
+  --json eval/agents/results/<slug>.json
+```
+
+The control arm gets no scaffold, the treatment arm gets the real always-on envelope, so the delta
+is the edit's effect and nothing else. It costs live model calls, which is why CI runs only
+`--mode fake` (that arm proves the GRADERS still reject a wrong answer — a grader that has lost its
+teeth accepts both arms and every later measurement silently reports success).
+
+Two honest limits, both recorded per task in `eval/agents/README.md`: of the eight tasks only
+`additive-migration` is currently `CAN_MEASURE`; the rest ceiling out because a competent model
+already knows the answer. And `files_changed: []` on an `expected_change: true` task means the run
+never reached the behaviour under test — that is an instrument failure, not a wrong answer. A delta
+of zero across ceiling tasks says nothing about the edit; say so rather than reporting it as
+evidence the rule works.
+
+**Read the cost before arguing about it.** `scripts/agent-harness metrics --store
+../.murmur-agent-driver/.git/agent-harness` reports reviewer PASS-rate, findings by severity, model
+minutes and tokens per accepted task. Every claim about a reviewer earning or not earning its place
+belongs to that command, not to an impression.
 
 ## Opt-in harness (`/harness`)
 

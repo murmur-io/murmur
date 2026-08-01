@@ -1884,12 +1884,19 @@ def probe_request_contexts(
 def review_authority(kind: str, config: Mapping[str, Any]) -> str:
     """Return whether a review kind may forbid a PASS.
 
-    Measured on Murmur's own review corpus in
-    ``docs/research/2026-08-01-reviewer-corpus-measurement.md``: the ``combined``
-    generalist produced one BLOCKER across 98 reviews while consuming 76% of the
-    review model budget and refusing 74% of attempts, so its findings are
-    recorded but no longer gate. The three risk specialists produced 11 BLOCKERs
-    across 118 reviews at a quarter of the cost and stay blocking.
+    The mechanism is config-driven and decision-free: whatever
+    ``review_authority`` marks ``advisory`` records its findings without gating,
+    and everything else gates.
+
+    All four planned kinds currently ship ``blocking``. The ``combined``
+    generalist was briefly demoted on
+    ``docs/research/2026-08-01-reviewer-corpus-measurement.md``, which ranked
+    reviewers by BLOCKER count; the gate that forbids a PASS reads
+    ``SEVERE_FINDINGS`` (``MAJOR`` + ``BLOCKER``). Re-counted on that metric over
+    the same 232-review corpus the generalist led on PASS-forbidding density
+    (116 over 105 reviews, against 0.41 per review for ``egress-security`` and
+    0.13 for ``lock-security``), so the demotion was reverted and
+    ``config_audit`` pins every kind blocking.
 
     Every unconfigured, unknown, or malformed kind fails closed as blocking, so a
     typo in the config and a future specialist kind both keep their gate, and an
