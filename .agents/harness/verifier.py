@@ -68,7 +68,6 @@ SPECIALIST_SOURCE_CONTEXT_LABEL = (
 )
 MAX_LEARNINGS_BYTES = 16_000
 LEARNINGS_DIR = ".claude/learnings"
-LEARNINGS_MAIN = "main-loop"
 LEARNINGS_HEADING = "## Recurring patterns"
 # The header carries the guard, not just the body: a reviewer who skims or whose
 # context is truncated still reads "verify" and "never authority" on the same
@@ -155,6 +154,12 @@ PROTOCOL_FILES = (
     "scripts/agent-harness",
     "scripts/agent-resource-run",
     "scripts/agent-config-audit",
+    # Executed by the `harness-v2-selftest` check and relied on by the
+    # `_learnings_parity` audit, so a rewrite of it changes what a verify
+    # actually runs. Every other runner-reachable script is pinned here; this
+    # one was the sole exception, which let a task own it, rewrite it, and take
+    # a PASS receipt whose `protocol_sha256` never moved.
+    "scripts/agent-sync-learnings",
     "scripts/harness-runtime-smoke",
     "scripts/harness-runtime-smoke.py",
     "scripts/verify-harness-attestation",
@@ -1239,18 +1244,23 @@ def recurring_patterns(source: str) -> str:
 def review_learnings_names(kind: str) -> Tuple[str, ...]:
     """Mirror the reviewer's policy-file mapping onto the learnings tree.
 
-    ``main-loop`` is the cross-cutting orchestration journal and always
-    applies.  The specialist name is derived rather than looked up in a table
-    so a reviewer kind added to ``risk_reviews`` later still receives the
-    cross-cutting lessons instead of silently receiving none.
+    ONLY the file whose role matches the reviewer crosses this seam, and a kind
+    with no such file receives nothing at all.  ``main-loop.md`` used to be
+    prepended to every kind as "the cross-cutting journal"; its own header says
+    it is for "the top-level agent that plans, dispatches sub-agents/workflows,
+    runs git + deploys", so unfiltered injection put driver instructions into a
+    tool-free reviewer's prompt.  Three of its bullets were actively harmful
+    there -- ``request a NARROW re-review of just the delta``, ``let CI be the
+    real full-gate``, and a ``SendMessage`` shutdown call for a tool the
+    reviewer does not have -- and the first landed in the prompt of the
+    blocking lock-security gate.  ``egress-security`` and ``protocol-security``
+    have no reviewer file today, so 100% of what they received was off-topic
+    orchestrator prose.  Emitting nothing is the honest answer.
     """
 
-    specialist = (
-        "adversarial-verifier" if kind == "combined" else f"{kind}-reviewer"
-    )
-    if specialist == LEARNINGS_MAIN:
-        return (LEARNINGS_MAIN,)
-    return (LEARNINGS_MAIN, specialist)
+    if kind == "combined":
+        return ("adversarial-verifier",)
+    return (f"{kind}-reviewer",)
 
 
 def review_learnings_section(
@@ -1262,10 +1272,11 @@ def review_learnings_section(
 
     Read from the plan's immutable base commit, never the live worktree, for
     the same reason ``specialist_source_context`` does: ``combined_review_prompt``
-    is re-derived at attestation time and compared by hash, and the canonical
-    journal is written between dispatch and verify (``learning_extract`` appends
-    a candidate on every NEEDS_FIX).  A filesystem read would therefore fail
-    ``v2 review checkpoint prompt hash changed`` deterministically.
+    is re-derived at attestation time and compared by hash, while the working
+    tree is mutable for the whole life of the dispatch (a ``/curate-learnings``
+    promotion landing mid-review is the ordinary case).  A filesystem read
+    would therefore fail ``v2 review checkpoint prompt hash changed``
+    nondeterministically.
 
     A missing file, an unreadable blob, or a file carrying no curated section
     degrades to no section at all rather than to an empty header.

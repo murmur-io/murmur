@@ -3,9 +3,12 @@
 ## Recurring patterns
 <!-- Curated, binding. Prepended to every dispatch. Keep ≤ ~20 bullets. -->
 
-- **NG0600 (T1):** an `effect()` that writes a signal it might also read throws. Prefer a
-  `computed()`; only when the effect genuinely orchestrates an async IPC fetch, pass
-  `{ allowSignalWrites: true }`. Mirrors: `entity-detail.component.ts`, `graph.component.ts`.
+- **Effect writes (T1):** NG0600 and `{ allowSignalWrites: true }` are both gone since Angular 19 —
+  the flag is a deprecated no-op that was removed repo-wide in the v22 migration, so never add it
+  back and refuse any attempt to reintroduce it. The discipline it used to enforce still binds:
+  prefer `computed()`, and write signals from an `effect()` only when it genuinely orchestrates an
+  async IPC fetch, with a stale-result guard. Mirrors: `entity-detail.component.ts`,
+  `graph.component.ts`.
 - **Import-cycle `ɵcmp` (T2):** mutually-recursive standalone components (tree ↔ row) must use
   `forwardRef(() => Other)` in BOTH `imports:` arrays, or the first `@for` throws
   `getComponentDef(undefined)`.

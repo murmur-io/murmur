@@ -697,6 +697,7 @@ def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
         "agent-resource-run",
         "agent-config-audit",
         "agent-remote-audit",
+        "agent-sync-learnings",
         "verify-harness-attestation",
         "ci.sh",
     ):

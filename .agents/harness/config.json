@@ -145,6 +145,7 @@
     "scripts/agent-config-audit",
     "scripts/agent-remote-audit",
     "scripts/agent-remote-audit.py",
+    "scripts/agent-sync-learnings",
     "scripts/ci.sh",
     "scripts/verify-harness-attestation"
   ]
