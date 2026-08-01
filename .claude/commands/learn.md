@@ -5,6 +5,8 @@ allowed-tools: ["Read", "Edit", "Bash"]
 ---
 
 Record a learning in the compounding-lessons loop (see `.claude/learnings/README.md`).
+`.claude/learnings/` is the canonical tree for both vendors; `.codex/learnings/` is a generated
+byte mirror — write canonical, then regenerate the mirror.
 
 Input: `$ARGUMENTS` — of the form `<agent>: <lesson text>`.
 
@@ -26,4 +28,6 @@ Steps:
 3. Do NOT touch `## Recurring patterns` — promotion is `/curate-learnings`'s job.
 4. If the journal now exceeds ~50 entries, drop the oldest `journal`-status entries (never drop
    `distilled`/`success-pattern`).
-5. Confirm the one-line title you added; do not restate the whole file.
+5. Run `scripts/agent-sync-learnings` to regenerate the `.codex/learnings/` mirror — skipping it
+   leaves `scripts/agent-config-audit` red.
+6. Confirm the one-line title you added; do not restate the whole file.
