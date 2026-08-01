@@ -10,13 +10,13 @@ scripts/agent-eval                       # fake mode: no model calls, runs in se
 scripts/agent-eval --selftest            # scaffold-injection assertions, no model calls
 scripts/agent-eval --task lock-masked-dto
 scripts/agent-eval --mode agent --agent-command 'claude -p --permission-mode dontAsk' \
-    --scaffold rules --repeat 3 --json /tmp/eval.json
+    --scaffold full --repeat 3 --json /tmp/eval.json
 
-# the comparison: {agents} x {none,rules} x {tasks} x {repeats}
+# the comparison: {agents} x {none,rules,full} x {tasks} x {repeats}
 python3 eval/agents/matrix.py \
     --agent 'claude=claude -p --permission-mode dontAsk' \
     --agent 'codex=codex exec --skip-git-repo-check --ephemeral -s workspace-write' \
-    --repeat 3 --json /tmp/matrix.json
+    --repeat 3 --seed 1 --json /tmp/matrix.json
 python3 eval/agents/matrix.py --agent 'claude=claude -p' --dry-run   # plan it before paying for it
 ```
 
@@ -56,6 +56,32 @@ that shipped as production code with its own selftests (`git -c` / `git -C` hand
 `.agents/harness/v2_selftest.py`). Re-testing settled deterministic behaviour through a live model
 would be slower, costlier and less reliable than the tests that already exist.
 
+## Prompts withhold the discriminating fact (2026-08-01)
+
+Four of the five prompts used to **state the very invariant the grader rewards**. `angular22-noop`
+said *"This fixture represents Murmur on Angular 22"* — which is precisely the fact that makes
+`allowSignalWrites` obsolete. `lock-masked-dto` said *"so the frontend cannot hand an asset path to
+`convertFileSrc`"* — the exact sentence `lock-model.md` exists to supply. A bare model passed
+without any rule, both arms sat at the ceiling, and the measured delta was pinned near zero **by
+construction**, no matter how good or bad the scaffold was.
+
+Every prompt now describes the **situation** and the **ask**, and withholds the **discriminating
+fact**. Each task JSON records what was removed in `prompt_withholds`, and — more importantly —
+carries a `measurement_limit` that states honestly whether the task can still measure anything:
+
+| Task | After the rewrite, can it measure the scaffold? |
+|---|---|
+| `lock-masked-dto` | **Partially.** "Mask the body, the path is just a filename" is a genuinely attractive wrong answer, so the arms can separate. A careful model can still reach the right answer from the field names alone. |
+| `analysis-only` | **Partially.** The finding itself is visible without any rule (an unused `unlocked` flag beside an unconditional return); what the scaffold plausibly changes is the no-edit discipline, which is now scored separately. |
+| `angular22-noop` | **Still weak.** That `allowSignalWrites` became a no-op in v19 is public framework knowledge, not repo knowledge. A recent model declines the edit unaided. Read a null result as "the model already knew". |
+| `seal-verify-before-destroy` | **Still weak.** The fixture is twelve lines with the destructive write textually above the failure return. "Audit this" ≈ "spot the obvious bug". |
+| `secret-sk-proj` | **No, by design.** `scaffold_files` is empty, so its arms are byte-identical and its delta is definitionally zero. It is a floor check that the graders discriminate at all. |
+
+Two of five tasks therefore remain weak instruments. That is a property of 12-line fixtures, not
+of the prompts: a rule's real contribution is knowing a failure class exists *before* writing the
+code, and a toy fixture with the bug already in it cannot stage that. Do not read a near-zero
+delta on those two rows as evidence that a rule is worthless.
+
 ## The scaffold arms — what makes this a comparison
 
 Until 2026-08-01 `--mode agent` measured a **bare model**, not the envelope: `materialize` copied
@@ -64,22 +90,29 @@ only `fixtures/<task>/initial/` into a temp directory and ran the CLI there, so 
 **both** arms, which made this suite's own thesis — "editing `angular-zoneless.md` is engineering,
 not vibes" — untestable by construction. `--scaffold` makes the envelope the independent variable:
 
-| arm | workspace |
-|---|---|
-| `none` (default) | the bare fixture — the CONTROL, byte-identical to the pre-2026-08-01 behaviour |
-| `rules` | the fixture **plus** the task's `scaffold_files`, copied from the repo root at their real repo-relative paths, plus a generated `CLAUDE.md`/`AGENTS.md` that declares them binding |
+| arm | workspace | answers |
+|---|---|---|
+| `none` (default) | the bare fixture — the CONTROL, byte-identical to the pre-2026-08-01 behaviour | what does the model do unaided? |
+| `rules` | the fixture **plus** the task's `scaffold_files`, plus a generated `CLAUDE.md`/`AGENTS.md` that declares them binding | does **this rule** carry the effect? |
+| `full` | the fixture plus the repo's **real** always-on envelope: the actual `CLAUDE.md`, the actual `AGENTS.md`, and **every** `.claude/rules/*.md`, no generation, no per-task selection | will this help a **real session**? |
 
-The generated loader exists because a rule file sitting at `.claude/rules/x.md` is not
-self-loading: the repo's real `CLAUDE.md` is what pulls its rules in, via `@.claude/rules/*.md`
+`rules` is the FOCUSED arm and its subset is oracle-picked, so its result does not transfer to
+production — production never loads a subset. `full` is the arm whose result transfers, and it is
+the one to quote when someone asks "does the scaffold help". Keep both: `full` says *whether* the
+envelope helps, `rules` says *which part* of it did.
+
+The generated loader (in `rules` only) exists because a rule file sitting at `.claude/rules/x.md`
+is not self-loading: the repo's real `CLAUDE.md` is what pulls its rules in, via `@.claude/rules/*.md`
 imports. The loader is an **ablation of that mechanism** — it names the files and says they bind,
-and it never contains task-specific advice. Claude Code follows the `@` import; Codex reads
-`AGENTS.md` verbatim and opens the listed paths itself.
+and it never contains task-specific advice. `full` generates nothing: replacing the real `CLAUDE.md`
+would replace the artefact under measurement.
 
 A declared file that does not exist on disk is a **hard error**, not a warning: a silently-absent
 scaffold file makes the treatment arm secretly identical to the control arm, which is the single
 worst failure mode of this design. `--selftest` asserts, per task and without any model call, that
-each declared file is ABSENT under `none` and PRESENT with identical bytes under `rules`, that the
-fixture itself is untouched, and that a missing declaration aborts.
+each declared file is ABSENT under `none` and PRESENT with identical bytes under `rules`, that
+`full` carries the whole envelope with the repo's real `CLAUDE.md` bytes, that the fixture itself
+is untouched, and that a missing declaration aborts.
 
 ### Which scaffold file per task, and why
 
@@ -91,13 +124,81 @@ fixture itself is untouched, and that a missing declaration aborts.
 | `analysis-only` | `.claude/rules/lock-model.md`, `.claude/rules/agentic-workflow.md` | lock-model supplies the finding the grader wants (ungated read = leak); agentic-workflow supplies the no-edit discipline ("the verifier records findings; it never edits the implementation") |
 | `secret-sk-proj` | **empty, on purpose** | no rule file or prompt in this repo states the secret-scanning contract. The only artefact that encodes it is `.agents/harness/hook_guard.py`'s pattern table — production code, and copying it would hand the agent the answer regex. A wrong mapping produces a measurement that looks rigorous and means nothing, so this task stays a scaffold-free control until a real rule exists. |
 
+## The graders score substance, not vocabulary
+
+A response grader that matches substrings appearing verbatim in the injected rule text hands the
+treatment arm free points for **quoting the file**, with zero behavioural difference. The old
+`angular22-noop` grader required the literal `"angular 22"`; the old `analysis-only` grader
+required `"unlock"`. Three rules now apply (`graders/smoke.py`):
+
+1. **Several independent phrasings** of the correct finding are accepted, and no piece of
+   repo-specific vocabulary that only the injected file supplies is required. What *is* still
+   required is the identifier under discussion (`allowSignalWrites`, `export_note`) — those come
+   from the **prompt and the fixture**, so naming them is evidence of reading the code, not of
+   reading a rule.
+2. **The behavioural signal outweighs the prose.** `angular22-noop` checks that the flag is not in
+   the component afterwards; `analysis-only` checks that every fixture file comes back
+   byte-identical (its `allowed_paths: []` half was previously graded only through prose);
+   `lock-masked-dto`, `seal-verify-before-destroy` and `secret-sk-proj` compile and run the
+   candidate and score nothing else. Behaviour cannot be produced by quoting.
+3. **Citation is not comprehension.** Sentences whose only content is a pointer at `CLAUDE.md`,
+   `AGENTS.md` or a rule file are stripped before the prose check runs. "The rule file says not to
+   add it", with no reasoning behind it, scores exactly nothing.
+
+Each task's `grading_notes` records what its grader weighs, including where phrasing-independence
+could not be reached.
+
+**Strict vs degraded.** `lock-masked-dto` and `seal-verify-before-destroy` compile and execute the
+candidate with `rustc`. Where `rustc` is absent they fall back to a structural read of the source,
+report `grader_mode: "degraded"`, and the runner records that per run — so a matrix can never
+silently compare a strict cell against a degraded one.
+
+## PASS / FAIL / ERROR — infrastructure failures are not behaviour
+
+A rate-limited 429, a non-zero exit, an empty stdout, a timeout, or a grader that itself crashed
+never produced a gradeable result. Scoring those as "the agent got it wrong" silently deflates
+whichever arm happened to run while the API was unhappy. Every run therefore carries a `status`:
+
+| status | meaning | counted in `k/N`? |
+|---|---|---|
+| `PASS` | the grader ran and accepted the result | yes, numerator and denominator |
+| `FAIL` | the grader ran and rejected it — a real behavioural datum | denominator only |
+| `ERROR` | transport: timeout, non-zero exit, empty stdout, an API error string, a broken grader | **no** — reported separately |
+
+The table prints `k/N` over **scored** runs and appends `eN` when a cell lost runs, the transport
+block lists every ERROR with its reason, and any arm that lost ≥10% of its runs is flagged
+**NOT COMPARABLE** — its denominator is no longer the same experiment as the other arm's. Deltas
+are reported as pass-**rate** differences for the same reason.
+
+## Ordering: arms interleave, from a recorded seed
+
+Every `none` run used to precede every `rules` run, so a mid-matrix model point-release, a warming
+cache, or progressive rate-limiting would land entirely in one arm and read as a scaffold effect.
+`matrix.py` now runs the arms of a single (agent, task, repeat) cell **back to back**, and draws
+which of them goes first from `--seed` (default `0`). The seed and the `order_index` are recorded
+in every JSON record; there is no unseeded RNG anywhere in the driver.
+
+## Provenance, and crash safety
+
+`--json` records are flushed **as each run completes** (atomically), so a Ctrl-C or a crash
+two-thirds of the way through a matrix keeps the live calls already paid for. Each record carries
+`started_utc`, `scaffold`, `injected` (the exact files materialised), `seed`, `order_index`,
+`cli_version` (`<cli> --version`), `model` (when the operator named it on the command line),
+`grader_mode`, `repo_sha` and `repo_dirty` — without which the claim "matrices are diffable across
+weeks" would be false.
+
+**TMPDIR guard.** Agent CLIs discover `CLAUDE.md`/`AGENTS.md` by walking **up** from the working
+directory. A `TMPDIR` inside this repo would hand the real envelope to the control arm too and
+collapse the delta for a reason that has nothing to do with the scaffold. `--mode agent` and
+`matrix.py` refuse to start in that case, with the path named. (Fake mode is unaffected: it runs
+no CLI, so the CI gate never depends on where `TMPDIR` points.)
+
 ## Repetition, and reading the output
 
 Models are non-deterministic; one run is an anecdote. `--repeat N` runs each cell N times and every
-cell reports `k/N`. `--json <path>` writes one record per `(task, agent label, scaffold, run)` with
-the verdict, the grader message and wall-clock seconds, so a matrix can be diffed across weeks.
-`matrix.py` prints the `k/N` table plus the `rules` − `none` delta per agent, which is the number
-this suite exists to produce.
+cell reports `k/N`. `matrix.py` prints the `k/N` table, the transport block, and the
+`rules` − `none` and `full` − `none` deltas per agent, which are the numbers this suite exists to
+produce.
 
 ## Fake mode is the control, not a shortcut
 
@@ -106,8 +207,9 @@ arm passes and the bad arm fails. It proves the **graders still have teeth**. A 
 graders have quietly become vacuous reports green forever and is worse than no eval — so the
 control runs for free and can go in CI, while the live measurement runs on a cadence.
 
-Current state: 5 tasks × 2 arms = **10/10**, zero model calls. `--selftest` adds 6 further
-assertions (5 tasks + the missing-file guard), also free.
+Current state: 5 tasks × 2 arms = **10/10**, zero model calls. `--selftest` adds 10 assertions
+(5 tasks across all three arms, the missing-file guard, ERROR-vs-pass-count, arm interleaving, the
+TMPDIR guard and incremental JSON), also free.
 
 ## Cadence
 
@@ -117,11 +219,19 @@ fake-mode control plus `--selftest`, both cheap enough to leave running.
 
 ## Known limits (do not read more into a green matrix than is there)
 
-- **`allowed_paths` / `expected_change` are declared but not enforced.** Nothing in the runner
-  fails a task for editing a file it was told not to touch; `analysis-only` is graded purely on
-  its response text, so "will the agent REFUSE to edit" is currently measured only indirectly.
+- **Two of five tasks are weak instruments** — see the `measurement_limit` table above. A
+  near-zero delta on `angular22-noop` or `seal-verify-before-destroy` is not evidence against the
+  rules those tasks name.
+- **`allowed_paths` / `expected_change` are declared but only partly enforced.** `analysis-only`
+  and `angular22-noop` now score the behavioural half in their graders; the runner still does not
+  fail a task generically for editing a file it was told not to touch.
 - **The user-level scaffold is not controlled.** An agent CLI still reads its own global config
-  (`~/.claude/CLAUDE.md` and friends). That is a constant across both arms, so the `rules` − `none`
-  delta stays attributable, but the `none` arm is "bare of THIS repo's scaffold", not "bare".
+  (`~/.claude/CLAUDE.md` and friends). That is a constant across arms, so the deltas stay
+  attributable, but `none` is "bare of THIS repo's scaffold", not "bare".
 - **Vendor asymmetry in the loader.** Claude Code auto-imports via `@path`; Codex is told to read
   the listed paths and may decline. Compare agents within an arm with that in mind.
+- **`full` injects the envelope, not the repo.** `CLAUDE.md` links to skills, docs and source paths
+  that do not exist in a fixture workspace. The `@.claude/rules/*.md` imports resolve (those files
+  are copied); incidental links dangle, as they would for any agent working in a partial checkout.
+- **`n` is small.** With `--repeat 3` a one-cell difference is noise. Treat a single matrix as a
+  smoke signal and re-run before acting on a delta.
