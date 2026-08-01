@@ -2336,6 +2336,7 @@ async fn summarize_and_export(
             &config.note_language,
             feed.labeled,
             feed.diarized_others,
+            &config.user_display_name,
         ),
         vault_titles,
         // STAGE 1 — no cross-meeting context in the generation prompt (Phase 1). Phase 2 will add
