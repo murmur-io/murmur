@@ -15,6 +15,61 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 Observation = Tuple[str, Any]
 RETRY_LABEL = re.compile(r"-try-(\d+)$")
+CONFIG_PATH = Path(__file__).with_name("config.json")
+# `--store <path>` accepts every shape an operator naturally has at hand. First
+# match wins, so `<store>/v2/tasks` is always preferred over the retired v1
+# sibling `<store>/tasks`; a bare directory is accepted only when it already IS
+# a task root, otherwise an unrelated path would silently mint phantom tasks.
+STORE_CANDIDATES: Tuple[Tuple[str, ...], ...] = (
+    ("agent-harness", "v2", "tasks"),
+    ("v2", "tasks"),
+    ("tasks",),
+)
+# `attempts[].telemetry.usage` has two vendor dialects; only `input_tokens` and
+# `output_tokens` are shared. First present key wins — never sum two aliases.
+USAGE_FIELDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("input", ("input_tokens",)),
+    ("output", ("output_tokens",)),
+    ("cached", ("cached_input_tokens", "cache_read_input_tokens")),
+    ("cache_write", ("cache_write_input_tokens", "cache_creation_input_tokens")),
+    ("reasoning", ("reasoning_output_tokens",)),
+)
+TOKEN_LABELS: Tuple[str, ...] = tuple(label for label, _ in USAGE_FIELDS)
+# The two dialects DISAGREE about what `input_tokens` means, so what is billable
+# is defined per dialect and never per field name.
+#   Anthropic: `input_tokens`, `cache_read_input_tokens` and
+#     `cache_creation_input_tokens` are DISJOINT counters, and a cached review
+#     reports nearly its whole prompt in the cache pair — measured over the 31
+#     claude reviews in the corpus, `input_tokens` totals 70 against 2.70M cache
+#     tokens. Billing `input` alone scored those reviews at 25.0% of what they
+#     actually consumed while codex was billed at ~100%, which inverts any
+#     cross-vendor or cross-reviewer comparison drawn from the result.
+#   OpenAI: `cached_input_tokens` is a SUBSET of `input_tokens`; adding it
+#     double-counts the cached prefix.
+# `reasoning_output_tokens` is a subset of `output_tokens` in both dialects —
+# measured strictly less in all 199 corpus records that report it — so it is
+# never billable.
+BILLABLE_LABELS_BY_DIALECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "anthropic": {"input": ("input", "cached", "cache_write"), "output": ("output",)},
+    "openai": {"input": ("input",), "output": ("output",)},
+}
+# The dialect is read off the usage KEYS, not off `vendor`: the keys are direct
+# evidence of which arithmetic applies to the very fields being summed, so a
+# record whose vendor label is missing or unexpected still bills correctly.
+# `vendor` is only the fallback, and an undetectable record falls back to the
+# OpenAI shape — it cannot carry the Anthropic cache keys or it would have been
+# detected, so `input + output` is the whole of what it reports.
+USAGE_DIALECTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("anthropic", ("cache_read_input_tokens", "cache_creation_input_tokens")),
+    ("openai", ("cached_input_tokens", "cache_write_input_tokens")),
+)
+VENDOR_DIALECTS: Dict[str, str] = {"claude": "anthropic", "codex": "openai"}
+DEFAULT_DIALECT = "openai"
+PRICE_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("input", "input_per_mtok"),
+    ("output", "output_per_mtok"),
+)
+ACCEPTED_VERDICT = "PASSED"
 
 
 def _utc_now() -> str:
@@ -124,10 +179,46 @@ def _read(path: Path) -> Dict[str, Any]:
     return result
 
 
-def _discover(common: Path) -> Tuple[List[Dict[str, Any]], int]:
+def _task_roots(
+    common: Path, stores: Sequence[Path]
+) -> List[Tuple[Path, Optional[Path], bool]]:
+    """`(argument, task root, already counted)` per store, default store first.
+
+    A `--store` that resolves to an ALREADY registered task root is marked and
+    then skipped rather than ingested a second time. `_review_rows` keys on
+    `(root_index, task_id)`, so a second root index turns every task into a new
+    task: absolute counts double while every rate stays identical, which makes
+    the doubling invisible in the output. It is reachable straight from the
+    documented command — `--store ../.murmur-agent-driver/.git/agent-harness`
+    run from the driver clone resolves back to that clone's own store, which
+    `runtime.repo_context` has already supplied as `common`.
+    """
+    default = common / "agent-harness" / "v2" / "tasks"
+    roots: List[Tuple[Path, Optional[Path], bool]] = [(common, default, False)]
+    seen = {default.resolve()}
+    for store in stores:
+        origin = Path(store).expanduser().resolve()
+        candidates = [origin.joinpath(*parts) for parts in STORE_CANDIDATES]
+        if origin.name == "tasks":
+            candidates.append(origin)
+        resolved = next(
+            (
+                candidate
+                for candidate in candidates
+                if _is_real(candidate, stat.S_IFDIR)
+            ),
+            None,
+        )
+        duplicate = resolved is not None and resolved.resolve() in seen
+        if resolved is not None:
+            seen.add(resolved.resolve())
+        roots.append((origin, resolved, duplicate))
+    return roots
+
+
+def _discover_root(root: Path, root_index: int) -> Tuple[List[Dict[str, Any]], int]:
     records: List[Dict[str, Any]] = []
     unsafe = 0
-    root = common / "agent-harness" / "v2" / "tasks"
     if not _is_real(root, stat.S_IFDIR):
         if root.exists() or root.is_symlink():
             unsafe += 1
@@ -163,6 +254,9 @@ def _discover(common: Path) -> Tuple[List[Dict[str, Any]], int]:
         records.append(
             {
                 "task_id": task.name,
+                "root_index": root_index,
+                "root": root,
+                "task_dir": task,
                 "status": status,
                 "last_event_at": last_at,
                 "last_epoch": last_epoch,
@@ -171,6 +265,29 @@ def _discover(common: Path) -> Tuple[List[Dict[str, Any]], int]:
             }
         )
     return records, unsafe
+
+
+def _discover(
+    common: Path, stores: Sequence[Path] = ()
+) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    records: List[Dict[str, Any]] = []
+    unsafe = 0
+    summaries: List[Dict[str, Any]] = []
+    for index, (origin, root, duplicate) in enumerate(_task_roots(common, stores)):
+        found: List[Dict[str, Any]] = []
+        if root is not None and not duplicate:
+            found, skipped = _discover_root(root, index)
+            unsafe += skipped
+        records.extend(found)
+        summaries.append(
+            {
+                "path": str(origin),
+                "root": None if root is None else str(root),
+                "duplicate": duplicate,
+                "tasks": len(found),
+            }
+        )
+    return records, unsafe, summaries
 
 
 def _coverage(observations: Sequence[Observation]) -> Dict[str, Any]:
@@ -383,20 +500,508 @@ def _checks(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def collect_metrics(common_dir: Path, *, limit: int = 20) -> Dict[str, Any]:
+def _load_json_file(path: Path) -> Optional[Any]:
+    if not _is_real(path, stat.S_IFREG):
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="strict") as handle:
+            return json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _safe_name(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        return None
+    if "/" in value or "\\" in value or "\x00" in value:
+        return None
+    return value
+
+
+def _resolve_record(task_dir: Path, event: Mapping[str, Any]) -> Optional[Path]:
+    """Resolve store-relatively first so a copied or archived store still joins.
+
+    `record_path` is an absolute path baked in at write time; following it
+    blindly makes `--store` useless for any store that ever moved.
+    """
+    attempt = _safe_name(event.get("attempt_id"))
+    kind = _safe_name(event.get("review_kind"))
+    if attempt is not None and kind is not None:
+        candidate = task_dir / "attempts" / attempt / "reviews" / f"{kind}.json"
+        if _is_real(candidate, stat.S_IFREG):
+            return candidate
+    baked = event.get("record_path")
+    if isinstance(baked, str) and baked:
+        fallback = Path(baked)
+        if _is_real(fallback, stat.S_IFREG):
+            return fallback
+    return None
+
+
+def _attempt_green(task_dir: Path, attempt_id: Any) -> Optional[bool]:
+    """True when every `checks/*.json` of the attempt recorded a PASS outcome.
+
+    The outcome is nested under `evidence`; the flat `outcome` belongs to the
+    `check` EVENT, not to this file.
+    """
+    attempt = _safe_name(attempt_id)
+    if attempt is None:
+        return None
+    checks = task_dir / "attempts" / attempt / "checks"
+    if not _is_real(checks, stat.S_IFDIR):
+        return None
+    try:
+        entries = sorted(checks.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return None
+    outcomes: List[str] = []
+    for entry in entries:
+        if entry.suffix != ".json":
+            continue
+        document = _load_json_file(entry)
+        if not isinstance(document, Mapping):
+            return None
+        evidence = document.get("evidence")
+        outcome = evidence.get("outcome") if isinstance(evidence, Mapping) else None
+        if not isinstance(outcome, str) or not outcome:
+            return None
+        outcomes.append(outcome)
+    if not outcomes:
+        return None
+    return all(outcome == "PASS" for outcome in outcomes)
+
+
+def _attempt_telemetry(record: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    attempts = record.get("attempts")
+    if not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)):
+        return []
+    return [
+        attempt["telemetry"]
+        for attempt in attempts
+        if isinstance(attempt, Mapping) and isinstance(attempt.get("telemetry"), Mapping)
+    ]
+
+
+def _usage_tokens(
+    record: Mapping[str, Any]
+) -> Tuple[Dict[str, Optional[int]], Optional[str]]:
+    """Per-label token totals plus the usage dialect they were reported in."""
+    totals: Dict[str, Optional[int]] = {label: None for label in TOKEN_LABELS}
+    dialects: set[str] = set()
+    for telemetry in _attempt_telemetry(record):
+        usage = telemetry.get("usage")
+        if not isinstance(usage, Mapping):
+            continue
+        for dialect, markers in USAGE_DIALECTS:
+            if any(marker in usage for marker in markers):
+                dialects.add(dialect)
+        for label, names in USAGE_FIELDS:
+            for name in names:
+                value = usage.get(name)
+                if _valid_integer(value):
+                    totals[label] = (totals[label] or 0) + int(value)
+                    break
+    return totals, dialects.pop() if len(dialects) == 1 else None
+
+
+def _observed_cost(record: Mapping[str, Any]) -> Optional[float]:
+    """The vendor's own measured `telemetry.cost_usd`, summed over attempts.
+
+    Measured, not derived, so it beats any rate card where it exists. It exists
+    on every claude record in the corpus and on no codex one, which is why it is
+    an additional coverage-carrying column and never a replacement for `tokens`.
+    """
+    values = [
+        float(telemetry["cost_usd"])
+        for telemetry in _attempt_telemetry(record)
+        if _valid_number(telemetry.get("cost_usd"))
+    ]
+    return math.fsum(values) if values else None
+
+
+def _review_rows(
+    records: Sequence[Mapping[str, Any]]
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Deduped `review-checkpoint` events joined to their record and checks.
+
+    The corpus contains checkpoints that fire twice against the same rewritten
+    record file; counting events instead of records double-counts their tokens
+    and model minutes.
+    """
+    deduped: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    duplicates = 0
+    green_cache: Dict[Tuple[Any, ...], Optional[bool]] = {}
+    for record in records:
+        task_key = (record["root_index"], record["task_id"])
+        task_dir = record["task_dir"]
+        for event in record["events"]:
+            if event.get("event") != "review-checkpoint":
+                continue
+            attempt_id = event.get("attempt_id")
+            reviewer = event.get("review_kind")
+            key = (task_key, str(attempt_id), str(reviewer))
+            if key in deduped:
+                duplicates += 1
+            green_key = (task_key, str(attempt_id))
+            if green_key not in green_cache:
+                green_cache[green_key] = _attempt_green(task_dir, attempt_id)
+            row: Dict[str, Any] = {
+                "task_key": task_key,
+                "task_id": record["task_id"],
+                "attempt_id": attempt_id,
+                "reviewer": reviewer if isinstance(reviewer, str) and reviewer else "UNKNOWN",
+                "resolved": "missing",
+                "verdict": None,
+                "vendor": None,
+                "dialect": None,
+                "observed_usd": None,
+                "duration_ms": None,
+                "proof_gaps": None,
+                "findings": {},
+                "green_checks": green_cache[green_key],
+            }
+            row.update({f"tokens_{label}": None for label in TOKEN_LABELS})
+            path = _resolve_record(task_dir, event)
+            document = None if path is None else _load_json_file(path)
+            if path is not None and not isinstance(document, Mapping):
+                row["resolved"] = "invalid"
+            elif isinstance(document, Mapping):
+                row["resolved"] = "available"
+                row["record_path"] = str(path)
+                kind = document.get("kind")
+                if row["reviewer"] == "UNKNOWN" and isinstance(kind, str) and kind:
+                    row["reviewer"] = kind
+                vendor = document.get("vendor")
+                row["vendor"] = vendor if isinstance(vendor, str) and vendor else None
+                duration = document.get("duration_ms")
+                row["duration_ms"] = duration if _valid_number(duration) else None
+                result = document.get("result")
+                if isinstance(result, Mapping):
+                    verdict = result.get("verdict")
+                    row["verdict"] = (
+                        verdict if isinstance(verdict, str) and verdict else None
+                    )
+                    findings = result.get("findings")
+                    severities: Dict[str, int] = {}
+                    if isinstance(findings, Sequence) and not isinstance(
+                        findings, (str, bytes)
+                    ):
+                        for finding in findings:
+                            if not isinstance(finding, Mapping):
+                                continue
+                            severity = finding.get("severity")
+                            name = (
+                                severity
+                                if isinstance(severity, str) and severity
+                                else "UNKNOWN"
+                            )
+                            severities[name] = severities.get(name, 0) + 1
+                    row["findings"] = severities
+                    gaps = result.get("proof_gaps")
+                    if isinstance(gaps, Sequence) and not isinstance(gaps, (str, bytes)):
+                        row["proof_gaps"] = len(gaps)
+                totals, dialect = _usage_tokens(document)
+                for label, total in totals.items():
+                    row[f"tokens_{label}"] = total
+                row["dialect"] = dialect or VENDOR_DIALECTS.get(str(row["vendor"]))
+                row["observed_usd"] = _observed_cost(document)
+            deduped[key] = row
+    ordered = sorted(deduped, key=lambda key: (key[0][0], key[0][1], key[1], key[2]))
+    return [deduped[key] for key in ordered], duplicates
+
+
+def _billable_labels(dialect: Any) -> Dict[str, Tuple[str, ...]]:
+    return BILLABLE_LABELS_BY_DIALECT.get(
+        str(dialect), BILLABLE_LABELS_BY_DIALECT[DEFAULT_DIALECT]
+    )
+
+
+def _billable(row: Mapping[str, Any]) -> Optional[int]:
+    labels = _billable_labels(row.get("dialect"))
+    present = [
+        int(row[f"tokens_{label}"])
+        for group in labels.values()
+        for label in group
+        if _valid_integer(row.get(f"tokens_{label}"))
+    ]
+    return sum(present) if present else None
+
+
+def _row_usd(
+    row: Mapping[str, Any], pricing: Mapping[str, Mapping[str, float]]
+) -> Optional[float]:
+    """Rate-card cost over exactly the tokens `_billable` counts.
+
+    A coarse upper bound for the Anthropic dialect: cache reads are priced here
+    at the fresh-input rate. `observed_usd` is the vendor's own measurement and
+    is authoritative wherever it is present.
+    """
+    rate = pricing.get(row.get("vendor"))
+    if not isinstance(rate, Mapping):
+        return None
+    labels = _billable_labels(row.get("dialect"))
+    parts = [
+        float(row[f"tokens_{label}"]) / 1000000.0 * float(rate[key])
+        for side, key in PRICE_FIELDS
+        for label in labels[side]
+        if _valid_integer(row.get(f"tokens_{label}")) and _valid_number(rate.get(key))
+    ]
+    return math.fsum(parts) if parts else None
+
+
+def _counted(observations: Sequence[Observation]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for state, value in observations:
+        if state == "available":
+            counts[str(value)] = counts.get(str(value), 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _reviewer_row(rows: Sequence[Mapping[str, Any]], priced: bool) -> Dict[str, Any]:
+    groups = [[row] for row in rows]
+    resolution: List[Observation] = [
+        (str(row["resolved"]), True if row["resolved"] == "available" else None)
+        for row in rows
+    ]
+    verdicts = _observe(
+        groups, "verdict", lambda value: isinstance(value, str) and bool(value)
+    )
+    by_verdict = _counted(verdicts)
+    decided = sum(state == "available" for state, _ in verdicts)
+    passes = by_verdict.get("PASS", 0)
+    findings: Dict[str, int] = {}
+    for row in rows:
+        for severity, count in row["findings"].items():
+            findings[severity] = findings.get(severity, 0) + count
+    tokens: Dict[str, Any] = {
+        label: _numeric(_observe(groups, f"tokens_{label}", _valid_integer))
+        for label in TOKEN_LABELS
+    }
+    billable = [value for value in (_billable(row) for row in rows) if value is not None]
+    tokens["total"] = sum(billable) if billable else None
+    gaps = _numeric(_observe(groups, "proof_gaps", _valid_integer))["total"]
+    summary: Dict[str, Any] = {
+        "reviews": len(rows),
+        "records": _coverage(resolution),
+        "pass": passes,
+        "pass_rate": round(100.0 * passes / decided, 1) if decided else None,
+        "by_verdict": by_verdict,
+        "findings": dict(sorted(findings.items())),
+        "proof_gaps": 0 if gaps is None else gaps,
+        "durations_ms": _numeric(_observe(groups, "duration_ms", _valid_number)),
+        "tokens": tokens,
+        "observed_usd": _numeric(_observe(groups, "observed_usd", _valid_number)),
+        "by_vendor": _counted(
+            _observe(groups, "vendor", lambda value: isinstance(value, str) and bool(value))
+        ),
+        # Which arithmetic produced `tokens.total`, so the normalization is
+        # visible in the report rather than only in the source.
+        "by_dialect": _counted(
+            _observe(groups, "dialect", lambda value: isinstance(value, str) and bool(value))
+        ),
+        "green_check_reviews": _true_count(
+            _observe(groups, "green_checks", lambda value: isinstance(value, bool))
+        ),
+    }
+    if priced:
+        summary["usd"] = _numeric(_observe(groups, "usd", _valid_number))
+    return summary
+
+
+def _review_outcomes(
+    rows: Sequence[Mapping[str, Any]],
+    duplicates: int,
+    pricing: Optional[Mapping[str, Mapping[str, float]]],
+) -> Dict[str, Any]:
+    by_reviewer: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in rows:
+        by_reviewer.setdefault(str(row["reviewer"]), []).append(row)
+    report = _reviewer_row(rows, pricing is not None)
+    report["duplicate_checkpoints"] = duplicates
+    report["by_reviewer"] = {
+        reviewer: _reviewer_row(by_reviewer[reviewer], pricing is not None)
+        for reviewer in sorted(by_reviewer)
+    }
+    if pricing is not None:
+        by_vendor: Dict[str, List[float]] = {}
+        for row in rows:
+            cost = row.get("usd")
+            if _valid_number(cost) and isinstance(row.get("vendor"), str):
+                by_vendor.setdefault(str(row["vendor"]), []).append(float(cost))
+        usd = report["usd"]
+        usd["by_vendor"] = {
+            vendor: _number(math.fsum(by_vendor[vendor])) for vendor in sorted(by_vendor)
+        }
+        usd["by_reviewer"] = {
+            reviewer: report["by_reviewer"][reviewer]["usd"]["total"]
+            for reviewer in sorted(by_reviewer)
+        }
+        report["usd"] = usd
+    return report
+
+
+def _task_outcomes(
+    records: Sequence[Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+    pricing: Optional[Mapping[str, Mapping[str, float]]],
+) -> Dict[str, Any]:
+    per_attempt: Dict[Tuple[Any, ...], str] = {}
+    per_task: Dict[Tuple[Any, ...], str] = {}
+    for record in records:
+        task_key = (record["root_index"], record["task_id"])
+        for event in record["events"]:
+            if event.get("event") != "evidence-checkpoint":
+                continue
+            verdict = event.get("verdict")
+            if not isinstance(verdict, str) or not verdict:
+                continue
+            attempt = event.get("attempt_id")
+            attempt_key = (
+                str(attempt)
+                if isinstance(attempt, str) and attempt
+                else f"_line:{event.get('_ledger')}:{event.get('_line')}"
+            )
+            per_attempt[(task_key, attempt_key)] = verdict
+            per_task[task_key] = verdict
+    tokens_by_verdict: Dict[str, int] = {}
+    usd_by_verdict: Dict[str, List[float]] = {}
+    attributed = 0
+    unattributed = 0
+    billable_rows = 0
+    attributed_usd: List[float] = []
+    unattributed_usd: List[float] = []
+    for row in rows:
+        verdict = per_attempt.get((row["task_key"], str(row["attempt_id"])))
+        tokens = _billable(row)
+        if tokens is not None:
+            billable_rows += 1
+            if verdict is None:
+                unattributed += tokens
+            else:
+                tokens_by_verdict[verdict] = tokens_by_verdict.get(verdict, 0) + tokens
+                attributed += tokens
+        cost = row.get("usd")
+        if pricing is not None and _valid_number(cost):
+            if verdict is None:
+                unattributed_usd.append(float(cost))
+            else:
+                usd_by_verdict.setdefault(verdict, []).append(float(cost))
+                attributed_usd.append(float(cost))
+    accepted = sum(verdict == ACCEPTED_VERDICT for verdict in per_task.values())
+    total_tokens = attributed + unattributed
+    report: Dict[str, Any] = {
+        "outcomes": len(per_attempt),
+        "by_verdict": _counted([("available", value) for value in per_attempt.values()]),
+        "tasks": len(per_task),
+        "by_final_verdict": _counted(
+            [("available", value) for value in per_task.values()]
+        ),
+        "accepted_tasks": accepted,
+        "tokens": {
+            # No priced review is an absent total, never a zero total.
+            "total": total_tokens if billable_rows else None,
+            "attributed": attributed,
+            "unattributed": unattributed,
+            "coverage": _coverage(
+                [
+                    ("available" if _billable(row) is not None else "missing", None)
+                    for row in rows
+                ]
+            ),
+        },
+        "tokens_by_verdict": dict(sorted(tokens_by_verdict.items())),
+        "tokens_per_accepted_task": _number(total_tokens / accepted)
+        if accepted and billable_rows
+        else None,
+    }
+    # Vendor-measured, so it is reported whether or not a rate card exists.
+    observed = [
+        float(row["observed_usd"]) for row in rows if _valid_number(row.get("observed_usd"))
+    ]
+    observed_total = math.fsum(observed) if observed else None
+    report["observed_usd"] = {
+        "total": None if observed_total is None else _number(observed_total),
+        "coverage": _coverage(
+            [
+                ("available" if _valid_number(row.get("observed_usd")) else "missing", None)
+                for row in rows
+            ]
+        ),
+    }
+    report["observed_usd_per_accepted_task"] = (
+        _number(observed_total / accepted)
+        if accepted and observed_total is not None
+        else None
+    )
+    if pricing is not None:
+        total_usd = math.fsum(attributed_usd + unattributed_usd)
+        report["usd"] = {
+            "total": _number(total_usd) if (attributed_usd or unattributed_usd) else None,
+            "by_verdict": {
+                verdict: _number(math.fsum(usd_by_verdict[verdict]))
+                for verdict in sorted(usd_by_verdict)
+            },
+        }
+        report["usd_per_accepted_task"] = (
+            _number(total_usd / accepted)
+            if accepted and (attributed_usd or unattributed_usd)
+            else None
+        )
+    return report
+
+
+def _pricing(config_path: Path) -> Optional[Dict[str, Dict[str, float]]]:
+    """Vendor -> per-Mtok rates, or None. An absent block means an absent column.
+
+    Read directly, never through `runtime.load_config`: metrics is a lazy,
+    stdlib-only read-only extension and must not pull in protocol code.
+    """
+    document = _load_json_file(config_path)
+    if not isinstance(document, Mapping):
+        return None
+    block = document.get("pricing")
+    if not isinstance(block, Mapping):
+        return None
+    priced: Dict[str, Dict[str, float]] = {}
+    for vendor, rate in block.items():
+        if not isinstance(vendor, str) or not vendor or not isinstance(rate, Mapping):
+            continue
+        entry = {
+            key: float(rate[key])
+            for _, key in PRICE_FIELDS
+            if _valid_number(rate.get(key))
+        }
+        if entry:
+            priced[vendor] = dict(sorted(entry.items()))
+    return dict(sorted(priced.items())) or None
+
+
+def collect_metrics(
+    common_dir: Path,
+    *,
+    limit: int = 20,
+    stores: Sequence[Path] = (),
+    config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     if limit < 1:
         raise ValueError("metrics limit must be positive")
     common = common_dir.resolve()
-    records, unsafe = _discover(common)
+    records, unsafe, store_summaries = _discover(common, stores)
     records.sort(
         key=lambda record: (
             record["last_epoch"] is not None,
             record["last_epoch"] or 0,
             record["task_id"],
+            record["root_index"],
         ),
         reverse=True,
     )
     selected = records[:limit]
+    pricing = _pricing(CONFIG_PATH if config_path is None else config_path)
+    review_rows, duplicate_checkpoints = _review_rows(selected)
+    if pricing is not None:
+        for row in review_rows:
+            row["usd"] = _row_usd(row, pricing)
     status_counts: Dict[str, int] = {}
     for record in selected:
         status = record["status"] or "UNKNOWN"
@@ -429,6 +1034,7 @@ def collect_metrics(common_dir: Path, *, limit: int = 20) -> Dict[str, Any]:
             "discovered_tasks": len(records),
             "selected_tasks": len(selected),
             "order": "latest valid event timestamp descending; task id tie-break",
+            "stores": store_summaries,
         },
         "tasks": {
             "count": len(selected),
@@ -437,6 +1043,7 @@ def collect_metrics(common_dir: Path, *, limit: int = 20) -> Dict[str, Any]:
             "records": [
                 {
                     "task_id": record["task_id"],
+                    "store": str(record["root"]),
                     "status": record["status"] or "UNKNOWN",
                     "last_event_at": record["last_event_at"],
                     "event_ledgers": len(record["reads"]),
@@ -447,6 +1054,10 @@ def collect_metrics(common_dir: Path, *, limit: int = 20) -> Dict[str, Any]:
         "models": _models(model_groups),
         "checks": _checks(selected),
         "reviews": _reviews(model_groups),
+        "review_outcomes": _review_outcomes(
+            review_rows, duplicate_checkpoints, pricing
+        ),
+        "task_outcomes": _task_outcomes(selected, review_rows, pricing),
         "events": {
             "ledgers": {
                 "discovered": len(reads),
@@ -482,6 +1093,112 @@ def _duration_text(value: Mapping[str, Any]) -> str:
     return f"{summary}; coverage {_coverage_text(value['coverage'])}"
 
 
+def _rate_text(value: Optional[float]) -> str:
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def _minutes_text(value: Mapping[str, Any]) -> str:
+    total = value["total"]
+    return "n/a" if total is None else f"{total / 60000.0:.1f}"
+
+
+def _tokens_text(value: Optional[int]) -> str:
+    return "n/a" if value is None else str(value)
+
+
+def _reviewer_text(name: str, row: Mapping[str, Any]) -> str:
+    line = (
+        f"  {name}: {row['reviews']} reviews, {row['pass']} PASS "
+        f"({_rate_text(row['pass_rate'])}); "
+        f"findings {json.dumps(row['findings'], sort_keys=True)}; "
+        f"{row['proof_gaps']} proof gaps; "
+        f"{row['green_check_reviews']['count']} on all-green checks; "
+        f"{_minutes_text(row['durations_ms'])} model min; "
+        f"{_tokens_text(row['tokens']['total'])} tokens "
+        f"(records {_coverage_text(row['records'])})"
+    )
+    observed = row["observed_usd"]
+    if observed["total"] is not None:
+        line += (
+            f"; observed USD {observed['total']} "
+            f"(coverage {_coverage_text(observed['coverage'])})"
+        )
+    if "usd" in row:
+        line += f"; rate-card USD {row['usd']['total']}"
+    return line
+
+
+def _outcome_lines(report: Mapping[str, Any]) -> List[str]:
+    reviews = report["review_outcomes"]
+    outcomes = report["task_outcomes"]
+    header = (
+        f"review outcomes: {reviews['reviews']} reviews, {reviews['pass']} PASS "
+        f"({_rate_text(reviews['pass_rate'])}); "
+        f"verdicts {json.dumps(reviews['by_verdict'], sort_keys=True)}; "
+        f"vendors {json.dumps(reviews['by_vendor'], sort_keys=True)}; "
+        f"token dialects {json.dumps(reviews['by_dialect'], sort_keys=True)}; "
+        f"{reviews['duplicate_checkpoints']} duplicate checkpoints skipped; "
+        f"records {_coverage_text(reviews['records'])}"
+    )
+    lines = [header]
+    lines.extend(
+        _reviewer_text(name, row) for name, row in reviews["by_reviewer"].items()
+    )
+    lines.append(
+        f"task outcomes: {outcomes['outcomes']} verification outcomes over "
+        f"{outcomes['tasks']} tasks; "
+        f"attempt verdicts {json.dumps(outcomes['by_verdict'], sort_keys=True)}; "
+        f"final task verdicts "
+        f"{json.dumps(outcomes['by_final_verdict'], sort_keys=True)}"
+    )
+    accepted = (
+        "n/a"
+        if outcomes["tokens_per_accepted_task"] is None
+        else str(outcomes["tokens_per_accepted_task"])
+    )
+    cost = (
+        f"tokens per accepted task: {accepted} "
+        f"({outcomes['accepted_tasks']} accepted tasks; "
+        f"{_tokens_text(outcomes['tokens']['total'])} review tokens, "
+        f"{outcomes['tokens']['unattributed']} unattributed; "
+        f"tokens by verdict "
+        f"{json.dumps(outcomes['tokens_by_verdict'], sort_keys=True)})"
+    )
+    observed = outcomes["observed_usd_per_accepted_task"]
+    if observed is not None:
+        cost += (
+            f"; observed USD per accepted task {observed} "
+            f"(total observed USD {outcomes['observed_usd']['total']}, "
+            f"coverage {_coverage_text(outcomes['observed_usd']['coverage'])})"
+        )
+    if "usd_per_accepted_task" in outcomes:
+        priced = outcomes["usd_per_accepted_task"]
+        cost += (
+            f"; rate-card USD per accepted task "
+            f"{'n/a' if priced is None else priced} "
+            f"(total USD {outcomes['usd']['total']})"
+        )
+    lines.append(cost)
+    return lines
+
+
+def _store_text(store: Mapping[str, Any]) -> str:
+    root = "UNRESOLVED" if store["root"] is None else store["root"]
+    tail = (
+        "DUPLICATE (already counted)"
+        if store["duplicate"]
+        else f"{store['tasks']} tasks"
+    )
+    return f"{store['path']} -> {root} ({tail})"
+
+
+def _store_lines(selection: Mapping[str, Any]) -> List[str]:
+    stores = selection["stores"]
+    if len(stores) < 2:
+        return []
+    return ["stores: " + "; ".join(_store_text(store) for store in stores)]
+
+
 def render_text(report: Mapping[str, Any]) -> str:
     selection = report["selection"]
     tasks = report["tasks"]
@@ -506,6 +1223,7 @@ def render_text(report: Mapping[str, Any]) -> str:
                 f"{selection['discovered_tasks']} most recent tasks "
                 f"(limit {selection['limit']})"
             ),
+            *_store_lines(selection),
             (
                 f"tasks: status {json.dumps(tasks['by_status'], sort_keys=True)}; "
                 f"coverage {_coverage_text(tasks['status_coverage'])}"
@@ -523,6 +1241,7 @@ def render_text(report: Mapping[str, Any]) -> str:
                 f"{reviews['timeouts']['count']} timeouts; "
                 f"durations {_duration_text(reviews['durations_ms'])}"
             ),
+            *_outcome_lines(report),
             (
                 f"checks: {checks['runs']} runs, {checks['timeouts']['count']} timeouts; "
                 f"outcomes {json.dumps(checks['by_outcome'], sort_keys=True)}; "
