@@ -33,6 +33,41 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 - **Shut down background review/verify agents the moment you've consumed their verdict.** Idle
   agents emit `idle_notification` every few seconds, each re-firing your turn (token + attention
   drain). `SendMessage({to, message:{type:"shutdown_request", reason}})`.
+- **EXACTLY ONE `cargo` process machine-wide, ever — concurrency is what freezes the Mac.** This
+  repo's test binary statically links the always-compiled ML tree (candle/mistralrs/whisper); ONE
+  such `cargo test --lib` link is a ~15-20 GB transient. Several builder/verifier agents (each
+  running its own cargo on the shared 187 GB `CARGO_TARGET_DIR`) + your own runs = multiple giant
+  links at once → macOS memory-compressor pins all 16 cores → the whole UI (even a new browser tab)
+  freezes, with swap still 0 (it's compression, not pageout). After `pkill cargo/rustc` the machine
+  is instantly 95% free — proving it's transient build peaks, not a leak. RULES: never run local
+  cargo while a subagent might; serialize builders (build → verify while builder idle → merge →
+  next); cap `CARGO_BUILD_JOBS=2 … -j2`; iterate with TARGETED filters (`cargo test --lib links` =
+  full compile, subset run) not the full 1900-test suite; **let CI (remote, 0 local RAM) be the real
+  full-gate.** Also: N divergent worktrees on ONE shared target THRASH (fingerprint miss → full ML
+  rebuild each switch) — prune stale worktrees, keep local cargo in as few trees as possible. Deeper
+  fix (needs a profile change): the default `debug=2` full debuginfo on every dependency is the
+  amplifier — see the build-perf research memory / `[profile.dev.package."*"] debug=false`.
+- **A multi-PR program under the RAM constraint = SEQUENTIAL build, CI-gated, not parallel-cargo.**
+  The proven cadence (ran a 12-PR program clean): build ONE PR in a worktree → verify (adversarial +
+  lock-security where the change touches seal/gate; verifiers are read-only or single-targeted-test,
+  never a 2nd concurrent cargo) → push → **CI (GitHub, remote = 0 local RAM) runs the full ci.sh
+  gate** → merge → remove the worktree → next. Overlap the NEXT builder's local compile with the
+  PREVIOUS PR's remote CI (still ONE local cargo). Rebase each PR onto fresh trunk before push
+  (merge-skew). Do NOT reach for a parallel-cargo Workflow — concurrent cargo freezes the Mac; a
+  read-only MAPPING fan-out (no cargo) is the only safe parallelism.
+- **Under session churn (model/effort switches, `/loop`), background tasks + subagents DIE silently.**
+  Verifiers/builders go idle without delivering; a re-verify run is lost. RECOVERY: trust the
+  FILESYSTEM, not chat — `git -C <wt> status/diff` (is the work there? is the tree byte-identical to
+  the builder's report?), `.claude/tmp/<task>/*.json` verdict artifacts, and any scratch files a dead
+  verifier left (its probe tests can be salvaged + run yourself to settle a verdict — that's how 2
+  real leaks were caught after verifiers stalled). Respawn a FRESH agent rather than nudging a wedged
+  one repeatedly. And SHUT DOWN each verify/build agent the moment you've consumed its verdict
+  (idle-notification spam re-fires your turn every few seconds).
+- **When a verifier FAILs a lock/seal change, apply its EXACT prescribed fix, then re-prove RED via
+  Edit (not git-checkout) + request a NARROW re-review of just the delta.** Both real bugs this
+  program (Accept deadlock, sealed-title leak) were caught by the lock/adversarial gate, fixed to the
+  reviewer's prescription (mirror the proven sibling), regression-pinned RED→GREEN, and re-confirmed
+  on the delta only — don't re-run the whole review.
 - **Deploy → POLL until the new artifact is genuinely live before saying "test now".** A green build
   ≠ deployed; the old container keeps serving until the new one is up. Poll the concrete changed
   thing (a new static file 200s, a response header flips) — a background `until`-loop, then verify.
@@ -66,7 +101,7 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
   `VALID`, and `https://api.murmurnotes.io/healthz` 200. For landing, require apex GitHub A records,
   `www CNAME -> murmur-io.github.io`, `landing/CNAME`, Pages deploy green, Pages `https_enforced=true`,
   and cert SAN covering both `murmurnotes.io` and `www.murmurnotes.io`. Full runbook:
-  `.codex/learnings/landing-api-deploy.md`.
+  `.claude/learnings/landing-api-deploy.md`.
 - **Status:** success-pattern
 
 ### [2026-07-05 sharing session — #194/#195/#196 + murmur-server #4/#5] password links + Touch ID + detail redesign
@@ -98,3 +133,9 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
   SSL Full, but disable Rocket-Loader/Email-Obfuscation or they break the strict-CSP viewer).
 - **Status:** superseded by `2026-07-05 landing/API deploy` (final fix was CNAME + TXT +
   wait/poll; cert became `CERTIFICATE_STATUS_TYPE_VALID`)
+
+### [2026-07-10 brain-l4-live] Never run the MUTATING adversarial verifier concurrently with the READ-ONLY lock auditor
+- **Pattern:** both verifiers dispatched in parallel on the same uncommitted diff; the adversarial's mutation-probe (removing a purge site, then restoring byte-identical) overlapped the lock reviewer's audit window — the lock reviewer saw the mutated tree, reported a "blocking leak" for code that was present before and after, and burned a FAIL verdict + an investigation on a concurrency artifact.
+- **Caught by:** the lock reviewer's own tree-state warning (diff hunk count changed mid-audit) + a post-hoc grep/test on the settled tree.
+- **Lesson:** patch-and-restore verifiers get EXCLUSIVE tree access. Run adversarial first, lock-security after (or vice versa) — never both at once on a dirty tree. If parallelism matters, give the mutating verifier a worktree.
+- **Status:** journal

@@ -10,7 +10,7 @@ Codex is one adapter to the vendor-neutral development harness in
 | `rules/` | Binding Rust, Angular, lock, and agent-loop rules |
 | `agents/` | Thin specialist role prompts |
 | `hooks.json` + `hooks/` | Codex wiring/adapters for the canonical hook guard |
-| `learnings/` | Curated recurring lessons and append-only run journals |
+| `learnings/` | **Generated** byte mirror of the canonical `.claude/learnings/` — never hand-edit; run `scripts/agent-sync-learnings` |
 | `../.agents/skills/` | Shared executable runbooks |
 
 The active development loop is:
