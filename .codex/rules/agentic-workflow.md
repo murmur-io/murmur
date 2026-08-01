@@ -132,6 +132,28 @@ lock-at-rest, signed-build behavior, notarization, or a real meeting workflow.
 Name that boundary explicitly.
 
 Commits are only `QueaT <kgm004a@gmail.com>` with no AI co-author trailers.
-Push, PR creation, merge, signing, notarization, and publication are
-operator-owned. Never direct-push `murmur`; use a PR. `com.meetnotes.app` is
-immutable. No new npm package or crate without explicit approval.
+Never direct-push `murmur`; use a PR. `com.meetnotes.app` is immutable. No new
+npm package or crate without explicit approval.
+
+**Commit, push and PR creation are agent work, not an operator handoff.** They
+used to be listed as operator-owned; that was written before the operator asked
+for releases to run end to end, and it was measurably harmful. It is the loudest
+always-on statement about where a turn ends, so opening a PR read as "control
+returns to the human" and work stopped there three times in one session with a
+declared task list still outstanding. Merging stays the operator's call. Signing
+and notarization stay operator-authorized because they need a real Keychain
+prompt — that is an authorization boundary, not an ownership one.
+
+## Keep going
+
+Opening a PR is not a turn boundary. Neither is answering a question.
+
+When a task list has been declared — by the operator, by a `/goal`, or by you in
+a previous turn — continue through it until every item is done, blocked on
+something only the operator can supply, or the operator redirects. A status
+question ("and?", "what now?") is a request for information, not an instruction
+to stop working: answer it in a sentence and carry on in the same turn.
+
+Announcing an intention and then ending the turn is the failure mode to avoid.
+If you write "taking this on now", the same turn must contain the first edit.
+Report what you finished, not what you are about to start.
