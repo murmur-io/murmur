@@ -85,6 +85,49 @@ for ledger in (evidence_store).rglob('events.jsonl'):
 No sampling: 348 ledgers, 216 review checkpoints, 100% of `record_path`s resolved. The corpus
 spans 2026-07-28 → 2026-07-31 and both vendors (`codex` and `claude`).
 
+### This is now a command, not an archaeology expedition
+
+The join above shipped as `scripts/agent-harness metrics --store <evidence-store>`
+(`.agents/harness/metrics.py`, `_review_rows` → `_review_outcomes` / `_task_outcomes`). Re-running
+it against the same store with the corpus restricted to `created_at < 2026-08-01` reproduces this
+table cell-for-cell for `egress-security` (65 / 69% / 17 findings / 5 BLOCKER / 38.8 min / 13%) and
+`lock-security` (53 / 75% / 11 / 6 / 33.0 min / 11%), and reproduces the headline **76%**
+generalist share of model time. Three arithmetic corrections fall out of that replay:
+
+1. **216 is an event count; there are 214 distinct reviews.** Two `combined` checkpoints —
+   `continuity-research-docs-20260728` and `dependency-rollup-v2-final-r2-20260728` — fire twice
+   against the same rewritten record. They contribute exactly the 2 reviews, 8 findings and 5.4
+   minutes by which this table exceeds a record-deduplicated count. The command deduplicates by
+   `(store, task, attempt, reviewer)` and prints how many events it skipped.
+2. **12.47M double-counts reasoning tokens.** `12,474,552` is
+   `input + output + reasoning_output_tokens` over the 216 events. `reasoning_output_tokens` is a
+   *subset* of `output_tokens` — measured strictly smaller in all 199 corpus records that report
+   it — so it must not be added.
+3. **`input_tokens` is not the prompt in both dialects, and treating it as one under-counted every
+   `claude` review by 75%.** Anthropic reports `input_tokens`, `cache_read_input_tokens` and
+   `cache_creation_input_tokens` as DISJOINT counters and puts a cached prompt almost entirely in
+   the cache pair: across the 31 `claude` records here, `input_tokens` totals **70** — per-record
+   values are literally 2 or 4 — against 2.23M cache-creation and 0.47M cache-read tokens. OpenAI
+   reports `cached_input_tokens` as a *subset* of `input_tokens`. So billable is per dialect, not
+   per field name: `input + cache_read + cache_creation + output` for Anthropic,
+   `input + output` for OpenAI (`.agents/harness/metrics.py`, `BILLABLE_LABELS_BY_DIALECT`).
+   Corrected billable is **14,305,563** over the 214 distinct reviews at this cutoff.
+
+None of the three moves the verdict; the generalist's share of model time is unchanged. Correction 3
+does move the token columns materially, so any per-reviewer token figure predating it is 75% low
+for every `claude` row and must not be compared against a `codex` row.
+
+The full store has since grown past this snapshot (232 reviews, 15.54M billable tokens, 343.4 min),
+and the growth is concentrated in nine `claude` `egress-security` reviews run on 2026-08-01 that
+alone account for 75 of that reviewer's now-92 findings and roughly 40 of its 78.9 minutes. The
+vendor split is **not** aligned with the reviewer split — the other 22 `claude` reviews are
+`combined` runs from 2026-07-28/29 — so a `combined`-vs-specialist comparison drawn from the
+current store is confounded by vendor at both ends; this table is the clean snapshot.
+
+Where a `claude` record carries `telemetry.cost_usd` the command now reports it as `observed USD`.
+It is measured rather than derived and needs no rate card: **$44.95** over the 31 `claude` records
+in the full store, and it exists on none of the 201 `codex` records.
+
 ## What this does NOT establish
 
 - **False-positive rate.** "MAJOR" is the reviewer's own label. Classifying each of the 90
