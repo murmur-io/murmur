@@ -43,14 +43,33 @@ runner, so its absence is a pass and the check can never fail a remote job.
 
 A local override **may widen** — extra `sandbox.filesystem.allowRead`/`allowWrite`
 paths outside the repository, extra `sandbox.network.allowedDomains`, extra
-`permissions.allow` entries the tracked policy does not deny. It **may not
-reverse** what the repository declares:
+`permissions.allow` entries the tracked policy does not deny, extra
+`permissions.deny` entries of its own (deny lists union across sources, so a
+local deny can only ever tighten). It **may not reverse** what the repository
+declares:
 
-- `sandbox.allowUnsandboxedCommands: true` while `settings.json` declares `false`;
-- a `sandbox.filesystem.allowWrite` entry covering any `.git` directory;
-- a `permissions.allow` entry that re-grants, or a `permissions.deny` list that
-  drops, anything the tracked `permissions.deny` declares (the comparison is
-  derived from `settings.json`, so it follows a legitimate policy change).
+- any tracked `sandbox` scalar flipped to its permissive side —
+  `enabled`/`failIfUnavailable` `true → false`, `allowUnsandboxedCommands`
+  `false → true`. Direction is per key: `autoAllowBashIfSandboxed: false` only
+  adds prompts and is allowed. The audit fails if `settings.json` ever grows a
+  sandbox scalar whose direction is not modelled, so the rule cannot rot;
+- a `permissions.defaultMode` at or above the tracked one on the
+  `plan < default < acceptEdits < bypassPermissions` ladder;
+- a `sandbox.filesystem.allowWrite` entry covering any `.git` directory **or any
+  ancestor of the repository root** (a write grant is a subtree grant, so `/`,
+  `$HOME`, and the repo directory itself all reach `<repo>/.git/hooks`);
+- a redeclared `sandbox.filesystem.denyWrite` that drops a tracked entry — the
+  array replaces rather than merges, so omitting one removes it;
+- a `permissions.allow` entry that re-grants anything the tracked
+  `permissions.deny` protects, matched on the deny rule's literal path prefix
+  rather than on the exact string, so `Read(~/.ssh/*)` and
+  `Bash(cat ~/.ssh/id_rsa)` are caught as well as `Read(~/.ssh/**)`;
+- an `env` value that differs from the one `settings.json` declares — notably
+  `MURMUR_FINISH_GUARD`, which `hook_guard._finish_guard` disables outright when
+  it reads `off`.
+
+Every one of those comparisons is derived from `settings.json`, so a legitimate
+policy change moves the rule with it instead of leaving a stale second copy.
 
 **Local convenience must never widen the declared posture.** The harness does
 not borrow this file: `.agents/harness/runtime.py` provisions each review with
@@ -72,9 +91,12 @@ strings downgrades the named key from a failure to a warning:
 }
 ```
 
-The auditable keys are `sandbox.allowUnsandboxedCommands`,
-`sandbox.filesystem.allowWrite`, and `permissions.deny`. An acknowledgement is a
-recorded justification, not a mute button: a bare key, an empty reason, or an
+The auditable keys are `env`, `permissions.allow`, `permissions.defaultMode`,
+`sandbox.allowUnsandboxedCommands`, `sandbox.enabled`,
+`sandbox.failIfUnavailable`, `sandbox.filesystem.allowWrite`, and
+`sandbox.filesystem.denyWrite` — one key per reversal, so acknowledging a
+sandbox scalar cannot also silence a credential re-grant. An acknowledgement is
+a recorded justification, not a mute button: a bare key, an empty reason, or an
 unrecognized key is itself a failure, an acknowledgement downgrades only the key
 it names, and the resulting `[WARN]` line keeps the reversal visible in every
 audit run.

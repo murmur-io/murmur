@@ -62,6 +62,7 @@ def _review_record(
     usage: Mapping[str, Any],
     severities: Any = (),
     proof_gaps: Any = (),
+    cost_usd: Any = None,
 ) -> Mapping[str, Any]:
     return {
         "schema_version": 2,
@@ -80,7 +81,7 @@ def _review_record(
                 "ok": True,
                 "transient": False,
                 "vendor": vendor,
-                "telemetry": {"cost_usd": None, "usage": dict(usage)},
+                "telemetry": {"cost_usd": cost_usd, "usage": dict(usage)},
             }
         ],
         "result": {
@@ -201,14 +202,20 @@ def _outcome_fixture(tasks: Path) -> None:
             "claude",
             "FAIL",
             90000,
+            # Copied verbatim from a real claude review record in the corpus.
+            # The Anthropic dialect puts essentially the whole prompt in the
+            # cache pair and leaves `input_tokens` at a literal 2, so a fixture
+            # that models it as a plausible-looking 2000 cannot tell the two
+            # dialects apart and the normalization assertion goes vacuous.
             {
-                "input_tokens": 2000,
-                "output_tokens": 200,
-                "cache_read_input_tokens": 300,
-                "cache_creation_input_tokens": 700,
+                "input_tokens": 2,
+                "output_tokens": 21730,
+                "cache_read_input_tokens": 3871,
+                "cache_creation_input_tokens": 57500,
             },
             ["MAJOR", "BLOCKER"],
             ["gap-a", "gap-b"],
+            cost_usd=1.45,
         ),
     )
     _write_json(needs_fix_attempt / "checks" / "ng-lint.json", _check_record("ng-lint", "FAIL"))
@@ -286,11 +293,6 @@ def outcome_cases(test: Tests) -> None:
             (180000, 60000, 90000),
         )
         test.equal(
-            "REVIEW-OUTCOME billable tokens are input plus output",
-            reviews["tokens"]["total"],
-            3850,
-        )
-        test.equal(
             "REVIEW-OUTCOME both vendor usage dialects are normalized",
             (
                 reviews["tokens"]["input"]["total"],
@@ -298,12 +300,41 @@ def outcome_cases(test: Tests) -> None:
                 reviews["tokens"]["cached"]["total"],
                 reviews["tokens"]["cache_write"]["total"],
             ),
-            (3500, 350, 500, 1100),
+            (1502, 21880, 4071, 57900),
+        )
+        test.equal(
+            "REVIEW-OUTCOME the usage dialect is attributed per record",
+            reviews["by_dialect"],
+            {"anthropic": 1, "openai": 2},
+        )
+        # codex: 1000+100 and 500+50 — `cached_input_tokens` is a SUBSET of
+        # `input_tokens` there, so adding it would double-count.
+        # claude: 2+3871+57500+21730 — those cache counters are DISJOINT from
+        # `input_tokens`, so billing `input + output` alone would score this
+        # 96k-token review at 21732 tokens, 26% of what it consumed.
+        test.equal(
+            "REVIEW-OUTCOME billable tokens follow each record's own dialect",
+            reviews["tokens"]["total"],
+            1100 + 550 + 83103,
+        )
+        test.equal(
+            "REVIEW-OUTCOME the Anthropic dialect bills its cache counters",
+            reviews["by_reviewer"]["combined"]["tokens"]["total"] - 1100,
+            83103,
         )
         test.equal(
             "REVIEW-OUTCOME reasoning tokens are reported but never billed",
             (reviews["tokens"]["reasoning"]["total"], reviews["tokens"]["total"]),
-            (10, 3850),
+            (10, 84753),
+        )
+        test.equal(
+            "REVIEW-OUTCOME the vendor's own measured cost is surfaced",
+            (
+                reviews["observed_usd"]["total"],
+                reviews["observed_usd"]["coverage"]["available"],
+                reviews["observed_usd"]["coverage"]["missing"],
+            ),
+            (1.45, 1, 3),
         )
         test.equal(
             "REVIEW-OUTCOME absent cache counters stay uncovered",
@@ -348,7 +379,7 @@ def outcome_cases(test: Tests) -> None:
         test.equal(
             "REVIEW-OUTCOME per-reviewer tokens and minutes are per reviewer",
             (combined["tokens"]["total"], combined["durations_ms"]["total"]),
-            (3300, 150000),
+            (84203, 150000),
         )
         test.equal(
             "REVIEW-OUTCOME a reviewer with no resolved record invents no rate",
@@ -371,12 +402,20 @@ def outcome_cases(test: Tests) -> None:
         test.equal(
             "TASK-OUTCOME review tokens are attributed to the outcome that consumed them",
             outcomes["tokens_by_verdict"],
-            {"NEEDS_FIX": 2200, "PASSED": 1650},
+            {"NEEDS_FIX": 83103, "PASSED": 1650},
         )
         test.equal(
             "TASK-OUTCOME cost per accepted task divides only by accepted tasks",
             (outcomes["tokens"]["total"], outcomes["tokens_per_accepted_task"]),
-            (3850, 1925),
+            (84753, 42376.5),
+        )
+        test.equal(
+            "TASK-OUTCOME observed cost per accepted task needs no rate card",
+            (
+                outcomes["observed_usd"]["total"],
+                outcomes["observed_usd_per_accepted_task"],
+            ),
+            (1.45, 0.725),
         )
         test.equal(
             "TASK-OUTCOME an unpriceable review is uncovered, not free",
@@ -398,9 +437,16 @@ def outcome_cases(test: Tests) -> None:
         )
         test.true(
             "TEXT cost per accepted task is rendered",
-            "tokens per accepted task: 1925" in text,
+            "tokens per accepted task: 42376.5" in text,
         )
-        test.true("TEXT omits USD when unpriced", "USD" not in text)
+        test.true(
+            "TEXT omits the rate-card column when unpriced",
+            "rate-card USD" not in text,
+        )
+        test.true(
+            "TEXT reports the measured cost even with no rate card",
+            "observed USD per accepted task 0.725" in text,
+        )
 
         first = metrics.collect_metrics(common, limit=20, config_path=unpriced)
         second = metrics.collect_metrics(common, limit=20, config_path=unpriced)
@@ -429,9 +475,11 @@ def outcome_cases(test: Tests) -> None:
         )
         with_usd = metrics.collect_metrics(common, limit=20, config_path=priced)
         test.equal(
-            "PRICING per-vendor rates price each vendor's own tokens",
+            "PRICING per-vendor rates price exactly the tokens each dialect bills",
             with_usd["review_outcomes"]["usd"]["by_vendor"],
-            {"claude": 0.015, "codex": 0.0045},
+            # claude: (2 + 3871 + 57500)/1e6*5 + 21730/1e6*25
+            # codex:  (1000 + 500)/1e6*2 + (100 + 50)/1e6*10
+            {"claude": 0.850115, "codex": 0.0045},
         )
         test.equal(
             "PRICING total USD and USD per accepted task follow the same join",
@@ -439,7 +487,7 @@ def outcome_cases(test: Tests) -> None:
                 with_usd["review_outcomes"]["usd"]["total"],
                 with_usd["task_outcomes"]["usd_per_accepted_task"],
             ),
-            (0.0195, 0.00975),
+            (0.854615, 0.427308),
         )
         test.true(
             "PRICING a malformed block is ignored rather than guessed",
@@ -475,6 +523,45 @@ def outcome_cases(test: Tests) -> None:
             "STORE an unresolvable store is reported, not silently empty",
             unresolved["selection"]["stores"][1]["root"],
             None,
+        )
+
+        # Absolute counts double while every rate stays identical, so nothing in
+        # the output looks anomalous. `--store <this repo's own store>` run from
+        # the driver clone is the documented command's own failure mode.
+        def totals(report: Mapping[str, Any]) -> Any:
+            return (
+                report["selection"]["discovered_tasks"],
+                report["review_outcomes"]["reviews"],
+                report["review_outcomes"]["tokens"]["total"],
+                report["task_outcomes"]["accepted_tasks"],
+                report["review_outcomes"]["durations_ms"]["total"],
+            )
+
+        once = metrics.collect_metrics(
+            common, limit=20, stores=[store], config_path=unpriced
+        )
+        twice = metrics.collect_metrics(
+            common, limit=20, stores=[store, store / "v2"], config_path=unpriced
+        )
+        test.equal(
+            "STORE the same task root passed twice is counted once",
+            totals(twice),
+            totals(once),
+        )
+        test.true(
+            "STORE a duplicate store is reported rather than silently elided",
+            twice["selection"]["stores"][2]["duplicate"] is True
+            and twice["selection"]["stores"][2]["tasks"] == 0
+            and "DUPLICATE (already counted)" in metrics.render_text(twice),
+        )
+        plain = metrics.collect_metrics(common, limit=20, config_path=unpriced)
+        self_referential = metrics.collect_metrics(
+            common, limit=20, stores=[common], config_path=unpriced
+        )
+        test.equal(
+            "STORE the default store passed as --store is not counted twice",
+            totals(self_referential),
+            totals(plain),
         )
         test.equal(
             "STORE same task id in two stores does not collide",
