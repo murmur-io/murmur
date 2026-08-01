@@ -603,6 +603,9 @@ pub struct AppConfigDto {
     /// as an empty list (all actions enabled) — a missing field enables, never disables.
     #[serde(default)]
     pub note_assist_actions_off: Vec<String>,
+    /// Display name for the `me` capture lane in generated notes. Empty = unset.
+    #[serde(default)]
+    pub user_display_name: String,
     pub note_language: String,
     /// On-device post-generation support marker. Settable from Settings. The thresholds are not
     /// calibrated, so the marker is a review cue rather than proof. Omission means PRESERVE the
@@ -4965,6 +4968,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_assist_shorten: c.note_assist_shorten,
         note_assist_enhance: c.note_assist_enhance,
         note_assist_actions_off: c.note_assist_actions_off.clone(),
+        user_display_name: c.user_display_name.clone(),
         note_language: c.note_language.clone(),
         ground_summary: Some(c.ground_summary),
         glossary: Some(c.glossary.clone()),
@@ -5131,6 +5135,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         note_assist_shorten: d.note_assist_shorten,
         note_assist_enhance: d.note_assist_enhance,
         note_assist_actions_off: d.note_assist_actions_off,
+        user_display_name: d.user_display_name.trim().to_string(),
         note_language: if d.note_language.trim().is_empty() {
             "auto".to_string()
         } else {
