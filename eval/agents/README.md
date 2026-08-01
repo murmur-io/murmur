@@ -75,7 +75,7 @@ carries a `measurement_limit` that states honestly whether the task can still me
 | `lock-masked-dto` | **No, for a frontier model — measured.** The half-fix was expected to be attractive. It was not. |
 | `analysis-only` | **Partially, untested live.** The finding is visible without any rule (an unused `unlocked` flag beside an unconditional return); what the scaffold plausibly changes is the no-edit discipline, which is now scored separately. |
 | `seal-verify-before-destroy` | **Still weak, untested live.** The fixture is twelve lines with the destructive write textually above the failure return. "Audit this" ≈ "spot the obvious bug". |
-| `secret-sk-proj` | **No, by design.** `scaffold_files` is empty, so its arms are byte-identical and its delta is definitionally zero. It is a floor check that the graders discriminate at all. |
+| `secret-sk-proj` | **No rule, by design — but only two of its three arms are identical.** `scaffold_files` is empty, so its `rules` arm is byte-identical to `none` and that delta is definitionally zero. `full` is **not** one of them: it injects the whole envelope for every task, so `full` − `none` here is a real number measuring the envelope's *general* effect, never a secret-scanning rule (there is none). It is a floor check that the graders discriminate at all. |
 
 **Measured 2026-08-01, `claude -p` (Claude Code 2.1.220), n=1 per arm.** After the rewrite, on the
 two tasks the review called the most important:
@@ -258,9 +258,15 @@ arm passes and the bad arm fails. It proves the **graders still have teeth**. A 
 graders have quietly become vacuous reports green forever and is worse than no eval — so the
 control runs for free and can go in CI, while the live measurement runs on a cadence.
 
-Current state: 5 tasks × 2 arms = **10/10**, zero model calls. `--selftest` adds 10 assertions
-(5 tasks across all three arms, the missing-file guard, ERROR-vs-pass-count, arm interleaving, the
-TMPDIR guard and incremental JSON), also free.
+Current state: 5 tasks × 2 arms = **10/10**, zero model calls. `--selftest` adds 14 assertion
+blocks (5 tasks across all three arms, the missing-file guard, ERROR-vs-pass-count, grader
+substance, transcript-echo neutrality, signal independence, the arm-identity doc check, arm
+interleaving, the TMPDIR guard and incremental JSON), also free.
+
+Fake mode alone is **not** enough to trust the graders: it replays two fixed strings per task, so a
+grader can be badly wrong and still report 10/10. Every response-grader property is pinned in
+`--selftest` instead, and each assertion there was proved non-vacuous by reverting its fix and
+watching it go red.
 
 ## Cadence
 

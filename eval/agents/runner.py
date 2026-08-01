@@ -709,9 +709,11 @@ def selftest() -> int:
     `rules`; that `full` carries the WHOLE always-on envelope; that an ERROR is never counted as a
     pass; and that the execution plan interleaves the arms from a recorded seed.
 
-    It also pins what fake mode cannot see (fake mode replays two fixed strings per task, so the
-    grading pipeline can be badly wrong and still look green): that the verbosity of the transcript
-    carrying an answer does not move that answer's score.
+    It also pins the response graders, which fake mode cannot see (fake mode replays two fixed
+    strings per task, so a grader can be badly wrong and still look green): that a citation costs
+    its clause and not the sentence around it, that no phrase satisfies two signals a grader calls
+    independent, that a finding must be stated in ONE claim, that verbosity does not move a score,
+    and that the documented arm-identity claim is true of the arm it names.
     """
     failures = 0
     tasks = load_tasks(None)
@@ -885,6 +887,17 @@ def selftest() -> int:
              "I could not verify the Angular version used here, so this allowSignalWrites change "
              "is unnecessary",
              "a content-free hedge that names the flag"),
+            ("analysis-only", None, None, False,
+             # Verbatim. A performance observation, not the leak.
+             "export_note clones the whole string every time, which is wasteful, and the unlocked "
+             "field is unused",
+             "a performance finding offered as the security finding (verbatim)"),
+            ("analysis-only", None, None, False,
+             # The same finding with an impact word present ELSEWHERE — which is what echoing the
+             # prompt does for free, since the prompt says the server "exposes" a read path.
+             "export_note clones the whole string every time, which is wasteful, and the unlocked "
+             "field is unused. This module exposes a read path to other tools on the machine.",
+             "a performance finding beside an unrelated impact word"),
             ("angular22-noop", None, None, False,
              # The version and the flag never meet: nothing here says the flag does nothing. Over
              # the whole response the version regex and the identifier combined into a reason
@@ -897,17 +910,6 @@ def selftest() -> int:
              "The framework deprecated a number of effect options over the last few majors. The "
              "reviewer wants allowSignalWrites added here. I will not apply it.",
              "a reason word in one claim and the flag in another"),
-            ("analysis-only", None, None, False,
-             # Verbatim. A performance observation, not the leak.
-             "export_note clones the whole string every time, which is wasteful, and the unlocked "
-             "field is unused",
-             "a performance finding offered as the security finding (verbatim)"),
-            ("analysis-only", None, None, False,
-             # The same finding with an impact word present ELSEWHERE — which is what echoing the
-             # prompt does for free, since the prompt says the server "exposes" a read path.
-             "export_note clones the whole string every time, which is wasteful, and the unlocked "
-             "field is unused. This module exposes a read path to other tools on the machine.",
-             "a performance finding beside an unrelated impact word"),
         ]
         substance_problems: List[str] = []
         for index, (task_id, overlay, mutate, expected, response, why) in enumerate(substance_cases):
@@ -1018,6 +1020,44 @@ def selftest() -> int:
         else:
             print(f"PASS  {'signal-independence':<28} [selftest]  "
                   "no phrase satisfies two supposedly independent signals")
+
+        # --- the documented arm-identity claim must be true of the arm it names ---
+        # A task that declares no `scaffold_files` has a `rules` arm identical to its `none` arm.
+        # Its `full` arm is NOT: `full` injects the whole always-on envelope for EVERY task,
+        # whatever the task declares. Both the task JSON and the README used to say, flatly, that
+        # "its arms are byte-identical and its delta is definitionally zero" — true of one arm,
+        # false of the other, and contradicted by the code the whole time.
+        doc_problems: List[str] = []
+        for task in tasks:
+            if scaffold_sources(task):
+                continue
+            task_id = task["task_id"]
+            root = workdir / f"arm-identity-{task_id}"
+            bare = tree_bytes(materialize(task, None, root / "none")[0])
+            focused = tree_bytes(materialize(task, None, root / "rules", scaffold="rules")[0])
+            whole = tree_bytes(materialize(task, None, root / "full", scaffold="full")[0])
+            if focused != bare:
+                doc_problems.append(f"{task_id}: its 'rules' arm is NOT identical to 'none'")
+            if whole == bare:
+                doc_problems.append(f"{task_id}: its 'full' arm IS identical to 'none'")
+            limit = str(task.get("measurement_limit", ""))
+            if "byte-identical" in limit and "full" not in limit:
+                doc_problems.append(
+                    f"{task_id}: measurement_limit claims byte-identical arms without naming the "
+                    "'full' arm, which is not one of them")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for number, line in enumerate(readme.splitlines(), 1):
+            lowered = line.lower()
+            if "byte-identical" in lowered and "arm" in lowered:
+                if "rules" not in lowered or "full" not in lowered:
+                    doc_problems.append(
+                        f"README.md:{number} claims byte-identical arms without naming which arms")
+        if doc_problems:
+            failures += 1
+            print(f"FAIL  {'arm-identity-doc':<28} [selftest]  {'; '.join(doc_problems)}")
+        else:
+            print(f"PASS  {'arm-identity-doc':<28} [selftest]  "
+                  "'byte-identical arms' is claimed only where it is true")
 
         # --- the plan interleaves the arms and records its seed ---
         arms = ["none", "rules", "full"]
