@@ -26,6 +26,7 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import learning_extract
 import runtime
 import verifier
 
@@ -2356,6 +2357,17 @@ def verify_task(
             protocol_sha256=evidence["protocol_sha256"],
             evidence_sha256=evidence["evidence_sha256"],
         )
+        # The learning loop's INPUT: a refused diff's severe findings become
+        # `## Run journal` candidates the operator curates by hand.  It runs
+        # AFTER the terminal state is durably written and BEFORE the receipt
+        # gate, so it can neither change a verdict nor mask an evidence
+        # failure, and the broad catch is deliberate — this writes outside the
+        # verification worktree and must never be able to turn a computed
+        # verdict into a traceback.
+        try:
+            learning_extract.append_learning_candidates(contract, evidence, config)
+        except Exception:  # noqa: BLE001 - journal extraction never gates a verdict
+            pass
         if new_state == "PASSED":
             try:
                 verifier.verify_v2_evidence(

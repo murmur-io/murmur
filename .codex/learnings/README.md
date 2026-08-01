@@ -37,13 +37,18 @@ Raw evidence-backed entries from individual runs. Format:
 ```
 ### [YYYY-MM-DD <task/PR>] <one-line title>
 - **Pattern:** what happened / the failure mode
-- **Caught by:** adversarial-verifier | lock-security-reviewer | operator | gate:<name>
+- **Caught by:** adversarial-verifier | lock-security-reviewer | operator | gate:<name> | harness verify
 - **Lesson:** the imperative to apply next time
-- **Status:** journal | distilled (<date>) | success-pattern
+- **Status:** journal | distilled (<date>) | success-pattern | auto-candidate (uncurated)
 ```
 
 Auto-pruned past ~50 entries (oldest journal entries drop off; distilled ones are already
 promoted). `success-pattern` entries capture what a *clean* run did right, not just failures.
+
+`auto-candidate (uncurated)` marks an entry the Harness filed by itself — one per MAJOR/BLOCKER
+finding of a `NEEDS_FIX` verify — with a placeholder Lesson. It is raw reviewer output, not yet a
+lesson: rewrite it by hand as one imperative, or delete it. It is never promoted automatically,
+because auto-promotion is exactly how a hallucinated finding would become a binding rule.
 
 ## The loop
 
@@ -51,7 +56,10 @@ promoted). `success-pattern` entries capture what a *clean* run did right, not j
    Harness protocol hash binds the complete tree through the generated `.codex/learnings/` mirror.
 2. **Work** — the developer implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry citing the artifact that
-   revealed it, then regenerate the mirror.
+   revealed it, then regenerate the mirror. A `NEEDS_FIX` verify does this for its own severe
+   findings (`.agents/harness/learning_extract.py`, enabled by `learning_extract` in
+   `.agents/harness/config.json`) and resyncs the mirror itself; those entries land as
+   `auto-candidate (uncurated)` and still need a human to turn them into a lesson.
 4. **Curate** — periodically, promote 2+ similar journal entries into `## Recurring patterns`,
    mark the sources `distilled`, then regenerate the mirror.
 
