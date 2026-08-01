@@ -259,6 +259,30 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
         "harness has a bounded reviewer deadline",
         "harness reviewer_timeout_seconds must be between 1 and 86400",
     )
+    authority = config.get("review_authority") if isinstance(config, dict) else None
+    risk_reviews = config.get("risk_reviews") if isinstance(config, dict) else None
+    audit.require(
+        isinstance(authority, dict)
+        and isinstance(risk_reviews, dict)
+        and all(
+            authority.get(kind) == "blocking"
+            for kind in ("lock-security", "egress-security", "protocol-security")
+        )
+        and all(
+            authority.get(kind) == "blocking" for kind in risk_reviews.values()
+        ),
+        "risk specialists retain blocking review authority",
+        "every risk_reviews specialist must stay blocking in review_authority",
+    )
+    audit.require(
+        isinstance(authority, dict)
+        and set(authority).issubset(
+            {"combined", "lock-security", "egress-security", "protocol-security"}
+        )
+        and set(authority.values()).issubset({"blocking", "advisory"}),
+        "review authority names only real review kinds",
+        "review_authority keys must be planned review kinds with blocking/advisory values",
+    )
     canonical = config.get("canonical_checks", {}) if isinstance(config, dict) else {}
     risk_evidence = config.get("risk_required_evidence", {}) if isinstance(config, dict) else {}
     required_check_ids = {

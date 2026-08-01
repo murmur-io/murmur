@@ -20,6 +20,7 @@
     "probes",
     "reviews",
     "findings",
+    "advisory_findings",
     "proof_gaps",
     "probe_requests",
     "telemetry",
@@ -54,6 +55,10 @@
       "items": { "type": "object", "additionalProperties": true }
     },
     "findings": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "advisory_findings": {
       "type": "array",
       "items": { "type": "object", "additionalProperties": true }
     },
