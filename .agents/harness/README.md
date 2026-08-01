@@ -66,6 +66,29 @@ The behavioral prompt cannot add shell commands. The derived plan is the sole
 executable evidence profile. Reviewers are fresh, read-only, and tool-free.
 They may request only a typed, allowlisted probe that the runner executes.
 
+`review_authority` in `config.json` decides which review can forbid a PASS. The
+three risk specialists are `blocking`. The `combined` generalist is `advisory`:
+it still runs, and its findings, proof gaps, and probe requests are still
+recorded in the receipt, but on any plan that keeps another gate they no longer
+gate the verdict and no longer spend a probe execution — see
+`docs/research/2026-08-01-reviewer-corpus-measurement.md`. Any unconfigured or
+unknown review kind is blocking.
+
+Demotion removes a gate; it must never remove the last one. Every PASS names at
+least one gate that could have refused it, so `verifier.gating_review_kinds`
+skips the demotion for a plan that derived no deterministic check and no
+configured blocking review — docs-only, asset-only, and landing-only diffs,
+whose only planned review is the generalist. There the generalist still gates,
+spends its probe, and can still refuse. The receipt gate re-derives that same
+set from the exact paths and the attested config, so a re-hashed `PASSED` on an
+ungated plan is refused by the rule that produced it.
+
+Findings from a demoted review are recorded in `evidence.advisory_findings`,
+projected into task state, printed by `status`, carried in the `verify` status
+JSON, and counted in the PASS reason, which then reads `all blocking checks and
+reviews passed; N advisory finding(s) recorded (M MAJOR/BLOCKER)` instead of
+claiming every review passed.
+
 Green checkpoints for an unchanged exact diff survive interruption.
 `NEEDS_FIX` means edit the worktree and verify the new diff.
 `NEEDS_EVIDENCE`, `PAUSED_RETRYABLE`, and `INTERRUPTED` resume without throwing
