@@ -7979,6 +7979,443 @@ def learning_extract_cases(test: Tests) -> None:
                 os.environ.pop("MURMUR_HARNESS_FAKE_REVIEW_VERDICT", None)
             else:
                 os.environ["MURMUR_HARNESS_FAKE_REVIEW_VERDICT"] = saved_verdict
+LOCAL_SETTINGS_TRACKED_FIXTURE: Dict[str, Any] = {
+    # Deliberately NOT config_audit.REQUIRED_DENIES: the deny comparison has to
+    # be derived from whatever the tracked file declares, so a fixture-only
+    # entry proves the check reads the document instead of a module constant.
+    "env": {"FIXTURE_GUARD": "enforce", "FIXTURE_AUTOFMT": "0"},
+    "permissions": {"deny": ["Read(~/fixture-only-secret/**)", "Read(**/fixture.pem)"]},
+    "sandbox": {
+        "allowUnsandboxedCommands": False,
+        "autoAllowBashIfSandboxed": True,
+        "enabled": True,
+        "failIfUnavailable": True,
+        "filesystem": {
+            "allowWrite": ["../.murmur-agent-tasks"],
+            "denyWrite": ["../meetnotes/.git", "../murmur-server/.git"],
+        },
+    },
+}
+
+
+def _local_settings_audit(
+    root: Path,
+    local: Optional[Mapping[str, Any]],
+    tracked_override: Optional[Mapping[str, Any]] = None,
+) -> config_audit.Audit:
+    """Run `_local_settings` against a temp tree with `local` as the override."""
+
+    tracked = copy.deepcopy(
+        LOCAL_SETTINGS_TRACKED_FIXTURE if tracked_override is None else tracked_override
+    )
+    claude = root / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    runtime.atomic_write_json(claude / "settings.json", tracked)
+    override = claude / "settings.local.json"
+    if local is None:
+        if override.exists():
+            override.unlink()
+    else:
+        runtime.atomic_write_json(override, local)
+    audit = config_audit.Audit()
+    original_root = config_audit.ROOT
+    config_audit.ROOT = root
+    try:
+        config_audit._local_settings({".claude/settings.json": tracked}, audit)
+    finally:
+        config_audit.ROOT = original_root
+    return audit
+
+
+def local_settings_policy_cases(test: Tests) -> None:
+    """Pin the untracked Claude override against the tracked sandbox posture."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-local-settings-") as raw:
+        root = Path(raw)
+
+        absent = _local_settings_audit(root, None)
+        test.equal(
+            "absent local override raises nothing (the CI case)",
+            (absent.errors, absent.warnings),
+            ([], []),
+        )
+        test.true(
+            "absent local override still records a positive check",
+            any("no local Claude settings override" in check for check in absent.checks),
+        )
+
+        unsandboxed = _local_settings_audit(
+            root, {"sandbox": {"allowUnsandboxedCommands": True}}
+        )
+        test.true(
+            "re-enabled allowUnsandboxedCommands is a single failure",
+            len(unsandboxed.errors) == 1
+            and "sandbox.allowUnsandboxedCommands=true" in unsandboxed.errors[0],
+        )
+        test.equal(
+            "re-enabled allowUnsandboxedCommands never downgrades itself",
+            unsandboxed.warnings,
+            [],
+        )
+
+        # Turning the sandbox OFF is a strictly larger reversal than permitting
+        # escapes from it, and it reaches the same way: local project settings
+        # outrank project settings for every sibling scalar in the object.
+        for name in ("enabled", "failIfUnavailable"):
+            disabled = _local_settings_audit(root, {"sandbox": {name: False}})
+            test.true(
+                f"a local override may not turn off sandbox.{name}",
+                len(disabled.errors) == 1
+                and f"sandbox.{name}=false" in disabled.errors[0],
+            )
+            test.true(
+                f"sandbox.{name} is acknowledgeable under its own key",
+                f"sandbox.{name}" in config_audit.LOCAL_POLICY_KEYS,
+            )
+        test.equal(
+            "a tightening sandbox scalar is not a reversal",
+            _local_settings_audit(
+                root, {"sandbox": {"autoAllowBashIfSandboxed": False}}
+            ).errors,
+            [],
+        )
+        unmodelled_tracked = copy.deepcopy(LOCAL_SETTINGS_TRACKED_FIXTURE)
+        unmodelled_tracked["sandbox"]["someFutureHardening"] = True
+        unmodelled = _local_settings_audit(root, None, unmodelled_tracked)
+        test.true(
+            "a tracked sandbox scalar this audit does not model fails, even with no override",
+            len(unmodelled.errors) == 1
+            and "someFutureHardening" in unmodelled.errors[0],
+        )
+
+        bypass = _local_settings_audit(
+            root, {"permissions": {"defaultMode": "bypassPermissions"}}
+        )
+        test.true(
+            "a local permissions.defaultMode that suppresses gating fails",
+            len(bypass.errors) == 1
+            and "permissions.defaultMode=bypassPermissions" in bypass.errors[0],
+        )
+        test.equal(
+            "a stricter local permissions.defaultMode passes",
+            _local_settings_audit(root, {"permissions": {"defaultMode": "plan"}}).errors,
+            [],
+        )
+
+        guard_off = _local_settings_audit(
+            root, {"env": {"FIXTURE_GUARD": "off", "FIXTURE_UNTRACKED": "1"}}
+        )
+        test.true(
+            "a local env value that reverses a tracked one fails",
+            len(guard_off.errors) == 1
+            and "FIXTURE_GUARD" in guard_off.errors[0]
+            and "FIXTURE_UNTRACKED" not in guard_off.errors[0],
+        )
+        test.equal(
+            "restating a tracked env value is not a reversal",
+            _local_settings_audit(root, {"env": {"FIXTURE_GUARD": "enforce"}}).errors,
+            [],
+        )
+
+        dropped_deny_write = _local_settings_audit(
+            root,
+            {
+                "sandbox": {
+                    "filesystem": {"denyWrite": ["/Users/fixture/murmur-server/.git"]}
+                }
+            },
+        )
+        test.true(
+            "a redeclared denyWrite that drops a tracked entry fails",
+            len(dropped_deny_write.errors) == 1
+            and "../meetnotes/.git" in dropped_deny_write.errors[0]
+            and "../murmur-server/.git" not in dropped_deny_write.errors[0],
+        )
+        test.equal(
+            "an absolute denyWrite still covering every tracked entry passes",
+            _local_settings_audit(
+                root,
+                {
+                    "sandbox": {
+                        "filesystem": {
+                            "denyWrite": [
+                                "/Users/fixture/Projects/meetnotes/.git",
+                                # An ancestor denies the subtree, so it covers
+                                # ../murmur-server/.git too.
+                                "/Users/fixture/Projects/murmur-server",
+                            ]
+                        }
+                    }
+                },
+            ).errors,
+            [],
+        )
+        test.equal(
+            "not redeclaring denyWrite at all is not a drop",
+            _local_settings_audit(
+                root, {"sandbox": {"filesystem": {"allowRead": ["/Users/fixture/x"]}}}
+            ).errors,
+            [],
+        )
+
+        git_entry = "/Users/fixture/Projects/meetnotes/.git"
+        git_write = _local_settings_audit(
+            root,
+            {
+                "sandbox": {
+                    "filesystem": {
+                        "allowWrite": [
+                            "/Users/fixture/.cargo",
+                            git_entry,
+                            "/Users/fixture/Projects/meetnotes/.git/agent-harness",
+                        ]
+                    }
+                }
+            },
+        )
+        test.equal("git write grants fail once per entry", len(git_write.errors), 2)
+        test.true(
+            "git write failure names the offending absolute entry verbatim",
+            any(error.endswith(git_entry) for error in git_write.errors),
+        )
+        lookalike = _local_settings_audit(
+            root,
+            {
+                "sandbox": {
+                    "filesystem": {
+                        "allowWrite": [
+                            "/Users/fixture/.gitconfig",
+                            "/Users/fixture/Projects/gitlab-runner",
+                            "/Users/fixture/Projects/.murmur-agent-tasks",
+                        ]
+                    }
+                }
+            },
+        )
+        test.equal(
+            "paths that merely start with 'git' are not Git directories",
+            (lookalike.errors, lookalike.warnings),
+            ([], []),
+        )
+        test.true(
+            "a case-variant .git component is still a Git directory",
+            len(
+                _local_settings_audit(
+                    root,
+                    {
+                        "sandbox": {
+                            "filesystem": {
+                                "allowWrite": ["/Users/fixture/Projects/meetnotes/.GIT"]
+                            }
+                        }
+                    },
+                ).errors
+            )
+            == 1,
+        )
+        # A write grant is a SUBTREE grant, so the one-component-shallower edit an
+        # operator makes to silence the rule above WIDENS it: <repo>/.git/hooks
+        # stays reachable and runs unsandboxed on the next commit.
+        for label, entry in (
+            ("the repository root itself", str(root)),
+            ("a parent of the repository root", str(root.parent)),
+            ("the filesystem root", "/"),
+            ("a relative self-grant", "."),
+        ):
+            ancestor = _local_settings_audit(
+                root, {"sandbox": {"filesystem": {"allowWrite": [entry]}}}
+            )
+            test.true(
+                f"a write grant covering {label} reaches .git and fails",
+                len(ancestor.errors) == 1
+                and "covers the repository root" in ancestor.errors[0],
+            )
+        test.equal(
+            "a sibling of the repository root is not an ancestor of it",
+            _local_settings_audit(
+                root,
+                {
+                    "sandbox": {
+                        "filesystem": {"allowWrite": ["../.murmur-agent-tasks"]}
+                    }
+                },
+            ).errors,
+            [],
+        )
+
+        test.true(
+            "the deny fixture is not reachable through REQUIRED_DENIES",
+            "Read(~/fixture-only-secret/**)" not in config_audit.REQUIRED_DENIES,
+        )
+        regrant = _local_settings_audit(
+            root, {"permissions": {"allow": ["Read(~/fixture-only-secret/**)"]}}
+        )
+        test.true(
+            "a local allow that re-grants a tracked deny fails",
+            len(regrant.errors) == 1
+            and "Read(~/fixture-only-secret/**)" in regrant.errors[0],
+        )
+        for label, allowed in (
+            ("narrower glob", "Read(~/fixture-only-secret/*)"),
+            ("single file", "Read(~/fixture-only-secret/key.txt)"),
+            ("another tool", "Bash(cat ~/fixture-only-secret/key.txt)"),
+        ):
+            widened = _local_settings_audit(root, {"permissions": {"allow": [allowed]}})
+            test.true(
+                f"a re-grant that is not the tracked string still fails ({label})",
+                len(widened.errors) == 1 and allowed in widened.errors[0],
+            )
+        test.equal(
+            "an allow that shares no literal prefix with a tracked deny passes",
+            _local_settings_audit(
+                root,
+                {"permissions": {"allow": ["Read(docs/**/*.md)", "Bash(ls:*)"]}},
+            ).errors,
+            [],
+        )
+        # Claude Code unions deny lists across settings sources and deny beats
+        # allow, so a local deny list can only ever ADD. Failing here accused an
+        # operator of weakening entries they never touched and pushed them onto
+        # the acknowledgement that also mutes the real re-grant above.
+        tightened = _local_settings_audit(
+            root, {"permissions": {"deny": ["Read(~/.kube/**)"]}}
+        )
+        test.equal(
+            "a strictly-tightening local deny list is not a weakening",
+            (tightened.errors, tightened.warnings),
+            ([], []),
+        )
+        test.equal(
+            "omitting permissions entirely is not a weakening",
+            _local_settings_audit(root, {"sandbox": {"enabled": True}}).errors,
+            [],
+        )
+
+        acknowledged = _local_settings_audit(
+            root,
+            {
+                "_ack_policy_overrides": [
+                    "sandbox.allowUnsandboxedCommands: fixture release step needs codesign"
+                ],
+                "sandbox": {"allowUnsandboxedCommands": True},
+            },
+        )
+        test.equal("an acknowledged override clears the failure", acknowledged.errors, [])
+        test.true(
+            "an acknowledged override is recorded as one reasoned warning",
+            len(acknowledged.warnings) == 1
+            and "sandbox.allowUnsandboxedCommands=true" in acknowledged.warnings[0]
+            and "fixture release step needs codesign" in acknowledged.warnings[0],
+        )
+
+        scoped = _local_settings_audit(
+            root,
+            {
+                "_ack_policy_overrides": [
+                    "sandbox.allowUnsandboxedCommands: fixture release step needs codesign"
+                ],
+                "sandbox": {
+                    "allowUnsandboxedCommands": True,
+                    "filesystem": {"allowWrite": [git_entry]},
+                },
+            },
+        )
+        test.true(
+            "an acknowledgement downgrades only the key it names",
+            len(scoped.errors) == 1
+            and len(scoped.warnings) == 1
+            and git_entry in scoped.errors[0],
+        )
+
+        for label, entry in (
+            ("bare key", "sandbox.allowUnsandboxedCommands"),
+            ("empty reason", "sandbox.allowUnsandboxedCommands:   "),
+        ):
+            reasonless = _local_settings_audit(
+                root,
+                {
+                    "_ack_policy_overrides": [entry],
+                    "sandbox": {"allowUnsandboxedCommands": True},
+                },
+            )
+            test.equal(
+                f"a reasonless acknowledgement ({label}) mutes nothing",
+                reasonless.warnings,
+                [],
+            )
+            test.true(
+                f"a reasonless acknowledgement ({label}) fails twice over",
+                len(reasonless.errors) == 2
+                and any("records no reason" in error for error in reasonless.errors),
+            )
+
+        mistyped = _local_settings_audit(
+            root,
+            {
+                "_ack_policy_overrides": ["sandbox.allowUnsandboxed: typo"],
+                "sandbox": {"allowUnsandboxedCommands": True},
+            },
+        )
+        test.true(
+            "an acknowledgement naming an unaudited key cannot silence a rule",
+            len(mistyped.errors) == 2
+            and any("unaudited key" in error for error in mistyped.errors),
+        )
+
+        clean = _local_settings_audit(
+            root,
+            {
+                "permissions": {"allow": []},
+                "sandbox": {
+                    "enabled": True,
+                    "network": {"allowedDomains": ["github.com"]},
+                    "filesystem": {
+                        "allowWrite": ["/Users/fixture/.cargo"],
+                        "allowRead": ["/Users/fixture/.config/gh"],
+                    },
+                },
+            },
+        )
+        test.equal(
+            "a widening-only local override passes",
+            (clean.errors, clean.warnings),
+            ([], []),
+        )
+        test.true(
+            "a passing local override records a positive check",
+            any("preserves the declared posture" in check for check in clean.checks),
+        )
+
+        def audit_raw_override(text: str) -> config_audit.Audit:
+            (root / ".claude" / "settings.local.json").write_text(text, encoding="utf-8")
+            audit = config_audit.Audit()
+            original_root = config_audit.ROOT
+            config_audit.ROOT = root
+            try:
+                config_audit._local_settings(
+                    {
+                        ".claude/settings.json": copy.deepcopy(
+                            LOCAL_SETTINGS_TRACKED_FIXTURE
+                        )
+                    },
+                    audit,
+                )
+            finally:
+                config_audit.ROOT = original_root
+            return audit
+
+        unparseable = audit_raw_override("{ not json")
+        test.true(
+            "an unparseable local override fails instead of being skipped",
+            len(unparseable.errors) == 1 and "invalid JSON" in unparseable.errors[0],
+        )
+        for label, text in (("null", "null"), ("array", "[]")):
+            non_object = audit_raw_override(text)
+            test.true(
+                f"a non-object local override ({label}) fails exactly once",
+                len(non_object.errors) == 1
+                and "must contain a JSON object" in non_object.errors[0],
+            )
 
 
 def main() -> int:
@@ -8006,6 +8443,7 @@ def main() -> int:
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
     plan_and_probe_cases(test)
+    local_settings_policy_cases(test)
     clean_cases(test)
     lock_review_scope_prompt_cases(test)
     egress_review_scope_prompt_cases(test)
