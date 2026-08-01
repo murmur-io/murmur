@@ -2074,17 +2074,22 @@ def verify_task(
         review_records = [
             records_by_kind[item["kind"]] for item in plan["reviews"]
         ]
-        # An advisory reviewer keeps its findings, proof gaps and probe requests
+        # A demoted reviewer keeps its findings, proof gaps and probe requests
         # in the receipt, but it may not spend a runner-owned probe execution or
         # force another full review round: the corpus measurement behind
         # `verifier.review_authority` attributes 148 of 215 proof gaps to the one
         # generalist, so leaving this loop authority-blind would demote the
         # verdict while keeping the escalation pressure that cost the most.
+        # `gating_review_kinds` reads the plan's own gate set, so a reviewer
+        # that is this plan's ONLY gate is never demoted here either and keeps
+        # the probe it needs to close the proof gap it is about to gate on.
+        plan_gating_kinds = set(
+            verifier.gating_review_kinds(plan["checks"], plan["reviews"], config)
+        )
         blocking_review_records = [
             record
             for record in review_records
-            if verifier.review_authority(str(record.get("kind", "")), config)
-            == verifier.BLOCKING_AUTHORITY
+            if str(record.get("kind", "")) in plan_gating_kinds
         ]
         requested_probe_ids = sorted(
             {
@@ -2338,6 +2343,11 @@ def verify_task(
             new_state,
             phase="complete",
             reason=evidence["reason"],
+            # An advisory reviewer keeps its voice only if some surface speaks
+            # it. The receipt already records these, but nothing read the
+            # receipt: this projection is what `verify`/`status` print, so an
+            # advisory BLOCKER cannot be recorded and never seen.
+            advisory_findings=[dict(item) for item in evidence["advisory_findings"]],
             attempt_id=attempt_dir.name,
             plan_path=str(attempt_dir / "plan.json"),
             evidence_path=str(evidence_path),
@@ -3689,6 +3699,31 @@ def v2_status(contract: Mapping[str, Any], task_dir: Path) -> Dict[str, Any]:
     }
 
 
+def advisory_status_lines(state: Mapping[str, Any]) -> List[str]:
+    """Render the findings a demoted reviewer recorded without gating.
+
+    A recorded finding nobody prints is a finding nobody reads, so `status`
+    speaks every advisory finding the verdict declined to gate on.
+    """
+
+    items = state.get("advisory_findings") or []
+    if not isinstance(items, list):
+        raise runtime.HarnessError("v2 state advisory findings are malformed")
+    lines: List[str] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise runtime.HarnessError("v2 state advisory finding is malformed")
+        lines.append(
+            "advisory {severity} [{review}] {file}: {evidence}".format(
+                severity=item.get("severity", "UNKNOWN"),
+                review=item.get("review", "unknown"),
+                file=item.get("file", "?"),
+                evidence=item.get("evidence", ""),
+            )
+        )
+    return lines
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_v2_task(args.task_id, Path.cwd())
     result = v2_status(contract, task_dir)
@@ -3702,6 +3737,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"worktree: {contract['worktree_path']}")
         if result["state"].get("reason"):
             print(f"reason: {result['state']['reason']}")
+        for line in advisory_status_lines(result["state"]):
+            print(line)
         if result["lock"]["owner"]:
             print("owner: " + json.dumps(result["lock"]["owner"], sort_keys=True))
     return 0
