@@ -655,6 +655,13 @@ def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
         ".claude/rules",
         ".codex/agents",
         ".claude/agents",
+        # `.claude/learnings` is the canonical tree and is executable reviewer
+        # input: `verifier.review_learnings_section` binds its curated
+        # `## Recurring patterns` into every review prompt. It listed only the
+        # generated `.codex` mirror before, so editing the canonical file that
+        # actually reaches a reviewer left this fingerprint unmoved. The mirror
+        # stays listed so a parity drift between the two is still tracked.
+        ".claude/learnings",
         ".codex/learnings",
         ".codex/hooks",
         ".claude/hooks",
@@ -690,6 +697,7 @@ def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
         "agent-resource-run",
         "agent-config-audit",
         "agent-remote-audit",
+        "agent-sync-learnings",
         "verify-harness-attestation",
         "ci.sh",
     ):

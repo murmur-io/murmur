@@ -26,6 +26,7 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import learning_extract
 import runtime
 import verifier
 
@@ -2356,6 +2357,29 @@ def verify_task(
             protocol_sha256=evidence["protocol_sha256"],
             evidence_sha256=evidence["evidence_sha256"],
         )
+        # The learning loop's INPUT: a refused diff's severe findings become
+        # `## Run journal` candidates the operator curates by hand.  It runs
+        # AFTER the terminal state is durably written and BEFORE the receipt
+        # gate, so it can neither change a verdict nor mask an evidence
+        # failure, and the broad catch is deliberate — filing a candidate must
+        # never be able to turn a computed verdict into a traceback.  The write
+        # target is the task store under the Git common directory: no working
+        # tree is touched, so a NEEDS_FIX cannot dirty the standalone driver
+        # that `open` requires to be clean.
+        try:
+            filed = learning_extract.append_learning_candidates(
+                contract, evidence, config, task_dir
+            )
+            if filed:
+                _checkpoint_event(
+                    task_dir,
+                    "learning-candidates",
+                    attempt_id=attempt_dir.name,
+                    path=str(filed[0]),
+                    total=learning_extract.candidate_count(task_dir),
+                )
+        except Exception:  # noqa: BLE001 - journal extraction never gates a verdict
+            pass
         if new_state == "PASSED":
             try:
                 verifier.verify_v2_evidence(
@@ -3696,6 +3720,14 @@ def v2_status(contract: Mapping[str, Any], task_dir: Path) -> Dict[str, Any]:
         "effective_status": effective,
         "lock": {"liveness": liveness, "owner": owner},
         "task_dir": str(task_dir),
+        # The extractor deliberately writes no working tree, so `status` is the
+        # only surface that can tell the operator a lesson is waiting. Without
+        # this line the candidates are exactly the write-only dead end the
+        # feature exists to end.
+        "learning_candidates": {
+            "count": learning_extract.candidate_count(task_dir),
+            "path": str(learning_extract.candidates_path(task_dir)),
+        },
     }
 
 
@@ -3739,6 +3771,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"reason: {result['state']['reason']}")
         for line in advisory_status_lines(result["state"]):
             print(line)
+        candidates = result["learning_candidates"]
+        if candidates["count"]:
+            print(
+                f"{candidates['count']} learning candidate(s) — file them from "
+                f"your primary checkout with /learn: {candidates['path']}"
+            )
         if result["lock"]["owner"]:
             print("owner: " + json.dumps(result["lock"]["owner"], sort_keys=True))
     return 0
