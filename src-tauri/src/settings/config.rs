@@ -251,6 +251,17 @@ pub struct AppConfig {
     /// config persisted before this field existed loads as an empty list (all new actions enabled).
     #[serde(default)]
     pub note_assist_actions_off: Vec<String>,
+    /// How to name the `me` capture lane in a generated note's `participants` front-matter.
+    ///
+    /// Empty (the default) means unset, and the note keeps the bare lane label `me`. This is the
+    /// only honest way to put a real name in `participants` for a collapsed-lane recording: the
+    /// far side is merged into ONE `others` lane, so who said what over there is genuinely
+    /// unknown, and `speaker_attribution_directive_collapsed` rightly forbids guessing it. The
+    /// `me` lane is not a guess though — it is the person running the app, and they can simply
+    /// say who that is. Configuration, never inference; nothing here loosens the no-fabrication
+    /// rule.
+    #[serde(default)]
+    pub user_display_name: String,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
     /// Workspace glossary used to keep domain names stable in generated notes. Each non-empty line
@@ -697,6 +708,7 @@ impl Default for AppConfig {
             note_assist_enhance: true,
             note_assist_actions_off: Vec::new(),
             auto_organize: false,
+            user_display_name: String::new(),
             note_language: "auto".to_string(),
             glossary: String::new(),
             mcp_require_token: true,
@@ -796,6 +808,7 @@ const K_NOTE_ASSIST_SHORTEN: &str = "note_assist_shorten";
 const K_NOTE_ASSIST_ENHANCE: &str = "note_assist_enhance";
 const K_NOTE_ASSIST_ACTIONS_OFF: &str = "note_assist_actions_off";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
+const K_USER_DISPLAY_NAME: &str = "user_display_name";
 const K_NOTE_LANGUAGE: &str = "note_language";
 const K_GLOSSARY: &str = "glossary";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
@@ -1008,6 +1021,9 @@ impl AppConfig {
         // empty list (all actions enabled) rather than erroring the whole config load.
         if let Some(v) = db.get_setting(K_NOTE_ASSIST_ACTIONS_OFF)? {
             cfg.note_assist_actions_off = serde_json::from_str(&v).unwrap_or_default();
+        }
+        if let Some(v) = db.get_setting(K_USER_DISPLAY_NAME)? {
+            cfg.user_display_name = v;
         }
         if let Some(v) = db.get_setting(K_NOTE_LANGUAGE)? {
             if !v.is_empty() {
@@ -1315,6 +1331,7 @@ impl AppConfig {
             K_NOTE_ASSIST_ACTIONS_OFF,
             &serde_json::to_string(&self.note_assist_actions_off).unwrap_or_else(|_| "[]".into()),
         )?;
+        db.set_setting(K_USER_DISPLAY_NAME, &self.user_display_name)?;
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
         db.set_setting(K_GLOSSARY, &self.glossary)?;
         db.set_setting(
