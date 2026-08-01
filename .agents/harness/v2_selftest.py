@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import cli as harness_cli
+import config_audit
 import runtime
 import verifier
 
@@ -7110,6 +7111,110 @@ def egress_review_scope_prompt_cases(test: Tests) -> None:
     )
 
 
+def learnings_parity_cases(test: Tests) -> None:
+    """Pin the canonical-learnings parity audit and its sync script against a temp tree."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-learnings-parity-") as raw:
+        repo = Path(raw)
+        canonical = repo / ".claude" / "learnings"
+        mirror = repo / ".codex" / "learnings"
+        canonical.mkdir(parents=True)
+        mirror.mkdir(parents=True)
+        # Non-ASCII on purpose: the real journals carry em-dashes, "ń" and "ɵcmp",
+        # so a text-mode round-trip anywhere in this path has to fail loudly here.
+        lesson = "# main loop — guard `ɵcmp`\n".encode("utf-8")
+        (canonical / "main-loop.md").write_bytes(lesson)
+        (mirror / "main-loop.md").write_bytes(lesson)
+
+        original_root = config_audit.ROOT
+        try:
+            config_audit.ROOT = repo
+
+            audit = config_audit.Audit()
+            config_audit._learnings_parity(audit)
+            test.equal("learnings parity green when the mirror matches", audit.errors, [])
+            test.true(
+                "learnings fingerprint recorded",
+                "learnings:main-loop.md" in audit.fingerprints,
+            )
+
+            (mirror / "main-loop.md").write_bytes(lesson + b"hand edit\n")
+            audit = config_audit.Audit()
+            config_audit._learnings_parity(audit)
+            test.true(
+                "learnings drift names the offending file",
+                any("main-loop.md" in message for message in audit.errors),
+            )
+            test.true(
+                "learnings drift names the fix",
+                any("agent-sync-learnings" in message for message in audit.errors),
+            )
+
+            (mirror / "main-loop.md").write_bytes(lesson)
+            (mirror / "stray.md").write_bytes(b"one-sided\n")
+            audit = config_audit.Audit()
+            config_audit._learnings_parity(audit)
+            test.true(
+                "one-sided mirror file is drift",
+                any("mirror-only" in message for message in audit.errors),
+            )
+            (mirror / "stray.md").unlink()
+
+            (canonical / "main-loop.md").unlink()
+            (mirror / "main-loop.md").unlink()
+            audit = config_audit.Audit()
+            config_audit._learnings_parity(audit)
+            test.true(
+                "empty canonical tree cannot pass vacuously",
+                any("missing canonical learnings tree" in message for message in audit.errors),
+            )
+        finally:
+            config_audit.ROOT = original_root
+
+        # End-to-end: the wrapper resolves its own repo root from __file__, so a copy
+        # inside the temp tree operates on the temp trees, never the real repo.
+        scripts_dir = repo / "scripts"
+        scripts_dir.mkdir()
+        wrapper = scripts_dir / "agent-sync-learnings"
+        shutil.copy2(ROOT / "scripts" / "agent-sync-learnings", wrapper)
+        (canonical / "main-loop.md").write_bytes(lesson)
+        (mirror / "stale.md").write_bytes(b"orphan\n")
+
+        check = subprocess.run(
+            [sys.executable, str(wrapper), "--check"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.equal("agent-sync-learnings --check fails on drift", check.returncode, 1)
+        test.true(
+            "agent-sync-learnings --check names both drifted files",
+            "main-loop.md" in check.stderr and "stale.md" in check.stderr,
+        )
+
+        written = subprocess.run(
+            [sys.executable, str(wrapper)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.equal("agent-sync-learnings writes the mirror", written.returncode, 0)
+        test.equal(
+            "sync reproduces the canonical bytes exactly",
+            (mirror / "main-loop.md").read_bytes(),
+            lesson,
+        )
+        test.true("sync removes orphaned mirror files", not (mirror / "stale.md").exists())
+
+        rechecked = subprocess.run(
+            [sys.executable, str(wrapper), "--check"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.equal("agent-sync-learnings --check is green after a sync", rechecked.returncode, 0)
+
+
 def main() -> int:
     test = Tests()
     open_branch_ownership_cases(test)
@@ -7137,6 +7242,7 @@ def main() -> int:
     lock_review_scope_prompt_cases(test)
     egress_review_scope_prompt_cases(test)
     probe_precedence_flow_cases(test)
+    learnings_parity_cases(test)
     if test.failures:
         print("v2 selftest: FAIL")
         for failure in test.failures:

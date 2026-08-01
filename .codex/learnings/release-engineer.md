@@ -11,7 +11,7 @@
   audio helpers → notarization comes back `Invalid`. Sign every `meetnotes-*` helper FIRST (glob
   them — a missed one like `meetnotes-calendar` = Invalid; read the `notarytool log` to find it),
   THEN seal the `.app` without `--deep`, THEN the DMG. Use `scripts/macos-sign-notarize.sh`.
-  (`codesign --deep` is also blocked by `.codex/hooks/block-bash.sh`.)
+  (`codesign --deep` is also blocked by `.claude/hooks/block-bash.sh`.)
 - **Sign by IDENTITY HASH, not name** — the cert CN has a Polish `ń` ("Gawroński") so name matching
   fails "no identity found": `HASH=$(security find-identity … | grep 'Developer ID Application' |
   head -1 | awk '{print $2}')`.
@@ -33,8 +33,8 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
-### [2026-07-02 seed] Distilled from AGENTS.md release rules + memory
+### [2026-07-02 seed] Distilled from CLAUDE.md release rules + memory
 - **Pattern:** the 2026-06-27 notarization mess + the sign/keychain/push gotchas.
 - **Caught by:** operator (seeding the loop).
-- **Lesson:** the bullets above; full runbook = `.agents/skills/release-murmur/SKILL.md`.
+- **Lesson:** the bullets above; full runbook = `.claude/skills/release-murmur/SKILL.md`.
 - **Status:** distilled (2026-07-02)

@@ -11,7 +11,7 @@ Claude Code is one adapter to the vendor-neutral development harness in
 | `agents/` | Thin specialist role prompts |
 | `skills/` | Claude-facing mirrors of shared executable runbooks |
 | `hooks/` | Claude adapters for the canonical hook guard |
-| `learnings/` | Curated recurring lessons and append-only run journals |
+| `learnings/` | **Canonical** curated recurring lessons and append-only run journals (`.codex/learnings/` mirrors it) |
 
 The active development loop is:
 

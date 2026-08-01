@@ -144,5 +144,5 @@ SIGNED-BUILD-ONLY (honest boundary):
   `lock-security-reviewer` as a REQUIRED second gate whenever the seam touches
   reads/exports/crypto/keychain/MCP/egress. The architect self-checks but does NOT self-certify.
 - **Inject prior lessons.** Before dispatching a role, prepend its curated `## Recurring patterns` from
-  `.codex/learnings/<agent>.md` as "Previous lessons (binding — do NOT repeat these)" — the
+  `.claude/learnings/<agent>.md` as "Previous lessons (binding — do NOT repeat these)" — the
   compounding-lessons loop.

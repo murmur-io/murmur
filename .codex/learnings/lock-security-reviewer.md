@@ -53,5 +53,5 @@
 - **Pattern:** gate-every-read + verify-before-destroy + the convertFileSrc asset-path leak.
 - **Caught by:** operator (seeding the loop). (Historically this gate caught a Resummarize
   content-loss in PR #95 and the @brain-substring egress in #98.)
-- **Lesson:** the bullets above; full detail in `.codex/rules/lock-model.md`.
+- **Lesson:** the bullets above; full detail in `.claude/rules/lock-model.md`.
 - **Status:** distilled (2026-07-02)
