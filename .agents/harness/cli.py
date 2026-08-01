@@ -497,7 +497,7 @@ def cmd_open(args: argparse.Namespace) -> int:
         raise runtime.HarnessError(f"task already exists: {args.task_id}")
     description = _read_description(args)
     owned = sorted(
-        set(runtime.normalize_owned_path(path) for path in args.owned)
+        set(runtime.normalize_owned_path(path) for path in (args.owned or []))
     )
     protected = _protected_v2_paths(owned)
     if protected:
@@ -2442,7 +2442,7 @@ def _stage_v2_commit(
     # after exact evidence is verified, immediately before commit.
     runtime.git(worktree, "reset", "--quiet", "HEAD", "--", ".")
     if evidence["changed_paths"]:
-        runtime.git(worktree, "add", "-A", "--", *contract["owned_paths"])
+        runtime.git(worktree, "add", "-A", "--", *(contract["owned_paths"] or ["."]))
     diff = runtime.staged_diff(worktree)
     if runtime.sha256_bytes(diff) != evidence["diff_sha256"]:
         raise runtime.HarnessError("real staged index differs from v2 evidence")
@@ -3966,7 +3966,9 @@ def build_parser() -> argparse.ArgumentParser:
     prompt = open_parser.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt")
     prompt.add_argument("--prompt-file")
-    open_parser.add_argument("--owned", action="append", required=True)
+    # OPTIONAL: omit it and the exact diff at `plan` defines the scope. Declare it only
+    # as a tripwire when you want a boundary asserted in advance.
+    open_parser.add_argument("--owned", action="append", default=[])
     open_parser.add_argument(
         "--claim", action="append", choices=["runtime", "performance"], default=[]
     )

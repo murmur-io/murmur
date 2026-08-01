@@ -656,6 +656,25 @@ def build_plan(
     return plan, bundle
 
 
+def _protected_changed_paths(paths: Sequence[str]) -> List[str]:
+    """Protected control-plane paths present in an actual diff.
+
+    With `--owned` declared, `cli.py` can refuse at `open`. With scope DERIVED there is nothing to
+    check until a diff exists, so the same refusal moves here — the guarantee is identical, it just
+    fires at the first moment it is computable.
+    """
+
+    protected = [
+        runtime.normalize_owned_path(path)
+        for path in runtime.load_config().get("protected_paths", [])
+    ]
+    return sorted(
+        path
+        for path in paths
+        if any(runtime.path_overlaps(path, guard) for guard in protected)
+    )
+
+
 def snapshot_scoped_diff(
     worktree: Path,
     contract: Mapping[str, Any],
@@ -673,15 +692,34 @@ def snapshot_scoped_diff(
             "task HEAD changed; clean and re-open against the actual parent before verification"
         )
     paths = runtime.changed_paths(worktree)
-    violations = [
-        path
-        for path in paths
-        if not runtime.path_is_owned(path, contract["owned_paths"])
-    ]
-    if violations:
-        raise runtime.HarnessError(
-            "out-of-scope v2 changes: " + ", ".join(violations)
-        )
+    owned_paths = list(contract["owned_paths"])
+    if owned_paths:
+        # An explicit --owned declaration is an opt-in TRIPWIRE: the developer asserted a boundary
+        # in advance and a diff that exceeds it is a scope error worth failing on.
+        violations = [
+            path for path in paths if not runtime.path_is_owned(path, owned_paths)
+        ]
+        if violations:
+            raise runtime.HarnessError(
+                "out-of-scope v2 changes: " + ", ".join(violations)
+            )
+    else:
+        # DERIVED scope. `--owned` is optional because declaring the file set up front requires
+        # knowing it before the work — and four of five restarts measured on 2026-08-01 came from
+        # learning it DURING the work (a test that pins the behaviour being changed; a command
+        # registry that must be edited; a component the design later dropped). Each restart minted
+        # a new task id, which is the mechanism behind the `-v2`/`-final`/`-scope2` series. The
+        # exact diff was always the real scope: everything downstream is bound to `diff_sha256`,
+        # and the risk classification that selects lock/egress/protocol reviewers reads the CHANGED
+        # PATHS, never the declaration. This branch simply stops asking twice.
+        protected = _protected_changed_paths(paths)
+        if protected:
+            raise runtime.HarnessError(
+                "the Harness cannot certify its own protected control plane "
+                f"({', '.join(protected)}); use a dedicated worktree outside the runner-owned "
+                "task root, the full control-plane selftests, a fresh independent review, and "
+                "the base-anchored CI gate"
+            )
     unsafe = runtime.unsafe_changed_nodes(worktree, paths)
     if unsafe:
         raise runtime.HarnessError(
@@ -711,7 +749,7 @@ def snapshot_scoped_diff(
         )
         if paths:
             subprocess.run(
-                ["git", "add", "-A", "--", *contract["owned_paths"]],
+                ["git", "add", "-A", "--", *(owned_paths or ["."])],
                 cwd=str(worktree),
                 env=environment,
                 check=True,
