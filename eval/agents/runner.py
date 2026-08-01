@@ -434,13 +434,26 @@ def changed_paths(before: Mapping[str, str], after: Mapping[str, str]) -> List[s
     )
 
 
-def echoable_fragments(prompt: str, workspace: Path) -> List[str]:
+def echoable_fragments(
+    prompt: str, workspace: Path, injected: Sequence[str] = ()
+) -> List[str]:
     """Every line and sentence the agent could REPRODUCE instead of author.
 
-    The prompt it was given, plus every file it was given: the bare fixture in the control arm, the
-    fixture PLUS the injected scaffold in the treatment arms. Deliberately asymmetric in the same
-    direction as the arms themselves — the treatment arm has strictly more to quote, and that extra
-    quotable material is exactly the free score being removed.
+    The prompt it was given, plus the FIXTURE it was given. Injected scaffold files are excluded,
+    and that exclusion is the whole point: this filter must be IDENTICAL across arms or it stops
+    measuring the arms and starts measuring itself.
+
+    Counted with the scaffold included, it grew 17 -> 231 -> 1255 fragments across none/rules/full
+    on `additive-migration`, so the treatment arm had ~74x more of its answer deleted before
+    grading. An agent that ABSORBED a rule states its conclusion in that rule's words — which is
+    the scaffold working — and a fragment filter cannot tell that apart from parroting. Charging
+    for it biases every delta toward zero, i.e. toward the one conclusion ("rules do not help")
+    that would be both wrong and expensive.
+
+    Parroting is still not rewarded: `graders/smoke.py::grounded_claims` drops the CLAUSE carrying
+    a citation before any substance check, so an answer whose only support is "the rule says so"
+    scores nothing. That defence belongs in the grader, where it can see claim structure — not
+    here, where it can only see bytes.
 
     Take this snapshot BEFORE the CLI runs. Files the agent WRITES are its own work, and a findings
     note it wrote and then printed must not be mistaken for material it echoed.
@@ -454,9 +467,12 @@ def echoable_fragments(prompt: str, workspace: Path) -> List[str]:
                 fragments.add(_normalized(sentence))
 
     collect(prompt)
+    excluded = {str(item) for item in injected}
     for path in sorted(workspace.rglob("*")):
         if not path.is_file():
             continue
+        if str(path.relative_to(workspace)) in excluded:
+            continue  # scaffold: shared vocabulary, not echoable material — see the docstring
         try:
             collect(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
@@ -588,7 +604,8 @@ def run_agent(
         task, None, workdir / f"{scaffold}-{run_index}", scaffold=scaffold
     )
     # Snapshot what the agent is ABOUT to be able to quote, before it can write anything itself.
-    echoable = echoable_fragments(task["prompt"], workspace)
+    # `injected` is excluded so the filter is arm-invariant: see echoable_fragments.
+    echoable = echoable_fragments(task["prompt"], workspace, injected)
     # And snapshot the bytes, so the record can say whether the agent actually TOUCHED anything.
     # A run that edited nothing is the instrument's floor, not a wrong answer: it is what a CLI
     # whose write tools are disabled looks like, and it is indistinguishable from a real failure
@@ -1161,6 +1178,35 @@ def selftest() -> int:
         else:
             print(f"PASS  {'transcript-echo':<28} [selftest]  "
                   "verbosity does not move the score; raw stdout still would")
+
+        # --- the echo filter must be ARM-INVARIANT, or it measures itself ---
+        # Counted with the scaffold included it was 17 -> 231 -> 1255 fragments across
+        # none/rules/full, so the treatment arm had ~74x more of its answer deleted before
+        # grading. An agent that absorbed a rule states its conclusion in that rule's words;
+        # a byte filter cannot tell that from parroting, so charging for it biases every delta
+        # toward "rules do not help" — the one wrong conclusion that is also expensive.
+        arm_problems: List[str] = []
+        for task in load_tasks(None):
+            counts = {}
+            for arm in SCAFFOLD_ARMS:
+                with tempfile.TemporaryDirectory(prefix="murmur-echo-arm-") as arm_tmp:
+                    ws, injected_paths = materialize(
+                        task, None, Path(arm_tmp), scaffold=arm
+                    )
+                    counts[arm] = len(
+                        echoable_fragments(task["prompt"], ws, injected_paths)
+                    )
+            if len(set(counts.values())) != 1:
+                arm_problems.append(
+                    f"{task['task_id']}: fragment count differs by arm "
+                    + ", ".join(f"{arm}={n}" for arm, n in counts.items())
+                )
+        if arm_problems:
+            failures += 1
+            print(f"FAIL  {'echo-arm-invariance':<28} [selftest]  {'; '.join(arm_problems)}")
+        else:
+            print(f"PASS  {'echo-arm-invariance':<28} [selftest]  "
+                  "the echo filter deletes the same material in every arm")
 
         # --- signals a grader treats as independent must have DISJOINT vocabularies ---
         # ANGULAR_DECLINES and ANGULAR_REASONS shared eight tokens, so one phrase satisfied both:

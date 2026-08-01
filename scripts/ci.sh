@@ -99,7 +99,11 @@ rust_gate() {
   #    That is what keeps the graders honest — a grader that has lost its teeth accepts both arms
   #    and the live `--mode agent` measurement silently starts reporting success for everything.
   #    Free, deterministic, seconds; the live arm costs model calls and stays out of CI. ──
-  echo "── development agent scaffold eval (graders, no model) ──"
+  echo "── development agent scaffold eval (graders + instrument, no model) ──"
+  # --selftest first: it guards the INSTRUMENT (arm-invariant echo filter, non-vacuous graders,
+  # scaffold actually injected, ERROR excluded from pass counts). --mode fake guards the GRADERS.
+  # Neither costs a model call. Without the first, a biased instrument reports plausible numbers.
+  python3 eval/agents/runner.py --selftest
   python3 eval/agents/runner.py --mode fake
 
   # ── User-facing vocabulary. WARN mode: it reports, and it FAILS only on a REGRESSION
