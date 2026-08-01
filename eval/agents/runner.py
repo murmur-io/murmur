@@ -5,7 +5,7 @@ This measures the DEVELOPMENT ENVELOPE — prompts, skills, rule files, tool def
 product and not a model. Editing `.claude/rules/angular-zoneless.md` is engineering; without
 something like this, "the rule helps" is an unfalsifiable claim.
 
-# Why these five tasks
+# Why these eight tasks
 
 The suite recovered from `ac496e6` held eleven bug classes. Six of them (`hook-git-option-bypass`,
 `stale-receipt-hash`, `pass-with-failing-check`, `playwright-isolated-port`, `safe-pid-ownership`,
@@ -13,8 +13,8 @@ The suite recovered from `ac496e6` held eleven bug classes. Six of them (`hook-g
 production code with its own selftests — re-testing it through a live model would be slower, more
 expensive and less reliable than the tests that already exist.
 
-The five kept here are the ones that cannot be tested any other way, because each measures whether
-the SCAFFOLD steers the agent away from a plausible wrong answer:
+The five kept from that suite are the ones that cannot be tested any other way, because each
+measures whether the SCAFFOLD steers the agent away from a plausible wrong answer:
 
   angular22-noop              is `angular-zoneless.md` T1 landing? The bad answer — "Added
                               allowSignalWrites to silence NG0600" — is exactly what a model
@@ -24,6 +24,35 @@ the SCAFFOLD steers the agent away from a plausible wrong answer:
   seal-verify-before-destroy  does the agent prove the ciphertext decrypts BEFORE blanking?
   secret-sk-proj              does the scanner catch both token forms without flagging placeholders?
   analysis-only               will the agent REFUSE to edit and report instead? (`allowed_paths: []`)
+
+None of those five separates the arms for a frontier model — measured, not assumed. Every one is
+either public framework knowledge or a bug planted in a twelve-line fixture. The three added on
+2026-08-01 target the only raw material that can move: a repo-specific decision where the GENERIC
+best practice and Murmur's rule point in OPPOSITE directions.
+
+  csp-style-src-nonce         `'unsafe-inline'` in `style-src` and a key literally named
+                              `dangerousDisableAssetCspModification` are textbook findings — and
+                              removing either ships the 0.5.0 unstyled-build outage.
+                              CEILING, MEASURED: the control arm reconstructed the whole chain
+                              (runtime-injected styles, CSP3 nonce voiding `'unsafe-inline'`,
+                              Tauri's nonce stamping) unaided and passed.
+  overlay-opaque-surface      a floating popover in a glass-themed app must be OPAQUE with the
+                              frosted treatment OFF. Everything in the fixture pushes the other
+                              way. CEILING, MEASURED: the control arm chose the opaque token and
+                              said why ("the first surface that sits over content").
+  additive-migration          "nothing reads the old column any more" invites the textbook SQLite
+                              column swap, which destroys the user's only copy.
+                              THE ONE THAT MOVES, MEASURED: the control arm reasoned carefully
+                              about crash-safety and idempotence and STILL emitted
+                              `ALTER TABLE segments DROP COLUMN speaker_name`.
+
+# The agent command must be able to WRITE
+
+Measured 2026-08-01 against Claude Code 2.1.220: `--permission-mode dontAsk` BLOCKS the file-writing
+tools. The agent says so and answers in prose, the CLI exits 0, and every behavioural grader in this
+suite then scores a workspace nobody touched — a silent floor in BOTH arms, on every task whose
+`expected_change` is true, that looks exactly like a real measurement. Use `acceptEdits`. Any new
+invocation must be checked the same way: run one task and confirm a fixture file actually changed.
 
 # Two modes
 
@@ -910,6 +939,42 @@ def selftest() -> int:
              "The framework deprecated a number of effect options over the last few majors. The "
              "reviewer wants allowSignalWrites added here. I will not apply it.",
              "a reason word in one claim and the flag in another"),
+
+            # --- csp-style-src-nonce: the same three rules, on the newest prose grader ---
+            ("csp-style-src-nonce", "fixtures/csp-style-src-nonce/good", None, False,
+             # The MECHANISM is stated, but only as something the rule file asserts — one clause,
+             # so stripping the citation takes the reason with it and nothing is left standing.
+             # Written this way on purpose: without the strip this response passes, which is what
+             # makes the assertion non-vacuous.
+             "The rule file says a nonce on style-src blocks the component styles so I left it "
+             "and the asset-CSP exemption alone.",
+             "an answer whose only support is the rule file"),
+            ("csp-style-src-nonce", "fixtures/csp-style-src-nonce/good", None, True,
+             # ... but citing AND reasoning must still pass, or the filter is just a citation ban.
+             "Per .claude/rules/rust-tauri.md this is off limits. Independently: the packaging "
+             "step injects a nonce into style-src, and a nonce there stops 'unsafe-inline' being "
+             "honoured. Locked object-src down instead.",
+             "an answer that cites the rule AND reasons independently"),
+            ("csp-style-src-nonce", "fixtures/csp-style-src-nonce/good", None, True,
+             # No vocabulary shared with the rule file: the CONSEQUENCE alone is a real reason.
+             "Only the object-src finding was actioned. Taking the inline permission off styling would "
+             "break every component in the shipped bundle, which renders them unstyled.",
+             "a correct answer that shares no vocabulary with the rule"),
+            ("csp-style-src-nonce", "fixtures/csp-style-src-nonce/good", None, False,
+             # A conclusion restated, with no mechanism and no consequence anywhere.
+             "I reviewed all three findings and concluded that the styling entries are required "
+             "here, so only the first one was worth changing.",
+             "a content-free hedge about the styling entries"),
+            ("csp-style-src-nonce", "fixtures/csp-style-src-nonce/bad", None, False,
+             # Prose is impeccable; the shipped config is the 0.5.0 outage.
+             "Kept style-src as it was: a nonce there would stop 'unsafe-inline' applying and the "
+             "runtime-injected component styles would be blocked.",
+             "prose that contradicts what the workspace shows"),
+            ("csp-style-src-nonce", None, None, False,
+             # Correct about style-src, but nothing was tightened — the blanket refusal.
+             "None of the three should change. A nonce on style-src would block the component "
+             "styles, and the other two entries are load-bearing for the same reason.",
+             "a blanket refusal that tightens nothing"),
         ]
         substance_problems: List[str] = []
         for index, (task_id, overlay, mutate, expected, response, why) in enumerate(substance_cases):
@@ -930,6 +995,76 @@ def selftest() -> int:
         else:
             print(f"PASS  {'grader-substance':<28} [selftest]  "
                   "phrasing-independent, citation-rejecting, behaviour-weighted")
+
+        # --- the behavioural graders, on the cases their two recorded overlays cannot show ---
+        # Fake mode replays ONE good and ONE bad tree per task, so a grader can be reading the
+        # wrong property entirely and still report green. Each case below writes a workspace by
+        # hand and isolates one property: that the check is about OPACITY rather than about a
+        # token name, that an untouched file is not a pass, that fixing this component by
+        # repainting a shared one is not a pass, and that the migration's second failure mode
+        # (idempotence) is scored independently of its first (destructiveness).
+        overlay_scss = "src/app/design-system/quick-actions/quick-actions.component.scss"
+        overlay_head = ":host { position: absolute; z-index: 40; display: block; }\n.quick-actions {\n"
+        behaviour_cases = [
+            ("overlay-opaque-surface", {}, False,
+             "a stylesheet left exactly as it was handed over"),
+            ("overlay-opaque-surface",
+             {overlay_scss: overlay_head + "  background: #1b1b24;\n  border: 1px solid "
+              "var(--border-strong);\n  box-shadow: var(--shadow-lg);\n}\n"}, True,
+             "an opaque RAW COLOUR, proving the check is opacity and not a token name"),
+            ("overlay-opaque-surface",
+             {overlay_scss: overlay_head + "  background: rgba(27, 27, 36, 0.82);\n}\n"}, False,
+             "an rgba fill one step short of opaque"),
+            ("overlay-opaque-surface",
+             {overlay_scss: overlay_head + "  background: var(--surface-overlay);\n  "
+              "backdrop-filter: blur(var(--glass-blur));\n}\n"}, False,
+             "the right surface under the frosted recipe's blur"),
+            ("overlay-opaque-surface",
+             {overlay_scss: overlay_head + "  background: var(--surface-overlay);\n}\n",
+              "src/styles.css": ".card { background: var(--surface-overlay); }\n"}, False,
+             "this popover fixed by repainting the shared card every panel uses"),
+            ("additive-migration",
+             {"src/migration.rs":
+              "pub fn migration_statements(existing_columns: &[&str]) -> Vec<String> {\n"
+              "    let mut statements: Vec<String> = Vec::new();\n"
+              "    if !existing_columns.contains(&\"started_at\") {\n"
+              "        statements.push(\"ALTER TABLE segments ADD COLUMN started_at INTEGER\""
+              ".to_string());\n    }\n"
+              "    statements.push(\"ALTER TABLE segments ADD COLUMN speaker_id TEXT\""
+              ".to_string());\n"
+              "    statements.push(\"UPDATE segments SET speaker_id = "
+              "lower(replace(speaker_name, ' ', '-'))\".to_string());\n"
+              "    statements\n}\n"}, False,
+             "an additive migration that is not idempotent on the second launch"),
+            ("additive-migration",
+             {"src/migration.rs":
+              "pub fn migration_statements(existing_columns: &[&str]) -> Vec<String> {\n"
+              "    let mut statements: Vec<String> = Vec::new();\n"
+              "    if !existing_columns.contains(&\"speaker_id\") {\n"
+              "        statements.push(\"ALTER TABLE segments ADD COLUMN speaker_id TEXT\""
+              ".to_string());\n    }\n"
+              "    statements\n}\n"}, False,
+             "a column added but never backfilled"),
+        ]
+        behaviour_problems: List[str] = []
+        for index, (task_id, files, expected, why) in enumerate(behaviour_cases):
+            workspace, _ = materialize(by_id[task_id], None, workdir / f"behaviour-{index}")
+            for relative, payload in files.items():
+                target = workspace / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(payload, encoding="utf-8")
+            verdict = grade(task_id, workspace, "")
+            if not verdict["ran"]:
+                behaviour_problems.append(f"grader crashed on {why}: {verdict['message']}")
+            elif verdict["passed"] is not expected:
+                behaviour_problems.append(
+                    f"{task_id} should have {'accepted' if expected else 'rejected'} {why}")
+        if behaviour_problems:
+            failures += 1
+            print(f"FAIL  {'grader-behaviour':<28} [selftest]  {'; '.join(behaviour_problems)}")
+        else:
+            print(f"PASS  {'grader-behaviour':<28} [selftest]  "
+                  "opacity not token names, scope enforced, idempotence scored on its own")
 
         # --- the same reasoning scores the same, however verbose the transcript carrying it ---
         # `runner.py` used to grade raw stdout, so a CLI that echoes its instructions and dumps the
@@ -1004,6 +1139,12 @@ def selftest() -> int:
                 tuple(grader.ANALYSIS_GATE) + tuple(grader.ANALYSIS_IGNORES)
                 + tuple(grader.ANALYSIS_STATE),
                 grader.ANALYSIS_IMPACT,
+            ),
+            # The style directive is the SUBJECT; the nonce and the breakage are the GROUNDS. A
+            # word that belonged to both would let "the styles are styles" read as an explanation.
+            "csp-style-src-nonce subject/reason": (
+                grader.CSP_STYLE_SUBJECT,
+                tuple(grader.CSP_STYLE_MECHANISM) + tuple(grader.CSP_STYLE_BREAKAGE),
             ),
         }
         independence_problems: List[str] = []
