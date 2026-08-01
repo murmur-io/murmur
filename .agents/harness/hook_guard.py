@@ -887,13 +887,65 @@ def _finish_guard(
                 f"use scripts/agent-harness commit {task['task_id']} -m <message>"
             )
         except NoTaskForWorktree:
-            return None  # normal mode: no active harness task → allow the commit
+            # Normal mode: no active harness task, so the commit itself is allowed. Before letting
+            # it through, run the ONE check that is cheaper than reading this comment.
+            return _control_plane_audit_refusal(commits[0])
         except GuardFailure as exc:
             reason = str(exc)
     if mode == "advisory":
         print(f"finish-guard advisory: {reason}", file=sys.stderr)
         return None
     return "Definition-of-Done receipt rejected: " + reason
+
+
+def _control_plane_audit_refusal(invocation: "GitInvocation") -> Optional[str]:
+    """Run agent-config-audit before a commit lands, and refuse if it fails.
+
+    CLAUDE.md records why: on PR #535 `cargo test --lib`, `ng lint` and `ng build` were all green
+    while the diff carried `.claude/`<->`.codex/` binding-rule drift AND a Bash-hook change that
+    silently disabled secret scanning and this very guard. The audit caught both in 0.09 s — but it
+    only ran remotely, so the feedback arrived one CI round-trip later, after the commit existed.
+
+    The check costs less than a tenth of a second; the round trip costs thirteen minutes. Deciding
+    whether a diff "touches the control plane" costs more thought than just running it, so it runs
+    on every commit.
+
+    Fails OPEN on anything that is not a clean non-zero verdict — a missing script, an unreadable
+    repo, a timeout. This hook must never be the reason a commit cannot happen when the auditor
+    itself is broken; it exists to surface a real FAIL earlier, not to add a new way to be stuck.
+    `MURMUR_FINISH_GUARD=off` disables it with everything else in this guard.
+    """
+
+    try:
+        repo = _repo_for_invocation(invocation)
+    except Exception:
+        return None
+    script = repo / "scripts" / "agent-config-audit"
+    if not script.is_file():
+        return None
+    try:
+        completed = subprocess.run(
+            [str(script), "--ci"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode == 0:
+        return None
+    detail = ""
+    for line in (completed.stdout or "").splitlines():
+        if line.startswith("[FAIL]"):
+            detail = line.strip()
+            break
+    return (
+        "control-plane audit failed before this commit"
+        + (f": {detail}" if detail else "")
+        + " — run scripts/agent-config-audit for the full report"
+    )
 
 
 def _guard_refusal_task_dirs(
