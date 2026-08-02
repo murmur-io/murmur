@@ -1559,10 +1559,44 @@ def build_check_seatbelt_profile(
     return "\n".join(lines) + "\n"
 
 
+def nested_sandbox_is_impossible() -> bool:
+    """True when THIS process is already inside a Seatbelt that forbids nesting.
+
+    macOS refuses `sandbox_apply` from inside an existing sandbox, so every `sandbox-exec` the
+    runner spawns dies with `sandbox_apply: Operation not permitted` before running anything. The
+    probe writes no record, and the failure then surfaces hundreds of lines later as a missing
+    evidence file — which reads exactly like a real harness defect on a byte-clean trunk. It cost
+    one wrong "the selftest is red on trunk" diagnosis and a stalled deletion program.
+
+    Probed by actually trying it, not by reading an environment marker: a host process can set an
+    env var, and only the kernel can answer this.
+    """
+
+    if sys.platform != "darwin":
+        return False
+    try:
+        probe = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "sandbox_apply" in (probe.stderr or "")
+
+
 def sandboxed_check_argv(profile: str, command: str) -> List[str]:
     sandbox = Path("/usr/bin/sandbox-exec")
     if sys.platform != "darwin" or not sandbox.is_file() or not os.access(sandbox, os.X_OK):
         raise HarnessError("deterministic checks require executable macOS /usr/bin/sandbox-exec")
+    if nested_sandbox_is_impossible():
+        raise HarnessError(
+            "cannot run a deterministic check: this process is already inside a Seatbelt sandbox, "
+            "and macOS refuses to nest one (`sandbox_apply: Operation not permitted`). Every check "
+            "and probe would produce no evidence, and the run would fail later as a missing "
+            "evidence file rather than here. Re-run the harness outside the outer sandbox."
+        )
     return [str(sandbox), "-p", profile, "/bin/zsh", "-f", "-c", command]
 
 
