@@ -805,14 +805,26 @@ fn configure_codex_command_prefix_with_tool_guard(
     cmd
 }
 
+/// The `--model <id>` argument pair for this arm, or `&[]` when the id is blank or unusable.
+///
+/// Same argv-injection guard as `claude_code::model_args`, and now the same SHAPE: the rule was
+/// inline in `finish_codex_command`, which meant the two CLI arms could drift and neither could be
+/// asked "what would you actually send?" without building a whole command. `pub(crate)` so the A6
+/// ledger-versus-wire test can ask exactly that, rather than re-implementing the rule in the test
+/// and proving only that two copies of it agree.
+pub(crate) fn model_args(model: &str) -> Vec<String> {
+    if !crate::summarize::provider::valid_model_id(model) {
+        return Vec::new();
+    }
+    vec!["--model".to_string(), model.trim().to_string()]
+}
+
 fn finish_codex_command(mut cmd: Command, model: &str, codex_home: &Path) -> Command {
     // The public JSONL stream intentionally omits internal unsupported-call events. Restrict the
     // child logger to the tool router's errors so Murmur can reject such an event without enabling
     // request/prompt tracing or recording content.
     cmd.env("RUST_LOG", CODEX_TOOL_ROUTER_LOG);
-    if !model.trim().is_empty() {
-        cmd.arg("--model").arg(model.trim());
-    }
+    cmd.args(model_args(model));
     cmd.arg("--json")
         .arg("-")
         .stdin(Stdio::piped())
@@ -2129,6 +2141,33 @@ mod tests {
             Path::new("/tmp/murmur-codex-test-home"),
         ));
         assert!(!args.iter().any(|arg| arg == "--model"));
+    }
+
+    /// A6 on the OTHER CLI arm, asserted on real argv. `--model` takes the next argv entry, so a
+    /// value beginning with `-` would be read by `codex exec` as a flag.
+    #[test]
+    fn a_hostile_model_id_never_reaches_codex_argv() {
+        let home = Path::new("/tmp/murmur-codex-hostile-home");
+        for hostile in [
+            "--sandbox danger-full-access",
+            "-m",
+            "codex --dangerously-bypass-approvals-and-sandbox",
+            "../../etc/passwd",
+        ] {
+            let args = args(&build_codex_command("codex", hostile, home));
+            assert!(
+                !args.iter().any(|arg| arg == "--model"),
+                "{hostile:?} must not produce a --model flag; got {args:?}"
+            );
+            assert!(
+                !args.iter().any(|arg| arg.contains(hostile.trim())),
+                "no fragment of {hostile:?} may survive into argv"
+            );
+        }
+        // A legitimate unlisted id still reaches the CLI — the point of a hint catalog.
+        let args = args(&build_codex_command("codex", "gpt-5.7-nova", home));
+        assert!(args.iter().any(|arg| arg == "--model"));
+        assert!(args.iter().any(|arg| arg == "gpt-5.7-nova"));
     }
 
     #[test]

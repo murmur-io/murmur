@@ -35,6 +35,16 @@ impl AnthropicProvider {
         Self::with_effort(api_key, model, String::new())
     }
 
+    /// Test-only view of the model this provider will put in its request body.
+    ///
+    /// The body is built inline in `summarize`/`complete` from `self.model`, so there is no builder
+    /// to call from another module. The A6 ledger-versus-body test needs to see this value; a
+    /// `#[cfg(test)]` accessor is the way to give it that without widening production API.
+    #[cfg(test)]
+    pub(crate) fn model_for_test(&self) -> &str {
+        &self.model
+    }
+
     /// Like [`new`], plus an explicit reasoning-effort tier (`""`/`"default"` = provider default).
     pub fn with_effort(api_key: Option<String>, model: String, effort: String) -> Self {
         let model = if model.trim().is_empty() {

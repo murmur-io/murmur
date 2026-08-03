@@ -12,6 +12,11 @@ import { modelSizeLabel } from "../../core/model-bytes";
 // is the documented mirror of the Rust half.
 import { CONNECTION_LABELS } from "../../core/copy/labels";
 import { MachineService } from "../../services/machine.service";
+import {
+  connectionConsumesRoleModel,
+  connectionKeepsModelId,
+  effectiveConnection,
+} from "./model-id";
 import type {
   AiMapRow,
   AppConfigDto,
@@ -30,6 +35,7 @@ import type {
   RetiredModelNudge,
   StorageReport,
   VoiceprintInfo,
+  ModelCatalog,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { NOTE_ASSIST_NEW_ACTION_IDS } from "../notes/note-brain-popover/note-assist-catalog";
@@ -41,6 +47,18 @@ import { ErrorCopyService } from "../../core/copy/error-copy.service";
  * reasoner-only targets (no SummarizerProvider, no per-role model select — the
  * local model is the global GGUF registry selection).
  */
+/**
+ * The connections whose catalog is FETCHED from a real endpoint. A static property of the
+ * connection, not of any request.
+ *
+ * Refresh visibility was derived from the loaded catalog twice, and both directions were wrong:
+ * `source === "live"` hid the button after a failed fetch — the one moment retrying is the point —
+ * and `source !== "bundled"` showed it for Claude/Codex/Anthropic before their first response, and
+ * permanently if that response failed. Whether an arm performs a live fetch does not depend on
+ * whether a fetch has happened yet, so it must not be read from the catalog at all.
+ */
+const LIVE_CATALOG_CONNECTION_IDS: readonly string[] = ["ollama", "gateway"];
+
 const PROVIDER_CONNECTION_IDS: readonly string[] = [
   "claude_code",
   "codex_cli",
@@ -48,12 +66,13 @@ const PROVIDER_CONNECTION_IDS: readonly string[] = [
   "ollama",
   "gateway",
 ];
-/** Static, authoritative catalogs: a foreign id is never a valid custom model on these. */
-const CURATED_PROVIDER_CONNECTION_IDS: readonly string[] = [
-  "claude_code",
-  "codex_cli",
-  "anthropic",
-];
+// There is deliberately NO "curated, therefore authoritative" list here any more. A bundled
+// catalog is a HINT: it exists so the picker has something to show, and a model id absent from it
+// is a custom id, not corruption. The previous `CURATED_PROVIDER_CONNECTION_IDS` +
+// `repairForeignRoleModels` pair cleared-and-persisted any unrecognised id, so every newly
+// released model was not merely missing from the dropdown — it was actively erased from config
+// the moment the catalog loaded. `ModelCatalog.source` now tells the UI which catalogs are live and
+// which are bundled, which is what that distinction was really for.
 
 /**
  * Coerce a form value (a number, a numeric string, or blank/null after clearing a
@@ -976,6 +995,14 @@ export class SettingsStore {
     this.form.controls.providerModel.valueChanges.pipe(startWith("")),
     { initialValue: "" },
   );
+  /**
+   * The Default-model field's LIVE value and its engine, so a view can react to TYPING and not only
+   * to an engine switch. Exposed because the persistence boundary refuses some ids, and a field
+   * that displays a value `save_config` is about to discard is the UI telling the user something
+   * untrue.
+   */
+  readonly providerModelValue = this._providerModelValue;
+  readonly providerIdValue = this._providerIdValue;
   private readonly _ollamaModelValue = toSignal(
     this.form.controls.ollamaModel.valueChanges.pipe(startWith("llama3.1")),
     { initialValue: "llama3.1" },
@@ -1008,7 +1035,7 @@ export class SettingsStore {
    * back to a free-text input (the gateway keep-manually-typed pattern).
    */
   private readonly _modelCatalogs = signal<
-    Readonly<Record<string, readonly string[]>>
+    Readonly<Record<string, ModelCatalog>>
   >({});
   readonly modelCatalogs = this._modelCatalogs.asReadonly();
   /** Connections with a `list_models` fetch currently in flight. */
@@ -1020,14 +1047,20 @@ export class SettingsStore {
   );
   /** One shared promise per connection prevents a selection race from observing a fake failure. */
   private readonly _modelLoadPromises = new Map<string, Promise<boolean>>();
-  /** A stale loaded role-model repair that completed before load() armed persistence. */
-  private _catalogRepairPending = false;
-
   /** Fetch a connection's catalog once; later calls are no-ops (Refresh re-fetches). */
   async ensureModels(connection: string): Promise<boolean> {
     if (this._modelCatalogs()[connection] !== undefined) {
       return !this._modelCatalogFailures().has(connection);
     }
+    // A RECORDED FAILURE also counts as "already attempted".
+    //
+    // A failed fetch no longer stores an empty catalog (it must not fabricate `"bundled"`
+    // provenance), and without this line the absent catalog made every later `ensureModels` re-issue
+    // the request. On `ollama` and `gateway` that is a real outbound call to a user-configured host,
+    // so an unreachable endpoint turned each engine/role selection into another attempt. The
+    // explicit Refresh button calls `refreshModels` directly and is unaffected — retrying stays a
+    // deliberate act rather than a side effect of touching a dropdown.
+    if (this._modelCatalogFailures().has(connection)) return false;
     return this.refreshModels(connection);
   }
 
@@ -1054,15 +1087,23 @@ export class SettingsStore {
 
   private async loadModels(connection: string): Promise<boolean> {
     this._modelsLoading.set(new Set(this._modelsLoading()).add(connection));
-    let models: string[] = [];
+    let models: ModelCatalog | null = null;
     let loaded = true;
     try {
       models = await this.ipc.listModels(connection);
     } catch {
-      // Fall through with [] — free-text fallback.
+      // Fall through — free-text fallback.
       loaded = false;
     }
-    this._modelCatalogs.set({ ...this._modelCatalogs(), [connection]: models });
+    // NEVER FABRICATE PROVENANCE. A failed fetch used to be stored as an empty `"bundled"`
+    // catalog, so a transport error on `ollama`/`gateway` made a LIVE connection look compiled-in:
+    // Refresh disappeared at the one moment retrying is the whole point, and the UI claimed the
+    // list ships with the app. A failure leaves the previous catalog in place if there is one,
+    // and otherwise records nothing at all — `_modelCatalogFailures` already carries the error
+    // state, and an absent catalog is honestly "unknown" rather than dishonestly "bundled".
+    if (models) {
+      this._modelCatalogs.set({ ...this._modelCatalogs(), [connection]: models });
+    }
     const failures = new Set(this._modelCatalogFailures());
     if (loaded) failures.delete(connection);
     else failures.add(connection);
@@ -1070,59 +1111,35 @@ export class SettingsStore {
     const next = new Set(this._modelsLoading());
     next.delete(connection);
     this._modelsLoading.set(next);
-    if (loaded && CURATED_PROVIDER_CONNECTION_IDS.includes(connection)) {
-      this.repairForeignRoleModels(connection, models);
-    }
     return loaded;
-  }
-
-  /**
-   * A role config can outlive its previous connection (older clients/manual edits). For curated
-   * catalogs, never preserve a foreign id as "custom": clear it to the selected connection's
-   * explicit default and persist the repair. Remote Ollama/Gateway ids remain user-extensible.
-   */
-  private repairForeignRoleModels(
-    connection: string,
-    models: readonly string[],
-  ): void {
-    const repairs: {
-      roleNotesModel?: string;
-      roleAskModel?: string;
-      roleLiveModel?: string;
-    } = {};
-    if (
-      this.form.controls.roleNotesConnection.value === connection &&
-      this.form.controls.roleNotesModel.value &&
-      !models.includes(this.form.controls.roleNotesModel.value)
-    ) {
-      repairs.roleNotesModel = "";
-    }
-    if (
-      this.form.controls.roleAskConnection.value === connection &&
-      this.form.controls.roleAskModel.value &&
-      !models.includes(this.form.controls.roleAskModel.value)
-    ) {
-      repairs.roleAskModel = "";
-    }
-    if (
-      this.form.controls.roleLiveConnection.value === connection &&
-      this.form.controls.roleLiveModel.value &&
-      !models.includes(this.form.controls.roleLiveModel.value)
-    ) {
-      repairs.roleLiveModel = "";
-    }
-    if (Object.keys(repairs).length === 0) return;
-    this.form.patchValue(repairs);
-    if (this.autoSaveReady) {
-      void this.save();
-    } else {
-      this._catalogRepairPending = true;
-    }
   }
 
   /** The Default-model picker's catalog (CLI/direct Default AI connections only). */
   readonly defaultModelCatalog = computed(
-    () => this.modelCatalogs()[this._providerIdValue()] ?? [],
+    () => this.modelCatalogs()[this._providerIdValue()]?.options ?? [],
+  );
+  /**
+   * Whether the Default-model catalog was FETCHED rather than compiled in. Read from the catalog,
+   * not from its options: an empty live catalog (a gateway answering with zero models) is exactly
+   * when Refresh matters, and it has no option to carry a source.
+   */
+  /**
+   * Whether to OFFER Refresh. Hidden only when the catalog is known to be `"bundled"` — compiled
+   * into the binary, where the button could not change anything.
+   *
+   * Deliberately `!== "bundled"` rather than `=== "live"`, because a MISSING catalog is the state
+   * after a failed fetch: `loadModels` no longer writes a fabricated bundled entry on error (that
+   * made a live connection look compiled-in), so `=== "live"` would have hidden Refresh at the one
+   * moment retrying is the entire point. Unknown provenance offers the button; only proven-bundled
+   * withholds it.
+   */
+  /** Whether this connection fetches its catalog from a real endpoint. See the constant. */
+  connectionHasLiveCatalog(connection: string): boolean {
+    return LIVE_CATALOG_CONNECTION_IDS.includes(connection);
+  }
+
+  readonly defaultCatalogIsLive = computed(() =>
+    this.connectionHasLiveCatalog(this._providerIdValue()),
   );
   /** True while the Default-model picker's catalog fetch is in flight. */
   readonly defaultModelsLoading = computed(() =>
@@ -1132,7 +1149,7 @@ export class SettingsStore {
   readonly defaultModelIsCustom = computed(() => {
     const current = this._providerModelValue();
     if (!current) return false;
-    return !this.defaultModelCatalog().includes(current);
+    return !this.defaultModelCatalog().some((o) => o.id === current);
   });
 
   /** "Claude Code · claude-opus-4-8"-style summary of the Default AI row. */
@@ -1223,19 +1240,72 @@ export class SettingsStore {
    * subscription: load() must be able to patch role keys without clobbering a
    * legacy `brainBackend`.
    */
+  /**
+   * The model a role keeps after its connection changes.
+   *
+   * This used to be an unconditional `""`, on the reasoning that a model belongs to the arm it was
+   * picked for. That is the same "the catalog is authoritative" instinct `repairForeignRoleModels`
+   * was deleted for: it destroys a choice the new arm could have honoured, and the user has no way
+   * to get it back. The Setup card already settled the rule — KEEP an id the new engine can send
+   * and explain that it is unlisted; clear ONLY one it cannot send at all — and a role row is the
+   * same question asked one row lower.
+   *
+   * Two different questions, and conflating them produced a bug in each direction.
+   *
+   * 1. INHERIT (`""`) keeps the model, always. `roles::is_explicit` keys on the connection key
+   *    alone, so an inheriting role resolves through `legacy_default_target`, which never reads
+   *    `role_*_model`. The value is genuinely inert, and clearing it would be a silent deletion on
+   *    a row that renders no model control and therefore cannot explain itself.
+   *
+   * 2. Every other connection CONSUMES the model, `local` emphatically included — and an earlier
+   *    version of this method claimed the opposite. `make_provider_resolved`'s local arm reads
+   *    `if target.model.trim().is_empty() { config.brain_model_id } else { Some(target.model) }`
+   *    and then `resolve_brain_model(...)?`, so a retained `llama3.1:8b` OVERRIDES the on-device
+   *    model and turns every local note into `AppError::Unavailable`. Fail-closed, never a silent
+   *    cloud fallback — but broken, on the surface a privacy-conscious user reaches for.
+   *
+   * So a consuming connection clears an id it cannot use, and the row SAYS SO. The notice for that
+   * lives outside the provider-model block precisely because `local`/`off` render no model control:
+   * a caption that only appears where a model field exists cannot describe the clears that happen
+   * where one does not.
+   */
+  private roleModelAfterConnectionChange(previous: string, connection: string): string {
+    const target = connection.trim();
+    // Nothing reads the model here, so there is nothing to protect against and nothing to explain.
+    if (!connectionConsumesRoleModel(target)) return previous;
+    // `local` DOES read it — as a registry KEY. `resolve_brain_model` looks the id up in
+    // `BRAIN_MODELS`, so a matching id is a working per-role on-device override and clearing it
+    // destroys a legitimate choice; a non-matching one overrides `brain_model_id` and fails the
+    // note with `Unavailable`, so it must go. Clearing BOTH — the previous version of this rule —
+    // was over-broad in exactly the direction this whole change exists to stop.
+    if (target === "local") {
+      return this.brainModels().some((m) => m.id === previous) ? previous : "";
+    }
+    if (!PROVIDER_CONNECTION_IDS.includes(target)) return "";
+    return connectionKeepsModelId(previous, effectiveConnection(target, this._providerIdValue() ?? ""))
+      ? previous
+      : "";
+  }
+
   setRoleConnection(role: "notes" | "ask" | "live", connection: string): void {
     switch (role) {
       case "notes":
         this.form.patchValue({
           roleNotesConnection: connection,
-          roleNotesModel: "",
+          roleNotesModel: this.roleModelAfterConnectionChange(
+            this.roleNotesModelValue(),
+            connection,
+          ),
           roleNotesEffort: "",
         });
         break;
       case "ask":
         this.form.patchValue({
           roleAskConnection: connection,
-          roleAskModel: "",
+          roleAskModel: this.roleModelAfterConnectionChange(
+            this.roleAskModelValue(),
+            connection,
+          ),
           roleAskEffort: "",
           // "" (Inherit) restores the LOADED fallback rather than forcing
           // "cloud" — a legacy local/off user who wanders to a cloud pick and
@@ -1253,7 +1323,10 @@ export class SettingsStore {
       case "live":
         this.form.patchValue({
           roleLiveConnection: connection,
-          roleLiveModel: "",
+          roleLiveModel: this.roleModelAfterConnectionChange(
+            this.roleLiveModelValue(),
+            connection,
+          ),
           roleLiveEffort: "",
         });
         break;
@@ -1732,10 +1805,6 @@ export class SettingsStore {
       // Only a SUCCESSFUL load arms auto-save — arming after a failed load
       // would let the pristine defaults overwrite the user's stored config.
       this.autoSaveReady = true;
-      if (this._catalogRepairPending) {
-        this._catalogRepairPending = false;
-        await this.save();
-      }
     } catch (e) {
       this._loadError.set(this.errorCopy.humanize(e));
     }

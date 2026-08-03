@@ -11,6 +11,8 @@ import {
   viewChild,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
+import type { ModelOption } from "../../../../../core/models";
+import { connectionKeepsModelId, effectiveConnection } from "../../../model-id";
 import { SettingsStore } from "../../../settings.store";
 
 /** Provider-backed connection ids (a per-role model select makes sense on these). */
@@ -35,7 +37,13 @@ interface RoleRowVm {
   readonly offersReasonerTargets: boolean;
   readonly conn: string;
   readonly isProviderConn: boolean;
-  readonly models: readonly string[];
+  readonly models: readonly ModelOption[];
+  /**
+   * Whether this row's catalog was FETCHED rather than compiled in. Read from the catalog, not
+   * from its options: an empty live catalog has no option to carry a source, and that is exactly
+   * the state in which Refresh matters.
+   */
+  readonly catalogIsLive: boolean;
   readonly modelsLoading: boolean;
   readonly modelValue: string;
   readonly modelIsCustom: boolean;
@@ -202,7 +210,7 @@ export class AiRoleRowsComponent {
   ): RoleRowVm {
     const isProviderConn = PROVIDER_CONNECTION_IDS.includes(conn);
     const models = isProviderConn
-      ? (this.store.modelCatalogs()[conn] ?? [])
+      ? (this.store.modelCatalogs()[conn]?.options ?? [])
       : [];
     return {
       role,
@@ -215,16 +223,77 @@ export class AiRoleRowsComponent {
       conn,
       isProviderConn,
       models,
+      catalogIsLive:
+        isProviderConn && this.store.connectionHasLiveCatalog(conn),
       modelsLoading: isProviderConn && this.store.modelsLoading().has(conn),
       modelValue,
-      modelIsCustom: !!modelValue && !models.includes(modelValue),
+      modelIsCustom: !!modelValue && !models.some((o) => o.id === modelValue),
       inheritSummary,
     };
   }
 
+  /**
+   * What a connection change did to each role's model, so it is never a silent edit.
+   *
+   * `"dropped"` — the id could not be sent by the new arm, so it was cleared; `"kept"` — it was
+   * kept even though the new arm's catalog does not list it. Same two outcomes, same vocabulary and
+   * the same reasoning as the Setup card: a catalog is a hint, so "not listed" is not "not valid",
+   * and only an id the arm genuinely cannot send gets destroyed.
+   */
+  readonly connectionChangeNotice = signal<
+    Record<string, { readonly outcome: "dropped" | "kept"; readonly model: string }>
+  >({});
+
   onConnectionChange(role: RoleRowVm["role"], e: Event): void {
+    const previous = this.rows().find((r) => r.role === role)?.modelValue ?? "";
     this.store.setRoleConnection(role, (e.target as HTMLSelectElement).value);
+    // `setRoleConnection` patches the form synchronously, so the row already carries the outcome.
+    const row = this.rows().find((r) => r.role === role);
+    const now = row?.modelValue ?? "";
+    this.connectionChangeNotice.update((map) => {
+      const next = { ...map };
+      if (!previous) delete next[role];
+      else if (!now) next[role] = { outcome: "dropped", model: previous };
+      else if (row?.isProviderConn && !row.models.some((o) => o.id === now))
+        next[role] = { outcome: "kept", model: now };
+      else delete next[role];
+      return next;
+    });
   }
+
+  /**
+   * Dismiss a role's switch notice once the user edits that model themselves.
+   *
+   * Without this the "… belonged to the previous engine" line survived the user picking a
+   * replacement, so the row went on explaining an edit that no longer described anything on screen.
+   */
+  onModelEdited(role: RoleRowVm["role"]): void {
+    this.connectionChangeNotice.update((map) => {
+      if (!(role in map)) return map;
+      const next = { ...map };
+      delete next[role];
+      return next;
+    });
+  }
+
+  /**
+   * Per-role: would the persistence boundary refuse the id currently typed in this row?
+   *
+   * The free-text id is rendered unconditionally on this surface now, exactly as on the Setup card,
+   * so it inherits the same obligation — a row that displays `-m` while `dto_to_config` has already
+   * fallen back to the previously stored value is stating something untrue. The connection is
+   * resolved first because `""` means inherit, so the id must be judged against the arm it will
+   * really run on.
+   */
+  readonly refusedTypedModels = computed(() => {
+    const refused = new Set<string>();
+    for (const row of this.rows()) {
+      if (!row.isProviderConn) continue;
+      const target = effectiveConnection(row.conn, this.store.providerIdValue() ?? "");
+      if (!connectionKeepsModelId(row.modelValue, target)) refused.add(row.role);
+    }
+    return refused;
+  });
 
   refreshModels(connection: string): void {
     void this.store.refreshModels(connection);
