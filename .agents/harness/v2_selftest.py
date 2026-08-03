@@ -857,13 +857,21 @@ def profile_cases(test: Tests) -> None:
     test.equal("PROFILE docs has no sensitive review", risks, [])
 
     checks, reviews, _ = _profile(["src-tauri/src/transcribe/render.rs"])
-    test.equal("PROFILE Rust source always runs rust-lib", checks, ["rust-lib"])
+    test.equal(
+        "PROFILE Rust source always runs rust-lib and rust-clippy",
+        checks,
+        ["rust-lib", "rust-clippy"],
+    )
     test.true("PROFILE Rust source has combined review", reviews == ["combined"])
     test.true("PROFILE Rust path does not infer runtime", "tauri-boot" not in checks)
     test.true("PROFILE Rust path does not infer performance", "perf-contracts" not in checks)
 
     checks, _, _ = _profile(["src-tauri/Cargo.toml"])
-    test.equal("PROFILE Rust manifest runs rust-lib", checks, ["rust-lib"])
+    test.equal(
+        "PROFILE Rust manifest runs rust-lib and rust-clippy",
+        checks,
+        ["rust-lib", "rust-clippy"],
+    )
 
     checks, reviews, _ = _profile(["src/app/features/detail/detail.ts"])
     test.equal(
@@ -893,7 +901,7 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE mixed surface is stable union",
         checks,
-        ["rust-lib", "ng-lint", "ng-build", "playwright"],
+        ["rust-lib", "rust-clippy", "ng-lint", "ng-build", "playwright"],
     )
 
     checks, _, _ = _profile(
@@ -902,14 +910,14 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE explicit runtime and performance claims add checks",
         checks,
-        ["rust-lib", "tauri-boot", "perf-contracts"],
+        ["rust-lib", "rust-clippy", "tauri-boot", "perf-contracts"],
     )
 
     checks, reviews, risks = _profile(["src-tauri/src/share/envelope.rs"])
     test.equal(
         "PROFILE protocol runs client and server checks",
         checks,
-        ["rust-lib", "protocol-server"],
+        ["rust-lib", "rust-clippy", "protocol-server"],
     )
     test.equal("PROFILE protocol actual risks", risks, ["egress", "protocol"])
     test.equal(
@@ -921,7 +929,7 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE server revision runs client and protocol checks",
         checks,
-        ["rust-lib", "protocol-server"],
+        ["rust-lib", "rust-clippy", "protocol-server"],
     )
     test.equal(
         "PROFILE server revision is protocol-sensitive",
@@ -940,7 +948,7 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE protocol crate has protocol checks",
         checks,
-        ["rust-lib", "protocol-server"],
+        ["rust-lib", "rust-clippy", "protocol-server"],
     )
     test.equal("PROFILE protocol crate has protocol risk", risks, ["protocol"])
     test.equal(
@@ -950,7 +958,11 @@ def profile_cases(test: Tests) -> None:
     )
 
     checks, reviews, risks = _profile(["src-tauri/src/storage/meeting_store.rs"])
-    test.equal("PROFILE lock surface retains rust baseline", checks, ["rust-lib"])
+    test.equal(
+        "PROFILE lock surface retains rust baseline",
+        checks,
+        ["rust-lib", "rust-clippy"],
+    )
     test.equal("PROFILE shallow lock path matches", risks, ["lock"])
     test.equal(
         "PROFILE lock adds specialist",
@@ -1667,10 +1679,33 @@ def verdict_cases(test: Tests) -> None:
             }
         ],
     }
+    # A gap is the reviewer's own "I could not verify this", not "this is broken" — the protocol
+    # gives it FAIL and MAJOR for the latter. Overriding its PASS could not terminate: closing a gap
+    # creates a new claim that the next round questions one link further out.
     test.equal(
-        "VERDICT PASS plus proof gap is rejected",
+        "VERDICT PASS plus proof gap passes, because the reviewer chose PASS",
         verifier.review_result_state(gap),
+        "PASSED",
+    )
+    # ...but a PROBE REQUEST still blocks: that names a command the runner can actually execute.
+    probe_request = {
+        **base,
+        "probe_requests": [{"probe_id": "rust-lib", "rationale": "need runner proof"}],
+    }
+    test.equal(
+        "VERDICT PASS plus probe request still blocks",
+        verifier.review_result_state(probe_request),
         "NEEDS_EVIDENCE",
+    )
+    # ...and a MAJOR still blocks, gap or no gap: severity is how "not mergeable" is spelled.
+    severe_with_gap = {
+        **gap,
+        "findings": [{"severity": "MAJOR", "evidence": "a real defect"}],
+    }
+    test.equal(
+        "VERDICT a MAJOR blocks regardless of the proof-gap change",
+        verifier.review_result_state(severe_with_gap),
+        "NEEDS_FIX",
     )
 
     # Review authority: a kind the config demotes records but does not gate, a
@@ -1736,23 +1771,35 @@ def verdict_cases(test: Tests) -> None:
         )[0],
         "PASSED",
     )
-    test.equal(
-        "VERDICT blocking combined proof gap forbids PASS",
-        verifier.aggregate_verdict(
-            [green_check],
-            [review("combined", gap), review("egress-security", base)],
-            gating_config,
-        )[0],
-        "NEEDS_EVIDENCE",
+    # A gap from a GATING reviewer that still voted PASS no longer forbids PASS — but the reason
+    # line has to say so, because it is now the only place the gap reaches the operator.
+    combined_gap_gating = verifier.aggregate_verdict(
+        [green_check],
+        [review("combined", gap), review("egress-security", base)],
+        gating_config,
     )
     test.equal(
-        "VERDICT blocking specialist proof gap still forbids PASS",
-        verifier.aggregate_verdict(
-            [green_check],
-            [review("combined", base), review("egress-security", gap)],
-            demoted_config,
-        )[0],
-        "NEEDS_EVIDENCE",
+        "VERDICT blocking combined proof gap no longer forbids PASS",
+        combined_gap_gating[0],
+        "PASSED",
+    )
+    test.true(
+        "VERDICT a passed gap is named in the reason line",
+        "proof gap(s) recorded as advisory" in combined_gap_gating[1],
+    )
+    specialist_gap = verifier.aggregate_verdict(
+        [green_check],
+        [review("combined", base), review("egress-security", gap)],
+        demoted_config,
+    )
+    test.equal(
+        "VERDICT a specialist proof gap no longer forbids PASS",
+        specialist_gap[0],
+        "PASSED",
+    )
+    test.true(
+        "VERDICT a specialist gap is named in the reason line",
+        "proof gap(s) recorded as advisory" in specialist_gap[1],
     )
     test.equal(
         "VERDICT unknown review kind fails closed as blocking",
@@ -1858,11 +1905,23 @@ def verdict_cases(test: Tests) -> None:
         ),
         ("NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"),
     )
+    # THE CONSEQUENCE, stated rather than hidden: with no deterministic checks in the plan, a gating
+    # reviewer's PASS is now sufficient even when it filed gaps — so the reason line naming those
+    # gaps is the only thing standing between "advisory" and "silently dropped". Assert both.
+    check_free = verifier.aggregate_verdict([], [review("combined", gap)], demoted_config)
     test.equal(
-        "VERDICT a check-free plan cannot pass over a generalist proof gap",
-        verifier.aggregate_verdict(
-            [], [review("combined", gap)], demoted_config
-        )[0],
+        "VERDICT a check-free plan passes on a gating review that chose PASS",
+        check_free[0],
+        "PASSED",
+    )
+    test.true(
+        "VERDICT a check-free PASS still names its proof gaps",
+        "proof gap(s) recorded as advisory" in check_free[1],
+    )
+    # The unrelated guard this must NOT weaken: no checks AND no gating review certifies nothing.
+    test.equal(
+        "VERDICT no checks and no gating review still certifies nothing",
+        verifier.aggregate_verdict([], [], demoted_config)[0],
         "NEEDS_EVIDENCE",
     )
     test.equal(
