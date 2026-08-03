@@ -11,7 +11,8 @@ import {
   viewChild,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
-import type { ModelOption } from "../../../../../core/models";
+import type { ModelCatalog, ModelOption } from "../../../../../core/models";
+import { MurModelPickerComponent } from "../../../../../design-system/model-picker/model-picker.component";
 import { connectionKeepsModelId, effectiveConnection } from "../../../model-id";
 import { SettingsStore } from "../../../settings.store";
 
@@ -38,6 +39,9 @@ interface RoleRowVm {
   readonly conn: string;
   readonly isProviderConn: boolean;
   readonly models: readonly ModelOption[];
+  /** The whole catalog, so the picker can read PROVENANCE — an empty live one still says
+   *  it was fetched, which no option list can express. */
+  readonly catalog: ModelCatalog | undefined;
   /**
    * Whether this row's catalog was FETCHED rather than compiled in. Read from the catalog, not
    * from its options: an empty live catalog has no option to carry a source, and that is exactly
@@ -64,7 +68,7 @@ interface RoleRowVm {
 @Component({
   selector: "app-ai-role-rows",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, MurModelPickerComponent],
   templateUrl: "./ai-role-rows.component.html",
   styleUrl: "./ai-role-rows.component.scss",
 })
@@ -223,6 +227,7 @@ export class AiRoleRowsComponent {
       conn,
       isProviderConn,
       models,
+      catalog: isProviderConn ? this.store.modelCatalogs()[conn] : undefined,
       catalogIsLive:
         isProviderConn && this.store.connectionHasLiveCatalog(conn),
       modelsLoading: isProviderConn && this.store.modelsLoading().has(conn),

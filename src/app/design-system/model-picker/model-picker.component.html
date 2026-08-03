@@ -1,0 +1,63 @@
+<div class="model-picker">
+  @if (options().length > 0) {
+    <select
+      #select
+      class="model-select"
+      [disabled]="isDisabled()"
+      [attr.aria-label]="ariaLabel()"
+      (change)="onSelect($event)"
+    >
+      <option value="" data-provider-default>{{ defaultLabel() }}</option>
+      @for (option of options(); track option.id) {
+        <option [value]="option.id">{{ option.label }}</option>
+      }
+      <!--
+        A stored id the catalog does not list stays selectable. Dropping it is how a newly released
+        model used to disappear from a user's config.
+      -->
+      @if (valueIsCustom()) {
+        <option [value]="value()">{{ value() }} (custom)</option>
+      }
+    </select>
+  }
+
+  <!--
+    ALWAYS rendered, not only when the catalog is empty. It used to live in the `@else` of the
+    catalog check, so a non-empty catalog made every unlisted model unreachable — which is exactly
+    the situation a model released after this build is in.
+  -->
+  <input
+    class="model-input"
+    type="text"
+    [value]="value()"
+    [disabled]="isDisabled()"
+    [attr.aria-label]="ariaLabel()"
+    [placeholder]="placeholder()"
+    autocomplete="off"
+    spellcheck="false"
+    (input)="onType($event)"
+  />
+
+  @if (canRefresh()) {
+    <button
+      type="button"
+      class="btn btn-ghost model-refresh"
+      [disabled]="loading() || isDisabled()"
+      title="Fetch this connection's model list"
+      (click)="onRefresh()"
+    >
+      @if (loading()) {
+        Loading…
+      } @else {
+        ↻ Refresh
+      }
+    </button>
+  }
+</div>
+
+@if (showsBundledNotice()) {
+  <p class="field-hint" data-bundled-catalog>
+    This list ships with the app, so a newer model may be missing — type its id above and it will be
+    used as-is.
+  </p>
+}

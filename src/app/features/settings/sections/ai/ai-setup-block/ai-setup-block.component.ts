@@ -6,6 +6,7 @@ import {
   signal,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
+import { MurModelPickerComponent } from "../../../../../design-system/model-picker/model-picker.component";
 import { defaultEngineKeepsModelId } from "../../../model-id";
 import { SettingsStore } from "../../../settings.store";
 
@@ -35,7 +36,7 @@ import { SettingsStore } from "../../../settings.store";
 @Component({
   selector: "app-ai-setup-block",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule],
+  imports: [ReactiveFormsModule, MurModelPickerComponent],
   templateUrl: "./ai-setup-block.component.html",
   styleUrl: "./ai-setup-block.component.scss",
 })
@@ -57,6 +58,17 @@ export class AiSetupBlockComponent {
   readonly defaultCatalogIsLive = this.store.defaultCatalogIsLive;
   readonly defaultModelsLoading = this.store.defaultModelsLoading;
   readonly defaultModelIsCustom = this.store.defaultModelIsCustom;
+
+  /**
+   * The catalog for the CURRENTLY SELECTED engine — the whole `ModelCatalog`, not its options.
+   *
+   * The picker needs the catalog itself because provenance lives there: an empty LIVE catalog still
+   * has to say it was fetched, and an option list cannot carry that. `undefined` means never
+   * fetched or the fetch failed, which the picker renders as "unknown" rather than as "bundled".
+   */
+  readonly activeCatalog = computed(
+    () => this.store.modelCatalogs()[this.store.providerIdValue() ?? ""],
+  );
 
   // ── on-device status wires (the full picker lives under Advanced) ────────────
   readonly brainDownloadingId = this.store.brainDownloadingId;
