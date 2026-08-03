@@ -567,20 +567,6 @@
             />
           }
 
-          <!-- Follow-ups live in the metadata band beside Related, NOT appended
-               after the document body — where the card used to sit, its distance
-               from the viewport grew with the length of the note. It collapses to
-               a single quiet row when there is nothing to review (.is-strip), so
-               this costs no real estate on a note with no suggestions. -->
-          @if (!embedded() && !doc.locked) {
-            <app-smart-reminder-card
-              sourceKind="note"
-              [sourceId]="doc.id"
-              [sourceTitle]="title() || doc.title"
-              [sourceRevision]="doc.updatedAt"
-            />
-          }
-
           <!-- Body: preview (cached computed) OR the source-of-truth textarea.
                Formatting lives in the floating bubble on selection (below) +
                ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar.
@@ -668,6 +654,14 @@
             </div>
           }
 
+          @if (!embedded() && !doc.locked) {
+            <app-smart-reminder-card
+              sourceKind="note"
+              [sourceId]="doc.id"
+              [sourceTitle]="title() || doc.title"
+              [sourceRevision]="doc.updatedAt"
+            />
+          }
 
         </article>
       }

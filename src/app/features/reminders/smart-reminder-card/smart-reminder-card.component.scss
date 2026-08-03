@@ -21,6 +21,16 @@
   justify-content: flex-start;
 }
 
+/* Compact error inside the strip: one row, no panel, no extra vertical box.
+   Above the body, a failure to fetch suggestions must not move the document. */
+.smart-card.is-strip .smart-error {
+  padding: 0;
+  border: 0;
+  background: none;
+  gap: var(--space-2);
+  font-size: 0.8125rem;
+}
+
 /* Flush the ghost button's own inline padding so the strip's text starts on the
    same left edge as the sibling metadata affordances (+ Link, Add image) rather
    than sitting a few pixels proud of them. */
