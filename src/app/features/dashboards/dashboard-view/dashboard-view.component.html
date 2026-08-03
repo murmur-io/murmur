@@ -1,0 +1,107 @@
+<header class="head">
+  <div class="head-text">
+    <button type="button" class="crumb" (click)="back()">← Dashboards</button>
+    <h1>
+      @if (board()?.emoji; as emoji) {
+        <span class="emoji">{{ emoji }}</span>
+      }
+      {{ board()?.title ?? "Board" }}
+    </h1>
+  </div>
+
+  <button type="button" class="btn btn-ghost" (click)="toggleEditing()">
+    {{ editing() ? "Done" : "Arrange" }}
+  </button>
+  <button type="button" class="btn btn-primary" (click)="openPalette()">
+    <mur-icon icon="plus" /> Add tile
+  </button>
+</header>
+
+@if (error(); as err) {
+  <div class="banner banner-error" role="alert">{{ err }}</div>
+}
+
+<div class="board">
+  <section class="canvas" aria-label="Board tiles">
+    @if (isEmpty() && loading()) {
+      <mur-empty-state>Loading this board…</mur-empty-state>
+    } @else if (isEmpty()) {
+      <mur-empty-state>
+        <strong>This board is empty.</strong>
+        <p class="empty-copy">
+          Add a note or a recording to give it something to stand on — then add a
+          drift lane, a promise ledger or a pulse, which only work because Murmur
+          heard the conversation.
+        </p>
+        <button type="button" class="btn btn-primary" (click)="openPalette()">
+          Add the first tile
+        </button>
+      </mur-empty-state>
+    } @else {
+      @for (tile of tiles(); track tile.id) {
+        <app-dashboard-tile
+          [tile]="tile"
+          [cited]="citationFor(tile)"
+          [editing]="editing()"
+          (remove)="removeTile(tile)"
+          (widen)="widen(tile)"
+          (narrow)="narrow(tile)"
+          (openSource)="openSource($event)"
+          (refreshAnswer)="refreshAnswer(tile)"
+        />
+      }
+    }
+  </section>
+
+  <aside class="ask" aria-label="Ask this board">
+    <header class="ask-head">
+      <mur-icon icon="ask" />
+      <h2>Ask this board</h2>
+    </header>
+
+    <p class="scope">
+      Grounded in <strong>this board only</strong> — {{ sourceCount() }}
+      readable {{ sourceCount() === 1 ? "source" : "sources" }}.
+      @if (sealedCount() > 0) {
+        <span class="scope-sealed">
+          {{ sealedCount() }} sealed {{ sealedCount() === 1 ? "tile is" : "tiles are" }}
+          excluded until unlocked.
+        </span>
+      }
+    </p>
+
+    <div class="thread">
+      @for (turn of turns(); track $index) {
+        <div class="bubble" [class.me]="turn.role === 'user'">{{ turn.text }}</div>
+      } @empty {
+        <div class="suggestions">
+          @for (s of suggestions; track s) {
+            <button type="button" class="suggestion" (click)="askSuggestion(s)">{{ s }}</button>
+          }
+        </div>
+      }
+
+      @if (asking()) {
+        <div class="bubble thinking"><mur-spinner /> Thinking…</div>
+      }
+    </div>
+
+    <form class="composer" (submit)="ask(); $event.preventDefault()">
+      <input
+        class="ask-field"
+        type="text"
+        placeholder="Ask about these tiles…"
+        [value]="draft()"
+        (input)="onDraft($event)"
+        aria-label="Ask a question about this board"
+      />
+      <button type="submit" class="btn btn-primary btn-sm" [disabled]="!draft().trim() || asking()">
+        Ask
+      </button>
+    </form>
+  </aside>
+</div>
+
+@if (paletteOpen()) {
+  <app-tile-palette (dismiss)="closePalette()" (choose)="addTile($event)" />
+}
