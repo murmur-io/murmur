@@ -43,6 +43,7 @@ BLOCKING_AUTHORITY = "blocking"
 ADVISORY_AUTHORITY = "advisory"
 ALLOWED_PROBES = {
     "rust-lib",
+    "rust-clippy",
     "protocol-server",
     "npm-lock",
     "tauri-boot",
@@ -557,6 +558,12 @@ def derive_profile(
 
     if _rust_surface(paths):
         require("rust-lib")
+        # `cargo test --lib` does not deny warnings, so a whole class of defect reached CI
+        # untouched by ~20 verify rounds: a `#[test]` attribute stolen from the item below by an
+        # insertion registered one test twice and silently disabled another, and
+        # `duplicate_macro_attributes` is only an ERROR under `-D warnings`. Three PASS reviewers
+        # and 2700 green tests did not see it; the first CI run did.
+        require("rust-clippy")
     if _package_lock_surface(paths):
         require("npm-lock")
     if _angular_surface(paths):
@@ -566,6 +573,7 @@ def derive_profile(
         require("playwright")
     if _protocol_surface(paths):
         require("rust-lib")
+        require("rust-clippy")
         require("protocol-server")
     if "runtime" in claim_set:
         require("tauri-boot")

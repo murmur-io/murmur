@@ -857,13 +857,21 @@ def profile_cases(test: Tests) -> None:
     test.equal("PROFILE docs has no sensitive review", risks, [])
 
     checks, reviews, _ = _profile(["src-tauri/src/transcribe/render.rs"])
-    test.equal("PROFILE Rust source always runs rust-lib", checks, ["rust-lib"])
+    test.equal(
+        "PROFILE Rust source always runs rust-lib and rust-clippy",
+        checks,
+        ["rust-lib", "rust-clippy"],
+    )
     test.true("PROFILE Rust source has combined review", reviews == ["combined"])
     test.true("PROFILE Rust path does not infer runtime", "tauri-boot" not in checks)
     test.true("PROFILE Rust path does not infer performance", "perf-contracts" not in checks)
 
     checks, _, _ = _profile(["src-tauri/Cargo.toml"])
-    test.equal("PROFILE Rust manifest runs rust-lib", checks, ["rust-lib"])
+    test.equal(
+        "PROFILE Rust manifest runs rust-lib and rust-clippy",
+        checks,
+        ["rust-lib", "rust-clippy"],
+    )
 
     checks, reviews, _ = _profile(["src/app/features/detail/detail.ts"])
     test.equal(
@@ -893,7 +901,7 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE mixed surface is stable union",
         checks,
-        ["rust-lib", "ng-lint", "ng-build", "playwright"],
+        ["rust-lib", "rust-clippy", "ng-lint", "ng-build", "playwright"],
     )
 
     checks, _, _ = _profile(
@@ -902,14 +910,14 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE explicit runtime and performance claims add checks",
         checks,
-        ["rust-lib", "tauri-boot", "perf-contracts"],
+        ["rust-lib", "rust-clippy", "tauri-boot", "perf-contracts"],
     )
 
     checks, reviews, risks = _profile(["src-tauri/src/share/envelope.rs"])
     test.equal(
         "PROFILE protocol runs client and server checks",
         checks,
-        ["rust-lib", "protocol-server"],
+        ["rust-lib", "rust-clippy", "protocol-server"],
     )
     test.equal("PROFILE protocol actual risks", risks, ["egress", "protocol"])
     test.equal(
@@ -921,7 +929,7 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE server revision runs client and protocol checks",
         checks,
-        ["rust-lib", "protocol-server"],
+        ["rust-lib", "rust-clippy", "protocol-server"],
     )
     test.equal(
         "PROFILE server revision is protocol-sensitive",
@@ -940,7 +948,7 @@ def profile_cases(test: Tests) -> None:
     test.equal(
         "PROFILE protocol crate has protocol checks",
         checks,
-        ["rust-lib", "protocol-server"],
+        ["rust-lib", "rust-clippy", "protocol-server"],
     )
     test.equal("PROFILE protocol crate has protocol risk", risks, ["protocol"])
     test.equal(
@@ -950,7 +958,11 @@ def profile_cases(test: Tests) -> None:
     )
 
     checks, reviews, risks = _profile(["src-tauri/src/storage/meeting_store.rs"])
-    test.equal("PROFILE lock surface retains rust baseline", checks, ["rust-lib"])
+    test.equal(
+        "PROFILE lock surface retains rust baseline",
+        checks,
+        ["rust-lib", "rust-clippy"],
+    )
     test.equal("PROFILE shallow lock path matches", risks, ["lock"])
     test.equal(
         "PROFILE lock adds specialist",
