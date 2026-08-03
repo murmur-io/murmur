@@ -139,3 +139,79 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 - **Caught by:** the lock reviewer's own tree-state warning (diff hunk count changed mid-audit) + a post-hoc grep/test on the settled tree.
 - **Lesson:** patch-and-restore verifiers get EXCLUSIVE tree access. Run adversarial first, lock-security after (or vice versa) — never both at once on a dirty tree. If parallelism matters, give the mutating verifier a worktree.
 - **Status:** journal
+
+### [2026-08-03 model-picker] The harness does not run clippy — 20 verify rounds passed a lint error CI caught in a minute
+- **Pattern:** `canonical_checks["rust-lib"]` is `cargo test --lib`, and nothing in the harness runs
+  `clippy -D warnings`. Inserting a `#[test]` fn immediately before an existing one split that item
+  from its attribute, so the pre-existing `#[test]` landed on the NEW function: it registered twice
+  (cargo prints the same test name twice, "2 passed") while the old test silently lost its
+  attribute. `cargo test --lib` cannot see this — `duplicate_macro_attributes` is a warning there.
+  Twenty verify rounds, three PASS reviewers and ~2700 green tests all missed it; CI failed on the
+  first run. The same insertion mistake happened THREE times in one session (`gateway.rs`,
+  `summarize/mod.rs`, `gateway.rs` again).
+- **Caught by:** GitHub Actions `rust lane` (`clippy --all-targets -- -D warnings`); once locally by
+  a `function is never used` warning after the attribute was stolen from a live test.
+- **Lesson:** After inserting any item before an existing `fn`, immediately check the NEXT item still
+  owns its attributes and doc comment. Before pushing Rust, run
+  `cargo clippy --lib --tests -- -D warnings` (NOT `--all-targets`, which the hook blocks and which
+  thrashes the profile) — the harness will not do it for you. A test-count DROP after removing a
+  duplicated attribute is not a lost test; the duplicate was registering one test twice.
+- **Status:** journal — the durable fix is to add a `rust-clippy` canonical check to the harness
+  (control-plane change, own PR).
+
+### [2026-08-03 model-picker] A green test proves nothing until you have seen it go red
+- **Pattern:** two assertions written as evidence were VACUOUS and passed with the bug restored.
+  (a) `the_ledger_reports_exactly_what_the_wire_sends` compared `effective_model_requested` against a
+  re-derivation of the same fallback — after the factory was routed through that function, the test
+  called it on both sides: a tautology dressed as a test. (b) An e2e assertion that "the new engine's
+  catalog still loads" switched to `claude_code`, which was ALREADY the selected engine, so its
+  catalog had loaded before the code under test ever ran. Both read as sensible evidence.
+- **Caught by:** deliberate RED checks — reverting the fix and confirming the intended assertion (and
+  only it) fails.
+- **Lesson:** RED-check every load-bearing assertion, and check WHAT failed, not just THAT something
+  failed. Two smells: an assertion whose two sides call the same function, and a fixture that is
+  valid under both branches of the rule being tested (a short model id cannot tell an argv rule from
+  a JSON-body rule; the DEFAULT engine cannot test "the new engine's catalog loads").
+- **Status:** journal
+
+### [2026-08-03 model-picker] Harness proof gaps have no termination condition
+- **Pattern:** after all three reviewers returned PASS with zero MAJOR findings, four consecutive
+  rounds returned `NEEDS_EVIDENCE` with the proof-gap count going 8 → 6 → 7 → 7. Closing a gap
+  creates a new claim ("this test proves X"), which the next round questions one link further out;
+  round N+1 restated claims closed in round N-1. `commit` refuses anything but PASS, so the loop has
+  no exit. Deterministic checks were green in every one of the ~20 rounds. Measured earlier on a
+  216-review corpus: the generalist reviewer PASSes 26% of the time and ALL 106 non-PASS verdicts
+  occurred with every deterministic gate green.
+- **Caught by:** counting gaps per round instead of reading them one round at a time.
+- **Lesson:** Distinguish "this is broken" (MAJOR — always fix; three of this session's eight MAJORs
+  were regressions introduced by earlier fixes in the same task) from "this is not proven" (a gap —
+  bounded value, unbounded supply). Track the gap COUNT across rounds; if it is not falling, the loop
+  is not converging and the work should land through Track A with the residual gaps written into the
+  PR body. `CLAUDE.md` is explicit that CI is the only merge authority.
+- **Status:** journal — durable fix is a harness stop condition (all reviewers PASS + zero MAJOR ⇒
+  gaps become advisory), own PR.
+
+### [2026-08-03 model-picker] A literal control byte makes a .ts file binary, and reviewers get a blob
+- **Pattern:** a regex character class was authored with the actual bytes (`\x00`, `\x1f`, `\x7f`)
+  instead of escape text. Git classifies a file with a NUL in the first 8000 bytes as binary, so a
+  production module deciding whether a stored model id is kept or cleared reached three reviewers as
+  `GIT binary patch / literal 4955` — unreadable. `ng lint`, `ng build` and 434 e2e tests were green
+  on it, because the code is identical either way.
+- **Caught by:** the lock-security reviewer, who refused to audit what it could not read.
+- **Lesson:** Write control characters as escapes (`\u0000`), never as the byte. The Write tool
+  transmits typed escapes literally, so build such strings programmatically and verify afterwards
+  (`[b for b in path.read_bytes() if b < 9 or 13 < b < 32 or b == 127]` must be empty).
+- **Status:** journal
+
+### [2026-08-03 model-picker] A stacked PR gets no CI, and retargeting alone does not start it
+- **Pattern:** `.github/workflows/ci.yml` triggers on `pull_request: branches: [murmur]`. A PR based
+  on another feature branch therefore runs NOTHING — it shows "no checks reported", which reads like
+  "CI hasn't finished" rather than "CI never started". Retargeting the base to `murmur` does not fire
+  a run either: `pull_request` defaults to `opened`/`synchronize`/`reopened`, and a base change is
+  `edited`.
+- **Caught by:** checking `gh pr checks` instead of assuming, then reading the workflow trigger.
+- **Lesson:** Either base a stacked PR on `murmur` from the start (accepting that its diff shows the
+  parent's commits until the parent merges — say so at the top of the body), or close+reopen after
+  retargeting to fire `reopened`. Merge the parent with a MERGE commit, not a squash: squashing
+  creates a new commit carrying content the child already has as its own commits.
+- **Status:** journal
