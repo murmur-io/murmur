@@ -9,6 +9,12 @@ import type {
   AppConfigDto,
   BacklinkSource,
   ClaimAlignment,
+  Dashboard,
+  DashboardDetail,
+  DashboardSummary,
+  DashboardTile,
+  DashboardTint,
+  TileKind,
   LinkEdge,
   LinkKind,
   SourceRef,
@@ -1228,6 +1234,94 @@ export class IpcService {
   /** Add a macOS Reminder for an action item (best-effort, TCC-gated). */
   addReminder(text: string, dueDate: string | null): Promise<void> {
     return invoke<void>("add_reminder", { text, dueDate });
+  }
+
+  // ── Dashboards ────────────────────────────────────────────────────────────
+  //
+  // Boards of tiles over EXISTING sources. `getDashboard` returns every tile
+  // already resolved through the backend's gated readers — a sealed source
+  // arrives as `{ kind: "locked" }` with no payload, so the FE cannot leak what
+  // it was never given. Board-scoped Ask reuses the shipped `askVault(…,
+  // explicitSources)` path with `getDashboardSources()`; there is no separate
+  // dashboard AI command and therefore no new egress surface.
+
+  /** Every board with its layout metadata (no gated payload read). */
+  listDashboards(): Promise<DashboardSummary[]> {
+    return invoke<DashboardSummary[]>("list_dashboards");
+  }
+
+  createDashboard(
+    title: string,
+    emoji?: string,
+    tint?: DashboardTint,
+  ): Promise<Dashboard> {
+    return invoke<Dashboard>("create_dashboard", { title, emoji, tint });
+  }
+
+  updateDashboard(
+    id: string,
+    patch: {
+      title?: string;
+      emoji?: string;
+      tint?: DashboardTint;
+      pinned?: boolean;
+    },
+  ): Promise<Dashboard> {
+    return invoke<Dashboard>("update_dashboard", { id, ...patch });
+  }
+
+  deleteDashboard(id: string): Promise<boolean> {
+    return invoke<boolean>("delete_dashboard", { id });
+  }
+
+  reorderDashboards(ids: string[]): Promise<void> {
+    return invoke<void>("reorder_dashboards", { ids });
+  }
+
+  /** One board with every tile resolved (and gated). `null` when unknown. */
+  getDashboard(id: string): Promise<DashboardDetail | null> {
+    return invoke<DashboardDetail | null>("get_dashboard", { id });
+  }
+
+  /**
+   * The board's VISIBLE sources, to hand straight to {@link askVault} as
+   * `explicitSources`. Sealed sources are absent, so a board-scoped Ask can
+   * never retrieve from a locked folder.
+   */
+  getDashboardSources(id: string): Promise<SourceRef[]> {
+    return invoke<SourceRef[]>("get_dashboard_sources", { id });
+  }
+
+  addDashboardTile(
+    dashboardId: string,
+    kind: TileKind,
+    opts?: {
+      refId?: string;
+      title?: string;
+      span?: number;
+      config?: string;
+    },
+  ): Promise<DashboardTile> {
+    return invoke<DashboardTile>("add_dashboard_tile", {
+      dashboardId,
+      kind,
+      ...opts,
+    });
+  }
+
+  updateDashboardTile(
+    id: string,
+    patch: { title?: string; span?: number; config?: string },
+  ): Promise<DashboardTile> {
+    return invoke<DashboardTile>("update_dashboard_tile", { id, ...patch });
+  }
+
+  deleteDashboardTile(id: string): Promise<boolean> {
+    return invoke<boolean>("delete_dashboard_tile", { id });
+  }
+
+  reorderDashboardTiles(dashboardId: string, tileIds: string[]): Promise<void> {
+    return invoke<void>("reorder_dashboard_tiles", { dashboardId, tileIds });
   }
 
   /** Content-free startup/sidebar count; does not read reminder titles or details. */

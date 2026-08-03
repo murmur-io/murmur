@@ -3191,3 +3191,147 @@ export function parseViewConfig(config: string): ViewConfig {
     columns: columns.length > 0 ? columns : [...DEFAULT_VIEW_CONFIG.columns],
   };
 }
+
+// ── Dashboards (2026-08-03) ─────────────────────────────────────────────────
+//
+// A board is LAYOUT + POINTERS. The backend resolves every tile through the
+// gated readers on each read, so a tile whose source is sealed arrives as
+// `{ kind: "locked" }` with NO payload — the renderer has nothing to leak.
+
+/** Cosmetic accent key; the FE maps it to a design token, never a raw colour. */
+export type DashboardTint =
+  | "indigo"
+  | "amber"
+  | "mint"
+  | "orchid"
+  | "azure"
+  | "coral";
+
+/** Every tile kind the backend can store AND resolve. */
+export type TileKind =
+  | "note"
+  | "meeting"
+  | "document"
+  | "person"
+  | "reminders"
+  | "drift"
+  | "numbers"
+  | "pulse"
+  | "promises"
+  | "living_answer";
+
+export interface Dashboard {
+  id: string;
+  title: string;
+  emoji: string | null;
+  tint: DashboardTint | null;
+  pinned: boolean;
+  position: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Layout metadata only — what the list view's miniature preview draws. */
+export interface TilePreview {
+  kind: TileKind;
+  span: number;
+}
+
+/** One board in the LIST view (the board's own chrome + its layout shape). */
+export interface DashboardSummary extends Dashboard {
+  tileCount: number;
+  tileKinds: TilePreview[];
+}
+
+export interface DashboardTile {
+  id: string;
+  dashboardId: string;
+  kind: TileKind;
+  refId: string | null;
+  /** User-authored heading; `null` ⇒ the resolved data supplies one. */
+  title: string | null;
+  span: number;
+  position: number;
+  /** JSON blob, shaped like {@link TileConfig}. */
+  config: string | null;
+  createdAt: string;
+}
+
+/** The `config` bag persisted on a tile. Every field optional. */
+export interface TileConfig {
+  predicate?: string;
+  owner?: string;
+  question?: string;
+  answer?: string;
+  answeredAt?: string;
+}
+
+/** One row inside a list-shaped tile — display-ready, never raw content. */
+export interface TileRow {
+  text: string;
+  meta: string | null;
+  /** `ok` | `late` | `due` | `open` | `now` | `old` | free-form ("was $240k"). */
+  status: string | null;
+  source: SourceRef | null;
+}
+
+/**
+ * The resolved payload of a tile, discriminated by `kind`.
+ *
+ * `locked` / `missing` / `unconfigured` carry NOTHING — that is the lock-model
+ * contract, asserted backend-side by `locked_tile_serializes_with_no_payload`.
+ */
+export type TileData =
+  | { kind: "locked" }
+  | { kind: "missing" }
+  | { kind: "unconfigured" }
+  | {
+      kind: "note";
+      id: string;
+      title: string;
+      snippet: string;
+      updatedAt: number;
+    }
+  | {
+      kind: "meeting";
+      id: string;
+      title: string;
+      startedAt: string;
+      durationS: number;
+      hasAudio: boolean;
+    }
+  | { kind: "document"; id: string; title: string; snippet: string }
+  | {
+      kind: "person";
+      id: string;
+      name: string;
+      mentionCount: number;
+      openCommitments: number;
+    }
+  | { kind: "reminders"; rows: TileRow[]; dueCount: number }
+  | { kind: "drift"; entity: string; predicate: string; rows: TileRow[] }
+  | { kind: "numbers"; entity: string; rows: TileRow[] }
+  | {
+      kind: "pulse";
+      entity: string;
+      weekly: number[];
+      total: number;
+      quietDays: number | null;
+    }
+  | { kind: "promises"; owner: string | null; rows: TileRow[] }
+  | {
+      kind: "livingAnswer";
+      question: string;
+      answer: string | null;
+      answeredAt: string | null;
+    };
+
+/** A tile plus its resolved (already gated) payload. */
+export interface ResolvedTile extends DashboardTile {
+  data: TileData;
+}
+
+/** One board with every tile resolved. */
+export interface DashboardDetail extends Dashboard {
+  tiles: ResolvedTile[];
+}

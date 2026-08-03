@@ -1,0 +1,124 @@
+<div class="scrim" (click)="onBackdrop()" aria-hidden="true"></div>
+
+<div
+  class="palette"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Add a tile"
+  tabindex="-1"
+>
+  @if (selected(); as type) {
+    <header class="palette-head">
+      <button type="button" class="btn btn-ghost btn-sm back" (click)="back()">← All tiles</button>
+      <div>
+        <h3>{{ type.name }}</h3>
+        <p>{{ type.description }}</p>
+      </div>
+    </header>
+
+    @switch (type.mode) {
+      @case ("question") {
+        <div class="question-step">
+          <label class="field-label" for="tile-question">
+            The question this tile keeps answering
+          </label>
+          <input
+            id="tile-question"
+            class="field"
+            type="text"
+            placeholder="Are we going to make the GA date?"
+            [value]="question()"
+            (input)="onQuestion($event)"
+          />
+          <button
+            type="button"
+            class="btn btn-primary"
+            [disabled]="!question().trim()"
+            (click)="chooseQuestion()"
+          >
+            Add tile
+          </button>
+        </div>
+      }
+
+      @default {
+        <div class="search-row">
+          <input
+            class="field"
+            type="text"
+            [placeholder]="type.mode === 'entity' ? 'Filter people & projects…' : 'Search your vault…'"
+            [value]="query()"
+            (input)="onQuery($event)"
+            aria-label="Search sources"
+          />
+        </div>
+
+        @if (loading()) {
+          <div class="picker-state"><mur-spinner /> Looking…</div>
+        } @else if (type.mode === "entity") {
+          @if (filteredEntities().length === 0) {
+            <p class="picker-state">
+              No people or projects yet — they appear once meetings mention them.
+            </p>
+          } @else {
+            <ul class="picker">
+              @for (entity of filteredEntities(); track entity.id) {
+                <li>
+                  <button type="button" class="pick" (click)="chooseEntity(entity)">
+                    <span class="pick-title">{{ entity.name }}</span>
+                    <span class="pick-meta">
+                      {{ entity.mentionCount }}
+                      {{ entity.mentionCount === 1 ? "meeting" : "meetings" }}
+                    </span>
+                  </button>
+                </li>
+              }
+            </ul>
+          }
+        } @else {
+          @if (candidates().length === 0) {
+            <p class="picker-state">Nothing matches — try another word.</p>
+          } @else {
+            <ul class="picker">
+              @for (candidate of candidates(); track candidate.id) {
+                <li>
+                  <button type="button" class="pick" (click)="chooseCandidate(candidate)">
+                    <span class="pick-title">{{ candidate.title }}</span>
+                    @if (candidate.snippet) {
+                      <span class="pick-meta">{{ candidate.snippet }}</span>
+                    }
+                  </button>
+                </li>
+              }
+            </ul>
+          }
+        }
+      }
+    }
+  } @else {
+    <header class="palette-head">
+      <div>
+        <h3>Add a tile</h3>
+        <p>
+          Every tile stays live — it re-reads itself when something new is said.
+          <strong>Only-Murmur</strong> tiles are the ones no vault or cloud notetaker can build.
+        </p>
+      </div>
+    </header>
+
+    <div class="catalogue">
+      @for (type of types; track type.kind) {
+        <button type="button" class="node" (click)="pick(type)">
+          <span class="node-dot" [class]="'dot-' + type.family"></span>
+          <span class="node-text">
+            <span class="node-name">{{ type.name }}</span>
+            <span class="node-desc">{{ type.description }}</span>
+            @if (type.onlyMurmur) {
+              <span class="only-badge">only Murmur</span>
+            }
+          </span>
+        </button>
+      }
+    </div>
+  }
+</div>

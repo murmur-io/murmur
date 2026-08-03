@@ -1,0 +1,98 @@
+<div class="board-card" [class.big]="big()" [attr.data-tint]="board().tint">
+  <button
+    type="button"
+    class="board-open"
+    (click)="onOpen()"
+    [attr.aria-label]="'Open ' + board().title"
+  >
+    <!-- The miniature: the board's REAL layout (kind + span), never a payload. -->
+    <span class="mini" aria-hidden="true">
+      @for (m of miniTiles(); track $index) {
+        <span class="mt" [class]="'mt-' + m.family" [style.grid-column]="'span ' + m.span">
+          @switch (m.family) {
+            @case ("rec") {
+              <span class="mt-wave">
+                @for (h of waveBars; track $index) {
+                  <b [style.height.%]="h"></b>
+                }
+              </span>
+            }
+            @case ("person") {
+              <span class="mt-dots"><b></b><b></b><b></b></span>
+            }
+            @case ("insight") {
+              <svg viewBox="0 0 100 30" preserveAspectRatio="none">
+                <polyline
+                  points="0,24 14,20 28,22 42,12 56,16 70,7 84,11 100,4"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            }
+            @default {
+              <span class="mt-ln l"></span>
+              <span class="mt-ln m"></span>
+              <span class="mt-ln s"></span>
+            }
+          }
+        </span>
+      }
+      <span class="mini-veil"></span>
+    </span>
+
+    <span class="board-body">
+      <span class="board-title">
+        @if (board().emoji) {
+          <span class="board-emoji">{{ board().emoji }}</span>
+        }
+        <span class="board-name">{{ board().title }}</span>
+      </span>
+
+      <span class="chips">
+        @for (chip of chips(); track chip.label) {
+          <span class="chip" [class]="'chip-' + chip.family"><b></b>{{ chip.label }}</span>
+        } @empty {
+          <span class="chip chip-empty">empty board — add your first tile</span>
+        }
+      </span>
+
+      <span class="board-foot">
+        <span class="when">updated {{ updatedLabel() }}</span>
+        <span class="tile-count">
+          {{ board().tileCount }} {{ board().tileCount === 1 ? "tile" : "tiles" }}
+        </span>
+      </span>
+    </span>
+  </button>
+
+  <div class="board-actions">
+    <button
+      type="button"
+      class="icon-btn"
+      [class.on]="board().pinned"
+      (click)="onPin($event)"
+      [attr.aria-label]="board().pinned ? 'Unpin board' : 'Pin board'"
+      [attr.aria-pressed]="board().pinned"
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 4h6l-1 6 3 3v2H7v-2l3-3-1-6z" />
+        <path d="M12 15v5" />
+      </svg>
+    </button>
+    <button
+      type="button"
+      class="icon-btn danger"
+      (click)="onRemove($event)"
+      [attr.aria-label]="'Delete ' + board().title"
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12" />
+      </svg>
+    </button>
+  </div>
+</div>
