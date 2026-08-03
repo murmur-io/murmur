@@ -17,7 +17,14 @@
   border: 0;
   margin: 0;
   padding: 0;
-  background: var(--surface-hover);
+  /* `--surface-hover` is a 6% WHITE wash — a hover tint, not a scrim, so the
+     dialog barely separated from the page behind it. Every other sheet in the
+     app (organize-sheet, org-share-sheet, share-verify-sheet, lock-shares-dialog)
+     paints `--scrim`, which colors.css documents as the "dimming backdrop behind
+     a floating modal". Keep `z-index: var(--z-overlay)` on .composer-backdrop —
+     the sheets' `z-index: 100` would drop this app-wide modal below the
+     teleported source-picker overlay it hosts. */
+  background: var(--scrim);
   cursor: default;
 }
 
@@ -50,18 +57,9 @@
 }
 
 .composer-head h2,
-.composer-eyebrow,
 .composer-error,
 .field-hint {
   margin: 0;
-}
-
-.composer-eyebrow {
-  color: var(--accent-hover);
-  font-size: 0.75rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .composer-close {
@@ -111,10 +109,77 @@ textarea {
   resize: vertical;
 }
 
+.when-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
 .due-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
+}
+
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* Each chip states its RESOLVED time on a second line. "This weekend" means
+   Saturday to some people and Friday evening to others; rendering `Sat 09:00`
+   turns a guess into a visible convention, which is the cheap 90% of what a
+   settings screen would buy. */
+.preset-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.preset-chip:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.preset-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.preset-chip.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.preset-label {
+  font-size: 0.875rem;
+  font-weight: 550;
+}
+
+.preset-resolved {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.when-echo {
+  min-height: 1.2em;
+}
+
+.when-echo.is-error {
+  color: var(--danger);
 }
 
 .repeat-row {
