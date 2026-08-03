@@ -729,11 +729,34 @@ scope to the GA-critical path only.
 
       // ── gateway / egress ──
       case "list_gateway_models": return [];
-      case "list_models":
-        if (args && args.connection === "ollama") return ["llama3.1:8b", "qwen2.5:7b", "mistral:7b"];
-        if (args && args.connection === "gateway") return [];
-        if (args && args.connection === "codex_cli") return ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
-        return ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
+      // `list_models` returns ModelCatalog { source, options }. Provenance is on the CATALOG so an
+      // empty live catalog — a gateway answering with zero models — still says it was fetched, and
+      // Refresh stays offered. A bundled catalog is a HINT: an id absent from it is a valid
+      // custom id.
+      case "list_models": {
+        const live = (ids) => ({
+          source: "live",
+          options: ids.map((id) => ({ id, label: id, source: "live" })),
+        });
+        const bundled = (rows) => ({
+          source: "bundled",
+          options: rows.map(([id, label]) => ({ id, label, source: "bundled" })),
+        });
+        if (args && args.connection === "ollama")
+          return live(["llama3.1:8b", "qwen2.5:7b", "mistral:7b"]);
+        if (args && args.connection === "gateway") return live([]);
+        if (args && args.connection === "codex_cli")
+          return bundled([
+            ["gpt-5.6-sol", "GPT-5.6 Sol — highest quality"],
+            ["gpt-5.6-terra", "GPT-5.6 Terra — balanced"],
+            ["gpt-5.6-luna", "GPT-5.6 Luna — fastest"],
+          ]);
+        return bundled([
+          ["claude-opus-5", "Claude Opus 5 — highest quality"],
+          ["claude-sonnet-5", "Claude Sonnet 5 — balanced"],
+          ["claude-haiku-4-5", "Claude Haiku 4.5 — fastest"],
+        ]);
+      }
       case "gateway_health": return { reachable: false, modelCount: 0 };
       case "get_egress_ledger": return EGRESS;
 

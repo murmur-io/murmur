@@ -379,6 +379,15 @@ struct TagEntry {
     name: String,
 }
 
+/// Test-only view of [`generate_body`] for the cross-module A6 body assertion.
+///
+/// `generate_body` is private to this module and stays that way; the ledger-versus-body test lives
+/// in `commands/tests` because that is where the persistence boundary it starts from is.
+#[cfg(test)]
+pub(crate) fn generate_body_for_test(model: &str, prompt: &str) -> serde_json::Value {
+    generate_body(model, prompt, None)
+}
+
 fn generate_body(model: &str, prompt: &str, system: Option<&str>) -> serde_json::Value {
     match system {
         Some(system) => json!({
@@ -565,6 +574,78 @@ impl SummarizerProvider for OllamaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE OTHER HALF of the justification for dropping the character allowlist on the JSON arms.
+    ///
+    /// `gateway.rs::a_gateway_model_id_can_never_reach_the_request_url` proves it for the gateway by
+    /// comparing constructed endpoints. Ollama builds its URLs inline from `self.base_url`, so there
+    /// is no endpoint accessor to compare — and "the model is not in the URL" was therefore left as
+    /// a claim in a doc comment, which is where the reviewers kept, correctly, refusing to accept it.
+    ///
+    /// So assert it against the SOURCE: every URL this module builds must interpolate `base_url` and
+    /// nothing else. A future edit that reached for `self.model` while composing a path — the only
+    /// way a `%`, `?`, `#` or `..` in an id could ever matter here — fails this test instead of
+    /// shipping.
+    #[test]
+    fn no_json_arm_url_is_built_from_the_model_id() {
+        let mut sites = 0;
+        for source in [
+            include_str!("ollama.rs"),
+            include_str!("gateway.rs"),
+            include_str!("anthropic.rs"),
+        ] {
+            sites += assert_no_model_id_in_urls(source);
+        }
+        // VACUITY FLOOR across the three files together, not per file: `anthropic.rs` composes no
+        // URL at all (its endpoint is the `API_URL` const), so demanding sites there would force a
+        // fake one. A matcher that stopped matching still cannot pass silently.
+        assert!(
+            sites >= 3,
+            "expected several JSON-arm URL composition sites; found {sites}, so this guard is no \
+             longer looking at what it thinks it is"
+        );
+    }
+
+    /// Shared by the three JSON-body arms. `anthropic.rs` composes no URL at all — its endpoint is
+    /// the `API_URL` const — so it contributes zero sites and is checked for the absence rather than
+    /// the shape; `gateway.rs` builds from `self.base`; `ollama.rs` from `self.base_url`.
+    fn assert_no_model_id_in_urls(source: &str) -> usize {
+        // A URL COMPOSITION is a format string whose first thing is an interpolation immediately
+        // followed by the path — `{}/api/tags`, `{base_url}/api/generate`. Matching merely
+        // "`format!` and `/api/` on one line" also caught an error MESSAGE that names the endpoint
+        // (`"failed to read Ollama /api/tags body: {e}"`), which composes no URL at all. The marker
+        // is assembled at runtime so this very line does not match itself — `include_str!` reads
+        // this file, self-reference included.
+        let marker = ["}", "/api/"].concat();
+        let mut url_lines = 0;
+        for (n, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || !line.contains("format!") || !line.contains(&marker) {
+                continue;
+            }
+            url_lines += 1;
+            assert!(
+                line.contains("base_url") || line.contains("self.base"),
+                "line {}: a JSON-arm URL must be composed from its BASE, nothing else: {line}",
+                n + 1
+            );
+            assert!(
+                !line.contains("model"),
+                "line {}: the model id must never be part of a URL — it is a JSON body value, \
+                 which is the entire basis for allowing arbitrary characters in it: {line}",
+                n + 1
+            );
+        }
+        // A FLOOR, not an exact count. The value of this test is in the per-line assertions above;
+        // the floor exists only so a matcher that stopped matching cannot pass silently — which is
+        // how a source-scanning guard usually dies. Pinning the exact number instead would break on
+        // any honest refactor that adds or removes an endpoint, teaching the next person to relax
+        // the guard rather than to read it.
+        // A FLOOR PER FILE would be wrong — `anthropic.rs` legitimately composes no URL (its
+        // endpoint is a const), so requiring sites there would force a fake one. The vacuity guard
+        // lives in the caller instead: across the three files together there must be several.
+        url_lines
+    }
 
     #[test]
     fn generate_http_error_keeps_status_but_omits_untrusted_body() {

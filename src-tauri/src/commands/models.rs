@@ -88,26 +88,167 @@ pub async fn list_gateway_models(
 ///   - `"local"` → the on-device `reason::BRAIN_MODELS` registry ids,
 ///   - `"off"` → empty (a valid connection that runs no models),
 ///   - anything else → `AppError::InvalidArg`.
-pub(crate) fn static_connection_models(connection: &str) -> Result<Vec<String>, AppError> {
+pub(crate) fn static_connection_models(connection: &str) -> Result<ModelCatalogDto, AppError> {
+    let bundled = |m: &crate::summarize::provider::CloudModel| ModelOptionDto {
+        id: m.id.to_string(),
+        label: format!("{} — {}", m.label, m.note),
+        source: SOURCE_BUNDLED.to_string(),
+    };
     match connection {
-        "claude_code" | "anthropic" => Ok(crate::summarize::provider::CLAUDE_MODELS
-            .iter()
-            .map(|id| id.to_string())
-            .collect()),
-        "codex_cli" => Ok(crate::summarize::provider::CODEX_MODELS
-            .iter()
-            .map(|id| id.to_string())
-            .collect()),
-        "local" => Ok(crate::reason::BRAIN_MODELS
-            .iter()
-            .map(|m| m.id.to_string())
-            .collect()),
-        "off" => Ok(vec![]),
+        "claude_code" | "anthropic" => Ok(ModelCatalogDto::bundled(
+            crate::summarize::provider::CLAUDE_MODELS
+                .iter()
+                .map(bundled)
+                .collect(),
+        )),
+        "codex_cli" => Ok(ModelCatalogDto::bundled(
+            crate::summarize::provider::CODEX_MODELS
+                .iter()
+                .map(bundled)
+                .collect(),
+        )),
+        // The on-device registry is authoritative for what is installable, so it is not a "hint"
+        // in the same sense — but it is still compile-time data, so it reports `bundled` and the
+        // picker keeps offering a free-text id for anything the user side-loads.
+        "local" => Ok(ModelCatalogDto::bundled(
+            crate::reason::BRAIN_MODELS
+                .iter()
+                .map(|m| ModelOptionDto {
+                    id: m.id.to_string(),
+                    label: m.name.to_string(),
+                    source: SOURCE_BUNDLED.to_string(),
+                })
+                .collect(),
+        )),
+        "off" => Ok(ModelCatalogDto::bundled(vec![])),
         other => Err(AppError::InvalidArg(format!(
             "unknown connection '{other}' — expected claude_code, codex_cli, anthropic, ollama, gateway, local, or off"
         ))),
     }
 }
+
+/// Catalog fetched from a real endpoint during THIS call — Refresh is meaningful.
+pub(crate) const SOURCE_LIVE: &str = "live";
+/// Catalog baked into the binary — Refresh would be a lie, and the list may be out of date.
+pub(crate) const SOURCE_BUNDLED: &str = "bundled";
+
+/// A connection's catalog plus WHERE IT CAME FROM.
+///
+/// Provenance lives on the catalog rather than on each option because the case that matters most is
+/// the EMPTY one: a gateway or Ollama daemon that answers successfully with zero models is exactly
+/// when the user wants Refresh, and an empty option list carries no provenance to read. Deriving
+/// liveness from `options.some(source == "live")` hid the button in that case.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogDto {
+    pub source: String,
+    pub options: Vec<ModelOptionDto>,
+}
+
+impl ModelCatalogDto {
+    fn live(options: Vec<ModelOptionDto>) -> Self {
+        Self {
+            source: SOURCE_LIVE.to_string(),
+            options,
+        }
+    }
+
+    fn bundled(options: Vec<ModelOptionDto>) -> Self {
+        Self {
+            source: SOURCE_BUNDLED.to_string(),
+            options,
+        }
+    }
+}
+
+/// One selectable model, as the picker needs it.
+///
+/// `label` is what the user reads; `id` is what is passed verbatim to the CLI/API. `source` tells
+/// the FE whether the list came off the wire this call (`"live"`) or out of the binary
+/// (`"bundled"`), which is the difference between offering a Refresh button that does something
+/// and offering one that cannot.
+///
+/// **This DTO is a hint, never an allowlist.** An id the user typed that appears in no catalog is
+/// a custom id and must be preserved as-is by every consumer.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOptionDto {
+    pub id: String,
+    pub label: String,
+    pub source: String,
+}
+
+/// Wrap ids from a live endpoint. The id IS the label, and that is the correct answer.
+///
+/// This deliberately does NOT prettify. Three attempts at a `humanize_model_id` were made and each
+/// broke the injectivity it claimed: trimming collapsed `"model"` with `" model "`; mapping `-` and
+/// `_` to a space collapsed `plain-model` with `plain_model`; capitalising collapsed `model` with
+/// `Model`. Uppercasing is lossy on case, so "prettier AND injective" is not achievable by
+/// rewriting the id at all.
+///
+/// It is also unnecessary. The raw-id complaint was about BUNDLED catalogs, where an id like
+/// `gpt-5.6-sol` says nothing — and those get real names from the registry
+/// (`"{label} — {note}"`). A LIVE id is already the name the user knows the model by: `llama3.1:8b`
+/// is what Ollama calls it and what they typed to pull it. Inventing a prettier form adds no
+/// information and cost three rounds of collisions.
+fn live_options(ids: Vec<String>) -> Vec<ModelOptionDto> {
+    ids.into_iter()
+        .map(|id| ModelOptionDto {
+            label: live_label(&id),
+            id,
+            source: SOURCE_LIVE.to_string(),
+        })
+        .collect()
+}
+
+/// A readable label for a live id that CANNOT collide with another id's label.
+///
+/// `llama3.1:8b` → `Llama3.1 8b — llama3.1:8b`; `hf.co/TheBloke/x:Q4` → `X Q4 — hf.co/TheBloke/x:Q4`.
+///
+/// The prettified part is lossy — three earlier attempts proved it. Trimming collapsed `"model"`
+/// with `" model "`; mapping `-`/`_` to a space collapsed `plain-model` with `plain_model`;
+/// capitalising collapsed `model` with `Model`. Any transform that normalises must, by definition,
+/// map two distinct ids together somewhere.
+///
+/// So the exact id is APPENDED rather than replaced. The label is then injective by construction —
+/// it contains the id verbatim — while still leading with something a human reads. That is the only
+/// shape that satisfies both "human label" and "distinct ids never collapse"; picking one or the
+/// other is what cost three review rounds.
+fn live_label(id: &str) -> String {
+    let tail = id.rsplit('/').next().unwrap_or(id);
+    let pretty = tail
+        .split([':', '-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // ALWAYS prefixed. Returning the bare id for an already-capitalised, separator-free slug
+    // (`Model`) made exactly those options render as raw ids — the thing the label field exists to
+    // prevent — while `model` beside it got a label. A little redundancy beats an inconsistent
+    // surface.
+    //
+    // A punctuation-only id (`_`, `:`) prettifies to nothing, and a live endpoint is free to return
+    // one — `valid_catalog_model_id` accepts it. It gets a name rather than falling through to the
+    // raw id, so no option anywhere renders unlabelled.
+    if pretty.is_empty() {
+        return format!("Unnamed model — {id}");
+    }
+    format!("{pretty} — {id}")
+}
+
+/// Test-only door onto [`live_options`], which is private because nothing outside this module has
+/// any business building a live catalog.
+#[cfg(test)]
+pub(crate) fn live_options_for_test(ids: Vec<String>) -> Vec<ModelOptionDto> {
+    live_options(ids)
+}
+
 
 /// Unified model catalog for a connection — the ONE source of truth behind the FE per-role
 /// model dropdowns. Dispatch by `connection`:
@@ -125,9 +266,9 @@ pub(crate) fn static_connection_models(connection: &str) -> Result<Vec<String>, 
 pub async fn list_models(
     state: State<'_, AppState>,
     connection: String,
-) -> Result<Vec<String>, AppError> {
+) -> Result<ModelCatalogDto, AppError> {
     match connection.as_str() {
-        "gateway" => gateway_model_ids(&state).await,
+        "gateway" => Ok(ModelCatalogDto::live(live_options(gateway_model_ids(&state).await?))),
         "ollama" => {
             let base_url = {
                 let config = state
@@ -138,9 +279,11 @@ pub async fn list_models(
             };
             // OllamaProvider::new normalizes an empty base URL to the localhost default and
             // trims trailing slashes; the model arg is unused for a catalog fetch.
-            crate::summarize::ollama::OllamaProvider::new(base_url, String::new())
-                .list_models()
-                .await
+            Ok(ModelCatalogDto::live(live_options(
+                crate::summarize::ollama::OllamaProvider::new(base_url, String::new())
+                    .list_models()
+                    .await?,
+            )))
         }
         other => static_connection_models(other),
     }

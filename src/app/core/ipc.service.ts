@@ -59,6 +59,7 @@ import type {
   GraphPayload,
   Meeting,
   MeetingDetail,
+  ModelCatalog,
   MeetingTimeline,
   Segment,
   SpeakerSuggestion,
@@ -906,8 +907,8 @@ export class IpcService {
    * the connection's endpoint is unreachable — the FE falls back to a free-text
    * model input (the {@link listGatewayModels} pattern).
    */
-  listModels(connection: string): Promise<string[]> {
-    return invoke<string[]>("list_models", { connection });
+  listModels(connection: string): Promise<ModelCatalog> {
+    return invoke<ModelCatalog>("list_models", { connection });
   }
 
   /**

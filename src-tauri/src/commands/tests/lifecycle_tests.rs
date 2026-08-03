@@ -12543,47 +12543,1131 @@
 
     // ─── list_models — static connection catalogs (pure, no network) ─────────────────────────
 
-    /// `claude_code` and `anthropic` both serve the curated CLAUDE_MODELS constant — the single
-    /// source of truth that replaced the FE-hardcoded dropdown list.
+    /// STRUCTURAL, not literal. The previous pair of tests asserted the returned ids equalled the
+    /// constants *verbatim*, which meant shipping a newly released model required editing a test
+    /// as well as the list — exactly the per-model cost this change exists to remove. What must
+    /// hold is the SHAPE: every option is usable and labelled, and a compile-time list is honestly
+    /// declared as such so the FE can offer a free-text id instead of trusting it.
     #[test]
-    fn list_models_claude_connections_return_curated_constant() {
-        for conn in ["claude_code", "anthropic"] {
-            let ids = static_connection_models(conn)
+    fn bundled_catalogs_are_labelled_and_declare_themselves_bundled() {
+        for conn in ["claude_code", "anthropic", "codex_cli", "local"] {
+            let catalog = static_connection_models(conn)
                 .unwrap_or_else(|e| panic!("{conn} must resolve statically: {e:?}"));
-            let want: Vec<String> = crate::summarize::provider::CLAUDE_MODELS
-                .iter()
-                .map(|id| id.to_string())
-                .collect();
-            assert_eq!(ids, want, "{conn} must serve CLAUDE_MODELS verbatim");
-            assert!(
-                ids.contains(&"claude-opus-4-8".to_string()),
-                "curated list must include the default Opus id"
+            assert_eq!(
+                catalog.source,
+                crate::commands::SOURCE_BUNDLED,
+                "{conn}: a compile-time catalog must declare itself bundled AT THE CATALOG level, \
+                 so an EMPTY one still carries provenance"
             );
-            assert!(
-                ids.contains(&"claude-sonnet-5".to_string()),
-                "curated list must include the current Sonnet id"
+            let options = catalog.options;
+            assert!(!options.is_empty(), "{conn} must offer at least one model");
+            for option in &options {
+                assert!(!option.id.trim().is_empty(), "{conn}: empty model id");
+                assert!(
+                    !option.label.trim().is_empty(),
+                    "{conn}: option {} has no label — the picker would render a raw id",
+                    option.id
+                );
+                assert_eq!(
+                    option.source,
+                    crate::commands::SOURCE_BUNDLED,
+                    "{conn}: a compile-time list must not claim to be live, or the FE offers a \
+                     Refresh button that cannot do anything"
+                );
+            }
+            let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), ids.len(), "{conn}: duplicate model id");
+        }
+    }
+
+    /// The ledger and the wire must never disagree about which model was requested.
+    ///
+    /// `summarize::effective_model_requested` reads the STORED value, while
+    /// `claude_code::model_args` decides what actually goes on the wire. An earlier attempt at
+    /// this fix rejected hostile ids only at the CLI, which meant a rejected id was still
+    /// RECORDED in the egress ledger as requested while the provider silently ran its own
+    /// default — a lying audit trail. Refusing to persist it is what keeps the two in sync.
+    #[test]
+    fn a_hostile_model_id_is_refused_at_the_persistence_boundary() {
+        let current = crate::settings::config::AppConfig {
+            provider_model: "claude-sonnet-5".into(),
+            role_notes_model: "claude-sonnet-5".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.provider_model = "--sandbox danger-full-access".into();
+        dto.role_notes_model = "claude opus 5".into();
+
+        let saved = dto_to_config(dto, &current);
+        assert_eq!(
+            saved.provider_model, "claude-sonnet-5",
+            "a hostile id must not be persisted — the ledger reads exactly this field"
+        );
+        assert_eq!(
+            saved.role_notes_model, "claude-sonnet-5",
+            "same for every per-role model"
+        );
+
+        // A legitimate unlisted id — the whole point of the hint catalog — still goes through.
+        let mut dto = config_to_dto(&current);
+        dto.provider_model = "claude-opus-6".into();
+        assert_eq!(dto_to_config(dto, &current).provider_model, "claude-opus-6");
+
+        // Blank stays blank: "let the provider pick" is a supported, explicit choice.
+        let mut dto = config_to_dto(&current);
+        dto.provider_model = "  ".into();
+        assert_eq!(dto_to_config(dto, &current).provider_model, "");
+    }
+
+    /// The save boundary is not enough on its own: a hostile id written BEFORE that boundary
+    /// existed, or by hand, survives until the next save — and until then the egress ledger reads
+    /// it (`effective_model_requested`) while the CLI silently omits `--model`, so the ledger
+    /// records a request that never went out. `AppConfig::load` therefore clears it too, which is
+    /// what makes "ledger and wire agree by construction" true for every LOADABLE configuration.
+    #[test]
+    fn a_hostile_model_id_already_on_disk_is_cleared_on_load() {
+        let db = Db::open_with_key(&tmp_db_path("hostile-model-load"), DB_KEY).expect("open");
+        db.migrate().expect("migrate");
+        // Write past the config API, exactly as an older build or a hand edit would have.
+        db.set_setting("provider_model", "--sandbox danger-full-access")
+            .expect("seed provider_model");
+        db.set_setting("role_notes_model", "claude opus 5")
+            .expect("seed role_notes_model");
+        db.set_setting("role_ask_model", "claude-opus-5")
+            .expect("seed a LEGITIMATE unlisted id");
+
+        let cfg = crate::settings::config::AppConfig::load(&db).expect("load");
+        assert_eq!(
+            cfg.provider_model, "",
+            "a hostile stored id must not survive a load — the ledger reads this field"
+        );
+        assert_eq!(cfg.role_notes_model, "", "same for every per-role model");
+        assert_eq!(
+            cfg.role_ask_model, "claude-opus-5",
+            "a legitimate unlisted id must survive; that is the whole point of a hint catalog"
+        );
+
+        // The load sweep judges `provider_model` by `provider_id`, like the save boundary. It was
+        // briefly pinned to `"claude_code"` here, which meant a legitimate long Anthropic id was
+        // cleared on EVERY LAUNCH — silently, since load performs no user-visible edit.
+        let db = Db::open_with_key(&tmp_db_path("long-anthropic-model-load"), DB_KEY).expect("open");
+        db.migrate().expect("migrate");
+        let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+        db.set_setting("provider_id", "anthropic").expect("seed provider_id");
+        db.set_setting("provider_model", &long).expect("seed provider_model");
+        assert_eq!(
+            crate::settings::config::AppConfig::load(&db)
+                .expect("load")
+                .provider_model,
+            long,
+            "a JSON-body arm's long vendor id must survive a load"
+        );
+
+        // ...and the same id under an ARGV engine is still cleared, so the rule stayed a rule.
+        let db = Db::open_with_key(&tmp_db_path("long-argv-model-load"), DB_KEY).expect("open");
+        db.migrate().expect("migrate");
+        db.set_setting("provider_id", "claude_code").expect("seed provider_id");
+        db.set_setting("provider_model", &long).expect("seed provider_model");
+        assert_eq!(
+            crate::settings::config::AppConfig::load(&db)
+                .expect("load")
+                .provider_model,
+            "",
+            "an id `--model` cannot carry must not survive a load on an argv engine"
+        );
+    }
+
+    /// THE A6 INVARIANT, stated once: what is STORED is exactly what the wire will accept.
+    ///
+    /// The predicate must follow the CONNECTION, not the field. A role pointing at `claude_code`
+    /// stores an id that becomes `--model <id>` argv, so it takes the strict short-slug ceiling; a
+    /// role pointing at `ollama` sends the id in a JSON body, where a long Hugging Face path is
+    /// legitimate. Applying one rule to both broke it in both directions across three review
+    /// rounds: the strict one rejected real Ollama ids, and the loose one let a 65-200 character id
+    /// sit in config for a CLI role — reported to the egress ledger by
+    /// `effective_model_requested` while `model_args` silently dropped `--model`. A stored value
+    /// the wire will not send is the ledger lying, which is the whole reason A6 exists.
+    #[test]
+    fn a_role_model_is_validated_against_its_own_connection() {
+        let long_but_valid = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+        assert!(long_but_valid.len() > 64, "fixture must exceed the argv ceiling");
+
+        // ARGV arm: too long for `--model`, so it must not be stored.
+        let current = crate::settings::config::AppConfig {
+            role_notes_connection: "claude_code".into(),
+            role_notes_model: "claude-sonnet-5".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.role_notes_model = long_but_valid.clone();
+        assert_eq!(
+            dto_to_config(dto, &current).role_notes_model,
+            "claude-sonnet-5",
+            "a CLI role must not store an id `model_args` would refuse — the ledger reads this"
+        );
+
+        // JSON-BODY arm: the same id is a real catalog entry and must round-trip untouched.
+        let current = crate::settings::config::AppConfig {
+            role_notes_connection: "ollama".into(),
+            role_notes_model: "llama3.1:8b".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.role_notes_model = long_but_valid.clone();
+        assert_eq!(
+            dto_to_config(dto, &current).role_notes_model,
+            long_but_valid,
+            "an Ollama role must keep a long Hugging Face id — refusing it protects nothing"
+        );
+
+        // AN EMPTY ROLE CONNECTION MEANS "INHERIT", and an inheriting role's model is INERT.
+        //
+        // This block used to resolve `""` to `provider_id` and apply that arm's rule, on the
+        // premise that `roles::resolve` follows the inheritance for the MODEL too. It does not —
+        // `is_explicit` keys on the connection key alone, so an inheriting role goes through
+        // `legacy_default_target`, which reads `provider_model` and never `role_*_model`. Judging
+        // the inert value by the default engine's CLI rule DESTROYED it: the UI deliberately keeps
+        // a role's model on the way to Inherit (nothing there can use it, so clearing would be
+        // silent loss on a row with no model control), and the very next autosave blanked it
+        // whenever the default engine happened to be `claude_code`.
+        for default_engine in ["ollama", "claude_code", "anthropic"] {
+            let current = crate::settings::config::AppConfig {
+                provider_id: default_engine.into(),
+                role_notes_connection: String::new(),
+                role_notes_model: "llama3.1:8b".into(),
+                ..Default::default()
+            };
+            let mut dto = config_to_dto(&current);
+            dto.role_notes_model = long_but_valid.clone();
+            assert_eq!(
+                dto_to_config(dto, &current).role_notes_model,
+                long_but_valid,
+                "an INHERITING role's model is never sent, so {default_engine:?} being the default \
+                 must not destroy it"
+            );
+        }
+        // Transport safety still applies to an inherited role — it is inert, not unchecked.
+        let current = crate::settings::config::AppConfig {
+            provider_id: "claude_code".into(),
+            role_notes_connection: String::new(),
+            role_notes_model: "llama3.1:8b".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.role_notes_model = "--sandbox danger-full-access".into();
+        assert_eq!(
+            dto_to_config(dto, &current).role_notes_model,
+            "llama3.1:8b",
+            "an argv shape is refused even where the value is inert"
+        );
+        // And the moment the role points at a CLI arm, that arm's rule applies and clears it.
+        let current = crate::settings::config::AppConfig {
+            provider_id: "ollama".into(),
+            role_notes_connection: "claude_code".into(),
+            role_notes_model: "claude-sonnet-5".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.role_notes_model = long_but_valid.clone();
+        assert_eq!(
+            dto_to_config(dto, &current).role_notes_model,
+            "claude-sonnet-5",
+            "an EXPLICIT CLI role must not store an id argv cannot carry"
+        );
+
+        // FAIL CLOSED for a connection nobody recognises — a future CLI provider, a typo. That is
+        // different from `""`, whose meaning IS defined (above).
+        for unknown in ["some_future_cli", "claude_code"] {
+            let current = crate::settings::config::AppConfig {
+                role_notes_connection: unknown.into(),
+                role_notes_model: "claude-sonnet-5".into(),
+                ..Default::default()
+            };
+            let mut dto = config_to_dto(&current);
+            dto.role_notes_model = long_but_valid.clone();
+            assert_eq!(
+                dto_to_config(dto, &current).role_notes_model,
+                "claude-sonnet-5",
+                "connection {unknown:?} must default to the STRICT predicate, not the loose one"
+            );
+        }
+
+        // SWITCHING ARMS. A long id stored while the role pointed at Ollama must not survive a move
+        // to a CLI connection — the fallback is re-validated under the NEW arm, so it clears rather
+        // than lingering as a value the wire will silently drop.
+        let current = crate::settings::config::AppConfig {
+            role_notes_connection: "ollama".into(),
+            role_notes_model: long_but_valid.clone(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.role_notes_connection = "claude_code".into();
+        assert_eq!(
+            dto_to_config(dto, &current).role_notes_model,
+            "",
+            "switching to a CLI arm must drop an id that arm cannot send"
+        );
+
+        // And the shape refusals hold on BOTH arms, whatever the connection.
+        for connection in ["claude_code", "ollama"] {
+            let current = crate::settings::config::AppConfig {
+                role_notes_connection: connection.into(),
+                role_notes_model: "llama3.1:8b".into(),
+                ..Default::default()
+            };
+            let mut dto = config_to_dto(&current);
+            dto.role_notes_model = "--sandbox danger-full-access".into();
+            assert_eq!(
+                dto_to_config(dto, &current).role_notes_model,
+                "llama3.1:8b",
+                "{connection}: an argv-injection shape is refused regardless of arm"
             );
         }
     }
 
-    /// Codex exposes its own curated current catalog, in the UI's intended display order.
+    /// THE RULE HAS NO EXCEPTIONS: every model field follows the connection that will send it.
+    ///
+    /// Two review rounds were spent on fields that stated this rule and then bypassed it —
+    /// `provider_model` pinned to the strict predicate regardless of `provider_id`, and the
+    /// per-connection fields left unguarded entirely. This pins the rule itself rather than any one
+    /// field, so the next field added cannot quietly become an exception.
     #[test]
-    fn list_models_codex_returns_curated_constant() {
-        let ids =
-            static_connection_models("codex_cli").expect("codex_cli must resolve statically");
-        let want: Vec<String> = crate::summarize::provider::CODEX_MODELS
-            .iter()
-            .map(|id| id.to_string())
-            .collect();
-        assert_eq!(ids, want, "codex_cli must serve CODEX_MODELS verbatim");
+    fn every_model_field_follows_its_own_connection() {
+        use crate::commands::{connection_builds_argv, model_predicate_for};
+        let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+        assert!(long.len() > 64);
+
+        // The JSON-body arms accept it; the argv arms do not. Same id, opposite answers, and the
+        // ONLY input is the connection.
+        for body_arm in ["anthropic", "ollama", "gateway"] {
+            assert!(!connection_builds_argv(body_arm));
+            assert!(model_predicate_for(body_arm)(&long), "{body_arm} sends JSON");
+        }
+        for argv_arm in ["claude_code", "codex_cli", "", "some_future_cli"] {
+            assert!(connection_builds_argv(argv_arm), "{argv_arm} must fail closed to argv");
+            assert!(!model_predicate_for(argv_arm)(&long), "{argv_arm} builds argv");
+        }
+
+        // `provider_model` is the ONE exception, and deliberately so: it is ALWAYS strict, whatever
+        // `provider_id` says. `roles::legacy_default_target` hands it to `claude_code`, `codex_cli`
+        // and `anthropic`, and a role with an explicit CLI connection but a blank model inherits
+        // it — so this single value can reach an argv arm regardless of the provider selected
+        // today. Keying it to the current `provider_id` let a long id stored under Ollama become a
+        // `claude_code` role's model, which `model_args` drops while the ledger still reports it.
+        // See `the_resolved_target_model_is_always_one_the_wire_will_send`.
+        // `provider_model` follows `provider_id`, because that is its only reader
+        // (`roles::legacy_default_target`). An explicit role does NOT inherit it — see
+        // `the_resolved_target_model_is_always_one_the_wire_will_send` — and the unconditional
+        // strict rule this replaced destroyed legitimate long vendor ids on the Anthropic arm.
+        let current = crate::settings::config::AppConfig {
+            provider_id: "anthropic".into(),
+            provider_model: "claude-sonnet-5".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.provider_model = long.clone();
         assert_eq!(
-            ids,
-            vec![
-                "gpt-5.6-sol".to_string(),
-                "gpt-5.6-terra".to_string(),
-                "gpt-5.6-luna".to_string(),
-            ]
+            dto_to_config(dto, &current).provider_model,
+            long,
+            "anthropic sends the model in a JSON body, so a long vendor id is legitimate there"
         );
+
+        // ...but the SAME id is refused the moment the engine becomes an argv arm. This is the
+        // safety property that made the over-broad rule look necessary: `dto_to_config` runs on
+        // every save with the DTO's NEW `provider_id`, so switching engines re-judges the stored id
+        // rather than carrying it onto a command line where `model_args` would drop it while
+        // `effective_model_requested` still reported it to the ledger.
+        let stored_long = crate::settings::config::AppConfig {
+            provider_id: "anthropic".into(),
+            provider_model: long.clone(),
+            ..Default::default()
+        };
+        let mut switching = config_to_dto(&stored_long);
+        switching.provider_id = "claude_code".into();
+        let after = dto_to_config(switching, &stored_long);
+        assert_eq!(
+            after.provider_model, "",
+            "switching to an argv engine must not carry a JSON-body-length id onto the command line"
+        );
+
+        // And a short id survives that same switch — otherwise the assertion above would be
+        // satisfied by a rule that simply wipes the field on every engine change.
+        let stored_short = crate::settings::config::AppConfig {
+            provider_id: "anthropic".into(),
+            provider_model: "claude-sonnet-5".into(),
+            ..Default::default()
+        };
+        let mut switching = config_to_dto(&stored_short);
+        switching.provider_id = "claude_code".into();
+        assert_eq!(
+            dto_to_config(switching, &stored_short).provider_model,
+            "claude-sonnet-5",
+            "a valid short id must survive an engine switch"
+        );
+
+        // The per-connection fields are guarded too — they were unguarded for two rounds. A refused
+        // proposal falls back to the STORED value (never to whatever was proposed), so the
+        // assertion is that the hostile string does not land, not that the field empties.
+        let current = crate::settings::config::AppConfig {
+            anthropic_model: "claude-sonnet-5".into(),
+            ollama_model: "llama3.1:8b".into(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.anthropic_model = "--sandbox danger-full-access".into();
+        dto.ollama_model = "../../etc/passwd".into();
+        dto.gateway_model = long.clone();
+        let saved = dto_to_config(dto, &current);
+        assert_eq!(
+            saved.anthropic_model, "claude-sonnet-5",
+            "an argv shape is refused on every arm, keeping the stored value"
+        );
+        assert_eq!(
+            saved.ollama_model, "llama3.1:8b",
+            "a path segment is refused on every arm, keeping the stored value"
+        );
+        assert_eq!(saved.gateway_model, long, "but a long JSON-body id is fine");
+
+        // A punctuation-only id prettifies to nothing. A live endpoint may return one — the
+        // predicate accepts it — and it must still get a name rather than rendering as a raw id.
+        for odd in ["_", ":", "-x"] {
+            let options = crate::commands::live_options_for_test(vec![odd.to_string()]);
+            assert!(
+                options[0].label.contains(odd) && options[0].label != odd,
+                "{odd:?} must be labelled AND still embed its id; got {:?}",
+                options[0].label
+            );
+        }
+    }
+
+    /// A6 PROVED ON THE RESOLVED TARGET, which is the only place it is actually true.
+    ///
+    /// Every earlier version proved it FIELD BY FIELD, and that kept missing cases because the
+    /// ledger does not read a field — it reads `effective_model_requested(target, config)`, where
+    /// `target` came out of `roles::resolve`. The gap that survived four rounds: a role with an
+    /// EXPLICIT `claude_code` connection and a BLANK model inherits `provider_model`, so a
+    /// 200-character id stored while `provider_id` was Ollama became that role's model on an argv
+    /// arm — dropped by `model_args`, still reported to the ledger.
+    ///
+    /// So this walks the resolution the runtime walks, over the combinations that produced every
+    /// past defect, and asserts the one property that matters: what the ledger would report is
+    /// exactly what the wire would carry.
+    #[test]
+    fn the_resolved_target_model_is_always_one_the_wire_will_send() {
+        use crate::summarize::roles::{resolve, Role};
+        let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+
+        for (provider_id, role_connection) in [
+            ("ollama", "claude_code"),  // the gap: explicit CLI role inheriting an Ollama default
+            ("ollama", ""),             // inherited role under a JSON default
+            ("claude_code", ""),        // inherited role under a CLI default
+            ("anthropic", "codex_cli"), // explicit CLI role under a direct-API default
+            ("gateway", "ollama"),      // JSON everywhere
+        ] {
+            let stored = crate::settings::config::AppConfig {
+                provider_id: provider_id.into(),
+                role_notes_connection: role_connection.into(),
+                ..Default::default()
+            };
+            // Try to store the long id in EVERY field a resolved target could draw from — not
+            // just the two a role reads directly. Leaving `anthropic_model` / `ollama_model` /
+            // `gateway_model` out of this sweep is what let the previous version of this test pass
+            // while a path through them was still open.
+            let mut dto = config_to_dto(&stored);
+            dto.provider_model = long.clone();
+            dto.role_notes_model = long.clone();
+            dto.anthropic_model = long.clone();
+            dto.ollama_model = long.clone();
+            dto.gateway_model = long.clone();
+            let saved = dto_to_config(dto, &stored);
+
+            let target = resolve(Role::Notes, &saved);
+            if target.model.is_empty() {
+                continue; // "let the connection pick" is always safe
+            }
+            let usable = crate::commands::model_predicate_for(&target.connection)(&target.model);
+            assert!(
+                usable,
+                "provider_id={provider_id:?} role={role_connection:?} resolved to \
+                 connection {:?} with model {:?}, which that arm cannot send — the ledger would \
+                 report a model the wire drops",
+                target.connection, target.model
+            );
+        }
+
+        // SECOND PASS, and the reason this test is worth anything on the argv legs.
+        //
+        // Above, the long fixture goes into every field and `dto_to_config` clears it from
+        // `provider_model` and `role_notes_model` before resolution — so on EVERY argv leg
+        // `target.model` came back empty, the `continue` fired, and the assertion never executed.
+        // The pass was real but vacuous at exactly the place the A6 ledger-lie would live.
+        //
+        // So seed a legitimate short id in the field each leg actually reads, and leave the long one
+        // in `anthropic_model` / `ollama_model` / `gateway_model`. Every leg then resolves NON-EMPTY
+        // and the assertions run — including the one that answers the open question directly: the
+        // resolved model is never drawn from a loosely-validated field.
+        //
+        // Which field a leg reads is not a guess; it is what `roles.rs` does. `explicit_target`
+        // reads ONLY that role's own `role_*_model` — an explicit role connection does NOT inherit
+        // `provider_model` — and `legacy_default_target` carries `provider_model` only for
+        // `claude_code`/`codex_cli`/`anthropic`, returning "" for `ollama`/`gateway`. That is why
+        // seeding `provider_model` on the `("ollama", "claude_code")` leg leaves it empty, and the
+        // first version of this pass failed on precisely that: the inheritance the A6 note feared
+        // does not exist for explicit role keys.
+        let mut argv_legs_asserted = 0;
+        for (provider_id, role_connection, seed_role_model) in [
+            ("ollama", "claude_code", true),   // explicit role → reads role_notes_model
+            ("anthropic", "codex_cli", true),  // explicit role → reads role_notes_model
+            ("claude_code", "", false),        // inherit → legacy_default_target reads provider_model
+        ] {
+            let stored = crate::settings::config::AppConfig {
+                provider_id: provider_id.into(),
+                role_notes_connection: role_connection.into(),
+                ..Default::default()
+            };
+            let mut dto = config_to_dto(&stored);
+            dto.provider_model = "claude-opus-5".into();
+            dto.role_notes_model = if seed_role_model {
+                "claude-opus-5".into()
+            } else {
+                String::new()
+            };
+            dto.anthropic_model = long.clone();
+            dto.ollama_model = long.clone();
+            dto.gateway_model = long.clone();
+            let saved = dto_to_config(dto, &stored);
+
+            let target = resolve(Role::Notes, &saved);
+            assert!(
+                crate::commands::connection_builds_argv(&target.connection),
+                "leg provider_id={provider_id:?} role={role_connection:?} was chosen because it \
+                 resolves to an argv arm, but resolved to {:?}",
+                target.connection
+            );
+            assert!(
+                !target.model.is_empty(),
+                "provider_id={provider_id:?} role={role_connection:?} resolved to an EMPTY model, \
+                 so this leg proves nothing — the vacuity this pass exists to remove"
+            );
+            assert_ne!(
+                target.model, long,
+                "an argv arm resolved to a loosely-validated field's value; `model_args` would \
+                 drop it while `effective_model_requested` still reported it to the ledger"
+            );
+            assert!(
+                crate::commands::model_predicate_for(&target.connection)(&target.model),
+                "provider_id={provider_id:?} role={role_connection:?} resolved to connection {:?} \
+                 with model {:?}, which that arm cannot send",
+                target.connection, target.model
+            );
+            argv_legs_asserted += 1;
+        }
+        assert_eq!(
+            argv_legs_asserted, 3,
+            "every argv leg must reach a real assertion"
+        );
+
+        // The structural fact the two passes above rest on, asserted rather than assumed: an
+        // EXPLICIT role connection does not inherit `provider_model`. If a later edit made it
+        // inherit, the loose/strict split would stop being sound and both passes would quietly
+        // start testing something else.
+        let inheriting = crate::settings::config::AppConfig {
+            provider_id: "ollama".into(),
+            provider_model: "claude-opus-5".into(),
+            role_notes_connection: "claude_code".into(),
+            role_notes_model: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(Role::Notes, &inheriting).model,
+            "",
+            "an explicit role connection must read its OWN model key only; inheriting \
+             `provider_model` here is the shape that would let a JSON-arm id reach an argv arm"
+        );
+    }
+
+    /// A6 STATED DIRECTLY: the LEDGER value equals the WIRE value.
+    ///
+    /// Every earlier test asserted a proxy — that the resolved model satisfies its arm's predicate —
+    /// and none ever called `effective_model_requested`, the function the ledger actually records.
+    /// So "ledger and wire agree by construction" was argued, not executed, and the legs where the
+    /// resolved model is EMPTY were skipped outright. Those are the interesting ones: an empty
+    /// resolved model makes `effective_model_requested` fall back to the arm's own config field, and
+    /// whether the wire then carries that same value is precisely the open question.
+    ///
+    /// This asks each side what it would do and compares them:
+    ///   - argv arms — the wire is the REAL argv from `model_args`, not a re-derivation;
+    ///   - JSON arms — the wire is whatever the request body would carry, which for an empty
+    ///     resolved model is the arm's own field (mirroring `make_provider_resolved`).
+    #[test]
+    fn the_ledger_reports_exactly_what_the_wire_sends() {
+        use crate::summarize::roles::{resolve, Role};
+        let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+
+        let after_model_flag = |args: Vec<String>| -> String {
+            args.iter()
+                .position(|a| a == "--model")
+                .and_then(|i| args.get(i + 1).cloned())
+                .unwrap_or_default()
+        };
+
+        let mut checked = 0;
+        for (provider_id, role_connection, seed, long_provider_model) in [
+            ("ollama", "claude_code", "", false),
+            ("ollama", "claude_code", "claude-opus-5", false),
+            ("ollama", "", "", false),
+            ("claude_code", "", "claude-opus-5", false),
+            ("claude_code", "", "", false),
+            ("anthropic", "codex_cli", "gpt-5.6-sol", false),
+            ("gateway", "ollama", "", false),
+            ("anthropic", "", "", false),
+            // THE SYMMETRIC ARGV LEG, previously absent — and the one that would expose an A6 lie.
+            //
+            // `provider_id` is a JSON-body arm, so `provider_model` is legitimately accepted at a
+            // length and character class no CLI could carry. The role is an EXPLICIT argv arm with
+            // a BLANK model, so `target.model` is empty and `model_args` emits no `--model`. If
+            // `effective_model_requested` had a `claude_code`/`codex_cli` fallback to
+            // `config.provider_model` — mirroring the three it does have — the ledger would record
+            // a 200-character id that never left the machine. It has no such arm (`_ => ""`), and
+            // that is now asserted here rather than argued in a comment.
+            ("ollama", "claude_code", "", true),
+            ("gateway", "codex_cli", "", true),
+        ] {
+            let stored = crate::settings::config::AppConfig {
+                provider_id: provider_id.into(),
+                role_notes_connection: role_connection.into(),
+                ..Default::default()
+            };
+            let mut dto = config_to_dto(&stored);
+            dto.role_notes_model = seed.into();
+            // Every field a fallback could read holds the long fixture, so a leg that silently
+            // reached for the wrong one shows up as a mismatch rather than passing by luck.
+            dto.provider_model = if long_provider_model {
+                long.clone()
+            } else if seed.is_empty() {
+                String::new()
+            } else {
+                seed.into()
+            };
+            dto.anthropic_model = long.clone();
+            dto.ollama_model = long.clone();
+            dto.gateway_model = long.clone();
+            let saved = dto_to_config(dto, &stored);
+
+            let target = resolve(Role::Notes, &saved);
+            let ledger = crate::summarize::effective_model_requested(&target, &saved);
+            let wire = match target.connection.as_str() {
+                "claude_code" => after_model_flag(crate::summarize::claude_code::model_args(
+                    &target.model,
+                )),
+                "codex_cli" => {
+                    after_model_flag(crate::summarize::codex_cli::model_args(&target.model))
+                }
+                // The JSON arms are NOT re-implemented here. `make_provider_resolved`'s
+                // anthropic/ollama/gateway arms now call `effective_model_requested` themselves, so
+                // asking it again is asking the production expression — not a copy of it that a
+                // future edit could silently desynchronise. The argv arms above stay the real
+                // check: they are the only ones where the two sides can genuinely differ.
+                "anthropic" | "ollama" | "gateway" => {
+                    crate::summarize::effective_model_requested(&target, &saved)
+                }
+                _ => String::new(),
+            };
+            assert_eq!(
+                ledger, wire,
+                "provider_id={provider_id:?} role={role_connection:?} seed={seed:?} resolved to \
+                 {:?}: the ledger would record {ledger:?} while the wire carries {wire:?}",
+                target.connection
+            );
+            if long_provider_model {
+                // Prove the leg is not vacuous in the way that matters: the long id really IS
+                // stored (so a fallback could have reached it) and the resolved model really IS
+                // empty (so only a fallback could have produced a non-empty ledger value).
+                assert_eq!(
+                    saved.provider_model, long,
+                    "the fixture must survive on a JSON-body engine, or this leg tests nothing"
+                );
+                assert!(
+                    target.model.is_empty(),
+                    "this leg needs an EMPTY resolved model to exercise the fallback path"
+                );
+                assert_eq!(ledger, "", "an argv arm has no config fallback, and must not gain one");
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 10, "every leg must be compared");
+
+        // The failure this guards against, shown to be detectable: an id the argv arm refuses,
+        // reported by the ledger. Reaching it requires bypassing the persistence boundary — which
+        // is the point, since that boundary is what makes the property true.
+        let cfg = crate::settings::config::AppConfig::default();
+        let hostile = crate::summarize::roles::RoleTarget {
+            connection: "claude_code".into(),
+            model: "--sandbox danger-full-access".into(),
+            effort: String::new(),
+        };
+        assert_eq!(
+            crate::summarize::effective_model_requested(&hostile, &cfg),
+            "--sandbox danger-full-access",
+            "the ledger reports the stored value verbatim, so a bad stored value IS a lie"
+        );
+        assert_eq!(
+            after_model_flag(crate::summarize::claude_code::model_args(&hostile.model)),
+            "",
+            "...while the wire sends nothing — the disagreement the boundary exists to prevent"
+        );
+    }
+
+    /// The loose JSON-arm predicate is safe for `local`, because that arm is a REGISTRY LOOKUP.
+    ///
+    /// `connection_builds_argv` classifies `local` as a JSON-body arm, so a role model bound to it
+    /// takes `valid_catalog_model_id` — no character allowlist, 512 bytes. That is only defensible
+    /// if the local arm treats the id as a KEY, never as a path. `reason::resolve_brain_model`
+    /// looks the id up with `brain_model_by_id` / `retired_model_by_id` and joins `models_dir()`
+    /// with the REGISTRY's own `filename`; the user's string is never a path component. An
+    /// unrecognised id therefore resolves to `None`, which `make_provider_resolved` turns into
+    /// `AppError::Unavailable` — fail-closed, and never a silent cloud fallback.
+    #[test]
+    fn a_local_role_model_is_a_registry_key_not_a_path() {
+        use crate::reason::resolve_brain_model;
+        for hostile in [
+            "/etc/passwd",
+            "../../etc/passwd",
+            "hf.co/whatever/model:Q4_K_M",
+            "not-a-registry-id",
+        ] {
+            assert_eq!(
+                resolve_brain_model(None, Some(hostile)).expect("resolve must not error"),
+                None,
+                "{hostile:?} is not a registry id, so it must resolve to None rather than to a path"
+            );
+        }
+        // A 512-byte id — the ceiling the loose predicate now permits — behaves the same.
+        let max_len = "a".repeat(512);
+        assert_eq!(resolve_brain_model(None, Some(&max_len)).expect("resolve"), None);
+    }
+
+    /// The load sweep and the save boundary must agree for EVERY stored `provider_id`, including
+    /// the empty one an unconfigured or hand-edited row can hold.
+    #[test]
+    fn an_empty_provider_id_is_judged_the_same_on_load_and_on_save() {
+        let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+        let db = Db::open_with_key(&tmp_db_path("empty-provider-id"), DB_KEY).expect("open");
+        db.migrate().expect("migrate");
+        db.set_setting("provider_id", "").expect("seed provider_id");
+        db.set_setting("provider_model", &long).expect("seed provider_model");
+        let loaded = crate::settings::config::AppConfig::load(&db).expect("load");
+        // Whether an empty engine is even REACHABLE decides how much this leg matters. Record the
+        // answer instead of assuming it: if load normalises the blank away, the divergence this
+        // test guards is unreachable in practice and the assertion below is belt-and-braces; if it
+        // does not, the assertion is load-bearing. Either way the next reader is not left guessing.
+        let empty_engine_is_reachable = loaded.provider_id.trim().is_empty();
+
+        let current = crate::settings::config::AppConfig {
+            provider_id: String::new(),
+            provider_model: String::new(),
+            ..Default::default()
+        };
+        let mut dto = config_to_dto(&current);
+        dto.provider_id = String::new();
+        dto.provider_model = long.clone();
+        let saved = dto_to_config(dto, &current);
+
+        assert_eq!(
+            loaded.provider_model, saved.provider_model,
+            "load and save must not disagree on an empty engine; one of them would then \
+             silently undo the other on the next launch (empty engine reachable after load: \
+             {empty_engine_is_reachable})"
+        );
+    }
+
+    /// A6 ON THE SERIALIZED BODY: what the ledger records is the `model` field the request carries.
+    ///
+    /// Every previous version of this stopped at the resolved target. The argv arms were then
+    /// compared against real argv, but the JSON arms were compared against a re-derivation of the
+    /// factory's fallback — first a copy of it, then (after the factory was routed through
+    /// `effective_model_requested`) the same function called twice, which is a tautology dressed as
+    /// a test. This goes one link further out, to the bytes: the value the ledger reports is looked
+    /// up in the body each arm actually builds.
+    ///
+    /// WHAT THIS DOES NOT PROVE, stated so it is not mistaken for more than it is: the factory
+    /// hands that value to the provider (one expression — `let model =
+    /// effective_model_requested(target, config);` at each of the three arms) and the provider hands
+    /// its `model` field to the builder. Those two links are read from the source, not executed,
+    /// because constructing an `AnthropicProvider` requires a Keychain secret and the providers'
+    /// `model` fields are private to their own modules.
+    #[test]
+    fn the_ledger_value_is_the_model_field_of_the_serialized_body() {
+        use crate::summarize::roles::{resolve, Role};
+        let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
+
+        for (provider_id, field_value) in [
+            ("ollama", long.clone()),
+            ("gateway", long.clone()),
+            ("anthropic", "claude-sonnet-5".to_string()),
+        ] {
+            let stored = crate::settings::config::AppConfig {
+                provider_id: provider_id.into(),
+                ..Default::default()
+            };
+            let mut dto = config_to_dto(&stored);
+            // The arm's OWN field carries the value; `provider_model` stays empty so the resolved
+            // target's model is empty and the ledger has to use the per-connection fallback — the
+            // path that would otherwise go unexercised.
+            match provider_id {
+                "ollama" => dto.ollama_model = field_value.clone(),
+                "gateway" => dto.gateway_model = field_value.clone(),
+                _ => dto.anthropic_model = field_value.clone(),
+            }
+            let saved = dto_to_config(dto, &stored);
+
+            let target = resolve(Role::Notes, &saved);
+            assert!(
+                target.model.is_empty(),
+                "{provider_id}: this leg needs an EMPTY resolved model to exercise the fallback"
+            );
+            let ledger = crate::summarize::effective_model_requested(&target, &saved);
+            assert_eq!(
+                ledger, field_value,
+                "{provider_id}: the ledger must fall back to that arm's own configured model"
+            );
+
+            // The bytes. `anthropic` builds its body inline from `self.model` and has no extractable
+            // builder, so the two arms that do are checked here; the anthropic link is the source
+            // reading named above.
+            let body = match provider_id {
+                "ollama" => crate::summarize::ollama::generate_body_for_test(&ledger, "prompt"),
+                _ => crate::summarize::gateway::chat_body(&ledger, "system", "user"),
+            };
+            if provider_id == "anthropic" {
+                // `anthropic` builds its body inline from `self.model`, so the check runs one step
+                // earlier — on the field that body reads.
+                let provider = crate::summarize::anthropic::AnthropicProvider::with_effort(
+                    None,
+                    ledger.clone(),
+                    String::new(),
+                );
+                assert_eq!(
+                    provider.model_for_test(),
+                    ledger,
+                    "anthropic: the provider must carry exactly the model the ledger recorded"
+                );
+                continue;
+            }
+            assert_eq!(
+                body.get("model").and_then(|m| m.as_str()),
+                Some(ledger.as_str()),
+                "{provider_id}: the request body's model must be exactly what the ledger recorded"
+            );
+        }
+    }
+
+    /// THE ONE PLACE LEDGER AND WIRE GENUINELY DIFFER, pinned rather than left to be rediscovered.
+    ///
+    /// When BOTH the resolved model and the arm's own config field are empty, the ledger records
+    /// `""` while `AnthropicProvider` substitutes its compiled-in `DEFAULT_MODEL` and the request
+    /// carries that. Byte-for-byte they disagree.
+    ///
+    /// This PRE-DATES the change (`effective_model_requested` and the `DEFAULT_MODEL` substitution
+    /// are both untouched) and it moves nothing that matters for egress: the destination, the cloud
+    /// classification, the consent gate and the redaction wrapper are identical, and `""` is the
+    /// ledger's existing convention for "the provider chose". But routing the factory arm through
+    /// `effective_model_requested` puts it inside this change's blast radius, so it is recorded here
+    /// as known and asserted, instead of surfacing later as a surprise in a privacy receipt.
+    ///
+    /// Deliberately NOT "fixed" here: making the ledger report a provider's private default is a
+    /// change to what the ledger MEANS, which belongs in its own diff with its own review.
+    #[test]
+    fn an_empty_anthropic_model_is_the_known_ledger_wire_gap() {
+        let cfg = crate::settings::config::AppConfig {
+            provider_id: "anthropic".into(),
+            provider_model: String::new(),
+            anthropic_model: String::new(),
+            ..Default::default()
+        };
+        let target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Notes, &cfg);
+        let ledger = crate::summarize::effective_model_requested(&target, &cfg);
+        assert_eq!(ledger, "", "with nothing configured the ledger records 'provider chose'");
+
+        let provider =
+            crate::summarize::anthropic::AnthropicProvider::with_effort(None, ledger.clone(), String::new());
+        assert_ne!(
+            provider.model_for_test(),
+            ledger,
+            "if these ever become equal the substitution was removed — update this test's premise \
+             rather than deleting it"
+        );
+        assert!(
+            !provider.model_for_test().is_empty(),
+            "the wire always carries a concrete model; it is the LEDGER that records the blank"
+        );
+    }
+
+    /// EXHAUSTIVENESS: `AppConfig::save` is the only production writer of the model-id keys.
+    ///
+    /// Both sanitizers are proven individually, but "ledger and wire agree by construction" needs
+    /// them to be the ONLY doors. `a_hostile_model_id_already_on_disk_is_cleared_on_load` writes
+    /// past the config API with `db.set_setting`, which shows such a path exists in-process — so a
+    /// command doing the same would let an unsanitised id sit in the DB and be read by
+    /// `effective_model_requested` before any save re-judged it. This scans the source rather than
+    /// arguing from one, and fails on a new writer instead of on the incident it would cause.
+    #[test]
+    fn appconfig_save_is_the_only_writer_of_model_id_settings() {
+        const KEYS: &[&str] = &[
+            "PROVIDER_MODEL",
+            "ANTHROPIC_MODEL",
+            "OLLAMA_MODEL",
+            "GATEWAY_MODEL",
+            "ROLE_NOTES_MODEL",
+            "ROLE_ASK_MODEL",
+            "ROLE_LIVE_MODEL",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let name = path.to_string_lossy().to_string();
+                // The sanctioned writer, and the test files that deliberately seed past it.
+                if name.ends_with("settings/config.rs") || name.contains("tests") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read");
+                for (n, line) in text.lines().enumerate() {
+                    if !line.contains("set_setting") {
+                        continue;
+                    }
+                    if KEYS.iter().any(|k| line.contains(k))
+                        || ["\"provider_model\"", "\"anthropic_model\"", "\"ollama_model\"",
+                            "\"gateway_model\"", "\"role_notes_model\"", "\"role_ask_model\"",
+                            "\"role_live_model\""]
+                            .iter()
+                            .any(|k| line.contains(k))
+                    {
+                        offenders.push(format!("{name}:{}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a model-id setting is written outside AppConfig::save, bypassing both sanitizers: {offenders:?}"
+        );
+    }
+
+    /// A7 GUARD. This diff changes which model ids can be CHOSEN and how they are DISPLAYED. It
+    /// must not move a provider between the local and cloud classes, because that class is what
+    /// decides whether the consent gate, the redaction firewall and the egress ledger apply.
+    /// Pinned as a full table so a later edit to the provider list cannot silently reclassify one.
+    #[test]
+    fn provider_cloud_local_classification_is_unchanged_by_the_picker_diff() {
+        use crate::summarize::egress_is_cloud;
+        let config = crate::settings::config::AppConfig::default();
+        for (id, expected_cloud) in [
+            ("claude_code", true),
+            ("anthropic", true),
+            ("codex_cli", true),
+            ("gateway", true),
+            ("local", false),
+        ] {
+            assert_eq!(
+                egress_is_cloud(id, &config),
+                expected_cloud,
+                "{id} changed cloud/local class — consent, redaction and ledger routing hang off this"
+            );
+        }
+        // `off` is a valid connection that runs no model at all, and it is on-device by definition.
+        assert!(
+            !egress_is_cloud("off", &config),
+            "off runs nothing and must never be classified as cloud"
+        );
+        // An unknown provider must FAIL CLOSED (treated as cloud), never default to local.
+        assert!(
+            egress_is_cloud("something-new", &config),
+            "an unrecognised provider must be treated as cloud, not silently exempted"
+        );
+
+        // `ollama` is the ONE provider whose class is config-dependent: loopback is local, a remote
+        // host is cloud and therefore consent-gated, redacted and ledgered. Both legs are pinned
+        // because a picker change that shifted only the remote leg would move an egress decision
+        // while every fixed-class row above still read as unchanged.
+        for (base_url, expected_cloud) in [
+            ("http://127.0.0.1:11434", false),
+            ("http://localhost:11434", false),
+            ("http://[::1]:11434", false),
+            ("http://ollama.example.com:11434", true),
+            ("https://10.0.0.9:11434", true),
+            // FAIL-CLOSED, and this leg is the one worth pinning: an unparseable URL — including
+            // the empty default — is treated as CLOUD, so a misconfigured Ollama demands consent
+            // and gets redacted rather than quietly bypassing both. `egress_is_cloud` says so in
+            // as many words (`Err(_) => true, // unparseable → fail safe`).
+            ("", true),
+            ("not a url", true),
+        ] {
+            let config = crate::settings::config::AppConfig {
+                ollama_base_url: base_url.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                egress_is_cloud("ollama", &config),
+                expected_cloud,
+                "ollama at {base_url:?} must be classified {}",
+                if expected_cloud { "cloud" } else { "local" }
+            );
+        }
+    }
+
+    /// A LIVE id is already the name the user knows the model by, so it IS the label.
+    ///
+    /// Three attempts at a `humanize_model_id` were reverted, each having broken the injectivity it
+    /// claimed: trimming collapsed `"model"` with `" model "`; mapping `-` and `_` to a space
+    /// collapsed `plain-model` with `plain_model`; capitalising collapsed `model` with `Model`.
+    /// Uppercasing is lossy on case, so "prettier AND injective" cannot be had by rewriting the id.
+    /// It was also unnecessary: the raw-id complaint was about BUNDLED catalogs, and those carry
+    /// real names from the registry. Identity is the correct transform here, and it is trivially
+    /// injective.
+    #[test]
+    fn a_live_catalog_label_is_readable_and_still_injective() {
+        let ids = vec![
+            "llama3.1:8b".to_string(),
+            "plain-model".to_string(),
+            // The pairs every previous transform collapsed: separator-only and case-only.
+            "plain_model".to_string(),
+            "Model".to_string(),
+            "model".to_string(),
+            "hf.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF:Q4_K_M".to_string(),
+        ];
+        let options = crate::commands::live_options_for_test(ids.clone());
+        assert_eq!(options.len(), ids.len());
+        for (option, id) in options.iter().zip(&ids) {
+            assert_eq!(&option.id, id, "the id is passed through untouched");
+            assert!(
+                option.label.contains(id),
+                "the label must embed the exact id — that is what makes it injective; got {:?}",
+                option.label
+            );
+            assert_eq!(option.source, crate::commands::SOURCE_LIVE);
+        }
+        // Readable: the label leads with a prettified form, not the bare slug.
+        let first = &options[0].label;
+        assert!(
+            first.starts_with("Llama3.1 8b — "),
+            "a live label must lead with something a human reads; got {first:?}"
+        );
+        // INJECTIVE, tested as a SET. Asserting each spelling on its own line is what let
+        // `plain-model` and `plain_model` both become "Plain Model" unnoticed.
+        let labels: std::collections::HashSet<&String> =
+            options.iter().map(|o| &o.label).collect();
+        assert_eq!(labels.len(), ids.len(), "labels must stay distinguishable");
+    }
+
+    /// The predicate must accept every id the LIVE catalogs can actually return. `gateway` and
+    /// `ollama` put the id in a JSON body rather than argv, so an argv-shaped restriction there
+    /// would reject ids this change makes selectable while protecting nothing.
+    #[test]
+    fn a_live_ollama_id_survives_the_persistence_boundary() {
+        use crate::summarize::provider::{valid_catalog_model_id, valid_model_id};
+        for real in [
+            "hf.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF:Q4_K_M",
+            "user@host/model:latest",
+            "llama3.1:8b",
+            "qwen2.5-coder:32b-instruct-q8_0",
+        ] {
+            assert!(
+                valid_catalog_model_id(real),
+                "{real:?} is a real Ollama catalog id and must round-trip on a JSON-body arm"
+            );
+        }
+        // The looser predicate is looser on LENGTH ONLY. Every argv-injection shape stays refused
+        // on both, because none of them is a real model id on any arm.
+        for hostile in ["--sandbox danger-full-access", "../../etc/passwd", "a b", "./m"] {
+            assert!(!valid_model_id(hostile), "{hostile:?} must be refused (argv)");
+            assert!(
+                !valid_catalog_model_id(hostile),
+                "{hostile:?} must be refused (json body) — looser length must not mean looser shape"
+            );
+        }
+        // ...and the argv ceiling still bites where it belongs.
+        let long = "a".repeat(65);
+        assert!(!valid_model_id(&long), "an argv id stays short-slug bounded");
+        assert!(valid_catalog_model_id(&long), "a body id may be longer");
+    }
+
+    /// A hint-catalog means any string the user types reaches `--model <id>` on a real CLI. That
+    /// argument takes the NEXT argv entry, so a value beginning with `-` is read as a FLAG.
+    /// RED before `valid_model_id` existed: every one of these was forwarded verbatim.
+    #[test]
+    fn a_hostile_model_id_is_never_forwarded_to_a_cli() {
+        use crate::summarize::provider::valid_model_id;
+        for hostile in [
+            "--sandbox danger-full-access",
+            "-m",
+            "--dangerously-skip-permissions",
+            "claude-opus-5 --sandbox danger-full-access",
+            "claude\nopus",
+            "claude opus 5",
+            "claude\topus",
+            "claude\u{0}opus",
+            "$(rm -rf ~)",
+            "`id`",
+            // `/` is legal for `vendor/model`, so a relative-path segment must be refused on its
+            // own terms — every character here is otherwise allowed and it is under the cap.
+            "../../etc/passwd",
+            "vendor/../secret",
+            "./model",
+            // Over the sanity bound. The cap is 200, not 64: Ollama's live catalog returns
+            // Hugging Face paths that pass 64 comfortably, and rejecting them would have blocked
+            // ids this change makes selectable while protecting nothing — those arms send the id
+            // in a JSON body, never as argv.
+            // Over the ARGV ceiling (64). The JSON-body arms use a looser bound —
+            // see `a_live_ollama_id_survives_the_persistence_boundary`.
+            "a".repeat(65).as_str(),
+            "",
+            "   ",
+        ] {
+            assert!(
+                !valid_model_id(hostile),
+                "must reject {hostile:?} before it becomes a CLI argument"
+            );
+        }
+        // ...while every shape a real catalog actually emits still passes.
+        for good in [
+            "claude-opus-5",
+            "gpt-5.6-sol",
+            "claude-haiku-4-5-20251001",
+            "llama3.1:8b",
+            "qwen2.5:7b",
+            "vendor/model-name",
+            "  claude-sonnet-5  ",
+        ] {
+            assert!(valid_model_id(good), "must accept the real id {good:?}");
+        }
+    }
+
+    /// The catalog is a HINT, never an allowlist: nothing in the backend may reject or rewrite an
+    /// id merely because it is absent. `static_connection_models` is a lookup, not a validator —
+    /// it takes a CONNECTION, never a model id, so there is no place for it to refuse one.
+    #[test]
+    fn an_unknown_connection_errors_but_an_unknown_model_id_has_no_gate_to_fail() {
+        assert!(
+            static_connection_models("nope").is_err(),
+            "an unknown connection is a programming error and must surface"
+        );
+        // Every legal connection resolves without ever being shown a model id.
+        for conn in ["claude_code", "anthropic", "codex_cli", "local", "off"] {
+            assert!(static_connection_models(conn).is_ok(), "{conn} must resolve");
+        }
     }
 
     #[test]
@@ -12620,23 +13704,64 @@
         assert_eq!(unavailable[1].reason.as_deref(), Some(reason.as_str()));
     }
 
-    /// `local` serves exactly the BRAIN_MODELS registry ids, in registry order.
+    /// `local` serves exactly the BRAIN_MODELS registry ids, in registry order. Unlike the cloud
+    /// hint lists this one IS authoritative — it mirrors what `download_brain_model` can install —
+    /// so the id set is still pinned; only the label/source wrapper is new.
     #[test]
     fn list_models_local_matches_brain_registry_ids() {
-        let ids = static_connection_models("local").expect("local must resolve statically");
+        let options = static_connection_models("local")
+            .expect("local must resolve statically")
+            .options;
+        let ids: Vec<String> = options.iter().map(|o| o.id.clone()).collect();
         let want: Vec<String> = crate::reason::BRAIN_MODELS
             .iter()
             .map(|m| m.id.to_string())
             .collect();
         assert_eq!(ids, want, "local must mirror the BRAIN_MODELS registry ids");
         assert!(!ids.is_empty(), "the brain registry is never empty");
+        for option in &options {
+            assert_eq!(
+                option.label,
+                crate::reason::brain_model_by_id(&option.id)
+                    .expect("every local option is a registry model")
+                    .name,
+                "the local picker must show the registry's display name, not the raw id"
+            );
+        }
     }
 
     /// `off` is a valid connection with no models — empty list, not an error.
     #[test]
     fn list_models_off_returns_empty() {
-        let ids = static_connection_models("off").expect("off must resolve statically");
-        assert!(ids.is_empty(), "off runs no models");
+        let catalog = static_connection_models("off").expect("off must resolve statically");
+        assert!(catalog.options.is_empty(), "off runs no models");
+        // The empty case is precisely where provenance must survive: an empty catalog that lost its
+        // source is what hid Refresh from a live endpoint answering with zero models.
+        assert_eq!(catalog.source, crate::commands::SOURCE_BUNDLED);
+    }
+
+    /// The reason provenance sits on the CATALOG and not on each option.
+    ///
+    /// A gateway or Ollama daemon that answers successfully with zero models is exactly when the
+    /// user wants Refresh — and an empty option list has no option to read a `source` from. Deriving
+    /// liveness as `options.any(|o| o.source == "live")` reported "bundled" for that case and hid
+    /// the button. The catalog-level field cannot be emptied away.
+    #[test]
+    fn empty_live_catalog_keeps_its_provenance() {
+        let empty = crate::commands::ModelCatalogDto {
+            source: crate::commands::SOURCE_LIVE.to_string(),
+            options: vec![],
+        };
+        assert!(empty.options.is_empty());
+        assert_eq!(
+            empty.source,
+            crate::commands::SOURCE_LIVE,
+            "an empty LIVE catalog must still report that it was fetched"
+        );
+        // Serialized shape the FE reads: `source` is a sibling of `options`, never inside them.
+        let json = serde_json::to_value(&empty).expect("catalog serializes");
+        assert_eq!(json["source"], "live");
+        assert!(json["options"].as_array().expect("options array").is_empty());
     }
 
     /// An unknown connection id refuses with `InvalidArg` — never a panic, never an empty Ok.
