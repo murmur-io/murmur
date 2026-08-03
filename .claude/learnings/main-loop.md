@@ -215,3 +215,56 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
   retargeting to fire `reopened`. Merge the parent with a MERGE commit, not a squash: squashing
   creates a new commit carrying content the child already has as its own commits.
 - **Status:** journal
+
+### [2026-08-03 deps] A dependabot PR gets no Actions secrets, so a secret-dependent lane makes it unmergeable forever
+- **Pattern:** #526/#527/#528 all failed the rust lane identically while changing no Rust at all. The
+  lane clones the PRIVATE sibling `murmur-server` for the `murmur-protocol` path dependency using
+  `secrets.MURMUR_SERVER_DEPLOY_KEY`, and dependabot pull requests read a SEPARATE Dependabot secret
+  store — repository Actions secrets are withheld. The step failed before any dependency was
+  exercised, so the red said nothing about the bumps and no rerun could ever make it green.
+- **Caught by:** noticing the SAME failure on three unrelated ecosystems, then reading the failing
+  step instead of the PR titles.
+- **Lesson:** Identical CI failure across PRs that share no content is an environment fact, not N
+  defects — read the step, not the diff. Two ways out: mirror the secret into Settings -> Secrets ->
+  **Dependabot** (a different tab from Actions; values cannot be read back, so it needs a FRESH
+  read-only deploy key), or re-create the bumps on an ordinary branch, which does receive secrets,
+  and close the originals as superseded. Never merge such a PR with `--admin` to "unblock" it: the
+  bumps then land with zero verification, which is the opposite of what the red was hiding.
+- **Status:** journal — resolved here by removing `.github/dependabot.yml` at the operator's request
+  (security ALERTS are a repo setting and survive; only the weekly version-bump PRs stop).
+
+### [2026-08-03 deps] Never write an action SHA you did not copy from somewhere
+- **Pattern:** while re-creating the dependabot bumps by hand, the first attempt pinned
+  `actions/setup-node` and `taiki-e/install-action` to SHAs that were INVENTED — plausible-looking
+  40-hex strings that correspond to no commit. A pinned action resolving to nothing breaks CI for
+  everyone, and the diff looks entirely normal.
+- **Caught by:** self-review before commit; `gh pr diff <n>` then showed the real SHAs.
+- **Lesson:** A SHA, a hash, a version, a line number and a file path are all values to be COPIED,
+  never composed from memory. When re-creating someone else's change, take the literal `+` line from
+  their diff (`gh pr diff <n>`), do not retype it.
+- **Status:** journal
+
+### [2026-08-03 cleanup] `git worktree remove` on a live harness task strands the task state
+- **Pattern:** three abandoned task worktrees held 8.1 GB. Removing them with
+  `git worktree remove --force` succeeded, and `agent-harness clean --abandon` then refused every
+  one: "v2 task lost its worktree before a durable clean intent". The harness records the intent to
+  clean BEFORE the bytes disappear, so removing the worktree first leaves the task permanently
+  non-terminal, and a non-terminal task is what blocks primary-checkout branch surgery.
+- **Caught by:** the harness refusing; recovery was `git worktree add --force <same path> <branch>`
+  to recreate an empty worktree, then `clean --abandon`, which then archived and closed all three.
+- **Lesson:** Reclaiming space from task worktrees is `scripts/agent-harness clean <id> --abandon`,
+  never `git worktree remove`. `clean` refuses while ignored build bytes are unarchived — delete
+  `target/`, `.angular/`, `dist/`, `test-results/` and any duplicated `src-tauri/binaries` first
+  (all regenerable), then let it run. 8.1 GB -> 28 MB this way.
+- **Status:** journal
+
+### [2026-08-03 cleanup] `git diff` does not carry untracked files — listing them is not preserving them
+- **Pattern:** archiving three doomed worktrees produced patches from `git diff HEAD` plus a
+  MANIFEST of untracked paths. One of those paths was `src-tauri/src/connectors/fetch.rs` — a whole
+  new source file that existed nowhere else. The manifest named it; the archive did not contain it.
+  Deleting the worktree at that point would have destroyed it while the archive looked complete.
+- **Caught by:** reading the manifest instead of trusting the line count of the patch.
+- **Lesson:** When rescuing a worktree, COPY the untracked files, do not enumerate them
+  (`git ls-files --others --exclude-standard` gives the list; the copy is a separate step). Verify
+  the archive by listing what is actually in it, not by trusting that the step ran.
+- **Status:** journal
