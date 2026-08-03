@@ -5,19 +5,149 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::summarize::meta::CallMeta;
 
-/// The curated Claude model ids offered for the `claude_code` and `anthropic` connections.
+/// One entry in a bundled model **hint** list.
 ///
-/// Single source of truth for the FE model dropdowns, served through the `list_models` command —
-/// this list previously lived hardcoded in the Settings template. Order is display order (most
-/// capable first). Static compile-time data — no I/O, no egress.
-pub const CLAUDE_MODELS: &[&str] = &["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"];
+/// The distinction from the old `&[&str]` constants is the whole point of this type: these lists
+/// are a convenience so the picker has something to show, **never an allowlist**. A model id the
+/// user types that is absent here is a custom id, not corruption — nothing may clear it, reject it
+/// or "repair" it. The FE learns which lists are merely bundled (versus fetched from a live
+/// endpoint) from `ModelOptionDto::source`, so it can offer Refresh only where refreshing means
+/// something and can say plainly that a bundled list may be out of date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudModel {
+    /// The id passed verbatim to the CLI / API.
+    pub id: &'static str,
+    /// Human display name. The picker shows this, not the raw id.
+    pub label: &'static str,
+    /// One-clause hint about when to reach for it.
+    pub note: &'static str,
+}
 
-/// Curated Codex model ids offered for the `codex_cli` connection.
+/// Length ceiling for an id that becomes a CLI argument. Real CLI model ids are short slugs.
+const MODEL_ID_MAX_CHARS: usize = 64;
+
+/// Storage bound for an id that is only ever sent in a JSON body.
 ///
-/// These are the current Sol/Terra/Luna roles exposed by Codex CLI: highest-quality, balanced,
-/// and fast respectively. Static compile-time data; selecting one passes it verbatim to
-/// `codex exec --model`.
-pub const CODEX_MODELS: &[&str] = &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+/// A BOUND, not a shape rule. Ollama's live catalog returns Hugging Face paths such as
+/// `hf.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF:Q4_K_M`, comfortably past 64 characters, and no
+/// observed id approaches this figure — it exists only so a config field cannot grow without limit
+/// (it is stored in SQLite and echoed in the egress ledger).
+const CATALOG_MODEL_ID_MAX_CHARS: usize = 512;
+
+/// Characters legal in any model id. `@` and `/` appear in real Hugging Face and vendor-scoped ids.
+fn model_id_shape_is_safe(model: &str, max_chars: usize) -> bool {
+    // A leading `-` is the argv-injection shape; a `..`/`.` segment is the path-traversal shape.
+    // Both are refused everywhere, because neither is a real model id on any arm.
+    !model.is_empty()
+        && model.len() <= max_chars
+        && !model.starts_with('-')
+        && !model.split('/').any(|segment| segment == ".." || segment == ".")
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/' | '@'))
+}
+
+/// Accept an id destined for a JSON REQUEST BODY (`anthropic`, `ollama`, `gateway`).
+///
+/// Accept an id destined for a JSON REQUEST BODY (`anthropic`, `ollama`, `gateway`).
+///
+/// NO CHARACTER ALLOWLIST here, and a storage-sized ceiling rather than a slug-sized one.
+///
+/// This used to share [`model_id_shape_is_safe`] with the CLI arms, differing on length alone.
+/// On these arms the id is `serde_json`-escaped into a request body; it never becomes argv, a URL
+/// path or a filename (checked: `ollama.rs` and `gateway.rs` put it in the body, plus a purely
+/// internal recovery key). So an ASCII allowlist and a 200-character cap prevented nothing and
+/// could only REFUSE legitimate ids — `vendor/model+preview`, any non-ASCII id a future endpoint
+/// returns — at save, and worse, `AppConfig::load` then CLEARED such an id on every launch. That
+/// is catalog-as-allowlist behaviour wearing a security hat, and removing it is the point of this
+/// change.
+///
+/// The two shape refusals that stay are the ones with ZERO legitimate cost: a leading `-` and a
+/// `.`/`..` path segment are not model ids on any arm, so keeping them out is free defence in depth
+/// if such a value ever reaches a context that does interpret it. What is dropped is only what was
+/// shown to reject real ids.
+pub fn valid_catalog_model_id(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty()
+        && model.len() <= CATALOG_MODEL_ID_MAX_CHARS
+        && !model.starts_with('-')
+        && !model.split('/').any(|segment| segment == ".." || segment == ".")
+        && !model.chars().any(char::is_control)
+        && !model.chars().any(char::is_whitespace)
+}
+
+/// Accept a model id only if it is safe to hand to a CLI as a `--model <id>` argument.
+///
+/// This became load-bearing the moment the catalog stopped being an allowlist. Previously the
+/// Settings picker could only emit an id from a compile-time constant, so nothing arbitrary could
+/// reach a provider. Now any string the user types is forwarded verbatim to
+/// `claude --model <id>` / `codex exec --model <id>`, and a value like
+/// `--sandbox danger-full-access` would be read by the CLI as a FLAG, not as a model name.
+///
+/// A model id is a slug, not free prose: ASCII alphanumerics plus `.`, `-`, `_`, `:` and `/`
+/// (Ollama uses `family:tag`, gateways use `vendor/model`). Anything else — a leading `-`, any
+/// whitespace or control character, or an unreasonable length — is rejected, and the caller falls
+/// back to the provider's own default rather than passing a hostile value through.
+pub fn valid_model_id(model: &str) -> bool {
+    model_id_shape_is_safe(model.trim(), MODEL_ID_MAX_CHARS)
+}
+
+/// Bundled Claude model hints for the `claude_code` and `anthropic` connections.
+///
+/// Neither connection has a catalog endpoint Murmur can reach without shipping a key exchange, so
+/// these are compile-time hints — no I/O, no egress. Order is display order, most capable first.
+/// **This list going stale must not break anything**: `list_models` marks it `source: "bundled"`,
+/// the picker always offers a free-text id, and nothing validates a stored id against it.
+pub const CLAUDE_MODELS: &[CloudModel] = &[
+    CloudModel {
+        id: "claude-opus-5",
+        label: "Claude Opus 5",
+        note: "highest quality",
+    },
+    CloudModel {
+        id: "claude-sonnet-5",
+        label: "Claude Sonnet 5",
+        note: "balanced",
+    },
+    CloudModel {
+        id: "claude-fable-5",
+        label: "Claude Fable 5",
+        note: "creative work",
+    },
+    CloudModel {
+        id: "claude-haiku-4-5",
+        label: "Claude Haiku 4.5",
+        note: "fastest",
+    },
+    CloudModel {
+        id: "claude-opus-4-8",
+        label: "Claude Opus 4.8",
+        note: "previous generation",
+    },
+];
+
+/// Bundled Codex model hints for the `codex_cli` connection.
+///
+/// The Sol/Terra/Luna roles exposed by Codex CLI: highest-quality, balanced and fast. Selecting
+/// one passes the id verbatim to `codex exec --model`. Same contract as [`CLAUDE_MODELS`] — a
+/// hint, not an allowlist.
+pub const CODEX_MODELS: &[CloudModel] = &[
+    CloudModel {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        note: "highest quality",
+    },
+    CloudModel {
+        id: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra",
+        note: "balanced",
+    },
+    CloudModel {
+        id: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna",
+        note: "fastest",
+    },
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
