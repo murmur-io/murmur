@@ -3,8 +3,10 @@ import {
   Component,
   computed,
   inject,
+  signal,
 } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
+import { defaultEngineKeepsModelId } from "../../../model-id";
 import { SettingsStore } from "../../../settings.store";
 
 /**
@@ -46,6 +48,13 @@ export class AiSetupBlockComponent {
   readonly posture = this.store.posture;
   readonly providerIsCloud = this.store.providerIsCloud;
   readonly defaultModelCatalog = this.store.defaultModelCatalog;
+
+  /**
+   * Whether this catalog was fetched from a real endpoint (`ollama`, `gateway`) rather than
+   * compiled into the binary. Drives the Refresh affordance: a bundled list cannot be refreshed,
+   * so offering the button there was a false promise about how current the list was.
+   */
+  readonly defaultCatalogIsLive = this.store.defaultCatalogIsLive;
   readonly defaultModelsLoading = this.store.defaultModelsLoading;
   readonly defaultModelIsCustom = this.store.defaultModelIsCustom;
 
@@ -101,22 +110,70 @@ export class AiSetupBlockComponent {
     }
   });
 
-  /** Prefetch the newly-picked engine's model catalog and clear an incompatible stale model id. */
+  /**
+   * The current model is not listed by the newly-selected engine.
+   *
+   * Set instead of clearing the value: the UI explains the mismatch and the user decides. Blanking
+   * it was the second half of the same defect as `repairForeignRoleModels` — a catalog treated as
+   * authoritative silently destroying a choice it did not recognise — and it defeated the whole
+   * point of making an unlisted id typeable.
+   */
+  readonly unlistedAfterEngineSwitch = signal<string>("");
+
+  /**
+   * An id the newly-selected engine cannot send at all, cleared here rather than left for the
+   * backend to drop on save. Distinct from `unlistedAfterEngineSwitch`, which keeps a valid id the
+   * catalog merely does not list.
+   */
+  readonly droppedAfterEngineSwitch = signal<string>("");
+
+  /**
+   * A TYPED id the persistence boundary will refuse, flagged live rather than at save time.
+   *
+   * `onEngineChanged` only sees the value at the moment the engine changes, but the free-text id is
+   * always available now — so a user can type `-m` or `./model` into a settled form and have it
+   * silently dropped by `dto_to_config` on autosave. This computed reacts to the value itself, so
+   * the field says so while the value is still on screen.
+   */
+  readonly typedModelWillBeRefused = computed(
+    () =>
+      !defaultEngineKeepsModelId(
+        this.store.providerModelValue() ?? "",
+        this.store.providerIdValue() ?? "",
+      ),
+  );
+
+  /** Prefetch the newly-picked engine's model catalog and flag (never erase) an unlisted id. */
   async onEngineChanged(e: Event): Promise<void> {
     const id = (e.target as HTMLSelectElement).value;
+    this.unlistedAfterEngineSwitch.set("");
+    this.droppedAfterEngineSwitch.set("");
+    // BEFORE the await. The engine FormControl has already changed, so the store's autosave can
+    // reach `dto_to_config` while a catalog fetch is still in flight — and that boundary drops an
+    // over-long id for a CLI engine. Clearing it only after the await left a window where the
+    // backend persisted empty while the form still showed the old value and the UI said it had
+    // been kept. An id this engine cannot SEND is a different case from one the catalog merely
+    // does not list, and it needs no catalog to detect.
+    const current = this.form.controls.providerModel.value;
+    if (current && !defaultEngineKeepsModelId(current, id)) {
+      this.form.controls.providerModel.setValue("");
+      this.droppedAfterEngineSwitch.set(current);
+      // DO NOT RETURN HERE. Clearing the old id says nothing about the NEW engine's catalog, and
+      // returning meant a first switch away from an unusable id left the engine with no options
+      // loaded and no "this list ships with the app" provenance — the user was told what was
+      // removed and then shown an empty picker with no explanation of why it was empty.
+    }
     if (id === "claude_code" || id === "codex_cli" || id === "anthropic") {
       const catalogLoaded = await this.store.ensureModels(id);
       if (this.form.controls.providerId.value !== id) return;
-      // Keep the user's stored model on transport/IPC failure. A successful empty catalog is
-      // different: it proves the new provider has no matching id, so the explicit default wins.
+      // A transport/IPC failure proves nothing about the id, so say nothing.
       if (!catalogLoaded) return;
       const model = this.form.controls.providerModel.value;
-      const catalog = this.store.modelCatalogs()[id] ?? [];
-      if (model && !catalog.includes(model)) {
-        // An engine switch must not silently opt the user into the first (usually highest-cost)
-        // model or retain a foreign id when catalog loading failed. Empty is an explicit,
-        // supported choice: let the selected provider pick its default.
-        this.form.controls.providerModel.setValue("");
+      const catalog = this.store.modelCatalogs()[id]?.options ?? [];
+      if (model && !catalog.some((o) => o.id === model)) {
+        // A bundled catalog is a hint, so "not listed" does not mean "not valid" — it commonly
+        // just means the model shipped after this build. Keep the id and explain.
+        this.unlistedAfterEngineSwitch.set(model);
       }
     }
   }

@@ -1014,12 +1014,18 @@ fn build_claude_command(bin: &str, system_prompt: &str, model: &str, inherit_env
 /// The `--model <id>` argument pair to append for a given model override, or `&[]` when the
 /// override is empty/blank (let the CLI use its default). Pure + unit-testable — the exact
 /// branch used at both call sites in `summarize`/`complete` (`if !self.model.trim().is_empty()`).
-fn model_args(model: &str) -> Vec<String> {
-    if model.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec!["--model".to_string(), model.to_string()]
+///
+/// `pub(crate)` so the A6 ledger-versus-wire test can ask this arm what it would ACTUALLY send,
+/// instead of re-implementing the rule in the test and proving only that two copies agree.
+pub(crate) fn model_args(model: &str) -> Vec<String> {
+    // Since the Settings catalog became a hint rather than an allowlist, this string can be
+    // anything the user typed. `--model` takes the NEXT argv entry, so an id like
+    // `--sandbox danger-full-access` would be parsed by the CLI as a flag. Reject anything that is
+    // not a plain slug and fall back to the CLI's own default.
+    if !crate::summarize::provider::valid_model_id(model) {
+        return Vec::new();
     }
+    vec!["--model".to_string(), model.trim().to_string()]
 }
 
 /// True iff `text`'s first non-empty line is exactly a three-dash YAML fence (allowing
@@ -1094,6 +1100,86 @@ mod tests {
             model_args("claude-opus-4-8"),
             vec!["--model".to_string(), "claude-opus-4-8".to_string()]
         );
+    }
+
+    /// A6, asserted on the ARGV the CLI would actually receive — not on the predicate.
+    ///
+    /// Testing `!valid_model_id(hostile)` alone proves the predicate rejects a string; it does not
+    /// prove this call site consults it. `--model` consumes the NEXT argv entry, so the property
+    /// that matters is that a hostile value never becomes an argument at all: no `--model`, and no
+    /// trace of the value anywhere in the vector.
+    #[test]
+    fn a_hostile_model_id_never_reaches_argv() {
+        for hostile in [
+            "--sandbox danger-full-access",
+            "-m",
+            "--dangerously-skip-permissions",
+            "claude-opus-5 --sandbox danger-full-access",
+            "claude\nopus",
+            "../../etc/passwd",
+            "$(rm -rf ~)",
+        ] {
+            let argv = model_args(hostile);
+            assert!(
+                argv.is_empty(),
+                "{hostile:?} must not produce any argument; got {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|arg| arg.contains(hostile.trim())),
+                "no fragment of {hostile:?} may survive into argv"
+            );
+        }
+        // ...while a legitimate UNLISTED id — the whole point of a hint catalog — still gets sent.
+        assert_eq!(
+            model_args("claude-opus-6"),
+            vec!["--model".to_string(), "claude-opus-6".to_string()],
+            "a valid id absent from every bundled catalog must still reach the CLI"
+        );
+        // Surrounding whitespace is trimmed rather than rejected, and never splits into two args.
+        assert_eq!(
+            model_args("  llama3.1:8b  "),
+            vec!["--model".to_string(), "llama3.1:8b".to_string()]
+        );
+    }
+
+    /// The same property asserted on the CONSTRUCTED COMMAND, not only on the helper.
+    ///
+    /// `a_hostile_model_id_never_reaches_argv` pins `model_args`, which proves the helper is sound
+    /// but not that the command builder routes through it — `build_claude_command` takes `model`
+    /// as its own parameter and could keep a private `if !model.trim().is_empty()` branch, which is
+    /// exactly the shape that used to be there. The codex arm already asserts on its built command;
+    /// this closes the same gap here so neither arm rests on an untested call edge.
+    #[test]
+    fn a_hostile_model_id_never_reaches_the_built_claude_argv() {
+        for hostile in [
+            "--sandbox danger-full-access",
+            "-m",
+            "--dangerously-skip-permissions",
+            "claude\nopus",
+            "../../etc/passwd",
+        ] {
+            let args = args_of(&build_claude_command("claude", "SYSTEM", hostile, false));
+            assert!(
+                !args.iter().any(|arg| arg == "--model"),
+                "{hostile:?} produced a --model flag in the built command: {args:?}"
+            );
+            // Compare whole argv ENTRIES, not substrings: the hermetic flags legitimately contain
+            // `-m` (`--strict-mcp-config`), so a `contains` check reports a leak that is not one.
+            // Each whitespace-separated token is checked so a builder that split the value into
+            // several args would still be caught.
+            for token in hostile.split_whitespace() {
+                assert!(
+                    !args.iter().any(|arg| arg == token),
+                    "token {token:?} of {hostile:?} reached the built argv: {args:?}"
+                );
+            }
+        }
+        // ...and a legitimate unlisted id DOES reach the command, or the guard would be vacuous:
+        // a builder that never passed `--model` at all would satisfy every assertion above.
+        let args = args_of(&build_claude_command("claude", "SYSTEM", "claude-opus-6", false));
+        let flag = args.iter().position(|arg| arg == "--model");
+        assert!(flag.is_some(), "a valid id must still reach argv: {args:?}");
+        assert_eq!(args[flag.unwrap() + 1], "claude-opus-6");
     }
 
     #[test]

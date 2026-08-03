@@ -74,9 +74,15 @@ test("Codex can be selected globally and per feature with its catalog and brande
   await expect(defaultModel.locator("[data-provider-default]")).toHaveText(
     "Default (provider's pick)",
   );
-  await expect(defaultModel).toHaveValue("");
-  await expect(defaultModel.locator(":checked")).toHaveText(
-    "Default (provider's pick)",
+  // A6: the stored id SURVIVES an engine switch. Blanking it was the same defect as
+  // `repairForeignRoleModels` — a hint catalog treated as authoritative, destroying a choice it
+  // did not recognise. The UI now keeps the value and explains the mismatch instead.
+  await expect(defaultModel.locator("[data-provider-default]")).toBeAttached();
+  await expect(
+    setup.locator('input[formcontrolname="providerModel"]'),
+  ).toHaveValue("claude-opus-4-8");
+  await expect(setup.locator("[data-unlisted-model]")).toContainText(
+    "claude-opus-4-8",
   );
   await expect(page.locator("app-ai-privacy-strip")).toContainText(
     "Codex → OpenAI (via the Codex CLI)",
@@ -235,13 +241,28 @@ test("a delayed Codex catalog cannot overwrite a newer engine selection", async 
       if (args.connection === "codex_cli") {
         return new Promise((resolve) =>
           setTimeout(
-            () => resolve(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]),
+            () =>
+              resolve({
+                source: "bundled",
+                options: [
+                  { id: "gpt-5.6-sol", label: "GPT-5.6 Sol — highest quality", source: "bundled" },
+                  { id: "gpt-5.6-terra", label: "GPT-5.6 Terra — balanced", source: "bundled" },
+                  { id: "gpt-5.6-luna", label: "GPT-5.6 Luna — fastest", source: "bundled" },
+                ],
+              }),
             200,
           ),
         );
       }
       if (args.connection === "anthropic") {
-        return ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"];
+        return {
+          source: "bundled",
+          options: [
+            { id: "claude-opus-5", label: "Claude Opus 5 — highest quality", source: "bundled" },
+            { id: "claude-sonnet-5", label: "Claude Sonnet 5 — balanced", source: "bundled" },
+            { id: "claude-haiku-4-5", label: "Claude Haiku 4.5 — fastest", source: "bundled" },
+          ],
+        };
       }
       return [];
     },
@@ -255,14 +276,19 @@ test("a delayed Codex catalog cannot overwrite a newer engine selection", async 
   await engine.selectOption("anthropic");
 
   const model = setup.locator('select[formcontrolname="providerModel"]');
+  // The property under test is that a LATE catalog response cannot overwrite a NEWER engine
+  // selection. Comparing the value against itself would detect the late write but pin nothing, so
+  // name the value that must be there: the SEEDED id. It survives both engine switches because a
+  // catalog is a hint — Anthropic's list does not contain it and keeps it anyway — which is the
+  // same invariant stated from the other side.
   await expect(engine).toHaveValue("anthropic");
-  await expect(model).toHaveValue("");
+  await expect(model).toHaveValue("gpt-5.6-terra");
   await page.waitForTimeout(250);
   await expect(engine).toHaveValue("anthropic");
-  await expect(model).toHaveValue("");
+  await expect(model).toHaveValue("gpt-5.6-terra");
 });
 
-test("an empty Codex catalog clears a foreign default-engine model", async ({
+test("an empty Codex catalog KEEPS a foreign default-engine model", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -273,7 +299,7 @@ test("an empty Codex catalog clears a foreign default-engine model", async ({
     ).__demoConfig = { providerModel: "claude-opus-4-8" };
   });
   await mockTauri(page, {
-    list_models: () => [],
+    list_models: () => ({ source: "live", options: [] }),
   });
 
   await page.goto("/settings");
@@ -282,9 +308,11 @@ test("an empty Codex catalog clears a foreign default-engine model", async ({
   await setup
     .locator('select[formcontrolname="providerId"]')
     .selectOption("codex_cli");
+  // An EMPTY catalog proves nothing about the id either — a bundled list that happens to be empty
+  // is still just a hint, so the stored value is kept rather than blanked.
   await expect(
     setup.locator('input[formcontrolname="providerModel"]'),
-  ).toHaveValue("");
+  ).toHaveValue("claude-opus-4-8");
 });
 
 test("a failed Codex catalog request preserves the stored model id", async ({
@@ -314,7 +342,14 @@ test("a failed Codex catalog request preserves the stored model id", async ({
   ).toHaveValue("claude-opus-4-8");
 });
 
-test("a loaded Codex role clears and persists a foreign Claude model id", async ({
+/**
+ * INVERTED on 2026-08-01. This used to assert that a role model absent from the connection's
+ * catalog was cleared to "" AND persisted. That behaviour (`settings.store.ts::
+ * repairForeignRoleModels`) is what made a newly released model unusable: it was not merely
+ * missing from the dropdown, it was erased from config the moment the catalog loaded. The catalog
+ * is now a HINT, so an unrecognised id is a custom id and must survive untouched.
+ */
+test("a loaded Codex role KEEPS a model id the catalog does not list", async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -344,25 +379,21 @@ test("a loaded Codex role clears and persists a foreign Claude model id", async 
   const notesRow = page.locator('[data-role="notes"]');
   await expect(notesRow).toBeVisible();
   await expect(notesRow.locator("select").first()).toHaveValue("codex_cli");
-  await expect(notesRow.locator("select").nth(1)).toHaveValue("");
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (
-            window as unknown as {
-              __savedCodexRoleRepair?: {
-                roleNotesConnection?: string;
-                roleNotesModel?: string;
-              };
-            }
-          ).__savedCodexRoleRepair,
-      ),
-    )
-    .toMatchObject({
-      roleNotesConnection: "codex_cli",
-      roleNotesModel: "",
-    });
+  // The id stays selectable as a custom entry rather than being blanked.
+  await expect(notesRow.locator("select").nth(1)).toHaveValue("claude-opus-4-8");
+  // ...and nothing writes a "repair" to config behind the user's back.
+  const saved = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __savedCodexRoleRepair?: { roleNotesModel?: string };
+        }
+      ).__savedCodexRoleRepair,
+  );
+  expect(
+    saved === undefined || saved.roleNotesModel === "claude-opus-4-8",
+    `an unlisted id must not be rewritten; config was saved as ${JSON.stringify(saved)}`,
+  ).toBeTruthy();
 });
 
 test("Codex cloud-consent copy names OpenAI's cloud", async ({ page }) => {
