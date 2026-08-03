@@ -128,7 +128,7 @@ test("an id the boundary would refuse is cleared visibly, not silently", async (
 
   // claude_code puts the id on a command line, so this one cannot be sent. The UI clears it in the
   // same interaction and says so, rather than leaving it on screen for autosave to drop.
-  await expect(page.locator("[data-dropped-model]")).toContainText(tooLong);
+  await expect(page.locator("app-ai-setup-block [data-dropped-model]")).toContainText(tooLong);
   await expect(
     page.locator(".model-row input.model-input").first(),
     "the field must not still show a value the backend will not keep",
@@ -157,13 +157,13 @@ test("dropping an unusable model does not cancel the new engine's catalog fetch"
     .first()
     .selectOption("codex_cli");
 
-  await expect(page.locator("[data-dropped-model]")).toContainText(tooLong);
+  await expect(page.locator("app-ai-setup-block [data-dropped-model]")).toContainText(tooLong);
   await expect(
     page.locator(".model-row select.model-select option", { hasText: "Claude Sonnet 5" }),
     "the new engine's catalog must load even when the switch dropped the previous model",
   ).toHaveCount(1);
   await expect(
-    page.locator("[data-bundled-catalog]"),
+    page.locator("app-ai-setup-block [data-bundled-catalog]"),
     "a bundled catalog must still say so; silence reads as 'this list is current'",
   ).toBeVisible();
 
@@ -192,7 +192,7 @@ test("a SHAPE the boundary refuses is cleared too, not only an over-long one", a
     .first()
     .selectOption("claude_code");
 
-  await expect(page.locator("[data-dropped-model]")).toContainText("./model");
+  await expect(page.locator("app-ai-setup-block [data-dropped-model]")).toContainText("./model");
   await expect(
     page.locator(".model-row input.model-input").first(),
   ).toHaveValue("");
@@ -212,7 +212,7 @@ test("refresh button tracks the ENGINE, not the mocked catalog source", async ({
     page.locator(".model-refresh"),
     "claude_code is a bundled arm: Refresh could not change anything, so it is not offered",
   ).toHaveCount(0);
-  await expect(page.locator("[data-bundled-catalog]")).toBeVisible();
+  await expect(page.locator("app-ai-setup-block [data-bundled-catalog]")).toBeVisible();
 
   // The LIVE half of this property is asserted on the role rows, not here: the Setup card still
   // defers `ollama`/`gateway` to Advanced, and inlining their picker is the follow-up task. See
@@ -276,8 +276,8 @@ test("a role row can type an unlisted id against a NON-EMPTY catalog", async ({ 
     options: [{ id: "llama3.1:8b", label: "llama3.1:8b", source: "live" }],
   });
   const row = page.locator('[data-role="notes"]');
-  await expect(row.locator("select.role-model-select")).toBeVisible();
-  const input = row.locator("input.role-model-input");
+  await expect(row.locator("select.model-select")).toBeVisible();
+  const input = row.locator("input.model-input");
   await expect(
     input,
     "a role row must accept a newer model id even when its catalog is non-empty",
@@ -305,7 +305,7 @@ test("a role row KEEPS a usable model across a connection change and says it is 
     "ollama",
   );
   const row = page.locator('[data-role="notes"]');
-  const model = row.locator("input.role-model-input");
+  const model = row.locator("input.model-input");
   // An id the catalog does NOT list — the whole point is that such an id is legitimate. A listed
   // one would prove less: it needs no explanation, and the row correctly stays silent for it.
   await model.fill("llama4:70b");
@@ -335,7 +335,7 @@ test("a role row clears a model the new engine cannot send, and names it", async
     "ollama",
   );
   const row = page.locator('[data-role="notes"]');
-  const model = row.locator("input.role-model-input");
+  const model = row.locator("input.model-input");
   await model.fill(hfModel);
   await model.blur();
   await expect.poll(async () => model.inputValue()).toBe(hfModel);
@@ -365,9 +365,9 @@ test("switching a role to on-device KEEPS a real registry model id", async ({ pa
     "ollama",
   );
   const row = page.locator('[data-role="notes"]');
-  await row.locator("input.role-model-input").fill("qwen25-3b");
-  await row.locator("input.role-model-input").blur();
-  await expect.poll(async () => row.locator("input.role-model-input").inputValue()).toBe(
+  await row.locator("input.model-input").fill("qwen25-3b");
+  await row.locator("input.model-input").blur();
+  await expect.poll(async () => row.locator("input.model-input").inputValue()).toBe(
     "qwen25-3b",
   );
 
@@ -380,7 +380,7 @@ test("switching a role to on-device KEEPS a real registry model id", async ({ pa
 
   await row.locator("select").first().selectOption("ollama");
   await expect(
-    row.locator("input.role-model-input"),
+    row.locator("input.model-input"),
     "a valid on-device model id is a working per-role override, so it must survive",
   ).toHaveValue("qwen25-3b");
 });
@@ -403,7 +403,7 @@ test("switching a role to the on-device engine clears an unusable model AND says
     "ollama",
   );
   const row = page.locator('[data-role="notes"]');
-  const model = row.locator("input.role-model-input");
+  const model = row.locator("input.model-input");
   await model.fill("llama3.1:8b");
   await model.blur();
   await expect.poll(async () => model.inputValue()).toBe("llama3.1:8b");
@@ -417,7 +417,7 @@ test("switching a role to the on-device engine clears an unusable model AND says
 
   await row.locator("select").first().selectOption("ollama");
   await expect(
-    row.locator("input.role-model-input"),
+    row.locator("input.model-input"),
     "the clear is real, not cosmetic: the id must not reappear",
   ).toHaveValue("");
 });
@@ -442,7 +442,7 @@ test("switching a role to Inherit keeps the model, because nothing reads it ther
     "ollama",
   );
   const row = page.locator('[data-role="notes"]');
-  const model = row.locator("input.role-model-input");
+  const model = row.locator("input.model-input");
   await model.fill(hfModel);
   await model.blur();
   await expect.poll(async () => model.inputValue()).toBe(hfModel);
@@ -451,7 +451,7 @@ test("switching a role to Inherit keeps the model, because nothing reads it ther
   await expect(row.locator(".role-model-row")).toHaveCount(0);
   await row.locator("select").first().selectOption("ollama");
   await expect(
-    row.locator("input.role-model-input"),
+    row.locator("input.model-input"),
     "a detour through Inherit must not destroy a choice nothing there could have used",
   ).toHaveValue(hfModel);
 
@@ -493,9 +493,9 @@ test("the length mirror counts UTF-8 BYTES, like the backend does", async ({ pag
     .locator("app-ai-setup-block")
     .locator('select[formcontrolname="providerId"]')
     .selectOption("anthropic");
-  await page.locator("input.model-input").fill(nonAscii);
+  await page.locator("app-ai-setup-block input.model-input").fill(nonAscii);
   await expect(
-    page.locator("[data-model-refused]"),
+    page.locator("app-ai-setup-block [data-model-refused]"),
     "an id the backend measures as over-long must be flagged, whatever JavaScript counts",
   ).toBeVisible();
 
@@ -505,16 +505,16 @@ test("the length mirror counts UTF-8 BYTES, like the backend does", async ({ pag
   // Built from its code point rather than typed: a literal control character in a source file
   // is exactly what made `model-id.ts` reach reviewers as an unreadable binary blob.
   const withNel = `claude${String.fromCharCode(0x85)}opus`;
-  await page.locator("input.model-input").fill(withNel);
+  await page.locator("app-ai-setup-block input.model-input").fill(withNel);
   await expect(
-    page.locator("[data-model-refused]"),
+    page.locator("app-ai-setup-block [data-model-refused]"),
     "a C1 control character is a control character to Rust, so the mirror must refuse it too",
   ).toBeVisible();
 
   // ...and a legitimate non-ASCII id on a JSON-body arm is still accepted — the allowlist was
   // removed on purpose, and this keeps the two refusals above from passing for the wrong reason.
-  await page.locator("input.model-input").fill("vendor/modèle+preview");
-  await expect(page.locator("[data-model-refused]")).toHaveCount(0);
+  await page.locator("app-ai-setup-block input.model-input").fill("vendor/modèle+preview");
+  await expect(page.locator("app-ai-setup-block [data-model-refused]")).toHaveCount(0);
 });
 
 test("a role row flags a typed id the boundary would refuse", async ({ page }) => {
@@ -530,7 +530,7 @@ test("a role row flags a typed id the boundary would refuse", async ({ page }) =
     "claude_code",
   );
   const row = page.locator('[data-role="notes"]');
-  const model = row.locator("input.role-model-input");
+  const model = row.locator("input.model-input");
 
   await model.fill("-m");
   await expect(
@@ -551,19 +551,19 @@ test("a typed model id the backend would refuse says so while it is on screen", 
   // already discarded is the UI stating something untrue, so the check has to react to the value,
   // not to the engine.
   await openAiSettings(page, "");
-  const model = page.locator("input.model-input");
+  const model = page.locator("app-ai-setup-block input.model-input");
 
   // A leading `-` is read as a flag on an argv engine, so `valid_model_id` refuses it — the same
   // rejection an over-long id gets, but reachable by typing three characters.
   await model.fill("-m");
   await expect(
-    page.locator("[data-model-refused]"),
+    page.locator("app-ai-setup-block [data-model-refused]"),
     "an id that will not survive save must be flagged before save, not silently dropped",
   ).toBeVisible();
 
   // And the notice must be about THIS value, not a sticky flag: a legal id clears it.
   await model.fill("claude-opus-5");
-  await expect(page.locator("[data-model-refused]")).toHaveCount(0);
+  await expect(page.locator("app-ai-setup-block [data-model-refused]")).toHaveCount(0);
 });
 
 test("a role row with an EMPTY live catalog still offers Refresh", async ({ page }) => {
@@ -573,11 +573,11 @@ test("a role row with an EMPTY live catalog still offers Refresh", async ({ page
   await openRoleRows(page, { source: "live", options: [] }, "gateway");
   const row = page.locator('[data-role="notes"]');
   await expect(
-    row.locator(".role-model-refresh"),
+    row.locator(".model-refresh"),
     "an empty LIVE catalog is precisely when Refresh matters",
   ).toBeVisible();
   await expect(
-    row.locator("[data-role-bundled-catalog]"),
+    row.locator("[data-bundled-catalog]"),
     "a live catalog must never claim to ship with the app, however empty it is",
   ).toHaveCount(0);
 });
@@ -594,8 +594,8 @@ test("a role row with a bundled catalog says so instead of offering Refresh", as
     "claude_code",
   );
   const row = page.locator('[data-role="notes"]');
-  await expect(row.locator(".role-model-refresh")).toHaveCount(0);
-  await expect(row.locator("[data-role-bundled-catalog]")).toBeVisible();
+  await expect(row.locator(".model-refresh")).toHaveCount(0);
+  await expect(row.locator("[data-bundled-catalog]")).toBeVisible();
 });
 
 test("engine switch that drops a model explains itself", async ({ page }) => {
@@ -605,7 +605,7 @@ test("engine switch that drops a model explains itself", async ({ page }) => {
 
   // The id must survive the switch — being absent from a hint catalog commonly just means the
   // model shipped after this build.
-  await expect(page.locator("[data-unlisted-model]")).toContainText(FUTURE_MODEL);
+  await expect(page.locator("app-ai-setup-block [data-unlisted-model]")).toContainText(FUTURE_MODEL);
   const input = page.locator(".model-row input.model-input").first();
   await expect(input).toHaveValue(FUTURE_MODEL);
 });
@@ -631,3 +631,63 @@ test("options render labels, not raw ids", async ({ page }) => {
 function entry_id_only(): string {
   return CATALOG[0].id;
 }
+
+test("gateway and ollama get a picker in the Setup card, bound to their OWN control", async ({
+  page,
+}) => {
+  // Both engines used to render prose — "the model for Kong AI Gateway is set in its connection
+  // card under Advanced" — on the very screen the user opened to choose a model, and on the only
+  // two arms with a LIVE catalog worth refreshing.
+  //
+  // The trap this pins: `roles::legacy_default_target` returns "" for these two, and their
+  // providers read `gateway_model` / `ollama_model`. Binding `providerModel` here would look
+  // perfectly correct in the UI and write a field the backend never reads, so the assertion is on
+  // the SAVED CONFIG, not on the input's value.
+  await openAiSettings(page, "");
+  const setup = page.locator("app-ai-setup-block");
+  await setup.locator('select[formcontrolname="providerId"]').selectOption("ollama");
+
+  await expect(
+    setup.locator("mur-model-picker[formcontrolname=\"ollamaModel\"]"),
+    "the Setup card must offer a picker, not a pointer to another screen",
+  ).toBeVisible();
+  await expect(setup.getByText("is set in its connection card")).toHaveCount(0);
+
+  await setup.locator("input.model-input").fill("llama4:70b");
+  await expect
+    .poll(async () =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __demoConfig?: Record<string, unknown> }).__demoConfig?.[
+            "ollamaModel"
+          ],
+      ),
+    )
+    .toBe("llama4:70b");
+
+  // ...and the value did NOT go to providerModel, which that arm ignores.
+  const providerModel = await page.evaluate(
+    () =>
+      (window as unknown as { __demoConfig?: Record<string, unknown> }).__demoConfig?.[
+        "providerModel"
+      ],
+  );
+  expect(
+    providerModel === "" || providerModel === undefined,
+    `ollama must write ollamaModel, not providerModel; providerModel was ${JSON.stringify(providerModel)}`,
+  ).toBeTruthy();
+});
+
+test("one accessor owns the control: typing is reflected by the select", async ({ page }) => {
+  // B5. The Setup card used to bind BOTH a <select> and an <input> to `providerModel`. Angular
+  // writes with `{emitModelToViewChange: false}`, so a value typed into one was never written into
+  // the other's view — two accessors, one control, silently diverging. They are one component now
+  // and share a single signal.
+  await openAiSettings(page, "");
+  const setup = page.locator("app-ai-setup-block");
+  await setup.locator("input.model-input").fill("claude-sonnet-5");
+  await expect(
+    setup.locator("select.model-select"),
+    "a value typed in the free-text field must be reflected by the dropdown of the same control",
+  ).toHaveValue("claude-sonnet-5");
+});

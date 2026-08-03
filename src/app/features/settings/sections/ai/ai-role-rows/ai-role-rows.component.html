@@ -73,84 +73,39 @@
 
           @if (row.isProviderConn) {
             <div class="role-model-row">
-              @if (row.models.length > 0) {
-                <select
-                  [formControlName]="row.modelCtrl"
-                  class="role-model-select"
-                >
-                  <option value="">Default (connection's pick)</option>
-                  @for (option of row.models; track option.id) {
-                    <option [value]="option.id">{{ option.label }}</option>
-                  }
-                  <!--
-                    Keep a manually-typed model selectable when it's not in
-                    the catalog — never silently lose it (the gateway
-                    picker's keep-manually-typed pattern).
-                  -->
-                  @if (row.modelIsCustom) {
-                    <option [value]="row.modelValue">
-                      {{ row.modelValue }} (custom)
-                    </option>
-                  }
-                </select>
-              }
               <!--
-                ALWAYS available, not only when the catalog is empty. This input used to live in the
-                `@else` of the catalog check — the same shape as the Setup card's old bug — so a
-                non-empty catalog made every unlisted id unreachable on this surface, which is the
-                entire behaviour this change exists to fix.
+                The SAME picker the Setup card uses. This surface used to carry its own copy, and
+                that is how a defect fixed on one lived on here for a full review round: the
+                free-text id stayed hidden behind a non-empty catalog after the Setup card had
+                already been fixed. One component, one behaviour, fixed once.
               -->
-              <input
+              <mur-model-picker
                 [formControlName]="row.modelCtrl"
+                [ariaLabel]="row.title + ' model'"
+                defaultLabel="Default (connection's pick)"
                 placeholder="Model id (blank = connection default)"
-                autocomplete="off"
-                spellcheck="false"
-                class="role-model-input"
-                (input)="onModelEdited(row.role)"
+                [catalog]="row.catalog"
+                [canRefresh]="row.catalogIsLive"
+                [loading]="row.modelsLoading"
+                (refresh)="refreshModels(row.conn)"
+                (modelEdited)="onModelEdited(row.role)"
               />
-              <!--
-                Refresh only where refreshing means something. A role row can select `ollama` or
-                `gateway` — the LIVE-fetched arms — so the button belongs here; a bundled catalog is
-                compiled into the binary and the button could not change it. Read from
-                `catalogIsLive` (the CATALOG's provenance), never from the options, so an empty live
-                catalog — a gateway answering with zero models, exactly when Refresh matters — still
-                offers it.
-              -->
-              @if (row.catalogIsLive) {
-                <button
-                  type="button"
-                  class="btn btn-ghost role-model-refresh"
-                  (click)="refreshModels(row.conn)"
-                  [disabled]="row.modelsLoading"
-                  title="Fetch this connection's model list"
-                >
-                  @if (row.modelsLoading) {
-                    Loading…
-                  } @else {
-                    ↻ Refresh
-                  }
-                </button>
-              } @else if (row.models.length > 0) {
-                <p class="field-hint" data-role-bundled-catalog>
-                  Ships with the app — a newer model may be missing; type its id above.
-                </p>
-              }
-              @if (refusedTypedModels().has(row.role)) {
-                <p class="field-hint" data-role-model-refused>
+            </div>
+            @if (refusedTypedModels().has(row.role)) {
+              <p class="field-hint" data-role-model-refused>
                   This is not a usable model id for the selected engine — it will not be saved.
                   Model ids are short and contain only letters, digits and
                   <code>. - _ : / &#64;</code>.
                 </p>
               }
-              @if (connectionChangeNotice()[row.role]; as notice) {
-                @if (notice.outcome === "kept") {
+            @if (connectionChangeNotice()[row.role]; as notice) {
+              @if (notice.outcome === "kept") {
                   <p class="field-hint" data-role-kept-model>
                     {{ notice.model }} is not in this engine's list. It has been kept — clear it
                     only if you want the engine to pick.
                   </p>
                 }
               }
-            </div>
 
             @if (row.conn === "anthropic") {
               <label class="field">

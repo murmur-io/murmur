@@ -22,106 +22,74 @@
         </label>
 
         <!--
-          Model + reasoning-effort. providerModel steers the claude_code,
-          codex_cli and anthropic arms (gateway/ollama read their own connection-card
-          model), so the picker renders for those three — for gateway/ollama we
-          point at the connection card, now under Advanced.
+          ONE picker for every engine.
+
+          `gateway` and `ollama` used to render prose pointing at their connection card under
+          Advanced — a dead end on the very screen the user opened in order to choose a model, and
+          on the only two arms with a LIVE catalog worth refreshing. They bind their OWN control
+          (`gatewayModel` / `ollamaModel`), because `roles::legacy_default_target` returns "" for
+          them and their providers read those fields: binding `providerModel` there would look
+          correct and do nothing at all.
         -->
-        @switch (form.controls.providerId.value) {
-          @case ("gateway") {
-            <p class="field-help text-muted">
-              The model for Kong AI Gateway is set in its connection card
-              under Advanced.
-            </p>
-          }
-          @case ("ollama") {
-            <p class="field-help text-muted">
-              The model for Ollama is set in its connection card under
-              Advanced.
-            </p>
-          }
-          @default {
-            <div class="field">
-              <span class="field-label">Model</span>
-              <div class="model-row">
-                @if (defaultModelCatalog().length > 0) {
-                  <select formControlName="providerModel" class="model-select">
-                    <option value="" data-provider-default>
-                      Default (provider's pick)
-                    </option>
-                    @for (option of defaultModelCatalog(); track option.id) {
-                      <option [value]="option.id">{{ option.label }}</option>
-                    }
-                    @if (defaultModelIsCustom()) {
-                      <option [value]="form.controls.providerModel.value">
-                        {{ form.controls.providerModel.value }} (custom)
-                      </option>
-                    }
-                  </select>
-                }
-                <!--
-                  The free-text id is ALWAYS available, not only when the catalog is empty. A
-                  bundled catalog is a hint, so the moment a new model ships it is typeable here
-                  without waiting for a release — which is the entire point of this change. It used
-                  to live in the `@else` of the catalog check, so a non-empty list made every
-                  unlisted model unreachable.
-                -->
-                <input
-                  formControlName="providerModel"
-                  placeholder="Model id (blank = provider's pick)"
-                  autocomplete="off"
-                  spellcheck="false"
-                  class="model-input"
+        <div class="field">
+          <span class="field-label">Model</span>
+          <div class="model-row">
+            @switch (form.controls.providerId.value) {
+              @case ("gateway") {
+                <mur-model-picker
+                  formControlName="gatewayModel"
+                  ariaLabel="Model for Kong AI Gateway"
+                  defaultLabel="Default (gateway's pick)"
+                  [catalog]="activeCatalog()"
+                  [canRefresh]="defaultCatalogIsLive()"
+                  [loading]="defaultModelsLoading()"
+                  (refresh)="refreshDefaultModels()"
                 />
-                <!--
-                  Refresh only where refreshing means something. A "bundled" catalog is compiled
-                  into the binary, so the button could never change it — offering it there taught
-                  the user the list was live when it was a constant.
-                -->
-                @if (defaultCatalogIsLive()) {
-                  <button
-                    type="button"
-                    class="btn btn-ghost model-refresh"
-                    (click)="refreshDefaultModels()"
-                    [disabled]="defaultModelsLoading()"
-                    title="Fetch this provider's model list"
-                  >
-                    @if (defaultModelsLoading()) {
-                      Loading…
-                    } @else {
-                      ↻ Refresh
-                    }
-                  </button>
-                }
-              </div>
-              @if (!defaultCatalogIsLive() && defaultModelCatalog().length > 0) {
-                <p class="field-hint" data-bundled-catalog>
-                  This list ships with the app, so a newer model may be missing — type its id
-                  above and it will be used as-is.
-                </p>
               }
-              @if (typedModelWillBeRefused()) {
-                <p class="field-hint" data-model-refused>
-                  This is not a usable model id for the selected engine — it will not be saved.
-                  Model ids are short and contain only letters, digits and
-                  <code>. - _ : / &#64;</code>.
-                </p>
+              @case ("ollama") {
+                <mur-model-picker
+                  formControlName="ollamaModel"
+                  ariaLabel="Model for Ollama"
+                  defaultLabel="Default (Ollama's pick)"
+                  [catalog]="activeCatalog()"
+                  [canRefresh]="defaultCatalogIsLive()"
+                  [loading]="defaultModelsLoading()"
+                  (refresh)="refreshDefaultModels()"
+                />
               }
-              @if (droppedAfterEngineSwitch(); as dropped) {
-                <p class="field-hint" data-dropped-model>
-                  {{ dropped }} is not a model id this engine can use, so it has been cleared —
-                  pick a model above, or leave it blank to let the engine choose.
-                </p>
+              @default {
+                <mur-model-picker
+                  formControlName="providerModel"
+                  ariaLabel="Default model"
+                  defaultLabel="Default (provider's pick)"
+                  [catalog]="activeCatalog()"
+                  [canRefresh]="defaultCatalogIsLive()"
+                  [loading]="defaultModelsLoading()"
+                  (refresh)="refreshDefaultModels()"
+                />
               }
-              @if (unlistedAfterEngineSwitch(); as unlisted) {
-                <p class="field-hint" data-unlisted-model>
-                  {{ unlisted }} is not in this engine's list. It has been kept — clear it only if
-                  you want the provider to pick.
-                </p>
-              }
-            </div>
+            }
+          </div>
+          @if (typedModelWillBeRefused()) {
+            <p class="field-hint" data-model-refused>
+              This is not a usable model id for the selected engine — it will not be saved.
+              Model ids are short and contain only letters, digits and
+              <code>. - _ : / &#64;</code>.
+            </p>
           }
-        }
+          @if (droppedAfterEngineSwitch(); as dropped) {
+            <p class="field-hint" data-dropped-model>
+              {{ dropped }} is not a model id this engine can use, so it has been cleared —
+              pick a model above, or leave it blank to let the engine choose.
+            </p>
+          }
+          @if (unlistedAfterEngineSwitch(); as unlisted) {
+            <p class="field-hint" data-unlisted-model>
+              {{ unlisted }} is not in this engine's list. It has been kept — clear it only if
+              you want the provider to pick.
+            </p>
+          }
+        </div>
 
         @if (form.controls.providerId.value === "anthropic") {
           <label class="field">
