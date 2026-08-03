@@ -1679,10 +1679,33 @@ def verdict_cases(test: Tests) -> None:
             }
         ],
     }
+    # A gap is the reviewer's own "I could not verify this", not "this is broken" — the protocol
+    # gives it FAIL and MAJOR for the latter. Overriding its PASS could not terminate: closing a gap
+    # creates a new claim that the next round questions one link further out.
     test.equal(
-        "VERDICT PASS plus proof gap is rejected",
+        "VERDICT PASS plus proof gap passes, because the reviewer chose PASS",
         verifier.review_result_state(gap),
+        "PASSED",
+    )
+    # ...but a PROBE REQUEST still blocks: that names a command the runner can actually execute.
+    probe_request = {
+        **base,
+        "probe_requests": [{"probe_id": "rust-lib", "rationale": "need runner proof"}],
+    }
+    test.equal(
+        "VERDICT PASS plus probe request still blocks",
+        verifier.review_result_state(probe_request),
         "NEEDS_EVIDENCE",
+    )
+    # ...and a MAJOR still blocks, gap or no gap: severity is how "not mergeable" is spelled.
+    severe_with_gap = {
+        **gap,
+        "findings": [{"severity": "MAJOR", "evidence": "a real defect"}],
+    }
+    test.equal(
+        "VERDICT a MAJOR blocks regardless of the proof-gap change",
+        verifier.review_result_state(severe_with_gap),
+        "NEEDS_FIX",
     )
 
     # Review authority: a kind the config demotes records but does not gate, a
@@ -1748,23 +1771,35 @@ def verdict_cases(test: Tests) -> None:
         )[0],
         "PASSED",
     )
-    test.equal(
-        "VERDICT blocking combined proof gap forbids PASS",
-        verifier.aggregate_verdict(
-            [green_check],
-            [review("combined", gap), review("egress-security", base)],
-            gating_config,
-        )[0],
-        "NEEDS_EVIDENCE",
+    # A gap from a GATING reviewer that still voted PASS no longer forbids PASS — but the reason
+    # line has to say so, because it is now the only place the gap reaches the operator.
+    combined_gap_gating = verifier.aggregate_verdict(
+        [green_check],
+        [review("combined", gap), review("egress-security", base)],
+        gating_config,
     )
     test.equal(
-        "VERDICT blocking specialist proof gap still forbids PASS",
-        verifier.aggregate_verdict(
-            [green_check],
-            [review("combined", base), review("egress-security", gap)],
-            demoted_config,
-        )[0],
-        "NEEDS_EVIDENCE",
+        "VERDICT blocking combined proof gap no longer forbids PASS",
+        combined_gap_gating[0],
+        "PASSED",
+    )
+    test.true(
+        "VERDICT a passed gap is named in the reason line",
+        "proof gap(s) recorded as advisory" in combined_gap_gating[1],
+    )
+    specialist_gap = verifier.aggregate_verdict(
+        [green_check],
+        [review("combined", base), review("egress-security", gap)],
+        demoted_config,
+    )
+    test.equal(
+        "VERDICT a specialist proof gap no longer forbids PASS",
+        specialist_gap[0],
+        "PASSED",
+    )
+    test.true(
+        "VERDICT a specialist gap is named in the reason line",
+        "proof gap(s) recorded as advisory" in specialist_gap[1],
     )
     test.equal(
         "VERDICT unknown review kind fails closed as blocking",
@@ -1870,11 +1905,23 @@ def verdict_cases(test: Tests) -> None:
         ),
         ("NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"),
     )
+    # THE CONSEQUENCE, stated rather than hidden: with no deterministic checks in the plan, a gating
+    # reviewer's PASS is now sufficient even when it filed gaps — so the reason line naming those
+    # gaps is the only thing standing between "advisory" and "silently dropped". Assert both.
+    check_free = verifier.aggregate_verdict([], [review("combined", gap)], demoted_config)
     test.equal(
-        "VERDICT a check-free plan cannot pass over a generalist proof gap",
-        verifier.aggregate_verdict(
-            [], [review("combined", gap)], demoted_config
-        )[0],
+        "VERDICT a check-free plan passes on a gating review that chose PASS",
+        check_free[0],
+        "PASSED",
+    )
+    test.true(
+        "VERDICT a check-free PASS still names its proof gaps",
+        "proof gap(s) recorded as advisory" in check_free[1],
+    )
+    # The unrelated guard this must NOT weaken: no checks AND no gating review certifies nothing.
+    test.equal(
+        "VERDICT no checks and no gating review still certifies nothing",
+        verifier.aggregate_verdict([], [], demoted_config)[0],
         "NEEDS_EVIDENCE",
     )
     test.equal(
