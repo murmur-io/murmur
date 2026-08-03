@@ -378,6 +378,20 @@ pub fn run() {
             commands::accept_reminder_suggestion,
             commands::dismiss_reminder_suggestion,
             commands::reminder_runtime_probe_control,
+            // Dashboards — boards + tiles over existing sources. `get_dashboard` resolves every
+            // tile through the gated readers; `get_dashboard_sources` feeds the SHIPPED
+            // `ask_vault(explicit_sources: …)` path, so board-scoped Ask adds no new AI surface.
+            commands::list_dashboards,
+            commands::create_dashboard,
+            commands::update_dashboard,
+            commands::delete_dashboard,
+            commands::reorder_dashboards,
+            commands::get_dashboard,
+            commands::get_dashboard_sources,
+            commands::add_dashboard_tile,
+            commands::update_dashboard_tile,
+            commands::delete_dashboard_tile,
+            commands::reorder_dashboard_tiles,
             commands::add_reminder,
             commands::pin_moment,
             commands::link_meeting_entities,

@@ -37,6 +37,11 @@ pub use pipeline_commands::*;
 mod reminders;
 pub use reminders::*;
 
+// Dashboards — user-composed boards of tiles over EXISTING sources. Every tile payload resolves
+// through the gated readers at read time; the module adds no ungated query and no new AI path.
+mod dashboards;
+pub use dashboards::*;
+
 // Model / capability / performance probes + NER download — no name collision with a crate module.
 mod model_perf;
 pub use model_perf::*;

@@ -1,0 +1,228 @@
+// The Add-a-tile palette. It FLOATS over the board, so per T3 it is OPAQUE
+// (`--surface-overlay`, no backdrop-filter) — the frosted `.card` surface here
+// would bleed the tiles behind it through and read as broken.
+:host {
+  display: contents;
+}
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay, 2000);
+  background: var(--scrim);
+}
+
+.palette {
+  position: fixed;
+  z-index: calc(var(--z-overlay, 2000) + 1);
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  width: min(880px, 92vw);
+  max-height: 78vh;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  background: var(--surface-overlay);
+  backdrop-filter: none;
+  box-shadow: var(--shadow-lg);
+}
+
+.palette-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
+
+  h3 {
+    margin: 0 0 2px;
+    font-size: 1.05rem;
+    font-weight: 660;
+    letter-spacing: -0.02em;
+  }
+
+  p {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    max-width: 68ch;
+  }
+
+  strong {
+    color: var(--accent-hover);
+    font-weight: 600;
+  }
+}
+
+.back {
+  flex: 0 0 auto;
+}
+
+.catalogue {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  overflow: auto;
+}
+
+.node {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.028);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    transform var(--transition-fast);
+
+  &:hover {
+    background: var(--surface-hover);
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
+  }
+}
+
+.node-dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  margin-top: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--dot-c, var(--accent));
+}
+
+.dot-note { --dot-c: var(--graph-note); }
+.dot-rec { --dot-c: var(--graph-meeting); }
+.dot-person { --dot-c: var(--graph-entity); }
+.dot-doc { --dot-c: var(--graph-document); }
+.dot-insight { --dot-c: var(--accent); }
+.dot-remind { --dot-c: var(--warning); }
+
+.node-text {
+  min-width: 0;
+}
+
+.node-name {
+  display: block;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.node-desc {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 0.73rem;
+  line-height: 1.45;
+}
+
+.only-badge {
+  display: inline-block;
+  margin-top: var(--space-2);
+  padding: 2px var(--space-2);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.search-row,
+.question-step {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  padding: var(--space-4) var(--space-5) var(--space-2);
+}
+
+.question-step {
+  flex-wrap: wrap;
+  padding-bottom: var(--space-5);
+}
+
+.field-label {
+  flex: 1 0 100%;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+}
+
+.field {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+
+  &::placeholder { color: var(--text-muted); }
+
+  &:focus-visible {
+    outline: none;
+    border-color: var(--accent-ring);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+}
+
+.picker {
+  margin: 0;
+  padding: 0 var(--space-4) var(--space-4);
+  overflow: auto;
+  list-style: none;
+}
+
+.pick {
+  display: block;
+  width: 100%;
+  padding: var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover { background: var(--surface-hover); }
+}
+
+.pick-title {
+  display: block;
+  color: var(--text-primary);
+  font-size: 0.84rem;
+  font-weight: 560;
+}
+
+.pick-meta {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-5);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
