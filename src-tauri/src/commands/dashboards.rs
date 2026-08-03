@@ -154,10 +154,15 @@ pub enum TileData {
         rows: Vec<TileRow>,
     },
     /// A pinned question plus the answer last computed for it (by the FE, through `ask_vault`).
+    ///
+    /// `withheld` is the lock-model half: a cached answer is a PARAPHRASE of the sources it was
+    /// built from, so once any of those sources is sealed-and-not-unlocked the answer stops being
+    /// returned (and `answer` is `None`) until they are unlocked again.
     LivingAnswer {
         question: String,
         answer: Option<String>,
         answered_at: Option<String>,
+        withheld: bool,
     },
 }
 
@@ -178,6 +183,12 @@ pub struct TileConfig {
     pub answer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
+    /// `living_answer` — the sources the cached answer was BUILT from. This is what makes a
+    /// cached answer gate-able: an answer paraphrases its sources, so if any of them is later
+    /// sealed the answer must stop being returned. A legacy row with no recorded sources is
+    /// treated as un-gateable and withheld (fail-closed) once it has an answer at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_sources: Option<Vec<SourceRef>>,
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────────────────────
@@ -466,6 +477,11 @@ pub fn get_dashboard(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Option<DashboardDetailDto>, AppError> {
+    // TOCTOU: hold the lock lifecycle guard across the gate AND every tile read, exactly like
+    // `commands/meetings.rs::get_meeting_detail`. Without it a relock landing between the
+    // `unlocked_snapshot` below and a later tile's read would resolve that tile against a stale
+    // "unlocked" view and return content from a folder that is sealed by the time it ships.
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let Some(dashboard) = state.db.get_dashboard(&id)? else {
         return Ok(None);
     };
@@ -475,13 +491,48 @@ pub fn get_dashboard(
         .into_iter()
         .map(|tile| {
             let data = resolve_tile(state.inner(), &tile, &unlocked)?;
-            Ok(ResolvedTileDto { tile, data })
+            Ok(ResolvedTileDto {
+                tile: redact_tile_chrome(tile, &data),
+                data,
+            })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
     Ok(Some(DashboardDetailDto {
         dashboard,
         tiles: resolved,
     }))
+}
+
+/// Strip the tile's stored chrome whenever its payload could NOT be fully resolved.
+///
+/// Defense-in-depth for a leak found by review (2026-08-03). The first line of defence is that the
+/// FE no longer persists a source-derived title at all (see `tile-palette.component.ts`), so
+/// `dashboard_tiles.title` should only ever hold something the user typed. This is the second: any
+/// row written by an OLDER build still carries a copied source title, and `ResolvedTileDto`
+/// flattens the whole tile — so a withheld payload shipped alongside that title would put the
+/// sealed source's name on the wire regardless.
+///
+/// Withheld means: `Locked` / `Missing` / `Unconfigured`, **and** the entity-anchored kinds whose
+/// entity is not currently visible — those deliberately degrade to an empty view rather than to
+/// `Locked`, so they would otherwise keep a stale entity name as their heading.
+///
+/// `ref_id`, `span` and `position` stay: pure layout, no content, and the FE needs them to keep the
+/// board's shape stable while a folder is sealed.
+fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> DashboardTile {
+    let withheld = match data {
+        TileData::Locked | TileData::Missing | TileData::Unconfigured => true,
+        // `entity_name` yields the placeholder when the entity is not visible.
+        TileData::Drift { entity, .. }
+        | TileData::Numbers { entity, .. }
+        | TileData::Pulse { entity, .. } => entity == ENTITY_HIDDEN,
+        TileData::LivingAnswer { withheld, .. } => *withheld,
+        _ => false,
+    };
+    if withheld {
+        tile.title = None;
+        tile.config = None;
+    }
+    tile
 }
 
 /// The board's VISIBLE sources, ready to hand to `ask_vault(explicit_sources: …)`. A sealed source
@@ -507,26 +558,34 @@ pub fn get_dashboard_sources(
             // vault, not retrievable documents — they contribute no source of their own.
             _ => continue,
         };
-        // GATE: only a source that survives its own gated reader may enter the Ask scope.
-        let visible = match kind {
-            LinkKind::Note => state.db.note_markdown_if_visible(ref_id, &unlocked)?.is_some(),
-            LinkKind::Meeting => state.db.meeting_is_visible(ref_id, &unlocked)?,
-            LinkKind::Document => state
-                .db
-                .get_document_if_visible(ref_id, &unlocked)?
-                .is_some(),
+        let candidate = SourceRef {
+            kind,
+            id: ref_id.to_string(),
         };
-        if !visible {
+        // GATE: only a source that survives its own gated reader may enter the Ask scope.
+        if !source_is_visible(&state.db, &candidate, &unlocked)? {
             continue;
         }
-        if !out.iter().any(|s| s.id == ref_id && s.kind == kind) {
-            out.push(SourceRef {
-                kind,
-                id: ref_id.to_string(),
-            });
+        if !out.iter().any(|s| s.id == candidate.id && s.kind == kind) {
+            out.push(candidate);
         }
     }
     Ok(out)
+}
+
+/// Is this source readable in the current session? ONE helper so the Ask scope and the
+/// Living-answer cache gate can never drift apart — each arm delegates to the shipped gated
+/// reader for that kind.
+fn source_is_visible(
+    db: &crate::storage::Db,
+    source: &SourceRef,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<bool, AppError> {
+    Ok(match source.kind {
+        LinkKind::Note => db.note_markdown_if_visible(&source.id, unlocked)?.is_some(),
+        LinkKind::Meeting => db.meeting_is_visible(&source.id, unlocked)?,
+        LinkKind::Document => db.get_document_if_visible(&source.id, unlocked)?.is_some(),
+    })
 }
 
 /// Resolve ONE tile. Every arm reads through a gated reader; nothing here queries raw content.
@@ -619,7 +678,9 @@ fn resolve_tile(
                 .find(|e| e.id == ref_id)
             else {
                 // An entity visible ONLY through sealed meetings is indistinguishable from an
-                // unknown one — the same non-leak contract `get_entity_detail` keeps.
+                // unknown one — the same non-leak contract `get_entity_detail` keeps, and the
+                // reason this arm must NOT fall back to any stored name. `redact_tile_chrome`
+                // strips the tile's chrome for `Missing`, so no legacy copied name survives here.
                 return Ok(TileData::Missing);
             };
             let open = db
@@ -793,14 +854,36 @@ fn resolve_tile(
                 .collect();
             Ok(TileData::Promises { owner, rows })
         }
-        "living_answer" => Ok(TileData::LivingAnswer {
-            question: cfg.question.unwrap_or_default(),
-            answer: cfg.answer,
-            answered_at: cfg.answered_at,
-        }),
+        "living_answer" => {
+            // GATE the CACHE. The stored answer is a paraphrase of the sources it was built from,
+            // so it must disappear the moment any of them is sealed-and-not-session-unlocked —
+            // otherwise a board keeps quoting a locked folder back at the user forever.
+            //
+            // Fail-closed on a legacy row: an answer with no recorded sources cannot be checked,
+            // so it is withheld rather than trusted.
+            let has_answer = cfg.answer.as_ref().is_some_and(|a| !a.trim().is_empty());
+            let sources = cfg.answer_sources.unwrap_or_default();
+            let all_visible = !sources.is_empty()
+                && sources
+                    .iter()
+                    .try_fold(true, |acc, s| -> Result<bool, AppError> {
+                        Ok(acc && source_is_visible(db, s, unlocked)?)
+                    })?;
+            let withheld = has_answer && !all_visible;
+            Ok(TileData::LivingAnswer {
+                question: cfg.question.unwrap_or_default(),
+                answer: if withheld { None } else { cfg.answer },
+                answered_at: if withheld { None } else { cfg.answered_at },
+                withheld,
+            })
+        }
         other => Err(AppError::InvalidArg(format!("unknown tile kind: {other}"))),
     }
 }
+
+/// The placeholder an entity-anchored tile shows when its entity is not currently visible. Also
+/// the signal `redact_tile_chrome` reads to strip that tile's stored chrome.
+const ENTITY_HIDDEN: &str = "—";
 
 /// The VISIBLE display name of an entity, or a neutral placeholder. Never leaks a name that only
 /// exists behind a sealed meeting (`list_entities_visible` already drops those).
@@ -815,15 +898,19 @@ fn entity_name(
         .into_iter()
         .find(|e| e.id == entity_id)
         .map(|e| e.name)
-        .unwrap_or_else(|| "—".to_string()))
+        .unwrap_or_else(|| ENTITY_HIDDEN.to_string()))
 }
 
 /// `late` when the due date is in the past, `due` when it is today, else `open`.
+///
+/// The comparison is against the user's LOCAL calendar day, not UTC: a due date is a date a human
+/// wrote down, so around local midnight east of UTC a UTC "today" would mark a commitment late a
+/// day early.
 fn commitment_status(due: Option<&str>) -> String {
     let Some(due) = due else {
         return "open".to_string();
     };
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     match due.get(..10) {
         Some(d) if d < today.as_str() => "late".to_string(),
         Some(d) if d == today => "due".to_string(),
@@ -833,13 +920,19 @@ fn commitment_status(due: Option<&str>) -> String {
 
 fn format_epoch_day(ms_or_s: i64) -> String {
     // Reminder due times are epoch MILLISECONDS in this codebase; tolerate seconds defensively.
-    let secs = if ms_or_s > 4_000_000_000 {
+    let secs = if ms_or_s.abs() > 4_000_000_000 {
         ms_or_s / 1000
     } else {
         ms_or_s
     };
+    // Rendered in the user's LOCAL zone — a due date shown as "Jun 13" when the reminder fires on
+    // the 14th is the same off-by-a-day bug as in `commitment_status`.
     chrono::DateTime::from_timestamp(secs, 0)
-        .map(|d| d.format("%b %-d").to_string())
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%b %-d")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 

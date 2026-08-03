@@ -3264,6 +3264,12 @@ export interface TileConfig {
   question?: string;
   answer?: string;
   answeredAt?: string;
+  /**
+   * The sources a cached Living answer was built from. The backend gates the
+   * cached answer against these, so a paraphrase never outlives the folder it
+   * came from (a legacy answer with no recorded sources is withheld).
+   */
+  answerSources?: SourceRef[];
 }
 
 /** One row inside a list-shaped tile — display-ready, never raw content. */
@@ -3324,6 +3330,8 @@ export type TileData =
       question: string;
       answer: string | null;
       answeredAt: string | null;
+      /** True when a cached answer is being withheld because a source is sealed. */
+      withheld: boolean;
     };
 
 /** A tile plus its resolved (already gated) payload. */

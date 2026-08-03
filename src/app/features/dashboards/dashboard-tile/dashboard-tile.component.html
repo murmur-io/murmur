@@ -217,7 +217,12 @@
   }
 
   @if (livingAnswer(); as la) {
-    @if (la.answer) {
+    @if (la.withheld) {
+      <p class="muted">
+        🔒 The saved answer is hidden — one of the sources it was built from is sealed.
+        Unlock it and re-answer.
+      </p>
+    } @else if (la.answer) {
       <p class="answer">{{ la.answer }}</p>
     } @else {
       <p class="muted">Not answered yet — ask it once and the answer lives here.</p>
