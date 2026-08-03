@@ -34,14 +34,17 @@
   },
   "risk_required_evidence": {
     "lock": [
-      "rust-lib"
+      "rust-lib",
+      "rust-clippy"
     ],
     "egress": [
-      "rust-lib"
+      "rust-lib",
+      "rust-clippy"
     ],
     "protocol": [
       "rust-lib",
-      "protocol-server"
+      "protocol-server",
+      "rust-clippy"
     ],
     "runtime": [
       "tauri-boot"
@@ -57,6 +60,7 @@
   },
   "canonical_checks": {
     "rust-lib": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo test --lib -- --test-threads=1)",
+    "rust-clippy": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo clippy --lib --tests -- -D warnings)",
     "protocol-server": "(cd ../murmur-server && CARGO_BUILD_JOBS=2 cargo test -p murmur-protocol -- --test-threads=1)",
     "npm-lock": "python3 -B .agents/harness/checks/npm-lock-evidence.py",
     "tauri-boot": "scripts/harness-runtime-smoke",
