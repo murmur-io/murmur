@@ -115,6 +115,162 @@ fn resolved_tile_wire_shape_is_flat_for_the_fe() {
     assert!(v["data"].get("title").is_none());
 }
 
+/// THE LEAK ORACLE for the flattened DTO (found by an independent review, 2026-08-03).
+///
+/// `ResolvedTileDto` flattens the whole `DashboardTile`, and the palette seeds `title` from the
+/// chosen source — so a locked tile that kept its title would ship the sealed source's name across
+/// IPC even though the UI declines to draw it. `config` carries the Living-answer paraphrase and
+/// must go the same way.
+#[test]
+fn locked_tile_sheds_its_user_authored_chrome() {
+    let tile = crate::storage::models::DashboardTile {
+        id: "t1".into(),
+        dashboard_id: "b1".into(),
+        kind: "meeting".into(),
+        ref_id: Some("m-sealed".into()),
+        title: Some("Acme — termination terms".into()),
+        span: 5,
+        position: 2,
+        config: Some(r#"{"answer":"they will not renew"}"#.into()),
+        created_at: "2026-08-03T10:00:00Z".into(),
+    };
+
+    let redacted = redact_tile_chrome(tile.clone(), &TileData::Locked);
+    assert_eq!(redacted.title, None, "a sealed tile must not ship its title");
+    assert_eq!(redacted.config, None, "nor the cached answer in its config");
+    assert_eq!(redacted.span, 5, "layout is the user's own, and stays");
+    assert_eq!(redacted.position, 2);
+
+    // The serialized wire form is where it actually matters.
+    let json = serde_json::to_string(&ResolvedTileDto {
+        tile: redacted,
+        data: TileData::Locked,
+    })
+    .unwrap();
+    assert!(
+        !json.contains("termination"),
+        "the sealed title must not appear anywhere on the wire: {json}"
+    );
+    assert!(!json.contains("will not renew"));
+
+    // CONTROL: a VISIBLE tile keeps its chrome, so the redaction is targeted, not blanket.
+    let visible = redact_tile_chrome(
+        tile,
+        &TileData::Meeting {
+            id: "m-1".into(),
+            title: "Atlas weekly".into(),
+            started_at: "2026-06-03T09:00:00Z".into(),
+            duration_s: 60,
+            has_audio: false,
+        },
+    );
+    assert_eq!(visible.title.as_deref(), Some("Acme — termination terms"));
+}
+
+/// The SECOND half of that leak, and the sharper one: entity-anchored tiles deliberately degrade
+/// to an EMPTY view rather than to `Locked`, so a legacy row's copied entity name ("Dana Reyes")
+/// would keep rendering as the heading after the folder was sealed. Withholding is keyed on the
+/// entity placeholder, so those tiles shed their chrome too.
+#[test]
+fn entity_tiles_shed_chrome_when_the_entity_is_not_visible() {
+    let tile = crate::storage::models::DashboardTile {
+        id: "t1".into(),
+        dashboard_id: "b1".into(),
+        kind: "drift".into(),
+        ref_id: Some("e-1".into()),
+        title: Some("Dana Reyes".into()),
+        span: 4,
+        position: 0,
+        config: None,
+        created_at: "2026-08-03T10:00:00Z".into(),
+    };
+
+    let hidden = redact_tile_chrome(
+        tile.clone(),
+        &TileData::Drift {
+            entity: ENTITY_HIDDEN.to_string(),
+            predicate: String::new(),
+            rows: vec![],
+        },
+    );
+    assert_eq!(
+        hidden.title, None,
+        "an entity that is no longer visible must not keep its name as the tile heading"
+    );
+
+    // Person degrades to Missing — same treatment.
+    assert_eq!(redact_tile_chrome(tile.clone(), &TileData::Missing).title, None);
+
+    // CONTROL: a VISIBLE entity keeps the tile's chrome.
+    let visible = redact_tile_chrome(
+        tile,
+        &TileData::Drift {
+            entity: "Project Atlas".to_string(),
+            predicate: "ga_date".to_string(),
+            rows: vec![],
+        },
+    );
+    assert_eq!(visible.title.as_deref(), Some("Dana Reyes"));
+}
+
+/// A withheld Living answer must also shed the `config` it is stored in — otherwise the gate on
+/// the payload is pointless, because the raw answer rides along in the flattened tile.
+#[test]
+fn withheld_living_answer_sheds_its_config() {
+    let tile = crate::storage::models::DashboardTile {
+        id: "t1".into(),
+        dashboard_id: "b1".into(),
+        kind: "living_answer".into(),
+        ref_id: None,
+        title: Some("Will they renew?".into()),
+        span: 4,
+        position: 0,
+        config: Some(r#"{"question":"Will they renew?","answer":"No — they are churning"}"#.into()),
+        created_at: "2026-08-03T10:00:00Z".into(),
+    };
+    let out = redact_tile_chrome(
+        tile,
+        &TileData::LivingAnswer {
+            question: "Will they renew?".into(),
+            answer: None,
+            answered_at: None,
+            withheld: true,
+        },
+    );
+    assert_eq!(out.config, None, "the cached answer must not ride along in config");
+    let json = serde_json::to_string(&ResolvedTileDto {
+        tile: out,
+        data: TileData::LivingAnswer {
+            question: "Will they renew?".into(),
+            answer: None,
+            answered_at: None,
+            withheld: true,
+        },
+    })
+    .unwrap();
+    assert!(!json.contains("churning"), "answer text on the wire: {json}");
+}
+
+#[test]
+fn living_answer_config_round_trips_its_sources() {
+    let cfg = TileConfig {
+        question: Some("Will we make Jun 14?".into()),
+        answer: Some("Probably not.".into()),
+        answer_sources: Some(vec![SourceRef {
+            kind: LinkKind::Meeting,
+            id: "m-1".into(),
+        }]),
+        ..Default::default()
+    };
+    let back = parse_config(Some(&serde_json::to_string(&cfg).unwrap()));
+    assert_eq!(back.answer_sources.as_ref().map(Vec::len), Some(1));
+    // A legacy row (an answer, no recorded sources) parses — and the resolver treats that as
+    // un-gateable, i.e. withheld. See `resolve_tile`'s living_answer arm.
+    let legacy = parse_config(Some(r#"{"question":"q","answer":"a"}"#));
+    assert_eq!(legacy.answer_sources, None);
+    assert!(legacy.answer.is_some());
+}
+
 #[test]
 fn snippets_are_bounded_and_ellipsized() {
     assert_eq!(snippet_of("  short  ", 10), "short");
@@ -142,8 +298,14 @@ fn commitment_status_reads_the_due_date() {
     assert_eq!(commitment_status(None), "open");
     assert_eq!(commitment_status(Some("1999-01-01")), "late");
     assert_eq!(commitment_status(Some("2999-01-01")), "open");
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // LOCAL, not UTC: a due date is a calendar day a human wrote down. Asserting against the UTC
+    // day is what made this test disagree with the fix east of Greenwich around local midnight.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     assert_eq!(commitment_status(Some(&today)), "due");
+    let yesterday = (chrono::Local::now() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(commitment_status(Some(&yesterday)), "late");
     // A malformed date is never "late" — an unparsable string must not nag the user.
     assert_eq!(commitment_status(Some("soon")), "open");
 }

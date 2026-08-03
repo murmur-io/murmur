@@ -159,6 +159,85 @@ test("Dashboards: a SEALED tile leaks nothing — not even the title the user ty
   expect(visibleTitleInDom).toBe(true);
 });
 
+test("Dashboards: an entity tile whose entity went invisible keeps no stored name", async ({
+  page,
+}) => {
+  // An older build persisted the entity's name into `dashboard_tiles.title`. The backend now
+  // strips that chrome whenever the payload is withheld, so even a legacy row cannot render it.
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: {
+        ...BOARDS[0],
+        tiles: [
+          {
+            id: "t-drift-hidden",
+            dashboardId: "b-atlas",
+            kind: "drift",
+            refId: "e-gone",
+            // The backend redacts this to null before it ships; a build that regressed would
+            // send it through and the heading would show the name.
+            title: null,
+            span: 4,
+            position: 0,
+            config: null,
+            createdAt: "2026-08-01T09:00:00Z",
+            data: { kind: "drift", entity: "—", predicate: "", rows: [] },
+          },
+        ],
+      },
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await expect(page.locator("app-dashboard-tile")).toHaveCount(1);
+  await expect(page.locator("app-dashboard-tile .tile-title")).not.toContainText("Dana");
+  await expect(page.getByText(/Nothing has moved here yet/)).toBeVisible();
+});
+
+test("Dashboards: a withheld Living answer shows why, and not the cached text", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: {
+        ...BOARDS[0],
+        tiles: [
+          {
+            id: "t-answer",
+            dashboardId: "b-atlas",
+            kind: "living_answer",
+            refId: null,
+            title: null,
+            span: 5,
+            position: 0,
+            config: null,
+            createdAt: "2026-08-01T09:00:00Z",
+            data: {
+              kind: "livingAnswer",
+              question: "Will Acme renew?",
+              answer: null,
+              answeredAt: null,
+              withheld: true,
+            },
+          },
+        ],
+      },
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await expect(page.getByText(/The saved answer is hidden/)).toBeVisible();
+  await expect(page.getByText(/one of the sources it was built from is sealed/)).toBeVisible();
+});
+
 test("Dashboards: board Ask is scoped to the board's sources and cites the tiles it used", async ({
   page,
 }) => {

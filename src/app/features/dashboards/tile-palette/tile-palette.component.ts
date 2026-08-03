@@ -204,43 +204,63 @@ export class TilePaletteComponent {
     this.question.set((event.target as HTMLInputElement).value);
   }
 
+  /**
+   * Monotonic token for the in-flight search. Every keystroke fires an IPC call,
+   * and without this a slower EARLIER query (or one from a tile kind the user
+   * has since navigated away from) can land last and replace newer results.
+   */
+  private searchToken = 0;
+
   private async searchLinks(prefix: string): Promise<void> {
     const type = this.selected();
     if (!type) return;
     const want = LINK_KIND[type.kind];
+    const token = ++this.searchToken;
     this.loading.set(true);
     try {
       const rows = await this.ipc.listLinkCandidates(prefix, 0, 60);
+      if (token !== this.searchToken) return; // a newer keystroke won
       this.candidates.set(rows.filter((r) => r.kind === want));
     } finally {
-      this.loading.set(false);
+      if (token === this.searchToken) this.loading.set(false);
     }
   }
 
   private async loadEntities(): Promise<void> {
+    const token = ++this.searchToken;
     this.loading.set(true);
     try {
       const graph = await this.ipc.getGraph();
+      if (token !== this.searchToken) return;
       this.entities.set(
         [...graph.nodes]
           .sort((a, b) => b.mentionCount - a.mentionCount)
           .map((n) => ({ id: n.id, name: n.name, mentionCount: n.mentionCount })),
       );
     } finally {
-      this.loading.set(false);
+      if (token === this.searchToken) this.loading.set(false);
     }
   }
 
+  /**
+   * SOURCE TITLES ARE DELIBERATELY NEVER SENT — the same rule reminders follow
+   * (`models.ts`: "Create/update payload. Source titles are deliberately never
+   * sent"). Persisting the chosen source's title into `dashboard_tiles.title`
+   * would put a plaintext COPY of gated content in an ungated column, which then
+   * survives sealing and keeps rendering as the tile's heading. Only `refId` is
+   * stored; the heading comes from the tile's freshly-gated payload on each read,
+   * so it masks itself the moment the source is sealed.
+   */
   chooseCandidate(candidate: NoteCitation): void {
     const type = this.selected();
     if (!type) return;
-    this.choose.emit({ kind: type.kind, refId: candidate.id, title: candidate.title });
+    this.choose.emit({ kind: type.kind, refId: candidate.id });
   }
 
   chooseEntity(entity: { id: string; name: string }): void {
     const type = this.selected();
     if (!type) return;
-    this.choose.emit({ kind: type.kind, refId: entity.id, title: entity.name });
+    this.choose.emit({ kind: type.kind, refId: entity.id });
   }
 
   chooseQuestion(): void {
