@@ -392,6 +392,7 @@ pub fn run() {
             commands::update_dashboard_tile,
             commands::delete_dashboard_tile,
             commands::reorder_dashboard_tiles,
+            commands::set_dashboard_answer,
             commands::add_reminder,
             commands::pin_moment,
             commands::link_meeting_entities,
