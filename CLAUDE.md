@@ -133,13 +133,32 @@ to implement.** Splitting those two loses every implicit decision made while exp
 by context boundary, not by task type.
 
 ```bash
-git checkout -b <slug>
+# ISOLATED CHECKOUT FIRST — never `git checkout -b` in the primary checkout.
+git worktree add -b <slug> ../.murmur-agent-tasks/<slug> origin/murmur
+cd ../.murmur-agent-tasks/<slug>
 # plan AND implement here
 scripts/agent-config-audit --ci                        # 0.1s — run it every time
 (cd src-tauri && cargo test --lib) && npx ng lint && npx ng build
 git commit && gh pr create -R murmur-io/murmur
 # CI red? ANOTHER COMMIT ON THE SAME BRANCH — never a new task id.
+# After the PR merges:  git worktree remove ../.murmur-agent-tasks/<slug>
 ```
+
+**Why a worktree and not `git checkout -b`.** This block used to say `git checkout -b <slug>`,
+which contradicted `ship-feature`'s own "ordinary low-risk fixes keep the normal isolated-worktree
+route" — and since THIS file is the one loaded into every session, the unsafe half won by default.
+The primary checkout is routinely shared: another agent session or the operator can be mid-change on
+their own branch, with uncommitted work in the tree. `git checkout -b` there moves HEAD under them
+and re-attributes their work to your new branch. That is not hypothetical — it happened on
+2026-08-03, branching off a live `feat/dashboards` with 29 uncommitted entries in the tree
+(recovered, nothing lost, because `checkout -b` commits nothing). `hook_guard.py`
+`_primary_branch_surgery_reason` now refuses branch selection in a dirty primary checkout;
+`MURMUR_ALLOW_PRIMARY_BRANCH_SURGERY=1` is the deliberate override for when the tree is provably
+yours or you are restoring the branch you moved off.
+
+Control-plane changes (`.claude/**`, `.codex/**`, `.agents/**`, `CLAUDE.md`, `AGENTS.md`, reviewer
+prompts) cannot be certified by the Harness and go in a worktree **outside** the runner-owned
+`../.murmur-agent-tasks` root — for example `../.murmur-control-plane/<slug>`.
 
 `agent-config-audit` is first because it is the cheapest check in the repo and the only one that
 sees a whole class of defect the others cannot. Measured on PR #535: `cargo test --lib`, `ng lint`
