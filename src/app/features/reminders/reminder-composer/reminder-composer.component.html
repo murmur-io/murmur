@@ -17,7 +17,6 @@
     >
       <header class="composer-head">
         <div>
-          <p class="composer-eyebrow">Murmur reminders</p>
           <h2 id="reminder-composer-title">{{ heading() }}</h2>
         </div>
         <button
@@ -57,7 +56,29 @@
           ></textarea>
         </label>
 
-        <div class="due-grid">
+        <div class="when-block">
+          <!-- The accessible name must not contain "Date" or "Time": Playwright's
+               getByLabel does SUBSTRING matching, and e2e/reminders/reminders.spec.ts
+               binds getByLabel("Date") / getByLabel("Time") in ~4 places. A group
+               labelled "Quick due times" made those locators strict-mode ambiguous
+               and would have failed the 2430-line suite on the web CI lane. -->
+          <div class="seg preset-row" role="group" aria-label="Quick due presets">
+            @for (preset of presets(); track preset.id) {
+              <button
+                type="button"
+                class="preset-chip"
+                [class.is-active]="preset.active"
+                [attr.aria-pressed]="preset.active"
+                [disabled]="busy()"
+                (click)="applyPreset(preset.id)"
+              >
+                <span class="preset-label">{{ preset.label }}</span>
+                <span class="preset-resolved">{{ preset.resolved }}</span>
+              </button>
+            }
+          </div>
+
+          <div class="due-grid">
           <label class="field">
             <span>Date</span>
             <input
@@ -78,6 +99,15 @@
               (input)="setTime($any($event.target).value)"
             />
           </label>
+          </div>
+
+          @if (dueOutOfRange()) {
+            <p class="field-help when-echo is-error" role="alert">
+              Pick a date between 2000 and 2200.
+            </p>
+          } @else if (dueEcho(); as echo) {
+            <p class="field-help when-echo" aria-live="polite">{{ echo }}</p>
+          }
         </div>
 
         <div class="repeat-row">

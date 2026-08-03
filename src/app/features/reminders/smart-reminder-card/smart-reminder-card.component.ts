@@ -78,6 +78,16 @@ export class SmartReminderCardComponent {
       })),
   );
 
+  /**
+   * Whether this surface has earned the full frosted card. Deliberately does
+   * NOT include `loading()`: it is a derivation of what is actually renderable,
+   * and a transient true during every audit would make the card flicker in and
+   * out above the fold.
+   */
+  readonly hasContent = computed(
+    () => this.error() !== null || this.rows().length > 0,
+  );
+
   constructor() {
     // The listener is established before the first audit is allowed to run.
     // Therefore a canonical write can never land in the mount→audit gap without
