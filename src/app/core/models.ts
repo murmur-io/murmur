@@ -2170,6 +2170,32 @@ export interface GatewayModel {
  * can safely `.catch(() => ({reachable:false, modelCount:0}))` as an extra guard.
  * Mirrors Rust `GatewayHealth` (camelCase via `serde(rename_all = "camelCase")`).
  */
+/**
+ * One selectable model, from `list_models`.
+ *
+ * `source` is the load-bearing field: `"live"` means the list came off a real endpoint during this
+ * call, so a Refresh button does something; `"bundled"` means it was baked into the binary and may
+ * be out of date. A bundled catalog is a HINT — an id the user typed that appears in no catalog is
+ * a valid custom id, and nothing may clear it.
+ */
+export interface ModelOption {
+  id: string;
+  label: string;
+  source: "live" | "bundled";
+}
+
+/**
+ * A connection's catalog plus WHERE IT CAME FROM.
+ *
+ * Provenance sits on the catalog, not on each option, because the case that matters is the EMPTY
+ * one: a gateway or Ollama daemon answering successfully with zero models is exactly when the user
+ * wants Refresh, and an empty option list has no option to read a source from.
+ */
+export interface ModelCatalog {
+  source: "live" | "bundled";
+  options: ModelOption[];
+}
+
 export interface GatewayHealth {
   reachable: boolean;
   modelCount: number;

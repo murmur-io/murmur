@@ -289,11 +289,11 @@ fn make_provider_resolved(
             let api_key = crate::secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?;
             // A resolved model takes precedence over the legacy `anthropic_model`; effort is
             // the adaptive-thinking tier (provider default when empty).
-            let model = if target.model.trim().is_empty() {
-                config.anthropic_model.clone()
-            } else {
-                target.model.clone()
-            };
+            // THE SAME EXPRESSION THE LEDGER USES. Each arm used to re-implement this fallback,
+            // so "ledger and wire agree" held only while two copies happened to match — a future
+            // edit to one would have made the ledger report a model the request never carried.
+            // Calling `effective_model_requested` here makes the agreement structural.
+            let model = effective_model_requested(target, config);
             Arc::new(AnthropicProvider::with_effort(
                 api_key,
                 model,
@@ -301,11 +301,11 @@ fn make_provider_resolved(
             ))
         }
         PROVIDER_OLLAMA => {
-            let model = if target.model.trim().is_empty() {
-                config.ollama_model.clone()
-            } else {
-                target.model.clone()
-            };
+            // THE SAME EXPRESSION THE LEDGER USES. Each arm used to re-implement this fallback,
+            // so "ledger and wire agree" held only while two copies happened to match — a future
+            // edit to one would have made the ledger report a model the request never carried.
+            // Calling `effective_model_requested` here makes the agreement structural.
+            let model = effective_model_requested(target, config);
             let ollama_is_local = !egress_is_cloud(id, config);
             let ollama = Arc::new(OllamaProvider::with_model_admission(
                 config.ollama_base_url.clone(),
@@ -328,11 +328,11 @@ fn make_provider_resolved(
             let api_key = crate::secrets::get_secret(GATEWAY_KEY_ACCOUNT)
                 .ok()
                 .flatten();
-            let model = if target.model.trim().is_empty() {
-                config.gateway_model.clone()
-            } else {
-                target.model.clone()
-            };
+            // THE SAME EXPRESSION THE LEDGER USES. Each arm used to re-implement this fallback,
+            // so "ledger and wire agree" held only while two copies happened to match — a future
+            // edit to one would have made the ledger report a model the request never carried.
+            // Calling `effective_model_requested` here makes the agreement structural.
+            let model = effective_model_requested(target, config);
             // R1/R4 enforced at construction via `validate_gateway_url` inside `new()`.
             Arc::new(crate::summarize::gateway::OpenAiCompatProvider::new(
                 config.gateway_base_url.clone(),
@@ -654,6 +654,49 @@ mod tests {
         )
         .expect("registered Codex id must build through the production factory");
         assert_eq!(provider.id(), PROVIDER_CODEX_CLI);
+    }
+
+    /// A `local` ROLE MODEL THAT IS NOT A REGISTRY ID FAILS CLOSED — asserted, not argued.
+    ///
+    /// The Settings UI keeps a role's model across a switch to `local` only when it matches
+    /// `BRAIN_MODELS`, precisely because this arm consumes it: a non-matching id OVERRIDES
+    /// `brain_model_id` and there is then no on-device model to load. That claim was made twice in
+    /// this change — once wrongly, in the opposite direction — and never executed. What matters for
+    /// privacy is not merely that it errors, but WHICH way it errors: `Unavailable`, with no
+    /// provider constructed, never a silent fall back to a cloud arm.
+    #[test]
+    fn an_unknown_local_role_model_fails_closed_without_building_any_provider() {
+        let config = AppConfig {
+            // Consent is GRANTED here on purpose. If this arm ever fell through to a cloud provider,
+            // a withheld consent would mask it behind a consent error and the test would pass for
+            // the wrong reason.
+            cloud_egress_consented: true,
+            provider_id: PROVIDER_ANTHROPIC.to_string(),
+            anthropic_model: "claude-sonnet-5".to_string(),
+            ..AppConfig::default()
+        };
+        for unknown in ["llama3.1:8b", "not-a-registry-id", "/etc/passwd"] {
+            let target = roles::RoleTarget {
+                connection: roles::CONN_LOCAL.to_string(),
+                model: unknown.to_string(),
+                effort: String::new(),
+            };
+            let built = make_provider_resolved(
+                &target,
+                &config,
+                &Arc::new(tokio::sync::Semaphore::new(1)),
+                None,
+                None,
+            );
+            match built {
+                Err(crate::error::AppError::Unavailable(_)) => {}
+                Err(other) => panic!("{unknown:?} must fail as Unavailable, got {other:?}"),
+                Ok(_) => panic!(
+                    "{unknown:?} built a provider on the local arm — an on-device role must never \
+                     silently resolve to something that can egress"
+                ),
+            }
+        }
     }
 
     #[tokio::test]
