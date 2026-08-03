@@ -1,0 +1,85 @@
+<header class="head">
+  <div class="head-text">
+    <h1>Dashboards</h1>
+    <p>Boards you compose — and your brain reasons inside.</p>
+  </div>
+  <button type="button" class="btn btn-primary" (click)="startCompose()">
+    <mur-icon icon="plus" /> New dashboard
+  </button>
+</header>
+
+@if (error(); as err) {
+  <div class="banner banner-error" role="alert">
+    {{ err }}
+    <button type="button" class="btn btn-ghost btn-sm" (click)="dismissError()">Dismiss</button>
+  </div>
+}
+
+@if (composing()) {
+  <form class="composer" (submit)="createBoard(); $event.preventDefault()">
+    <input
+      #titleField
+      class="composer-input"
+      type="text"
+      placeholder="Name this board — “Atlas GA”, “Acme — the deal”…"
+      [value]="draftTitle()"
+      (input)="onDraftInput($event)"
+      aria-label="Board name"
+    />
+    <button type="submit" class="btn btn-primary" [disabled]="!draftTitle().trim() || busy()">
+      Create
+    </button>
+    <button type="button" class="btn btn-ghost" (click)="cancelCompose()">Cancel</button>
+  </form>
+}
+
+<!--
+  §8: the loading branch is gated on listEmpty() && loading(), so a RETURN visit
+  paints the cached boards immediately while the reload runs underneath.
+-->
+@if (listEmpty() && loading()) {
+  <mur-empty-state>Loading your boards…</mur-empty-state>
+} @else if (listEmpty()) {
+  <mur-empty-state>
+    <strong>No dashboards yet.</strong>
+    <p class="empty-copy">
+      A board pulls notes, recordings, people and derived views into one place — and
+      scopes Ask to exactly what you put on it.
+    </p>
+    <button type="button" class="btn btn-primary" (click)="startCompose()">
+      Create your first board
+    </button>
+  </mur-empty-state>
+} @else {
+  @if (pinned().length > 0) {
+    <div class="group-bar"><h2>Pinned</h2><span class="rule"></span></div>
+    <div class="grid grid-big">
+      @for (board of pinned(); track board.id) {
+        <app-board-card
+          [board]="board"
+          [big]="true"
+          (open)="open(board)"
+          (togglePin)="togglePin(board)"
+          (remove)="remove(board)"
+        />
+      }
+    </div>
+  }
+
+  <div class="group-bar"><h2>All boards</h2><span class="rule"></span></div>
+  <div class="grid">
+    @for (board of unpinned(); track board.id) {
+      <app-board-card
+        [board]="board"
+        (open)="open(board)"
+        (togglePin)="togglePin(board)"
+        (remove)="remove(board)"
+      />
+    }
+    <button type="button" class="new-card" (click)="startCompose()">
+      <span class="new-plus"><mur-icon icon="plus" /></span>
+      <span class="new-title">New dashboard</span>
+      <span class="new-hint">Notes, recordings, people, drift, promises…</span>
+    </button>
+  </div>
+}

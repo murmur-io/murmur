@@ -80,6 +80,11 @@ LOCAL_POLICY_KEYS: Tuple[str, ...] = tuple(
             "env",
             "permissions.allow",
             "permissions.defaultMode",
+            # `allowRead` widens what the agent can SEE. It is modelled here for the same reason
+            # `allowWrite` is: a local file may legitimately need it (workflow transcripts live
+            # under ~/.claude/projects), and an override the audit cannot name is an override the
+            # audit cannot check.
+            "sandbox.filesystem.allowRead",
             "sandbox.filesystem.allowWrite",
             "sandbox.filesystem.denyWrite",
         }
@@ -1199,6 +1204,15 @@ def _local_settings(documents: Mapping[str, Any], audit: Audit) -> None:
         if reach is not None:
             findings.append(
                 ("sandbox.filesystem.allowWrite", f"local Claude override {reach}")
+            )
+    # READ side. A read override is not harmless just because it writes nothing: the paths the
+    # tracked policy denies are denied because they hold credentials and keys, and reading those is
+    # the whole risk. Flagged so it must be acknowledged, exactly like the write side.
+    for entry in _string_list(local_filesystem, "allowRead"):
+        reach = _covers_git_directory(entry)
+        if reach is not None:
+            findings.append(
+                ("sandbox.filesystem.allowRead", f"local Claude override {reach}")
             )
 
     # The sandbox-side deny list, and the same protection as the rule above seen

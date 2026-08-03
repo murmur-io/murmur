@@ -1,0 +1,295 @@
+// Board card — tokens only (design-tokens/*.css). The per-family accents reuse the
+// graph node palette so a board's miniature reads with the SAME colour language as
+// the brain map: notes mint, recordings amber, people azure, documents orchid.
+:host {
+  display: block;
+}
+
+.board-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  backdrop-filter: blur(18px) saturate(140%);
+  overflow: hidden;
+  transition:
+    transform var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+
+  &:hover {
+    transform: translateY(-3px);
+    border-color: var(--border-strong);
+    box-shadow: var(--shadow-lg);
+  }
+
+  // The board's accent tint washes the top-left corner. `--tint` resolves to a
+  // token; an unknown/absent value simply falls back to the accent.
+  &[data-tint="indigo"] { --tint: var(--accent); }
+  &[data-tint="amber"] { --tint: var(--warning); }
+  &[data-tint="mint"] { --tint: var(--graph-note); }
+  &[data-tint="orchid"] { --tint: var(--graph-document); }
+  &[data-tint="azure"] { --tint: var(--graph-entity); }
+  &[data-tint="coral"] { --tint: var(--live); }
+}
+
+.board-open {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+// ── the miniature ────────────────────────────────────────────────────────────
+.mini {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  grid-auto-rows: 26px;
+  gap: 5px;
+  height: 128px;
+  padding: var(--space-3);
+  overflow: hidden;
+  background:
+    radial-gradient(120% 140% at 50% -20%, var(--tint, transparent), transparent 62%),
+    rgba(0, 0, 0, 0.22);
+
+  .big & {
+    height: 168px;
+    grid-auto-rows: 36px;
+  }
+}
+
+.mt {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  color: var(--mt-c);
+  background: color-mix(in srgb, var(--mt-c) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--mt-c) 30%, transparent);
+  transition:
+    background var(--transition),
+    border-color var(--transition);
+
+  .board-card:hover & {
+    background: color-mix(in srgb, var(--mt-c) 22%, transparent);
+    border-color: color-mix(in srgb, var(--mt-c) 48%, transparent);
+  }
+
+  &::after {
+    content: "";
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 5px;
+    height: 5px;
+    border-radius: var(--radius-pill);
+    background: var(--mt-c);
+    opacity: 0.8;
+  }
+}
+
+.mt-note { --mt-c: var(--graph-note); }
+.mt-rec { --mt-c: var(--graph-meeting); }
+.mt-person { --mt-c: var(--graph-entity); }
+.mt-doc { --mt-c: var(--graph-document); }
+.mt-insight { --mt-c: var(--accent); }
+.mt-remind { --mt-c: var(--warning); }
+
+.mt-ln {
+  height: 2.5px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.26);
+
+  &.s { width: 52%; }
+  &.m { width: 78%; }
+  &.l { width: 94%; }
+}
+
+.mt-wave {
+  display: flex;
+  align-items: flex-end;
+  gap: 1.5px;
+  height: 60%;
+
+  b {
+    flex: 1;
+    border-radius: 1px;
+    background: currentColor;
+    opacity: 0.7;
+  }
+}
+
+.mt-dots {
+  display: flex;
+  gap: 3px;
+
+  b {
+    width: 9px;
+    height: 9px;
+    border-radius: var(--radius-pill);
+    background: currentColor;
+    opacity: 0.75;
+  }
+}
+
+.mt svg {
+  width: 100%;
+  height: 60%;
+  overflow: visible;
+}
+
+.mini-veil {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, transparent 52%, var(--surface-base));
+  opacity: 0.66;
+}
+
+// ── the body ─────────────────────────────────────────────────────────────────
+.board-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+}
+
+.board-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 1.05rem;
+  font-weight: 640;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.board-emoji {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+.board-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+
+  b {
+    width: 6px;
+    height: 6px;
+    border-radius: var(--radius-pill);
+    background: var(--chip-c, var(--text-muted));
+  }
+}
+
+.chip-note { --chip-c: var(--graph-note); }
+.chip-rec { --chip-c: var(--graph-meeting); }
+.chip-person { --chip-c: var(--graph-entity); }
+.chip-doc { --chip-c: var(--graph-document); }
+.chip-insight { --chip-c: var(--accent); }
+.chip-remind { --chip-c: var(--warning); }
+
+.chip-empty {
+  color: var(--text-muted);
+
+  b { display: none; }
+}
+
+.board-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 0.74rem;
+}
+
+.tile-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+// ── hover actions ────────────────────────────────────────────────────────────
+.board-actions {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: flex;
+  gap: var(--space-1);
+  opacity: 0;
+  transition: opacity var(--transition);
+
+  .board-card:hover &,
+  .board-card:focus-within & {
+    opacity: 1;
+  }
+}
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  // Opaque, because it floats over the miniature (T3: never the frosted card).
+  background: var(--surface-overlay);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+  }
+
+  &.on {
+    color: var(--accent-hover);
+    border-color: var(--accent-ring);
+  }
+
+  &.danger:hover {
+    color: var(--danger);
+  }
+}
