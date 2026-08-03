@@ -728,9 +728,6 @@ mod tests {
         );
     }
 
-    /// `chat_endpoint` applies the path-resolution heuristic: root/`/v1` → append
-    /// `chat/completions`; any other path (custom Kong route, already-full endpoint) → as-is.
-    #[test]
     /// THE JUSTIFICATION FOR DROPPING THE CHARACTER ALLOWLIST, made executable.
     ///
     /// `valid_catalog_model_id` no longer restricts characters on the JSON-body arms, on the
@@ -773,6 +770,8 @@ mod tests {
         }
     }
 
+    /// `chat_endpoint` applies the path-resolution heuristic: root/`/v1` → append
+    /// `chat/completions`; any other path (custom Kong route, already-full endpoint) → as-is.
     #[test]
     fn chat_endpoint_preserves_base_path() {
         // /v1 base — must append /chat/completions.
