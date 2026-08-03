@@ -88,7 +88,7 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map([], |r| row_to_dashboard(r))
+            .query_map([], row_to_dashboard)
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
@@ -99,7 +99,7 @@ impl Db {
         let conn = self.lock();
         let sql = format!("SELECT {DASHBOARD_COLS} FROM dashboards WHERE id = ?1");
         let out = conn
-            .query_row(&sql, [id], |r| row_to_dashboard(r))
+            .query_row(&sql, [id], row_to_dashboard)
             .optional()
             .map_err(map_err)?;
         Ok(out)
@@ -209,7 +209,7 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map([dashboard_id], |r| row_to_tile(r))
+            .query_map([dashboard_id], row_to_tile)
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
@@ -240,7 +240,7 @@ impl Db {
         let conn = self.lock();
         let sql = format!("SELECT {TILE_COLS} FROM dashboard_tiles WHERE id = ?1");
         let out = conn
-            .query_row(&sql, [id], |r| row_to_tile(r))
+            .query_row(&sql, [id], row_to_tile)
             .optional()
             .map_err(map_err)?;
         Ok(out)
