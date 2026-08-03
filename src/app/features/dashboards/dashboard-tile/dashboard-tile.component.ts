@@ -81,9 +81,17 @@ export class DashboardTileComponent {
 
   readonly heading = computed(() => {
     const t = this.tile();
-    // A user-authored title is board chrome — but NEVER for a locked tile, where
-    // the user's own wording routinely paraphrases the sealed content.
-    if (t.data.kind === "locked") return DEFAULT_TITLE.locked;
+    // A user-authored title is board chrome — but NEVER for a WITHHELD tile, where
+    // the wording routinely paraphrases content the session cannot read. The
+    // backend already strips it (`redact_tile_chrome`); this is the second layer,
+    // and it covers `missing`/`unconfigured` too, not just `locked`.
+    if (
+      t.data.kind === "locked" ||
+      t.data.kind === "missing" ||
+      t.data.kind === "unconfigured"
+    ) {
+      return DEFAULT_TITLE[t.data.kind];
+    }
     if (t.title && t.title.trim()) return t.title;
     const d = t.data;
     switch (d.kind) {
