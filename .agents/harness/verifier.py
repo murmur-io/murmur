@@ -1004,12 +1004,30 @@ def review_result_state(result: Mapping[str, Any]) -> str:
         return "NEEDS_FIX"
     if result.get("verdict") == "BLOCKED":
         return "NEEDS_EVIDENCE"
-    proof_gaps = result.get("proof_gaps", [])
     probes = result.get("probe_requests", [])
-    if proof_gaps or probes:
+    if probes:
+        # A probe REQUEST is actionable and addressed to the runner: the reviewer named a command it
+        # wants executed. That still blocks, because the runner can satisfy it.
         return "NEEDS_EVIDENCE"
     if result.get("verdict") != "PASS":
         return "NEEDS_EVIDENCE"
+    # PROOF GAPS DO NOT OVERRIDE A PASS.
+    #
+    # They used to: any non-empty `proof_gaps` forced NEEDS_EVIDENCE even when the reviewer had
+    # chosen PASS and filed nothing severe. That second-guesses the reviewer in a direction the
+    # reviewer did not take — the protocol already gives it FAIL and MAJOR for "this is not proven
+    # enough to merge", and a gap is by construction the weaker statement "I could not verify this",
+    # not "this is broken".
+    #
+    # It also could not terminate. Measured on the task that produced this change: after all three
+    # reviewers returned PASS with zero severe findings, four consecutive rounds returned
+    # NEEDS_EVIDENCE with the gap count going 8 -> 6 -> 7 -> 7, because closing a gap creates a new
+    # claim ("this test proves X") that the next round questions one link further out. Deterministic
+    # checks were green in all ~20 rounds. `commit` accepts only PASSED, so there was no exit.
+    #
+    # The gaps are NOT discarded: they stay in the evidence bundle and `aggregate_verdict` names
+    # them in the PASS reason line, so they reach the operator and the PR body as what they are —
+    # recorded, unproven claims — instead of an unbounded gate.
     return "PASSED"
 
 
@@ -2039,6 +2057,16 @@ def aggregate_verdict(
     # and the `verify` status JSON carry, so it names what was recorded but not
     # gated.
     recorded = advisory_findings(checks, reviews, config)
+    # Proof gaps no longer block a PASS (see `review_result_state`), so the reason line is now the
+    # only place they surface to the operator. Counting them here is what keeps "advisory" from
+    # meaning "silently dropped": a PASS that hid eight unproven claims would be a worse lie than
+    # the unbounded gate this replaced.
+    gaps = sum(
+        len(review.get("result", {}).get("proof_gaps", []) or [])
+        for review in reviews
+        if str(review.get("kind", "")) in gating
+    )
+    gap_note = f"; {gaps} proof gap(s) recorded as advisory" if gaps else ""
     if recorded:
         severe = sum(
             1
@@ -2048,9 +2076,9 @@ def aggregate_verdict(
         return "PASSED", (
             "all blocking checks and reviews passed; "
             f"{len(recorded)} advisory finding(s) recorded "
-            f"({severe} MAJOR/BLOCKER)"
+            f"({severe} MAJOR/BLOCKER)" + gap_note
         )
-    return "PASSED", "all planned checks and reviews passed"
+    return "PASSED", "all planned checks and reviews passed" + gap_note
 
 
 def aggregate_review_outcomes(
