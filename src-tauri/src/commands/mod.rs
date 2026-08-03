@@ -5044,22 +5044,180 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
 /// the security-sensitive `cloud_egress_consented` is PRESERVED from `current` and never taken from
 /// the DTO (BLK-4) — so a settings save can neither grant nor clear cloud-egress consent. The
 /// dedicated `consent_to_cloud_egress` command is the only path that flips it.
+/// Keep a proposed model id only if it passes `accept`; otherwise fall back to the stored value,
+/// and to empty ("let the provider pick") when that is unusable too.
+///
+/// The fallback is validated as well: a config written before this boundary existed can already
+/// hold a hostile id, and returning it unchecked would preserve exactly what the guard exists to
+/// remove.
+/// Whether this connection turns its model id into a CLI ARGUMENT, and therefore takes the strict
+/// short-slug ceiling rather than the looser JSON-body one.
+///
+/// FAILS CLOSED. The listed connections are the ones PROVEN to send the id in a JSON request body
+/// (`anthropic`, `ollama`, `gateway`) plus the two that run no external model at all (`local`,
+/// `off`); everything else — including `""` and any connection added later — is treated as
+/// argv-building and gets the strict predicate.
+///
+/// Written as a JSON-body allowlist for exactly that reason. The obvious spelling,
+/// `matches!(connection, "claude_code" | "codex_cli")`, fails OPEN: a new CLI-backed provider, or a
+/// typo, would silently inherit the 200-character ceiling and could store an id `model_args`
+/// refuses at the wire while `effective_model_requested` still reports it to the egress ledger.
+/// Being wrong in this direction costs a rejected long id; being wrong in the other costs a lying
+/// ledger.
+pub(crate) fn connection_builds_argv(connection: &str) -> bool {
+    !matches!(
+        connection,
+        "anthropic" | "ollama" | "gateway" | "local" | "off"
+    )
+}
+
+/// THE rule, in one place: a model id is validated against the connection that will SEND it.
+///
+/// Every model field routes through here — `provider_model` by `provider_id`, each role model by
+/// its own role connection, and the per-connection fields by the connection they belong to. Stating
+/// the rule and then hard-coding one field to a fixed predicate is how the last two rounds of
+/// defects happened; there are no exceptions left to get wrong.
+/// Resolve what a stored connection string MEANS before judging a model id against it.
+///
+/// An empty role connection is not an unknown connection — in this app it means "inherit the
+/// default", and `roles::resolve` follows that to `provider_id`. Treating `""` as unknown made the
+/// fail-closed default fire on inherited roles, so a legitimate 65–200 character Ollama id was
+/// cleared even though the arm that would send it is Ollama. Fail-closed is right for a connection
+/// nobody recognises; it is wrong for one whose meaning is defined.
+pub(crate) fn effective_connection(connection: &str, config_provider_id: &str) -> String {
+    let connection = connection.trim();
+    if connection.is_empty() {
+        return config_provider_id.trim().to_string();
+    }
+    connection.to_string()
+}
+
+pub(crate) fn model_predicate_for(connection: &str) -> fn(&str) -> bool {
+    if connection_builds_argv(connection) {
+        crate::summarize::provider::valid_model_id
+    } else {
+        crate::summarize::provider::valid_catalog_model_id
+    }
+}
+
+/// Keep a proposed model id only if the target connection can actually send it.
+///
+/// When BOTH the proposal and the stored value fail, the answer is empty — "let the provider pick".
+/// That is a deliberate choice, not an oversight: switching from a JSON-body arm to a CLI arm can
+/// strand a 65–200 character Hugging Face id that `claude_code` will never put on the wire, and the
+/// only alternatives are worse. Keeping it means `effective_model_requested` reports a model to the
+/// egress ledger that `model_args` silently drops — the ledger lie A6 exists to prevent. Rejecting
+/// the whole save means an engine switch fails because of a field the user did not touch. Empty is
+/// the one outcome where the stored value and the wire agree, and the provider's own default is a
+/// working configuration rather than a broken one.
+///
+/// The loss is not silent at the layer that can speak: `AppConfig::load` logs it, and the Settings
+/// UI keeps and explains an unlisted id rather than dropping it mid-edit
+/// (`unlistedAfterEngineSwitch`).
+fn sanitized_model(proposed: String, previous: &str, accept: fn(&str) -> bool) -> String {
+    if proposed.trim().is_empty() || accept(&proposed) {
+        proposed.trim().to_string()
+    } else if accept(previous) {
+        previous.trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
     // Normalize empty strings on optional fields to None so they round-trip cleanly.
     let norm = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+    // The picker's catalog is a HINT, so `providerModel` and the per-role models are now free
+    // text. Refuse a value that is not a plain model slug HERE, at the persistence boundary,
+    // rather than dropping it later at the CLI.
+    //
+    // Dropping it later would make the EGRESS LEDGER LIE: `summarize::effective_model_requested`
+    // reads the stored value independently of what `claude_code::model_args` actually puts on the
+    // wire, so a rejected id would be RECORDED as requested while the provider silently ran its
+    // own default. Refusing to persist it means the ledger and the wire cannot disagree — and the
+    // CLI-side `valid_model_id` checks become defence in depth over an already-clean value.
+    // The fallback is validated too. A config persisted BEFORE this boundary existed can already
+    // hold a hostile id, and falling back to it unchecked would leave the very value this guard
+    // exists to stop. When neither the proposal nor the stored value is a valid slug the answer is
+    // empty — "let the provider pick", which is an explicit, supported choice.
+    // ONE rule for every model field: validate against the connection that will SEND the id.
+    // `claude_code` / `codex_cli` build `--model <id>` argv, where the short-slug ceiling is part of
+    // the defence; `anthropic`, `ollama` and `gateway` put the id in a JSON body, where a long
+    // Hugging Face path is legitimate. Every SHAPE refusal applies to both.
+    let provider_conn = d.provider_id.clone();
+    let notes_conn = d.role_notes_connection.clone();
+    let ask_conn = d.role_ask_connection.clone();
+    let live_conn = d.role_live_connection.clone();
+
+    // Judge against the EFFECTIVE connection — the one that will actually send the id — because
+    // that is what `roles::resolve` hands to the factory and what `effective_model_requested`
+    // reports to the egress ledger. An inherited (empty) role connection resolves to `provider_id`.
+    let for_connection = |proposed: String, previous: &str, connection: &str| -> String {
+        let effective = effective_connection(connection, &provider_conn);
+        sanitized_model(proposed, previous, model_predicate_for(&effective))
+    };
+    // A ROLE model, whose connection may be `""` = INHERIT.
+    //
+    // An inheriting role is judged by TRANSPORT SAFETY ONLY, never by the default engine's rule.
+    // This used to resolve `""` to `provider_id` and apply that arm's predicate, on the belief that
+    // an inherited role sends its own model. It does not: `roles::is_explicit` keys on the
+    // connection key alone, so `resolve` goes to `legacy_default_target` and never reads
+    // `role_*_model` at all. Judging an inert value by the CLI rule DESTROYED it — a legitimate
+    // long Ollama id, kept deliberately by the UI on the way to Inherit, was blanked by the very
+    // next autosave because the default engine happened to be `claude_code`. The UI promised
+    // retention and the boundary broke the promise.
+    //
+    // The moment the role points at a real connection again, `for_connection` judges it there and
+    // clears it if that arm cannot send it — with the row saying so.
+    let for_role = |proposed: String, previous: &str, connection: &str| -> String {
+        if connection.trim().is_empty() {
+            return sanitized_model(
+                proposed,
+                previous,
+                crate::summarize::provider::valid_catalog_model_id,
+            );
+        }
+        sanitized_model(proposed, previous, model_predicate_for(connection.trim()))
+    };
+    // A role can point at ANY connection, so the predicate must follow the CONNECTION, not the
+    // field. Applying the loose one uniformly was wrong: a role targeting `claude_code` could
+    // store a 65–200 character id, which `model_args` then refuses at the wire — so the id would
+    // sit in config and be reported by `effective_model_requested` to the egress ledger while
+    // `--model` was silently omitted. That is the ledger-lies failure A6 exists to prevent,
+    // reintroduced through a different door.
+    // Snapshot the role connections BEFORE the struct literal: fields are evaluated in written
+    // order, and each `role_*_connection` is moved out of the DTO above the matching `_model`.
+
     AppConfig {
         provider_id: d.provider_id,
         vault_path: norm(d.vault_path),
         vault_subfolder: norm(d.vault_subfolder),
         whisper_model_path: norm(d.whisper_model_path),
         language: norm(d.language),
-        anthropic_model: d.anthropic_model,
+        anthropic_model: for_connection(d.anthropic_model, &current.anthropic_model, "anthropic"),
         // Brain/AI model + effort ARE settable from the DTO (the Settings UI owns the pickers),
         // exactly like `anthropic_model` — plain strings, NOT preserve-only. `""` = provider default.
-        provider_model: d.provider_model,
+        //
+        // Judged by `provider_id`, like every other model field, because that is the only arm that
+        // ever reads it. This was UNCONDITIONALLY STRICT for several rounds, justified by "a role
+        // with an explicit CLI connection but a blank model inherits `provider_model`". That claim
+        // is FALSE, and `the_resolved_target_model_is_always_one_the_wire_will_send` now asserts so:
+        // `roles::is_explicit` keys on the connection alone and `explicit_target` reads only that
+        // role's own model key, so an explicit role never inherits this value. The one reader is
+        // `legacy_default_target`, which returns it for `claude_code`/`codex_cli`/`anthropic` and
+        // `""` for `ollama`/`gateway`.
+        //
+        // The over-broad rule was not merely redundant, it destroyed data: under `anthropic` — a
+        // JSON-body arm — a legitimate 65–200 character vendor id was refused and the field reset,
+        // which is exactly the A1/A2 violation this whole change exists to end.
+        //
+        // Switching engines stays safe because this runs on EVERY save with the DTO's NEW
+        // `provider_id`: moving to an argv arm re-judges the stored id under the strict rule and
+        // clears it there, so the ledger can never report a model the wire drops.
+        provider_model: for_connection(d.provider_model, &current.provider_model, &provider_conn),
         provider_effort: d.provider_effort,
         ollama_base_url: d.ollama_base_url,
-        ollama_model: d.ollama_model,
+        ollama_model: for_connection(d.ollama_model, &current.ollama_model, "ollama"),
         claude_binary: d.claude_binary,
         input_device: norm(d.input_device),
         capture_system_audio: d.capture_system_audio,
@@ -5258,7 +5416,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // AI Gateway fields ARE settable from the DTO (the Settings UI owns them). An omitted value
         // deserializes to `""` (`#[serde(default)]`), which is a valid "unset" state.
         gateway_base_url: d.gateway_base_url,
-        gateway_model: d.gateway_model,
+        gateway_model: for_connection(d.gateway_model, &current.gateway_model, "gateway"),
         // M3-CLIENT: the sharing-server base URL IS settable from the DTO (Settings → Account owns
         // it). An omitted value defaults to `""` (unset) — no behavioral change for existing installs.
         share_base_url: d.share_base_url,
@@ -5289,13 +5447,13 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // `gateway_model` — plain strings, `""` = inherit legacy. An omitted key deserializes to
         // `""` (`#[serde(default)]`), so an older FE payload can never flip a role.
         role_notes_connection: d.role_notes_connection,
-        role_notes_model: d.role_notes_model,
+        role_notes_model: for_role(d.role_notes_model, &current.role_notes_model, &notes_conn),
         role_notes_effort: d.role_notes_effort,
         role_ask_connection: d.role_ask_connection,
-        role_ask_model: d.role_ask_model,
+        role_ask_model: for_role(d.role_ask_model, &current.role_ask_model, &ask_conn),
         role_ask_effort: d.role_ask_effort,
         role_live_connection: d.role_live_connection,
-        role_live_model: d.role_live_model,
+        role_live_model: for_role(d.role_live_model, &current.role_live_model, &live_conn),
         role_live_effort: d.role_live_effort,
     }
 }

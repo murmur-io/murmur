@@ -731,6 +731,49 @@ mod tests {
     /// `chat_endpoint` applies the path-resolution heuristic: root/`/v1` → append
     /// `chat/completions`; any other path (custom Kong route, already-full endpoint) → as-is.
     #[test]
+    /// THE JUSTIFICATION FOR DROPPING THE CHARACTER ALLOWLIST, made executable.
+    ///
+    /// `valid_catalog_model_id` no longer restricts characters on the JSON-body arms, on the
+    /// argument that the id "never becomes argv, a URL path or a filename". That was asserted in a
+    /// doc comment and nowhere executed, which is a poor place for a security argument to live.
+    ///
+    /// Here it is executed: a model id carrying every character that would matter if it were ever
+    /// interpolated into a URL — `%` (percent-encoding), `?` (query), `#` (fragment), `/` (path),
+    /// `..` (traversal), a backslash and a non-ASCII character — leaves BOTH endpoints byte-identical
+    /// to the ones a benign id produces. The endpoints are pure functions of the base URL, so the
+    /// id has no way in.
+    #[test]
+    fn a_gateway_model_id_can_never_reach_the_request_url() {
+        let hostile = "vendor/../..%2f?x=1#frag\\modèle+preview";
+        for base in [
+            "http://localhost:4000/v1",
+            "http://localhost:4000",
+            "https://gw.example.com/route/x",
+        ] {
+            let benign =
+                OpenAiCompatProvider::new(base.to_string(), "gpt-4o".to_string(), None).unwrap();
+            let nasty =
+                OpenAiCompatProvider::new(base.to_string(), hostile.to_string(), None).unwrap();
+            assert_eq!(
+                benign.chat_endpoint().as_str(),
+                nasty.chat_endpoint().as_str(),
+                "the chat endpoint for {base:?} must not depend on the model id"
+            );
+            assert_eq!(
+                benign.models_endpoint().map(|u| u.to_string()),
+                nasty.models_endpoint().map(|u| u.to_string()),
+                "the catalog endpoint for {base:?} must not depend on the model id"
+            );
+            assert!(
+                !nasty.chat_endpoint().as_str().contains("frag")
+                    && !nasty.chat_endpoint().as_str().contains("preview"),
+                "no fragment of the model id may appear in the URL: {}",
+                nasty.chat_endpoint()
+            );
+        }
+    }
+
+    #[test]
     fn chat_endpoint_preserves_base_path() {
         // /v1 base — must append /chat/completions.
         let p = OpenAiCompatProvider::new(

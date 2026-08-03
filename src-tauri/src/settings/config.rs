@@ -1206,6 +1206,51 @@ impl AppConfig {
             cfg.audio_auto_prune = v == "true";
         }
 
+        // SANITIZE MODEL IDS ON LOAD, not only on save, and by the SAME rule `dto_to_config`
+        // uses: the predicate follows the connection that will SEND the id. The two must agree, or
+        // a value one accepts the other clears on the next launch.
+        //
+        // Load-time matters on its own: a row written before this boundary existed — or by hand —
+        // stays hostile until the next save, and in that window `effective_model_requested` reports
+        // it to the egress ledger while the wire silently drops it. That is the ledger lying.
+        let provider_id = cfg.provider_id.clone();
+        let by_connection = [
+            // Judged by `provider_id` — the only arm that reads it. It was pinned to
+            // `"claude_code"` here on the belief that an explicit CLI role inherits this value;
+            // `roles::is_explicit` keys on the connection alone, so it does not, and pinning it
+            // cleared a legitimate long Anthropic id on every launch.
+            (&mut cfg.provider_model, provider_id.clone()),
+            (&mut cfg.role_notes_model, cfg.role_notes_connection.clone()),
+            (&mut cfg.role_ask_model, cfg.role_ask_connection.clone()),
+            (&mut cfg.role_live_model, cfg.role_live_connection.clone()),
+            (&mut cfg.anthropic_model, "anthropic".to_string()),
+            (&mut cfg.ollama_model, "ollama".to_string()),
+            (&mut cfg.gateway_model, "gateway".to_string()),
+        ];
+        for (field, connection) in by_connection {
+            if field.is_empty() {
+                continue;
+            }
+            // An INHERITED (empty) role connection is judged by transport safety alone, matching
+            // `dto_to_config`'s `for_role`. Resolving `""` to `provider_id` here was destructive
+            // for the same reason it was there: `roles::is_explicit` keys on the connection key,
+            // so an inheriting role never reads `role_*_model`, and applying the default engine's
+            // CLI rule cleared a legitimate long id on every launch. The fixed-arm fields below
+            // pass their own connection, so they are unaffected.
+            let usable = if connection.trim().is_empty() {
+                crate::summarize::provider::valid_catalog_model_id(field)
+            } else {
+                crate::commands::model_predicate_for(connection.trim())(field)
+            };
+            if !usable {
+                tracing::warn!(
+                    target: "config",
+                    "stored model id is not usable on its connection; clearing to the default"
+                );
+                field.clear();
+            }
+        }
+
         Ok(cfg)
     }
 

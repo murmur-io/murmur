@@ -79,8 +79,8 @@
                   class="role-model-select"
                 >
                   <option value="">Default (connection's pick)</option>
-                  @for (id of row.models; track id) {
-                    <option [value]="id">{{ id }}</option>
+                  @for (option of row.models; track option.id) {
+                    <option [value]="option.id">{{ option.label }}</option>
                   }
                   <!--
                     Keep a manually-typed model selectable when it's not in
@@ -93,28 +93,63 @@
                     </option>
                   }
                 </select>
-              } @else {
-                <input
-                  [formControlName]="row.modelCtrl"
-                  placeholder="Model id (blank = connection default)"
-                  autocomplete="off"
-                  spellcheck="false"
-                  class="role-model-input"
-                />
               }
-              <button
-                type="button"
-                class="btn btn-ghost role-model-refresh"
-                (click)="refreshModels(row.conn)"
-                [disabled]="row.modelsLoading"
-                title="Fetch this connection's model list"
-              >
-                @if (row.modelsLoading) {
-                  Loading…
-                } @else {
-                  ↻ Refresh
+              <!--
+                ALWAYS available, not only when the catalog is empty. This input used to live in the
+                `@else` of the catalog check — the same shape as the Setup card's old bug — so a
+                non-empty catalog made every unlisted id unreachable on this surface, which is the
+                entire behaviour this change exists to fix.
+              -->
+              <input
+                [formControlName]="row.modelCtrl"
+                placeholder="Model id (blank = connection default)"
+                autocomplete="off"
+                spellcheck="false"
+                class="role-model-input"
+                (input)="onModelEdited(row.role)"
+              />
+              <!--
+                Refresh only where refreshing means something. A role row can select `ollama` or
+                `gateway` — the LIVE-fetched arms — so the button belongs here; a bundled catalog is
+                compiled into the binary and the button could not change it. Read from
+                `catalogIsLive` (the CATALOG's provenance), never from the options, so an empty live
+                catalog — a gateway answering with zero models, exactly when Refresh matters — still
+                offers it.
+              -->
+              @if (row.catalogIsLive) {
+                <button
+                  type="button"
+                  class="btn btn-ghost role-model-refresh"
+                  (click)="refreshModels(row.conn)"
+                  [disabled]="row.modelsLoading"
+                  title="Fetch this connection's model list"
+                >
+                  @if (row.modelsLoading) {
+                    Loading…
+                  } @else {
+                    ↻ Refresh
+                  }
+                </button>
+              } @else if (row.models.length > 0) {
+                <p class="field-hint" data-role-bundled-catalog>
+                  Ships with the app — a newer model may be missing; type its id above.
+                </p>
+              }
+              @if (refusedTypedModels().has(row.role)) {
+                <p class="field-hint" data-role-model-refused>
+                  This is not a usable model id for the selected engine — it will not be saved.
+                  Model ids are short and contain only letters, digits and
+                  <code>. - _ : / &#64;</code>.
+                </p>
+              }
+              @if (connectionChangeNotice()[row.role]; as notice) {
+                @if (notice.outcome === "kept") {
+                  <p class="field-hint" data-role-kept-model>
+                    {{ notice.model }} is not in this engine's list. It has been kept — clear it
+                    only if you want the engine to pick.
+                  </p>
                 }
-              </button>
+              }
             </div>
 
             @if (row.conn === "anthropic") {
@@ -127,6 +162,21 @@
                   <option value="high">High</option>
                 </select>
               </label>
+            }
+          }
+
+          <!--
+            OUTSIDE the provider-model block on purpose. `local` and `off` render no model control
+            at all, yet they are connections that CONSUME the role model (the local arm lets it
+            override `brain_model_id`), so switching to them clears it. A caption nested inside the
+            model row could never appear for exactly the cases where the clear is invisible.
+          -->
+          @if (connectionChangeNotice()[row.role]; as notice) {
+            @if (notice.outcome === "dropped") {
+              <p class="field-hint" data-role-cleared-model>
+                {{ notice.model }} is not a model id this engine can use, so it has been cleared —
+                pick a model above, or leave it blank to use this engine's default.
+              </p>
             }
           }
 
