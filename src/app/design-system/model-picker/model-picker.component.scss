@@ -1,0 +1,26 @@
+// Layout only. The controls themselves inherit the global form/`.btn` primitives from
+// `styles.css`, so this file adds no colours, radii or shadows of its own — every value here is a
+// design token.
+.model-picker {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+// Both controls share the same flex basis so the row does not jump when a catalog arrives and the
+// select appears next to the always-present free-text input.
+.model-select,
+.model-input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.model-refresh {
+  flex: none;
+  white-space: nowrap;
+}
+
+.field-hint {
+  margin: var(--space-1) 0 0;
+}
