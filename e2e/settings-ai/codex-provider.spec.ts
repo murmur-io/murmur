@@ -70,7 +70,7 @@ test("Codex can be selected globally and per feature with its catalog and brande
   await expect(engine.locator('option[value="codex_cli"]')).toHaveText("Codex");
   await engine.selectOption("codex_cli");
 
-  const defaultModel = setup.locator('select[formcontrolname="providerModel"]');
+  const defaultModel = setup.locator('mur-model-picker[formcontrolname="providerModel"] select.model-select');
   await expect(defaultModel.locator("[data-provider-default]")).toHaveText(
     "Default (provider's pick)",
   );
@@ -79,7 +79,7 @@ test("Codex can be selected globally and per feature with its catalog and brande
   // did not recognise. The UI now keeps the value and explains the mismatch instead.
   await expect(defaultModel.locator("[data-provider-default]")).toBeAttached();
   await expect(
-    setup.locator('input[formcontrolname="providerModel"]'),
+    setup.locator('mur-model-picker[formcontrolname="providerModel"] input.model-input'),
   ).toHaveValue("claude-opus-4-8");
   await expect(setup.locator("[data-unlisted-model]")).toContainText(
     "claude-opus-4-8",
@@ -275,7 +275,7 @@ test("a delayed Codex catalog cannot overwrite a newer engine selection", async 
   await engine.selectOption("codex_cli");
   await engine.selectOption("anthropic");
 
-  const model = setup.locator('select[formcontrolname="providerModel"]');
+  const model = setup.locator('mur-model-picker[formcontrolname="providerModel"] select.model-select');
   // The property under test is that a LATE catalog response cannot overwrite a NEWER engine
   // selection. Comparing the value against itself would detect the late write but pin nothing, so
   // name the value that must be there: the SEEDED id. It survives both engine switches because a
@@ -311,7 +311,7 @@ test("an empty Codex catalog KEEPS a foreign default-engine model", async ({
   // An EMPTY catalog proves nothing about the id either — a bundled list that happens to be empty
   // is still just a hint, so the stored value is kept rather than blanked.
   await expect(
-    setup.locator('input[formcontrolname="providerModel"]'),
+    setup.locator('mur-model-picker[formcontrolname="providerModel"] input.model-input'),
   ).toHaveValue("claude-opus-4-8");
 });
 
@@ -338,7 +338,7 @@ test("a failed Codex catalog request preserves the stored model id", async ({
     .locator('select[formcontrolname="providerId"]')
     .selectOption("codex_cli");
   await expect(
-    setup.locator('input[formcontrolname="providerModel"]'),
+    setup.locator('mur-model-picker[formcontrolname="providerModel"] input.model-input'),
   ).toHaveValue("claude-opus-4-8");
 });
 
