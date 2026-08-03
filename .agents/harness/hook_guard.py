@@ -594,13 +594,48 @@ def _primary_branch_surgery_reason(invocation: GitInvocation) -> Optional[str]:
         else (top / common_raw).resolve()
     )
     live = _live_harness_task_ids(common)
-    if not live:
+    if live:
+        preview = ", ".join(live[:3]) + ("…" if len(live) > 3 else "")
+        return (
+            f"primary-checkout branch surgery is blocked while Harness task(s) "
+            f"are live or state-unknown ({preview}); continue from the isolated task/driver worktree "
+            "and use server-side PR merge"
+        )
+
+    # A live Harness task is not the only way the primary checkout is occupied.
+    # An ordinary concurrent session — another agent, or the operator — leaves no
+    # task record at all, so keying solely on `live` made the guard weakest
+    # exactly when the neighbour was least formal. `git checkout -b` in that
+    # window moves HEAD under their feet and re-attributes their uncommitted work
+    # to the new branch. That is the incident this arm exists for; the recovery
+    # (switching back) is what the override below is for.
+    #
+    # Scoped to branch selection only. merge/rebase/reset/cherry-pick/pull stay on
+    # the harness-task arm above: Git already refuses those when they would clobber
+    # a dirty tree, and `git reset` on dirty state is ordinary, intended work.
+    if invocation.subcommand not in {"checkout", "switch"}:
         return None
-    preview = ", ".join(live[:3]) + ("…" if len(live) > 3 else "")
+    if os.environ.get("MURMUR_ALLOW_PRIMARY_BRANCH_SURGERY") == "1":
+        return None
+    # TRACKED modifications only (`--untracked-files=no`). Untracked files are the
+    # loud majority of a working repo's `--porcelain` output and are precisely the
+    # entries branch selection CANNOT mis-attribute: they belong to no branch, they
+    # carry over untouched, and Git refuses on its own when a target branch would
+    # overwrite one. Counting them would fire this guard on a tree full of stray
+    # scratch docs — and an over-eager guard gets routed around, which is strictly
+    # worse than no guard. Staged and unstaged edits to tracked files are the ones
+    # that follow HEAD onto the new branch, so they are what this measures.
+    dirty = _git_text(top, "status", "--porcelain", "--untracked-files=no", check=False)
+    entries = [line for line in dirty.splitlines() if line.strip()]
+    if not entries:
+        return None
     return (
-        f"primary-checkout branch surgery is blocked while Harness task(s) "
-        f"are live or state-unknown ({preview}); continue from the isolated task/driver worktree "
-        "and use server-side PR merge"
+        f"primary-checkout branch selection is blocked while its working tree has "
+        f"{len(entries)} uncommitted tracked change(s) that may belong to a "
+        "concurrent session; create an isolated checkout with `git worktree add "
+        "<path> origin/murmur` instead. If the tree is provably yours (or you are "
+        "restoring the branch you moved off), re-run with "
+        "MURMUR_ALLOW_PRIMARY_BRANCH_SURGERY=1"
     )
 
 
@@ -2122,6 +2157,82 @@ def _run_selftest() -> int:
         for label, cmd in anti_bypass_dev:
             got = "DEV" if resource_policy.command_is_dev_in(cmd, SOURCE_ROOT) else "NOT-DEV"
             test.result(f"anti-bypass classifier: {label}", got, "DEV")
+
+    print("-- primary-checkout branch selection vs a concurrent session --")
+    # RED-before-GREEN oracle for the 2026-08-03 incident: `git checkout -b` was
+    # run in the primary checkout while another session held `feat/dashboards`
+    # with 29 uncommitted entries. The guard existed but keyed solely on live
+    # Harness tasks, so an ordinary concurrent session — which registers no task —
+    # left it silent. These cases FAIL on the pre-fix guard and pass after it.
+    for vendor in ("codex", "claude"):
+        with tempfile.TemporaryDirectory(prefix="murmur-hook-branch-") as temp:
+            repo = Path(temp) / "repo"
+            _init_repo(repo)  # already leaves a committed, CLEAN tree
+
+            # Clean primary checkout: branch selection stays allowed.
+            test.expect(
+                "clean primary: checkout -b", vendor, "block-bash",
+                "git checkout -b feature/y", repo, "ALLOW",
+            )
+            test.expect(
+                "clean primary: switch -c", vendor, "block-bash",
+                "git switch -c feature/z", repo, "ALLOW",
+            )
+
+            # Untracked scratch files alone must NOT trip the guard: branch
+            # selection cannot mis-attribute them, and a working repo is full of
+            # them. This is the false-positive floor.
+            (repo / "scratch.txt").write_text("stray\n", encoding="utf-8")
+            test.expect(
+                "untracked-only primary: checkout -b", vendor, "block-bash",
+                "git checkout -b feature/y", repo, "ALLOW",
+            )
+
+            # Someone else's uncommitted work to a TRACKED file — this is what
+            # follows HEAD onto the new branch.
+            (repo / "base.txt").write_text("concurrent edit\n", encoding="utf-8")
+
+            test.expect(
+                "dirty primary: checkout -b", vendor, "block-bash",
+                "git checkout -b feature/y", repo, "BLOCK",
+            )
+            test.expect(
+                "dirty primary: switch -c", vendor, "block-bash",
+                "git switch -c feature/z", repo, "BLOCK",
+            )
+            test.expect(
+                "dirty primary: plain branch switch", vendor, "block-bash",
+                "git checkout feature/other", repo, "BLOCK",
+            )
+            # Scoped to branch selection — `git reset` on a dirty tree is ordinary
+            # intended work and must stay allowed (Git refuses the clobbering cases
+            # on its own).
+            test.expect(
+                "dirty primary: reset stays allowed", vendor, "block-bash",
+                "git reset HEAD~1", repo, "ALLOW",
+            )
+            # Creating the isolated checkout is the prescribed escape and must
+            # never be blocked.
+            test.expect(
+                "dirty primary: worktree add", vendor, "block-bash",
+                "git worktree add ../wt origin/murmur", repo, "ALLOW",
+            )
+            # Deliberate override for "the tree is provably mine" / recovery.
+            got, _ = test.invoke(
+                vendor, "block-bash", "git checkout -b feature/y", repo,
+                extra_env={"MURMUR_ALLOW_PRIMARY_BRANCH_SURGERY": "1"},
+            )
+            test.result(f"{vendor}: dirty primary: explicit override", got, "ALLOW")
+
+            # A LINKED worktree is the sanctioned place to work; its own dirty
+            # state must not trip the primary-checkout arm.
+            linked = Path(temp) / "linked"
+            _run(["git", "worktree", "add", "-q", "-b", "wt/branch", str(linked)], repo)
+            (linked / "mine.txt").write_text("mine\n", encoding="utf-8")
+            test.expect(
+                "linked worktree: dirty checkout -b", vendor, "block-bash",
+                "git checkout -b feature/in-worktree", linked, "ALLOW",
+            )
 
     print("-- staged secret scan (no path exclusions) --")
     for vendor in ("codex", "claude"):
