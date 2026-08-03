@@ -139,7 +139,13 @@ impl Db {
         Ok(())
     }
 
-    /// Patch a board's user-editable fields. `None` leaves a field untouched.
+    /// Patch a board's user-editable fields.
+    ///
+    /// Three-state per nullable column, because plain `COALESCE(?, col)` can only ever SET a
+    /// value — it makes "remove the emoji" unexpressible:
+    ///   * `None`      ⇒ leave the column untouched,
+    ///   * `Some("")`  ⇒ CLEAR the column to NULL,
+    ///   * `Some(v)`   ⇒ set it to `v`.
     pub fn update_dashboard(
         &self,
         id: &str,
@@ -154,8 +160,10 @@ impl Db {
             .execute(
                 "UPDATE dashboards
                     SET title      = COALESCE(?2, title),
-                        emoji      = COALESCE(?3, emoji),
-                        tint       = COALESCE(?4, tint),
+                        emoji      = CASE WHEN ?3 IS NULL THEN emoji
+                                          WHEN ?3 = '' THEN NULL ELSE ?3 END,
+                        tint       = CASE WHEN ?4 IS NULL THEN tint
+                                          WHEN ?4 = '' THEN NULL ELSE ?4 END,
                         pinned     = COALESCE(?5, pinned),
                         updated_at = ?6
                   WHERE id = ?1",
@@ -294,7 +302,8 @@ impl Db {
         Ok(())
     }
 
-    /// Patch a tile's title / span / config. `None` leaves a field untouched.
+    /// Patch a tile's title / span / config. Same three-state nullable contract as
+    /// [`Self::update_dashboard`]: `None` = untouched, `Some("")` = clear, `Some(v)` = set.
     pub fn update_dashboard_tile(
         &self,
         id: &str,
@@ -306,9 +315,11 @@ impl Db {
         let n = conn
             .execute(
                 "UPDATE dashboard_tiles
-                    SET title  = COALESCE(?2, title),
+                    SET title  = CASE WHEN ?2 IS NULL THEN title
+                                      WHEN ?2 = '' THEN NULL ELSE ?2 END,
                         span   = COALESCE(?3, span),
-                        config = COALESCE(?4, config)
+                        config = CASE WHEN ?4 IS NULL THEN config
+                                      WHEN ?4 = '' THEN NULL ELSE ?4 END
                   WHERE id = ?1",
                 rusqlite::params![id, title, span.map(|s| s.clamp(MIN_SPAN, MAX_SPAN)), config],
             )
@@ -325,11 +336,23 @@ impl Db {
     }
 
     /// Rewrite the layout order of a board from an explicit id list, in ONE transaction so a
-    /// partial reorder can never persist. Ids not belonging to the board are ignored.
+    /// partial reorder can never persist.
+    ///
+    /// The caller's list is treated as a PREFERENCE, not a trusted permutation: duplicates are
+    /// collapsed to their first occurrence, unknown ids are dropped, and any tile the caller
+    /// omitted is appended in its existing order. Without that, a duplicated or short list left
+    /// rows sharing a position — and the rendered order then depended on the secondary sort key
+    /// rather than on what the user dragged.
     pub fn reorder_dashboard_tiles(&self, dashboard_id: &str, tile_ids: &[String]) -> Result<()> {
+        let existing: Vec<String> = self
+            .list_dashboard_tiles(dashboard_id)?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        let order = dense_order(tile_ids, &existing);
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        for (i, tile_id) in tile_ids.iter().enumerate() {
+        for (i, tile_id) in order.iter().enumerate() {
             tx.execute(
                 "UPDATE dashboard_tiles SET position = ?3
                   WHERE id = ?1 AND dashboard_id = ?2",
@@ -384,23 +407,35 @@ impl Db {
     /// which is the same existence signal the masked note/meeting DTOs already expose (a locked
     /// meeting renders as "🔒 Locked", so its existence was never the secret; its content is).
     pub fn dashboard_ref_exists(&self, kind: &str, id: &str) -> Result<bool> {
-        let table = match kind {
-            "note" | "document" => "documents",
-            "meeting" => "meetings",
-            "person" | "drift" | "numbers" | "pulse" => "entities",
+        // `note` and `document` share the `documents` table, so the probe must also match the
+        // row's KIND — otherwise a note tile pointing at a document row reports "sealed" when the
+        // honest answer is "missing".
+        let (table, kind_filter) = match kind {
+            "note" => ("documents", " AND kind = 'note'"),
+            "document" => ("documents", " AND kind <> 'note'"),
+            "meeting" => ("meetings", ""),
+            "person" | "drift" | "numbers" | "pulse" => ("entities", ""),
             _ => return Ok(false),
         };
         let conn = self.lock();
-        let sql = format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1)");
+        let sql =
+            format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1{kind_filter})");
         let exists: i64 = conn.query_row(&sql, [id], |r| r.get(0)).map_err(map_err)?;
         Ok(exists != 0)
     }
 
-    /// Reorder BOARDS themselves (drag in the list view).
+    /// Reorder BOARDS themselves (drag in the list view). Same permutation discipline as
+    /// [`Self::reorder_dashboard_tiles`].
     pub fn reorder_dashboards(&self, ids: &[String]) -> Result<()> {
+        let existing: Vec<String> = self
+            .list_dashboards()?
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        let order = dense_order(ids, &existing);
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        for (i, id) in ids.iter().enumerate() {
+        for (i, id) in order.iter().enumerate() {
             tx.execute(
                 "UPDATE dashboards SET position = ?2 WHERE id = ?1",
                 rusqlite::params![id, i as i64],
@@ -410,4 +445,24 @@ impl Db {
         tx.commit().map_err(map_err)?;
         Ok(())
     }
+}
+
+/// Turn a caller-supplied (possibly partial, possibly duplicated, possibly bogus) id list into a
+/// TOTAL order over `existing`: requested ids first in their requested order, then everything the
+/// caller left out, in its current order. Ids not in `existing` are dropped.
+fn dense_order(requested: &[String], existing: &[String]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = existing.iter().map(String::as_str).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(existing.len());
+    for id in requested {
+        if known.contains(id.as_str()) && seen.insert(id.clone()) {
+            out.push(id.clone());
+        }
+    }
+    for id in existing {
+        if seen.insert(id.clone()) {
+            out.push(id.clone());
+        }
+    }
+    out
 }

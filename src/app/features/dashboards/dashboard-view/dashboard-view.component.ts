@@ -128,10 +128,13 @@ export class DashboardViewComponent {
 
   private async refresh(id: string): Promise<void> {
     await this.service.loadBoard(id);
+    // Same stale-result discipline as the service: a late source-count for the
+    // board we just navigated AWAY from must not overwrite the current one.
     try {
-      this.sourceCount.set((await this.ipc.getDashboardSources(id)).length);
+      const count = (await this.ipc.getDashboardSources(id)).length;
+      if (this.id() === id) this.sourceCount.set(count);
     } catch {
-      this.sourceCount.set(0);
+      if (this.id() === id) this.sourceCount.set(0);
     }
   }
 
@@ -268,6 +271,10 @@ export class DashboardViewComponent {
           question,
           answer: result.answer,
           answeredAt: new Date().toISOString(),
+          // Record WHICH sources produced this answer. The backend gates the
+          // cached answer against them, so once any of those folders is sealed
+          // the paraphrase stops being returned instead of outliving its source.
+          answerSources: sources,
         },
       });
     } catch {

@@ -111,6 +111,103 @@ fn tiles_append_clamp_and_reorder() {
     assert_eq!(db.list_dashboard_tiles(&b).unwrap().len(), 2);
 }
 
+/// A reorder is a TOTAL rewrite, even when the caller's list is partial, duplicated or bogus.
+/// Before this was enforced, an omitted id kept its old position and a duplicate collapsed two
+/// tiles onto one — leaving duplicate positions, so the rendered order fell back to the secondary
+/// sort key instead of what the user dragged.
+#[test]
+fn reorder_tolerates_partial_duplicate_and_unknown_ids() {
+    let db = file_db("reorder-permutation");
+    let b = board(&db, "reorder");
+    for i in 0..4 {
+        db.insert_dashboard_tile(
+            &format!("t{i}"),
+            &b,
+            "note",
+            Some("n"),
+            None,
+            4,
+            None,
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+    }
+
+    // Ask for: a duplicate, an unknown id, and only two of the four real tiles.
+    db.reorder_dashboard_tiles(
+        &b,
+        &[
+            "t2".into(),
+            "t2".into(),
+            "does-not-exist".into(),
+            "t0".into(),
+        ],
+    )
+    .unwrap();
+
+    let tiles = db.list_dashboard_tiles(&b).unwrap();
+    let order: Vec<String> = tiles.iter().map(|t| t.id.clone()).collect();
+    assert_eq!(
+        order,
+        vec!["t2", "t0", "t1", "t3"],
+        "requested ids first (deduped), then the untouched rest in their prior order"
+    );
+    let positions: Vec<i64> = tiles.iter().map(|t| t.position).collect();
+    assert_eq!(positions, vec![0, 1, 2, 3], "positions stay dense and unique");
+}
+
+/// `None` = leave alone, `Some("")` = clear, `Some(v)` = set. Plain `COALESCE` could only ever
+/// set, so "remove the emoji" was unexpressible.
+#[test]
+fn partial_updates_can_clear_a_nullable_column() {
+    let db = file_db("clear-nullable");
+    let id = board(&db, "clear");
+    assert_eq!(db.get_dashboard(&id).unwrap().unwrap().emoji.as_deref(), Some("🚀"));
+
+    // None leaves it.
+    db.update_dashboard(&id, None, None, None, None, "2026-08-03T11:00:00Z")
+        .unwrap();
+    assert_eq!(db.get_dashboard(&id).unwrap().unwrap().emoji.as_deref(), Some("🚀"));
+
+    // Empty string CLEARS it.
+    db.update_dashboard(&id, None, Some(""), Some(""), None, "2026-08-03T12:00:00Z")
+        .unwrap();
+    let d = db.get_dashboard(&id).unwrap().unwrap();
+    assert_eq!(d.emoji, None);
+    assert_eq!(d.tint, None);
+
+    // And a tile's title/config clear the same way.
+    db.insert_dashboard_tile(
+        "t1",
+        &id,
+        "note",
+        Some("n1"),
+        Some("a title"),
+        4,
+        Some("{}"),
+        "2026-08-03T10:00:00Z",
+    )
+    .unwrap();
+    db.update_dashboard_tile("t1", Some(""), None, Some("")).unwrap();
+    let t = db.get_dashboard_tile("t1").unwrap().unwrap();
+    assert_eq!(t.title, None);
+    assert_eq!(t.config, None);
+}
+
+/// note/document share the `documents` table, so the probe must match the row's KIND too.
+#[test]
+fn ref_exists_probe_distinguishes_note_from_document() {
+    let db = file_db("ref-kind");
+    seed_folder(&db, "f-open", "Open", false);
+    db.insert_note("n-1", "f-open", "n-1.md", "A note", "body", 1)
+        .unwrap();
+    assert!(db.dashboard_ref_exists("note", "n-1").unwrap());
+    assert!(
+        !db.dashboard_ref_exists("document", "n-1").unwrap(),
+        "a note row must not answer YES to a document probe"
+    );
+}
+
 #[test]
 fn unknown_tile_kind_is_refused() {
     let db = file_db("kind-allowlist");

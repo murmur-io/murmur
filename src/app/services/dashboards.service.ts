@@ -58,20 +58,33 @@ export class DashboardsService {
   }
 
   /**
-   * Load ONE board. `keepStale` (the default) leaves the previously loaded
-   * board on screen while the fetch is in flight, so re-entering a board you
-   * just left never flashes empty; it is cleared when the id differs.
+   * The board id whose load is currently authoritative. Every `loadBoard` call
+   * claims it, and a response only lands if it still holds the claim.
+   */
+  private wantedBoardId: string | null = null;
+
+  /**
+   * Load ONE board.
+   *
+   * STALE-RESULT GUARD (mandatory, not defensive): navigating board A → board B
+   * while A's `getDashboard` is still in flight would otherwise let A's late
+   * response overwrite B — rendering an unrelated board on B's route. The same
+   * class of bug the entity-detail effect guards against.
    */
   async loadBoard(id: string): Promise<void> {
+    this.wantedBoardId = id;
     if (this._board()?.id !== id) this._board.set(null);
     this._boardLoading.set(true);
     try {
-      this._board.set(await this.ipc.getDashboard(id));
+      const detail = await this.ipc.getDashboard(id);
+      if (this.wantedBoardId !== id) return; // a newer board won the race
+      this._board.set(detail);
       this._error.set(null);
     } catch (e) {
+      if (this.wantedBoardId !== id) return;
       this._error.set(this.message(e));
     } finally {
-      this._boardLoading.set(false);
+      if (this.wantedBoardId === id) this._boardLoading.set(false);
     }
   }
 
