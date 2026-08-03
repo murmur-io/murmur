@@ -38,25 +38,20 @@ const ONE_SUGGESTION = [
   },
 ];
 
-test("reminders surface is reachable without scrolling past the whole note", async ({
+test("meeting follow-ups are reachable without scrolling past the whole note", async ({
   page,
 }) => {
-  await mockTauri(
-    page,
-    {},
-    { get_note: LONG_NOTE, audit_reminder_suggestions: ONE_SUGGESTION },
-  );
+  await mockTauri(page, {}, { audit_reminder_suggestions: ONE_SUGGESTION });
   await page.setViewportSize({ width: 1280, height: 900 });
-  await page.goto("/notes/n-atlas-prd");
+  await page.goto("/meeting/m-q2-roadmap");
 
-  const card = page.locator("app-smart-reminder-card");
-  await expect(card).toBeVisible();
+  const actions = page.locator("app-meeting-actions");
+  await expect(actions).toBeVisible();
 
-  const box = await card.boundingBox();
+  const box = await actions.boundingBox();
   expect(box).not.toBeNull();
-  // Inside the first viewport height: the whole point of the move. With the old
-  // placement (last child of the article, after ~90 sections) this is several
-  // thousand pixels down.
+  // Inside the first viewport height. Previously this sat at line ~455 of a
+  // 481-line template — below Summary, Decisions, Related and the Q&A log.
   expect(box!.y).toBeLessThan(900);
 });
 
