@@ -1026,6 +1026,57 @@ impl Db {
         // migrate() stays idempotent. Runs LAST so the companion backfill can read the (now-migrated)
         // `documents.meeting_id` column. See `migrate_links`.
         Self::migrate_links(&conn)?;
+
+        // Dashboards — user-composed boards of tiles over EXISTING sources. Additive + guarded so
+        // migrate() stays idempotent. Runs last: a tile's `ref_id` points at a meeting/document/
+        // entity/… row, so every referenceable table must already exist. NOTHING here stores
+        // meeting CONTENT — a tile holds only a kind + a reference, and every tile READ is
+        // re-gated at read time (`visibility_clause` / `meeting_is_unlocked`), so a board can
+        // never become an ungated back door into a sealed folder.
+        Self::migrate_dashboards(&conn)?;
+        Ok(())
+    }
+
+    /// Idempotent DASHBOARD schema (2026-08-03).
+    ///
+    /// - `dashboards` — one board per row. Cosmetic-only columns (`emoji`, `tint`) plus ordering.
+    /// - `dashboard_tiles` — the tiles on a board. `kind` selects the renderer; `ref_id` is the
+    ///   OPTIONAL anchor into an existing row (meeting / document / entity id) and is deliberately
+    ///   NOT an FK: a tile whose target was deleted must degrade to a "missing source" tile rather
+    ///   than cascade-delete a user's board layout. `config` is a small JSON bag for per-kind
+    ///   options (e.g. the Living-answer question). `position` is a dense integer order.
+    ///
+    /// The tables carry no note text, no transcript, and no title copied from a gated row — the
+    /// board is a set of POINTERS, resolved through the gated readers on every read.
+    fn migrate_dashboards(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dashboards (
+               id TEXT PRIMARY KEY,
+               title TEXT NOT NULL,
+               emoji TEXT,
+               tint TEXT,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               position INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_dashboards_position ON dashboards(position);
+             CREATE TABLE IF NOT EXISTS dashboard_tiles (
+               id TEXT PRIMARY KEY,
+               dashboard_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               ref_id TEXT,
+               title TEXT,
+               span INTEGER NOT NULL DEFAULT 4,
+               position INTEGER NOT NULL DEFAULT 0,
+               config TEXT,
+               created_at TEXT NOT NULL,
+               FOREIGN KEY (dashboard_id) REFERENCES dashboards(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_dashboard_tiles_board
+               ON dashboard_tiles(dashboard_id, position);",
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -8022,3 +8073,7 @@ mod graph_tests;
 #[cfg(test)]
 #[path = "db_tests/reminder_tests.rs"]
 mod reminder_tests;
+
+#[cfg(test)]
+#[path = "db_tests/dashboard_tests.rs"]
+mod dashboard_tests;

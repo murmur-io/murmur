@@ -2177,6 +2177,49 @@ pub(crate) struct RecordingGenerationSnapshot {
     pub(crate) cleanup_mask: u8,
 }
 
+// ── Dashboards (2026-08-03) ────────────────────────────────────────────────────────────────────
+//
+// A board is LAYOUT + POINTERS. Neither struct carries meeting content: the tile holds a `kind`
+// and an optional `ref_id`, and the command layer resolves that reference through the gated
+// readers on every read, so a sealed source surfaces a masked tile rather than a title.
+
+/// One user-composed board.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dashboard {
+    pub id: String,
+    pub title: String,
+    /// Cosmetic leading emoji (a single grapheme, validated at the command layer).
+    pub emoji: Option<String>,
+    /// Cosmetic accent key (a design-token NAME such as `indigo`, never a raw colour).
+    pub tint: Option<String>,
+    pub pinned: bool,
+    pub position: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One tile on a board — a pointer plus its layout, never content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardTile {
+    pub id: String,
+    pub dashboard_id: String,
+    /// One of `storage::dashboards_store::TILE_KINDS`.
+    pub kind: String,
+    /// The anchor into an existing row (meeting / document / entity id). `None` for kinds that
+    /// derive from the whole board (e.g. `reminders`).
+    pub ref_id: Option<String>,
+    /// A user-supplied tile heading. `None` ⇒ the resolver supplies one from the source.
+    pub title: Option<String>,
+    /// Grid columns spanned, 3–12.
+    pub span: i64,
+    pub position: i64,
+    /// Small per-kind JSON options bag (e.g. the Living-answer question).
+    pub config: Option<String>,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

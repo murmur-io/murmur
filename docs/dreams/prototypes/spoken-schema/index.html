@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur — Spoken Schema (vibe prototype)</title>
+<style>
+/* ============================================================================
+   VIBE PROTOTYPE — fake data, fake AI, fake vault, fake audio. Not production.
+   Tokens copied from src/design-tokens/*.css so this FEELS like Murmur.
+   Demo world = "Sonora" (same cast as scripts/screenshots/mock-tauri.js).
+   ============================================================================ */
+:root{
+  --surface-base:#07070b; --surface-raised:rgba(255,255,255,.045);
+  --surface-overlay:#1b1b24; --surface-solid:#111118;
+  --surface-hover:rgba(255,255,255,.06); --surface-input:rgba(255,255,255,.035);
+  --scrim:rgba(0,0,0,.5);
+  --text-primary:#f6f6fa; --text-secondary:#a6a6b6; --text-muted:#6c6c7d;
+  --text-on-accent:#fff;
+  --accent:#6e76ff; --accent-hover:#8a90ff; --accent-soft:rgba(110,118,255,.16);
+  --accent-ring:rgba(110,118,255,.5);
+  --live:#ff7a5c; --live-soft:rgba(255,122,92,.16); --live-glow:0 8px 24px rgba(255,122,92,.28);
+  --border:rgba(255,255,255,.09); --border-strong:rgba(255,255,255,.16);
+  --border-subtle:rgba(255,255,255,.055);
+  --success:#4ade80; --success-soft:rgba(74,222,128,.15);
+  --danger:#ff6b6b; --danger-soft:rgba(255,107,107,.14);
+  --warning:#f5b14c; --warning-soft:rgba(245,177,76,.14);
+  --graph-note:#4ce0a0; --graph-entity:#5bbdff;
+  --radius-sm:9px; --radius-md:13px; --radius-lg:18px; --radius-xl:24px; --radius-pill:999px;
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px;
+  --space-6:32px; --space-7:48px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+  --shadow-md:0 12px 32px rgba(0,0,0,.35); --shadow-lg:0 22px 56px rgba(0,0,0,.48);
+  --transition:200ms cubic-bezier(.32,.72,0,1);
+  --transition-fast:130ms cubic-bezier(.32,.72,0,1);
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--surface-base); color:var(--text-primary);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  font-size:14.5px; line-height:1.5; letter-spacing:-.01em; overflow:hidden;
+}
+button{font:inherit;color:inherit}
+
+/* aurora field ------------------------------------------------------------- */
+.aurora{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.aurora i{position:absolute;display:block;border-radius:50%;filter:blur(90px);opacity:.5}
+.aurora i:nth-child(1){width:640px;height:640px;left:-160px;top:-200px;
+  background:radial-gradient(circle,#3a3fb0,transparent 65%);animation:drift1 26s ease-in-out infinite}
+.aurora i:nth-child(2){width:520px;height:520px;right:-120px;top:120px;
+  background:radial-gradient(circle,#7a3f8f,transparent 65%);animation:drift2 32s ease-in-out infinite}
+.aurora i:nth-child(3){width:560px;height:560px;left:38%;bottom:-260px;
+  background:radial-gradient(circle,#20607a,transparent 65%);animation:drift3 30s ease-in-out infinite}
+@keyframes drift1{0%,100%{transform:translate(0,0)}50%{transform:translate(70px,50px)}}
+@keyframes drift2{0%,100%{transform:translate(0,0)}50%{transform:translate(-60px,40px)}}
+@keyframes drift3{0%,100%{transform:translate(0,0)}50%{transform:translate(50px,-40px)}}
+@media (prefers-reduced-motion:reduce){.aurora i{animation:none}}
+
+/* shell -------------------------------------------------------------------- */
+.shell{position:relative;z-index:1;height:100%;display:flex;flex-direction:column;padding:var(--space-4);gap:var(--space-3)}
+
+.topbar{display:flex;align-items:center;gap:var(--space-3);flex:0 0 auto}
+.brand{display:flex;align-items:center;gap:10px;font-weight:640;letter-spacing:-.02em}
+.brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent-ring)}
+.brand small{color:var(--text-muted);font-weight:500;letter-spacing:0}
+.spacer{flex:1}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:var(--radius-pill);
+  border:1px solid var(--border);background:var(--surface-raised);color:var(--text-secondary);
+  font-size:12px;white-space:nowrap}
+.chip b{color:var(--text-primary);font-weight:600}
+.chip.on-device{border-color:rgba(74,222,128,.28);color:#9ef0bd;background:var(--success-soft)}
+
+.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 16px;border-radius:var(--radius-pill);
+  border:1px solid var(--border-strong);background:var(--surface-raised);cursor:pointer;
+  transition:background var(--transition-fast),border-color var(--transition-fast),transform var(--transition-fast);
+  font-size:13.5px;font-weight:560}
+.btn:hover{background:var(--surface-hover)}
+.btn:active{transform:scale(.98)}
+.btn[disabled]{opacity:.4;cursor:default}
+.btn-primary{background:var(--accent);border-color:transparent;color:var(--text-on-accent);
+  box-shadow:0 4px 14px rgba(110,118,255,.22)}
+.btn-primary:hover{background:var(--accent-hover)}
+.btn-live{background:var(--live);border-color:transparent;color:#fff;box-shadow:var(--live-glow)}
+
+/* two columns -------------------------------------------------------------- */
+.cols{flex:1;min-height:0;display:grid;grid-template-columns:minmax(300px,0.86fr) 1.6fr;gap:var(--space-3)}
+.panel{border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--surface-raised);
+  backdrop-filter:blur(18px) saturate(140%);display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.panel-head{display:flex;align-items:center;gap:10px;padding:11px var(--space-4);
+  border-bottom:1px solid var(--border-subtle);flex:0 0 auto}
+.panel-head h2{margin:0;font-size:12.5px;font-weight:640;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--text-secondary)}
+.panel-body{flex:1;min-height:0;overflow:auto}
+.panel-body::-webkit-scrollbar{width:9px}
+.panel-body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:9px}
+
+/* transcript --------------------------------------------------------------- */
+.rec-dot{width:8px;height:8px;border-radius:50%;background:var(--live);box-shadow:var(--live-glow)}
+.rec-dot.idle{background:var(--text-muted);box-shadow:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.rec-dot:not(.idle){animation:pulse 1.6s ease-in-out infinite}
+.tape{padding:var(--space-4);display:flex;flex-direction:column;gap:14px}
+.utt{opacity:0;transform:translateY(6px);animation:rise .32s var(--ease-spring) forwards}
+@keyframes rise{to{opacity:1;transform:none}}
+.utt .who{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--text-muted);margin-bottom:3px}
+.utt .who .av{width:17px;height:17px;border-radius:50%;display:grid;place-items:center;
+  font-size:9px;font-weight:700;color:#0b0b12}
+.utt.me .av{background:var(--accent);color:#fff}
+.utt .txt{color:var(--text-secondary);font-size:14px}
+.utt.me .txt{color:var(--text-primary)}
+.utt mark{background:transparent;color:var(--text-primary);border-bottom:2px solid var(--accent);
+  padding-bottom:1px;transition:background var(--transition)}
+.utt mark.hot{background:var(--accent-soft);border-radius:4px;border-bottom-color:var(--accent-hover)}
+.tape .idle-note{color:var(--text-muted);font-size:13px;text-align:center;padding:var(--space-6) var(--space-4)}
+
+/* right stack -------------------------------------------------------------- */
+.right{display:flex;flex-direction:column;gap:var(--space-3);min-height:0}
+.right .panel:first-child{flex:1.45}
+.right .panel:last-child{flex:1}
+
+/* the base table ----------------------------------------------------------- */
+.obs-tag{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--text-muted);
+  border:1px solid var(--border-subtle);border-radius:var(--radius-pill);padding:3px 9px}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px}
+thead th{position:sticky;top:0;z-index:2;text-align:left;font-weight:600;font-size:11.5px;
+  letter-spacing:.04em;text-transform:uppercase;color:var(--text-muted);
+  padding:9px var(--space-3);background:#0d0d15;border-bottom:1px solid var(--border)}
+tbody td{padding:0;border-bottom:1px solid var(--border-subtle);vertical-align:middle}
+tbody tr:hover td{background:rgba(255,255,255,.022)}
+.cell{display:flex;align-items:center;gap:7px;padding:11px var(--space-3);min-height:42px;
+  border-radius:8px;margin:2px;transition:background var(--transition-fast)}
+.cell.filled{cursor:pointer}
+.cell.filled:hover{background:var(--surface-hover)}
+.cell .empty{color:#3f3f4d}
+td.proj .cell{font-weight:600;color:var(--text-primary)}
+td.proj .cell::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--graph-note);flex:0 0 auto}
+.val{opacity:0;animation:pop .34s var(--ease-spring) forwards}
+@keyframes pop{from{opacity:0;transform:translateY(4px) scale(.96)}to{opacity:1;transform:none}}
+.cell.justwrote{background:var(--accent-soft);box-shadow:inset 0 0 0 1px var(--accent-ring)}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:var(--radius-pill);
+  font-size:12px;font-weight:600;border:1px solid transparent}
+.badge.risk{background:var(--danger-soft);color:#ff9f9f;border-color:rgba(255,107,107,.28)}
+.badge.ok{background:var(--success-soft);color:#9ef0bd;border-color:rgba(74,222,128,.28)}
+.badge.blocked{background:var(--warning-soft);color:#f3c887;border-color:rgba(245,177,76,.3)}
+.badge.dropped{background:rgba(255,255,255,.07);color:var(--text-secondary);border-color:var(--border)}
+.spk{flex:0 0 auto;width:19px;height:19px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(255,255,255,.06);border:1px solid var(--border-subtle);opacity:.55;
+  transition:opacity var(--transition-fast),background var(--transition-fast)}
+.cell:hover .spk{opacity:1;background:var(--accent-soft)}
+.spk svg{width:10px;height:10px;fill:var(--text-secondary)}
+.cell:hover .spk svg{fill:var(--accent-hover)}
+.cell.unsure .val{border-bottom:1.5px dotted var(--warning);padding-bottom:1px}
+
+/* raw file pane ------------------------------------------------------------ */
+.tabs{display:flex;gap:2px;background:rgba(0,0,0,.22);border-radius:var(--radius-pill);padding:3px}
+.tabs button{border:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:600;
+  padding:5px 12px;border-radius:var(--radius-pill);cursor:pointer;transition:all var(--transition-fast)}
+.tabs button[aria-selected="true"]{background:var(--surface-hover);color:var(--text-primary)}
+pre.code{margin:0;padding:var(--space-4);font-family:var(--mono);font-size:12.4px;line-height:1.72;
+  color:var(--text-secondary);white-space:pre-wrap;word-break:break-word}
+pre.code .k{color:#8fb7ff}
+pre.code .s{color:#c9e7a5}
+pre.code .c{color:var(--text-muted)}
+pre.code .fresh{background:var(--accent-soft);border-radius:4px;
+  box-shadow:0 0 0 1px var(--accent-ring) inset;animation:fade 3.2s 1.2s forwards}
+@keyframes fade{to{background:transparent;box-shadow:none}}
+
+/* footer bar --------------------------------------------------------------- */
+.footer{flex:0 0 auto;display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap}
+.counter{display:flex;align-items:baseline;gap:7px;font-size:12.5px;color:var(--text-muted)}
+.counter b{font-size:19px;color:var(--text-primary);font-weight:660;font-variant-numeric:tabular-nums}
+.counter.zero b{color:var(--success)}
+
+/* scrubber ----------------------------------------------------------------- */
+.scrub{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-muted)}
+.scrub input[type=range]{-webkit-appearance:none;width:190px;height:3px;border-radius:3px;
+  background:linear-gradient(90deg,var(--accent) var(--pct,100%),rgba(255,255,255,.14) var(--pct,100%));outline:none}
+.scrub input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;
+  border-radius:50%;background:#fff;box-shadow:var(--shadow-sm);cursor:pointer}
+.scrub b{color:var(--text-primary);font-weight:600;min-width:74px;display:inline-block}
+
+/* provenance popover (OPAQUE — T3) ---------------------------------------- */
+.pop{position:fixed;z-index:2000;width:340px;background:var(--surface-overlay);backdrop-filter:none;
+  border:1px solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);
+  padding:var(--space-4);opacity:0;transform:translateY(6px) scale(.98);pointer-events:none;
+  transition:opacity var(--transition),transform var(--transition)}
+.pop.show{opacity:1;transform:none;pointer-events:auto}
+.pop .ph{display:flex;align-items:center;gap:9px;margin-bottom:11px}
+.pop .ph .who{font-weight:640;font-size:13.5px}
+.pop .ph .when{color:var(--text-muted);font-size:11.5px;margin-left:auto}
+.pop .av-lg{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:11px;
+  font-weight:700;color:#0b0b12}
+.pop blockquote{margin:0 0 11px;padding:10px 12px;border-left:2px solid var(--accent);
+  background:rgba(255,255,255,.035);border-radius:0 8px 8px 0;font-size:13px;color:var(--text-primary)}
+.wave{display:flex;align-items:center;gap:2px;height:26px;margin-bottom:11px}
+.wave span{flex:1;background:var(--accent);border-radius:2px;opacity:.32;transition:opacity .2s,transform .2s}
+.wave.playing span{animation:bounce 1.05s ease-in-out infinite}
+@keyframes bounce{0%,100%{opacity:.32}50%{opacity:1}}
+.pop .yaml{font-family:var(--mono);font-size:11.6px;color:var(--text-secondary);
+  background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;margin-bottom:10px}
+.pop .yaml b{color:#8fb7ff;font-weight:500}
+.pop .foot{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--text-muted)}
+.pop .foot .btn{padding:6px 12px;font-size:12px}
+
+/* the gap card ------------------------------------------------------------- */
+.gap{position:fixed;right:var(--space-5);bottom:76px;z-index:2100;width:370px;
+  background:var(--surface-overlay);border:1px solid var(--border-strong);border-radius:var(--radius-lg);
+  box-shadow:var(--shadow-lg);padding:var(--space-4);opacity:0;transform:translateY(14px);
+  pointer-events:none;transition:opacity var(--transition),transform var(--transition)}
+.gap.show{opacity:1;transform:none;pointer-events:auto}
+.gap .gh{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--text-muted);
+  letter-spacing:.05em;text-transform:uppercase;margin-bottom:9px}
+.gap .q{font-size:15.5px;font-weight:600;margin-bottom:4px}
+.gap .sub{font-size:12.5px;color:var(--text-muted);margin-bottom:13px}
+.gap .answer{font-family:var(--mono);font-size:12.5px;color:var(--graph-note);min-height:19px;margin-bottom:12px}
+.gap .row{display:flex;gap:8px;align-items:center}
+.mic{width:34px;height:34px;border-radius:50%;background:var(--live);display:grid;place-items:center;
+  box-shadow:var(--live-glow);flex:0 0 auto}
+.mic svg{width:15px;height:15px;fill:#fff}
+.mic.listening{animation:pulse 1.2s ease-in-out infinite}
+</style>
+</head>
+<body>
+<div class="aurora"><i></i><i></i><i></i></div>
+
+<div class="shell">
+  <!-- ── top bar ───────────────────────────────────────────────────────── -->
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span>Murmur <small>× your Obsidian vault</small></div>
+    <span class="chip on-device">◆ on-device · nothing left this Mac</span>
+    <div class="spacer"></div>
+    <span class="chip" id="chipVault">vault <b>~/Sonora</b></span>
+    <button class="btn btn-live" id="playBtn">▶ Play the meeting</button>
+    <button class="btn" id="resetBtn">Reset</button>
+  </div>
+
+  <!-- ── two columns ───────────────────────────────────────────────────── -->
+  <div class="cols">
+    <!-- left: what was actually SAID -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="rec-dot idle" id="recDot"></span>
+        <h2>Atlas weekly · far side captured, no bot</h2>
+        <div class="spacer"></div>
+        <span class="chip" id="clock">00:00</span>
+      </div>
+      <div class="panel-body"><div class="tape" id="tape">
+        <p class="idle-note">Nothing said yet.<br>Press <b>Play the meeting</b> — then watch the right side write itself.</p>
+      </div></div>
+    </section>
+
+    <!-- right: the vault -->
+    <div class="right">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Projects.base</h2>
+          <span class="obs-tag">▦ Obsidian Bases view</span>
+          <div class="spacer"></div>
+          <div class="scrub">
+            <span>time</span>
+            <input type="range" id="scrub" min="0" max="2" step="1" value="2" style="--pct:100%">
+            <b id="scrubLabel">today</b>
+          </div>
+        </div>
+        <div class="panel-body">
+          <table>
+            <thead><tr>
+              <th style="width:23%">Project</th><th style="width:15%">Status</th>
+              <th style="width:19%">Owner</th><th style="width:24%">Risk</th><th style="width:19%">Milestone</th>
+            </tr></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>the actual file</h2>
+          <div class="tabs" id="tabs">
+            <button data-tab="md" aria-selected="true">Projects/Atlas.md</button>
+            <button data-tab="base" aria-selected="false">Projects.base</button>
+          </div>
+          <div class="spacer"></div>
+          <span class="obs-tag">plain markdown · yours</span>
+        </div>
+        <div class="panel-body"><pre class="code" id="code"></pre></div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ── footer ────────────────────────────────────────────────────────── -->
+  <div class="footer">
+    <div class="counter"><b id="cFields">0</b> fields written by Murmur</div>
+    <div class="counter zero"><b id="cTyped">0</b> keystrokes by you</div>
+    <div class="counter"><b id="cFiles">0</b> vault files touched</div>
+    <div class="spacer"></div>
+    <span class="chip" id="hintChip" style="opacity:.75">tip: click any filled cell — it has a voice</span>
+    <button class="btn" id="gapBtn" disabled>Ask me the gaps</button>
+  </div>
+</div>
+
+<!-- provenance popover -->
+<div class="pop" id="pop" role="dialog" aria-label="Where this value came from"></div>
+
+<!-- the gap card -->
+<div class="gap" id="gap">
+  <div class="gh">◆ the vault is asking you</div>
+  <div class="q" id="gapQ"></div>
+  <div class="sub" id="gapSub"></div>
+  <div class="answer" id="gapA"></div>
+  <div class="row">
+    <div class="mic" id="gapMic"><svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-2.1A7 7 0 0 0 19 12h-2z"/></svg></div>
+    <button class="btn btn-primary" id="gapSay">Hold to answer (fake)</button>
+    <button class="btn" id="gapSkip">Skip</button>
+  </div>
+</div>
+
+<script>
+/* ===========================================================================
+   FAKE EVERYTHING. The point is the FEELING: you never typed any of this.
+   =========================================================================== */
+
+const CAST = {
+  me:     {name:"You",          initials:"Y", color:"#6e76ff", far:false},
+  sarah:  {name:"Sarah Chen",   initials:"SC",color:"#5bbdff", far:true},
+  priya:  {name:"Priya Nair",   initials:"PN",color:"#4ce0a0", far:true},
+  marcus: {name:"Marcus Reid",  initials:"MR",color:"#f5b14c", far:true},
+};
+
+const ROWS = [
+  {id:"atlas",  name:"Project Atlas",   file:"Projects/Atlas.md"},
+  {id:"mobile", name:"Mobile Redesign", file:"Projects/Mobile Redesign.md"},
+  {id:"sales",  name:"Sales Engine",    file:"Projects/Sales Engine.md"},
+  {id:"pricing",name:"Pricing Workshop",file:"Projects/Pricing Workshop.md"},
+];
+const COLS = ["status","owner","risk","milestone"];
+
+/* the meeting, as a timeline of utterances; some carry an extraction */
+const SCRIPT = [
+  {t:"00:04", who:"me", text:"Okay — Atlas weekly. Sarah, where are we really?"},
+  {t:"00:11", who:"sarah",
+   text:"Honestly? <m>it's at risk</m>. The auth migration is going to eat another full sprint.",
+   ex:[{row:"atlas",col:"status",value:"at-risk",kind:"risk",yaml:"status: at-risk"},
+       {row:"atlas",col:"risk",value:"auth migration +1 sprint",yaml:'risk: "auth migration +1 sprint"'}]},
+  {t:"00:22", who:"me", text:"So GA moves. What date can you actually stand behind?"},
+  {t:"00:29", who:"sarah", text:"<m>June 14th</m> at the earliest, and that assumes nothing else lands on us.",
+   ex:[{row:"atlas",col:"milestone",value:"GA · Jun 14",yaml:"milestone: 2026-06-14"}]},
+  {t:"00:41", who:"me", text:"Who owns the migration end to end? I don't want it split."},
+  {t:"00:47", who:"sarah", text:"<m>I'll own it.</m> All of it, through GA.",
+   ex:[{row:"atlas",col:"owner",value:"Sarah Chen",yaml:"owner: Sarah Chen"}]},
+  {t:"00:58", who:"me", text:"Good. Priya — mobile?"},
+  {t:"01:02", who:"priya", text:"<m>Mobile Redesign shipped Tuesday.</m> We're done, it's in 3.2.",
+   ex:[{row:"mobile",col:"status",value:"shipped",kind:"ok",yaml:"status: shipped"},
+       {row:"mobile",col:"owner",value:"Priya Nair",yaml:"owner: Priya Nair"}]},
+  {t:"01:14", who:"marcus", text:"Sales Engine is <m>still blocked on the Acme contract</m>. Legal hasn't moved in three weeks.",
+   ex:[{row:"sales",col:"status",value:"blocked",kind:"blocked",yaml:"status: blocked"},
+       {row:"sales",col:"risk",value:"Acme contract · legal",yaml:'risk: "Acme contract · legal"'},
+       {row:"sales",col:"owner",value:"Marcus Reid",yaml:"owner: Marcus Reid"}]},
+  {t:"01:31", who:"me", text:"Then let's <m>kill the pricing workshop</m> this month — nobody has the room.",
+   ex:[{row:"pricing",col:"status",value:"dropped",kind:"dropped",unsure:true,yaml:"status: dropped   # confidence 0.61"}]},
+  {t:"01:44", who:"sarah", text:"One more thing — the Atlas budget window <m>moves to Q3</m>.",
+   ex:[{row:"atlas",col:"milestone",value:"GA · Jun 14",yaml:"budget_window: Q3",extraOnly:true}]},
+];
+
+/* what a cell looked like in the past (the bitemporal scrubber) */
+const HISTORY = {
+  0:{label:"12 wks ago", cells:{ "atlas.status":{value:"on-track",kind:"ok"}, "atlas.risk":{value:"—"},
+      "atlas.milestone":{value:"GA · Apr 30"}, "atlas.owner":{value:"Devon Blake"},
+      "mobile.status":{value:"in-progress",kind:"blocked"}, "mobile.owner":{value:"Priya Nair"},
+      "sales.status":{value:"on-track",kind:"ok"}, "sales.owner":{value:"Marcus Reid"}, "sales.risk":{value:"—"},
+      "pricing.status":{value:"planned",kind:"dropped"} }},
+  1:{label:"6 wks ago", cells:{ "atlas.status":{value:"slipping",kind:"blocked"}, "atlas.risk":{value:"auth migration"},
+      "atlas.milestone":{value:"GA · May 24"}, "atlas.owner":{value:"Devon Blake"},
+      "mobile.status":{value:"in-review",kind:"blocked"}, "mobile.owner":{value:"Priya Nair"},
+      "sales.status":{value:"at-risk",kind:"risk"}, "sales.owner":{value:"Marcus Reid"}, "sales.risk":{value:"Acme legal"},
+      "pricing.status":{value:"planned",kind:"dropped"} }},
+  2:{label:"today", cells:null},
+};
+
+/* ---------- state ---------- */
+let live = {};           // "row.col" -> {value, kind, unsure, quote, who, t, yaml, file}
+let playing = false, timers = [], typed = 0, filesTouched = new Set(), tab = "md";
+let mdLines = [];        // rendered Atlas.md front-matter lines
+
+const $ = id => document.getElementById(id);
+const tbody = $("tbody"), tape = $("tape"), code = $("code"), pop = $("pop");
+
+/* ---------- table ---------- */
+function buildTable(){
+  tbody.innerHTML = "";
+  ROWS.forEach(r=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="proj"><div class="cell">${r.name}</div></td>` +
+      COLS.map(c=>`<td><div class="cell" id="c-${r.id}-${c}"><span class="empty">—</span></div></td>`).join("");
+    tbody.appendChild(tr);
+  });
+}
+function cellEl(row,col){ return $(`c-${row}-${col}`); }
+
+function paint(row,col,data,{animate=false}={}){
+  const el = cellEl(row,col); if(!el) return;
+  el.classList.toggle("unsure", !!data.unsure);
+  const badge = col==="status" ? `<span class="badge ${data.kind||"dropped"}">${data.value}</span>` :
+                `<span>${data.value}</span>`;
+  const speaker = data.who ? `<span class="spk" title="hear it"><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4zm13.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z"/></svg></span>` : "";
+  el.innerHTML = `<span class="val">${badge}</span>${speaker}`;
+  // no entry animation on a re-paint (scrubbing) — but the .val default is opacity:0, so pin it.
+  if(!animate) el.querySelector(".val").style.cssText = "animation:none;opacity:1";
+  el.classList.toggle("filled", !!data.who);
+  if(animate){
+    el.classList.add("justwrote");
+    setTimeout(()=>el.classList.remove("justwrote"), 1500);
+  }
+}
+
+function clearCell(row,col){
+  const el = cellEl(row,col); if(!el) return;
+  el.className = "cell"; el.innerHTML = `<span class="empty">—</span>`;
+}
+
+/* ---------- the code pane ---------- */
+function renderCode(){
+  if(tab==="md"){
+    const head = [
+      `<span class="c">&lt;!-- Projects/Atlas.md — written by Murmur, owned by you --&gt;</span>`,
+      `---`,
+      `<span class="k">title</span>: <span class="s">Project Atlas</span>`,
+      `<span class="k">type</span>: <span class="s">project</span>`,
+    ];
+    const tail = [`---`,``,`## What was said`,`<span class="c">…the note body…</span>`];
+    code.innerHTML = head.concat(mdLines, tail).join("\n");
+  } else {
+    code.innerHTML = [
+      `<span class="c"># Projects.base — the Obsidian view Murmur generated for you</span>`,
+      `<span class="k">filters</span>:`,
+      `  <span class="k">and</span>:`,
+      `    - <span class="s">'type == "project"'</span>`,
+      `<span class="k">views</span>:`,
+      `  - <span class="k">type</span>: <span class="s">table</span>`,
+      `    <span class="k">name</span>: <span class="s">Live projects</span>`,
+      `    <span class="k">order</span>:`,
+      `      - <span class="s">file.name</span>`,
+      `      - <span class="s">status</span>`,
+      `      - <span class="s">owner</span>`,
+      `      - <span class="s">risk</span>`,
+      `      - <span class="s">milestone</span>`,
+      `    <span class="k">sort</span>:`,
+      `      - <span class="k">property</span>: <span class="s">status</span>`,
+      ``,
+      `<span class="c"># Obsidian renders this. Murmur is the only thing that can FILL it.</span>`,
+    ].join("\n");
+  }
+}
+function pushMd(yaml, fresh){
+  const [k, ...rest] = yaml.split(":");
+  const v = rest.join(":").trim();
+  const line = `<span class="${fresh?"fresh":""}"><span class="k">${k}</span>: <span class="s">${v}</span></span>`;
+  const i = mdLines.findIndex(l=>l.includes(`>${k}</span>`));
+  if(i>=0) mdLines[i] = line; else mdLines.push(line);
+  renderCode();
+}
+
+/* ---------- counters ---------- */
+function counters(){
+  $("cFields").textContent = Object.keys(live).length;
+  $("cTyped").textContent  = typed;
+  $("cFiles").textContent  = filesTouched.size;
+}
+
+/* ---------- transcript ---------- */
+function say(u){
+  const c = CAST[u.who];
+  const el = document.createElement("div");
+  el.className = "utt" + (u.who==="me" ? " me" : "");
+  el.innerHTML =
+    `<div class="who"><span class="av" style="background:${c.color}">${c.initials}</span>` +
+    `${c.name}${c.far?" · far side":""}<span style="margin-left:auto">${u.t}</span></div>` +
+    `<div class="txt">${u.text.replace(/<m>/g,'<mark>').replace(/<\/m>/g,'</mark>')}</div>`;
+  tape.appendChild(el);
+  tape.parentElement.scrollTop = tape.parentElement.scrollHeight;
+  return el;
+}
+
+/* ---------- playback ---------- */
+function play(){
+  if(playing) return;
+  reset(false);
+  playing = true;
+  $("playBtn").textContent = "● recording…";
+  $("playBtn").disabled = true;
+  $("recDot").classList.remove("idle");
+  tape.innerHTML = "";
+  let d = 300;
+  SCRIPT.forEach((u,i)=>{
+    timers.push(setTimeout(()=>{
+      $("clock").textContent = u.t;
+      const el = say(u);
+      const marks = el.querySelectorAll("mark");
+      if(u.ex){
+        timers.push(setTimeout(()=>{
+          marks.forEach(m=>m.classList.add("hot"));
+          u.ex.forEach((e,j)=>{
+            timers.push(setTimeout(()=>{
+              const key = `${e.row}.${e.col}`;
+              if(!e.extraOnly){
+                live[key] = {value:e.value, kind:e.kind, unsure:e.unsure, who:u.who, t:u.t,
+                             quote:u.text.replace(/<\/?m>/g,""), yaml:e.yaml,
+                             file:ROWS.find(r=>r.id===e.row).file};
+                paint(e.row, e.col, live[key], {animate:true});
+              }
+              filesTouched.add(ROWS.find(r=>r.id===e.row).file);
+              if(e.row==="atlas") pushMd(e.yaml, true);
+              counters();
+            }, 260*j));
+          });
+        }, 430));
+      }
+    }, d));
+    d += u.ex ? 1950 : 1150;
+  });
+  timers.push(setTimeout(finish, d + 1300));
+}
+
+function finish(){
+  playing = false;
+  $("recDot").classList.add("idle");
+  $("playBtn").textContent = "▶ Play again";
+  $("playBtn").disabled = false;
+  $("gapBtn").disabled = false;
+  $("hintChip").innerHTML = `↓ ${Object.keys(live).length} fields across ${filesTouched.size} files. ` +
+    `<b>Zero</b> keystrokes. Click a cell — it has a voice.`;
+}
+
+function reset(full=true){
+  timers.forEach(clearTimeout); timers = [];
+  playing = false; live = {}; typed = 0; filesTouched = new Set(); mdLines = [];
+  buildTable(); renderCode(); counters(); hidePop(); $("gap").classList.remove("show");
+  $("clock").textContent = "00:00";
+  $("recDot").classList.add("idle");
+  $("playBtn").textContent = "▶ Play the meeting"; $("playBtn").disabled = false;
+  $("gapBtn").disabled = true;
+  $("scrub").value = 2; setScrub(2);
+  if(full){
+    tape.innerHTML = `<p class="idle-note">Nothing said yet.<br>Press <b>Play the meeting</b> — then watch the right side write itself.</p>`;
+    $("hintChip").textContent = "tip: click any filled cell — it has a voice";
+  }
+}
+
+/* ---------- provenance popover ---------- */
+let popKey = null;
+function showPop(key, el){
+  const d = live[key]; if(!d) return;
+  const c = CAST[d.who];
+  pop.innerHTML =
+    `<div class="ph"><span class="av-lg" style="background:${c.color};color:${d.who==="me"?"#fff":"#0b0b12"}">${c.initials}</span>` +
+    `<span class="who">${c.name}</span><span class="when">said it out loud · ${d.t}</span></div>` +
+    `<blockquote>“${d.quote}”</blockquote>` +
+    `<div class="wave" id="wave">${Array.from({length:38},(_,i)=>
+      `<span style="height:${18+Math.round(Math.abs(Math.sin(i*1.7))*72)}%;animation-delay:${i*38}ms"></span>`).join("")}</div>` +
+    `<div class="yaml"><b>${d.yaml.split(":")[0]}</b>:${d.yaml.split(":").slice(1).join(":")}<br>` +
+    `<span style="color:var(--text-muted)">→ ${d.file}</span></div>` +
+    `<div class="foot"><button class="btn" id="playClip">▶ Hear it</button>` +
+    `<span>voiceprint-matched · on-device</span></div>`;
+  const r = el.getBoundingClientRect();
+  const top = Math.min(r.bottom + 8, window.innerHeight - 290);
+  pop.style.top = top + "px";
+  pop.style.left = Math.min(r.left, window.innerWidth - 356) + "px";
+  pop.classList.add("show");
+  popKey = key;
+  $("playClip").onclick = () => {
+    const w = $("wave"); w.classList.add("playing");
+    setTimeout(()=>w.classList.remove("playing"), 2400);
+  };
+}
+function hidePop(){ pop.classList.remove("show"); popKey = null; }
+
+document.addEventListener("click", e=>{
+  const cell = e.target.closest(".cell.filled");
+  if(cell && cell.id){
+    const [,row,col] = cell.id.split("-");
+    const key = `${row}.${col}`;
+    if(popKey === key){ hidePop(); return; }
+    showPop(key, cell); e.stopPropagation(); return;
+  }
+  if(!e.target.closest(".pop")) hidePop();
+});
+
+/* ---------- the scrubber (bitemporal) ---------- */
+function setScrub(v){
+  const h = HISTORY[v];
+  $("scrubLabel").textContent = h.label;
+  $("scrub").style.setProperty("--pct", (v/2*100)+"%");
+  ROWS.forEach(r=>COLS.forEach(c=>{
+    const key = `${r.id}.${c}`;
+    if(v===2){
+      if(live[key]) paint(r.id,c,live[key]); else clearCell(r.id,c);
+    } else {
+      const past = h.cells[key];
+      if(past && past.value!=="—") paint(r.id,c,{...past, who:null});
+      else clearCell(r.id,c);
+    }
+  }));
+  document.querySelectorAll(".cell").forEach(el=>{
+    if(v!==2) el.classList.remove("filled");
+  });
+  const tag = document.querySelector(".obs-tag");
+  if(v===2){ tag.textContent = "▦ Obsidian Bases view"; tag.style.color = ""; tag.style.borderColor = ""; }
+  else { tag.textContent = "⟲ as it was — replayed from bitemporal facts";
+         tag.style.color = "#f3c887"; tag.style.borderColor = "rgba(245,177,76,.35)"; }
+  document.querySelector("table").style.opacity = v===2 ? "1" : ".78";
+  hidePop();
+}
+$("scrub").addEventListener("input", e=>setScrub(+e.target.value));
+
+/* ---------- "the gap" — the vault asks YOU ---------- */
+const GAPS = [
+  {q:"Sales Engine — is Acme signing this quarter?",
+   sub:"blocked 3 weeks · nobody has said a word about it since Jun 2",
+   answer:"“No — they pushed it to Q3, Marcus is re-scoping.”",
+   write:{row:"sales", col:"milestone", value:"Acme · Q3", yaml:'milestone: "Acme · Q3"'}},
+  {q:"Pricing Workshop — dropped, or just paused?",
+   sub:"I heard “kill it” but I'm only 61% sure that was final",
+   answer:"“Paused. Revisit after Atlas GA.”",
+   write:{row:"pricing", col:"status", value:"paused", kind:"blocked", yaml:"status: paused"}},
+];
+let gapIdx = 0;
+
+function openGap(){
+  if(gapIdx >= GAPS.length){ $("gap").classList.remove("show"); gapIdx = 0; return; }
+  const g = GAPS[gapIdx];
+  $("gapQ").textContent = g.q; $("gapSub").textContent = g.sub; $("gapA").textContent = "";
+  $("gapSay").textContent = "Hold to answer (fake)"; $("gapSay").disabled = false;
+  $("gap").classList.add("show");
+}
+$("gapBtn").onclick = () => { gapIdx = 0; openGap(); };
+$("gapSkip").onclick = () => { gapIdx++; openGap(); };
+$("gapSay").onclick = () => {
+  const g = GAPS[gapIdx];
+  $("gapSay").disabled = true; $("gapSay").textContent = "listening…";
+  $("gapMic").classList.add("listening");
+  let i = 0;
+  const iv = setInterval(()=>{
+    $("gapA").textContent = g.answer.slice(0, ++i);
+    if(i >= g.answer.length){
+      clearInterval(iv);
+      $("gapMic").classList.remove("listening");
+      const w = g.write, key = `${w.row}.${w.col}`;
+      live[key] = {value:w.value, kind:w.kind, who:"me", t:"just now", quote:g.answer.replace(/[“”]/g,""),
+                   yaml:w.yaml, file:ROWS.find(r=>r.id===w.row).file};
+      filesTouched.add(live[key].file);
+      if($("scrub").value === "2") paint(w.row, w.col, live[key], {animate:true});
+      counters();
+      $("gapSay").textContent = "written ✓";
+      setTimeout(()=>{ gapIdx++; openGap(); }, 1100);
+    }
+  }, 26);
+};
+
+/* ---------- tabs ---------- */
+$("tabs").addEventListener("click", e=>{
+  const b = e.target.closest("button"); if(!b) return;
+  tab = b.dataset.tab;
+  [...$("tabs").children].forEach(x=>x.setAttribute("aria-selected", x===b));
+  renderCode();
+});
+
+$("playBtn").onclick = play;
+$("resetBtn").onclick = () => reset(true);
+
+/* boot */
+buildTable(); renderCode(); counters();
+</script>
+</body>
+</html>
