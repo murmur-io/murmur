@@ -251,23 +251,59 @@ fn withheld_living_answer_sheds_its_config() {
     assert!(!json.contains("churning"), "answer text on the wire: {json}");
 }
 
+/// THE ORACLE the previous gate never had. An independent verifier proved that switching the old
+/// Living-answer gate off left all 2732 tests green — it was unfalsifiable. This tests the gate
+/// itself as a pure function, so neutering it fails here immediately.
+///
+/// The gate is a READABLE-FOLDER snapshot rather than a source list because `ask_vault`'s pinned
+/// path expands into linked NEIGHBOURS (`vault_context.rs`, `LINK_CONTEXT_CAP`) that no caller
+/// records — so only a bound on what was readable at the time can cover what the answer saw.
 #[test]
-fn living_answer_config_round_trips_its_sources() {
+fn living_answer_gate_withholds_when_a_folder_stopped_being_readable() {
+    let readable = |ids: &[&str]| -> std::collections::HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    };
+    let recorded = vec!["f-open".to_string(), "f-secret".to_string()];
+
+    // Everything still readable ⇒ the answer shows.
+    assert!(!living_answer_withheld(
+        true,
+        &recorded,
+        &readable(&["f-open", "f-secret", "f-new"]),
+    ));
+
+    // `f-secret` got sealed ⇒ WITHHELD, even though it was never a tile source: the answer could
+    // have paraphrased it via link expansion.
+    assert!(living_answer_withheld(
+        true,
+        &recorded,
+        &readable(&["f-open"]),
+    ));
+
+    // A folder that vanished entirely is also "not readable" ⇒ withheld.
+    assert!(living_answer_withheld(true, &recorded, &readable(&[])));
+
+    // FAIL-CLOSED: a legacy row with no recorded snapshot cannot be checked ⇒ withheld.
+    assert!(living_answer_withheld(true, &[], &readable(&["f-open"])));
+
+    // No answer at all is not "withheld" — the tile just has nothing yet.
+    assert!(!living_answer_withheld(false, &[], &readable(&[])));
+}
+
+#[test]
+fn living_answer_config_round_trips_its_readable_snapshot() {
     let cfg = TileConfig {
         question: Some("Will we make Jun 14?".into()),
         answer: Some("Probably not.".into()),
-        answer_sources: Some(vec![SourceRef {
-            kind: LinkKind::Meeting,
-            id: "m-1".into(),
-        }]),
+        answer_readable_folders: Some(vec!["f-open".into()]),
         ..Default::default()
     };
     let back = parse_config(Some(&serde_json::to_string(&cfg).unwrap()));
-    assert_eq!(back.answer_sources.as_ref().map(Vec::len), Some(1));
+    assert_eq!(back.answer_readable_folders.as_ref().map(Vec::len), Some(1));
     // A legacy row (an answer, no recorded sources) parses — and the resolver treats that as
     // un-gateable, i.e. withheld. See `resolve_tile`'s living_answer arm.
     let legacy = parse_config(Some(r#"{"question":"q","answer":"a"}"#));
-    assert_eq!(legacy.answer_sources, None);
+    assert_eq!(legacy.answer_readable_folders, None);
     assert!(legacy.answer.is_some());
 }
 

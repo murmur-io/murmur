@@ -12,7 +12,6 @@ import type {
   Dashboard,
   DashboardDetail,
   DashboardSummary,
-  DashboardTile,
   DashboardTint,
   TileKind,
   LinkEdge,
@@ -1292,6 +1291,10 @@ export class IpcService {
     return invoke<SourceRef[]>("get_dashboard_sources", { id });
   }
 
+  /**
+   * Returns nothing on purpose: the backend refuses to hand back the raw stored
+   * row, because that would ship `title`/`config` unredacted. Reload the board.
+   */
   addDashboardTile(
     dashboardId: string,
     kind: TileKind,
@@ -1301,8 +1304,8 @@ export class IpcService {
       span?: number;
       config?: string;
     },
-  ): Promise<DashboardTile> {
-    return invoke<DashboardTile>("add_dashboard_tile", {
+  ): Promise<void> {
+    return invoke<void>("add_dashboard_tile", {
       dashboardId,
       kind,
       ...opts,
@@ -1312,8 +1315,22 @@ export class IpcService {
   updateDashboardTile(
     id: string,
     patch: { title?: string; span?: number; config?: string },
-  ): Promise<DashboardTile> {
-    return invoke<DashboardTile>("update_dashboard_tile", { id, ...patch });
+  ): Promise<void> {
+    return invoke<void>("update_dashboard_tile", { id, ...patch });
+  }
+
+  /**
+   * Persist a Living-answer result. The BACKEND writes it, because the gate that
+   * governs the cached answer is a snapshot of which folders were readable at
+   * answer time — something the FE cannot compute, and something no list of
+   * sources can substitute for (Ask expands into linked neighbours).
+   */
+  setDashboardAnswer(
+    id: string,
+    question: string,
+    answer: string,
+  ): Promise<void> {
+    return invoke<void>("set_dashboard_answer", { id, question, answer });
   }
 
   deleteDashboardTile(id: string): Promise<boolean> {

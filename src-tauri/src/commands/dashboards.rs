@@ -183,12 +183,61 @@ pub struct TileConfig {
     pub answer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<String>,
-    /// `living_answer` — the sources the cached answer was BUILT from. This is what makes a
-    /// cached answer gate-able: an answer paraphrases its sources, so if any of them is later
-    /// sealed the answer must stop being returned. A legacy row with no recorded sources is
-    /// treated as un-gateable and withheld (fail-closed) once it has an answer at all.
+    /// `living_answer` — the board's tile sources at answer time. Kept for provenance display;
+    /// it is NOT the gate (see `answer_readable_folders` for why it cannot be).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_sources: Option<Vec<SourceRef>>,
+    /// `living_answer` — every folder that was READABLE when the answer was computed.
+    ///
+    /// This, not the source list, is what makes a cached answer gate-able. `ask_vault`'s pinned
+    /// path does not answer from the pinned sources alone: `summarize/vault_context.rs`
+    /// (`build_vault_context_pinned_visible`) additionally packs up to `LINK_CONTEXT_CAP` linked
+    /// NEIGHBOURS into the corpus, and the note/document arm of that expansion does not even
+    /// report them back in `AskVaultResult.sources`. So no list of sources the caller knows about
+    /// can bound what the answer paraphrases.
+    ///
+    /// A folder set can. The answer could only ever have drawn on content that was readable at the
+    /// time, so recording the readable set and withholding the moment any of it stops being
+    /// readable is sound regardless of how retrieval expanded. Absent ⇒ un-gateable ⇒ withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_readable_folders: Option<Vec<String>>,
+}
+
+/// Decide whether a cached Living answer may still be shown.
+///
+/// Split out as a PURE function on purpose: `resolve_tile` needs a `State<AppState>`, so nothing
+/// could test the gate in place — and an independent verifier proved that disabling the previous
+/// gate left the entire suite green. This one has a direct oracle
+/// (`living_answer_gate_withholds_when_a_folder_stopped_being_readable`).
+///
+/// Fail-closed: an answer with no recorded readable set, or an empty one, is withheld.
+pub(crate) fn living_answer_withheld(
+    has_answer: bool,
+    recorded_readable: &[String],
+    currently_readable: &std::collections::HashSet<String>,
+) -> bool {
+    if !has_answer {
+        return false;
+    }
+    if recorded_readable.is_empty() {
+        return true; // un-gateable (legacy row) ⇒ withhold
+    }
+    !recorded_readable
+        .iter()
+        .all(|id| currently_readable.contains(id))
+}
+
+/// Every folder the session can currently read: unlocked outright, or sealed but session-unlocked.
+fn readable_folder_ids(
+    db: &crate::storage::Db,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>, AppError> {
+    Ok(db
+        .list_folders()?
+        .into_iter()
+        .filter(|f| !f.locked || unlocked.contains(&f.id))
+        .map(|f| f.id)
+        .collect())
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────────────────────
@@ -373,7 +422,7 @@ pub fn add_dashboard_tile(
     title: Option<String>,
     span: Option<i64>,
     config: Option<String>,
-) -> Result<DashboardTile, AppError> {
+) -> Result<(), AppError> {
     if !TILE_KINDS.contains(&kind.as_str()) {
         return Err(AppError::InvalidArg(format!("unknown tile kind: {kind}")));
     }
@@ -411,10 +460,10 @@ pub fn add_dashboard_tile(
         &now,
     )?;
     state.db.touch_dashboard(&dashboard_id, &now)?;
-    state
-        .db
-        .get_dashboard_tile(&id)?
-        .ok_or_else(|| AppError::Storage("tile vanished after insert".into()))
+    // Deliberately returns nothing. Handing back the stored row would ship `title`/`config`
+    // unredacted — the same "on the wire regardless" hole `redact_tile_chrome` closes for
+    // `get_dashboard`, on a command it does not cover. The FE reloads the board anyway.
+    Ok(())
 }
 
 #[tauri::command]
@@ -424,7 +473,7 @@ pub fn update_dashboard_tile(
     title: Option<String>,
     span: Option<i64>,
     config: Option<String>,
-) -> Result<DashboardTile, AppError> {
+) -> Result<(), AppError> {
     let Some(existing) = state.db.get_dashboard_tile(&id)? else {
         return Err(AppError::InvalidArg(format!("no tile with id {id}")));
     };
@@ -443,10 +492,60 @@ pub fn update_dashboard_tile(
         .db
         .update_dashboard_tile(&id, title.as_deref(), span, config.as_deref())?;
     state.db.touch_dashboard(&existing.dashboard_id, &now_iso())?;
+    // Same reason as `add_dashboard_tile`: never return the raw row. Reachable proof this
+    // mattered — the Arrange-mode resize control fires for a SEALED tile, so returning the row
+    // would push that tile's stored title/config into the webview.
+    Ok(())
+}
+
+/// Persist a Living-answer result, stamping the readable-folder snapshot that gates it.
+///
+/// The FE cannot compute that snapshot (it has no folder/lock view), and letting it write the
+/// answer through the generic `update_dashboard_tile` is what made the cache un-gateable. So the
+/// backend owns this write end-to-end.
+#[tauri::command]
+pub fn set_dashboard_answer(
+    state: State<'_, AppState>,
+    id: String,
+    question: String,
+    answer: String,
+) -> Result<(), AppError> {
+    let Some(existing) = state.db.get_dashboard_tile(&id)? else {
+        return Err(AppError::InvalidArg(format!("no tile with id {id}")));
+    };
+    if existing.kind != "living_answer" {
+        return Err(AppError::InvalidArg(
+            "only a living-answer tile stores an answer".into(),
+        ));
+    }
+    let question = clean_title(&question, "question")?;
+    if answer.len() > MAX_CONFIG_LEN {
+        return Err(AppError::InvalidArg("answer too large".into()));
+    }
+    // Snapshot under the lifecycle guard so a relock cannot land between computing the readable
+    // set and storing it — otherwise the answer would be stamped with a MORE permissive set than
+    // was actually in force, which is the one direction that would weaken the gate.
+    let _lifecycle = super::lifecycle_guard(state.inner());
+    let unlocked = super::unlocked_snapshot(state.inner())?;
+    let readable: Vec<String> = readable_folder_ids(&state.db, &unlocked)?
+        .into_iter()
+        .collect();
+
+    let mut cfg = parse_config(existing.config.as_deref());
+    cfg.question = Some(question);
+    cfg.answer = Some(answer);
+    cfg.answered_at = Some(now_iso());
+    cfg.answer_readable_folders = Some(readable);
+    let encoded = serde_json::to_string(&cfg)
+        .map_err(|e| AppError::Storage(format!("encoding tile config failed: {e}")))?;
+    if encoded.len() > MAX_CONFIG_LEN {
+        return Err(AppError::InvalidArg("answer too large".into()));
+    }
     state
         .db
-        .get_dashboard_tile(&id)?
-        .ok_or_else(|| AppError::Storage("tile vanished after update".into()))
+        .update_dashboard_tile(&id, None, None, Some(&encoded))?;
+    state.db.touch_dashboard(&existing.dashboard_id, &now_iso())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -543,6 +642,8 @@ pub fn get_dashboard_sources(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<SourceRef>, AppError> {
+    // Same TOCTOU discipline as `get_dashboard`: gate and read under one lifecycle guard.
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let tiles = state.db.list_dashboard_tiles(&id)?;
     let unlocked = super::unlocked_snapshot(state.inner())?;
     let mut out: Vec<SourceRef> = Vec::new();
@@ -862,14 +963,9 @@ fn resolve_tile(
             // Fail-closed on a legacy row: an answer with no recorded sources cannot be checked,
             // so it is withheld rather than trusted.
             let has_answer = cfg.answer.as_ref().is_some_and(|a| !a.trim().is_empty());
-            let sources = cfg.answer_sources.unwrap_or_default();
-            let all_visible = !sources.is_empty()
-                && sources
-                    .iter()
-                    .try_fold(true, |acc, s| -> Result<bool, AppError> {
-                        Ok(acc && source_is_visible(db, s, unlocked)?)
-                    })?;
-            let withheld = has_answer && !all_visible;
+            let recorded = cfg.answer_readable_folders.unwrap_or_default();
+            let withheld =
+                living_answer_withheld(has_answer, &recorded, &readable_folder_ids(db, unlocked)?);
             Ok(TileData::LivingAnswer {
                 question: cfg.question.unwrap_or_default(),
                 answer: if withheld { None } else { cfg.answer },

@@ -260,23 +260,15 @@ export class DashboardViewComponent {
     if (tile.data.kind !== "livingAnswer") return;
     const question = tile.data.question.trim();
     if (!question) return;
-    const config = this.service.parseConfig(tile.config);
     try {
       const sources = await this.ipc.getDashboardSources(this.id());
       if (sources.length === 0) return;
       const result = await this.ipc.askVault(question, [], undefined, sources);
-      await this.service.updateTile(tile.id, {
-        config: {
-          ...config,
-          question,
-          answer: result.answer,
-          answeredAt: new Date().toISOString(),
-          // Record WHICH sources produced this answer. The backend gates the
-          // cached answer against them, so once any of those folders is sealed
-          // the paraphrase stops being returned instead of outliving its source.
-          answerSources: sources,
-        },
-      });
+      // The BACKEND persists this, so it can stamp the readable-folder snapshot
+      // that gates the cached answer. Writing it from here through the generic
+      // tile update is what left the cache un-gateable.
+      await this.ipc.setDashboardAnswer(tile.id, question, result.answer);
+      await this.service.loadBoard(this.id());
     } catch {
       // The service surfaces the error banner; a failed re-answer leaves the
       // previous answer intact rather than blanking the tile.
