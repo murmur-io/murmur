@@ -64,6 +64,25 @@ export const routes: Routes = [
           ),
       },
       {
+        // Dashboards — the boards LIST. Deliberately NOT in
+        // `TabRouteReuseStrategy`'s scope: a list route must be destroyed and
+        // recreated so it always refetches, and its rows live in the root
+        // `DashboardsService` so the remount is invisible (angular-zoneless §8).
+        path: "dashboards",
+        loadComponent: () =>
+          import(
+            "./features/dashboards/dashboards-home/dashboards-home.component"
+          ).then((m) => m.DashboardsHomeComponent),
+      },
+      {
+        // One board.
+        path: "dashboards/:id",
+        loadComponent: () =>
+          import(
+            "./features/dashboards/dashboard-view/dashboard-view.component"
+          ).then((m) => m.DashboardViewComponent),
+      },
+      {
         // New-note gateway: creates a note then replaces the URL with /notes/:id.
         path: "notes/new",
         loadComponent: () =>
