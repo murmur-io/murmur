@@ -165,12 +165,14 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   const palette = page.getByRole("dialog", { name: "Add a tile" });
   await expect(palette).toBeVisible();
 
-  // It must be a child of <body>, not of the board subtree.
-  const parentIsBody = await page.evaluate(() => {
-    const el = document.querySelector(".palette");
-    return el?.parentElement?.parentElement?.tagName === "BODY";
+  // It must be in the browser's TOP LAYER — that is what puts it outside every
+  // stacking context and every fixed-positioning containing block. `:modal`
+  // matches only a dialog opened with showModal(), not one merely `open`.
+  const isTopLayer = await page.evaluate(() => {
+    const el = document.querySelector("dialog.palette");
+    return !!el && el.matches(":modal");
   });
-  expect(parentIsBody, "the palette overlay must be teleported to <body>").toBe(true);
+  expect(isTopLayer, "the palette must be a showModal() dialog in the top layer").toBe(true);
 
   // And it must be fully on screen — the failure mode is "opens, but off-viewport".
   const box = await palette.boundingBox();
