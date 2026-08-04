@@ -168,6 +168,46 @@ export class TilePaletteComponent {
 
   readonly types = NODE_TYPES;
 
+  /**
+   * TEMPORARY on-screen instrument — remove once the packaged webview is confirmed
+   * good. There is no log file to read from the running dev app and this engine
+   * cannot be driven from a test, so the only way to MEASURE rather than guess is
+   * to put the numbers where a screenshot can capture them (angular-zoneless.md
+   * T5: add observability before guessing). Seeded with "measuring…" on purpose:
+   * if that is what shows, `afterNextRender` never ran, which is itself the answer.
+   */
+  readonly diag = signal("measuring…");
+
+  private readonly _measure = afterNextRender(() => {
+    const box = (sel: string): string => {
+      const el = document.querySelector(sel);
+      if (!el) return `${sel}:none`;
+      const b = el.getBoundingClientRect();
+      return `${sel} ${Math.round(b.x)},${Math.round(b.y)} ${Math.round(b.width)}x${Math.round(b.height)}`;
+    };
+    try {
+      const panel = document.querySelector(".palette");
+      const cs = panel ? getComputedStyle(panel) : null;
+      this.diag.set(
+        [
+          `vp ${window.innerWidth}x${window.innerHeight}`,
+          box(".tp-overlay"),
+          box(".palette"),
+          box(".palette-head"),
+          box(".catalogue"),
+          `kids ${panel?.childElementCount ?? "-"}`,
+          `scrollH ${panel?.scrollHeight ?? "-"}`,
+          `maxH ${cs?.maxHeight ?? "-"}`,
+          `minH ${cs?.minHeight ?? "-"}`,
+          `disp ${cs?.display ?? "-"}`,
+          `nodes ${document.querySelectorAll(".palette .node").length}`,
+        ].join(" · "),
+      );
+    } catch (e) {
+      this.diag.set(`measure threw: ${String(e)}`);
+    }
+  });
+
   /** The kind being configured; `null` ⇒ the catalogue step. */
   readonly selected = signal<NodeType | null>(null);
   readonly query = signal("");
