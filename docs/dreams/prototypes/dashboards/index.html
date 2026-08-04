@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur — Dashboards (vibe prototype)</title>
+<style>
+/* ============================================================================
+   VIBE PROTOTYPE — fake data, fake AI, fake audio, fake vault. Not production.
+   Tokens copied from src/design-tokens/*.css. Demo world = "Sonora".
+   Two screens: (1) the Dashboards tab — a rich list; (2) one dashboard open.
+   ============================================================================ */
+:root{
+  --surface-base:#07070b; --surface-raised:rgba(255,255,255,.045);
+  --surface-overlay:#1b1b24; --surface-solid:#111118;
+  --surface-hover:rgba(255,255,255,.06); --surface-input:rgba(255,255,255,.035);
+  --scrim:rgba(0,0,0,.55);
+  --text-primary:#f6f6fa; --text-secondary:#a6a6b6; --text-muted:#6c6c7d;
+  --text-on-accent:#fff;
+  --accent:#6e76ff; --accent-hover:#8a90ff; --accent-soft:rgba(110,118,255,.16);
+  --accent-ring:rgba(110,118,255,.5);
+  --live:#ff7a5c; --live-soft:rgba(255,122,92,.16); --live-glow:0 8px 24px rgba(255,122,92,.28);
+  --border:rgba(255,255,255,.09); --border-strong:rgba(255,255,255,.16);
+  --border-subtle:rgba(255,255,255,.055);
+  --success:#4ade80; --success-soft:rgba(74,222,128,.15);
+  --danger:#ff6b6b; --danger-soft:rgba(255,107,107,.14);
+  --warning:#f5b14c; --warning-soft:rgba(245,177,76,.14);
+  --n-note:#4ce0a0; --n-rec:#ff9d5c; --n-person:#5bbdff; --n-doc:#c86ff2;
+  --n-insight:#6e76ff; --n-remind:#f5b14c; --n-sealed:#5a5a6b;
+  --radius-sm:9px; --radius-md:13px; --radius-lg:18px; --radius-xl:24px; --radius-pill:999px;
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px;
+  --space-6:32px; --space-7:48px;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+  --shadow-md:0 12px 32px rgba(0,0,0,.35); --shadow-lg:0 22px 56px rgba(0,0,0,.48);
+  --transition:200ms cubic-bezier(.32,.72,0,1);
+  --transition-fast:130ms cubic-bezier(.32,.72,0,1);
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--surface-base);color:var(--text-primary);
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+  font-size:14.5px;line-height:1.5;letter-spacing:-.01em;overflow:hidden}
+button{font:inherit;color:inherit;cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:10px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* aurora ------------------------------------------------------------------- */
+.aurora{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.aurora i{position:absolute;display:block;border-radius:50%;filter:blur(100px);opacity:.45}
+.aurora i:nth-child(1){width:700px;height:700px;left:-200px;top:-240px;
+  background:radial-gradient(circle,#3a3fb0,transparent 65%);animation:d1 28s ease-in-out infinite}
+.aurora i:nth-child(2){width:560px;height:560px;right:-140px;top:80px;
+  background:radial-gradient(circle,#7a3f8f,transparent 65%);animation:d2 34s ease-in-out infinite}
+.aurora i:nth-child(3){width:620px;height:620px;left:42%;bottom:-300px;
+  background:radial-gradient(circle,#20607a,transparent 65%);animation:d3 31s ease-in-out infinite}
+@keyframes d1{0%,100%{transform:translate(0,0)}50%{transform:translate(80px,60px)}}
+@keyframes d2{0%,100%{transform:translate(0,0)}50%{transform:translate(-70px,50px)}}
+@keyframes d3{0%,100%{transform:translate(0,0)}50%{transform:translate(60px,-50px)}}
+@media (prefers-reduced-motion:reduce){.aurora i{animation:none}}
+
+/* app shell ---------------------------------------------------------------- */
+.app{position:relative;z-index:1;height:100%;display:flex;gap:var(--space-3);padding:var(--space-3)}
+
+/* left rail (the real Murmur sidebar shape) */
+.rail{width:216px;flex:0 0 auto;display:flex;flex-direction:column;gap:var(--space-1);
+  border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--space-3);
+  background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.025));
+  backdrop-filter:blur(44px) saturate(210%)}
+.rail .logo{display:flex;align-items:center;gap:9px;padding:6px 8px 14px;font-weight:660;letter-spacing:-.02em}
+.rail .logo .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent-ring)}
+.rail .sect{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-muted);
+  padding:12px 8px 5px;font-weight:640}
+.navi{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--radius-sm);
+  color:var(--text-secondary);font-size:13.5px;font-weight:520;border:1px solid transparent;
+  transition:background var(--transition-fast),color var(--transition-fast);background:none;width:100%;text-align:left}
+.navi:hover{background:var(--surface-hover);color:var(--text-primary)}
+.navi.active{background:rgba(255,255,255,.08);color:var(--text-primary);
+  border-color:var(--border-subtle);box-shadow:0 1px 0 rgba(255,255,255,.05) inset}
+.navi svg{width:16px;height:16px;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.7;
+  stroke-linecap:round;stroke-linejoin:round}
+.navi.active svg{stroke:var(--accent)}
+.navi .n{margin-left:auto;font-size:11px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+.rail .foot{margin-top:auto;font-size:11px;color:var(--text-muted);padding:8px}
+
+/* main --------------------------------------------------------------------- */
+main{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
+
+.hdr{flex:0 0 auto;display:flex;align-items:center;gap:var(--space-3);padding:var(--space-2) var(--space-2) var(--space-4)}
+.hdr h1{margin:0;font-size:25px;font-weight:680;letter-spacing:-.035em}
+.hdr .sub{color:var(--text-muted);font-size:13px;margin-top:2px}
+.spacer{flex:1}
+
+.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 15px;border-radius:var(--radius-pill);
+  border:1px solid var(--border-strong);background:var(--surface-raised);font-size:13.5px;font-weight:560;
+  transition:background var(--transition-fast),transform var(--transition-fast),border-color var(--transition-fast)}
+.btn:hover{background:var(--surface-hover)}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:var(--accent);border-color:transparent;color:var(--text-on-accent);
+  box-shadow:0 4px 14px rgba(110,118,255,.22)}
+.btn-primary:hover{background:var(--accent-hover)}
+.btn-sm{padding:6px 11px;font-size:12.5px}
+.btn-ghost{border-color:transparent;background:transparent;color:var(--text-secondary)}
+.btn-ghost:hover{background:var(--surface-hover);color:var(--text-primary)}
+
+.seg{display:inline-flex;background:rgba(0,0,0,.25);border-radius:var(--radius-pill);padding:3px;gap:2px}
+.seg button{border:0;background:transparent;color:var(--text-muted);font-size:12.5px;font-weight:600;
+  padding:6px 14px;border-radius:var(--radius-pill);transition:all var(--transition-fast)}
+.seg button[aria-selected="true"]{background:var(--surface-hover);color:var(--text-primary)}
+
+.search{display:flex;align-items:center;gap:8px;padding:8px 13px;border-radius:var(--radius-pill);
+  background:var(--surface-input);border:1px solid var(--border-subtle);color:var(--text-muted);font-size:13px;width:220px}
+.search svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8}
+
+.scrollarea{flex:1;min-height:0;overflow:auto;padding:0 var(--space-2) var(--space-6)}
+
+/* ── screen 1: the dashboards list ───────────────────────────────────────── */
+.groupbar{display:flex;align-items:center;gap:9px;margin:var(--space-2) 0 var(--space-3)}
+.groupbar h2{margin:0;font-size:12px;font-weight:680;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted)}
+.groupbar .line{flex:1;height:1px;background:var(--border-subtle)}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:var(--space-4)}
+.grid.big{grid-template-columns:repeat(auto-fill,minmax(430px,1fr))}
+
+.dcard{position:relative;border:1px solid var(--border);border-radius:var(--radius-lg);overflow:hidden;
+  background:var(--surface-raised);backdrop-filter:blur(18px) saturate(140%);
+  transition:transform var(--transition),border-color var(--transition),box-shadow var(--transition);
+  cursor:pointer;display:flex;flex-direction:column;text-align:left;padding:0;width:100%}
+.dcard:hover{transform:translateY(-3px);border-color:var(--border-strong);box-shadow:var(--shadow-lg)}
+.dcard .glow{position:absolute;inset:0;opacity:.5;pointer-events:none;
+  background:radial-gradient(120% 90% at 12% -10%,var(--tint,transparent),transparent 62%)}
+
+/* the live mini-preview — a REAL miniature of the board, not colour blocks */
+.mini{position:relative;height:132px;padding:11px;display:grid;gap:5px;
+  grid-template-columns:repeat(12,1fr);grid-auto-rows:28px;
+  background:radial-gradient(120% 140% at 50% -20%,rgba(255,255,255,.045),rgba(0,0,0,.3))}
+.dcard.big .mini{height:176px;grid-auto-rows:38px}
+.mt{position:relative;display:flex;flex-direction:column;gap:3px;justify-content:center;
+  border-radius:5px;padding:5px 6px;overflow:hidden;
+  background:color-mix(in srgb,var(--c) 13%,transparent);
+  border:1px solid color-mix(in srgb,var(--c) 30%,transparent);
+  transition:background var(--transition),border-color var(--transition),transform var(--transition)}
+.dcard:hover .mt{background:color-mix(in srgb,var(--c) 22%,transparent);
+  border-color:color-mix(in srgb,var(--c) 48%,transparent)}
+.mt::after{content:"";position:absolute;top:4px;right:4px;width:5px;height:5px;border-radius:50%;
+  background:var(--c);opacity:.8}
+.mt .ln{height:2.5px;border-radius:2px;background:rgba(255,255,255,.26)}
+.mt .ln.s{width:52%}.mt .ln.m{width:78%}.mt .ln.l{width:94%}
+.mt .wv{display:flex;align-items:flex-end;gap:1.5px;height:60%}
+.mt .wv b{flex:1;background:var(--c);opacity:.7;border-radius:1px}
+.mt .dots{display:flex;gap:3px}
+.mt .dots b{width:9px;height:9px;border-radius:50%;background:var(--c);opacity:.75}
+.mt svg{width:100%;height:60%;overflow:visible}
+.mt .hatch{position:absolute;inset:0;background:repeating-linear-gradient(45deg,
+  rgba(255,255,255,.09) 0 3px,transparent 3px 7px)}
+.dcard:hover .mt.pulse{animation:tilepulse 1.7s ease-in-out infinite}
+@keyframes tilepulse{0%,100%{transform:none}50%{transform:scale(1.02)}}
+.mini .veil{position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(180deg,transparent 52%,rgba(7,7,11,.68))}
+
+.dbody{padding:var(--space-4);display:flex;flex-direction:column;gap:10px;position:relative}
+.dtitle{display:flex;align-items:center;gap:9px;font-size:16.5px;font-weight:660;letter-spacing:-.02em}
+.dtitle .em{font-size:17px}
+.dtitle .lock{margin-left:auto;color:var(--text-muted);font-size:11.5px;display:inline-flex;gap:5px;align-items:center}
+.dmeta{display:flex;flex-wrap:wrap;gap:6px}
+.tchip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--text-secondary);
+  border:1px solid var(--border-subtle);background:rgba(255,255,255,.03);border-radius:var(--radius-pill);padding:3px 9px}
+.tchip b{width:6px;height:6px;border-radius:50%;background:var(--c)}
+.dfoot{display:flex;align-items:center;gap:10px;padding-top:2px;border-top:1px solid var(--border-subtle);margin-top:2px}
+.dfoot .when{font-size:11.5px;color:var(--text-muted)}
+.dfoot .fresh{font-size:11.5px;color:var(--n-note);display:inline-flex;align-items:center;gap:5px}
+.dfoot .fresh .rd{width:6px;height:6px;border-radius:50%;background:var(--n-note);
+  box-shadow:0 0 8px rgba(76,224,160,.7);animation:blip 2.2s ease-in-out infinite}
+@keyframes blip{0%,100%{opacity:1}50%{opacity:.3}}
+.avstack{display:flex;margin-left:auto}
+.avstack span{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:9.5px;
+  font-weight:700;color:#0b0b12;border:2px solid #0e0e15;margin-left:-7px}
+.spark{height:22px;display:flex;align-items:flex-end;gap:2px;margin-left:auto}
+.spark i{width:3px;border-radius:2px;background:var(--accent);opacity:.5}
+
+.newcard{border:1px dashed var(--border-strong);background:transparent;display:grid;place-items:center;
+  min-height:290px;border-radius:var(--radius-lg);color:var(--text-muted);gap:8px;transition:all var(--transition)}
+.newcard:hover{background:var(--surface-hover);color:var(--text-primary);border-color:var(--accent-ring)}
+.newcard .plus{width:44px;height:44px;border-radius:50%;background:var(--accent-soft);display:grid;
+  place-items:center;font-size:22px;color:var(--accent-hover);margin-bottom:2px}
+
+/* ── screen 2: one dashboard open ────────────────────────────────────────── */
+.dash{display:flex;gap:var(--space-3);flex:1;min-height:0}
+.canvas{flex:1;min-width:0;overflow:auto;padding:0 var(--space-2) var(--space-6);
+  display:grid;grid-template-columns:repeat(12,1fr);grid-auto-rows:max-content;
+  gap:var(--space-3);align-content:start}
+
+.tile{grid-column:span var(--w,4);align-self:start;border:1px solid var(--border);
+  border-radius:var(--radius-lg);
+  background:var(--surface-raised);backdrop-filter:blur(18px) saturate(140%);display:flex;
+  flex-direction:column;position:relative;
+  opacity:0;transform:translateY(10px);animation:tin .42s var(--ease-spring) forwards;
+  transition:border-color var(--transition),box-shadow var(--transition)}
+@keyframes tin{to{opacity:1;transform:none}}
+.tile.cited{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-ring),0 10px 40px rgba(110,118,255,.22)}
+.tile .cite-n{position:absolute;top:-9px;left:-9px;width:24px;height:24px;border-radius:50%;
+  background:var(--accent);color:#fff;display:grid;place-items:center;font-size:12px;font-weight:700;
+  box-shadow:var(--shadow-md);z-index:3;animation:pop .3s var(--ease-spring)}
+@keyframes pop{from{transform:scale(.4);opacity:0}to{transform:none;opacity:1}}
+.th{display:flex;align-items:center;gap:9px;padding:11px var(--space-4) 9px;flex:0 0 auto}
+.th .ic{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;background:var(--c);flex:0 0 auto}
+.th .ic svg{width:12px;height:12px;stroke:#0b0b12;fill:none;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+.th h3{margin:0;font-size:13.5px;font-weight:640;letter-spacing:-.01em}
+.th .kind{font-size:10.5px;color:var(--text-muted);letter-spacing:.05em;text-transform:uppercase}
+.th .live{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--text-muted)}
+.th .live .rd{width:5px;height:5px;border-radius:50%;background:var(--n-note);animation:blip 2.4s ease-in-out infinite}
+.tb{padding:0 var(--space-4) var(--space-4);font-size:13px;color:var(--text-secondary);
+  overflow:hidden;border-radius:0 0 var(--radius-lg) var(--radius-lg)}
+
+/* tile internals */
+.drift{position:relative;padding-left:16px}
+.drift::before{content:"";position:absolute;left:4px;top:6px;bottom:10px;width:1.5px;
+  background:linear-gradient(180deg,var(--border-subtle),var(--accent-ring))}
+.drift .step{position:relative;padding:6px 0}
+.drift .step::before{content:"";position:absolute;left:-16px;top:12px;width:9px;height:9px;border-radius:50%;
+  background:var(--surface-solid);border:2px solid var(--border-strong)}
+.drift .step.now::before{background:var(--accent);border-color:var(--accent);box-shadow:0 0 10px var(--accent-ring)}
+.drift .v{font-weight:620;color:var(--text-primary);font-size:13.5px}
+.drift .m{font-size:11.5px;color:var(--text-muted)}
+.drift .step.old .v{color:var(--text-muted);text-decoration:line-through;text-decoration-color:rgba(255,255,255,.24)}
+
+.qlist{display:flex;flex-direction:column;gap:9px}
+.q{padding:9px 11px;border-radius:var(--radius-sm);background:rgba(255,255,255,.03);
+  border:1px solid var(--border-subtle);transition:background var(--transition-fast)}
+.q:hover{background:var(--surface-hover)}
+.q .t{color:var(--text-primary);font-size:13px;margin-bottom:3px}
+.q .m{font-size:11px;color:var(--text-muted);display:flex;gap:8px;align-items:center}
+.q .m .warn{color:var(--warning)}
+
+.prow{display:flex;align-items:center;gap:9px;padding:8px 0;border-bottom:1px solid var(--border-subtle)}
+.prow:last-child{border-bottom:0}
+.av{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-size:9.5px;
+  font-weight:700;color:#0b0b12;flex:0 0 auto}
+.prow .t{flex:1;min-width:0;color:var(--text-primary);font-size:12.8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{font-size:10.5px;font-weight:650;padding:2.5px 8px;border-radius:var(--radius-pill);border:1px solid transparent;white-space:nowrap}
+.pill.ok{background:var(--success-soft);color:#9ef0bd;border-color:rgba(74,222,128,.28)}
+.pill.late{background:var(--danger-soft);color:#ff9f9f;border-color:rgba(255,107,107,.28)}
+.pill.due{background:var(--warning-soft);color:#f3c887;border-color:rgba(245,177,76,.3)}
+.play{width:22px;height:22px;border-radius:50%;background:rgba(255,255,255,.06);border:1px solid var(--border-subtle);
+  display:grid;place-items:center;flex:0 0 auto;transition:all var(--transition-fast)}
+.play:hover{background:var(--accent-soft);border-color:var(--accent-ring)}
+.play svg{width:9px;height:9px;fill:var(--text-secondary)}
+.play:hover svg{fill:var(--accent-hover)}
+
+.wave{display:flex;align-items:center;gap:2px;height:52px;margin:6px 0 10px}
+.wave span{flex:1;background:var(--n-rec);border-radius:2px;opacity:.32}
+.wave span.on{opacity:.9}
+.wave.playing span{animation:bnc 1.1s ease-in-out infinite}
+@keyframes bnc{0%,100%{opacity:.3}50%{opacity:.95}}
+.marks{display:flex;gap:5px;flex-wrap:wrap}
+.mark{font-size:11px;padding:3px 8px;border-radius:var(--radius-pill);background:rgba(255,157,92,.12);
+  color:#ffbe95;border:1px solid rgba(255,157,92,.25)}
+
+.notepv{font-size:12.6px;line-height:1.62;color:var(--text-secondary);
+  max-height:160px;overflow:hidden;position:relative;
+  -webkit-mask-image:linear-gradient(180deg,#000 62%,transparent)}
+.notepv h4{margin:0 0 6px;font-size:13px;color:var(--text-primary)}
+.notepv .wl{color:var(--n-person)}
+
+.pulse svg{width:100%;height:60px;display:block}
+.pulsemeta{display:flex;gap:var(--space-4);margin-top:6px}
+.pulsemeta div{font-size:11.5px;color:var(--text-muted)}
+.pulsemeta b{display:block;font-size:16px;color:var(--text-primary);font-weight:660;font-variant-numeric:tabular-nums}
+.pulsemeta .bad b{color:var(--warning)}
+
+.people{display:flex;flex-direction:column;gap:10px}
+.person{display:flex;align-items:center;gap:10px}
+.person .nm{font-size:13px;color:var(--text-primary);font-weight:560}
+.person .sm{font-size:11px;color:var(--text-muted)}
+
+.rem{display:flex;align-items:center;gap:10px;padding:7px 0}
+.box{width:16px;height:16px;border-radius:5px;border:1.6px solid var(--border-strong);flex:0 0 auto}
+.rem.done .box{background:var(--success);border-color:var(--success)}
+.rem.done .t{color:var(--text-muted);text-decoration:line-through}
+
+.answer{font-size:13.4px;color:var(--text-primary);line-height:1.62}
+.answer .src{color:var(--accent-hover);font-size:11px;vertical-align:super;cursor:pointer}
+.refreshed{margin-top:10px;font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:6px}
+
+.sealed .tb{position:relative;min-height:120px;display:grid;place-items:center;text-align:center}
+.sealed .blur{position:absolute;inset:0;background:
+  repeating-linear-gradient(0deg,rgba(255,255,255,.045) 0 9px,transparent 9px 19px);
+  filter:blur(1px);border-radius:var(--radius-sm)}
+.sealed .msg{position:relative;color:var(--text-muted);font-size:12.5px}
+.sealed .msg .big{font-size:22px;display:block;margin-bottom:6px}
+
+.numbers{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.num{padding:9px 11px;border-radius:var(--radius-sm);background:rgba(255,255,255,.03);border:1px solid var(--border-subtle)}
+.num .v{font-size:18px;font-weight:680;color:var(--text-primary);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.num .k{font-size:11px;color:var(--text-muted)}
+.num .was{font-size:10.5px;color:var(--warning);margin-top:2px}
+
+/* ask column --------------------------------------------------------------- */
+.ask{width:330px;flex:0 0 auto;display:flex;flex-direction:column;border:1px solid var(--border);
+  border-radius:var(--radius-lg);background:var(--surface-raised);backdrop-filter:blur(18px) saturate(140%);overflow:hidden}
+.ask .ah{padding:12px var(--space-4);border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:9px}
+.ask .ah h3{margin:0;font-size:13px;font-weight:640}
+.ask .scope{margin:var(--space-3) var(--space-4) 0;padding:10px 12px;border-radius:var(--radius-sm);
+  background:var(--accent-soft);border:1px solid rgba(110,118,255,.28);font-size:11.5px;color:#bfc3ff}
+.ask .scope b{color:#fff}
+.ask .body{flex:1;overflow:auto;padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3)}
+.bubble{padding:11px 13px;border-radius:14px;font-size:13.2px;line-height:1.6}
+.bubble.me{background:var(--accent);color:#fff;align-self:flex-end;max-width:88%;border-bottom-right-radius:5px}
+.bubble.ai{background:rgba(255,255,255,.05);border:1px solid var(--border-subtle);border-bottom-left-radius:5px}
+.bubble.ai .src{display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;
+  background:var(--accent);color:#fff;font-size:10px;font-weight:700;vertical-align:middle;margin:0 2px;cursor:pointer}
+.suggest{display:flex;flex-direction:column;gap:7px}
+.suggest button{text-align:left;padding:9px 11px;border-radius:var(--radius-sm);border:1px solid var(--border-subtle);
+  background:rgba(255,255,255,.028);font-size:12.4px;color:var(--text-secondary);transition:all var(--transition-fast)}
+.suggest button:hover{background:var(--surface-hover);color:var(--text-primary);border-color:var(--border-strong)}
+.ask .comp{padding:var(--space-3);border-top:1px solid var(--border-subtle);display:flex;gap:8px;align-items:center}
+.ask .comp .fake-in{flex:1;padding:9px 13px;border-radius:var(--radius-pill);background:var(--surface-input);
+  border:1px solid var(--border-subtle);color:var(--text-muted);font-size:12.5px}
+.typing span{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--text-muted);margin-right:3px;
+  animation:tp 1.1s ease-in-out infinite}
+.typing span:nth-child(2){animation-delay:.16s}.typing span:nth-child(3){animation-delay:.32s}
+@keyframes tp{0%,100%{opacity:.25;transform:translateY(0)}50%{opacity:1;transform:translateY(-3px)}}
+
+/* add-tile palette (OPAQUE floating — T3) ---------------------------------- */
+.scrim{position:fixed;inset:0;background:var(--scrim);z-index:1900;opacity:0;pointer-events:none;
+  transition:opacity var(--transition)}
+.scrim.show{opacity:1;pointer-events:auto}
+.palette{position:fixed;z-index:2000;top:50%;left:50%;transform:translate(-50%,-46%) scale(.97);
+  width:min(880px,92vw);max-height:78vh;background:var(--surface-overlay);backdrop-filter:none;
+  border:1px solid var(--border-strong);border-radius:var(--radius-xl);box-shadow:var(--shadow-lg);
+  opacity:0;pointer-events:none;transition:opacity var(--transition),transform var(--transition);
+  display:flex;flex-direction:column;overflow:hidden}
+.palette.show{opacity:1;transform:translate(-50%,-50%) scale(1);pointer-events:auto}
+.palette .ph{padding:var(--space-4) var(--space-5);border-bottom:1px solid var(--border-subtle)}
+.palette .ph h3{margin:0 0 3px;font-size:17px;font-weight:660;letter-spacing:-.02em}
+.palette .ph p{margin:0;font-size:12.5px;color:var(--text-muted)}
+.palette .pg{padding:var(--space-4) var(--space-5) var(--space-5);overflow:auto;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}
+.nodeopt{display:flex;gap:11px;padding:12px;border-radius:var(--radius-md);border:1px solid var(--border-subtle);
+  background:rgba(255,255,255,.028);text-align:left;transition:all var(--transition-fast);align-items:flex-start}
+.nodeopt:hover{background:var(--surface-hover);border-color:var(--border-strong);transform:translateY(-1px)}
+.nodeopt .ic{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:var(--c);flex:0 0 auto}
+.nodeopt .ic svg{width:14px;height:14px;stroke:#0b0b12;fill:none;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+.nodeopt .nm{display:block;font-size:13.2px;font-weight:600;color:var(--text-primary);margin-bottom:2px}
+.nodeopt .ds{display:block;font-size:11.6px;color:var(--text-muted);line-height:1.45}
+.nodeopt .only{display:inline-block;margin-top:6px;font-size:10px;letter-spacing:.04em;text-transform:uppercase;
+  color:#bfc3ff;background:var(--accent-soft);border:1px solid rgba(110,118,255,.3);border-radius:var(--radius-pill);padding:2px 7px}
+
+.toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(14px);z-index:2200;
+  background:var(--surface-overlay);border:1px solid var(--border-strong);border-radius:var(--radius-pill);
+  padding:10px 18px;font-size:12.8px;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;
+  transition:all var(--transition)}
+.toast.show{opacity:1;transform:translateX(-50%)}
+
+.crumb{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-muted)}
+.crumb button{background:none;border:0;color:var(--text-muted);padding:0;font-size:12.5px}
+.crumb button:hover{color:var(--text-primary)}
+</style>
+</head>
+<body>
+<div class="aurora"><i></i><i></i><i></i></div>
+
+<div class="app">
+  <!-- left rail ---------------------------------------------------------- -->
+  <nav class="rail">
+    <div class="logo"><span class="dot"></span>Murmur</div>
+    <button class="navi" data-nav="record"><svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 12a7 7 0 0 1-14 0M12 19v3"/></svg>Record</button>
+    <div class="sect">Library</div>
+    <button class="navi" data-nav="notes"><svg viewBox="0 0 24 24"><path d="M5 4h9l5 5v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M14 4v5h5"/></svg>Notes<span class="n">142</span></button>
+    <button class="navi" data-nav="meetings"><svg viewBox="0 0 24 24"><path d="M4 7h16v13H4z"/><path d="M8 3v4M16 3v4M4 11h16"/></svg>Meetings<span class="n">318</span></button>
+    <button class="navi" data-nav="reminders"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8z"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>Reminders<span class="n">7</span></button>
+    <button class="navi active" data-nav="dashboards"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg>Dashboards<span class="n">6</span></button>
+    <div class="sect">Brain</div>
+    <button class="navi" data-nav="ask"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3.2-6.9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.3 2.4c-.8.3-1.3 1-1.3 1.9M12 17h.01"/></svg>Ask</button>
+    <button class="navi" data-nav="graph"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="8" r="2.4"/><circle cx="11" cy="18" r="2.4"/><path d="M8 7l8 1M8.5 8l2 8M16.5 10l-4.5 7"/></svg>Brain map</button>
+    <div class="foot">◆ on-device · nothing left this Mac</div>
+  </nav>
+
+  <main id="main"></main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<div class="palette" id="palette"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+/* ===========================================================================
+   FAKE EVERYTHING. The point is the FEELING of a rich, living, self-aware board.
+   =========================================================================== */
+const $ = id => document.getElementById(id);
+const el = (h) => { const d=document.createElement("div"); d.innerHTML=h.trim(); return d.firstElementChild; };
+
+/* ── icons ─────────────────────────────────────────────────────────────── */
+const IC = {
+  note:`<path d="M5 4h9l5 5v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M14 4v5h5"/>`,
+  rec:`<path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M19 12a7 7 0 0 1-14 0"/>`,
+  drift:`<path d="M3 17l5-6 4 3 5-8"/><path d="M3 21h18"/>`,
+  q:`<path d="M9.5 9a2.5 2.5 0 1 1 3.3 2.4c-.8.3-1.3 1-1.3 1.9M12 17h.01"/><circle cx="12" cy="12" r="9"/>`,
+  promise:`<path d="M20 6L9 17l-5-5"/>`,
+  timeline:`<path d="M3 12h18"/><circle cx="7" cy="12" r="2"/><circle cx="14" cy="12" r="2"/><path d="M7 8v-3M14 16v3"/>`,
+  pulse:`<path d="M3 12h4l3-8 4 16 3-8h4"/>`,
+  people:`<circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0"/><path d="M16 5.5a3 3 0 0 1 0 5M17 20a6 6 0 0 0-2-4.3"/>`,
+  remind:`<path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8z"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>`,
+  answer:`<path d="M21 15a2 2 0 0 1-2 2H8l-4 4V5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/>`,
+  num:`<path d="M5 8h14M5 16h14M10 3l-2 18M17 3l-2 18"/>`,
+  decide:`<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M8.5 12l2.5 2.5 5-5"/>`,
+  graph:`<circle cx="6" cy="6" r="2.2"/><circle cx="18" cy="8" r="2.2"/><circle cx="11" cy="18" r="2.2"/><path d="M8 7l8 1M8.5 8l2 8"/>`,
+  quote:`<path d="M8 7c-2.2 0-4 1.8-4 4s1.8 4 4 4c0 3-2 4-2 4M18 7c-2.2 0-4 1.8-4 4s1.8 4 4 4c0 3-2 4-2 4"/>`,
+  block:`<circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>`,
+  silence:`<path d="M11 5L6 9H3v6h3l5 4z"/><path d="M22 9l-6 6M16 9l6 6"/>`,
+  sealed:`<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>`,
+  agenda:`<path d="M5 4h14v16H5z"/><path d="M9 9h6M9 13h6M9 17h3"/>`,
+  doc:`<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 13h6M9 17h6"/>`,
+};
+
+/* ── the node-type catalogue (this is the "what else could live here" answer) ── */
+const NODES = [
+  {k:"note",  ic:"note",  c:"var(--n-note)",  nm:"Note",            ds:"A live note preview — edit in place, wikilinks resolve."},
+  {k:"rec",   ic:"rec",   c:"var(--n-rec)",   nm:"Recording",       ds:"Waveform with topic markers. Scrub it, hear it, jump to the second.", only:1},
+  {k:"doc",   ic:"doc",   c:"var(--n-doc)",   nm:"Document",        ds:"A PDF/deck from the brain, page-anchored."},
+  {k:"drift", ic:"drift", c:"var(--n-insight)",nm:"Drift lane",     ds:"How ONE value moved over time — GA: Apr 30 → May 24 → Jun 14.", only:1},
+  {k:"q",     ic:"q",     c:"var(--n-insight)",nm:"Open questions", ds:"Questions that were ASKED out loud and never answered.", only:1},
+  {k:"promise",ic:"promise",c:"var(--n-insight)",nm:"Promise ledger",ds:"Who committed to what, in their own voice, and whether it landed.", only:1},
+  {k:"timeline",ic:"timeline",c:"var(--n-rec)",nm:"Timeline",       ds:"Every meeting/decision on one scrubbable axis."},
+  {k:"pulse", ic:"pulse", c:"var(--n-insight)",nm:"Pulse",          ds:"How often this is actually talked about — and where it went quiet.", only:1},
+  {k:"people",ic:"people",c:"var(--n-person)",nm:"People",          ds:"Voice-verified attendance, open commitments, last contact.", only:1},
+  {k:"remind",ic:"remind",c:"var(--n-remind)",nm:"Reminders",       ds:"The reminders bound to this board's sources."},
+  {k:"answer",ic:"answer",c:"var(--n-insight)",nm:"Living answer",  ds:"A pinned question whose answer re-runs after every meeting.", only:1},
+  {k:"num",   ic:"num",   c:"var(--n-insight)",nm:"Numbers",        ds:"Figures that were said out loud, with what they used to be.", only:1},
+  {k:"decide",ic:"decide",c:"var(--n-insight)",nm:"Decision log",   ds:"What was decided, when, and who was in the room."},
+  {k:"graph", ic:"graph", c:"var(--n-person)",nm:"Mini brain-map",  ds:"The graph, clipped to just this board's entities."},
+  {k:"quote", ic:"quote", c:"var(--n-rec)",   nm:"Quote wall",      ds:"Hand-picked lines, each one playable.", only:1},
+  {k:"block", ic:"block", c:"var(--n-remind)",nm:"Blocked-on",      ds:"The dependency chain, lifted from what people said blocks them.", only:1},
+  {k:"silence",ic:"silence",c:"var(--n-remind)",nm:"Going quiet",   ds:"What nobody has mentioned in N days — the stuff dying silently.", only:1},
+  {k:"agenda",ic:"agenda",c:"var(--n-note)",  nm:"Next agenda",     ds:"Auto-built from this board's open questions + overdue promises.", only:1},
+  {k:"sealed",ic:"sealed",c:"var(--n-sealed)",nm:"Sealed source",   ds:"A locked folder's tile — redacted until Touch ID. Safe to screen-share.", only:1},
+];
+const NODE = Object.fromEntries(NODES.map(n=>[n.k,n]));
+
+/* ── the dashboards ────────────────────────────────────────────────────── */
+const DASHBOARDS = [
+  {id:"atlas", em:"🚀", name:"Atlas GA", tint:"rgba(110,118,255,.35)", pinned:true,
+   sub:"the whole GA push in one board", when:"updated 2h ago", fresh:"3 new facts since Tuesday",
+   people:[["SC","#5bbdff"],["MR","#f5b14c"],["PN","#4ce0a0"]], locked:true,
+   counts:[["4 notes","var(--n-note)"],["3 recordings","var(--n-rec)"],["6 people","var(--n-person)"],["2 docs","var(--n-doc)"]],
+   spark:[3,5,4,7,6,9,12,8,14,11,16,13],
+   layout:[[6,2,"insight",1],[3,2,"note"],[3,1,"rec",1],[3,1,"person"],[4,1,"remind"],[5,1,"insight"],[3,1,"sealed"]]},
+  {id:"acme", em:"🤝", name:"Acme — the deal", tint:"rgba(255,157,92,.3)", pinned:true,
+   sub:"every call with them, what they promised", when:"updated yesterday", fresh:"1 contradiction found",
+   people:[["DB","#c86ff2"],["MR","#f5b14c"]], locked:false,
+   counts:[["2 notes","var(--n-note)"],["8 recordings","var(--n-rec)"],["4 people","var(--n-person)"]],
+   spark:[8,6,9,4,7,3,5,2,6,4,3,7],
+   layout:[[4,2,"rec",1],[4,1,"insight"],[4,1,"person"],[4,2,"insight"],[8,1,"note"]]},
+  {id:"q3", em:"🗓", name:"Q3 planning", tint:"rgba(76,224,160,.26)",
+   sub:"what we said we'd do", when:"updated 3d ago", fresh:"",
+   people:[["SC","#5bbdff"],["PN","#4ce0a0"],["AP","#ff9d5c"],["DB","#c86ff2"]], locked:false,
+   counts:[["9 notes","var(--n-note)"],["5 recordings","var(--n-rec)"]],
+   spark:[2,4,3,6,5,4,7,5,3,4,2,3],
+   layout:[[12,1,"insight"],[4,2,"note"],[4,2,"note"],[4,1,"remind"],[4,1,"person"]]},
+  {id:"hiring", em:"🧭", name:"Hiring — staff eng", tint:"rgba(91,189,255,.26)",
+   sub:"every loop, every debrief", when:"updated 5d ago", fresh:"2 debriefs unread",
+   people:[["AP","#ff9d5c"],["SC","#5bbdff"]], locked:true,
+   counts:[["11 recordings","var(--n-rec)"],["7 people","var(--n-person)"],["3 docs","var(--n-doc)"]],
+   spark:[1,3,2,5,4,6,3,7,5,8,6,4],
+   layout:[[4,1,"person"],[4,1,"person"],[4,1,"person"],[6,2,"rec",1],[6,1,"insight"],[6,1,"sealed"]]},
+  {id:"pricing", em:"💸", name:"Pricing workshop", tint:"rgba(200,111,242,.26)",
+   sub:"the numbers everyone keeps changing", when:"updated 1w ago", fresh:"going quiet — 9 days",
+   people:[["MR","#f5b14c"],["DB","#c86ff2"]], locked:false,
+   counts:[["3 notes","var(--n-note)"],["2 recordings","var(--n-rec)"],["1 doc","var(--n-doc)"]],
+   spark:[9,11,8,10,6,5,3,2,1,1,0,0],
+   layout:[[6,2,"insight",1],[6,1,"note"],[6,1,"doc"],[12,1,"insight"]]},
+  {id:"board", em:"📈", name:"Board update", tint:"rgba(245,177,76,.24)",
+   sub:"the story we tell investors", when:"updated 2w ago", fresh:"",
+   people:[["SC","#5bbdff"]], locked:true,
+   counts:[["5 notes","var(--n-note)"],["4 recordings","var(--n-rec)"]],
+   spark:[4,3,5,4,6,4,3,5,4,6,5,4],
+   layout:[[8,2,"insight",1],[4,1,"num"],[4,1,"note"],[6,1,"sealed"],[6,1,"rec"]]},
+];
+const TINT = {note:"var(--n-note)",rec:"var(--n-rec)",person:"var(--n-person)",doc:"var(--n-doc)",
+              insight:"var(--n-insight)",remind:"var(--n-remind)",sealed:"var(--n-sealed)",num:"var(--n-insight)"};
+
+/* ── the open board's tiles ────────────────────────────────────────────── */
+let TILES = [
+  {id:"t-drift", k:"drift", w:4, title:"GA date", live:true},
+  {id:"t-q",     k:"q",     w:4, title:"Open questions", live:true},
+  {id:"t-prom",  k:"promise",w:4, title:"Promises made out loud", live:true},
+  {id:"t-rec",   k:"rec",   w:5, title:"Atlas weekly · Jun 3"},
+  {id:"t-note",  k:"note",  w:4, title:"Atlas GA checklist"},
+  {id:"t-pulse", k:"pulse", w:3, title:"Pulse", live:true},
+  {id:"t-ans",   k:"answer",w:5, title:"Are we going to make Jun 14?", live:true},
+  {id:"t-people",k:"people",w:3, title:"Who's on this"},
+  {id:"t-num",   k:"num",   w:4, title:"Numbers said out loud", live:true},
+  {id:"t-rem",   k:"remind",w:4, title:"Reminders"},
+  {id:"t-seal",  k:"sealed",w:4, title:"Legal · Acme terms"},
+];
+
+/* ── tile bodies ───────────────────────────────────────────────────────── */
+const BODY = {
+  drift: () => `<div class="drift">
+    <div class="step old"><div class="v">GA · Apr 30</div><div class="m">Devon Blake · Mar 12 · kickoff</div></div>
+    <div class="step old"><div class="v">GA · May 24</div><div class="m">Sarah Chen · Apr 28 · “auth is heavier than we thought”</div></div>
+    <div class="step now"><div class="v">GA · Jun 14</div><div class="m">Sarah Chen · Jun 3 · “June 14th at the earliest”</div></div>
+    <div style="margin-top:9px;font-size:11.5px;color:var(--warning)">↑ slipped 45 days across 3 meetings</div></div>`,
+  q: () => `<div class="qlist">
+    <div class="q"><div class="t">Who signs off on SOC2 before GA?</div>
+      <div class="m">asked 2× · <span class="warn">unanswered 19 days</span></div></div>
+    <div class="q"><div class="t">Do we ship the migration behind a flag?</div>
+      <div class="m">asked by Priya · <span class="warn">unanswered 6 days</span></div></div>
+    <div class="q"><div class="t">What happens to EU customers on launch day?</div>
+      <div class="m">asked 3× · <span class="warn">unanswered 24 days</span></div></div></div>`,
+  promise: () => `
+    <div class="prow"><span class="av" style="background:#5bbdff">SC</span>
+      <span class="t">“I'll own the migration end to end”</span>
+      <span class="pill ok">kept</span>${playBtn()}</div>
+    <div class="prow"><span class="av" style="background:#f5b14c">MR</span>
+      <span class="t">“Acme paperwork by Friday”</span>
+      <span class="pill late">12d late</span>${playBtn()}</div>
+    <div class="prow"><span class="av" style="background:#4ce0a0">PN</span>
+      <span class="t">“Mobile ships Tuesday”</span>
+      <span class="pill ok">kept</span>${playBtn()}</div>
+    <div class="prow"><span class="av" style="background:#6e76ff">Y</span>
+      <span class="t">“I'll get legal on the call”</span>
+      <span class="pill due">due today</span>${playBtn()}</div>`,
+  rec: () => `<div class="wave" id="wv">${Array.from({length:64},(_,i)=>
+      `<span class="${[8,9,10,26,27,44,45,46].includes(i)?"on":""}" style="height:${14+Math.round(Math.abs(Math.sin(i*.9))*74)}%"></span>`).join("")}</div>
+    <div class="marks"><span class="mark">02:14 auth migration</span><span class="mark">11:40 GA date</span>
+      <span class="mark">19:02 Acme</span><span class="mark">26:31 hiring</span></div>
+    <div style="margin-top:10px;display:flex;align-items:center;gap:9px;font-size:11.5px;color:var(--text-muted)">
+      ${playBtn("big")}<span>34:12 · Me + 3 others · far side captured, no bot</span></div>`,
+  note: () => `<div class="notepv"><h4>Atlas GA checklist</h4>
+    <p>Blocking: <span class="wl">[[auth migration]]</span> — Sarah owns it end to end, ~1 sprint left.</p>
+    <p>SOC2 evidence pack still unsigned. <span class="wl">[[Acme]]</span> contract is the only external gate.</p>
+    <p>Launch comms drafted, waiting on the date to stop moving.</p>
+    <p>EU rollout follows +1 week…</p></div>`,
+  pulse: () => `<div class="pulse"><svg viewBox="0 0 120 46" preserveAspectRatio="none">
+      <polyline points="0,38 10,34 20,36 30,26 40,28 50,18 60,20 70,12 80,16 90,8 100,14 110,6 120,10"
+        fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <polyline points="0,46 0,38 10,34 20,36 30,26 40,28 50,18 60,20 70,12 80,16 90,8 100,14 110,6 120,10 120,46"
+        fill="url(#g)" opacity=".22"/>
+      <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#6e76ff"/><stop offset="1" stop-color="transparent"/></linearGradient></defs>
+    </svg></div>
+    <div class="pulsemeta"><div>mentions / wk<b>16</b></div><div class="bad">quiet on<b>pricing 9d</b></div></div>`,
+  answer: () => `<div class="answer">Probably not. The migration still has ~1 sprint of work
+    <span class="src" data-jump="t-drift">1</span>, SOC2 sign-off has been unanswered for 19 days
+    <span class="src" data-jump="t-q">2</span>, and the only external gate — Acme — is 12 days past
+    the date Marcus committed to <span class="src" data-jump="t-prom">3</span>. Jun 21 is the honest date.</div>
+    <div class="refreshed">↻ re-ran 2h ago, after “Atlas weekly · Jun 3” · 4 sources · on-device</div>`,
+  people: () => `<div class="people">
+    <div class="person"><span class="av" style="background:#5bbdff">SC</span>
+      <div><div class="nm">Sarah Chen</div><div class="sm">12 meetings · 1 open promise</div></div></div>
+    <div class="person"><span class="av" style="background:#f5b14c">MR</span>
+      <div><div class="nm">Marcus Reid</div><div class="sm">8 meetings · 1 overdue</div></div></div>
+    <div class="person"><span class="av" style="background:#4ce0a0">PN</span>
+      <div><div class="nm">Priya Nair</div><div class="sm">6 meetings · voice-verified ✓</div></div></div></div>`,
+  num: () => `<div class="numbers">
+    <div class="num"><div class="v">Jun 14</div><div class="k">GA date</div><div class="was">was May 24</div></div>
+    <div class="num"><div class="v">1 sprint</div><div class="k">auth migration left</div><div class="was">was 2 days</div></div>
+    <div class="num"><div class="v">$180k</div><div class="k">Acme ACV</div><div class="was">was $240k</div></div>
+    <div class="num"><div class="v">4</div><div class="k">EU blockers</div></div></div>`,
+  remind: () => `<div class="rem"><span class="box"></span><span class="t">Chase legal on Acme terms</span>
+      <span class="pill due" style="margin-left:auto">today</span></div>
+    <div class="rem"><span class="box"></span><span class="t">Confirm SOC2 signer with Sarah</span>
+      <span class="pill" style="margin-left:auto;color:var(--text-muted);border-color:var(--border)">Thu</span></div>
+    <div class="rem done"><span class="box"></span><span class="t">Send GA comms draft</span></div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted)">↳ auto-suggested from this board's open questions</div>`,
+  sealed: () => `<div class="blur"></div><div class="msg"><span class="big">🔒</span>
+    Sealed folder — redacted here.<br><span style="font-size:11.5px">Safe to screen-share as-is.</span>
+    <div style="margin-top:11px"><button class="btn btn-sm" onclick="unlockSeal(event)">Unlock with Touch ID</button></div></div>`,
+  doc:()=>`<div class="notepv"><h4>Acme MSA v4.pdf</h4><p>§7.2 termination for convenience…</p></div>`,
+  timeline:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— timeline —</div>`,
+  decide:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— decisions —</div>`,
+  graph:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— mini map —</div>`,
+  quote:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— quotes —</div>`,
+  block:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— blocked-on —</div>`,
+  silence:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— going quiet —</div>`,
+  agenda:()=>`<div style="font-size:12.5px;color:var(--text-muted)">— next agenda —</div>`,
+};
+function playBtn(size){ return `<button class="play" onclick="hear(event)"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></button>`; }
+
+/* the guts of ONE miniature tile — what makes the preview read as a real board */
+function miniGuts(t, w){
+  const bars = n => Array.from({length:n},(_,i)=>
+    `<b style="height:${22+Math.round(Math.abs(Math.sin(i*1.3))*76)}%"></b>`).join("");
+  switch(t){
+    case "rec":    return `<span class="wv">${bars(Math.max(6, w*2))}</span>`;
+    case "person": return `<span class="dots"><b></b><b></b><b></b></span><span class="ln s"></span>`;
+    case "sealed": return `<span class="hatch"></span>`;
+    case "remind": return `<span class="ln m"></span><span class="ln l"></span><span class="ln s"></span>`;
+    case "num":    return `<span class="ln s" style="height:6px;width:38%"></span><span class="ln m"></span>`;
+    case "insight":return `<svg viewBox="0 0 100 30" preserveAspectRatio="none">
+        <polyline points="0,24 14,20 28,22 42,12 56,16 70,7 84,11 100,4" fill="none"
+          stroke="var(--c)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" opacity=".85"/></svg>`;
+    case "doc":    return `<span class="ln l"></span><span class="ln l"></span><span class="ln m"></span>`;
+    default:       return `<span class="ln l"></span><span class="ln m"></span><span class="ln s"></span>`;
+  }
+}
+
+/* ── screen 1 ──────────────────────────────────────────────────────────── */
+function renderList(){
+  const card = d => `
+    <button class="dcard ${d.pinned?"big":""}" data-open="${d.id}" style="--tint:${d.tint}">
+      <span class="glow"></span>
+      <div class="mini">${d.layout.map(([w,h,t,p])=>
+        `<span class="mt ${p?"pulse":""}" style="grid-column:span ${w};grid-row:span ${h};--c:${TINT[t]}">${miniGuts(t,w)}</span>`).join("")}
+        <span class="veil"></span></div>
+      <div class="dbody">
+        <div class="dtitle"><span class="em">${d.em}</span>${d.name}
+          ${d.locked?`<span class="lock">🔒 has sealed sources</span>`:""}</div>
+        <div style="font-size:12.4px;color:var(--text-muted);margin-top:-4px">${d.sub}</div>
+        <div class="dmeta">${d.counts.map(([t,c])=>`<span class="tchip"><b style="--c:${c}"></b>${t}</span>`).join("")}</div>
+        <div class="dfoot">
+          <span class="when">${d.when}</span>
+          ${d.fresh?`<span class="fresh"><span class="rd"></span>${d.fresh}</span>`:""}
+          <span class="spark">${d.spark.map(v=>`<i style="height:${6+v*1.1}px"></i>`).join("")}</span>
+          <span class="avstack">${d.people.map(([i,c])=>`<span style="background:${c}">${i}</span>`).join("")}</span>
+        </div>
+      </div>
+    </button>`;
+  const pinned = DASHBOARDS.filter(d=>d.pinned), rest = DASHBOARDS.filter(d=>!d.pinned);
+  $("main").innerHTML = `
+    <div class="hdr">
+      <div><h1>Dashboards</h1><div class="sub">boards you compose — and your brain reasons inside</div></div>
+      <div class="spacer"></div>
+      <div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Search boards</div>
+      <div class="seg"><button aria-selected="true">All</button><button aria-selected="false">Pinned</button>
+        <button aria-selected="false">Shared</button></div>
+      <button class="btn btn-primary" id="newDash">＋ New dashboard</button>
+    </div>
+    <div class="scrollarea">
+      <div class="groupbar"><h2>Pinned</h2><span class="line"></span></div>
+      <div class="grid big">${pinned.map(card).join("")}</div>
+      <div class="groupbar" style="margin-top:var(--space-5)"><h2>All boards</h2><span class="line"></span></div>
+      <div class="grid">${rest.map(card).join("")}
+        <button class="newcard" id="newDash2"><span class="plus">＋</span>
+          <span style="font-size:13.5px;font-weight:600">New dashboard</span>
+          <span style="font-size:11.5px">or say “Murmur, make a board for Acme”</span></button>
+      </div>
+    </div>`;
+  document.querySelectorAll("[data-open]").forEach(b=>b.onclick=()=>renderDash(b.dataset.open));
+  $("newDash").onclick = $("newDash2").onclick = () => renderDash("atlas");
+}
+
+/* ── screen 2 ──────────────────────────────────────────────────────────── */
+function tileHTML(t){
+  const n = NODE[t.k];
+  return `<section class="tile ${t.k==="sealed"?"sealed":""}" id="${t.id}" style="--w:${t.w}">
+    <div class="th"><span class="ic" style="--c:${n.c}"><svg viewBox="0 0 24 24">${IC[n.ic]}</svg></span>
+      <div><h3>${t.title}</h3><div class="kind">${n.nm}</div></div>
+      ${t.live?`<span class="live"><span class="rd"></span>live</span>`:""}</div>
+    <div class="tb">${(BODY[t.k]||(()=>""))()}</div></section>`;
+}
+function renderDash(id){
+  const d = DASHBOARDS.find(x=>x.id===id) || DASHBOARDS[0];
+  $("main").innerHTML = `
+    <div class="hdr">
+      <div>
+        <div class="crumb"><button id="back">Dashboards</button> ›  <span>${d.name}</span></div>
+        <h1 style="margin-top:2px">${d.em} ${d.name}</h1>
+      </div>
+      <div class="spacer"></div>
+      <span class="tchip" title="it lives in your vault">▦ ~/Sonora/Dashboards/${d.name}.canvas</span>
+      <button class="btn" id="addTile">＋ Add tile</button>
+      <button class="btn btn-ghost">Share</button>
+    </div>
+    <div class="dash">
+      <div class="canvas" id="canvas">${TILES.map((t,i)=>tileHTML(t)).join("")}</div>
+      <aside class="ask">
+        <div class="ah"><span class="ic" style="width:20px;height:20px;border-radius:6px;display:grid;place-items:center;background:var(--accent)"><svg viewBox="0 0 24 24" style="width:11px;height:11px;stroke:#fff;fill:none;stroke-width:2.2">${IC.answer}</svg></span>
+          <h3>Ask this board</h3></div>
+        <div class="scope">Grounded in <b>this board only</b> — 11 tiles · 4 notes · 3 recordings ·
+          6 people · 2 docs. Nothing else in your vault is in scope.</div>
+        <div class="body" id="chat">
+          <div class="suggest">
+            <button data-q="risk">What's actually going to make us miss Jun 14?</button>
+            <button data-q="owed">Who owes me something on this board?</button>
+            <button data-q="quiet">What went quiet that shouldn't have?</button>
+          </div>
+        </div>
+        <div class="comp"><span class="fake-in">Ask anything about these 11 tiles…</span>
+          <button class="play" style="width:32px;height:32px"><svg viewBox="0 0 24 24" style="width:13px;height:13px;fill:var(--text-secondary)">${"<path d='M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-2.1A7 7 0 0 0 19 12h-2z'/>"}</svg></button></div>
+      </aside>
+    </div>`;
+  document.querySelectorAll(".tile").forEach((t,i)=>t.style.animationDelay = (i*45)+"ms");
+  $("back").onclick = renderList;
+  $("addTile").onclick = openPalette;
+  document.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>askIt(b.dataset.q, b.textContent));
+  document.querySelectorAll("[data-jump]").forEach(s=>s.onclick=()=>cite([s.dataset.jump]));
+}
+
+/* ── ask: the brain that KNOWS this board ──────────────────────────────── */
+const ANSWERS = {
+  risk:{txt:`Three things, ranked. <b>1)</b> The auth migration — Sarah re-scoped it to a full sprint on
+    Jun 3 <span class="src" data-jump="t-drift">1</span>. <b>2)</b> SOC2 sign-off: nobody has answered
+    “who signs?” in 19 days, asked twice <span class="src" data-jump="t-q">2</span>.
+    <b>3)</b> Acme — Marcus committed to Friday paperwork, that was 12 days ago
+    <span class="src" data-jump="t-prom">3</span>. Only #3 is outside your control.`,
+    cites:["t-drift","t-q","t-prom"]},
+  owed:{txt:`Marcus Reid — Acme paperwork, 12 days late <span class="src" data-jump="t-prom">1</span>,
+    and he's the owner on the one blocker you can't fix yourself. Sarah is clean: she took the migration
+    and kept the Mobile date <span class="src" data-jump="t-people">2</span>. You owe legal a call — due today
+    <span class="src" data-jump="t-rem">3</span>.`,
+    cites:["t-prom","t-people","t-rem"]},
+  quiet:{txt:`Pricing. Nine days of silence <span class="src" data-jump="t-pulse">1</span> after being
+    the most-discussed topic for three weeks — and the $180k Acme ACV on this board is down from $240k
+    with no meeting where that was decided <span class="src" data-jump="t-num">2</span>. That drop was
+    never talked through.`,
+    cites:["t-pulse","t-num"]},
+};
+function askIt(k, label){
+  const chat = $("chat");
+  chat.querySelector(".suggest")?.remove();
+  chat.appendChild(el(`<div class="bubble me">${label}</div>`));
+  const think = el(`<div class="bubble ai typing"><span></span><span></span><span></span></div>`);
+  chat.appendChild(think); chat.scrollTop = chat.scrollHeight;
+  setTimeout(()=>{
+    think.remove();
+    const a = ANSWERS[k];
+    const b = el(`<div class="bubble ai">${a.txt}</div>`);
+    chat.appendChild(b);
+    chat.appendChild(el(`<div class="suggest">${Object.entries(ANSWERS).filter(([kk])=>kk!==k)
+      .map(([kk])=>`<button data-q="${kk}">${kk==="risk"?"What's actually going to make us miss Jun 14?":
+        kk==="owed"?"Who owes me something on this board?":"What went quiet that shouldn't have?"}</button>`).join("")}</div>`));
+    chat.scrollTop = chat.scrollHeight;
+    cite(a.cites);
+    document.querySelectorAll("[data-q]").forEach(x=>x.onclick=()=>askIt(x.dataset.q, x.textContent));
+    document.querySelectorAll("[data-jump]").forEach(s=>s.onclick=()=>cite([s.dataset.jump]));
+  }, 1100);
+}
+function cite(ids){
+  document.querySelectorAll(".tile").forEach(t=>{ t.classList.remove("cited"); t.querySelector(".cite-n")?.remove(); });
+  ids.forEach((id,i)=>{
+    const t = $(id); if(!t) return;
+    t.classList.add("cited");
+    t.appendChild(el(`<span class="cite-n">${i+1}</span>`));
+  });
+  const first = $(ids[0]); if(first) first.scrollIntoView({behavior:"smooth", block:"nearest"});
+}
+
+/* ── the add-tile palette ──────────────────────────────────────────────── */
+function openPalette(){
+  $("palette").innerHTML = `
+    <div class="ph"><h3>Add a tile</h3>
+      <p>Every tile stays live — it re-reads itself when someone says something new.
+         <b style="color:#bfc3ff">Only-Murmur</b> tiles are the ones no vault or cloud notetaker can build.</p></div>
+    <div class="pg">${NODES.map(n=>`
+      <button class="nodeopt" data-add="${n.k}">
+        <span class="ic" style="--c:${n.c}"><svg viewBox="0 0 24 24">${IC[n.ic]}</svg></span>
+        <span><span class="nm">${n.nm}</span><span class="ds">${n.ds}</span>
+        ${n.only?`<span class="only">only Murmur</span>`:""}</span></button>`).join("")}</div>`;
+  $("palette").classList.add("show"); $("scrim").classList.add("show");
+  document.querySelectorAll("[data-add]").forEach(b=>b.onclick=()=>{
+    const k = b.dataset.add, n = NODE[k];
+    TILES.push({id:"t-"+k+"-"+TILES.length, k, w:4, title:n.nm, live:!!n.only});
+    closePalette(); renderDash("atlas");
+    toast(`“${n.nm}” added — live, and already in scope for Ask`);
+  });
+}
+function closePalette(){ $("palette").classList.remove("show"); $("scrim").classList.remove("show"); }
+$("scrim").onclick = closePalette;
+
+/* ── little fakes ──────────────────────────────────────────────────────── */
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"), 2600); }
+window.hear = (e) => { e.stopPropagation();
+  const w = document.getElementById("wv");
+  if(w){ w.classList.add("playing"); setTimeout(()=>w.classList.remove("playing"), 2400); }
+  toast("▶ playing the actual tape · voiceprint-matched · on-device"); };
+window.unlockSeal = (e) => { e.stopPropagation();
+  toast("👆 Touch ID — sealed content decrypted for this session only");
+  const t = $("t-seal");
+  setTimeout(()=>{ t.classList.remove("sealed");
+    t.querySelector(".tb").innerHTML = `<div class="notepv"><h4>Acme MSA — open terms</h4>
+      <p>Termination for convenience at 30 days — Marcus flagged this on Jun 3.</p>
+      <p>Auto-renew removed in v4. Legal wants a call before GA.</p></div>`; }, 900); };
+document.querySelectorAll("[data-nav]").forEach(b=>b.onclick=()=>{
+  if(b.dataset.nav==="dashboards") renderList(); else toast("(prototype — only Dashboards is built)"); });
+
+renderList();
+</script>
+</body>
+</html>
