@@ -15,6 +15,24 @@
     box-shadow var(--transition);
 }
 
+// Arrange mode: the tile becomes a grab target and says so.
+:host(.is-arranging) {
+  cursor: grab;
+}
+
+:host(.is-dragging) {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+:host(.is-drop-target) {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2px var(--accent-ring),
+    var(--shadow-md);
+  transform: translateY(-2px);
+}
+
 :host(.cited) {
   border-color: var(--accent);
   box-shadow:
@@ -260,10 +278,11 @@
 
 .pulse-bar {
   flex: 1;
-  min-height: 2px;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  opacity: 0.75;
+  min-height: 3px;
+  // A pill radius on a 6px-wide bar renders as a dot; keep the bar a bar.
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--accent-hover), var(--accent));
+  opacity: 0.85;
 }
 
 // ── drift ────────────────────────────────────────────────────────────────────
@@ -327,12 +346,14 @@
 // ── numbers ──────────────────────────────────────────────────────────────────
 .numbers {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  // Two up from the narrowest tile onwards: one giant figure per row reads as a
+  // rendering accident, not as a stat block.
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-2);
 }
 
 .number {
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.03);
@@ -347,7 +368,7 @@
 .number-value {
   display: block;
   color: var(--text-primary);
-  font-size: 1.05rem;
+  font-size: 0.95rem;
   font-weight: 680;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
