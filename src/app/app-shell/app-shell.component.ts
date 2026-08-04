@@ -30,6 +30,7 @@ import { MurSidebarComponent } from "../design-system/sidebar/sidebar.component"
 import { MurSidebarSectionComponent } from "../design-system/sidebar-section/sidebar-section.component";
 import { MurTabStripComponent } from "../design-system/tab-strip/tab-strip.component";
 import { DocumentPreviewComponent } from "../features/brain/document-preview/document-preview.component";
+import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-palette.component";
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { MeetingsSidebarTreeComponent } from "../features/folders/meetings-sidebar-tree/meetings-sidebar-tree.component";
 import { NotesSidebarTreeComponent } from "../features/notes/notes-sidebar-tree/notes-sidebar-tree.component";
@@ -40,6 +41,7 @@ import { DocumentPreviewService } from "../services/document-preview.service";
 import { FolderLockFlowService } from "../services/folder-lock-flow.service";
 import { FoldersService } from "../services/folders.service";
 import { NotesService } from "../services/notes.service";
+import { TilePaletteService } from "../services/tile-palette.service";
 import { ToastService, type Toast } from "../services/toast.service";
 
 /** localStorage key for the chrome mode: "1" = pill bar, "0" = sidebar. */
@@ -172,6 +174,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     LockSharesDialogComponent,
     DocumentPreviewComponent,
     ReminderComposerComponent,
+    TilePaletteComponent,
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto
@@ -234,6 +237,12 @@ export class AppShellComponent {
    * "open a document" surface calls {@link DocumentPreviewService.open}.
    */
   readonly docPreview = inject(DocumentPreviewService);
+
+  /**
+   * The Add-a-tile palette's open state. The palette is rendered HERE (see the
+   * template) rather than by the board — `TilePaletteService` documents why.
+   */
+  readonly tilePalette = inject(TilePaletteService);
 
   constructor() {
     void this.reminders.initSummary();

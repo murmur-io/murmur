@@ -139,9 +139,10 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   // REGRESSION GUARD. A `position: fixed` overlay only anchors to the VIEWPORT when no
   // ancestor establishes a fixed-positioning containing block — any ancestor with
   // transform / filter / backdrop-filter / contain becomes one, and the board canvas and
-  // the Ask column are both frosted surfaces. The palette shipped WITHOUT the teleport
-  // `mur-source-picker` uses for exactly this reason, which is how it could open fine in
-  // one engine and be unreachable in the packaged WKWebView.
+  // the Ask column are both frosted surfaces. The palette used to render INSIDE that
+  // subtree and lift itself back out (teleport, then top layer); it is now rendered by
+  // `app-shell`, so there is nothing to lift it out of. This asserts both halves: where
+  // it hangs in the DOM, and that it lands on screen and hit-testable.
   await mockTauri(
     page,
     {},
@@ -160,19 +161,49 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   // The trigger reflects state, so "the click landed" and "the palette rendered"
   // are separately observable — the two failures that looked identical in the
   // original bug report.
-  await expect(page.getByRole("button", { name: "Close" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Close", exact: true })).toBeVisible();
 
   const palette = page.getByRole("dialog", { name: "Add a tile" });
   await expect(palette).toBeVisible();
 
-  // It must be in the browser's TOP LAYER — that is what puts it outside every
-  // stacking context and every fixed-positioning containing block. `:modal`
-  // matches only a dialog opened with showModal(), not one merely `open`.
-  const isTopLayer = await page.evaluate(() => {
-    const el = document.querySelector("dialog.palette");
-    return !!el && el.matches(":modal");
+  // It must be rendered by `app-shell`, NOT inside the board. That is the whole
+  // fix: an overlay whose only ancestors are <body>/<html> has no containing
+  // block, stacking context or compositing decision to escape, so it needs no
+  // teleport, no top layer and no `<dialog>` — none of which behaved the same in
+  // the packaged webview as in the engines this suite runs.
+  const ancestry = await page.evaluate(() => {
+    const el = document.querySelector(".tp-overlay");
+    if (!el) return { found: false, insideBoard: true, containingBlocks: ["missing"] };
+    const containingBlocks: string[] = [];
+    for (let n = el.parentElement; n; n = n.parentElement) {
+      const cs = getComputedStyle(n);
+      const traps = [
+        cs.transform,
+        cs.filter,
+        cs.backdropFilter || cs.webkitBackdropFilter,
+        cs.perspective,
+        cs.contain,
+        cs.willChange,
+      ];
+      if (traps.some((v) => v && v !== "none" && v !== "auto" && v !== "normal")) {
+        containingBlocks.push(n.tagName.toLowerCase());
+      }
+    }
+    return {
+      found: true,
+      insideBoard: !!el.closest("app-dashboard-view"),
+      containingBlocks,
+    };
   });
-  expect(isTopLayer, "the palette must be a showModal() dialog in the top layer").toBe(true);
+  expect(ancestry.found, "the palette overlay must render").toBe(true);
+  expect(
+    ancestry.insideBoard,
+    "the palette must NOT render inside the board's own subtree",
+  ).toBe(false);
+  expect(
+    ancestry.containingBlocks,
+    "no ancestor may establish a fixed-positioning containing block",
+  ).toEqual([]);
 
   // And it must be fully on screen — the failure mode is "opens, but off-viewport".
   const box = await palette.boundingBox();
@@ -207,8 +238,8 @@ test("Dashboards: the palette still shows on an engine without :modal or showMod
   // THE REPORTED FAILURE, reproduced. The trigger flipped to "Close" — so the click
   // landed and the state was right — while nothing appeared on screen. That is what
   // a <dialog> looks like when showModal() throws: it never opens, so it stays
-  // display:none. Here showModal is forced to throw, and the palette must still be
-  // usable via the plain `open` fallback that the stylesheet pins to the viewport.
+  // display:none. The palette no longer uses <dialog> at all, so this now guards
+  // against REINTRODUCING one: an engine missing either API must change nothing.
   await page.addInitScript(() => {
     // Simulate an OLDER engine, which is what the report turned out to be:
     // `:modal` is unknown so matches() THROWS, and showModal() is refused. The
@@ -252,9 +283,75 @@ test("Dashboards: the palette still shows on an engine without :modal or showMod
   expect(box!.y).toBeGreaterThanOrEqual(0);
   expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height + 1);
   const hit = await page.evaluate(() => {
-    const el = document.querySelector("dialog.palette")!;
+    const el = document.querySelector(".palette")!;
     const r = el.getBoundingClientRect();
     return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
   });
   expect(hit, "the fallback palette must be clickable, not covered").toBe(true);
+});
+
+test("Dashboards: the palette's position does not depend on the board's own subtree", async ({
+  page,
+}) => {
+  // THE ORACLE THE EARLIER GUARDS COULD NOT BE. Every previous fix put the palette
+  // somewhere INSIDE the board's own component subtree and then relied on one
+  // mechanism to lift it back out — a teleport, then a `position: fixed` box, then
+  // the browser's TOP LAYER via showModal(). Each of those works in the engines
+  // Playwright ships and each still failed in the packaged WKWebView, because each
+  // is a thing an engine can implement differently.
+  //
+  // This test removes the engine from the question by making the environment hostile
+  // in BOTH ways at once:
+  //   * the board's subtree establishes a fixed-positioning containing block
+  //     (`transform` — the same thing a frosted/animated ancestor does), and
+  //   * showModal() is refused, so the top layer is not available to escape it.
+  // A palette rendered inside the board is then pinned to a box 1200px down the
+  // page and is off screen. A palette rendered by `app-shell` — whose only
+  // ancestors are <body> and <html> — cannot be affected by either, which is the
+  // property this asserts.
+  await page.addInitScript(() => {
+    if (window.HTMLDialogElement) {
+      HTMLDialogElement.prototype.showModal = function () {
+        throw new Error("simulated: no top layer on this engine");
+      };
+    }
+  });
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: { ...BOARDS[0], tiles: [] },
+      get_dashboard_sources: [],
+      list_link_candidates: [],
+      get_graph: { nodes: [], edges: [], hasHidden: false },
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await page.addStyleTag({
+    content: "app-dashboard-view { transform: translateY(1200px); }",
+  });
+  await page.getByRole("button", { name: "Add tile" }).click();
+
+  const palette = page.getByRole("dialog", { name: "Add a tile" });
+  await expect(palette).toBeVisible();
+
+  const box = await palette.boundingBox();
+  const viewport = page.viewportSize();
+  expect(box).not.toBeNull();
+  expect(
+    box!.y,
+    "a transformed ancestor must not be able to push the palette off screen",
+  ).toBeGreaterThanOrEqual(0);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height + 1);
+
+  // And still hit-testable at its centre, so it is genuinely usable.
+  const hit = await page.evaluate(() => {
+    const el = document.querySelector(".palette");
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+  });
+  expect(hit, "the palette centre must be hit-testable").toBe(true);
 });
