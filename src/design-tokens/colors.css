@@ -13,7 +13,14 @@
   --text-primary: #f6f6fa;
   --text-secondary: #a6a6b6;
   --text-muted: #6c6c7d;
+  /* The ≤12px tier. `--text-muted` measures 3.62:1 on the raised surface, which is
+     below the legibility floor, and it was carrying every eyebrow, meta line and
+     unit label in the app. Anything set at 12px or smaller uses THIS (5.50:1);
+     `--text-muted` stays for ≥13px only. */
+  --text-tertiary: #8a8a9c;
   --text-on-accent: #ffffff;
+  /* Diagonal hatch for a redacted/sealed region — was a raw rgba() in three files. */
+  --hatch-stripe: rgba(255, 255, 255, 0.05);
 
   /* --- Cool accent (calm states: idle, nav, focus, links) ----------------- */
   --accent: #6e76ff;

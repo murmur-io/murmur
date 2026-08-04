@@ -20,15 +20,33 @@ import {
   TilePaletteService,
   type TileChoice,
 } from "../../../services/tile-palette.service";
-import type { ResolvedTile, SourceRef } from "../../../core/models";
+import type { ChatTurn, ResolvedTile, SourceRef } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 
-/** One exchange in the board-scoped Ask column. */
+/**
+ * One exchange in the board-scoped Ask column.
+ *
+ * `error` is a THIRD role, not a flavour of `assistant`. A failure used to be
+ * pushed as an assistant turn, so a dispatch error rendered in the same grey
+ * bubble as a real answer, with nothing to retry - the board stated a provider
+ * failure in the exact visual language it uses for grounded conclusions.
+ */
 interface BoardTurn {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "error";
   text: string;
   /** Tile ids this answer was grounded in (assistant turns only). */
   citedTiles?: string[];
+  /** The question that produced an error turn, so Try again can re-send it. */
+  retry?: string;
 }
+
+/**
+ * The same 12-message bound every other chat surface uses (`CHAT_CONTEXT_TURNS`).
+ * The board sent `[]`, so every question arrived context-free and a follow-up
+ * like "and the second one?" could not resolve.
+ */
+const HISTORY_TURNS = 12;
 
 const SUGGESTIONS = [
   "What's most likely to go wrong here?",
@@ -59,6 +77,7 @@ const SUGGESTIONS = [
     MurIconComponent,
     MurSpinnerComponent,
     DashboardTileComponent,
+    MarkdownComponent,
   ],
   templateUrl: "./dashboard-view.component.html",
   styleUrl: "./dashboard-view.component.scss",
@@ -69,6 +88,7 @@ export class DashboardViewComponent {
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
   private readonly palette = inject(TilePaletteService);
+  private readonly errors = inject(ErrorCopyService);
 
   constructor() {
     // The palette is app-wide, so leaving the board must not strand it on screen
@@ -111,6 +131,48 @@ export class DashboardViewComponent {
   readonly sealedCount = computed(
     () => this.tiles().filter((t) => t.data.kind === "locked").length,
   );
+
+  /**
+   * Tile id → the heading of the EARLIER tile it duplicates.
+   *
+   * Two tiles that resolve to the same payload render the same rows twice, which
+   * is what made a nine-tile board read as a duplicated one. The cause is a
+   * missing parameter rather than user error — `tile-palette` never writes
+   * `config.owner`, so every Promise ledger resolves to the same global list —
+   * so the second tile becomes a back-reference and the fix costs no backend.
+   *
+   * Keyed on the RESOLVED payload, not on `(kind, refId, config)`: two tiles can
+   * be configured differently and still resolve identically, and it is the
+   * on-screen repetition that the user sees.
+   */
+  readonly duplicates = computed<ReadonlyMap<string, string>>(() => {
+    const seen = new Map<string, string>();
+    const out = new Map<string, string>();
+    for (const t of this.tiles()) {
+      // A sealed tile carries no fields at all, so every sealed tile would look
+      // like every other one. Redaction is not duplication — never collapse them.
+      if (t.data.kind === "locked") continue;
+      const key = JSON.stringify(t.data);
+      const first = seen.get(key);
+      if (first === undefined) seen.set(key, this.headingOf(t));
+      else out.set(t.id, first);
+    }
+    return out;
+  });
+
+  duplicateOf(tile: ResolvedTile): string | null {
+    return this.duplicates().get(tile.id) ?? null;
+  }
+
+  /** The label a back-reference points at — the user-visible name of the original. */
+  private headingOf(tile: ResolvedTile): string {
+    if (tile.title && tile.title.trim()) return tile.title.trim();
+    const d = tile.data;
+    if (d.kind === "note" || d.kind === "meeting" || d.kind === "document") return d.title;
+    if (d.kind === "person") return d.name;
+    if (d.kind === "promises") return d.owner ? `Promises · ${d.owner}` : "Promises";
+    return d.kind;
+  }
 
   /** Owned by the root service — the palette itself is rendered by `app-shell`. */
   readonly paletteOpen = this.palette.open;
@@ -316,7 +378,7 @@ export class DashboardViewComponent {
         ]);
         return;
       }
-      const result = await this.ipc.askVault(question, [], undefined, sources);
+      const result = await this.ipc.askVault(question, this.askHistory(), undefined, sources);
       this.turns.update((t) => [
         ...t,
         {
@@ -328,11 +390,32 @@ export class DashboardViewComponent {
     } catch (e) {
       this.turns.update((t) => [
         ...t,
-        { role: "assistant", text: this.errorText(e) },
+        { role: "error", text: this.errors.humanize(e, "generic"), retry: question },
       ]);
     } finally {
       this.asking.set(false);
     }
+  }
+
+  /**
+   * The conversation so far, bounded and stripped of error turns - a failed
+   * dispatch is UI chrome, and replaying "That didn't work" as prior context
+   * would teach the model that the board could not answer.
+   */
+  private askHistory(): ChatTurn[] {
+    return this.turns()
+      .filter((t) => t.role !== "error")
+      .slice(-HISTORY_TURNS)
+      .map((t) => ({ role: t.role as "user" | "assistant", content: t.text }));
+  }
+
+  /** Re-send the question an error turn was raised for. */
+  retry(turn: BoardTurn): void {
+    if (!turn.retry) return;
+    const question = turn.retry;
+    this.turns.update((t) => t.filter((x) => x !== turn));
+    this.draft.set(question);
+    void this.ask();
   }
 
   /** Map the answer's source ids back onto the tiles that carry them. */
@@ -363,12 +446,4 @@ export class DashboardViewComponent {
     }
   }
 
-  private errorText(e: unknown): string {
-    if (typeof e === "string") return e;
-    if (e && typeof e === "object") {
-      const v = Object.values(e as Record<string, unknown>)[0];
-      if (typeof v === "string") return v;
-    }
-    return "That didn't work. Try again.";
-  }
 }

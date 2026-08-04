@@ -2,12 +2,12 @@ import {
   ChangeDetectionStrategy,
   Component,
   ElementRef,
-  Injector,
-  afterNextRender,
   computed,
+  effect,
   inject,
   output,
   signal,
+  viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
@@ -32,6 +32,30 @@ interface NodeType {
 /**
  * The tile catalogue. Order is the palette's reading order: material first,
  * then the derived views that are the actual reason to build a board.
+ *
+ * RETIRED 2026-08-04 — `drift`, `numbers`, `pulse`. Each is anchored to ONE
+ * entity over the two thinnest tables in the schema, and each is blocked by a
+ * mechanism in the extractor rather than by a shortage of recordings:
+ *
+ *  - `numbers` post-filters facts with `looks_numeric`, but `facts::EXTRACT_SYSTEM`
+ *    asks for "durable state worth tracking" and never asks for quantities, so the
+ *    filter runs over a substrate that was never built to contain figures (and
+ *    what it does match is mostly dates).
+ *  - `drift` needs SUPERSEDED facts, and `facts::reconcile_facts` requires the same
+ *    NORMALIZED `(entity, subject, predicate)` while predicates are free-form —
+ *    so supersessions do not form.
+ *  - `pulse` reads `entity_mentions`, written by `graph_store::Db::add_mention` as
+ *    `INSERT OR IGNORE` on PK `(entity_id, meeting_id)`. It counts MEETINGS, not
+ *    utterances, which makes this entry's own former copy ("how often this is
+ *    actually talked about") false, and caps every weekly bucket at 1.
+ *
+ * A tile that is empty for most people is worse than no tile, so they stop being
+ * OFFERED. Their `resolve_tile` arms stay alive and must never be deleted: that
+ * function ends in `Err(AppError::InvalidArg("unknown tile kind"))` and
+ * `get_dashboard` collects with `?`, so removing an arm would turn every board
+ * that already contains one of these into a hard error at open. Fixing the
+ * extractor is its own investigation; see
+ * docs/superpowers/specs/2026-08-04-dashboards-rebuild-design.md §7.
  */
 const NODE_TYPES: NodeType[] = [
   {
@@ -65,30 +89,6 @@ const NODE_TYPES: NodeType[] = [
     onlyMurmur: true,
     mode: "entity",
     family: "person",
-  },
-  {
-    kind: "drift",
-    name: "Drift lane",
-    description: "How ONE value moved over time — GA: Apr 30 → May 24 → Jun 14.",
-    onlyMurmur: true,
-    mode: "entity",
-    family: "insight",
-  },
-  {
-    kind: "numbers",
-    name: "Numbers",
-    description: "Figures that were said out loud, with what they used to be.",
-    onlyMurmur: true,
-    mode: "entity",
-    family: "insight",
-  },
-  {
-    kind: "pulse",
-    name: "Pulse",
-    description: "How often this is actually talked about — and where it went quiet.",
-    onlyMurmur: true,
-    mode: "entity",
-    family: "insight",
   },
   {
     kind: "promises",
@@ -161,7 +161,6 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
 })
 export class TilePaletteComponent {
   private readonly ipc = inject(IpcService);
-  private readonly injector = inject(Injector);
 
   readonly dismiss = output<void>();
   readonly choose = output<TileChoice>();
@@ -176,8 +175,19 @@ export class TilePaletteComponent {
   readonly entities = signal<{ id: string; name: string; mentionCount: number }[]>([]);
   readonly question = signal("");
 
-  private readonly searchField =
-    signal<ElementRef<HTMLInputElement> | null>(null);
+  /**
+   * Focus the picker's field the moment it exists.
+   *
+   * This replaces a `registerField()` method that was bound NOWHERE in the
+   * template, so it never ran and the field never focused — the palette opened
+   * its second step and left the caret in the void. A `viewChild` signal fires
+   * on its own when the `@switch` swaps the step in, with no call site to forget.
+   */
+  private readonly searchField = viewChild<ElementRef<HTMLInputElement>>("searchField");
+
+  private readonly _focusField = effect(() => {
+    this.searchField()?.nativeElement.focus();
+  });
 
   readonly filteredEntities = computed(() => {
     const q = this.query().trim().toLowerCase();
@@ -292,9 +302,4 @@ export class TilePaletteComponent {
     else this.dismiss.emit();
   }
 
-  registerField(el: ElementRef<HTMLInputElement> | undefined): void {
-    if (!el) return;
-    this.searchField.set(el);
-    afterNextRender(() => el.nativeElement.focus(), { injector: this.injector });
-  }
 }
