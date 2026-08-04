@@ -221,6 +221,19 @@ export class DashboardViewComponent {
     this.paletteOpen.set(true);
   }
 
+  /**
+   * The trigger is a TOGGLE, and its label follows the state ("Add tile" ⇄ "Close").
+   *
+   * That is ordinary UX — a control that opens a modal should close it — but it is
+   * also the cheapest possible signal that the click landed at all. If the label
+   * flips and no palette appears, the fault is presentation; if the label does not
+   * flip, the click never reached the handler. Without it those two failures look
+   * identical from the outside, which is what made the first report hard to place.
+   */
+  togglePalette(): void {
+    this.paletteOpen.update((open) => !open);
+  }
+
   closePalette(): void {
     this.paletteOpen.set(false);
   }
