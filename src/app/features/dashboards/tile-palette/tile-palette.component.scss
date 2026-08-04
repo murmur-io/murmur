@@ -5,28 +5,76 @@
   display: contents;
 }
 
-.scrim {
+// ONE fixed layer: the scrim AND the centring box, rendered by `app-shell`, whose
+// only ancestors are <body> and <html>.
+//
+// That location is the whole point (see TilePaletteService). `position: fixed`
+// anchors to the viewport ONLY while no ancestor establishes a fixed-positioning
+// containing block — any `transform` / `filter` / `backdrop-filter` / `contain`
+// ancestor takes that job — and the board is full of frosted surfaces. Rendering
+// from the shell means there is no such ancestor to begin with, so nothing has to
+// resolve correctly and nothing has to be escaped: no teleport, no top layer, no
+// `<dialog>`. Centring is plain flex layout, not a percentage transform.
+.tp-overlay {
   position: fixed;
+  // `inset` AND the four longhands: the shorthand is newer than the engine we
+  // ship for, and a fixed box that falls back to `auto` insets is shrink-to-fit
+  // at its static position instead of the viewport.
   inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: var(--z-overlay, 2000);
+  // GEOMETRY COPIED FROM `.qs-scrim` (quick-search), deliberately. That overlay is
+  // proven in the packaged WKWebView — ⌘K works there — and this one was not:
+  // `align-items: center` over an auto-height flex child is a shape WebKit has
+  // collapsed to zero height before, which is exactly what the report showed (a
+  // dimmed screen with an 880px-wide grey LINE where the panel should be: correct
+  // width from `min()`, no height at all). Top-aligned with a `vh` offset needs no
+  // cross-axis sizing of the child.
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 9vh var(--space-4) var(--space-4);
+}
+
+// The scrim fills the overlay and sits BEHIND the panel; it is its own element so
+// the click-to-dismiss target is unambiguous and can carry the a11y affordances.
+.tp-scrim {
+  position: absolute;
+  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border: 0;
   background: var(--scrim);
+  cursor: default;
 }
 
 .palette {
-  position: fixed;
-  z-index: calc(var(--z-overlay, 2000) + 1);
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  // In-flow inside the centring layer — no position or transform of its own,
+  // just a paint order above the scrim.
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
-  width: min(880px, 92vw);
+  // `min(880px, 100%)` (of the padded overlay) rather than `92vw`, mirroring
+  // `.qs-panel`. The reported failure had the WIDTH right and the HEIGHT zero, so
+  // the floor below is what makes "a grey line" structurally impossible: a panel
+  // whose content somehow measures nothing still occupies a real box.
+  width: min(880px, 100%);
+  min-height: 240px;
   max-height: 78vh;
+  padding: 0;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-xl);
+  // Floating overlay ⇒ OPAQUE (T3): the frosted card surface would bleed the
+  // board behind it through and read as broken.
   background: var(--surface-overlay);
-  backdrop-filter: none;
+  color: var(--text-primary);
   box-shadow: var(--shadow-lg);
 }
 
@@ -66,6 +114,11 @@
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: var(--space-2);
   padding: var(--space-4) var(--space-5) var(--space-5);
+  // Takes the panel's remaining height and scrolls inside it; `min-height: 0` is
+  // what lets a flex item shrink below its content instead of forcing the panel
+  // taller than its max.
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
 }
 

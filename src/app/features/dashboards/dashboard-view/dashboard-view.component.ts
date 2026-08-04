@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   computed,
   effect,
   inject,
@@ -16,9 +17,9 @@ import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { DashboardTileComponent } from "../dashboard-tile/dashboard-tile.component";
 import {
-  TilePaletteComponent,
+  TilePaletteService,
   type TileChoice,
-} from "../tile-palette/tile-palette.component";
+} from "../../../services/tile-palette.service";
 import type { ResolvedTile, SourceRef } from "../../../core/models";
 
 /** One exchange in the board-scoped Ask column. */
@@ -58,7 +59,6 @@ const SUGGESTIONS = [
     MurIconComponent,
     MurSpinnerComponent,
     DashboardTileComponent,
-    TilePaletteComponent,
   ],
   templateUrl: "./dashboard-view.component.html",
   styleUrl: "./dashboard-view.component.scss",
@@ -68,6 +68,15 @@ export class DashboardViewComponent {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
   private readonly route = inject(ActivatedRoute);
+  private readonly palette = inject(TilePaletteService);
+
+  constructor() {
+    // The palette is app-wide, so leaving the board must not strand it on screen
+    // over whatever route comes next.
+    inject(DestroyRef).onDestroy(() => {
+      if (this.palette.open()) this.palette.dismiss();
+    });
+  }
 
   /**
    * The board id, as a SIGNAL off the router's own paramMap — not
@@ -103,7 +112,8 @@ export class DashboardViewComponent {
     () => this.tiles().filter((t) => t.data.kind === "locked").length,
   );
 
-  readonly paletteOpen = signal(false);
+  /** Owned by the root service — the palette itself is rendered by `app-shell`. */
+  readonly paletteOpen = this.palette.open;
   readonly editing = signal(false);
 
   // ── drag-to-reorder (Arrange mode) ─────────────────────────────────────────
@@ -217,16 +227,27 @@ export class DashboardViewComponent {
     this.editing.update((v) => !v);
   }
 
-  openPalette(): void {
-    this.paletteOpen.set(true);
+  /** Open the palette and add whatever the user picked (nothing if dismissed). */
+  async openPalette(): Promise<void> {
+    const choice = await this.palette.request();
+    if (choice) await this.addTile(choice);
   }
 
-  closePalette(): void {
-    this.paletteOpen.set(false);
+  /**
+   * The trigger is a TOGGLE, and its label follows the state ("Add tile" ⇄ "Close").
+   *
+   * That is ordinary UX — a control that opens a modal should close it — but it is
+   * also the cheapest possible signal that the click landed at all. If the label
+   * flips and no palette appears, the fault is presentation; if the label does not
+   * flip, the click never reached the handler. Without it those two failures look
+   * identical from the outside, which is what made the first report hard to place.
+   */
+  togglePalette(): void {
+    if (this.paletteOpen()) this.palette.dismiss();
+    else void this.openPalette();
   }
 
   async addTile(choice: TileChoice): Promise<void> {
-    this.paletteOpen.set(false);
     await this.service.addTile(this.id(), choice.kind, {
       refId: choice.refId,
       title: choice.title,

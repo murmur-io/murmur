@@ -7,6 +7,11 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 ## Recurring patterns
 <!-- Curated, binding. Keep ≤ ~20 bullets. -->
 
+- **A user-reported failure against green gates means the ORACLE is wrong, not the code.** The
+  correct first move is to fix the measurement, not to patch the implementation. On PR #566 I
+  shipped three speculative fixes because my e2e ran in a newer engine than the app does; the bug
+  was invisible to the suite by construction. If the report and the suite disagree, the suite is
+  testing something other than the product — say so, and go make it testable.
 - **Verify the build YOURSELF before trusting a workflow's "PASS" — or before committing.** A
   workflow's verify phase can run on a mid-edit or half-finished tree and still report a
   structure-level PASS while `cargo test --lib` / `npx ng build` is actually RED. A green *unit* run
