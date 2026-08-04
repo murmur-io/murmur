@@ -203,13 +203,24 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   await expect(palette.getByRole("button", { name: /All tiles/ })).toBeVisible();
 });
 
-test("Dashboards: the palette still shows when showModal() is refused", async ({ page }) => {
+test("Dashboards: the palette still shows on an engine without :modal or showModal", async ({ page }) => {
   // THE REPORTED FAILURE, reproduced. The trigger flipped to "Close" — so the click
   // landed and the state was right — while nothing appeared on screen. That is what
   // a <dialog> looks like when showModal() throws: it never opens, so it stays
   // display:none. Here showModal is forced to throw, and the palette must still be
   // usable via the plain `open` fallback that the stylesheet pins to the viewport.
   await page.addInitScript(() => {
+    // Simulate an OLDER engine, which is what the report turned out to be:
+    // `:modal` is unknown so matches() THROWS, and showModal() is refused. The
+    // thrown SyntaxError used to escape afterNextRender, leaving the dialog
+    // unopened — and an unopened <dialog> is display:none.
+    const realMatches = Element.prototype.matches;
+    Element.prototype.matches = function (sel: string) {
+      if (typeof sel === "string" && sel.includes(":modal")) {
+        throw new DOMException("':modal' is not a valid selector", "SyntaxError");
+      }
+      return realMatches.call(this, sel);
+    };
     if (window.HTMLDialogElement) {
       HTMLDialogElement.prototype.showModal = function () {
         throw new Error("simulated: showModal refused");
