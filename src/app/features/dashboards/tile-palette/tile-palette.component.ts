@@ -8,21 +8,16 @@ import {
   inject,
   output,
   signal,
-  viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
-import type { NoteCitation, TileConfig, TileKind } from "../../../core/models";
+import type { TileChoice } from "../../../services/tile-palette.service";
+import type { NoteCitation, TileKind } from "../../../core/models";
 
 /** What a chosen tile kind needs before it can be added. */
 type SourceMode = "none" | "link" | "entity" | "question";
 
-export interface TileChoice {
-  kind: TileKind;
-  refId?: string;
-  title?: string;
-  config?: TileConfig;
-}
+export type { TileChoice };
 
 interface NodeType {
   kind: TileKind;
@@ -129,8 +124,20 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
 };
 
 /**
- * The "Add a tile" palette — a FLOATING modal, so it is OPAQUE
+ * The "Add a tile" palette — a FLOATING overlay, so it is OPAQUE
  * (`--surface-overlay`, `backdrop-filter: none`) per angular-zoneless.md T3.
+ *
+ * PRESENTATION IS PURELY DECLARATIVE, and that is deliberate. The component is
+ * rendered by `app-shell` behind `@if (tilePalette.open())` (see
+ * `TilePaletteService` for why the shell and not the board), and its own template
+ * is a plain `position: fixed` layer. There is no imperative "reveal" step at
+ * all — no `showModal()`, no `matches(":modal")`, no teleport, no top layer.
+ *
+ * That is the lesson of angular-zoneless.md T5, paid for five times over: every
+ * one of those is a modern-ish API that the engine the tests run supports and the
+ * engine we ship may not, and each failure looked identical from outside — the
+ * trigger flipping to "Close" while nothing appeared. A template `@if` plus CSS
+ * has nothing left that can throw, be refused, or resolve differently.
  *
  * Source pickers reuse the SHIPPED gated readers: `list_link_candidates` for
  * notes/recordings/documents and `get_graph` for entities. Nothing sealed can
@@ -143,58 +150,18 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
   imports: [MurSpinnerComponent],
   templateUrl: "./tile-palette.component.html",
   styleUrl: "./tile-palette.component.scss",
+  host: {
+    // Escape is handled on the DOCUMENT rather than on the overlay, because the
+    // catalogue step focuses nothing — a `(keydown.escape)` bound to the overlay
+    // would only fire once something inside it happened to hold focus. The
+    // component only exists while the palette is open, so the listener cannot
+    // outlive it.
+    "(document:keydown)": "onKeydown($event)",
+  },
 })
 export class TilePaletteComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
-
-  private readonly dlg = viewChild<ElementRef<HTMLDialogElement>>("dlg");
-
-  /**
-   * Promote the dialog into the TOP LAYER once it renders.
-   *
-   * `showModal()` (not `open`) is the point: only the modal form enters the top
-   * layer, which is what puts it outside every stacking context and every
-   * fixed-positioning containing block. `afterNextRender` is the zoneless-safe
-   * one-shot, and the injector is required because this runs from a field
-   * initialiser's effect rather than a constructor body.
-   */
-  private readonly _open = afterNextRender(() => this.reveal());
-
-  /**
-   * Show the dialog, preferring the modal (top-layer) form but never depending on
-   * it.
-   *
-   * `showModal()` is the good path: it promotes the element into the top layer,
-   * outside every stacking context and containing block. But it THROWS when the
-   * element is not connected, and a webview may refuse it for its own reasons —
-   * and when it does, a `<dialog>` that never opened stays `display: none`. That
-   * is exactly the symptom reported: the trigger flipped to "Close" (state was
-   * right) while nothing appeared on screen.
-   *
-   * So: try modal, and fall back to a plain `open` dialog, which the stylesheet
-   * pins to the viewport. The panel is on screen either way.
-   *
-   * DO NOT reintroduce an `el.matches(":modal")` check here. `:modal` is a recent
-   * pseudo-class, and an engine that does not know it makes `matches()` THROW a
-   * SyntaxError — which, thrown from `afterNextRender`, meant the dialog never
-   * received `open` and an unopened `<dialog>` is `display: none`. That produced
-   * exactly the reported symptom (trigger flipped to "Close", nothing on screen)
-   * and could not reproduce in the e2e, because the engines Playwright ships DO
-   * support `:modal`. `el.open` alone answers the only question that matters.
-   */
-  private reveal(): void {
-    const el = this.dlg()?.nativeElement;
-    if (!el || el.open) return;
-    try {
-      el.showModal();
-    } catch {
-      // Modal refused — the plain-open path below covers it.
-    }
-    if (!el.open) {
-      el.open = true;
-    }
-  }
 
   readonly dismiss = output<void>();
   readonly choose = output<TileChoice>();
@@ -314,29 +281,15 @@ export class TilePaletteComponent {
   }
 
   /**
-   * A click that lands on the DIALOG ITSELF is a backdrop click: the dialog's own
-   * box is the panel, and its ::backdrop is painted by the element, so a press
-   * outside the panel is reported with the dialog as target. Anything inside the
-   * panel has a descendant target and is left alone.
-   */
-  onDialogClick(event: MouseEvent): void {
-    if (event.target === this.dlg()?.nativeElement) this.dismiss.emit();
-  }
-
-  /** Escape is handled by the platform; this mirrors it back into our state. */
-  onDialogClose(): void {
-    this.dismiss.emit();
-  }
-
-  /**
    * Escape on the SECOND step goes back to the catalogue instead of closing the
-   * whole palette — losing the whole modal because you changed your mind about
+   * whole palette — losing the whole overlay because you changed your mind about
    * which KIND of tile you wanted is a needless step backwards.
    */
-  onDialogKeydown(event: KeyboardEvent): void {
-    if (event.key !== "Escape" || !this.selected()) return;
+  onKeydown(event: KeyboardEvent): void {
+    if (event.key !== "Escape") return;
     event.preventDefault();
-    this.back();
+    if (this.selected()) this.back();
+    else this.dismiss.emit();
   }
 
   registerField(el: ElementRef<HTMLInputElement> | undefined): void {

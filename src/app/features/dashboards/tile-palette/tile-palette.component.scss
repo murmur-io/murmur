@@ -5,33 +5,41 @@
   display: contents;
 }
 
-// ONE fixed layer that fills the viewport and centres its child with grid.
+// ONE fixed layer: the scrim AND the centring box, rendered by `app-shell`, whose
+// only ancestors are <body> and <html>.
 //
-// This replaces a `top:50% / left:50% / translate(-50%,-50%)` palette sitting beside
-// a SEPARATE fixed scrim. That shape depends on two things resolving correctly — the
-// fixed containing block, AND a percentage transform against the element's own box —
-// and it is the shape that failed in the packaged webview while working in Chromium.
-// `inset: 0` + `place-items: center` needs neither: the box IS the viewport and the
-// centring is plain layout, not a transform.
-// The dialog IS the panel; its ::backdrop is the scrim. Both are painted by the
-// browser in the TOP LAYER, so there is no z-index, no fixed positioning and no
-// containing block left to get wrong.
-.palette[open] {
-  // BELT AND BRACES. `showModal()` promotes the dialog into the top layer and the
-  // browser then positions it; but if that call is ever refused (it throws when the
-  // element is not connected, and a webview may differ), a plain `open` dialog is
-  // `position: absolute` and would sit wherever the flow left it — invisible in
-  // practice. Pinning it here means the panel is on screen either way: with
-  // showModal() the top layer wins and this is harmless; without it, this is what
-  // makes it visible. The symptom that forced this: the trigger flipped to "Close"
-  // (so the state was right) while nothing appeared.
+// That location is the whole point (see TilePaletteService). `position: fixed`
+// anchors to the viewport ONLY while no ancestor establishes a fixed-positioning
+// containing block — any `transform` / `filter` / `backdrop-filter` / `contain`
+// ancestor takes that job — and the board is full of frosted surfaces. Rendering
+// from the shell means there is no such ancestor to begin with, so nothing has to
+// resolve correctly and nothing has to be escaped: no teleport, no top layer, no
+// `<dialog>`. Centring is plain flex layout, not a percentage transform.
+.tp-overlay {
   position: fixed;
   inset: 0;
   z-index: var(--z-overlay, 2000);
-  margin: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+// The scrim fills the overlay and sits BEHIND the panel; it is its own element so
+// the click-to-dismiss target is unambiguous and can carry the a11y affordances.
+.tp-scrim {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: var(--scrim);
+  cursor: default;
 }
 
 .palette {
+  // In-flow inside the centring layer — no position or transform of its own,
+  // just a paint order above the scrim.
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   width: min(880px, 92vw);
@@ -45,10 +53,6 @@
   background: var(--surface-overlay);
   color: var(--text-primary);
   box-shadow: var(--shadow-lg);
-
-  &::backdrop {
-    background: var(--scrim);
-  }
 }
 
 .palette-head {
