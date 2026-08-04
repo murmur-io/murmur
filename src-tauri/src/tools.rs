@@ -3770,6 +3770,62 @@ mod tests {
         );
     }
 
+    /// The INVARIANT test for the agent path, on the exact shape that used to leak: a
+    /// `living_answer` tile with a cached answer, NO question and a stored title.
+    ///
+    /// HONEST LIMIT, measured rather than assumed. Two independent layers now protect this — the
+    /// `redact_tile_chrome` call in `GetDashboard`, and `render_tile_for_agent` no longer falling
+    /// back to the stored title for a withheld answer — and EITHER alone is sufficient. I neutered
+    /// the redaction call and this test still passed, so it is NOT red-before-green proof of that
+    /// layer; it pins the end-to-end invariant, which is what actually must hold.
+    ///
+    /// The layers are covered separately where each is observable in isolation:
+    /// `commands/tests/dashboard_cmd_tests.rs::agent_rendering_of_a_withheld_tile_prints_no_stored_chrome`
+    /// drives the renderer with an UNREDACTED tile (red if the renderer regresses), and
+    /// `…::locked_tile_sheds_its_user_authored_chrome` covers `redact_tile_chrome` itself.
+    #[test]
+    fn agent_path_withholds_a_living_answer_title_and_cached_text() {
+        let db = tmp_db();
+        db.insert_dashboard("b1", "Deals", None, None, "2026-08-03T10:00:00Z")
+            .unwrap();
+        // A legacy-shaped row: cached answer, no question, and a title copied from the source.
+        db.insert_dashboard_tile(
+            "t1",
+            "b1",
+            "living_answer",
+            None,
+            Some("Acme termination terms"),
+            4,
+            Some(r#"{"answer":"They are not renewing"}"#),
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let nothing_unlocked = HashSet::new();
+        let out = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &nothing_unlocked,
+            &cfg,
+        )
+        .unwrap();
+
+        // The answer has no recorded readable-folder snapshot ⇒ un-gateable ⇒ withheld, and with
+        // it goes the stored title.
+        assert!(
+            !out.contains("Acme termination terms"),
+            "a withheld living answer must not hand an agent its stored title: {out}"
+        );
+        assert!(
+            !out.contains("not renewing"),
+            "nor the cached answer text: {out}"
+        );
+        assert!(out.contains("withheld"), "and it must say why: {out}");
+    }
+
     #[test]
     fn production_connector_builder_requires_and_retains_live_recording_identity() {
         let _serial = crate::perf::model_lifecycle_test_guard();
