@@ -13,34 +13,27 @@
 // and it is the shape that failed in the packaged webview while working in Chromium.
 // `inset: 0` + `place-items: center` needs neither: the box IS the viewport and the
 // centring is plain layout, not a transform.
-.tp-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-overlay, 2000);
-  display: grid;
-  place-items: center;
-  padding: var(--space-5);
-}
-
-.scrim {
-  position: absolute;
-  inset: 0;
-  background: var(--scrim);
-}
-
+// The dialog IS the panel; its ::backdrop is the scrim. Both are painted by the
+// browser in the TOP LAYER, so there is no z-index, no fixed positioning and no
+// containing block left to get wrong.
 .palette {
-  // In-flow inside the centring grid — no position/transform of its own to resolve.
-  position: relative;
   display: flex;
   flex-direction: column;
   width: min(880px, 92vw);
   max-height: 78vh;
+  padding: 0;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-xl);
+  // Floating overlay ⇒ OPAQUE (T3): the frosted card surface would bleed the
+  // board behind it through and read as broken.
   background: var(--surface-overlay);
-  backdrop-filter: none;
+  color: var(--text-primary);
   box-shadow: var(--shadow-lg);
+
+  &::backdrop {
+    background: var(--scrim);
+  }
 }
 
 .palette-head {
