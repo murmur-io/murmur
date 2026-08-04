@@ -157,6 +157,11 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   await page.goto("/dashboards/b-atlas");
   await page.getByRole("button", { name: "Add tile" }).click();
 
+  // The trigger reflects state, so "the click landed" and "the palette rendered"
+  // are separately observable — the two failures that looked identical in the
+  // original bug report.
+  await expect(page.getByRole("button", { name: "Close" })).toBeVisible();
+
   const palette = page.getByRole("dialog", { name: "Add a tile" });
   await expect(palette).toBeVisible();
 

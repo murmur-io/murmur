@@ -15,8 +15,13 @@
   @if (editing()) {
     <span class="arrange-hint">drag tiles to reorder · ‹ › to resize</span>
   }
-  <button type="button" class="btn btn-primary" (click)="openPalette()">
-    <mur-icon icon="plus" /> Add tile
+  <button
+    type="button"
+    class="btn btn-primary"
+    [class.is-open]="paletteOpen()"
+    (click)="togglePalette()"
+  >
+    <mur-icon icon="plus" /> {{ paletteOpen() ? "Close" : "Add tile" }}
   </button>
 </header>
 
