@@ -12,6 +12,21 @@
     />
   </section>
 
+  <!-- ACTION ITEMS + Smart reminders (both hidden/collapsed when empty).
+       Hoisted from line ~455 of 481 to sit beside Related, so a commitment is
+       visible without scrolling past Summary, Decisions and the Q&A log.
+       `<app-meeting-actions>` carries `<app-smart-reminder-card>` internally,
+       so the two follow-up surfaces travel together and their overlap is now
+       legible in one glance rather than 400 lines apart — the merge itself is a
+       separate product decision (see docs/research/2026-08-03-reminders-ux.md).
+       Still inside note-panel, so it keeps the detail view's `@else (!locked())`
+       ancestor guard. -->
+  <app-meeting-actions
+    [meetingId]="meetingId()"
+    [meetingTitle]="meetingTitle()"
+    [sourceRevision]="noteRaw()"
+  />
+
   <!-- ANALYSIS CARD: primary verb + ⋯ More menu, then the note body. -->
   <section class="block print-keep" [class.is-resummarizing]="busy()">
     <div class="block-head">
@@ -450,13 +465,6 @@
       </ul>
     </section>
   }
-
-  <!-- ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none). -->
-  <app-meeting-actions
-    [meetingId]="meetingId()"
-    [meetingTitle]="meetingTitle()"
-    [sourceRevision]="noteRaw()"
-  />
 
   <!-- "Ask about this meeting" moved OUT of this in-flow Note panel into the
        detail shell's summoned right-side drawer (2026-07 slideout), so the

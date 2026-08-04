@@ -99,6 +99,7 @@
 /* --- Form fields ----------------------------------------------------------- */
 input[type="text"], input[type="password"], input[type="search"],
 input[type="number"], input[type="email"], input[type="url"],
+input[type="date"], input[type="time"],
 input:not([type]), select, textarea {
   width: 100%;
   padding: 0 var(--space-3);
@@ -120,6 +121,20 @@ textarea {
   padding: var(--space-3);
   resize: vertical;
   line-height: 1.55;
+}
+/* Temporal inputs were absent from the base-box list above while the BARE
+   `input:hover` / `input:focus` rules below still matched them — so a date or
+   time field got `outline: none` plus a 3px accent focus ring on a control that
+   had never been given a visible border. That is an accessibility defect on top
+   of the visual one, and it is why the reminder composer read as "unstyled".
+   WebKit renders these as inline-flex internally, so a forced 40px height
+   bottom-aligns the ::-webkit-datetime-edit segments without the centring below.
+   `accent-color` makes the picker's selected-day highlight follow the user's
+   palette instead of the OS accent (accents.css ships six). */
+input[type="date"], input[type="time"] {
+  display: inline-flex;
+  align-items: center;
+  accent-color: var(--accent);
 }
 input::placeholder, textarea::placeholder { color: var(--text-muted); }
 input:hover, select:hover, textarea:hover { border-color: var(--border-strong); }
