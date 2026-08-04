@@ -172,8 +172,16 @@ export class TilePaletteComponent {
    * is exactly the symptom reported: the trigger flipped to "Close" (state was
    * right) while nothing appeared on screen.
    *
-   * So: try modal, verify with `:modal`, and fall back to a plain `open` dialog,
-   * which the stylesheet pins to the viewport. The panel is on screen either way.
+   * So: try modal, and fall back to a plain `open` dialog, which the stylesheet
+   * pins to the viewport. The panel is on screen either way.
+   *
+   * DO NOT reintroduce an `el.matches(":modal")` check here. `:modal` is a recent
+   * pseudo-class, and an engine that does not know it makes `matches()` THROW a
+   * SyntaxError — which, thrown from `afterNextRender`, meant the dialog never
+   * received `open` and an unopened `<dialog>` is `display: none`. That produced
+   * exactly the reported symptom (trigger flipped to "Close", nothing on screen)
+   * and could not reproduce in the e2e, because the engines Playwright ships DO
+   * support `:modal`. `el.open` alone answers the only question that matters.
    */
   private reveal(): void {
     const el = this.dlg()?.nativeElement;
@@ -181,9 +189,9 @@ export class TilePaletteComponent {
     try {
       el.showModal();
     } catch {
-      // fall through to the non-modal path below
+      // Modal refused — the plain-open path below covers it.
     }
-    if (!el.open || !el.matches(":modal")) {
+    if (!el.open) {
       el.open = true;
     }
   }
