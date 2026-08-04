@@ -1,22 +1,21 @@
 <!--
-  Scrim + palette are TELEPORTED to <body> as ONE overlay box. A `position: fixed`
-  overlay only anchors to the VIEWPORT when no ancestor establishes a fixed-
-  positioning containing block — and any ancestor with transform / filter /
-  backdrop-filter / contain becomes one. The board canvas and the Ask column are
-  both frosted surfaces, so the palette could land offset or clipped depending on
-  the engine. `mur-source-picker` teleports for exactly this reason; this did not,
-  which is the difference between it working in Chromium and vanishing in the
-  packaged WKWebView.
+  A NATIVE <dialog> opened with showModal() — not a hand-rolled fixed overlay.
+  showModal() promotes the element into the browser's TOP LAYER, which sits
+  outside the normal stacking tree and outside every fixed-positioning containing
+  block. So no frosted or transformed ancestor can offset, clip or cover it, on
+  any engine — and the board canvas and the Ask column are both `backdrop-filter`
+  surfaces. The scrim is the built-in `::backdrop`, and Escape is handled by the
+  platform. This replaced two successive hand-rolled attempts that each worked in
+  Chromium and still failed in the packaged webview.
 -->
-<div class="tp-overlay" appTeleportToBody>
-<div class="scrim" (click)="onBackdrop()" aria-hidden="true"></div>
-
-<div
+<dialog
+  #dlg
   class="palette"
-  role="dialog"
-  aria-modal="true"
   aria-label="Add a tile"
   tabindex="-1"
+  (close)="onDialogClose()"
+  (click)="onDialogClick($event)"
+  (keydown)="onDialogKeydown($event)"
 >
   @if (selected(); as type) {
     <header class="palette-head">
@@ -132,5 +131,4 @@
       }
     </div>
   }
-</div>
-</div>
+</dialog>

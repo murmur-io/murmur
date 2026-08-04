@@ -8,10 +8,10 @@ import {
   inject,
   output,
   signal,
+  viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
-import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 import type { NoteCitation, TileConfig, TileKind } from "../../../core/models";
 
 /** What a chosen tile kind needs before it can be added. */
@@ -140,19 +140,29 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
 @Component({
   selector: "app-tile-palette",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurSpinnerComponent, TeleportToBodyDirective],
+  imports: [MurSpinnerComponent],
   templateUrl: "./tile-palette.component.html",
   styleUrl: "./tile-palette.component.scss",
-  host: {
-    // Escape must dismiss the modal no matter where focus currently sits. A
-    // keydown bound to the dialog element only fires when the dialog itself (or
-    // a descendant) has focus, which is not guaranteed the moment it opens.
-    "(document:keydown)": "onKeydown($event)",
-  },
 })
 export class TilePaletteComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+
+  private readonly dlg = viewChild<ElementRef<HTMLDialogElement>>("dlg");
+
+  /**
+   * Promote the dialog into the TOP LAYER once it renders.
+   *
+   * `showModal()` (not `open`) is the point: only the modal form enters the top
+   * layer, which is what puts it outside every stacking context and every
+   * fixed-positioning containing block. `afterNextRender` is the zoneless-safe
+   * one-shot, and the injector is required because this runs from a field
+   * initialiser's effect rather than a constructor body.
+   */
+  private readonly _open = afterNextRender(() => {
+    const el = this.dlg()?.nativeElement;
+    if (el && !el.open) el.showModal();
+  });
 
   readonly dismiss = output<void>();
   readonly choose = output<TileChoice>();
@@ -271,17 +281,30 @@ export class TilePaletteComponent {
     this.choose.emit({ kind: type.kind, title: q, config: { question: q } });
   }
 
-  onBackdrop(): void {
+  /**
+   * A click that lands on the DIALOG ITSELF is a backdrop click: the dialog's own
+   * box is the panel, and its ::backdrop is painted by the element, so a press
+   * outside the panel is reported with the dialog as target. Anything inside the
+   * panel has a descendant target and is left alone.
+   */
+  onDialogClick(event: MouseEvent): void {
+    if (event.target === this.dlg()?.nativeElement) this.dismiss.emit();
+  }
+
+  /** Escape is handled by the platform; this mirrors it back into our state. */
+  onDialogClose(): void {
     this.dismiss.emit();
   }
 
-  /** Escape closes the palette (a modal must always be dismissable). */
-  onKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape") {
-      event.stopPropagation();
-      if (this.selected()) this.back();
-      else this.dismiss.emit();
-    }
+  /**
+   * Escape on the SECOND step goes back to the catalogue instead of closing the
+   * whole palette — losing the whole modal because you changed your mind about
+   * which KIND of tile you wanted is a needless step backwards.
+   */
+  onDialogKeydown(event: KeyboardEvent): void {
+    if (event.key !== "Escape" || !this.selected()) return;
+    event.preventDefault();
+    this.back();
   }
 
   registerField(el: ElementRef<HTMLInputElement> | undefined): void {
