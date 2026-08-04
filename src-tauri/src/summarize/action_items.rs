@@ -73,6 +73,11 @@ fn parse_item_line(line: &str) -> Option<(bool, String)> {
 fn extract_owner(text: &str) -> Option<String> {
     for sep in [" — ", " – ", " - "] {
         if let Some((head, _)) = text.split_once(sep) {
+            // A head that is NOTHING BUT a parenthetical is the model declining to
+            // name anyone, not a person called that. See `is_parenthetical_only`.
+            if is_parenthetical_only(head) {
+                return None;
+            }
             let head = normalize_owner(head);
             if !head.is_empty() && head.chars().count() <= 40 {
                 return Some(head);
@@ -80,6 +85,56 @@ fn extract_owner(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Is this head WHOLLY wrapped in one pair of parentheses, with nothing outside?
+///
+/// THE DEFECT THIS CLOSES. `normalize_owner` deliberately KEEPS any parenthetical
+/// that is not `(others-N)` or `(me)`, because `me (Ali)` and `me (YuYakob)` are
+/// different people and collapsing them would merge three people's commitments
+/// into one rollup. That rule is right for a name WITH a parenthetical and wrong
+/// for a head that is only a parenthetical: measured on a real vault, **29 of 29**
+/// open commitments carried the literal owner `"(właściciel nieokreślony)"` — the
+/// model's Polish for "owner unspecified" — and every one of them was treated as a
+/// person's name. Downstream, `commands/dashboards.rs::resolve_tile`'s `person`
+/// arm matches `normalize_owner` against the person's name, so
+/// `TileData::Person.open_commitments` was structurally **0 for every person in
+/// the vault**, and `list_open_commitments(owner)` could never match.
+///
+/// STRUCTURAL, NEVER LEXICAL. Matching the Polish string (or a list of phrases)
+/// would pass the measurement that motivated it and silently regress the moment
+/// `note_language` is English — "(owner unspecified)", "(unassigned)", "(TBD)" —
+/// which is the same class of bug as pinning a test to today's copy. The shape
+/// "the whole head is inside brackets" carries the meaning in every language.
+///
+/// The balance walk matters: `"(a) b"` opens and closes before the end, so it has
+/// content OUTSIDE the parentheses and is a normal head; `"(a (b))"` never returns
+/// to depth 0 until the last char, so it is parenthetical-only. A naive
+/// `starts_with('(') && ends_with(')')` would misread the first as wrapped.
+fn is_parenthetical_only(head: &str) -> bool {
+    let s = head.trim();
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                // An unbalanced ')' cannot be a wrapper; bail rather than underflow.
+                depth = match depth.checked_sub(1) {
+                    Some(d) => d,
+                    None => return false,
+                };
+                // Closed the opening bracket before the end ⇒ there is content outside.
+                if depth == 0 && i + c.len_utf8() != s.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Strip the SCAFFOLDING a diarization tag or a wikilink leaves around an owner name.
@@ -229,6 +284,55 @@ mod tests {
             vec!["Miles", "Miles", "Miles"],
             "all three spellings resolve to one owner key"
         );
+    }
+
+    /// RED-BEFORE-GREEN. On the unpatched parser every one of these yields
+    /// `Some("(…)")`, and that pseudo-owner is what made
+    /// `TileData::Person.open_commitments` structurally 0 for every person.
+    ///
+    /// Both languages are asserted ON PURPOSE: Polish is the string measured in
+    /// the field, English proves the rule is STRUCTURAL rather than a lexical
+    /// special case for the one phrase that happened to be observed.
+    #[test]
+    fn an_owner_head_that_is_only_a_parenthetical_is_no_owner() {
+        let md = "## Action items\n\
+                  - [ ] (właściciel nieokreślony) — ustalić liczbę osób\n\
+                  - [ ] (owner unspecified) — book the room\n\
+                  - [ ] (TBD) — sign the contract\n\
+                  - [ ]  (unassigned)  — chase the invoice\n";
+        let owners: Vec<_> = parse_action_items(md).into_iter().map(|i| i.owner).collect();
+        assert_eq!(
+            owners,
+            vec![None, None, None, None],
+            "a head wholly inside brackets names nobody, in any language"
+        );
+    }
+
+    /// The identity rule this must NOT weaken, re-asserted through the real parser.
+    #[test]
+    fn a_parenthetical_beside_a_name_still_survives() {
+        let md = "## Action items\n\
+                  - [ ] Anna (QA) — sign off\n\
+                  - [ ] me (Ali) — draft it\n\
+                  - [ ] me (YuYakob) — review it\n\
+                  - [ ] (a) b — the bracket closes early, so this is a normal head\n";
+        let owners: Vec<_> = parse_action_items(md)
+            .into_iter()
+            .filter_map(|i| i.owner)
+            .collect();
+        assert_eq!(owners, vec!["Anna (QA)", "me (Ali)", "me (YuYakob)", "(a) b"]);
+    }
+
+    /// The balance walk, directly — nesting must not read as "content outside".
+    #[test]
+    fn parenthetical_detection_walks_the_balance() {
+        assert!(is_parenthetical_only("(a (b))"), "nested is still wrapped");
+        assert!(is_parenthetical_only("  (unspecified)  "), "padding is trimmed");
+        assert!(!is_parenthetical_only("(a) b"), "closes before the end");
+        assert!(!is_parenthetical_only("b (a)"), "trailing bracket is not a wrapper");
+        assert!(!is_parenthetical_only("Anna"), "no brackets at all");
+        assert!(!is_parenthetical_only(")a("), "unbalanced never underflows");
+        assert!(!is_parenthetical_only("(a"), "unterminated is not wrapped");
     }
 
     #[test]
