@@ -307,6 +307,63 @@ fn living_answer_config_round_trips_its_readable_snapshot() {
     assert!(legacy.answer.is_some());
 }
 
+/// THE AGENT-SURFACE LEAK ORACLE. `render_tile_for_agent` feeds BOTH the local MCP server and the
+/// in-app agentic Ask loop, so a withheld tile that printed its stored title there would leak to a
+/// surface the screen-side redaction never sees. Every withheld state must print its state ONLY.
+#[test]
+fn agent_rendering_of_a_withheld_tile_prints_no_stored_chrome() {
+    let tile = |kind: &str, title: &str, config: Option<&str>| {
+        crate::storage::models::DashboardTile {
+            id: "t1".into(),
+            dashboard_id: "b1".into(),
+            kind: kind.into(),
+            ref_id: Some("x".into()),
+            title: Some(title.into()),
+            span: 4,
+            position: 0,
+            config: config.map(str::to_string),
+            created_at: "2026-08-03T10:00:00Z".into(),
+        }
+    };
+
+    for data in [TileData::Locked, TileData::Missing, TileData::Unconfigured] {
+        let out = render_tile_for_agent(&tile("note", "Acme — termination terms", None), &data);
+        assert!(
+            !out.contains("termination"),
+            "a withheld tile must not print its stored title to an agent: {out}"
+        );
+    }
+
+    // A withheld living answer prints the question but never the cached text.
+    let out = render_tile_for_agent(
+        &tile(
+            "living_answer",
+            "Will they renew?",
+            Some(r#"{"answer":"No — they are churning"}"#),
+        ),
+        &TileData::LivingAnswer {
+            question: "Will they renew?".into(),
+            answer: None,
+            answered_at: None,
+            withheld: true,
+        },
+    );
+    assert!(out.contains("withheld"), "the agent is told WHY: {out}");
+    assert!(!out.contains("churning"), "cached answer leaked: {out}");
+
+    // CONTROL: a visible tile does render its content, so the assertions above are not vacuous.
+    let out = render_tile_for_agent(
+        &tile("note", "Atlas GA checklist", None),
+        &TileData::Note {
+            id: "n1".into(),
+            title: "Atlas GA checklist".into(),
+            snippet: "auth migration is the blocker".into(),
+            updated_at: 0,
+        },
+    );
+    assert!(out.contains("Atlas GA checklist") && out.contains("auth migration"));
+}
+
 #[test]
 fn snippets_are_bounded_and_ellipsized() {
     assert_eq!(snippet_of("  short  ", 10), "short");

@@ -156,6 +156,36 @@
         aria-label="Source candidates"
         (scroll)="onScroll()"
       >
+        <!--
+          Boards first: a dashboard is the user's OWN declaration of what belongs
+          together, so it is the strongest scope on offer. Picking one expands it
+          into its visible sources (sealed ones are dropped backend-side).
+        -->
+        @if (dashboardRows().length > 0) {
+          <p class="sp-group">Dashboards</p>
+          @for (board of dashboardRows(); track board.id) {
+            <button
+              type="button"
+              class="sp-row menu-item sp-board"
+              role="option"
+              [attr.aria-selected]="false"
+              [disabled]="disabled() || selectionLimitReached() || expandingBoard() === board.id"
+              (click)="pickDashboard(board)"
+            >
+              <span class="sp-title">
+                @if (board.emoji) {
+                  <span class="sp-emoji">{{ board.emoji }}</span>
+                }
+                {{ board.title }}
+              </span>
+              <span class="sp-kind">
+                {{ expandingBoard() === board.id ? "adding…" : board.tileCount + " tiles" }}
+              </span>
+            </button>
+          }
+          <p class="sp-group">Notes &amp; meetings</p>
+        }
+
         @for (
           r of rows();
           track r.candidate.kind + r.candidate.id;

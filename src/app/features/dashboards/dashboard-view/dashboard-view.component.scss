@@ -45,6 +45,12 @@
   line-height: 1;
 }
 
+.arrange-hint {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .board {
   display: flex;
   gap: var(--space-3);
@@ -227,7 +233,13 @@
 
 // Narrow windows: the Ask column drops under the canvas rather than squeezing it.
 @media (max-width: 1080px) {
-  .board {
+  .arrange-hint {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.board {
     flex-direction: column;
   }
 
