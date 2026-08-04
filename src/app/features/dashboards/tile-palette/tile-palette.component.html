@@ -24,9 +24,6 @@
     (keydown.escape)="dismiss.emit()"
   ></div>
 
-  <!-- TEMPORARY instrument (see `diag` in the component) — remove once confirmed. -->
-  <p class="tp-diag">{{ diag() }}</p>
-
   <div class="palette" role="dialog" aria-modal="true" aria-label="Add a tile">
     @if (selected(); as type) {
       <header class="palette-head">
