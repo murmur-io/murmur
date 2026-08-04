@@ -355,3 +355,64 @@ test("Dashboards: the palette's position does not depend on the board's own subt
   });
   expect(hit, "the palette centre must be hit-testable").toBe(true);
 });
+
+test("Dashboards: a tile with a malformed payload cannot blank the rest of the UI", async ({
+  page,
+}) => {
+  // THE ACTUAL BUG behind six fixes aimed at the palette. `TileData` is an internally-tagged
+  // serde enum, and `rename_all` on an enum renames the VARIANTS, not the fields inside them —
+  // so a meeting tile shipped `started_at` while `models.ts` declares `startedAt`. Reading
+  // `undefined` made `formatDate` do `undefined.slice(0, 10)` and THROW, and an exception from a
+  // template binding aborts the rest of that change-detection pass. Everything rendered after it
+  // in the same pass went blank — including the Add-a-tile palette, which `app-shell` renders
+  // later. A board of only note tiles was fine, so it looked like a tile-COUNT bug.
+  //
+  // The wire shape itself is pinned in Rust (`every_tile_payload_field_is_camel_case_on_the_wire`),
+  // because a fixture written from the TypeScript type can only ever assert the shape it already
+  // assumes. THIS test pins the blast radius instead: whatever arrives, one bad tile must cost one
+  // wrong-looking cell and nothing more.
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+
+  const brokenTiles = [
+    {
+      id: "t-note", dashboardId: "b-atlas", kind: "note", refId: "n-1", title: null,
+      span: 4, position: 0, config: null, createdAt: "2026-08-01T09:00:00Z",
+      data: { kind: "note", id: "n-1", title: "A NOTE", snippet: "s", updatedAt: null },
+    },
+    {
+      // Exactly what the backend used to send: no `startedAt`, no `durationS`, no `hasAudio`.
+      id: "t-rec", dashboardId: "b-atlas", kind: "meeting", refId: "m-1", title: null,
+      span: 4, position: 1, config: null, createdAt: "2026-08-01T09:00:00Z",
+      data: { kind: "meeting", id: "m-1", title: "A RECORDING", started_at: "2026-07-20T02:30:00Z", duration_s: 900, has_audio: true },
+    },
+  ];
+
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: { ...BOARDS[0], tiles: brokenTiles },
+      get_dashboard_sources: [],
+      list_link_candidates: [],
+      get_graph: { nodes: [], edges: [], hasHidden: false },
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await expect(page.getByText("A RECORDING")).toBeVisible();
+
+  // The palette is rendered LATER in the same change-detection pass than the tiles, so it is the
+  // thing a throwing tile binding takes down. It must still open, and be populated.
+  await page.getByRole("button", { name: "Add tile" }).click();
+  const palette = page.getByRole("dialog", { name: "Add a tile" });
+  await expect(palette, "a malformed tile must not stop the palette rendering").toBeVisible();
+  expect(
+    await palette.locator(".node").count(),
+    "the palette's catalogue must render, not just its box",
+  ).toBe(10);
+
+  // And nothing threw: a binding that throws is what caused the blanking in the first place.
+  expect(errors, "no uncaught error may escape a template binding").toEqual([]);
+});

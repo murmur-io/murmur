@@ -53,24 +53,6 @@
   cursor: default;
 }
 
-// TEMPORARY instrument. Pinned to the very top of the viewport, OUTSIDE the panel,
-// so it is readable in a screenshot even when the panel itself is not.
-.tp-diag {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 1;
-  margin: 0;
-  padding: 4px 8px;
-  background: #000;
-  color: #7fff9f;
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  line-height: 1.4;
-  word-break: break-all;
-}
-
 .palette {
   // In-flow inside the centring layer — no position or transform of its own,
   // just a paint order above the scrim.
