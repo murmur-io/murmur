@@ -617,7 +617,7 @@ pub fn get_dashboard(
 ///
 /// `ref_id`, `span` and `position` stay: pure layout, no content, and the FE needs them to keep the
 /// board's shape stable while a folder is sealed.
-fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> DashboardTile {
+pub(crate) fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> DashboardTile {
     let withheld = match data {
         TileData::Locked | TileData::Missing | TileData::Unconfigured => true,
         // `entity_name` yields the placeholder when the entity is not visible.
@@ -1061,10 +1061,13 @@ pub(crate) fn render_tile_for_agent(tile: &DashboardTile, data: &TileData) -> St
             withheld,
             ..
         } => {
-            let q = if question.trim().is_empty() {
-                heading("living answer")
-            } else {
-                question.clone()
+            // NEVER fall back to the stored title when the answer is withheld: that title is
+            // exactly the field a legacy row copied from the source. An unnamed withheld tile is
+            // anonymous, which is the correct outcome.
+            let q = match (question.trim().is_empty(), *withheld) {
+                (true, true) => "(untitled)".to_string(),
+                (true, false) => heading("living answer"),
+                _ => question.clone(),
             };
             if *withheld {
                 format!("- living answer: {q}\n    [saved answer withheld — a source is sealed]")
