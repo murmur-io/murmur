@@ -19,7 +19,15 @@ export type ShellIcon =
   | "topbar"
   | "sun"
   | "moon"
-  | "display";
+  | "display"
+  // Dashboard tile marks. A board tile identifies its KIND by a glyph, and the
+  // glyph set lives here with every other icon rather than inline in one feature.
+  | "document"
+  | "drift"
+  | "numbers"
+  | "pulse"
+  | "promises"
+  | "lock";
 
 /**
  * Design System — one inline-SVG glyph, shared by the floating sidebar, the

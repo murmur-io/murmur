@@ -1,5 +1,7 @@
 import { ChangeDetectionStrategy, Component, computed, input, output } from "@angular/core";
 import type { ResolvedTile, SourceRef, TileData } from "../../../core/models";
+import type { ShellIcon } from "../../../design-system/icon/icon.component";
+import { MurIconComponent } from "../../../design-system/icon/icon.component";
 
 /** What the tile header shows when the user gave the tile no title of its own. */
 const DEFAULT_TITLE: Record<TileData["kind"], string> = {
@@ -44,6 +46,92 @@ const LIVE_KINDS = new Set<TileData["kind"]>([
   "livingAnswer",
 ]);
 
+/** The 22px mark in each tile header — the kind, made scannable. */
+const TILE_ICON: Record<TileData["kind"], ShellIcon> = {
+  locked: "lock",
+  missing: "document",
+  unconfigured: "plus",
+  note: "notes",
+  meeting: "meetings",
+  document: "document",
+  person: "people",
+  reminders: "reminders",
+  drift: "drift",
+  numbers: "numbers",
+  pulse: "pulse",
+  promises: "promises",
+  livingAnswer: "ask",
+};
+
+/**
+ * FOUR hues, and no more.
+ *
+ * The four graph families measure PASS on chroma, CVD separation and contrast in
+ * both themes; adding a fifth (`--warning`) collides with amber at ΔE 5.7. So only
+ * MATERIAL kinds — the things that exist in the vault as documents — wear a hue.
+ * DERIVED tiles are views over that material and take the neutral mark, which is
+ * also what keeps a board of ten tiles from reading as confetti.
+ *
+ * `--accent` is deliberately absent: it is reserved for the AI channel (the
+ * citation ring, the Ask composer, the living answer), it is USER-SELECTABLE, and
+ * five of its six options sit within ΔE 15 of a family hue. An accent doing
+ * category work is an accent that stops meaning "the brain touched this".
+ */
+const TILE_HUE: Partial<Record<TileData["kind"], string>> = {
+  note: "var(--graph-note)",
+  document: "var(--graph-document)",
+  meeting: "var(--graph-meeting)",
+  person: "var(--graph-entity)",
+  livingAnswer: "var(--accent)",
+};
+
+/**
+ * The width a kind wants, in 12ths — applied only to tiles the user never resized.
+ *
+ * Why an override and not a default at add time: `commands/dashboards.rs` clamps
+ * with `span.unwrap_or(4)`, so EVERY tile on EVERY existing board already holds a
+ * concrete `4` in SQLite. A new add-time default would change nothing about a board
+ * that already exists, which is exactly the board that was complained about. The
+ * first explicit resize writes a real value and this stops applying.
+ */
+const DEFAULT_SPAN: Record<TileData["kind"], number> = {
+  locked: 3,
+  missing: 3,
+  unconfigured: 3,
+  note: 4,
+  meeting: 6,
+  document: 4,
+  person: 3,
+  reminders: 4,
+  drift: 4,
+  numbers: 4,
+  pulse: 3,
+  promises: 6,
+  livingAnswer: 6,
+};
+
+/** The span the backend hands every un-resized tile — the value the override replaces. */
+const STORED_DEFAULT_SPAN = 4;
+
+/** Collapsed empties are uniform and narrow, so a row of them reads as one gutter. */
+const EMPTY_SPAN = 3;
+
+/**
+ * What the body has to say, which is NOT the same question as "does it have rows".
+ *
+ * - `empty`      — never had data. Collapses to a header strip; a full card holding
+ *                  one sentence of regret is what made nine tiles read as a wall.
+ * - `good`       — genuinely zero, and that is the GOOD outcome. Keeps its card.
+ *                  "Nothing open — every commitment on this board is closed" is a
+ *                  result; rendering a success as an absence is the most
+ *                  demoralising thing a board can do, and it is why this is a
+ *                  separate state rather than `rows.length === 0`.
+ * - `degenerate` — populated, but with too little to support the mark it implies.
+ *                  A drift lane with one step asserts movement that never happened.
+ * - `normal`     — render the body.
+ */
+export type TileBodyState = "empty" | "good" | "degenerate" | "normal";
+
 /**
  * ONE tile on a board.
  *
@@ -58,10 +146,16 @@ const LIVE_KINDS = new Set<TileData["kind"]>([
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: "./dashboard-tile.component.html",
   styleUrl: "./dashboard-tile.component.scss",
+  imports: [MurIconComponent],
   host: {
-    "[style.--tile-span]": "tile().span",
+    "[attr.data-tile-id]": "tile().id",
+    "[attr.data-kind]": "data().kind",
+    "[style.--tile-span]": "displaySpan()",
+    "[style.--tile-hue]": "hue()",
     "[class.cited]": "cited() > 0",
     "[class.is-locked]": "tile().data.kind === 'locked'",
+    "[class.is-empty]": "bodyState() === 'empty'",
+    "[class.is-duplicate]": "duplicateOf() !== null",
     "[class.is-arranging]": "editing()",
     "[class.is-dragging]": "dragging()",
     "[class.is-drop-target]": "dropTarget()",
@@ -77,6 +171,16 @@ export class DashboardTileComponent {
   readonly dragging = input(false);
   /** This tile is the current drop target. */
   readonly dropTarget = input(false);
+  /**
+   * The title of an EARLIER tile that resolves to exactly the same thing, or null.
+   *
+   * The board that prompted this work carried two identical Promise ledgers. That is
+   * not user error: `tile-palette` declares `promises` with `mode: "none"`, so it
+   * never asks for an owner, so `config.owner` is never written, so both tiles
+   * resolve to the same global list — structurally guaranteed. The second one
+   * renders as a back-reference instead of a second copy of the same rows.
+   */
+  readonly duplicateOf = input<string | null>(null);
 
   readonly remove = output<void>();
   readonly widen = output<void>();
@@ -121,7 +225,94 @@ export class DashboardTileComponent {
   });
 
   readonly kindLabel = computed(() => KIND_LABEL[this.data().kind]);
-  readonly isLive = computed(() => LIVE_KINDS.has(this.data().kind));
+  readonly mark = computed(() => TILE_ICON[this.data().kind]);
+  readonly hue = computed(() => TILE_HUE[this.data().kind] ?? "var(--text-secondary)");
+
+  /**
+   * What the body has to say. See {@link TileBodyState} — the load-bearing
+   * distinction is `empty` (never had data → collapse) versus `good` (zero, and
+   * zero is the win → keep the card).
+   */
+  readonly bodyState = computed<TileBodyState>(() => {
+    const d = this.data();
+    switch (d.kind) {
+      case "missing":
+      case "unconfigured":
+        return "empty";
+      case "note":
+      case "document":
+        return d.snippet.trim() ? "normal" : "empty";
+      case "numbers":
+        return d.rows.length === 0 ? "empty" : "normal";
+      case "pulse":
+        return d.total === 0 ? "empty" : "normal";
+      case "drift":
+        // Zero steps is nothing; ONE step is worse than nothing, because a rail
+        // drawn through a single point asserts a movement that never happened.
+        if (d.rows.length === 0) return "empty";
+        return d.rows.length < 2 ? "degenerate" : "normal";
+      case "promises":
+      case "reminders":
+        return d.rows.length === 0 ? "good" : "normal";
+      default:
+        // `locked` keeps its full card ON PURPOSE: a redacted region is content,
+        // and a board that can be screen-shared as-is is the point of the lock model.
+        return "normal";
+    }
+  });
+
+  /** One sentence saying where data WILL land — never an apology for its absence. */
+  readonly emptyCopy = computed(() => {
+    const d = this.data();
+    switch (d.kind) {
+      case "missing":
+        return "Its source is gone from the vault";
+      case "unconfigured":
+        return "No source chosen yet";
+      case "note":
+      case "document":
+        return "Nothing written in it yet";
+      case "numbers":
+        return "Figures said out loud land here";
+      case "pulse":
+        return "Mentions land here once it comes up";
+      case "drift":
+        return "Values land here as they get revised";
+      default:
+        return "Nothing here yet";
+    }
+  });
+
+  /** The good-news line for a tile whose emptiness is the desired outcome. */
+  readonly goodCopy = computed(() =>
+    this.data().kind === "promises"
+      ? "Nothing open — every commitment on this board is closed"
+      : "No open reminders",
+  );
+
+  /**
+   * A tile with nothing in it does not get to claim it is live, and neither does
+   * a collapsed strip — a blinking dot on an empty box is the board asserting
+   * activity it cannot show.
+   */
+  readonly isLive = computed(
+    () =>
+      LIVE_KINDS.has(this.data().kind) &&
+      this.bodyState() === "normal" &&
+      this.duplicateOf() === null,
+  );
+
+  /**
+   * The width actually rendered. Collapsed empties are uniform and narrow; a tile
+   * the user never resized takes its kind's natural width; an explicitly resized
+   * tile is left exactly alone.
+   */
+  readonly displaySpan = computed(() => {
+    if (this.duplicateOf() !== null) return EMPTY_SPAN;
+    if (this.bodyState() === "empty") return EMPTY_SPAN;
+    const stored = this.tile().span;
+    return stored === STORED_DEFAULT_SPAN ? DEFAULT_SPAN[this.data().kind] : stored;
+  });
 
   // ── narrowed views of the discriminated union ──────────────────────────────
   //
@@ -150,14 +341,25 @@ export class DashboardTileComponent {
   readonly isMissing = computed(() => this.data().kind === "missing");
   readonly isUnconfigured = computed(() => this.data().kind === "unconfigured");
 
-  /** Pulse: the tallest weekly bucket, so the bars can be scaled to it. */
-  readonly pulsePeak = computed(() => {
-    const p = this.pulse();
-    return p ? Math.max(1, ...p.weekly) : 1;
-  });
-
-  barHeight(value: number): number {
-    return Math.round((value / this.pulsePeak()) * 100);
+  /**
+   * Pulse, as a heat strip on a FIXED ladder — not bars scaled to the local peak.
+   *
+   * The bar chart this replaces lied twice. `min-height: 3px` drew a visible mark
+   * for a week with no mentions at all, so absence looked like activity; and
+   * scaling to `max(...weekly)` meant a peak of 1 rendered at full height, so a
+   * board with forty mentions a week was pixel-identical to one with a single
+   * mention. A fixed ladder is what makes two tiles — and two boards —
+   * comparable at a glance, which is the entire job of the mark.
+   *
+   * Level 0 is drawn as an empty well: the week EXISTS and had nothing, which is
+   * a different statement from "no data".
+   */
+  heatLevel(value: number): 0 | 1 | 2 | 3 | 4 {
+    if (value <= 0) return 0;
+    if (value <= 1) return 1;
+    if (value <= 3) return 2;
+    if (value <= 6) return 3;
+    return 4;
   }
 
   onSource(source: SourceRef | null): void {

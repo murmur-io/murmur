@@ -665,6 +665,20 @@ pub fn get_dashboard_sources(
     let _lifecycle = super::lifecycle_guard(state.inner());
     let tiles = state.db.list_dashboard_tiles(&id)?;
     let unlocked = super::unlocked_snapshot(state.inner())?;
+    dashboard_sources_inner(&state.db, tiles, &unlocked)
+}
+
+/// The scope rule itself, free of `AppState` so it can be tested directly.
+///
+/// Extracted 2026-08-04: this function DEFINES what a board-scoped Ask may read,
+/// and it had no Rust test at all — its only coverage was Playwright mocks, which
+/// assert the frontend's assumption about the answer rather than the answer.
+/// See `commands/tests/dashboard_source_scope_tests.rs`.
+pub(crate) fn dashboard_sources_inner(
+    db: &crate::storage::Db,
+    tiles: Vec<DashboardTile>,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<Vec<SourceRef>, AppError> {
     let mut out: Vec<SourceRef> = Vec::new();
     for tile in tiles {
         let Some(ref_id) = tile.ref_id.as_deref() else {
@@ -676,6 +690,10 @@ pub fn get_dashboard_sources(
             "document" => LinkKind::Document,
             // Derived tiles (drift/numbers/pulse/promises/person/reminders) are VIEWS over the
             // vault, not retrievable documents — they contribute no source of their own.
+            //
+            // This is deliberate and stays. What a derived tile SHOWS still has to reach the
+            // model, but it reaches it as a rendered brief, never as a `SourceRef`: that type's
+            // `kind` is a `LinkKind`, and a drift lane is not a retrievable document.
             _ => continue,
         };
         let candidate = SourceRef {
@@ -683,7 +701,7 @@ pub fn get_dashboard_sources(
             id: ref_id.to_string(),
         };
         // GATE: only a source that survives its own gated reader may enter the Ask scope.
-        if !source_is_visible(&state.db, &candidate, &unlocked)? {
+        if !source_is_visible(db, &candidate, unlocked)? {
             continue;
         }
         if !out.iter().any(|s| s.id == candidate.id && s.kind == kind) {
@@ -1213,3 +1231,7 @@ fn short_day(iso: &str) -> String {
 #[cfg(test)]
 #[path = "tests/dashboard_cmd_tests.rs"]
 mod dashboard_cmd_tests;
+
+#[cfg(test)]
+#[path = "tests/dashboard_source_scope_tests.rs"]
+mod dashboard_source_scope_tests;
