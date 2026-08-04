@@ -6,6 +6,39 @@
   border-color: var(--border-strong);
 }
 
+/* Idle: nothing to review. The surface keeps its affordance but stops paying
+   for a frosted card, a kicker and an imperative heading. This is the whole
+   reason promoting it above the fold does not cost real estate. */
+.smart-card.is-strip {
+  gap: 0;
+  padding: var(--space-1) 0;
+  border: 0;
+  background: none;
+  backdrop-filter: none;
+}
+
+.smart-card.is-strip .smart-head {
+  justify-content: flex-start;
+}
+
+/* Compact error inside the strip: one row, no panel, no extra vertical box.
+   Above the body, a failure to fetch suggestions must not move the document. */
+.smart-card.is-strip .smart-error {
+  padding: 0;
+  border: 0;
+  background: none;
+  gap: var(--space-2);
+  font-size: 0.8125rem;
+}
+
+/* Flush the ghost button's own inline padding so the strip's text starts on the
+   same left edge as the sibling metadata affordances (+ Link, Add image) rather
+   than sitting a few pixels proud of them. */
+.smart-card.is-strip .smart-head .btn {
+  padding-left: 0;
+  padding-right: var(--space-2);
+}
+
 .smart-head,
 .smart-error,
 .suggestion-row,
