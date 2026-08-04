@@ -5,6 +5,11 @@
   display: contents;
 }
 
+// The teleported wrapper is a pass-through: its children are the fixed layers.
+.tp-overlay {
+  display: contents;
+}
+
 .scrim {
   position: fixed;
   inset: 0;
