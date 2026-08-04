@@ -93,8 +93,27 @@ pub struct TileRow {
 }
 
 /// The resolved payload of a tile, discriminated by `kind` on the wire.
+///
+/// BOTH rename attributes are load-bearing and they do different jobs. On an ENUM,
+/// `rename_all` renames the VARIANTS (`Meeting` → `"meeting"`, the `kind` tag the FE switches
+/// on); `rename_all_fields` renames the FIELDS INSIDE each variant. With only the first, this
+/// enum shipped `{"kind":"meeting","started_at":…,"duration_s":…,"has_audio":…}` while
+/// `models.ts` declares `startedAt` / `durationS` / `hasAudio` — so every one of them read
+/// `undefined` in the browser, silently, with both sides "typed".
+///
+/// The damage was not cosmetic and it did not surface here. `DashboardTileComponent.formatDate`
+/// falls back to `iso.slice(0, 10)` when `Date.parse` returns NaN, so an `undefined` timestamp
+/// THREW — and an exception from a template binding aborts the rest of that change-detection
+/// pass, blanking every binding after it, including the Add-a-tile palette rendered later in the
+/// same pass by `app-shell`. Boards with only note tiles were unaffected (note timestamps merely
+/// read "recently" forever), which is why it presented as "I can't add a tile once I have more
+/// than two" and cost six fixes aimed at the palette's positioning.
+///
+/// Pinned by `every_tile_payload_field_is_camel_case_on_the_wire` in `dashboard_cmd_tests` —
+/// against the real serializer, because the e2e fixtures are written from the TS type and so can
+/// only ever assert the shape they already assume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum TileData {
     /// The tile's source exists but is sealed and not session-unlocked. Carries NOTHING.
     Locked,
