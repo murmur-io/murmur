@@ -16,6 +16,21 @@
 // The dialog IS the panel; its ::backdrop is the scrim. Both are painted by the
 // browser in the TOP LAYER, so there is no z-index, no fixed positioning and no
 // containing block left to get wrong.
+.palette[open] {
+  // BELT AND BRACES. `showModal()` promotes the dialog into the top layer and the
+  // browser then positions it; but if that call is ever refused (it throws when the
+  // element is not connected, and a webview may differ), a plain `open` dialog is
+  // `position: absolute` and would sit wherever the flow left it — invisible in
+  // practice. Pinning it here means the panel is on screen either way: with
+  // showModal() the top layer wins and this is harmless; without it, this is what
+  // makes it visible. The symptom that forced this: the trigger flipped to "Close"
+  // (so the state was right) while nothing appeared.
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay, 2000);
+  margin: auto;
+}
+
 .palette {
   display: flex;
   flex-direction: column;

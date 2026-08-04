@@ -159,10 +159,34 @@ export class TilePaletteComponent {
    * one-shot, and the injector is required because this runs from a field
    * initialiser's effect rather than a constructor body.
    */
-  private readonly _open = afterNextRender(() => {
+  private readonly _open = afterNextRender(() => this.reveal());
+
+  /**
+   * Show the dialog, preferring the modal (top-layer) form but never depending on
+   * it.
+   *
+   * `showModal()` is the good path: it promotes the element into the top layer,
+   * outside every stacking context and containing block. But it THROWS when the
+   * element is not connected, and a webview may refuse it for its own reasons —
+   * and when it does, a `<dialog>` that never opened stays `display: none`. That
+   * is exactly the symptom reported: the trigger flipped to "Close" (state was
+   * right) while nothing appeared on screen.
+   *
+   * So: try modal, verify with `:modal`, and fall back to a plain `open` dialog,
+   * which the stylesheet pins to the viewport. The panel is on screen either way.
+   */
+  private reveal(): void {
     const el = this.dlg()?.nativeElement;
-    if (el && !el.open) el.showModal();
-  });
+    if (!el || el.open) return;
+    try {
+      el.showModal();
+    } catch {
+      // fall through to the non-modal path below
+    }
+    if (!el.open || !el.matches(":modal")) {
+      el.open = true;
+    }
+  }
 
   readonly dismiss = output<void>();
   readonly choose = output<TileChoice>();
