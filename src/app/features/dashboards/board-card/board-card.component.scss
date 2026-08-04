@@ -53,7 +53,11 @@
   position: relative;
   display: grid;
   grid-template-columns: repeat(12, 1fr);
-  grid-auto-rows: 26px;
+  // `1fr` rows STRETCH the miniature to fill its box. With fixed-height rows a
+  // two-row board left the bottom half of every card empty, which read as an
+  // unfinished render rather than as a small board.
+  grid-auto-rows: minmax(0, 1fr);
+  align-content: stretch;
   gap: 5px;
   height: 128px;
   padding: var(--space-3);
@@ -64,7 +68,6 @@
 
   .big & {
     height: 168px;
-    grid-auto-rows: 36px;
   }
 }
 

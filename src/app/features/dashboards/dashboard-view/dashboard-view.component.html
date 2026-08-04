@@ -12,6 +12,9 @@
   <button type="button" class="btn btn-ghost" (click)="toggleEditing()">
     {{ editing() ? "Done" : "Arrange" }}
   </button>
+  @if (editing()) {
+    <span class="arrange-hint">drag tiles to reorder · ‹ › to resize</span>
+  }
   <button type="button" class="btn btn-primary" (click)="openPalette()">
     <mur-icon icon="plus" /> Add tile
   </button>
@@ -43,6 +46,13 @@
           [tile]="tile"
           [cited]="citationFor(tile)"
           [editing]="editing()"
+          [dragging]="draggingId() === tile.id"
+          [dropTarget]="dropTargetId() === tile.id"
+          [attr.draggable]="editing() ? 'true' : null"
+          (dragstart)="onDragStart(tile, $event)"
+          (dragover)="onDragOver(tile, $event)"
+          (drop)="onDrop(tile, $event)"
+          (dragend)="onDragEnd()"
           (remove)="removeTile(tile)"
           (widen)="widen(tile)"
           (narrow)="narrow(tile)"

@@ -10,6 +10,35 @@
   align-items: center;
   gap: var(--space-2);
 }
+
+/* Dashboards section — boards are offered ABOVE the note/meeting rows because a
+   board is the user's own declaration of scope, which beats a search guess. */
+.sp-group {
+  margin: var(--space-2) var(--space-3) var(--space-1);
+  color: var(--text-muted);
+  font-size: 0.66rem;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sp-board {
+  .sp-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-weight: 560;
+  }
+
+  .sp-kind {
+    color: var(--accent-hover);
+  }
+}
+
+.sp-emoji {
+  font-size: 0.95rem;
+  line-height: 1;
+}
 /* While the popover is open the chips + trigger must stay clickable ABOVE the
    full-viewport scrim (removing a just-added source, re-toggling) — raise the
    in-flow chip strip over the scrim (z-index 40) without leaving normal flow. */

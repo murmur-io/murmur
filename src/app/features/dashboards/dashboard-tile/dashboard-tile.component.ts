@@ -62,6 +62,9 @@ const LIVE_KINDS = new Set<TileData["kind"]>([
     "[style.--tile-span]": "tile().span",
     "[class.cited]": "cited() > 0",
     "[class.is-locked]": "tile().data.kind === 'locked'",
+    "[class.is-arranging]": "editing()",
+    "[class.is-dragging]": "dragging()",
+    "[class.is-drop-target]": "dropTarget()",
   },
 })
 export class DashboardTileComponent {
@@ -70,6 +73,10 @@ export class DashboardTileComponent {
   readonly cited = input(0);
   /** True while the board is in layout mode (resize / remove affordances shown). */
   readonly editing = input(false);
+  /** This tile is the one being dragged. */
+  readonly dragging = input(false);
+  /** This tile is the current drop target. */
+  readonly dropTarget = input(false);
 
   readonly remove = output<void>();
   readonly widen = output<void>();
