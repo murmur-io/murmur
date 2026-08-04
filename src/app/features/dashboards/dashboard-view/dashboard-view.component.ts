@@ -112,6 +112,48 @@ export class DashboardViewComponent {
     () => this.tiles().filter((t) => t.data.kind === "locked").length,
   );
 
+  /**
+   * Tile id → the heading of the EARLIER tile it duplicates.
+   *
+   * Two tiles that resolve to the same payload render the same rows twice, which
+   * is what made a nine-tile board read as a duplicated one. The cause is a
+   * missing parameter rather than user error — `tile-palette` never writes
+   * `config.owner`, so every Promise ledger resolves to the same global list —
+   * so the second tile becomes a back-reference and the fix costs no backend.
+   *
+   * Keyed on the RESOLVED payload, not on `(kind, refId, config)`: two tiles can
+   * be configured differently and still resolve identically, and it is the
+   * on-screen repetition that the user sees.
+   */
+  readonly duplicates = computed<ReadonlyMap<string, string>>(() => {
+    const seen = new Map<string, string>();
+    const out = new Map<string, string>();
+    for (const t of this.tiles()) {
+      // A sealed tile carries no fields at all, so every sealed tile would look
+      // like every other one. Redaction is not duplication — never collapse them.
+      if (t.data.kind === "locked") continue;
+      const key = JSON.stringify(t.data);
+      const first = seen.get(key);
+      if (first === undefined) seen.set(key, this.headingOf(t));
+      else out.set(t.id, first);
+    }
+    return out;
+  });
+
+  duplicateOf(tile: ResolvedTile): string | null {
+    return this.duplicates().get(tile.id) ?? null;
+  }
+
+  /** The label a back-reference points at — the user-visible name of the original. */
+  private headingOf(tile: ResolvedTile): string {
+    if (tile.title && tile.title.trim()) return tile.title.trim();
+    const d = tile.data;
+    if (d.kind === "note" || d.kind === "meeting" || d.kind === "document") return d.title;
+    if (d.kind === "person") return d.name;
+    if (d.kind === "promises") return d.owner ? `Promises · ${d.owner}` : "Promises";
+    return d.kind;
+  }
+
   /** Owned by the root service — the palette itself is rendered by `app-shell`. */
   readonly paletteOpen = this.palette.open;
   readonly editing = signal(false);

@@ -139,7 +139,9 @@ test("Dashboards: a SEALED tile leaks nothing — not even the title the user ty
 
   const sealed = page.locator("app-dashboard-tile.is-locked");
   await expect(sealed).toHaveCount(1);
-  await expect(sealed).toContainText("Sealed folder");
+  // Copy tightened 2026-08-04 to tie the lock model to the board's thesis: a sealed
+  // tile is not merely locked, it is OUT OF SCOPE for the board's Ask.
+  await expect(sealed).toContainText("Sealed — not in scope");
   await expect(sealed.locator(".tile-title")).toHaveText("🔒 Locked");
 
   // The whole page must not contain the sealed title anywhere — heading, DOM
@@ -195,7 +197,11 @@ test("Dashboards: an entity tile whose entity went invisible keeps no stored nam
   await page.goto("/dashboards/b-atlas");
   await expect(page.locator("app-dashboard-tile")).toHaveCount(1);
   await expect(page.locator("app-dashboard-tile .tile-title")).not.toContainText("Dana");
-  await expect(page.getByText(/Nothing has moved here yet/)).toBeVisible();
+  // A drift lane with no rows never had data, so it collapses to a strip rather
+  // than reserving a full card for an apology (2026-08-04 density pass). The
+  // leak assertion above is the point of this test and is unchanged.
+  await expect(page.locator("app-dashboard-tile")).toHaveClass(/is-empty/);
+  await expect(page.getByText(/Values land here as they get revised/)).toBeVisible();
 });
 
 test("Dashboards: a withheld Living answer shows why, and not the cached text", async ({

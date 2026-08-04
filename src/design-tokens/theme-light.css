@@ -23,6 +23,8 @@
   --text-primary: #17171f;
   --text-secondary: #55555f;
   --text-muted: #86868f;
+  --text-tertiary: #6e6e78; /* 4.84:1 on the light tile surface */
+  --hatch-stripe: rgba(18, 18, 40, 0.055);
   --accent-soft: rgba(110, 118, 255, 0.13);
   --border: rgba(18, 18, 40, 0.12);
   --border-strong: rgba(18, 18, 40, 0.20);
@@ -86,6 +88,8 @@
     --text-primary: #17171f;
     --text-secondary: #55555f;
     --text-muted: #86868f;
+    --text-tertiary: #6e6e78;
+    --hatch-stripe: rgba(18, 18, 40, 0.055);
     --accent-soft: rgba(110, 118, 255, 0.13);
     --border: rgba(18, 18, 40, 0.12);
     --border-strong: rgba(18, 18, 40, 0.20);
