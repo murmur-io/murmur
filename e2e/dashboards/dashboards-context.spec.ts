@@ -202,3 +202,48 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   await palette.locator(".node").first().click();
   await expect(palette.getByRole("button", { name: /All tiles/ })).toBeVisible();
 });
+
+test("Dashboards: the palette still shows when showModal() is refused", async ({ page }) => {
+  // THE REPORTED FAILURE, reproduced. The trigger flipped to "Close" — so the click
+  // landed and the state was right — while nothing appeared on screen. That is what
+  // a <dialog> looks like when showModal() throws: it never opens, so it stays
+  // display:none. Here showModal is forced to throw, and the palette must still be
+  // usable via the plain `open` fallback that the stylesheet pins to the viewport.
+  await page.addInitScript(() => {
+    if (window.HTMLDialogElement) {
+      HTMLDialogElement.prototype.showModal = function () {
+        throw new Error("simulated: showModal refused");
+      };
+    }
+  });
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: { ...BOARDS[0], tiles: [] },
+      get_dashboard_sources: [],
+      list_link_candidates: [],
+      get_graph: { nodes: [], edges: [], hasHidden: false },
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await page.getByRole("button", { name: "Add tile" }).click();
+
+  const palette = page.getByRole("dialog", { name: "Add a tile" });
+  await expect(palette, "a refused showModal must not leave the palette hidden").toBeVisible();
+  expect(await palette.locator(".node").count()).toBe(10);
+
+  // On screen, and hit-testable — not merely present in the DOM.
+  const box = await palette.boundingBox();
+  const viewport = page.viewportSize();
+  expect(box!.y).toBeGreaterThanOrEqual(0);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height + 1);
+  const hit = await page.evaluate(() => {
+    const el = document.querySelector("dialog.palette")!;
+    const r = el.getBoundingClientRect();
+    return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+  });
+  expect(hit, "the fallback palette must be clickable, not covered").toBe(true);
+});
