@@ -50,6 +50,7 @@
         <app-dashboard-tile
           [tile]="tile"
           [cited]="citationFor(tile)"
+          [duplicateOf]="duplicateOf(tile)"
           [editing]="editing()"
           [dragging]="draggingId() === tile.id"
           [dropTarget]="dropTargetId() === tile.id"
