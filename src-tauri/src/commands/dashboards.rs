@@ -794,12 +794,20 @@ pub(crate) fn resolve_tile(
             })
         }
         "reminders" => {
-            // Reminders are the user's OWN data (independent of any meeting), and the store
-            // already drops sealed source anchors. Show the soonest open ones.
+            // Reminders are the user's OWN data, so a reminder with no source anchor always
+            // shows. But `list_stored_reminders` is UNGATED (it takes no `unlocked` set and
+            // applies no `visibility_clause`) — an earlier comment here claimed the store drops
+            // sealed anchors, and that was simply false.
+            //
+            // That mattered little while this tile only rendered on screen; it matters now that
+            // a board is readable by agents (local MCP and the cloud-capable Ask loop). A
+            // "smart" reminder's TITLE is authored from meeting content, so a reminder whose
+            // every anchor points at a source the session cannot read is withheld here.
             let mut rows: Vec<(i64, TileRow)> = db
                 .list_stored_reminders()?
                 .into_iter()
                 .filter(|r| matches!(r.state, crate::storage::models::ReminderState::Active))
+                .filter(|r| reminder_provenance_is_readable(db, r, unlocked))
                 .map(|r| {
                     // Due in the past ⇒ "due" (needs attention), else "open".
                     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -826,9 +834,17 @@ pub(crate) fn resolve_tile(
             // The bitemporal fact history for the entity, already gated by `list_facts_visible`.
             let facts = db.list_facts_visible(&ref_id, unlocked)?;
             if facts.is_empty() {
+                let entity = entity_name(db, &ref_id, unlocked)?;
                 return Ok(TileData::Drift {
-                    entity: entity_name(db, &ref_id, unlocked)?,
-                    predicate: cfg.predicate.unwrap_or_default(),
+                    // A hidden entity emits NO stored predicate either. Nothing writes
+                    // `config.predicate` today, but the day a UI lets a user pin one chosen from
+                    // an entity's facts, echoing it back for a sealed entity would be a leak.
+                    predicate: if entity == ENTITY_HIDDEN {
+                        String::new()
+                    } else {
+                        cfg.predicate.unwrap_or_default()
+                    },
+                    entity,
                     rows: vec![],
                 });
             }
@@ -1079,6 +1095,39 @@ pub(crate) fn render_tile_for_agent(tile: &DashboardTile, data: &TileData) -> St
             }
         }
     }
+}
+
+/// Is a reminder's PROVENANCE readable in this session?
+///
+/// `true` when it has no anchors at all (a hand-written reminder is the user's own data), or when
+/// at least one anchor still resolves through its gated reader. Withholding a reminder whose every
+/// anchor is sealed is what stops an agent reading a title that was authored from sealed content.
+fn reminder_provenance_is_readable(
+    db: &crate::storage::Db,
+    reminder: &crate::storage::models::StoredReminder,
+    unlocked: &std::collections::HashSet<String>,
+) -> bool {
+    if reminder.sources.is_empty() {
+        return true;
+    }
+    reminder.sources.iter().any(|anchor| {
+        let kind = match anchor.kind.as_str() {
+            "meeting" => LinkKind::Meeting,
+            "note" => LinkKind::Note,
+            "document" => LinkKind::Document,
+            // An anchor kind we do not understand cannot be proven readable ⇒ it does not count.
+            _ => return false,
+        };
+        source_is_visible(
+            db,
+            &SourceRef {
+                kind,
+                id: anchor.id.clone(),
+            },
+            unlocked,
+        )
+        .unwrap_or(false)
+    })
 }
 
 /// The placeholder an entity-anchored tile shows when its entity is not currently visible. Also
