@@ -232,6 +232,10 @@ fn tool_label(call: &ToolCall) -> &'static str {
         // labels keep the shared transport enum compile-safe without advertising either to a model.
         ToolCall::ListEntities { .. } => "Entities",
         ToolCall::ListNoteFolders => "Note folders",
+        // Dashboards — the user's own composed boards. `ListDashboards` is metadata; `GetDashboard`
+        // resolves each tile through the gated resolver, so it labels like any other vault read.
+        ToolCall::ListDashboards => "Dashboards",
+        ToolCall::GetDashboard { .. } => "Dashboard",
         // Brain v3 PR-6 — knowledge diff / decision ledger (explicit tool; label for completeness).
         ToolCall::KnowledgeDiff { .. } => "Knowledge diff",
         ToolCall::GetOpenCommitments { .. } => "Open commitments",

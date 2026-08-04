@@ -110,7 +110,12 @@ impl AssistantScope {
         ) {
             return false;
         }
-        const VAULT_READS: [&str; 9] = [
+        const VAULT_READS: [&str; 11] = [
+            // Dashboards: `list_dashboards` is metadata-only; `get_dashboard` resolves each tile
+            // through the gated readers, so it is exactly the class of `get_meeting` — an owned
+            // vault read that a sealed folder redacts.
+            "list_dashboards",
+            "get_dashboard",
             "search_meetings",
             "search_semantic",
             "get_meeting",
@@ -259,6 +264,14 @@ pub enum ToolCall {
     /// Local-MCP-only discovery of visible note folders, visible row counts, and typed columns.
     /// Intentionally absent from [`tool_specs`] and [`GatedToolExecutor`].
     ListNoteFolders,
+    /// The user's DASHBOARDS — boards they composed by hand. Metadata only (title, tile count,
+    /// tile kinds): no board reads a source here, so this carries no gated content and is safe at
+    /// every scope. It exists so an agent can DISCOVER the boards before scoping to one.
+    ListDashboards,
+    /// ONE dashboard, every tile resolved through the SAME gated resolver the UI uses
+    /// (`commands::dashboards::resolve_tile`). A sealed source yields a redacted tile, exactly as
+    /// on screen — a board is never a back door.
+    GetDashboard { dashboard_id: String },
     /// LOCAL-MCP-ONLY knowledge diff / decision ledger for one entity: what changed between two
     /// instants (`from`/`to` ISO-8601), the chronological supersession ledger, and a separate,
     /// explicitly-HISTORICAL read-time context from Decisions / Risks / Open Questions sections in
@@ -385,6 +398,33 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "includeNote": { "type": "boolean", "description": "Include the note on the first page (default true)." }
                 },
                 "required": ["meetingId"]
+            }),
+            write: false,
+        },
+        ToolSpec {
+            name: "list_dashboards".into(),
+            description: "List the user's DASHBOARDS — boards they composed by hand out of \
+                          meetings, notes, documents, people and derived views. Returns titles + \
+                          ids only. When a question is about a project/deal/topic the user tracks, \
+                          check here first: a board is the user's OWN declaration of what belongs \
+                          together, which is better scope than a search guess."
+                .into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_dashboard".into(),
+            description: "Read one dashboard by id: every tile, already resolved — the notes and \
+                          recordings on it, who is on it, what values drifted, what was promised \
+                          and whether it landed. Sealed sources come back redacted. Use it to \
+                          answer from exactly the context the user curated."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "dashboardId": { "type": "string", "description": "The board id from list_dashboards." }
+                },
+                "required": ["dashboardId"]
             }),
             write: false,
         },
@@ -1077,6 +1117,64 @@ pub fn execute_tool(
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))
+        }
+        ToolCall::ListDashboards => {
+            let boards = db
+                .list_dashboards()
+                .map_err(|e| AppError::Storage(format!("dashboard list failed: {e}")))?;
+            if boards.is_empty() {
+                return Ok("No dashboards yet.".to_string());
+            }
+            let kinds = db
+                .dashboard_tile_kinds()
+                .map_err(|e| AppError::Storage(format!("dashboard tile kinds failed: {e}")))?;
+            Ok(boards
+                .iter()
+                .map(|b| {
+                    let mut tile_kinds: Vec<&str> = kinds
+                        .iter()
+                        .filter(|(board_id, _, _)| board_id == &b.id)
+                        .map(|(_, kind, _)| kind.as_str())
+                        .collect();
+                    tile_kinds.sort_unstable();
+                    tile_kinds.dedup();
+                    format!(
+                        "- {} · id:{} · tiles:{} · kinds:{}",
+                        b.title,
+                        b.id,
+                        kinds.iter().filter(|(bid, _, _)| bid == &b.id).count(),
+                        if tile_kinds.is_empty() {
+                            "none".to_string()
+                        } else {
+                            tile_kinds.join(",")
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        ToolCall::GetDashboard { dashboard_id } => {
+            let Some(board) = db
+                .get_dashboard(dashboard_id)
+                .map_err(|e| AppError::Storage(format!("dashboard read failed: {e}")))?
+            else {
+                return Ok(format!("No dashboard with id {dashboard_id}."));
+            };
+            let tiles = db
+                .list_dashboard_tiles(dashboard_id)
+                .map_err(|e| AppError::Storage(format!("dashboard tiles failed: {e}")))?;
+            let mut out = format!("# {} (dashboard)\n", board.title);
+            if tiles.is_empty() {
+                out.push_str("(no tiles yet)");
+                return Ok(out);
+            }
+            for tile in &tiles {
+                // The SAME gated resolver the UI uses. A sealed source renders redacted here too.
+                let data = crate::commands::resolve_tile(db, tile, unlocked)?;
+                out.push_str(&crate::commands::render_tile_for_agent(tile, &data));
+                out.push('\n');
+            }
+            Ok(out.trim_end().to_string())
         }
         ToolCall::ListNoteFolders => {
             let folders = db
@@ -3212,6 +3310,22 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             ));
         }
         match name {
+            // Dashboards — the user's own curated scope. Same gated executor, same visibility
+            // snapshot as every other vault read here.
+            "list_dashboards" => execute_tool(
+                &ToolCall::ListDashboards,
+                self.db,
+                &unlocked,
+                self.config,
+            ),
+            "get_dashboard" => execute_tool(
+                &ToolCall::GetDashboard {
+                    dashboard_id: s("dashboardId"),
+                },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
             "search_meetings" => execute_tool(
                 &ToolCall::SearchMeetings { query: s("query") },
                 self.db,
