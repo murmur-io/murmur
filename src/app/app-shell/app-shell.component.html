@@ -381,3 +381,15 @@
 
 <!-- The one opaque app-wide Murmur reminder composer host. -->
 <app-reminder-composer />
+
+<!-- Add-a-tile palette (Dashboards). Hosted HERE, not by the board, for the same
+     reason as every overlay above it: a `position: fixed` layer whose only
+     ancestors are <body>/<html> cannot be pushed, clipped, covered or offset by
+     anything a feature view does. The board only flips the service's signal.
+     See TilePaletteService for the five fixes that bought this. -->
+@if (tilePalette.open()) {
+  <app-tile-palette
+    (dismiss)="tilePalette.dismiss()"
+    (choose)="tilePalette.choose($event)"
+  />
+}
