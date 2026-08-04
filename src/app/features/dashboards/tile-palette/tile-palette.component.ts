@@ -11,17 +11,13 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
-import type { NoteCitation, TileConfig, TileKind } from "../../../core/models";
+import type { TileChoice } from "../../../services/tile-palette.service";
+import type { NoteCitation, TileKind } from "../../../core/models";
 
 /** What a chosen tile kind needs before it can be added. */
 type SourceMode = "none" | "link" | "entity" | "question";
 
-export interface TileChoice {
-  kind: TileKind;
-  refId?: string;
-  title?: string;
-  config?: TileConfig;
-}
+export type { TileChoice };
 
 interface NodeType {
   kind: TileKind;
@@ -128,8 +124,20 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
 };
 
 /**
- * The "Add a tile" palette — a FLOATING modal, so it is OPAQUE
+ * The "Add a tile" palette — a FLOATING overlay, so it is OPAQUE
  * (`--surface-overlay`, `backdrop-filter: none`) per angular-zoneless.md T3.
+ *
+ * PRESENTATION IS PURELY DECLARATIVE, and that is deliberate. The component is
+ * rendered by `app-shell` behind `@if (tilePalette.open())` (see
+ * `TilePaletteService` for why the shell and not the board), and its own template
+ * is a plain `position: fixed` layer. There is no imperative "reveal" step at
+ * all — no `showModal()`, no `matches(":modal")`, no teleport, no top layer.
+ *
+ * That is the lesson of angular-zoneless.md T5, paid for five times over: every
+ * one of those is a modern-ish API that the engine the tests run supports and the
+ * engine we ship may not, and each failure looked identical from outside — the
+ * trigger flipping to "Close" while nothing appeared. A template `@if` plus CSS
+ * has nothing left that can throw, be refused, or resolve differently.
  *
  * Source pickers reuse the SHIPPED gated readers: `list_link_candidates` for
  * notes/recordings/documents and `get_graph` for entities. Nothing sealed can
@@ -143,9 +151,11 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
   templateUrl: "./tile-palette.component.html",
   styleUrl: "./tile-palette.component.scss",
   host: {
-    // Escape must dismiss the modal no matter where focus currently sits. A
-    // keydown bound to the dialog element only fires when the dialog itself (or
-    // a descendant) has focus, which is not guaranteed the moment it opens.
+    // Escape is handled on the DOCUMENT rather than on the overlay, because the
+    // catalogue step focuses nothing — a `(keydown.escape)` bound to the overlay
+    // would only fire once something inside it happened to hold focus. The
+    // component only exists while the palette is open, so the listener cannot
+    // outlive it.
     "(document:keydown)": "onKeydown($event)",
   },
 })
@@ -270,17 +280,16 @@ export class TilePaletteComponent {
     this.choose.emit({ kind: type.kind, title: q, config: { question: q } });
   }
 
-  onBackdrop(): void {
-    this.dismiss.emit();
-  }
-
-  /** Escape closes the palette (a modal must always be dismissable). */
+  /**
+   * Escape on the SECOND step goes back to the catalogue instead of closing the
+   * whole palette — losing the whole overlay because you changed your mind about
+   * which KIND of tile you wanted is a needless step backwards.
+   */
   onKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape") {
-      event.stopPropagation();
-      if (this.selected()) this.back();
-      else this.dismiss.emit();
-    }
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    if (this.selected()) this.back();
+    else this.dismiss.emit();
   }
 
   registerField(el: ElementRef<HTMLInputElement> | undefined): void {
