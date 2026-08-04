@@ -178,4 +178,20 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
 
   // The catalogue is actually populated — an empty palette is the same dead end.
   expect(await palette.locator(".node").count()).toBe(10);
+
+  // HIT TEST: the palette's centre must actually BE the palette. "Rendered, on
+  // screen, but covered by something" looks identical to the user to "did not
+  // open", and neither a visibility check nor a bounding box catches it.
+  const hit = await page.evaluate(() => {
+    const el = document.querySelector(".palette");
+    if (!el) return "no-palette";
+    const r = el.getBoundingClientRect();
+    const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+    return el.contains(top) ? "palette" : (top?.className?.toString() ?? "unknown");
+  });
+  expect(hit, "the palette centre must be hit-testable, not covered").toBe("palette");
+
+  // And a catalogue entry must be clickable end to end (it advances to step 2).
+  await palette.locator(".node").first().click();
+  await expect(palette.getByRole("button", { name: /All tiles/ })).toBeVisible();
 });
