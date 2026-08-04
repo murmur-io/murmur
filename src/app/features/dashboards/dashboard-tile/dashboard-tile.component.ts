@@ -164,14 +164,44 @@ export class DashboardTileComponent {
     if (source) this.openSource.emit(source);
   }
 
-  formatDuration(seconds: number): string {
+  /** Same contract as `formatDate`: a template-reachable formatter degrades, never throws. */
+  formatDuration(seconds: number | null | undefined): string {
+    if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "—";
     const m = Math.round(seconds / 60);
     if (m < 60) return `${m} min`;
     const h = Math.floor(m / 60);
     return `${h}h ${m % 60}m`;
   }
 
-  formatDate(iso: string): string {
+  /** "2h ago" / "yesterday" / "12 Jun" from an epoch-millis timestamp. */
+  relative(ms: number): string {
+    if (!ms) return "recently";
+    const mins = Math.max(0, Math.round((Date.now() - ms) / 60000));
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.round(hours / 24);
+    if (days === 1) return "yesterday";
+    if (days < 30) return `${days}d ago`;
+    return new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  }
+
+  /**
+   * NEVER THROWS, and that is the point — this method used to.
+   *
+   * It read `iso.slice(0, 10)` on the NaN branch, so a missing timestamp raised a TypeError from
+   * a template binding. Angular aborts the REST of a change-detection pass when a binding throws,
+   * so one bad tile blanked every binding after it — including, three components away, the
+   * Add-a-tile palette that `app-shell` renders later in the same pass. It presented as "the
+   * palette won't open once the board has more than two tiles" and took six fixes aimed at the
+   * wrong thing.
+   *
+   * The cause (a serde field-naming mismatch) is fixed at the seam and pinned by a Rust test. This
+   * guard is the second half: a formatter reachable from a template must degrade to a string on
+   * ANY input, so a future data glitch costs one wrong-looking cell instead of half the UI.
+   */
+  formatDate(iso: string | null | undefined): string {
+    if (typeof iso !== "string" || iso === "") return "—";
     const t = Date.parse(iso);
     if (Number.isNaN(t)) return iso.slice(0, 10);
     return new Date(t).toLocaleDateString(undefined, {

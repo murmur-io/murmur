@@ -60,18 +60,25 @@
 
   @if (note(); as n) {
     <button type="button" class="body-link" (click)="onSource({ kind: 'note', id: n.id })">
-      <span class="snippet">{{ n.snippet || "Empty note." }}</span>
+      @if (n.snippet) {
+        <span class="snippet">{{ n.snippet }}</span>
+      } @else {
+        <span class="snippet is-empty">This note has no text yet.</span>
+      }
+      <span class="row-meta">edited {{ relative(n.updatedAt) }}</span>
     </button>
   }
 
   @if (meeting(); as m) {
     <button type="button" class="body-link" (click)="onSource({ kind: 'meeting', id: m.id })">
       <span class="meta-line">
-        {{ formatDate(m.startedAt) }} · {{ formatDuration(m.durationS) }}
+        <span class="meeting-when">{{ formatDate(m.startedAt) }}</span>
+        <span class="meeting-dur">{{ formatDuration(m.durationS) }}</span>
         @if (m.hasAudio) {
-          <span class="audio-chip">audio</span>
+          <span class="audio-chip">▶ audio</span>
         }
       </span>
+      <span class="row-meta">open the recording to read or hear it</span>
     </button>
   }
 
