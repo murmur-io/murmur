@@ -41,6 +41,7 @@
               The question this tile keeps answering
             </label>
             <input
+              #searchField
               id="tile-question"
               class="field"
               type="text"
@@ -62,6 +63,7 @@
         @default {
           <div class="search-row">
             <input
+              #searchField
               class="field"
               type="text"
               [placeholder]="type.mode === 'entity' ? 'Filter people & projects…' : 'Search your vault…'"
