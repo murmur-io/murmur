@@ -180,6 +180,69 @@ test("Dashboards: every tile header carries a per-kind mark", async ({ page }) =
   ).toHaveAttribute("data-kind", "note");
 });
 
+test("Dashboards: a failed Ask is a banner with a retry, not a grey bubble that looks like an answer", async ({
+  page,
+}) => {
+  // The exact failure from the 2026-08-04 report: `summarize/redact.rs::
+  // content_free_dispatch_error` collapses a provider failure into one sentence,
+  // and the board pushed it as `{role: "assistant"}` — so it rendered in the same
+  // bubble as a grounded conclusion, with nothing to retry.
+  await mockTauri(
+    page,
+    {
+      ask_vault: () => {
+        throw new Error(
+          "summarizer error: cloud provider response failed after protected dispatch; details omitted",
+        );
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [{ kind: "note", id: "n-1" }],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is late?");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+
+  const banner = page.locator(".thread .banner.is-danger");
+  await expect(banner).toBeVisible();
+  await expect(banner.getByRole("button", { name: /Try again/i })).toBeVisible();
+  // And it is NOT dressed as an answer.
+  await expect(page.locator(".thread .bubble:not(.me)")).toHaveCount(0);
+});
+
+test("Dashboards: an answer renders as markdown, not as literal asterisks", async ({ page }) => {
+  // `summarize/vault_chat.rs::build` DEMANDS markdown from the model, and the
+  // board rendered `{{ turn.text }}` with `white-space: pre-wrap`.
+  await mockTauri(
+    page,
+    {
+      ask_vault: () => ({
+        answer: "The **auth migration** is the risk.",
+        sources: [],
+        citations: [],
+      }),
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [{ kind: "note", id: "n-1" }],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is the risk?");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+
+  const answer = page.locator(".thread .bubble:not(.me)");
+  await expect(answer).toBeVisible();
+  await expect(answer.locator("strong")).toHaveText("auth migration");
+  await expect(answer).not.toContainText("**");
+});
+
 test("Dashboards: a duplicate tile renders as a back-reference, not a second copy", async ({
   page,
 }) => {

@@ -88,7 +88,24 @@
 
     <div class="thread">
       @for (turn of turns(); track $index) {
-        <div class="bubble" [class.me]="turn.role === 'user'">{{ turn.text }}</div>
+        @if (turn.role === "error") {
+          <!-- A failure is chrome, not a conclusion. It used to render in the same
+               grey bubble as a real answer, with nothing to retry. -->
+          <div class="banner is-danger" role="alert">
+            <span>{{ turn.text }}</span>
+            <button type="button" class="btn btn-ghost btn-sm" (click)="retry(turn)">
+              Try again
+            </button>
+          </div>
+        } @else if (turn.role === "user") {
+          <div class="bubble me">{{ turn.text }}</div>
+        } @else {
+          <!-- The prompt in `summarize/vault_chat.rs::build` DEMANDS markdown, so
+               rendering the answer as plain text printed `**` and `[[…]]` literally.
+               `app-markdown` also turns wikilinks into gated, clickable chips —
+               dashboards was the only AI surface in the app not using it. -->
+          <div class="bubble"><app-markdown [markdown]="turn.text" compact /></div>
+        }
       } @empty {
         <div class="suggestions">
           @for (s of suggestions; track s) {
