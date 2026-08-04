@@ -94,6 +94,21 @@ export class DashboardsService {
     if (id) await this.loadBoard(id);
   }
 
+  /**
+   * Apply a committed span locally — the backend already accepted it, so this is
+   * reconciliation, not an optimistic guess that could diverge.
+   */
+  private patchTileSpan(tileId: string, span: number): void {
+    this._board.update((board) => {
+      if (!board) return board;
+      const i = board.tiles.findIndex((t) => t.id === tileId);
+      if (i < 0 || board.tiles[i].span === span) return board;
+      const tiles = [...board.tiles];
+      tiles[i] = { ...tiles[i], span };
+      return { ...board, tiles };
+    });
+  }
+
   async create(
     title: string,
     emoji?: string,
@@ -166,7 +181,17 @@ export class DashboardsService {
         span: patch.span,
         config: patch.config ? JSON.stringify(patch.config) : undefined,
       });
-      await this.reloadOpenBoard();
+      // A SPAN-only change is pure layout: it cannot alter a single gated payload,
+      // so patch it in place instead of re-resolving the board. `get_dashboard`
+      // re-runs every tile's gated reader, and a Promise ledger costs a full-vault
+      // note scan — so one chevron click was paying for the whole board twice over,
+      // and a board with two ledgers paid for that scan twice again.
+      //
+      // Anything else (title, config) CAN change what resolves, so it still reloads.
+      const spanOnly =
+        patch.span !== undefined && patch.title === undefined && patch.config === undefined;
+      if (spanOnly) this.patchTileSpan(id, patch.span!);
+      else await this.reloadOpenBoard();
     } catch (e) {
       this._error.set(this.message(e));
     }
