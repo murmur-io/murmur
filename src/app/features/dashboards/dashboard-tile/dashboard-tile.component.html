@@ -1,0 +1,239 @@
+@if (cited() > 0) {
+  <span class="cite-n" aria-hidden="true">{{ cited() }}</span>
+}
+
+<header class="tile-head">
+  <div class="tile-titles">
+    <h3 class="tile-title">{{ heading() }}</h3>
+    <span class="tile-kind">{{ kindLabel() }}</span>
+  </div>
+
+  @if (isLive()) {
+    <span class="live-chip" title="Re-derives itself when someone says something new">
+      <span class="live-dot"></span>live
+    </span>
+  }
+
+  @if (editing()) {
+    <div class="tile-tools">
+      <button type="button" class="tool" (click)="narrow.emit()" aria-label="Make tile narrower">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><path d="M15 6l-6 6 6 6" /></svg>
+      </button>
+      <button type="button" class="tool" (click)="widen.emit()" aria-label="Make tile wider">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><path d="M9 6l6 6-6 6" /></svg>
+      </button>
+      <button type="button" class="tool danger" (click)="remove.emit()" aria-label="Remove tile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+      </button>
+    </div>
+  }
+</header>
+
+<div class="tile-body">
+  <!--
+    A sealed tile's payload is `{ kind: "locked" }` — there are literally no
+    fields to render. That is the lock-model contract, asserted backend-side.
+  -->
+  @if (isSealed()) {
+    <div class="sealed">
+      <span class="sealed-hatch" aria-hidden="true"></span>
+      <span class="sealed-copy">
+        <span class="sealed-glyph" aria-hidden="true">🔒</span>
+        Sealed folder — redacted here.
+        <small>Unlock the source to see this tile.</small>
+      </span>
+    </div>
+  }
+
+  @if (isMissing()) {
+    <p class="muted">
+      The source this tile pointed at is gone. Remove the tile, or add a new one.
+    </p>
+  }
+
+  @if (isUnconfigured()) {
+    <p class="muted">This tile has no source. Remove it and add it again from the palette.</p>
+  }
+
+  @if (note(); as n) {
+    <button type="button" class="body-link" (click)="onSource({ kind: 'note', id: n.id })">
+      <span class="snippet">{{ n.snippet || "Empty note." }}</span>
+    </button>
+  }
+
+  @if (meeting(); as m) {
+    <button type="button" class="body-link" (click)="onSource({ kind: 'meeting', id: m.id })">
+      <span class="meta-line">
+        {{ formatDate(m.startedAt) }} · {{ formatDuration(m.durationS) }}
+        @if (m.hasAudio) {
+          <span class="audio-chip">audio</span>
+        }
+      </span>
+    </button>
+  }
+
+  @if (document(); as d) {
+    <button type="button" class="body-link" (click)="onSource({ kind: 'document', id: d.id })">
+      <span class="snippet">{{ d.snippet || "No extractable text." }}</span>
+    </button>
+  }
+
+  @if (person(); as p) {
+    <dl class="stats">
+      <div class="stat">
+        <dt>meetings</dt>
+        <dd>{{ p.mentionCount }}</dd>
+      </div>
+      <div class="stat" [class.warn]="p.openCommitments > 0">
+        <dt>open promises</dt>
+        <dd>{{ p.openCommitments }}</dd>
+      </div>
+    </dl>
+  }
+
+  @if (pulse(); as pl) {
+    <div class="pulse">
+      <div class="pulse-bars" aria-hidden="true">
+        @for (w of pl.weekly; track $index) {
+          <span class="pulse-bar" [style.height.%]="barHeight(w)"></span>
+        }
+      </div>
+      <dl class="stats">
+        <div class="stat">
+          <dt>mentions · 12 wks</dt>
+          <dd>{{ pl.total }}</dd>
+        </div>
+        @if (pl.quietDays !== null) {
+          <div class="stat" [class.warn]="pl.quietDays >= 7">
+            <dt>quiet for</dt>
+            <dd>{{ pl.quietDays }}d</dd>
+          </div>
+        }
+      </dl>
+    </div>
+  }
+
+  @if (drift(); as dr) {
+    @if (dr.rows.length === 0) {
+      <p class="muted">Nothing has moved here yet — no superseded values recorded.</p>
+    } @else {
+      <ol class="drift">
+        @for (row of dr.rows; track $index) {
+          <li
+            class="drift-step"
+            [class.now]="row.status === 'now'"
+            [class.old]="row.status === 'old'"
+          >
+            <button
+              type="button"
+              class="row-link"
+              [disabled]="!row.source"
+              (click)="onSource(row.source)"
+            >
+              <span class="drift-value">{{ row.text }}</span>
+              @if (row.meta) {
+                <span class="drift-meta">{{ row.meta }}</span>
+              }
+            </button>
+          </li>
+        }
+      </ol>
+    }
+  }
+
+  @if (numbers(); as nu) {
+    @if (nu.rows.length === 0) {
+      <p class="muted">No figures recorded for this yet.</p>
+    } @else {
+      <div class="numbers">
+        @for (row of nu.rows; track $index) {
+          <button
+            type="button"
+            class="number"
+            [disabled]="!row.source"
+            (click)="onSource(row.source)"
+          >
+            <span class="number-value">{{ row.text }}</span>
+            <span class="number-key">{{ row.meta }}</span>
+            @if (row.status) {
+              <span class="number-was">{{ row.status }}</span>
+            }
+          </button>
+        }
+      </div>
+    }
+  }
+
+  @if (promises(); as pr) {
+    @if (pr.rows.length === 0) {
+      <p class="muted">Nothing open — every commitment on this board is closed.</p>
+    } @else {
+      <ul class="rows">
+        @for (row of pr.rows; track $index) {
+          <li class="row">
+            <button
+              type="button"
+              class="row-link"
+              [disabled]="!row.source"
+              (click)="onSource(row.source)"
+            >
+              <span class="row-text">{{ row.text }}</span>
+              @if (row.meta) {
+                <span class="row-meta">{{ row.meta }}</span>
+              }
+            </button>
+            @if (row.status) {
+              <span class="pill" [class]="'pill-' + row.status">{{ row.status }}</span>
+            }
+          </li>
+        }
+      </ul>
+    }
+  }
+
+  @if (reminders(); as rm) {
+    @if (rm.rows.length === 0) {
+      <p class="muted">No open reminders.</p>
+    } @else {
+      <ul class="rows">
+        @for (row of rm.rows; track $index) {
+          <li class="row">
+            <span class="row-static">
+              <span class="row-text">{{ row.text }}</span>
+              @if (row.meta) {
+                <span class="row-meta">{{ row.meta }}</span>
+              }
+            </span>
+            @if (row.status) {
+              <span class="pill" [class]="'pill-' + row.status">{{ row.status }}</span>
+            }
+          </li>
+        }
+      </ul>
+    }
+  }
+
+  @if (livingAnswer(); as la) {
+    @if (la.withheld) {
+      <p class="muted">
+        🔒 The saved answer is hidden — one of the sources it was built from is sealed.
+        Unlock it and re-answer.
+      </p>
+    } @else if (la.answer) {
+      <p class="answer">{{ la.answer }}</p>
+    } @else {
+      <p class="muted">Not answered yet — ask it once and the answer lives here.</p>
+    }
+    <div class="answer-foot">
+      @if (la.answeredAt) {
+        <span class="muted-small">answered {{ formatDate(la.answeredAt) }}</span>
+      }
+      <button type="button" class="btn btn-ghost btn-sm" (click)="refreshAnswer.emit()">
+        Re-answer
+      </button>
+    </div>
+  }
+</div>
