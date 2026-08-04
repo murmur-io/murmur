@@ -5,24 +5,32 @@
   display: contents;
 }
 
-// The teleported wrapper is a pass-through: its children are the fixed layers.
+// ONE fixed layer that fills the viewport and centres its child with grid.
+//
+// This replaces a `top:50% / left:50% / translate(-50%,-50%)` palette sitting beside
+// a SEPARATE fixed scrim. That shape depends on two things resolving correctly — the
+// fixed containing block, AND a percentage transform against the element's own box —
+// and it is the shape that failed in the packaged webview while working in Chromium.
+// `inset: 0` + `place-items: center` needs neither: the box IS the viewport and the
+// centring is plain layout, not a transform.
 .tp-overlay {
-  display: contents;
-}
-
-.scrim {
   position: fixed;
   inset: 0;
   z-index: var(--z-overlay, 2000);
+  display: grid;
+  place-items: center;
+  padding: var(--space-5);
+}
+
+.scrim {
+  position: absolute;
+  inset: 0;
   background: var(--scrim);
 }
 
 .palette {
-  position: fixed;
-  z-index: calc(var(--z-overlay, 2000) + 1);
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+  // In-flow inside the centring grid — no position/transform of its own to resolve.
+  position: relative;
   display: flex;
   flex-direction: column;
   width: min(880px, 92vw);
