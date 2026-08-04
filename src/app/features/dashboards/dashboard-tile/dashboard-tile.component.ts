@@ -171,6 +171,19 @@ export class DashboardTileComponent {
     return `${h}h ${m % 60}m`;
   }
 
+  /** "2h ago" / "yesterday" / "12 Jun" from an epoch-millis timestamp. */
+  relative(ms: number): string {
+    if (!ms) return "recently";
+    const mins = Math.max(0, Math.round((Date.now() - ms) / 60000));
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.round(hours / 24);
+    if (days === 1) return "yesterday";
+    if (days < 30) return `${days}d ago`;
+    return new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  }
+
   formatDate(iso: string): string {
     const t = Date.parse(iso);
     if (Number.isNaN(t)) return iso.slice(0, 10);

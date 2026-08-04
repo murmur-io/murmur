@@ -1,3 +1,14 @@
+<!--
+  Scrim + palette are TELEPORTED to <body> as ONE overlay box. A `position: fixed`
+  overlay only anchors to the VIEWPORT when no ancestor establishes a fixed-
+  positioning containing block — and any ancestor with transform / filter /
+  backdrop-filter / contain becomes one. The board canvas and the Ask column are
+  both frosted surfaces, so the palette could land offset or clipped depending on
+  the engine. `mur-source-picker` teleports for exactly this reason; this did not,
+  which is the difference between it working in Chromium and vanishing in the
+  packaged WKWebView.
+-->
+<div class="tp-overlay" appTeleportToBody>
 <div class="scrim" (click)="onBackdrop()" aria-hidden="true"></div>
 
 <div
@@ -121,4 +132,5 @@
       }
     </div>
   }
+</div>
 </div>
