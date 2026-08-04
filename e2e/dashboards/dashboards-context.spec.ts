@@ -215,7 +215,12 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height + 1);
 
   // The catalogue is actually populated — an empty palette is the same dead end.
-  expect(await palette.locator(".node").count()).toBe(10);
+  // Asserted as "several, including the ones we know are offered" rather than an
+  // exact count: the catalogue legitimately shrinks (three kinds were retired on
+  // 2026-08-04 because they structurally could not fire), and a magic number turns
+  // every such product decision into a false failure here.
+  expect(await palette.locator(".node").count()).toBeGreaterThanOrEqual(6);
+  await expect(palette.getByText("Promise ledger")).toBeVisible();
 
   // HIT TEST: the palette's centre must actually BE the palette. "Rendered, on
   // screen, but covered by something" looks identical to the user to "did not
@@ -275,7 +280,7 @@ test("Dashboards: the palette still shows on an engine without :modal or showMod
 
   const palette = page.getByRole("dialog", { name: "Add a tile" });
   await expect(palette, "a refused showModal must not leave the palette hidden").toBeVisible();
-  expect(await palette.locator(".node").count()).toBe(10);
+  expect(await palette.locator(".node").count()).toBeGreaterThanOrEqual(6);
 
   // On screen, and hit-testable — not merely present in the DOM.
   const box = await palette.boundingBox();
@@ -411,7 +416,7 @@ test("Dashboards: a tile with a malformed payload cannot blank the rest of the U
   expect(
     await palette.locator(".node").count(),
     "the palette's catalogue must render, not just its box",
-  ).toBe(10);
+  ).toBeGreaterThanOrEqual(6);
 
   // And nothing threw: a binding that throws is what caused the blanking in the first place.
   expect(errors, "no uncaught error may escape a template binding").toEqual([]);
