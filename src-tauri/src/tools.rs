@@ -1171,7 +1171,12 @@ pub fn execute_tool(
             for tile in &tiles {
                 // The SAME gated resolver the UI uses. A sealed source renders redacted here too.
                 let data = crate::commands::resolve_tile(db, tile, unlocked)?;
-                out.push_str(&crate::commands::render_tile_for_agent(tile, &data));
+                // Redact BEFORE rendering, exactly as `get_dashboard` does for the UI. The agent
+                // path calls `resolve_tile` directly, so without this the renderer would still see
+                // a withheld tile's stored `title`/`config` — and a legacy row (written by a build
+                // that copied the source's title) would hand a sealed source's name to an agent.
+                let tile = crate::commands::redact_tile_chrome(tile.clone(), &data);
+                out.push_str(&crate::commands::render_tile_for_agent(&tile, &data));
                 out.push('\n');
             }
             Ok(out.trim_end().to_string())
@@ -3669,6 +3674,100 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// THE AGENT-PATH LEAK ORACLE, end to end through `execute_tool`.
+    ///
+    /// The renderer is tested in isolation elsewhere, but the agent path calls `resolve_tile`
+    /// DIRECTLY — it does not go through the command layer — so the redaction has to be applied
+    /// here too. A legacy row (written by a build that copied the source's title into the tile)
+    /// plus a sealed folder is exactly the shape that would hand an agent a sealed source's name.
+    #[test]
+    fn get_dashboard_tool_redacts_a_sealed_tile_for_agents() {
+        use crate::storage::models::{Folder, MeetingStatus, NoteRecord};
+
+        let db = tmp_db();
+        db.insert_folder(&Folder {
+            id: "f-sealed".to_string(),
+            name: "Legal".to_string(),
+            path: "Legal".to_string(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-08-01T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_meeting(&crate::storage::models::Meeting {
+            id: "m-sealed".to_string(),
+            started_at: "2026-08-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Acme termination call".to_string()),
+            duration_s: 600,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: Some("f-sealed".to_string()),
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m-sealed".to_string(),
+            provider_id: "test".to_string(),
+            markdown: "they are not renewing".to_string(),
+            created_at: "2026-08-01T09:00:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_note_folder("m-sealed", Some("f-sealed")).unwrap();
+
+        db.insert_dashboard("b1", "Deals", None, None, "2026-08-03T10:00:00Z")
+            .unwrap();
+        // The tile carries a copied source title, as an older build would have written it.
+        db.insert_dashboard_tile(
+            "t1",
+            "b1",
+            "meeting",
+            Some("m-sealed"),
+            Some("Acme termination call"),
+            4,
+            None,
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let nothing_unlocked = HashSet::new();
+        let out = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &nothing_unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("Acme termination call") && !out.contains("not renewing"),
+            "a sealed tile must reach an agent redacted: {out}"
+        );
+        assert!(out.contains("sealed"), "and it must say so: {out}");
+
+        // CONTROL: session-unlock the folder and the SAME call returns the real content, so the
+        // assertion above is not passing merely because the tool returns nothing useful.
+        let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+        let out = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Acme termination call"),
+            "unlocking must restore the tile for agents too: {out}"
+        );
     }
 
     #[test]
