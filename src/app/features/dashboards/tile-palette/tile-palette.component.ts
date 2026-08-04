@@ -11,6 +11,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
+import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 import type { NoteCitation, TileConfig, TileKind } from "../../../core/models";
 
 /** What a chosen tile kind needs before it can be added. */
@@ -139,7 +140,7 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
 @Component({
   selector: "app-tile-palette",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurSpinnerComponent],
+  imports: [MurSpinnerComponent, TeleportToBodyDirective],
   templateUrl: "./tile-palette.component.html",
   styleUrl: "./tile-palette.component.scss",
   host: {

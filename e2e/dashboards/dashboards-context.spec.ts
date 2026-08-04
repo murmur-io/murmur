@@ -132,3 +132,50 @@ test("Dashboards: Arrange mode makes tiles draggable and persists a reorder", as
     )
     .toEqual(["t-b", "t-a"]);
 });
+
+test("Dashboards: the tile palette escapes every containing block and lands in the viewport", async ({
+  page,
+}) => {
+  // REGRESSION GUARD. A `position: fixed` overlay only anchors to the VIEWPORT when no
+  // ancestor establishes a fixed-positioning containing block — any ancestor with
+  // transform / filter / backdrop-filter / contain becomes one, and the board canvas and
+  // the Ask column are both frosted surfaces. The palette shipped WITHOUT the teleport
+  // `mur-source-picker` uses for exactly this reason, which is how it could open fine in
+  // one engine and be unreachable in the packaged WKWebView.
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: { ...BOARDS[0], tiles: [] },
+      get_dashboard_sources: [],
+      list_link_candidates: [],
+      get_graph: { nodes: [], edges: [], hasHidden: false },
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await page.getByRole("button", { name: "Add tile" }).click();
+
+  const palette = page.getByRole("dialog", { name: "Add a tile" });
+  await expect(palette).toBeVisible();
+
+  // It must be a child of <body>, not of the board subtree.
+  const parentIsBody = await page.evaluate(() => {
+    const el = document.querySelector(".palette");
+    return el?.parentElement?.parentElement?.tagName === "BODY";
+  });
+  expect(parentIsBody, "the palette overlay must be teleported to <body>").toBe(true);
+
+  // And it must be fully on screen — the failure mode is "opens, but off-viewport".
+  const box = await palette.boundingBox();
+  const viewport = page.viewportSize();
+  expect(box).not.toBeNull();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.y).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(viewport!.width + 1);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height + 1);
+
+  // The catalogue is actually populated — an empty palette is the same dead end.
+  expect(await palette.locator(".node").count()).toBe(10);
+});
