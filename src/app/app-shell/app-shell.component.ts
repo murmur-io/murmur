@@ -91,6 +91,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
     items: [
       { path: "/library", label: "Meetings", icon: "meetings" },
       { path: "/notes", label: "Notes", icon: "notes" },
+      { path: "/dashboards", label: "Dashboards", icon: "dashboards" },
       { path: "/reminders", label: "Reminders", icon: "reminders" },
     ],
   },
@@ -121,6 +122,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { path: "/record", label: "Record", icon: "record" },
   { path: "/library", label: "Meetings", icon: "meetings" },
   { path: "/notes", label: "Notes", icon: "notes" },
+  { path: "/dashboards", label: "Dashboards", icon: "dashboards" },
   { path: "/reminders", label: "Reminders", icon: "reminders" },
   { path: "/analytics", label: "Analytics", icon: "analytics" },
   { path: "/graph", label: "Graph", icon: "graph" },
