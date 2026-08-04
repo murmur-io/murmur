@@ -589,7 +589,7 @@ pub fn get_dashboard(
     let resolved = tiles
         .into_iter()
         .map(|tile| {
-            let data = resolve_tile(state.inner(), &tile, &unlocked)?;
+            let data = resolve_tile(&state.db, &tile, &unlocked)?;
             Ok(ResolvedTileDto {
                 tile: redact_tile_chrome(tile, &data),
                 data,
@@ -617,7 +617,7 @@ pub fn get_dashboard(
 ///
 /// `ref_id`, `span` and `position` stay: pure layout, no content, and the FE needs them to keep the
 /// board's shape stable while a folder is sealed.
-fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> DashboardTile {
+pub(crate) fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> DashboardTile {
     let withheld = match data {
         TileData::Locked | TileData::Missing | TileData::Unconfigured => true,
         // `entity_name` yields the placeholder when the entity is not visible.
@@ -690,13 +690,12 @@ fn source_is_visible(
 }
 
 /// Resolve ONE tile. Every arm reads through a gated reader; nothing here queries raw content.
-fn resolve_tile(
-    state: &AppState,
+pub(crate) fn resolve_tile(
+    db: &crate::storage::Db,
     tile: &DashboardTile,
     unlocked: &std::collections::HashSet<String>,
 ) -> Result<TileData, AppError> {
     let cfg = parse_config(tile.config.as_deref());
-    let db = &state.db;
 
     // Kinds that need an anchor.
     let needs_ref = matches!(
@@ -795,12 +794,20 @@ fn resolve_tile(
             })
         }
         "reminders" => {
-            // Reminders are the user's OWN data (independent of any meeting), and the store
-            // already drops sealed source anchors. Show the soonest open ones.
+            // Reminders are the user's OWN data, so a reminder with no source anchor always
+            // shows. But `list_stored_reminders` is UNGATED (it takes no `unlocked` set and
+            // applies no `visibility_clause`) — an earlier comment here claimed the store drops
+            // sealed anchors, and that was simply false.
+            //
+            // That mattered little while this tile only rendered on screen; it matters now that
+            // a board is readable by agents (local MCP and the cloud-capable Ask loop). A
+            // "smart" reminder's TITLE is authored from meeting content, so a reminder whose
+            // every anchor points at a source the session cannot read is withheld here.
             let mut rows: Vec<(i64, TileRow)> = db
                 .list_stored_reminders()?
                 .into_iter()
                 .filter(|r| matches!(r.state, crate::storage::models::ReminderState::Active))
+                .filter(|r| reminder_provenance_is_readable(db, r, unlocked))
                 .map(|r| {
                     // Due in the past ⇒ "due" (needs attention), else "open".
                     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -827,9 +834,17 @@ fn resolve_tile(
             // The bitemporal fact history for the entity, already gated by `list_facts_visible`.
             let facts = db.list_facts_visible(&ref_id, unlocked)?;
             if facts.is_empty() {
+                let entity = entity_name(db, &ref_id, unlocked)?;
                 return Ok(TileData::Drift {
-                    entity: entity_name(state, &ref_id, unlocked)?,
-                    predicate: cfg.predicate.unwrap_or_default(),
+                    // A hidden entity emits NO stored predicate either. Nothing writes
+                    // `config.predicate` today, but the day a UI lets a user pin one chosen from
+                    // an entity's facts, echoing it back for a sealed entity would be a leak.
+                    predicate: if entity == ENTITY_HIDDEN {
+                        String::new()
+                    } else {
+                        cfg.predicate.unwrap_or_default()
+                    },
+                    entity,
                     rows: vec![],
                 });
             }
@@ -872,7 +887,7 @@ fn resolve_tile(
                 .rev()
                 .collect();
             Ok(TileData::Drift {
-                entity: entity_name(state, &ref_id, unlocked)?,
+                entity: entity_name(db, &ref_id, unlocked)?,
                 predicate,
                 rows,
             })
@@ -904,7 +919,7 @@ fn resolve_tile(
                 }
             }
             Ok(TileData::Numbers {
-                entity: entity_name(state, &ref_id, unlocked)?,
+                entity: entity_name(db, &ref_id, unlocked)?,
                 rows,
             })
         }
@@ -926,7 +941,7 @@ fn resolve_tile(
                 }
             }
             Ok(TileData::Pulse {
-                entity: entity_name(state, &ref_id, unlocked)?,
+                entity: entity_name(db, &ref_id, unlocked)?,
                 total: mentions.len() as i64,
                 quiet_days: newest.map(|ts| (now - ts).max(0) / 86_400),
                 weekly,
@@ -977,6 +992,144 @@ fn resolve_tile(
     }
 }
 
+/// Render ONE resolved tile as plain text for an agent (the local MCP surface and the in-app
+/// agentic Ask loop both read this).
+///
+/// It applies the SAME redaction discipline as the UI, in the same place: a withheld payload
+/// prints its state and nothing else — never the tile's stored title, never a cached answer. That
+/// is why this lives next to `redact_tile_chrome` rather than in `tools.rs`; keeping the two
+/// together is what stops the agent surface from drifting away from the screen surface.
+pub(crate) fn render_tile_for_agent(tile: &DashboardTile, data: &TileData) -> String {
+    let heading = |fallback: &str| -> String {
+        match tile.title.as_deref() {
+            Some(t) if !t.trim().is_empty() => t.to_string(),
+            _ => fallback.to_string(),
+        }
+    };
+    let rows = |rows: &[TileRow]| -> String {
+        rows.iter()
+            .map(|r| {
+                let meta = r.meta.as_deref().unwrap_or("");
+                let status = r.status.as_deref().unwrap_or("");
+                format!("    · {} {} {}", r.text, meta, status)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match data {
+        // Withheld states print their state ONLY — no stored title, no config.
+        TileData::Locked => "- [sealed tile — redacted; unlock the source to read it]".to_string(),
+        TileData::Missing => "- [tile whose source no longer exists]".to_string(),
+        TileData::Unconfigured => "- [tile with no source configured]".to_string(),
+        TileData::Note {
+            title, snippet, id, ..
+        } => format!("- note: {title} · id:{id}\n    {snippet}"),
+        TileData::Meeting {
+            title,
+            started_at,
+            duration_s,
+            id,
+            ..
+        } => format!("- recording: {title} · id:{id} · {started_at} · {duration_s}s"),
+        TileData::Document { title, snippet, id } => {
+            format!("- document: {title} · id:{id}\n    {snippet}")
+        }
+        TileData::Person {
+            name,
+            mention_count,
+            open_commitments,
+            id,
+        } => format!(
+            "- person: {name} · id:{id} · visibleMeetings:{mention_count} · openCommitments:{open_commitments}"
+        ),
+        TileData::Reminders { rows: r, due_count } => {
+            format!("- reminders ({due_count} open)\n{}", rows(r))
+        }
+        TileData::Drift {
+            entity,
+            predicate,
+            rows: r,
+        } => format!("- drift: {entity} · {predicate}\n{}", rows(r)),
+        TileData::Numbers { entity, rows: r } => {
+            format!("- numbers: {entity}\n{}", rows(r))
+        }
+        TileData::Pulse {
+            entity,
+            total,
+            quiet_days,
+            ..
+        } => format!(
+            "- pulse: {entity} · mentions12w:{total} · quietDays:{}",
+            quiet_days.map_or("n/a".to_string(), |d| d.to_string())
+        ),
+        TileData::Promises { owner, rows: r } => format!(
+            "- promises{}\n{}",
+            owner
+                .as_deref()
+                .map_or(String::new(), |o| format!(" ({o})")),
+            rows(r)
+        ),
+        TileData::LivingAnswer {
+            question,
+            answer,
+            withheld,
+            ..
+        } => {
+            // NEVER fall back to the stored title when the answer is withheld: that title is
+            // exactly the field a legacy row copied from the source. An unnamed withheld tile is
+            // anonymous, which is the correct outcome.
+            let q = match (question.trim().is_empty(), *withheld) {
+                (true, true) => "(untitled)".to_string(),
+                (true, false) => heading("living answer"),
+                _ => question.clone(),
+            };
+            if *withheld {
+                format!("- living answer: {q}\n    [saved answer withheld — a source is sealed]")
+            } else {
+                format!(
+                    "- living answer: {q}\n    {}",
+                    answer.as_deref().unwrap_or("(not answered yet)")
+                )
+            }
+        }
+    }
+}
+
+/// Is a reminder's PROVENANCE readable in this session?
+///
+/// `true` when it has no anchors at all (a hand-written reminder is the user's own data), or when
+/// at least one anchor still resolves through its gated reader. Withholding a reminder whose every
+/// anchor is sealed is what stops an agent reading a title that was authored from sealed content.
+fn reminder_provenance_is_readable(
+    db: &crate::storage::Db,
+    reminder: &crate::storage::models::StoredReminder,
+    unlocked: &std::collections::HashSet<String>,
+) -> bool {
+    if reminder.sources.is_empty() {
+        return true;
+    }
+    reminder.sources.iter().any(|anchor| {
+        let kind = match anchor.kind.as_str() {
+            "meeting" => LinkKind::Meeting,
+            "note" => LinkKind::Note,
+            "document" => LinkKind::Document,
+            // An anchor kind we do not understand cannot be proven readable ⇒ it does not count.
+            _ => return false,
+        };
+        source_is_visible(
+            db,
+            &SourceRef {
+                kind,
+                id: anchor.id.clone(),
+            },
+            unlocked,
+        )
+        .unwrap_or(false)
+    })
+}
+
 /// The placeholder an entity-anchored tile shows when its entity is not currently visible. Also
 /// the signal `redact_tile_chrome` reads to strip that tile's stored chrome.
 const ENTITY_HIDDEN: &str = "—";
@@ -984,12 +1137,11 @@ const ENTITY_HIDDEN: &str = "—";
 /// The VISIBLE display name of an entity, or a neutral placeholder. Never leaks a name that only
 /// exists behind a sealed meeting (`list_entities_visible` already drops those).
 fn entity_name(
-    state: &AppState,
+    db: &crate::storage::Db,
     entity_id: &str,
     unlocked: &std::collections::HashSet<String>,
 ) -> Result<String, AppError> {
-    Ok(state
-        .db
+    Ok(db
         .list_entities_visible(unlocked)?
         .into_iter()
         .find(|e| e.id == entity_id)
