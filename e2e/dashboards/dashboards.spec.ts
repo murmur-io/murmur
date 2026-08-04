@@ -349,11 +349,19 @@ test("Dashboards: the tile palette offers the catalogue and flags only-Murmur ti
 
   const palette = page.getByRole("dialog", { name: "Add a tile" });
   await expect(palette).toBeVisible();
-  await expect(palette.getByText("Drift lane")).toBeVisible();
   await expect(palette.getByText("Promise ledger")).toBeVisible();
-  await expect(palette.getByText("Pulse")).toBeVisible();
+  await expect(palette.getByText("Living answer")).toBeVisible();
+  // RETIRED 2026-08-04 and asserted ABSENT, not merely unmentioned: `drift`,
+  // `numbers` and `pulse` are blocked in the extractor rather than by a shortage
+  // of recordings (see tile-palette.component.ts), and a tile that is empty for
+  // most people is worse than no tile. Their `resolve_tile` arms stay alive so
+  // boards that already contain one keep opening — this asserts only that the
+  // palette stops OFFERING them.
+  await expect(palette.getByText("Drift lane")).toHaveCount(0);
+  await expect(palette.getByText("Numbers")).toHaveCount(0);
+  await expect(palette.getByText("Pulse")).toHaveCount(0);
   // The catalogue marks the tiles that only exist because Murmur heard the room.
-  expect(await palette.locator(".only-badge").count()).toBeGreaterThanOrEqual(6);
+  expect(await palette.locator(".only-badge").count()).toBeGreaterThanOrEqual(3);
 
   // Escape must always dismiss a modal.
   await page.keyboard.press("Escape");
