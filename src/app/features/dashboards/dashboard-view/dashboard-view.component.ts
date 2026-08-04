@@ -83,7 +83,21 @@ export class DashboardViewComponent {
   readonly loading = this.service.boardLoading;
   readonly error = this.service.error;
 
-  readonly tiles = computed<ResolvedTile[]>(() => this.board()?.tiles ?? []);
+  private readonly serverTiles = computed<ResolvedTile[]>(
+    () => this.board()?.tiles ?? [],
+  );
+  /** Server order, unless a drag is mid-flight and we are showing its result. */
+  readonly tiles = computed<ResolvedTile[]>(() => {
+    const rows = this.serverTiles();
+    const order = this.orderOverride();
+    if (!order) return rows;
+    const byId = new Map(rows.map((t) => [t.id, t]));
+    const out = order.map((id) => byId.get(id)).filter((t): t is ResolvedTile => !!t);
+    // Anything the override does not mention (a tile added meanwhile) keeps its
+    // place at the end rather than vanishing.
+    for (const t of rows) if (!order.includes(t.id)) out.push(t);
+    return out;
+  });
   readonly isEmpty = computed(() => this.tiles().length === 0);
   readonly sealedCount = computed(
     () => this.tiles().filter((t) => t.data.kind === "locked").length,
@@ -91,6 +105,59 @@ export class DashboardViewComponent {
 
   readonly paletteOpen = signal(false);
   readonly editing = signal(false);
+
+  // ── drag-to-reorder (Arrange mode) ─────────────────────────────────────────
+  //
+  // Native HTML5 drag events, deliberately: no new dependency, no DOM observer,
+  // and the drop target is the tile itself so the grid needs no hit-testing.
+  // The order is applied OPTIMISTICALLY to a local override so the board does not
+  // jump while the backend write is in flight; the reload then replaces it.
+  readonly draggingId = signal<string | null>(null);
+  readonly dropTargetId = signal<string | null>(null);
+  private readonly orderOverride = signal<string[] | null>(null);
+
+  onDragStart(tile: ResolvedTile, event: DragEvent): void {
+    if (!this.editing()) return;
+    this.draggingId.set(tile.id);
+    event.dataTransfer?.setData("text/plain", tile.id);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  }
+
+  onDragOver(tile: ResolvedTile, event: DragEvent): void {
+    if (!this.editing() || !this.draggingId()) return;
+    // Without preventDefault the browser refuses the drop outright.
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    if (this.dropTargetId() !== tile.id) this.dropTargetId.set(tile.id);
+  }
+
+  onDragEnd(): void {
+    this.draggingId.set(null);
+    this.dropTargetId.set(null);
+  }
+
+  async onDrop(target: ResolvedTile, event: DragEvent): Promise<void> {
+    event.preventDefault();
+    const sourceId = this.draggingId();
+    this.draggingId.set(null);
+    this.dropTargetId.set(null);
+    if (!sourceId || sourceId === target.id) return;
+
+    const ids = this.tiles().map((t) => t.id);
+    const from = ids.indexOf(sourceId);
+    const to = ids.indexOf(target.id);
+    if (from < 0 || to < 0) return;
+    ids.splice(to, 0, ...ids.splice(from, 1));
+
+    this.orderOverride.set(ids);
+    try {
+      await this.service.reorderTiles(this.id(), ids);
+    } finally {
+      // The reload inside reorderTiles is authoritative; drop the override so a
+      // rejected write cannot leave the UI showing an order the backend refused.
+      this.orderOverride.set(null);
+    }
+  }
 
   // ── board Ask ──────────────────────────────────────────────────────────────
   readonly turns = signal<BoardTurn[]>([]);
