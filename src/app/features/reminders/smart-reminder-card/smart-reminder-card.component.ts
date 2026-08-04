@@ -78,6 +78,23 @@ export class SmartReminderCardComponent {
       })),
   );
 
+  /**
+   * Whether this surface has earned the full frosted card.
+   *
+   * Deliberately excludes BOTH `loading()` and `error()`. Now that this renders
+   * ABOVE the document body, anything that inflates it after mount pushes the
+   * user's text down mid-interaction — a real layout shift, not a cosmetic one.
+   * An audit failure is the common async case (the command rejects a second
+   * after paint), and a failure to fetch *suggestions* does not justify moving
+   * the note under the caret. The error still renders, as one compact row
+   * inside the strip.
+   *
+   * This is not hypothetical: growing on error broke
+   * e2e/notes/link-picker.spec.ts on webkit, where the body shifted between the
+   * slash menu opening and the "Link to note" click landing.
+   */
+  readonly hasContent = computed(() => this.rows().length > 0);
+
   constructor() {
     // The listener is established before the first audit is allowed to run.
     // Therefore a canonical write can never land in the mount→audit gap without
