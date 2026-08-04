@@ -17,12 +17,26 @@
 // `<dialog>`. Centring is plain flex layout, not a percentage transform.
 .tp-overlay {
   position: fixed;
+  // `inset` AND the four longhands: the shorthand is newer than the engine we
+  // ship for, and a fixed box that falls back to `auto` insets is shrink-to-fit
+  // at its static position instead of the viewport.
   inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: var(--z-overlay, 2000);
+  // GEOMETRY COPIED FROM `.qs-scrim` (quick-search), deliberately. That overlay is
+  // proven in the packaged WKWebView — ⌘K works there — and this one was not:
+  // `align-items: center` over an auto-height flex child is a shape WebKit has
+  // collapsed to zero height before, which is exactly what the report showed (a
+  // dimmed screen with an 880px-wide grey LINE where the panel should be: correct
+  // width from `min()`, no height at all). Top-aligned with a `vh` offset needs no
+  // cross-axis sizing of the child.
   display: flex;
-  align-items: center;
   justify-content: center;
-  padding: var(--space-5);
+  align-items: flex-start;
+  padding: 9vh var(--space-4) var(--space-4);
 }
 
 // The scrim fills the overlay and sits BEHIND the panel; it is its own element so
@@ -30,9 +44,31 @@
 .tp-scrim {
   position: absolute;
   inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   border: 0;
   background: var(--scrim);
   cursor: default;
+}
+
+// TEMPORARY instrument. Pinned to the very top of the viewport, OUTSIDE the panel,
+// so it is readable in a screenshot even when the panel itself is not.
+.tp-diag {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 4px 8px;
+  background: #000;
+  color: #7fff9f;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-all;
 }
 
 .palette {
@@ -42,7 +78,12 @@
   z-index: 1;
   display: flex;
   flex-direction: column;
-  width: min(880px, 92vw);
+  // `min(880px, 100%)` (of the padded overlay) rather than `92vw`, mirroring
+  // `.qs-panel`. The reported failure had the WIDTH right and the HEIGHT zero, so
+  // the floor below is what makes "a grey line" structurally impossible: a panel
+  // whose content somehow measures nothing still occupies a real box.
+  width: min(880px, 100%);
+  min-height: 240px;
   max-height: 78vh;
   padding: 0;
   overflow: hidden;
@@ -91,6 +132,11 @@
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: var(--space-2);
   padding: var(--space-4) var(--space-5) var(--space-5);
+  // Takes the panel's remaining height and scrolls inside it; `min-height: 0` is
+  // what lets a flex item shrink below its content instead of forcing the panel
+  // taller than its max.
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
 }
 
