@@ -458,3 +458,43 @@ test("Dashboards: deleting a board takes two clicks, and the first one is revers
     .poll(() => page.evaluate(() => (globalThis as any).__deleted ?? 0))
     .toBe(1);
 });
+
+test("Dashboards: navigating away mid-ask does not leave the next board stuck busy", async ({
+  page,
+}) => {
+  // The stale-async guard's own failure mode. Gating BOTH the data writes and the
+  // busy flag on "same board AND same request" means that after navigating away
+  // mid-flight nothing ever clears `asking` — so the NEXT board opens with its Ask
+  // control disabled, waiting on a request that was never its own.
+  await mockTauri(
+    page,
+    {
+      ask_vault: async () => {
+        await new Promise((r) => setTimeout(r, 1500));
+        return { answer: "answer for the first board", sources: [], citations: [] };
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [{ kind: "note", id: "n-1" }],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await openAsk(page);
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("slow question");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+
+  // Leave while it is still running, then come back.
+  await page.goto("/dashboards");
+  await page.goto("/dashboards/b-dense");
+  await openAsk(page);
+
+  // The Ask control is USABLE — not stuck behind a dead request…
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("a fresh question");
+  await expect(page.getByRole("button", { name: "Ask", exact: true })).toBeEnabled();
+  // …and the previous board's thread did not follow us here.
+  await expect(page.getByText("slow question")).toHaveCount(0);
+  await expect(page.getByText("answer for the first board")).toHaveCount(0);
+});
