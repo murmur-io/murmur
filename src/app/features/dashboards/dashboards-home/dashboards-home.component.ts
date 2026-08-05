@@ -12,7 +12,10 @@ import {
   viewChild,
 } from "@angular/core";
 import { Router } from "@angular/router";
-import { DashboardsService } from "../../../services/dashboards.service";
+import {
+  DashboardsService,
+  splitLeadingEmoji,
+} from "../../../services/dashboards.service";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { BoardCardComponent } from "../board-card/board-card.component";
@@ -89,10 +92,12 @@ export class DashboardsHomeComponent {
   }
 
   async createBoard(): Promise<void> {
-    const title = this.draftTitle().trim();
-    if (!title || this.busy()) return;
+    const typed = this.draftTitle().trim();
+    if (!typed || this.busy()) return;
     this.busy.set(true);
-    const created = await this.service.create(title);
+    // "🚀 Atlas GA" names the board AND gives it its emoji — see `splitLeadingEmoji`.
+    const { emoji, title } = splitLeadingEmoji(typed);
+    const created = await this.service.create(title, emoji);
     this.busy.set(false);
     this.composing.set(false);
     if (created) void this.router.navigate(["/dashboards", created.id]);
