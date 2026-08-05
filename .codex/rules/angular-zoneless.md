@@ -411,6 +411,53 @@ went to a real bug the tests structurally could not see.
    open. Without that, "the click never landed" and "the panel never painted" look identical from
    outside — and you cannot tell which half to fix.
 
+**CORRECTION (2026-08-05, measured with `scripts/wkwebview-probe`).** The diagnosis above was
+WRONG, and it is left standing only so the correction is legible. `:modal` was never the cause.
+Executing JS inside the real shipping WKWebView returns:
+
+    matches(":modal") threw: null      // it does not throw
+    showModal() threw:     null        // it is not refused
+    :modal after showModal: true       // it works correctly
+
+The actual cause was the wire contract — snake_case payload fields against a camelCase FE (T6
+below), found by inspecting the payload rather than the component. Three of the six fixes were
+built on a hypothesis nobody could falsify, because until now nothing in this repo could run a
+line of JavaScript in the engine we ship.
+
+**The discipline in T5 stands; only its example was false.** Reproduce first. Get a RED check. Do
+not depend on an API you have not verified *in the shipping engine* — and now you can:
+
+```bash
+swiftc -O -o /tmp/wkprobe scripts/wkwebview-probe/main.swift
+/tmp/wkprobe --url http://localhost:1420/ --eval 'return CSS.supports("color","color-mix(in srgb, red, blue)")'
+```
+
+No accessibility grant, no signing, no GUI. When a UI failure will not reproduce in Playwright,
+that is the tool that tells you whether the engine is actually the difference — in seconds, instead
+of three speculative rounds.
+
+### T6 — a hand-written IPC mock DEFINES a contract; it does not verify one
+
+**The failure (2026-08-04, PR #566/#568).** Six rounds went to the Add-tile palette's positioning.
+The palette was never the bug. `TileData` shipped its variant fields in snake_case
+(`started_at` / `duration_s` / `has_audio`) while the FE read camelCase, so every field was
+`undefined`, the tile threw while rendering, and it took the board down with it.
+
+**Why the suite was blind.** Every `mockTauri` fixture in `e2e/` is hand-written TypeScript typed
+against the FE's own interface — so the fixtures were camelCase by construction and could not
+disagree with the FE. The e2e proved that the FE renders the shape the FE expects. It said nothing
+about the shape the backend sends, which is the only thing that was wrong.
+
+**Binding.**
+- A mock is a stand-in for the TRANSPORT, never for the CONTRACT. The contract is asserted on the
+  producing side — see `rust-tauri.md` §2b (assert serialized key names).
+- When a UI failure survives more than one fix, stop debugging the component and check the PAYLOAD
+  first: log/inspect one real IPC response and compare its keys with the interface. A field that is
+  `undefined` on screen and correct in the mock is a contract mismatch, not a rendering bug.
+- A tile/row renderer must not throw on a missing field. Formatters that take `string | number`
+  from IPC should tolerate `undefined` — one bad field killing the whole view is what turned a
+  naming mismatch into "the palette does not open".
+
 ---
 
 ## Quality gate (a change is not done until these are green)
