@@ -3,6 +3,12 @@
 ## Recurring patterns
 <!-- Curated, binding. Prepended to every dispatch. Keep ≤ ~20 bullets. -->
 
+- **An enum crossing IPC needs BOTH `rename_all` AND `rename_all_fields`.** On an enum the first
+  renames the VARIANTS, the second the FIELDS INSIDE them. `TileData` had only the first: variants
+  tagged correctly so it looked right, while `started_at`/`duration_s`/`has_audio` reached a FE
+  reading camelCase — every field `undefined`, the tile threw, the board died, and six fixes went
+  to the wrong layer. Assert the SERIALIZED key names in a test; a round-trip through the same Rust
+  type passes regardless of naming. See `rust-tauri.md` §2b.
 - **`AppError` + `Result<T>` only.** Never bare `anyhow::Result`, `Box<dyn Error>`, or
   `unwrap()`/`expect()` in non-test code. A locked-content refusal is `AppError::Locked`, never a
   generic `Storage`/`Other`. `AppError` is `Serialize` — don't hand-build error strings for the FE.
