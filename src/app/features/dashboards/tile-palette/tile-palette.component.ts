@@ -2,26 +2,22 @@ import {
   ChangeDetectionStrategy,
   Component,
   ElementRef,
-  Injector,
-  afterNextRender,
   computed,
+  effect,
   inject,
   output,
   signal,
+  viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
-import type { NoteCitation, TileConfig, TileKind } from "../../../core/models";
+import type { TileChoice } from "../../../services/tile-palette.service";
+import type { NoteCitation, TileKind } from "../../../core/models";
 
 /** What a chosen tile kind needs before it can be added. */
 type SourceMode = "none" | "link" | "entity" | "question";
 
-export interface TileChoice {
-  kind: TileKind;
-  refId?: string;
-  title?: string;
-  config?: TileConfig;
-}
+export type { TileChoice };
 
 interface NodeType {
   kind: TileKind;
@@ -36,6 +32,30 @@ interface NodeType {
 /**
  * The tile catalogue. Order is the palette's reading order: material first,
  * then the derived views that are the actual reason to build a board.
+ *
+ * RETIRED 2026-08-04 — `drift`, `numbers`, `pulse`. Each is anchored to ONE
+ * entity over the two thinnest tables in the schema, and each is blocked by a
+ * mechanism in the extractor rather than by a shortage of recordings:
+ *
+ *  - `numbers` post-filters facts with `looks_numeric`, but `facts::EXTRACT_SYSTEM`
+ *    asks for "durable state worth tracking" and never asks for quantities, so the
+ *    filter runs over a substrate that was never built to contain figures (and
+ *    what it does match is mostly dates).
+ *  - `drift` needs SUPERSEDED facts, and `facts::reconcile_facts` requires the same
+ *    NORMALIZED `(entity, subject, predicate)` while predicates are free-form —
+ *    so supersessions do not form.
+ *  - `pulse` reads `entity_mentions`, written by `graph_store::Db::add_mention` as
+ *    `INSERT OR IGNORE` on PK `(entity_id, meeting_id)`. It counts MEETINGS, not
+ *    utterances, which makes this entry's own former copy ("how often this is
+ *    actually talked about") false, and caps every weekly bucket at 1.
+ *
+ * A tile that is empty for most people is worse than no tile, so they stop being
+ * OFFERED. Their `resolve_tile` arms stay alive and must never be deleted: that
+ * function ends in `Err(AppError::InvalidArg("unknown tile kind"))` and
+ * `get_dashboard` collects with `?`, so removing an arm would turn every board
+ * that already contains one of these into a hard error at open. Fixing the
+ * extractor is its own investigation; see
+ * docs/superpowers/specs/2026-08-04-dashboards-rebuild-design.md §7.
  */
 const NODE_TYPES: NodeType[] = [
   {
@@ -71,30 +91,6 @@ const NODE_TYPES: NodeType[] = [
     family: "person",
   },
   {
-    kind: "drift",
-    name: "Drift lane",
-    description: "How ONE value moved over time — GA: Apr 30 → May 24 → Jun 14.",
-    onlyMurmur: true,
-    mode: "entity",
-    family: "insight",
-  },
-  {
-    kind: "numbers",
-    name: "Numbers",
-    description: "Figures that were said out loud, with what they used to be.",
-    onlyMurmur: true,
-    mode: "entity",
-    family: "insight",
-  },
-  {
-    kind: "pulse",
-    name: "Pulse",
-    description: "How often this is actually talked about — and where it went quiet.",
-    onlyMurmur: true,
-    mode: "entity",
-    family: "insight",
-  },
-  {
     kind: "promises",
     name: "Promise ledger",
     description: "Who committed to what, and whether it landed on time.",
@@ -128,8 +124,20 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
 };
 
 /**
- * The "Add a tile" palette — a FLOATING modal, so it is OPAQUE
+ * The "Add a tile" palette — a FLOATING overlay, so it is OPAQUE
  * (`--surface-overlay`, `backdrop-filter: none`) per angular-zoneless.md T3.
+ *
+ * PRESENTATION IS PURELY DECLARATIVE, and that is deliberate. The component is
+ * rendered by `app-shell` behind `@if (tilePalette.open())` (see
+ * `TilePaletteService` for why the shell and not the board), and its own template
+ * is a plain `position: fixed` layer. There is no imperative "reveal" step at
+ * all — no `showModal()`, no `matches(":modal")`, no teleport, no top layer.
+ *
+ * That is the lesson of angular-zoneless.md T5, paid for five times over: every
+ * one of those is a modern-ish API that the engine the tests run supports and the
+ * engine we ship may not, and each failure looked identical from outside — the
+ * trigger flipping to "Close" while nothing appeared. A template `@if` plus CSS
+ * has nothing left that can throw, be refused, or resolve differently.
  *
  * Source pickers reuse the SHIPPED gated readers: `list_link_candidates` for
  * notes/recordings/documents and `get_graph` for entities. Nothing sealed can
@@ -143,15 +151,16 @@ const LINK_KIND: Partial<Record<TileKind, string>> = {
   templateUrl: "./tile-palette.component.html",
   styleUrl: "./tile-palette.component.scss",
   host: {
-    // Escape must dismiss the modal no matter where focus currently sits. A
-    // keydown bound to the dialog element only fires when the dialog itself (or
-    // a descendant) has focus, which is not guaranteed the moment it opens.
+    // Escape is handled on the DOCUMENT rather than on the overlay, because the
+    // catalogue step focuses nothing — a `(keydown.escape)` bound to the overlay
+    // would only fire once something inside it happened to hold focus. The
+    // component only exists while the palette is open, so the listener cannot
+    // outlive it.
     "(document:keydown)": "onKeydown($event)",
   },
 })
 export class TilePaletteComponent {
   private readonly ipc = inject(IpcService);
-  private readonly injector = inject(Injector);
 
   readonly dismiss = output<void>();
   readonly choose = output<TileChoice>();
@@ -166,8 +175,19 @@ export class TilePaletteComponent {
   readonly entities = signal<{ id: string; name: string; mentionCount: number }[]>([]);
   readonly question = signal("");
 
-  private readonly searchField =
-    signal<ElementRef<HTMLInputElement> | null>(null);
+  /**
+   * Focus the picker's field the moment it exists.
+   *
+   * This replaces a `registerField()` method that was bound NOWHERE in the
+   * template, so it never ran and the field never focused — the palette opened
+   * its second step and left the caret in the void. A `viewChild` signal fires
+   * on its own when the `@switch` swaps the step in, with no call site to forget.
+   */
+  private readonly searchField = viewChild<ElementRef<HTMLInputElement>>("searchField");
+
+  private readonly _focusField = effect(() => {
+    this.searchField()?.nativeElement.focus();
+  });
 
   readonly filteredEntities = computed(() => {
     const q = this.query().trim().toLowerCase();
@@ -270,22 +290,16 @@ export class TilePaletteComponent {
     this.choose.emit({ kind: type.kind, title: q, config: { question: q } });
   }
 
-  onBackdrop(): void {
-    this.dismiss.emit();
-  }
-
-  /** Escape closes the palette (a modal must always be dismissable). */
+  /**
+   * Escape on the SECOND step goes back to the catalogue instead of closing the
+   * whole palette — losing the whole overlay because you changed your mind about
+   * which KIND of tile you wanted is a needless step backwards.
+   */
   onKeydown(event: KeyboardEvent): void {
-    if (event.key === "Escape") {
-      event.stopPropagation();
-      if (this.selected()) this.back();
-      else this.dismiss.emit();
-    }
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    if (this.selected()) this.back();
+    else this.dismiss.emit();
   }
 
-  registerField(el: ElementRef<HTMLInputElement> | undefined): void {
-    if (!el) return;
-    this.searchField.set(el);
-    afterNextRender(() => el.nativeElement.focus(), { injector: this.injector });
-  }
 }

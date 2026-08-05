@@ -1664,6 +1664,16 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "list_dashboards",
+            "description": "List the user's DASHBOARDS — boards they composed BY HAND out of meetings, notes, documents, people and derived views (drift lanes, promise ledgers, pulses). Returns title + id + tile kinds only, no content. A board is the user's own declaration of what belongs together, so it is better scope than a search guess: check here first for questions about a project, deal or topic they track.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_dashboard",
+            "description": "Read one dashboard by id: every tile, already resolved — the notes and recordings on it, who is on it, which values drifted over time, what was promised and whether it landed, and what has gone quiet. A tile whose source is sealed-and-not-session-unlocked comes back redacted, exactly as it renders on screen. Use it to answer from precisely the context the user curated.",
+            "inputSchema": { "type": "object", "properties": { "dashboardId": { "type": "string" } }, "required": ["dashboardId"] }
+        },
+        {
             "name": "org_search",
             "description": "Fallback for when search_meetings / search_semantic find nothing relevant in your OWN vault and you have joined an org: search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
@@ -1821,6 +1831,14 @@ fn dispatch_tool(
                 .clamp(1, 100) as usize,
         },
         "list_note_folders" => ToolCall::ListNoteFolders,
+        "list_dashboards" => ToolCall::ListDashboards,
+        "get_dashboard" => ToolCall::GetDashboard {
+            dashboard_id: args
+                .get("dashboardId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
         "search_transcript" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             ToolCall::SearchTranscript {
@@ -2055,10 +2073,15 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_fifteen_tools() {
+    fn tools_list_has_seventeen_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 17);
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_dashboards")
+                && tools.iter().any(|t| t["name"] == "get_dashboard"),
+            "the user's own curated boards must be reachable over local MCP"
+        );
         assert!(
             tools.iter().any(|t| t["name"] == "list_entities"),
             "entity discovery must be advertised on local MCP"

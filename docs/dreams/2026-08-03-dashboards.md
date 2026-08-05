@@ -91,6 +91,32 @@ needs `lock-security-reviewer` before merge. Tile *quality* (are the "open quest
 can't be judged headlessly — real vault, real Mac. And the moment a board can be shared, the redaction
 story has to hold on the *server* side too (`../murmur-server/`), not just in the UI.
 
-## Verdict  (accepted / rejected / iterate — filled after the user disposes)
+## Verdict
 
-_pending — awaiting the user's call._
+**ACCEPTED → BUILT → MERGED (2026-08-03, PR #562, trunk `85afce8`).**
+
+Shipped scope: the `/dashboards` tab + one-board view, 10 tile kinds (note, meeting,
+document, person, reminders, drift, numbers, pulse, promises, living answer), the tile palette,
+and board-scoped Ask that cites the tiles it used. Board Ask reuses the shipped
+`ask_vault(explicit_sources)` seam, so the feature adds no new AI path and no new egress surface.
+
+**Three independent reviews, three FAILs, all fixed before merge — this is the part worth keeping.**
+Every review ran while all gates were green, and each found something the other two did not:
+
+| Review | Found |
+| --- | --- |
+| codex (cross-vendor) | 3 blockers + 5 more, incl. the flattened-DTO title leak |
+| lock-security | confirmed 2, found the sharper variant: entity tiles never resolve to `Locked`, so a stored entity NAME kept rendering after sealing |
+| adversarial verifier | the answer-cache gate was both INCOMPLETE (Ask expands into linked neighbours no source list records) and UNFALSIFIABLE (disabling it left all 2732 tests green) |
+
+Two lessons generalised beyond this feature:
+1. **A UI mask is not a gate.** `#[serde(flatten)]` ships every column of the stored row; the FE
+   declining to render one is not protection. Assert the SERIALIZED wire form, not the DOM.
+2. **A cached AI answer cannot be gated on a source list** when retrieval expands beyond the
+   sources the caller passed. Gate it on the readable-FOLDER set at answer time — that bounds
+   whatever the answer saw, however retrieval got there.
+
+Still not built (unchanged from the plan above): open-questions tiles, drag-to-reorder, `.canvas`
+export of a board. Tile quality against a real vault, Touch-ID unlock behaviour around a live
+board, and screen-share auto-relock re-masking are asserted from code, not executed on a signed
+build.

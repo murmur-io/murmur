@@ -139,7 +139,9 @@ test("Dashboards: a SEALED tile leaks nothing — not even the title the user ty
 
   const sealed = page.locator("app-dashboard-tile.is-locked");
   await expect(sealed).toHaveCount(1);
-  await expect(sealed).toContainText("Sealed folder");
+  // Copy tightened 2026-08-04 to tie the lock model to the board's thesis: a sealed
+  // tile is not merely locked, it is OUT OF SCOPE for the board's Ask.
+  await expect(sealed).toContainText("Sealed — not in scope");
   await expect(sealed.locator(".tile-title")).toHaveText("🔒 Locked");
 
   // The whole page must not contain the sealed title anywhere — heading, DOM
@@ -195,7 +197,11 @@ test("Dashboards: an entity tile whose entity went invisible keeps no stored nam
   await page.goto("/dashboards/b-atlas");
   await expect(page.locator("app-dashboard-tile")).toHaveCount(1);
   await expect(page.locator("app-dashboard-tile .tile-title")).not.toContainText("Dana");
-  await expect(page.getByText(/Nothing has moved here yet/)).toBeVisible();
+  // A drift lane with no rows never had data, so it collapses to a strip rather
+  // than reserving a full card for an apology (2026-08-04 density pass). The
+  // leak assertion above is the point of this test and is unchanged.
+  await expect(page.locator("app-dashboard-tile")).toHaveClass(/is-empty/);
+  await expect(page.getByText(/Values land here as they get revised/)).toBeVisible();
 });
 
 test("Dashboards: a withheld Living answer shows why, and not the cached text", async ({
@@ -343,11 +349,19 @@ test("Dashboards: the tile palette offers the catalogue and flags only-Murmur ti
 
   const palette = page.getByRole("dialog", { name: "Add a tile" });
   await expect(palette).toBeVisible();
-  await expect(palette.getByText("Drift lane")).toBeVisible();
   await expect(palette.getByText("Promise ledger")).toBeVisible();
-  await expect(palette.getByText("Pulse")).toBeVisible();
+  await expect(palette.getByText("Living answer")).toBeVisible();
+  // RETIRED 2026-08-04 and asserted ABSENT, not merely unmentioned: `drift`,
+  // `numbers` and `pulse` are blocked in the extractor rather than by a shortage
+  // of recordings (see tile-palette.component.ts), and a tile that is empty for
+  // most people is worse than no tile. Their `resolve_tile` arms stay alive so
+  // boards that already contain one keep opening — this asserts only that the
+  // palette stops OFFERING them.
+  await expect(palette.getByText("Drift lane")).toHaveCount(0);
+  await expect(palette.getByText("Numbers")).toHaveCount(0);
+  await expect(palette.getByText("Pulse")).toHaveCount(0);
   // The catalogue marks the tiles that only exist because Murmur heard the room.
-  expect(await palette.locator(".only-badge").count()).toBeGreaterThanOrEqual(6);
+  expect(await palette.locator(".only-badge").count()).toBeGreaterThanOrEqual(3);
 
   // Escape must always dismiss a modal.
   await page.keyboard.press("Escape");

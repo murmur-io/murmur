@@ -374,6 +374,65 @@ the engine; it was the **header**. `ng serve` sends no `Content-Security-Policy`
 the only reason development never reproduced it. Do not go hunting for a WebKit-specific quirk —
 supply the header and any engine will show you the bug.
 
+### T5 — the e2e engine is NEWER than the shipping one: a modern web API can throw only for the user
+
+**Symptom shape:** a user reports "the UI does nothing", every gate is green, and the failure will
+not reproduce in Playwright — on either project. Do not treat that as "cannot reproduce". It is a
+RESULT: the difference is the environment, so stop reading CSS and go find which API differs.
+
+**The case that cost four rounds (2026-08-04, PR #566).** The Add-tile palette opened correctly in
+Chromium AND Playwright's WebKit, and stayed invisible in the packaged WKWebView. The cause was one
+line of my own code:
+
+```ts
+if (!el.open || !el.matches(":modal")) { el.open = true; }   // ← matches() OUTSIDE the try
+```
+
+`:modal` is a recent pseudo-class. An engine that does not know it makes `matches()` **throw
+SyntaxError**, and thrown from `afterNextRender` that skipped the line which sets `el.open` — and an
+unopened `<dialog>` is `display: none`. Playwright ships engines that DO support `:modal`, so the
+throw never happened in the suite. Three fixes (teleport, non-transform layout, native `<dialog>`)
+went to a real bug the tests structurally could not see.
+
+**Binding consequences.**
+1. **Reproduce BEFORE analysing.** With a user-reported UI failure, the first action is a live
+   repro — Playwright MCP, click it, look at it — never "read the component and form a hypothesis".
+   Three of the four rounds above were hypotheses from reading code; the first real observation came
+   from adding state to the UI, and it settled the question in one screenshot.
+2. **RED-before-GREEN applies to UI too.** `11/11 green` before AND after a fix proves nothing. If
+   you cannot produce a failing check first, you have not found the bug — you have found a change.
+   The way to get RED when the engine differs is to STUB the newer API (`Element.prototype.matches`
+   throwing on `:modal`, `HTMLDialogElement.prototype.showModal` refusing) and assert the UI still
+   works.
+3. **Guard every modern-API call, or don't make it.** `matches(":modal")`, `:has()`,
+   `structuredClone`, `showModal()` — wrap it, or answer the question with an older API. Here
+   `el.open` answered the only question that mattered.
+4. **Add observability before guessing.** A control that opens a modal should say whether it is
+   open. Without that, "the click never landed" and "the panel never painted" look identical from
+   outside — and you cannot tell which half to fix.
+
+### T6 — a hand-written IPC mock DEFINES a contract; it does not verify one
+
+**The failure (2026-08-04, PR #566/#568).** Six rounds went to the Add-tile palette's positioning.
+The palette was never the bug. `TileData` shipped its variant fields in snake_case
+(`started_at` / `duration_s` / `has_audio`) while the FE read camelCase, so every field was
+`undefined`, the tile threw while rendering, and it took the board down with it.
+
+**Why the suite was blind.** Every `mockTauri` fixture in `e2e/` is hand-written TypeScript typed
+against the FE's own interface — so the fixtures were camelCase by construction and could not
+disagree with the FE. The e2e proved that the FE renders the shape the FE expects. It said nothing
+about the shape the backend sends, which is the only thing that was wrong.
+
+**Binding.**
+- A mock is a stand-in for the TRANSPORT, never for the CONTRACT. The contract is asserted on the
+  producing side — see `rust-tauri.md` §2b (assert serialized key names).
+- When a UI failure survives more than one fix, stop debugging the component and check the PAYLOAD
+  first: log/inspect one real IPC response and compare its keys with the interface. A field that is
+  `undefined` on screen and correct in the mock is a contract mismatch, not a rendering bug.
+- A tile/row renderer must not throw on a missing field. Formatters that take `string | number`
+  from IPC should tolerate `undefined` — one bad field killing the whole view is what turned a
+  naming mismatch into "the palette does not open".
+
 ---
 
 ## Quality gate (a change is not done until these are green)

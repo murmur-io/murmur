@@ -23,12 +23,25 @@ import type {
 import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { RemindersStore } from "../reminders.store";
 import {
+  defaultDueAt,
+  resolvePresets,
+  type PresetId,
+} from "./due-presets";
+import {
   ReminderComposerService,
   type ReminderComposerRequest,
 } from "./reminder-composer.service";
 
-const DEFAULT_DUE_OFFSET_MS = 60 * 60 * 1000;
 const MAX_SOURCES = 20;
+/** Mirrors the CHECK bounds in `storage/reminder_store.rs`. */
+const DUE_MIN_EPOCH = Date.UTC(2000, 0, 1);
+const DUE_MAX_EPOCH = Date.UTC(2200, 0, 1);
+const PRESET_LABELS: Record<PresetId, string> = {
+  "later-today": "Later today",
+  tomorrow: "Tomorrow",
+  weekend: "This weekend",
+  "next-week": "Next week",
+};
 const REMINDER_SOURCE_KINDS = ["meeting", "note"] as const;
 const FOCUSABLE_SELECTOR = [
   "button:not([disabled])",
@@ -50,6 +63,43 @@ function localDateParts(epoch: number): { date: string; time: string } {
   const hours = String(value.getHours()).padStart(2, "0");
   const minutes = String(value.getMinutes()).padStart(2, "0");
   return { date: `${year}-${month}-${day}`, time: `${hours}:${minutes}` };
+}
+
+/**
+ * Never hardcode a date format string: the native inputs render segments in
+ * OS-locale order (dd.MM.yyyy on a Polish Mac) and the operator writes Polish,
+ * so the readback has to agree with what the fields show.
+ */
+function formatDueEcho(epoch: number): string {
+  const when = new Date(epoch);
+  const absolute = new Intl.DateTimeFormat(undefined, {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(when);
+  const deltaMinutes = Math.round((epoch - Date.now()) / 60000);
+  if (Math.abs(deltaMinutes) >= 60 * 24 * 14) {
+    return absolute;
+  }
+  const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const rel =
+    Math.abs(deltaMinutes) < 60
+      ? relative.format(deltaMinutes, "minute")
+      : Math.abs(deltaMinutes) < 60 * 24
+        ? relative.format(Math.round(deltaMinutes / 60), "hour")
+        : relative.format(Math.round(deltaMinutes / (60 * 24)), "day");
+  return `${absolute} · ${rel}`;
+}
+
+/** Short resolved time shown under a preset chip, so the rule is visible. */
+function formatPresetTime(epoch: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(epoch));
 }
 
 function matchesInvalidation(
@@ -123,6 +173,58 @@ export class ReminderComposerComponent {
     () => this.sources().length >= MAX_SOURCES,
   );
 
+  /**
+   * Presets are derived, never stored — `purgeInvalidatedRequest()` resets ten
+   * signals and its guarantee is that no source-derived state can outlive a
+   * lock event. Every addition here is a `computed()` over `date()`/`time()`,
+   * so that method stays byte-identical and the guarantee is untouched.
+   *
+   * Recomputed per composer open (the `date()` dependency changes on hydrate),
+   * which is the only moment the row is read.
+   */
+  readonly presets = computed(() => {
+    const currentDate = this.date();
+    const currentTime = this.time();
+    return resolvePresets(new Date())
+      .filter((preset) => !preset.hidden)
+      .map((preset) => {
+        const parts = localDateParts(preset.at);
+        return {
+          id: preset.id,
+          label: PRESET_LABELS[preset.id],
+          resolved: formatPresetTime(preset.at),
+          active: parts.date === currentDate && parts.time === currentTime,
+        };
+      });
+  });
+
+  /** Plain-language readback of the moment actually selected. */
+  readonly dueEcho = computed(() => {
+    const due = this.dueEpoch();
+    if (due === null) {
+      return "";
+    }
+    return formatDueEcho(due);
+  });
+
+  readonly dueOutOfRange = computed(() => {
+    const due = this.dueEpoch();
+    return due !== null && (due < DUE_MIN_EPOCH || due >= DUE_MAX_EPOCH);
+  });
+
+  /**
+   * Public because `strictTemplates` forbids binding a private member; the
+   * template needs this and `setDue` stays private.
+   */
+  applyPreset(id: PresetId): void {
+    const preset = resolvePresets(new Date()).find(
+      (candidate) => candidate.id === id,
+    );
+    if (preset) {
+      this.setDue(preset.at);
+    }
+  }
+
   readonly valid = computed(() => {
     const title = this.title().trim();
     const due = this.dueEpoch();
@@ -135,6 +237,7 @@ export class ReminderComposerComponent {
       title.length > 0 &&
       title.length <= 240 &&
       due !== null &&
+      !this.dueOutOfRange() &&
       recurrenceValid &&
       this.sources().length <= MAX_SOURCES
     );
@@ -403,7 +506,9 @@ export class ReminderComposerComponent {
       this.lastPointerTarget = null;
       this.hydratedRequestKey = request.key;
     }
-    const defaultDue = Date.now() + DEFAULT_DUE_OFFSET_MS;
+    // The first preset still on offer — a round hour later today before ~15:00,
+    // otherwise tomorrow 09:00. The old `now + 1h` produced times like 00:09.
+    const defaultDue = defaultDueAt(new Date());
     if (request.mode === "edit") {
       this.title.set(request.reminder.title);
       this.details.set(request.reminder.details ?? "");
