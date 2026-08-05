@@ -2,16 +2,21 @@ import {
   ChangeDetectionStrategy,
   Component,
   DestroyRef,
+  ElementRef,
   computed,
   effect,
   inject,
   signal,
   untracked,
+  viewChild,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import { ActivatedRoute, Router } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
-import { DashboardsService } from "../../../services/dashboards.service";
+import {
+  DashboardsService,
+  splitLeadingEmoji,
+} from "../../../services/dashboards.service";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
@@ -203,6 +208,19 @@ export class DashboardViewComponent {
     if (this.dropTargetId() !== tile.id) this.dropTargetId.set(tile.id);
   }
 
+  /**
+   * Clear the highlight when the pointer leaves this tile.
+   *
+   * `dragover` only ever SETS a target, so dragging off the grid entirely left the
+   * last-hovered tile lit as a drop target that no longer existed. Guarded on identity
+   * because `dragleave` also fires when the pointer crosses into a CHILD element —
+   * clearing unconditionally would flicker the highlight off and on across every row
+   * inside the tile you are actually hovering.
+   */
+  onDragLeave(tile: ResolvedTile): void {
+    if (this.dropTargetId() === tile.id) this.dropTargetId.set(null);
+  }
+
   onDragEnd(): void {
     this.draggingId.set(null);
     this.dropTargetId.set(null);
@@ -233,6 +251,86 @@ export class DashboardViewComponent {
 
   // ── board Ask ──────────────────────────────────────────────────────────────
   readonly turns = signal<BoardTurn[]>([]);
+
+  /** Monotonic ask token — the per-REQUEST half of the stale-async guard. */
+  private askToken = 0;
+
+  /**
+   * Switching boards starts a new conversation.
+   *
+   * `/dashboards/:id` reuses this component across board→board navigation, so without
+   * this the thread — including the user turn `ask()` appends synchronously before its
+   * first await — follows the user onto a board it was never about. Bumping the token
+   * in the same pass orphans any in-flight request's data writes while still letting
+   * it clear the spinner it set.
+   */
+  private readonly _resetOnBoardChange = effect(() => {
+    this.id();
+    untracked(() => {
+      this.askToken += 1;
+      this.turns.set([]);
+      this.draft.set("");
+      this.asking.set(false);
+    });
+  });
+
+  // ── rename ────────────────────────────────────────────────────────────────
+  //
+  // The board's name was write-once: `DashboardsService.update` shipped accepting
+  // `title`/`emoji`/`tint`, and the only caller ever passed `{pinned}`. A board named
+  // the wrong thing stayed named the wrong thing.
+  readonly renaming = signal(false);
+  readonly renameDraft = signal("");
+  private readonly renameField =
+    viewChild<ElementRef<HTMLInputElement>>("renameField");
+  private readonly _focusRename = effect(() => {
+    this.renameField()?.nativeElement.select();
+  });
+
+  startRename(): void {
+    const b = this.board();
+    if (!b) return;
+    // Round-trips through the same convention `create` uses, so renaming is also how
+    // you add or change the emoji: "🚀 Atlas GA".
+    this.renameDraft.set(b.emoji ? `${b.emoji} ${b.title}` : b.title);
+    this.renaming.set(true);
+  }
+
+  onRenameInput(event: Event): void {
+    this.renameDraft.set((event.target as HTMLInputElement).value);
+  }
+
+  cancelRename(): void {
+    this.renaming.set(false);
+  }
+
+  async commitRename(): Promise<void> {
+    const typed = this.renameDraft().trim();
+    const b = this.board();
+    if (!typed || !b) return;
+    this.renaming.set(false);
+    const { emoji, title } = splitLeadingEmoji(typed);
+    if (title === b.title && (emoji ?? null) === (b.emoji ?? null)) return;
+    // `emoji: ""` clears it — dropping the field would leave the old one in place.
+    await this.service.update(b.id, { title, emoji: emoji ?? "" });
+  }
+
+  /**
+   * Whether the Ask column is open, versus collapsed to its rail.
+   *
+   * Opens on demand and STAYS open once there is a conversation — a thread the user
+   * can no longer see is worse than a wide column. The rail keeps the scope count on
+   * screen either way, because that readout is the feature's actual claim: this board,
+   * and nothing else, is what an answer may be built from. The empty transcript has no
+   * such claim to make, and it was spending a third of the width on three suggestion
+   * buttons.
+   */
+  private readonly _askOpen = signal(false);
+  readonly askExpanded = computed(() => this._askOpen() || this.turns().length > 0);
+
+  expandAsk(): void {
+    this._askOpen.set(true);
+  }
   readonly asking = signal(false);
   readonly draft = signal("");
   readonly sourceCount = signal(0);
@@ -365,8 +463,20 @@ export class DashboardViewComponent {
     this.draft.set("");
     this.turns.update((t) => [...t, { role: "user", text: question }]);
     this.asking.set(true);
+    // TWO different questions, and conflating them is a bug of its own.
+    //
+    // `owns()` guards DATA writes: an answer, an error, a source count belong to the
+    // board AND the request that asked for them. `current()` guards the BUSY flag,
+    // which is per-request only — gating the spinner on the board too means that after
+    // navigating away mid-flight nothing ever clears it, and the NEW board sits
+    // disabled forever waiting on a request that was never its own.
+    const boardId = this.id();
+    const token = ++this.askToken;
+    const current = () => this.askToken === token;
+    const owns = () => current() && this.id() === boardId;
     try {
-      const sources = await this.ipc.getDashboardSources(this.id());
+      const sources = await this.ipc.getDashboardSources(boardId);
+      if (!owns()) return;
       this.sourceCount.set(sources.length);
       if (sources.length === 0) {
         this.turns.update((t) => [
@@ -379,6 +489,8 @@ export class DashboardViewComponent {
         return;
       }
       const result = await this.ipc.askVault(question, this.askHistory(), undefined, sources);
+      // The answer belongs to the board — and the request — that asked for it.
+      if (!owns()) return;
       this.turns.update((t) => [
         ...t,
         {
@@ -388,12 +500,15 @@ export class DashboardViewComponent {
         },
       ]);
     } catch (e) {
+      if (!owns()) return;
       this.turns.update((t) => [
         ...t,
         { role: "error", text: this.errors.humanize(e, "generic"), retry: question },
       ]);
     } finally {
-      this.asking.set(false);
+      // The LATEST request clears the spinner, whichever board is on screen now. A
+      // superseded ask must not; a navigated-away one still must, or it never comes up.
+      if (current()) this.asking.set(false);
     }
   }
 

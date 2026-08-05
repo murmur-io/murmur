@@ -296,3 +296,25 @@
     color: var(--danger);
   }
 }
+
+// ── delete confirmation ──────────────────────────────────────────────────────
+// Armed, the destructive button says what it will do. Widening it is the point:
+// the second click must not land on muscle memory from the first.
+.icon-btn.is-confirming {
+  width: auto;
+  padding: 0 var(--space-2);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.confirm-word,
+.confirm-cancel {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.confirm-cancel {
+  width: auto;
+  padding: 0 var(--space-2);
+}
