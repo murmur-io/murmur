@@ -635,3 +635,20 @@
 
   .btn { margin-left: auto; }
 }
+
+// ── keyboard ─────────────────────────────────────────────────────────────────
+//
+// A tile's rows, numbers and body links are real `<button>`s, but they are
+// background-less by design, so a keyboard user had nothing to follow: the browser
+// ring lands on an element with no box of its own and reads as a stray outline.
+// One shared, token-driven ring on every interactive element in the tile.
+.body-link,
+.row-link,
+.number,
+.tool {
+  &:focus-visible {
+    outline: none;
+    border-radius: var(--radius-sm);
+    box-shadow: 0 0 0 2px var(--accent-ring);
+  }
+}
