@@ -7,6 +7,12 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 ## Recurring patterns
 <!-- Curated, binding. Keep ≤ ~20 bullets. -->
 
+- **A hypothesis you cannot falsify is not a diagnosis — build the instrument first.** Three of six
+  palette fixes rested on "`:modal` throws in the shipping WKWebView". Nobody could check, because
+  nothing here could run JS in that engine. `scripts/wkwebview-probe` now can, and the first thing
+  it did was DISPROVE that hypothesis in ten seconds (`:modal` does not throw; the cause was the
+  wire contract). When a report will not reproduce in your tools, the next move is to get a tool
+  that can see it — not a fourth variant of the same guess.
 - **When a fix does not hold, change the LAYER you are looking at — do not iterate inside it.** Six
   rounds went to the Add-tile palette's positioning (teleport, non-transform layout, native
   `<dialog>`, fallbacks) and the palette was never the bug: the tile payload shipped snake_case
