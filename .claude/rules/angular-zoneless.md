@@ -411,6 +411,28 @@ went to a real bug the tests structurally could not see.
    open. Without that, "the click never landed" and "the panel never painted" look identical from
    outside — and you cannot tell which half to fix.
 
+### T6 — a hand-written IPC mock DEFINES a contract; it does not verify one
+
+**The failure (2026-08-04, PR #566/#568).** Six rounds went to the Add-tile palette's positioning.
+The palette was never the bug. `TileData` shipped its variant fields in snake_case
+(`started_at` / `duration_s` / `has_audio`) while the FE read camelCase, so every field was
+`undefined`, the tile threw while rendering, and it took the board down with it.
+
+**Why the suite was blind.** Every `mockTauri` fixture in `e2e/` is hand-written TypeScript typed
+against the FE's own interface — so the fixtures were camelCase by construction and could not
+disagree with the FE. The e2e proved that the FE renders the shape the FE expects. It said nothing
+about the shape the backend sends, which is the only thing that was wrong.
+
+**Binding.**
+- A mock is a stand-in for the TRANSPORT, never for the CONTRACT. The contract is asserted on the
+  producing side — see `rust-tauri.md` §2b (assert serialized key names).
+- When a UI failure survives more than one fix, stop debugging the component and check the PAYLOAD
+  first: log/inspect one real IPC response and compare its keys with the interface. A field that is
+  `undefined` on screen and correct in the mock is a contract mismatch, not a rendering bug.
+- A tile/row renderer must not throw on a missing field. Formatters that take `string | number`
+  from IPC should tolerate `undefined` — one bad field killing the whole view is what turned a
+  naming mismatch into "the palette does not open".
+
 ---
 
 ## Quality gate (a change is not done until these are green)
