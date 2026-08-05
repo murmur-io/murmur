@@ -478,7 +478,11 @@ export class DashboardViewComponent {
       const sources = await this.ipc.getDashboardSources(boardId);
       if (!owns()) return;
       this.sourceCount.set(sources.length);
-      if (sources.length === 0) {
+      // An empty SOURCE list no longer means an empty board. Derived tiles are never
+      // `SourceRef`s, and sealed material tiles resolve to no readable source either.
+      // Presence of ANY stored tile therefore keeps the board scope alive and lets
+      // the backend's empty-but-present path prevent a vault-wide fallback.
+      if (sources.length === 0 && this.tiles().length === 0) {
         this.turns.update((t) => [
           ...t,
           {
@@ -488,7 +492,17 @@ export class DashboardViewComponent {
         ]);
         return;
       }
-      const result = await this.ipc.askVault(question, this.askHistory(), undefined, sources);
+      const result = await this.ipc.askVault(
+        question,
+        this.askHistory(),
+        undefined,
+        sources,
+        undefined,
+        // The BOARD, so the backend can render its derived tiles into the prompt.
+        // An id, never the finished text: handing the FE a string to inject would be
+        // a new injection surface and would build content outside the gate.
+        boardId,
+      );
       // The answer belongs to the board — and the request — that asked for it.
       if (!owns()) return;
       this.turns.update((t) => [
