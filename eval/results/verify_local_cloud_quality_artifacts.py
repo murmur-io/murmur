@@ -9,7 +9,9 @@ import copy
 import gzip
 import hashlib
 import json
+import lzma
 import re
+import zlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,12 +27,59 @@ RETRIEVAL_FIXTURE_SOURCE = Path(
     "src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json"
 )
 RETRIEVAL_CORPUS_SOURCE = Path("src-tauri/src/eval/corpus.rs")
+BASELINE_BUNDLE = RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-baseline-raw.json.xz"
+DECISION_BUNDLE = RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-decision-raw.json.xz"
+HISTORY_CONTENT_INVENTORY = (
+    RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-history-content-inventory.json"
+)
 
 FINAL_EVIDENCE_SHA256 = "73eb8325bf536dc0e5c47ad739502b853fb37722c82f362b080884dac9de6c44"
 FINAL_FIXTURE_SHA256 = "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2"
 FINAL_CONTENT_INVENTORY_SHA256 = (
     "5ce634a6bff61e48fdbcec19b2c08bf91f3aaae29c78d8028ac79d8679afac28"
 )
+BASELINE_BUNDLE_SHA256 = "05f248da2a6e1104b9311d2fd21422c9dc2af10c1cf0492472812295509f2186"
+DECISION_BUNDLE_SHA256 = "18521020093fe4c3f1d39027e319fd4e9dea8ee9758464c48b7e0bb81349a5ed"
+DECISION_COMBINED_SHA256 = "a024c257ae79939a61879c54db02c3f845d2c46286b567fff443d925f00c72d5"
+BASELINE_RESCORE_SHA256 = {
+    "r1": "259b709e720183d12aaba4f02b08d817e7a42c83fa2369eb89f457726b60c672",
+    "r2": "ece5e953fd3ad45fe74a713948f7504f7ec30c26f677e3bbe6671d3e3ca1a101",
+}
+HISTORY_MEMBER_HASHES = {
+    "baseline/r1": (
+        "9b1cbf49733995f3469463ee40cf03993eadb49042d5dcd748692b394d807338",
+        "9a87f49f7cd00601c4b60ff005d0b91e0e810c4bf47c03fdc7454781266e405c",
+    ),
+    "baseline/r2": (
+        "bcddce863367cdbe08e62ec9345b94700bd5a7b8ebf1c3a67a8b848c7931bf7e",
+        "bd63cbb603710234ae0dc2871e6f6fd0013d8ba44ab2c191738fb480fcc93239",
+    ),
+    "decision/r1": (
+        "451e7ccb431d4e972c4c4afa10936bd4b3b837602e4a9866d7aaf0b70e2147d3",
+        "98fa05e44040844180ceeeab69435b1845571fc072667438b48b70c5957ff205",
+    ),
+    "decision/r2": (
+        "c244bfa9705c90a26a9ebaee285c062603e60108124896566e1bd0432958c5c5",
+        "be61472521be4e3eccef681b1b7f0f31fa48c8c7efe2ff5575b4a77a4c0e0203",
+    ),
+}
+HISTORY_CONTENT_INVENTORY_SHA256 = (
+    "e501da20b98123b82e2c38ee74a6d22a553b4ccc4594eccd8ae69890d071c5a2"
+)
+HISTORY_SCHEMA_SHA256 = {
+    "baseline/r1": "8809cb885cfc6f849271464111d4258274ae537893fde109306b45bde6509e08",
+    "baseline/r2": "75b86d906d5d88eecb2d9ddb8112d50471ee506bae67abb191729b4dbf00e2ce",
+    "decision/r1": "799795d0cf954e961340508eb135fef770f3de1c852d4e8728db28544b858754",
+    "decision/r2": "a6ba467b726477bab4200cc4844710655affe9077dbdb3797627ae04a3729b28",
+}
+HISTORY_TEXT_SHA256 = {
+    "baseline/r1": "f01fe02944b657d98a17a414b40e9424e048482d21615e96e577cbbbb12ad7dd",
+    "baseline/r2": "6eff56d30a7975851223e7431a79b4a5727186e9c7a84bd445fad6ec38d2ed61",
+    "decision/r1": "a790690d380590583ee334090937dd8b25b1eca38f870c5a6c78cdaa702a42ff",
+    "decision/r2": "0663940fca79b7c33ea0b7154114745519a248749a95662e7d36cf5e061d5a60",
+}
+MAX_GZIP_ARCHIVE_BYTES = 2 * 1024 * 1024
+MAX_GZIP_LOGICAL_BYTES = 8 * 1024 * 1024
 FINAL_REPETITIONS = {
     "1": {
         "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1.json.gz",
@@ -69,6 +118,24 @@ FINAL_CASE_IDS = {
     "summary-pl-kestrel",
     "summary-pl-lumen-holdout",
 } | {f"retrieval-{index:02d}" for index in range(1, 21)}
+BASELINE_CASE_LANGUAGES = {
+    "ask-vault-en-quartz-holdout": "en",
+    "ask-vault-pl-orchid": "pl",
+    "live-bullets-pl-polaris": "pl",
+    "live-current-en-nimbus": "en",
+    "live-current-pl-ember-holdout": "pl",
+    "meeting-chat-en-fjord-holdout": "en",
+    "meeting-chat-pl-delta": "pl",
+    "note-popup-actions-en-holdout": "en",
+    "note-popup-actions-pl": "pl",
+    "note-popup-decisions-en": "en",
+    "note-popup-fact-check-pl": "pl",
+    "note-popup-refine-pl": "pl",
+    "note-popup-shorten-en": "en",
+    "summary-en-cedar": "en",
+    "summary-pl-kestrel": "pl",
+    "summary-pl-lumen-holdout": "pl",
+}
 
 # These are commitments to the complete, invented fixture payloads, not hashes
 # of model output.  Keeping the language and synthetic entity inventory beside
@@ -889,14 +956,26 @@ def validate_gzip(
     require(is_sha256(archive_sha256), f"{label}: invalid archive SHA-256")
     require(is_sha256(logical_sha256), f"{label}: invalid logical SHA-256")
     require(sha256(archive) == archive_sha256, f"{label}: archive SHA-256 differs")
+    require(len(archive) <= MAX_GZIP_ARCHIVE_BYTES, f"{label}: gzip archive exceeds size limit")
     require(len(archive) >= 10, f"{label}: truncated gzip header")
-    require(archive[:3] == b"\x1f\x8b\x08", f"{label}: invalid gzip magic/method")
-    require(archive[3] == 0, f"{label}: gzip flags must be zero")
-    require(archive[4:8] == b"\x00\x00\x00\x00", f"{label}: gzip mtime must be zero")
+    require(
+        archive[:10] == b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03",
+        f"{label}: gzip header must be deterministic",
+    )
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
     try:
-        logical = gzip.decompress(archive)
-    except (EOFError, OSError) as exc:
+        logical = decompressor.decompress(archive, MAX_GZIP_LOGICAL_BYTES + 1)
+        require(
+            len(logical) <= MAX_GZIP_LOGICAL_BYTES,
+            f"{label}: logical JSON exceeds size limit",
+        )
+        logical += decompressor.flush(MAX_GZIP_LOGICAL_BYTES - len(logical) + 1)
+    except zlib.error as exc:
         raise ArtifactError(f"{label}: gzip decompression failed") from exc
+    require(len(logical) <= MAX_GZIP_LOGICAL_BYTES, f"{label}: logical JSON exceeds size limit")
+    require(decompressor.eof, f"{label}: incomplete gzip stream")
+    require(not decompressor.unused_data, f"{label}: concatenated/trailing gzip data forbidden")
+    require(not decompressor.unconsumed_tail, f"{label}: unconsumed gzip data forbidden")
     require(sha256(logical) == logical_sha256, f"{label}: logical SHA-256 differs")
     report = load_object(logical, f"{label} logical JSON")
     require(report.get("syntheticOnly") is True, f"{label}: syntheticOnly must be true")
@@ -1065,6 +1144,215 @@ def validate_final() -> None:
     scan_privacy(combined_bytes, "final combined")
 
 
+def validate_history_case_inventory(
+    report: dict[str, Any],
+    expected_languages: dict[str, str],
+    label: str,
+) -> None:
+    require(case_ids(report) == set(expected_languages), f"{label}: case IDs differ")
+    for record in walk_objects(report):
+        case_id = record.get("caseId")
+        if case_id is None:
+            continue
+        require(case_id in expected_languages, f"{label}: unexpected case ID")
+        if "language" in record:
+            require(
+                record["language"] == expected_languages[case_id],
+                f"{label}: case language differs",
+            )
+
+
+def validate_history_envelope(
+    bundle: dict[str, Any],
+    bundle_name: str,
+    expected_kind: str,
+    derived_field: str,
+    expected_derived: Any,
+) -> dict[str, dict[str, Any]]:
+    require(
+        set(bundle) == {"schemaVersion", "kind", "encoding", "members", derived_field},
+        f"{bundle_name}: outer schema differs",
+    )
+    require(bundle.get("schemaVersion") == 2, f"{bundle_name}: schema differs")
+    require(bundle.get("kind") == expected_kind, f"{bundle_name}: kind differs")
+    require(
+        bundle.get("encoding")
+        == "xz_lzma2_preset_9_over_compact_json_with_base64_gzip_members",
+        f"{bundle_name}: encoding differs",
+    )
+    require(bundle.get(derived_field) == expected_derived, f"{bundle_name}: derived hash differs")
+    members = bundle.get("members")
+    require(
+        isinstance(members, dict) and set(members) == {"r1", "r2"},
+        f"{bundle_name}: members must be exactly r1 and r2",
+    )
+    reports: dict[str, dict[str, Any]] = {}
+    sanitized = copy.deepcopy(bundle)
+    for repetition in ("r1", "r2"):
+        label = f"{bundle_name}/{repetition}"
+        member = members[repetition]
+        require(
+            isinstance(member, dict)
+            and set(member) == {"archiveSha256", "logicalSha256", "archiveBase64"},
+            f"{label}: member schema differs",
+        )
+        expected_archive_sha256, expected_logical_sha256 = HISTORY_MEMBER_HASHES[label]
+        require(
+            member.get("archiveSha256") == expected_archive_sha256,
+            f"{label}: fixed archive hash differs",
+        )
+        require(
+            member.get("logicalSha256") == expected_logical_sha256,
+            f"{label}: fixed logical hash differs",
+        )
+        encoded = member.get("archiveBase64")
+        require(isinstance(encoded, str), f"{label}: archiveBase64 must be text")
+        try:
+            archive = base64.b64decode(encoded, validate=True)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactError(f"{label}: invalid base64") from exc
+        require(
+            base64.b64encode(archive).decode("ascii") == encoded,
+            f"{label}: base64 must be canonical",
+        )
+        _, report = validate_gzip(
+            archive,
+            expected_archive_sha256,
+            expected_logical_sha256,
+            label,
+        )
+        expected_schema = 3 if bundle_name == "baseline" else 8
+        require(report.get("schemaVersion") == expected_schema, f"{label}: report schema differs")
+        require(report.get("syntheticOnly") is True, f"{label}: syntheticOnly must be true")
+        require(
+            canonical_sha256(schema_inventory(report)) == HISTORY_SCHEMA_SHA256[label],
+            f"{label}: closed schema commitment differs",
+        )
+        require(
+            canonical_sha256(text_inventory(report)) == HISTORY_TEXT_SHA256[label],
+            f"{label}: path/text commitment differs",
+        )
+        if bundle_name == "baseline":
+            validate_history_case_inventory(report, BASELINE_CASE_LANGUAGES, label)
+            require(
+                not any(key == "casePayloadSha256" for key, _ in walk_json(report)),
+                f"{label}: baseline unexpectedly claims case payload hashes",
+            )
+        else:
+            decision_languages = {
+                case_id: oracle[0]
+                for case_id, oracle in GENERATION_FIXTURE_ORACLE.items()
+            } | {
+                case_id: oracle[0]
+                for case_id, oracle in RETRIEVAL_FIXTURE_ORACLE.items()
+            }
+            validate_history_case_inventory(report, decision_languages, label)
+            validate_fixture_commitments(report, label)
+        reports[label] = report
+        sanitized["members"][repetition]["archiveBase64"] = (
+            "<validated exact synthetic gzip member>"
+        )
+    scan_privacy(
+        json.dumps(sanitized, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        f"{bundle_name} envelope",
+    )
+    return reports
+
+
+def validate_history_bundle(
+    relative: Path,
+    expected_sha256: str,
+    bundle_name: str,
+    expected_kind: str,
+    derived_field: str,
+    expected_derived: Any,
+) -> dict[str, dict[str, Any]]:
+    archive = read_repository_file(relative)
+    require(sha256(archive) == expected_sha256, f"{bundle_name}: XZ SHA-256 differs")
+    require(len(archive) <= MAX_GZIP_ARCHIVE_BYTES, f"{bundle_name}: XZ archive too large")
+    require(archive[:6] == b"\xfd7zXZ\x00", f"{bundle_name}: invalid XZ magic")
+    try:
+        logical = lzma.decompress(archive, format=lzma.FORMAT_XZ)
+    except lzma.LZMAError as exc:
+        raise ArtifactError(f"{bundle_name}: XZ decompression failed") from exc
+    require(len(logical) <= MAX_GZIP_LOGICAL_BYTES, f"{bundle_name}: XZ logical JSON too large")
+    require(
+        lzma.compress(
+            logical,
+            format=lzma.FORMAT_XZ,
+            check=lzma.CHECK_CRC64,
+            preset=9,
+        )
+        == archive,
+        f"{bundle_name}: XZ bytes are not deterministic Python LZMA2 preset 9",
+    )
+    bundle = load_object(logical, f"{bundle_name} envelope")
+    return validate_history_envelope(
+        bundle,
+        bundle_name,
+        expected_kind,
+        derived_field,
+        expected_derived,
+    )
+
+
+def validate_history_content_inventory(
+    reports: dict[str, dict[str, Any]],
+) -> None:
+    inventory_bytes = read_repository_file(HISTORY_CONTENT_INVENTORY)
+    require(
+        sha256(inventory_bytes) == HISTORY_CONTENT_INVENTORY_SHA256,
+        "history content inventory: SHA-256 differs",
+    )
+    inventory = load_object(inventory_bytes, "history content inventory")
+    strings: list[str] = []
+    counts: dict[str, int] = {}
+    for label in sorted(reports):
+        report_inventory = text_inventory(reports[label])
+        counts[label] = len(report_inventory)
+        strings.extend(value for _, value in report_inventory)
+    expected = {
+        "schemaVersion": 1,
+        "kind": "murmur_synthetic_quality_history_all_string_inventory",
+        "syntheticOnly": True,
+        "memberLogicalSha256": {
+            label: HISTORY_MEMBER_HASHES[label][1]
+            for label in sorted(HISTORY_MEMBER_HASHES)
+        },
+        "pathAndOccurrenceCommitmentSha256ByMember": {
+            label: HISTORY_TEXT_SHA256[label]
+            for label in sorted(HISTORY_TEXT_SHA256)
+        },
+        "stringLeafCountByMember": counts,
+        "uniqueStringCount": len(set(strings)),
+        "uniqueStrings": sorted(set(strings)),
+    }
+    require(inventory == expected, "history content inventory: decoded binding differs")
+    scan_privacy(inventory_bytes, "history content inventory")
+
+
+def validate_history() -> None:
+    reports = validate_history_bundle(
+        BASELINE_BUNDLE,
+        BASELINE_BUNDLE_SHA256,
+        "baseline",
+        "murmur_quality_initial_baseline_raw_archive_bundle",
+        "removedDerivedRescoreSha256",
+        BASELINE_RESCORE_SHA256,
+    )
+    reports.update(
+        validate_history_bundle(
+            DECISION_BUNDLE,
+            DECISION_BUNDLE_SHA256,
+            "decision",
+            "murmur_quality_pre_routing_decision_raw_archive_bundle",
+            "removedDerivedCombinedSha256",
+            DECISION_COMBINED_SHA256,
+        )
+    )
+    validate_history_content_inventory(reports)
+
+
 def expect_failure(action: Callable[[], None], label: str) -> None:
     try:
         action()
@@ -1202,21 +1490,96 @@ def run_selftests() -> None:
     )
 
 
+def run_history_selftests() -> None:
+    baseline_outer = load_object(
+        lzma.decompress(read_repository_file(BASELINE_BUNDLE), format=lzma.FORMAT_XZ),
+        "selftest baseline envelope",
+    )
+    extra_member = copy.deepcopy(baseline_outer)
+    extra_member["members"]["r3"] = copy.deepcopy(extra_member["members"]["r1"])
+    expect_failure(
+        lambda: validate_history_envelope(
+            extra_member,
+            "baseline",
+            "murmur_quality_initial_baseline_raw_archive_bundle",
+            "removedDerivedRescoreSha256",
+            BASELINE_RESCORE_SHA256,
+        ),
+        "a third historical bundle member",
+    )
+    displaced_base64 = copy.deepcopy(baseline_outer)
+    displaced_base64["payload"] = displaced_base64["members"]["r1"]["archiveBase64"]
+    expect_failure(
+        lambda: validate_history_envelope(
+            displaced_base64,
+            "baseline",
+            "murmur_quality_initial_baseline_raw_archive_bundle",
+            "removedDerivedRescoreSha256",
+            BASELINE_RESCORE_SHA256,
+        ),
+        "archiveBase64 outside the two fixed member paths",
+    )
+    noncanonical_base64 = copy.deepcopy(baseline_outer)
+    noncanonical_base64["members"]["r1"]["archiveBase64"] += "\n"
+    expect_failure(
+        lambda: validate_history_envelope(
+            noncanonical_base64,
+            "baseline",
+            "murmur_quality_initial_baseline_raw_archive_bundle",
+            "removedDerivedRescoreSha256",
+            BASELINE_RESCORE_SHA256,
+        ),
+        "noncanonical historical base64",
+    )
+    original_archive = base64.b64decode(
+        baseline_outer["members"]["r1"]["archiveBase64"],
+        validate=True,
+    )
+    expect_failure(
+        lambda: validate_gzip(
+            original_archive + original_archive,
+            sha256(original_archive + original_archive),
+            HISTORY_MEMBER_HASHES["baseline/r1"][1],
+            "selftest concatenated gzip",
+        ),
+        "concatenated gzip members",
+    )
+    expect_failure(
+        lambda: scan_privacy(
+            b'{"output":"private.person@example.com"}',
+            "selftest decoded historical PII",
+        ),
+        "PII in a decoded historical member",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--final", action="store_true", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--final", action="store_true")
+    mode.add_argument("--history", action="store_true")
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
 
     try:
-        validate_final()
-        print(
-            "final quality artifacts verified: deterministic gzip, archive/logical/combined "
-            "hashes, closed PL/EN source/fixture/text/schema commitments, human-readable "
-            "content inventory, repetition bindings, producer commitments, and privacy scan"
-        )
+        if args.final:
+            validate_final()
+            print(
+                "final quality artifacts verified: deterministic gzip, archive/logical/combined "
+                "hashes, closed PL/EN source/fixture/text/schema commitments, human-readable "
+                "content inventory, repetition bindings, producer commitments, and privacy scan"
+            )
+        else:
+            validate_history()
+            print(
+                "historical quality artifacts verified: deterministic XZ, exact two-member gzip "
+                "archives, closed case/schema/text commitments, human-readable all-string "
+                "inventory, derived hashes, and privacy scan"
+            )
         if args.selftest:
             run_selftests()
+            if args.history:
+                run_history_selftests()
             print("quality artifact verifier selftests passed")
     except ArtifactError as exc:
         print(f"quality artifact verification failed: {exc}")
