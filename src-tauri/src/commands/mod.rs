@@ -1610,10 +1610,8 @@ fn spawn_recording_terminal_watchdog(app: AppHandle, meeting_id: String) {
                     return;
                 }
                 let mic_is_muted = active.is_muted();
-                if crate::audio::system::mic_must_be_restored(
-                    mic_is_muted,
-                    active.system.as_mut(),
-                ) {
+                if crate::audio::system::mic_must_be_restored(mic_is_muted, active.system.as_mut())
+                {
                     // The helper was healthy when mute was accepted but can fail later. Restore
                     // the mic within this backend-owned 100 ms heartbeat; renderer health is not
                     // required, so a hidden/reloaded webview cannot leave the recording silent.
@@ -3102,12 +3100,7 @@ fn note_doc_from_row(row: &crate::storage::db::NoteRow) -> NoteDoc {
 
 /// The MASKED (sealed-not-unlocked) editor DTO: identity + timestamps only, NO body/title/tags —
 /// the topic never leaks. Mirrors the masked meeting-detail DTO.
-fn masked_note_doc(
-    id: &str,
-    folder_id: &str,
-    created_at: i64,
-    updated_at: Option<i64>,
-) -> NoteDoc {
+fn masked_note_doc(id: &str, folder_id: &str, created_at: i64, updated_at: Option<i64>) -> NoteDoc {
     NoteDoc {
         id: id.to_string(),
         title: "🔒 Locked".into(),
@@ -4428,6 +4421,12 @@ pub(crate) fn get_person_dossier_inner(
 /// original error/consent semantics. `ask_thread_id` (FE camelCase `askThreadId`) is the OPTIONAL
 /// thread identity stamped on every trace chip; absent ⇒ backend-generated (UUID v4).
 #[tauri::command]
+// Same cohesive-surface exemption the two functions it delegates to already carry
+// (`ask_vault_floor`, `build_ask_vault_floor_prompt`): these are one gated-Ask
+// parameter set — question, history, thread identity, and the three mutually
+// exclusive SCOPE pins (explicit sources / org item / board). Bundling them into a
+// struct would hide which pins are exclusive without removing a single one.
+#[allow(clippy::too_many_arguments)]
 pub async fn ask_vault(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -4440,6 +4439,14 @@ pub async fn ask_vault(
     // path is used and the item is packed FIRST, gated by `get_org_item` (tombstoned/disabled-org
     // ⇒ nothing). FE camelCase `pinnedOrgItemId`. `None`/empty ⇒ byte-identical to before.
     pinned_org_item_id: Option<String>,
+    // The BOARD this question was asked from. Present ⇒ its DERIVED tiles (promises, drift,
+    // pulse, reminders, person, living answer) are rendered as a labelled brief and prepended to
+    // the pinned corpus — the tiles the user is looking at, which `get_dashboard_sources`
+    // deliberately never turns into `SourceRef`s because a drift lane is not a retrievable
+    // document. An ID, never the finished text: the FE handing a string straight into a prompt
+    // would be a new injection surface and would generate content outside the gate.
+    // FE camelCase `dashboardId`. `None`/empty ⇒ byte-identical to before.
+    dashboard_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -4464,8 +4471,22 @@ pub async fn ask_vault(
     // BYTE-IDENTICAL to before.
     let pinned_sources = explicit_sources.filter(|s| !s.is_empty());
     let pinned_org = pinned_org_item_id.filter(|s| !s.trim().is_empty());
-    if pinned_sources.is_some() || pinned_org.is_some() {
-        let unlocked = unlocked_snapshot(state.inner())?;
+    // A BOARD is a scope in its own right. Gating this on `pinned_sources` alone meant a
+    // board whose tiles are ALL derived — a Promise ledger and nothing else, which is
+    // precisely the case this exists for — produced an empty source list, missed the
+    // floor entirely, and fell through to a vault-wide search with its board id silently
+    // dropped. Review caught it; the motivating scenario was the one still broken.
+    let board_id = dashboard_id.filter(|s| !s.trim().is_empty());
+    if pinned_sources.is_some() || pinned_org.is_some() || board_id.is_some() {
+        // Snapshot AND resolve under ONE guard, exactly as `get_dashboard` does. Sharing
+        // the caller's snapshot is not enough on its own: it prevents a second, later
+        // snapshot but does not serialize against a relock landing between the snapshot
+        // and `resolve_tile`. The later `require_current_content_visibility_snapshot`
+        // cannot cover that window either — it runs AFTER the provider call, so it
+        // suppresses the RESULT, not the disclosure. The guard is dropped before the
+        // await below; it is held only for the reads it has to bracket.
+        let (unlocked, board_brief) =
+            board_scoped_floor_inputs(state.inner(), &config, board_id.as_deref())?;
         let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
         let reranker = crate::rerank::active_reranker(
             state
@@ -4483,6 +4504,7 @@ pub async fn ask_vault(
             &state.heavy_inference,
             pinned_sources,
             pinned_org,
+            board_brief.as_deref(),
         )
         .await?;
         require_current_content_visibility_snapshot(state.inner(), visibility)?;
@@ -4540,6 +4562,7 @@ pub async fn ask_vault(
         &state.heavy_inference,
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
         None, // …and no pinned org item — this is the vault-wide fallthrough.
+        None, // …and no board: a board-scoped ask never reaches this branch.
     )
     .await?;
     require_current_content_visibility_snapshot(state.inner(), visibility)?;
@@ -4563,7 +4586,49 @@ pub(crate) enum AskFloorPrompt {
 /// completion, with the original error/consent semantics (`make_provider`'s fail-closed consent
 /// gate errors exactly as before). Runs on the local/off brain backend and whenever the agentic
 /// attempt did not converge or errored.
-#[allow(clippy::too_many_arguments)] // cohesive gated-Ask surface: corpus/consent state + the heavy-inference permit.
+/// The session snapshot and the board brief, both taken under ONE `lifecycle_guard`.
+///
+/// Extracted so the ORDERING is executed by a test rather than read from a diff.
+/// Sharing the caller's snapshot is not sufficient on its own: it prevents a second,
+/// later snapshot, but only the guard serializes against a relock landing between the
+/// snapshot and the last `resolve_tile`. The later
+/// `require_current_content_visibility_snapshot` cannot cover that window either —
+/// it runs AFTER the provider call, so it suppresses the RESULT, not the disclosure.
+///
+/// The guard is released with the returned tuple, before any `.await`.
+pub(crate) fn board_scoped_floor_inputs(
+    state: &AppState,
+    config: &AppConfig,
+    dashboard_id: Option<&str>,
+) -> Result<(std::collections::HashSet<String>, Option<String>), AppError> {
+    with_board_scoped_floor_inputs(state, |unlocked| {
+        // The SAME budget the corpus is packed against, resolved from the ASK role's
+        // connection exactly as `build_ask_vault_floor_prompt` does — so the brief's share
+        // is a documented fraction of ONE budget, not a second, unrelated cap.
+        let ask_conn =
+            crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
+                .connection;
+        let budget = crate::summarize::vault_context::budget_for(&ask_conn);
+        crate::commands::dashboards::board_scoped_brief(&state.db, dashboard_id, unlocked, budget)
+    })
+}
+
+/// Execute a board-input resolver inside the same lifecycle interval as its unlock snapshot.
+/// Kept separate so the serialization property has a deterministic two-thread oracle.
+pub(crate) fn with_board_scoped_floor_inputs<T>(
+    state: &AppState,
+    resolve: impl FnOnce(&std::collections::HashSet<String>) -> Result<T, AppError>,
+) -> Result<(std::collections::HashSet<String>, T), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let unlocked = unlocked_snapshot(state)?;
+    let resolved = resolve(&unlocked)?;
+    Ok((unlocked, resolved))
+}
+
+// Same cohesive-surface exemption `ask_vault` and `build_ask_vault_floor_prompt` carry:
+// one gated-Ask parameter set, whose three SCOPE pins are mutually exclusive. Bundling
+// them into a struct would hide that exclusivity without removing an argument.
+#[allow(clippy::too_many_arguments)]
 async fn ask_vault_floor(
     db: &std::sync::Arc<crate::storage::Db>,
     config: &AppConfig,
@@ -4575,6 +4640,10 @@ async fn ask_vault_floor(
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
+    // The board's derived tiles, already gated and rendered. `None` for every
+    // non-board caller, which keeps the packed prompt byte-identical for them;
+    // `Some("")` is a board that scopes the ask but has nothing readable to show.
+    board_brief: Option<&str>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -4591,6 +4660,7 @@ async fn ask_vault_floor(
     let question_owned = question.to_string();
     let history_owned = history.to_vec();
     let memory_brief_owned = memory_brief.to_string();
+    let board_brief_owned = board_brief.map(str::to_string);
     let prompt = tokio::task::spawn_blocking(move || {
         build_ask_vault_floor_prompt(
             &db_for_prompt,
@@ -4602,6 +4672,7 @@ async fn ask_vault_floor(
             reranker.as_deref(),
             explicit_sources.as_deref(),
             pinned_org_item_id.as_deref(),
+            board_brief_owned.as_deref(),
         )
     })
     .await
@@ -6591,11 +6662,9 @@ fn move_into_locked_folder_under_lifecycle(
 
     // Reassign every provider row and install the verified image seals in the same transaction.
     bump_seal_epoch(state);
-    state.db.move_meeting_with_attachments_sealed(
-        meeting_id,
-        folder_id,
-        &attachment_seals,
-    )?;
+    state
+        .db
+        .move_meeting_with_attachments_sealed(meeting_id, folder_id, &attachment_seals)?;
     seal_moved_note(state, folder_id, meeting_id, &ck)?;
 
     // The destination folder is SESSION-UNLOCKED (checked above), so the moved note MUST be READABLE
@@ -6897,9 +6966,7 @@ fn seal_moved_note(
     }
     ensure_no_external_edit_siblings(exported_paths.iter().map(|(_, path)| path))?;
     for (provider_id, path) in &exported_paths {
-        let expected = state
-            .db
-            .get_note_exported_hash(meeting_id, provider_id)?;
+        let expected = state.db.get_note_exported_hash(meeting_id, provider_id)?;
         remove_note_export_if_unchanged(
             path,
             expected.as_deref(),
@@ -7079,8 +7146,7 @@ pub(crate) fn ensure_no_active_salvage_for_meeting(
         .contains(meeting_id)
     {
         return Err(AppError::Locked(
-            "this meeting has a transcription recovery in progress — wait for it to finish"
-                .into(),
+            "this meeting has a transcription recovery in progress — wait for it to finish".into(),
         ));
     }
     Ok(())
@@ -7259,7 +7325,9 @@ pub(crate) fn prepare_folder_exports_before_relock(
     )?;
     for attachment in attachments {
         if attachment.exported_path.is_some() {
-            state.db.set_attachment_exported_path(&attachment.id, None)?;
+            state
+                .db
+                .set_attachment_exported_path(&attachment.id, None)?;
         }
     }
     Ok(())
@@ -8388,9 +8456,7 @@ pub(crate) fn reexport_stripped_marker_sources(state: &AppState, sources: &[(boo
                     tracing::warn!(target: "links", meeting_id = %source_id, error = %e, "marker-strip .md re-export: note read failed")
                 }
             }
-        } else if let Err(e) =
-            export_note_to_vault_under_lifecycle_authorized(state, source_id)
-        {
+        } else if let Err(e) = export_note_to_vault_under_lifecycle_authorized(state, source_id) {
             // Note-doc source: the gate inside is satisfied (a stripped source is VISIBLE by
             // construction — the strip skips sealed-at-rest sources).
             tracing::warn!(target: "links", note_id = %source_id, error = %e, "marker-strip .md re-export (note) failed");
