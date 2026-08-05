@@ -421,3 +421,40 @@ test("Dashboards: renaming with no emoji clears the old one", async ({ page }) =
   expect(sent.title).toBe("Plain name");
   expect(sent.emoji).toBe("");
 });
+
+test("Dashboards: deleting a board takes two clicks, and the first one is reversible", async ({
+  page,
+}) => {
+  // A board is the one artifact in this feature the user BUILT rather than recorded,
+  // and delete fired straight through on a single click with no undo.
+  await mockTauri(
+    page,
+    {
+      delete_dashboard: () => {
+        (globalThis as any).__deleted = ((globalThis as any).__deleted ?? 0) + 1;
+        return true;
+      },
+    },
+    { list_dashboards: BOARDS, get_dashboard: BOARD_DETAIL, get_dashboard_sources: [] },
+  );
+
+  await page.goto("/dashboards");
+  const card = page.locator(".board-card").first();
+
+  // FIRST click arms — it must not delete.
+  await card.getByRole("button", { name: /^Delete / }).click();
+  await expect(card.getByRole("button", { name: /^Confirm delete / })).toBeVisible();
+  expect(await page.evaluate(() => (globalThis as any).__deleted ?? 0)).toBe(0);
+
+  // Backing out leaves the board alone…
+  await card.getByRole("button", { name: /^Keep / }).click();
+  await expect(card.getByRole("button", { name: /^Delete / })).toBeVisible();
+  expect(await page.evaluate(() => (globalThis as any).__deleted ?? 0)).toBe(0);
+
+  // …and only the SECOND click on an armed button actually deletes.
+  await card.getByRole("button", { name: /^Delete / }).click();
+  await card.getByRole("button", { name: /^Confirm delete / }).click();
+  await expect
+    .poll(() => page.evaluate(() => (globalThis as any).__deleted ?? 0))
+    .toBe(1);
+});
