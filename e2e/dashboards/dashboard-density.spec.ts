@@ -2,6 +2,23 @@ import { expect, test } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
+ * Open the Ask column. It starts collapsed to a rail — the scope count stays on
+ * screen, the empty transcript does not — so any test that types a question expands
+ * it first, which is the same click a user makes.
+ */
+async function openAsk(page: import("@playwright/test").Page): Promise<void> {
+  // Wait for the panel to EXIST before deciding. A bare `count()` races Angular's
+  // first render and silently no-ops, which then surfaces as a `fill` timeout on a
+  // field that was never revealed.
+  const panel = page.locator("aside.ask");
+  await panel.waitFor();
+  const rail = panel.locator("button.ask-rail");
+  if (await rail.count()) await rail.click();
+  await page.getByRole("textbox", { name: /Ask a question/i }).waitFor();
+}
+
+
+/**
  * Dashboards — the DENSITY oracle (Phase 1 of the 2026-08-04 rebuild).
  *
  * These are RED-before-GREEN tests for a bug that had no failing check: a real
@@ -204,6 +221,7 @@ test("Dashboards: a failed Ask is a banner with a retry, not a grey bubble that 
   );
 
   await page.goto("/dashboards/b-dense");
+  await openAsk(page);
   await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is late?");
   await page.getByRole("button", { name: "Ask", exact: true }).click();
 
@@ -234,6 +252,7 @@ test("Dashboards: an answer renders as markdown, not as literal asterisks", asyn
   );
 
   await page.goto("/dashboards/b-dense");
+  await openAsk(page);
   await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is the risk?");
   await page.getByRole("button", { name: "Ask", exact: true }).click();
 
@@ -292,4 +311,190 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
 
   // The row is rendered ONCE on the board, not twice.
   await expect(page.getByText("Send the Acme paperwork")).toHaveCount(1);
+});
+
+test("Dashboards: the Ask column is a rail until it has something to say", async ({ page }) => {
+  // The scope readout is the feature's claim made visible, so it stays on screen; the
+  // empty transcript is not, and it was spending a third of the width on three
+  // suggestion buttons.
+  await mockTauri(
+    page,
+    { ask_vault: () => ({ answer: "Two are late.", sources: [], citations: [] }) },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [{ kind: "note", id: "n-1" }],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  const ask = page.locator("aside.ask");
+  await expect(ask).toHaveClass(/is-rail/);
+  // …and the count is still readable while collapsed.
+  await expect(ask.getByText(/in scope/)).toBeVisible();
+  const railWidth = (await ask.boundingBox())!.width;
+  expect(railWidth).toBeLessThan(60);
+
+  await ask.getByRole("button", { name: /Ask this board/ }).click();
+  await expect(ask).not.toHaveClass(/is-rail/);
+  // The width TRANSITIONS, so a single read lands mid-animation. Poll instead of
+  // measuring once — and the composer being reachable is the real invariant anyway.
+  await expect(page.getByRole("textbox", { name: /Ask a question/i })).toBeVisible();
+  await expect
+    .poll(async () => (await ask.boundingBox())!.width)
+    .toBeGreaterThan(railWidth * 3);
+
+  // Once there is a conversation it STAYS open — a thread you cannot see is worse
+  // than a wide column.
+  await openAsk(page);
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("who is late?");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await expect(page.getByText("Two are late.")).toBeVisible();
+  await expect(ask).not.toHaveClass(/is-rail/);
+});
+
+test("Dashboards: a board can be renamed, and a leading emoji becomes its emoji", async ({
+  page,
+}) => {
+  // `DashboardsService.update` shipped accepting title/emoji/tint and the only caller
+  // ever passed `{pinned}` — so a board named the wrong thing stayed named the wrong
+  // thing, and the `emoji` column plus six SCSS tint mappings were dead code.
+  await mockTauri(
+    page,
+    {
+      update_dashboard: (args: any) => {
+        (globalThis as any).__updateArgs = args;
+        return null;
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await page.getByRole("button", { name: /Rename this board/i }).click();
+
+  const field = page.getByRole("textbox", { name: "Board name" });
+  await expect(field).toBeVisible();
+  // A ZWJ cluster — the case a naive `[...str][0]` splits into a lone man.
+  await field.fill("👨‍👩‍👧 Family planning");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+
+  const sent = await expect
+    .poll(async () => page.evaluate(() => (globalThis as any).__updateArgs))
+    .toBeTruthy()
+    .then(() => page.evaluate(() => (globalThis as any).__updateArgs));
+  expect(sent.title).toBe("Family planning");
+  expect(sent.emoji).toBe("👨‍👩‍👧");
+});
+
+test("Dashboards: renaming with no emoji clears the old one", async ({ page }) => {
+  // Dropping the field instead of sending "" would leave the previous emoji in place,
+  // making the picture impossible to remove once set.
+  await mockTauri(
+    page,
+    {
+      update_dashboard: (args: any) => {
+        (globalThis as any).__updateArgs = args;
+        return null;
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: { ...BOARD_DETAIL, emoji: "🚀" },
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await page.getByRole("button", { name: /Rename this board/i }).click();
+  await page.getByRole("textbox", { name: "Board name" }).fill("Plain name");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+
+  const sent = await expect
+    .poll(async () => page.evaluate(() => (globalThis as any).__updateArgs))
+    .toBeTruthy()
+    .then(() => page.evaluate(() => (globalThis as any).__updateArgs));
+  expect(sent.title).toBe("Plain name");
+  expect(sent.emoji).toBe("");
+});
+
+test("Dashboards: deleting a board takes two clicks, and the first one is reversible", async ({
+  page,
+}) => {
+  // A board is the one artifact in this feature the user BUILT rather than recorded,
+  // and delete fired straight through on a single click with no undo.
+  await mockTauri(
+    page,
+    {
+      delete_dashboard: () => {
+        (globalThis as any).__deleted = ((globalThis as any).__deleted ?? 0) + 1;
+        return true;
+      },
+    },
+    { list_dashboards: BOARDS, get_dashboard: BOARD_DETAIL, get_dashboard_sources: [] },
+  );
+
+  await page.goto("/dashboards");
+  const card = page.locator(".board-card").first();
+
+  // FIRST click arms — it must not delete.
+  await card.getByRole("button", { name: /^Delete / }).click();
+  await expect(card.getByRole("button", { name: /^Confirm delete / })).toBeVisible();
+  expect(await page.evaluate(() => (globalThis as any).__deleted ?? 0)).toBe(0);
+
+  // Backing out leaves the board alone…
+  await card.getByRole("button", { name: /^Keep / }).click();
+  await expect(card.getByRole("button", { name: /^Delete / })).toBeVisible();
+  expect(await page.evaluate(() => (globalThis as any).__deleted ?? 0)).toBe(0);
+
+  // …and only the SECOND click on an armed button actually deletes.
+  await card.getByRole("button", { name: /^Delete / }).click();
+  await card.getByRole("button", { name: /^Confirm delete / }).click();
+  await expect
+    .poll(() => page.evaluate(() => (globalThis as any).__deleted ?? 0))
+    .toBe(1);
+});
+
+test("Dashboards: navigating away mid-ask does not leave the next board stuck busy", async ({
+  page,
+}) => {
+  // The stale-async guard's own failure mode. Gating BOTH the data writes and the
+  // busy flag on "same board AND same request" means that after navigating away
+  // mid-flight nothing ever clears `asking` — so the NEXT board opens with its Ask
+  // control disabled, waiting on a request that was never its own.
+  await mockTauri(
+    page,
+    {
+      ask_vault: async () => {
+        await new Promise((r) => setTimeout(r, 1500));
+        return { answer: "answer for the first board", sources: [], citations: [] };
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [{ kind: "note", id: "n-1" }],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await openAsk(page);
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("slow question");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+
+  // Leave while it is still running, then come back.
+  await page.goto("/dashboards");
+  await page.goto("/dashboards/b-dense");
+  await openAsk(page);
+
+  // The Ask control is USABLE — not stuck behind a dead request…
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("a fresh question");
+  await expect(page.getByRole("button", { name: "Ask", exact: true })).toBeEnabled();
+  // …and the previous board's thread did not follow us here.
+  await expect(page.getByText("slow question")).toHaveCount(0);
+  await expect(page.getByText("answer for the first board")).toHaveCount(0);
 });

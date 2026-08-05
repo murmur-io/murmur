@@ -2,6 +2,23 @@ import { expect, test } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
+ * Open the Ask column. It starts collapsed to a rail — the scope count stays on
+ * screen, the empty transcript does not — so any test that types a question expands
+ * it first, which is the same click a user makes.
+ */
+async function openAsk(page: import("@playwright/test").Page): Promise<void> {
+  // Wait for the panel to EXIST before deciding. A bare `count()` races Angular's
+  // first render and silently no-ops, which then surfaces as a `fill` timeout on a
+  // field that was never revealed.
+  const panel = page.locator("aside.ask");
+  await panel.waitFor();
+  const rail = panel.locator("button.ask-rail");
+  if (await rail.count()) await rail.click();
+  await page.getByRole("textbox", { name: /Ask a question/i }).waitFor();
+}
+
+
+/**
  * Dashboards — the runtime oracle for the boards feature.
  *
  * The load-bearing test here is the SEALED-TILE one: the backend resolves a
@@ -292,11 +309,17 @@ test("Dashboards: board Ask is scoped to the board's sources and cites the tiles
 
   await page.goto("/dashboards/b-atlas");
 
-  // The scope line is explicit about WHAT the answer may draw on, and says out
-  // loud that the sealed tile is excluded.
+  // Collapsed, the rail still carries the count — that readout is the feature's
+  // claim and stays on screen whether or not the transcript is open.
+  await expect(page.getByText("2 in scope")).toBeVisible();
+
+  await openAsk(page);
+  // Expanded, the scope line is explicit about WHAT the answer may draw on, and
+  // says out loud that the sealed tile is excluded.
   await expect(page.getByText(/2 readable sources/)).toBeVisible();
   await expect(page.getByText(/1 sealed tile is excluded until unlocked/)).toBeVisible();
 
+  await openAsk(page);
   await page.getByRole("textbox", { name: "Ask a question about this board" }).fill("Will we make Jun 14?");
   await page.getByRole("button", { name: "Ask", exact: true }).click();
 
@@ -326,6 +349,7 @@ test("Dashboards: an empty board invites the first tile instead of showing a dea
   await expect(page.getByRole("button", { name: "Add the first tile" })).toBeVisible();
 
   // Asking an empty board is honest rather than hallucinating from the vault.
+  await openAsk(page);
   await page.getByRole("textbox", { name: "Ask a question about this board" }).fill("What is going on?");
   await page.getByRole("button", { name: "Ask", exact: true }).click();
   await expect(page.getByText(/no readable sources yet/)).toBeVisible();

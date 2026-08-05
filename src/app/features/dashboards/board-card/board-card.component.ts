@@ -1,4 +1,11 @@
-import { ChangeDetectionStrategy, Component, computed, input, output } from "@angular/core";
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  input,
+  output,
+  signal,
+} from "@angular/core";
 import type { DashboardSummary, TileKind } from "../../../core/models";
 
 /** One box in the miniature preview — a scaled stand-in for a real tile. */
@@ -94,9 +101,29 @@ export class BoardCardComponent {
     event.stopPropagation();
     this.togglePin.emit();
   }
+  /**
+   * Arm, then fire.
+   *
+   * A board is the one artifact in this feature the user BUILT rather than recorded,
+   * and delete went straight through on a single click with no undo. This is a
+   * two-step in the component rather than `window.confirm`, because a native dialog
+   * blocks the entire webview — the trap `angular-zoneless.md` calls out.
+   */
+  readonly confirming = signal(false);
+
   onRemove(event: Event): void {
     event.stopPropagation();
+    if (!this.confirming()) {
+      this.confirming.set(true);
+      return;
+    }
+    this.confirming.set(false);
     this.remove.emit();
+  }
+
+  cancelRemove(event: Event): void {
+    event.stopPropagation();
+    this.confirming.set(false);
   }
 }
 
