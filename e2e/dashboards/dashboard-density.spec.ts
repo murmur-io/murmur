@@ -352,3 +352,72 @@ test("Dashboards: the Ask column is a rail until it has something to say", async
   await expect(page.getByText("Two are late.")).toBeVisible();
   await expect(ask).not.toHaveClass(/is-rail/);
 });
+
+test("Dashboards: a board can be renamed, and a leading emoji becomes its emoji", async ({
+  page,
+}) => {
+  // `DashboardsService.update` shipped accepting title/emoji/tint and the only caller
+  // ever passed `{pinned}` — so a board named the wrong thing stayed named the wrong
+  // thing, and the `emoji` column plus six SCSS tint mappings were dead code.
+  await mockTauri(
+    page,
+    {
+      update_dashboard: (args: any) => {
+        (globalThis as any).__updateArgs = args;
+        return null;
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await page.getByRole("button", { name: /Rename this board/i }).click();
+
+  const field = page.getByRole("textbox", { name: "Board name" });
+  await expect(field).toBeVisible();
+  // A ZWJ cluster — the case a naive `[...str][0]` splits into a lone man.
+  await field.fill("👨‍👩‍👧 Family planning");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+
+  const sent = await expect
+    .poll(async () => page.evaluate(() => (globalThis as any).__updateArgs))
+    .toBeTruthy()
+    .then(() => page.evaluate(() => (globalThis as any).__updateArgs));
+  expect(sent.title).toBe("Family planning");
+  expect(sent.emoji).toBe("👨‍👩‍👧");
+});
+
+test("Dashboards: renaming with no emoji clears the old one", async ({ page }) => {
+  // Dropping the field instead of sending "" would leave the previous emoji in place,
+  // making the picture impossible to remove once set.
+  await mockTauri(
+    page,
+    {
+      update_dashboard: (args: any) => {
+        (globalThis as any).__updateArgs = args;
+        return null;
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: { ...BOARD_DETAIL, emoji: "🚀" },
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await page.getByRole("button", { name: /Rename this board/i }).click();
+  await page.getByRole("textbox", { name: "Board name" }).fill("Plain name");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+
+  const sent = await expect
+    .poll(async () => page.evaluate(() => (globalThis as any).__updateArgs))
+    .toBeTruthy()
+    .then(() => page.evaluate(() => (globalThis as any).__updateArgs));
+  expect(sent.title).toBe("Plain name");
+  expect(sent.emoji).toBe("");
+});
