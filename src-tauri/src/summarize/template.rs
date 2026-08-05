@@ -141,6 +141,26 @@ keep the hedge in your wording OR mark the item '(to confirm)'. Never restate an
 as a fact, a specification, or a decision, and never promote one into the Decisions section. An \
 unanswered question stays an open question.";
 
+/// Shared coverage/polarity rules for every built-in and saved summary style. The real-model
+/// bake-off showed that Qwen retained the right dates/amounts in prose but emitted `None recorded`
+/// under Decisions, while both providers occasionally promoted a plan or a non-approval into a
+/// stronger decision. This is a semantic inventory rule, not provider-specific prompting.
+pub(crate) const DECISION_COMMITMENT_COVERAGE_RULE: &str = "\
+Decision and commitment coverage rules:
+- Before writing the note, inventory every explicit approval, agreement, chosen rollout, committed \
+schedule, budget cap, assignment, and due date in the transcript.
+- Put every explicit decision under Decisions when that section is requested; in a saved custom \
+template use its closest decision/outcome section instead. Preserve its exact date, amount, and scope \
+when stated. Do not write \"None recorded\" when any explicit decision exists.
+- Preserve polarity and modality exactly: planned is not approved; open is not rejected; not \
+approved is not an instruction to reject; a hypothesis is not a decision.
+- Put every explicit commitment under Action items when that section is requested; in a saved custom \
+template use its closest task/follow-up section instead. Include it exactly once, preserving owner, \
+action, due date when stated, and pending/future status. Never rewrite a future commitment as already \
+completed.
+- Suggestions, possibilities, and open questions are not tasks. Never invent meta-tasks to assign \
+an owner, choose a deadline, investigate, or confirm unless the transcript explicitly assigns them.";
+
 /// The canonical Obsidian note-format prompt (front-matter + sections), shared by all providers.
 ///
 /// This is the *system / instruction* portion sent to every provider. It instructs the
@@ -190,7 +210,8 @@ Any additional context, open questions, or follow-ups.
 Linking rules:
 - When the meeting clearly references one of the EXISTING NOTE TITLES provided below,
   link to it using Obsidian wikilink syntax: [[Exact Title]]. Only link titles that
-  appear in that list; never invent links.
+  appear in that list; never invent links. A generic or translated phrase that merely
+  resembles a title is not a reference — link only an exact or unambiguous title mention.
 
 Formatting rules:
 - Use plain Markdown. Use real newlines.
@@ -198,6 +219,8 @@ Formatting rules:
   or action items that are not supported by the transcript.
 
 {EPISTEMIC_STRENGTH_RULE}
+
+{DECISION_COMMITMENT_COVERAGE_RULE}
 "#
     )
 }
@@ -318,7 +341,8 @@ if there is genuinely nothing to say):
 Linking rules:
 - When the meeting clearly references one of the EXISTING NOTE TITLES provided below,
   link to it using Obsidian wikilink syntax: [[Exact Title]]. Only link titles that
-  appear in that list; never invent links.
+  appear in that list; never invent links. A generic or translated phrase that merely
+  resembles a title is not a reference — link only an exact or unambiguous title mention.
 
 Formatting rules:
 - Use plain Markdown. Use real newlines.
@@ -326,6 +350,8 @@ Formatting rules:
   items that are not supported by the transcript.
 
 {EPISTEMIC_STRENGTH_RULE}
+
+{DECISION_COMMITMENT_COVERAGE_RULE}
 "#
     )
 }
@@ -365,11 +391,17 @@ pub fn language_directive(note_language: &str) -> String {
         }
         Some(name) => name,
     };
+    let heading_map = if note_language.trim().eq_ignore_ascii_case("pl") {
+        " For a requested `## Decisions` section use exactly `## Decyzje`; for a requested \
+`## Action items` section use exactly `## Zadania`, never `## Akcje`."
+    } else {
+        ""
+    };
     format!(
         "OUTPUT LANGUAGE: Write the section headings AND the body content in {target}. \
 KEEP the YAML front-matter KEYS in English exactly as specified (title, date, \
 duration_minutes, tags, participants) — translate only their values and the note body, \
-never the keys."
+never the keys.{heading_map}"
     )
 }
 
@@ -459,16 +491,22 @@ tags do not support."
 ///
 /// The lane tag is a CAPTURE CHANNEL, not a person. Nothing in such a feed identifies which of the N
 /// remote people spoke a given line, so any personal name in the note would be a guess dressed as a
-/// record — the exact failure this directive exists to prevent. It therefore forbids personal-name
-/// attribution outright, forbids guessed names in the `participants` front-matter, and allows a
-/// heard name through ONLY as an explicitly-marked inference.
+/// record — the exact failure this directive exists to prevent. It therefore forbids guessed
+/// speaker attribution while preserving an explicitly spoken named task assignment, forbids guessed
+/// names in the `participants` front-matter, and allows other heard names only as marked inference.
 pub(crate) fn speaker_attribution_directive_collapsed() -> &'static str {
     "SPEAKER ATTRIBUTION: the transcript below has exactly TWO lanes — `me` (the person recording) \
 and `others` (EVERY remote participant, merged into ONE lane by the capture, however many people \
 were on the call). The `(speaker)` tag is a capture LANE, not a person, and nothing in this \
 transcript says which of the remote people spoke any given line. Therefore:\n\
-- NEVER attribute a statement, decision, key point, or action item to a personal NAME. Attribute \
-only to the lane: `me` or `others` (write action items as `others — action`, or `me — action`).\n\
+- NEVER attribute who SPOKE a statement, decision, or key point to a personal NAME. Attribute the \
+speaker only to the lane: `me` or `others`.\n\
+- Task OWNERSHIP is different from speaker identity. If the words explicitly assign a named person \
+(for example `Sara will deliver the checklist`), preserve that named assignment as \
+`Sara — deliver the checklist`. Keep the owner token clean for task parsing: do not append a \
+parenthetical disclaimer to the name. This records only the explicitly spoken task assignment; it \
+does NOT identify who spoke. Never infer an owner merely from who spoke; without an explicit named \
+assignment use `me` or `others`.\n\
 - NEVER put a guessed personal name in the `participants` front-matter. List only the lane labels \
 that actually appear (`me`, `others`), or leave the list empty.\n\
 - A name you hear in the conversation (someone being addressed or referred to) may be reported ONLY \
@@ -1282,7 +1320,7 @@ pub fn assemble_note_with_template(
     vars: &ResolvedVars,
     model_markdown: &str,
 ) -> String {
-    let (model_yaml, model_body) = crate::storage::db::split_front_matter(model_markdown);
+    let (model_yaml, model_body) = split_model_front_matter(model_markdown);
     let mut lines = deterministic_front_matter_lines(template, vars);
     let owned: std::collections::HashSet<String> = lines
         .iter()
@@ -1303,6 +1341,70 @@ pub fn assemble_note_with_template(
         lines.join("\n"),
         body.trim_start_matches('\n')
     )
+}
+
+/// Split provider output at the summary-assembly boundary, with one deliberately narrow recovery
+/// for a weak model that opens prompt-requested YAML but forgets the closing fence before its first
+/// Markdown heading. The global storage splitter stays strict; only untrusted model output gets
+/// this repair.
+///
+/// Recovery fires only when:
+/// - line 1 is exactly `---`;
+/// - no canonical closing fence exists;
+/// - every line before the first `# `/`## ` heading is YAML-shaped (safe `key:`, blank, or an
+///   indented/list continuation); and
+/// - at least one safe key was seen.
+///
+/// Otherwise the strict split is returned byte-for-byte. A legitimate horizontal rule followed by
+/// prose therefore remains ordinary body text, never data-lost cleanup.
+pub(crate) fn split_model_front_matter(model_markdown: &str) -> (String, String) {
+    let strict = crate::storage::db::split_front_matter(model_markdown);
+    if !strict.0.is_empty() {
+        return strict;
+    }
+
+    let after_open = if let Some(rest) = model_markdown.strip_prefix("---\n") {
+        rest
+    } else if let Some(rest) = model_markdown.strip_prefix("---\r\n") {
+        rest
+    } else {
+        return strict;
+    };
+
+    let mut yaml_lines = Vec::new();
+    let mut body_offset = 0usize;
+    let mut saw_key = false;
+    let mut continuation_allowed = false;
+    for chunk in after_open.split_inclusive('\n') {
+        let line = chunk.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+        if trimmed.starts_with("# ") || trimmed.starts_with("## ") {
+            if saw_key {
+                return (yaml_lines.join("\n"), after_open[body_offset..].to_string());
+            }
+            return strict;
+        }
+
+        let yaml_shaped = if trimmed.is_empty() {
+            true
+        } else if line.chars().next().is_some_and(char::is_whitespace) || trimmed.starts_with("- ")
+        {
+            continuation_allowed
+        } else if let Some((key, value)) = line.split_once(':') {
+            let valid = is_safe_yaml_key(key.trim());
+            saw_key |= valid;
+            continuation_allowed = valid && value.trim().is_empty();
+            valid
+        } else {
+            false
+        };
+        if !yaml_shaped {
+            return strict;
+        }
+        yaml_lines.push(line);
+        body_offset += chunk.len();
+    }
+    strict
 }
 
 /// The model-emitted front-matter lines that SURVIVE the merge, re-quoted where needed. Everything
@@ -1821,11 +1923,10 @@ mod tests {
         );
         // The forbidding directive survives untouched alongside it.
         assert!(
-            p.contains(
-                "NEVER attribute a statement, decision, key point, or action item to a personal NAME"
-            ),
+            p.contains("NEVER attribute who SPOKE a statement, decision, or key point"),
             "the no-fabrication rule for the collapsed lane must remain in force"
         );
+        assert!(p.contains("Task OWNERSHIP is different from speaker identity"));
     }
 
     /// Whitespace is not a name: it must behave exactly like the unset default.
@@ -1846,10 +1947,23 @@ mod tests {
             "a collapsed lane still gets an attribution directive, just the forbidding one"
         );
         assert!(
-            p.contains(
-                "NEVER attribute a statement, decision, key point, or action item to a personal NAME"
-            ),
+            p.contains("NEVER attribute who SPOKE a statement, decision, or key point"),
             "collapsed lane must FORBID personal-name attribution; got:\n{p}"
+        );
+        assert!(
+            p.contains("Task OWNERSHIP is different from speaker identity")
+                && p.contains("`Sara — deliver the checklist`")
+                && p.contains("do not append a parenthetical disclaimer to the name")
+                && p.contains("does NOT identify who spoke"),
+            "explicit named task ownership must survive without becoming speaker identity: {p}"
+        );
+        let parsed = crate::summarize::action_items::parse_action_items(
+            "## Action items\n- [ ] Sara — deliver the checklist",
+        );
+        assert_eq!(
+            parsed.first().and_then(|item| item.owner.as_deref()),
+            Some("Sara"),
+            "the prompt's prescribed owner shape must remain queryable by the production parser"
         );
         assert!(
             p.contains("NEVER put a guessed personal name in the `participants` front-matter"),
@@ -1998,7 +2112,8 @@ Max 2 sentences capturing the outcome.
 Linking rules:
 - When the meeting clearly references one of the EXISTING NOTE TITLES provided below,
   link to it using Obsidian wikilink syntax: [[Exact Title]]. Only link titles that
-  appear in that list; never invent links.
+  appear in that list; never invent links. A generic or translated phrase that merely
+  resembles a title is not a reference — link only an exact or unambiguous title mention.
 
 Formatting rules:
 - Use plain Markdown. Use real newlines.
@@ -2006,6 +2121,8 @@ Formatting rules:
   items that are not supported by the transcript.
 
 {EPISTEMIC_STRENGTH_RULE}
+
+{DECISION_COMMITMENT_COVERAGE_RULE}
 "#
         );
         assert_eq!(template_for_style("brief"), expected);
@@ -2576,6 +2693,69 @@ Formatting rules:
         assert_eq!(fence_lines(&empty), 2, "{empty}");
         assert!(empty.contains("# Q3 planning"), "scaffold body: {empty}");
         assert!(empty.contains("## Outcome"), "scaffold sections: {empty}");
+    }
+
+    /// RED-before-GREEN from the Qwen quality bake-off: a weak model can open YAML and forget the
+    /// closing fence before starting the real `#` body. Murmur owns final front-matter, so that
+    /// recoverable model prefix must never survive as a second YAML document in the user's note.
+    #[test]
+    fn assembly_recovers_unterminated_model_front_matter_before_heading() {
+        let vars = hostile_vars();
+        let malformed = "---\n\
+title: guessed\n\
+tags:\n\
+  - meeting\n\
+participants: [Rowan]\n\
+# Real body\n\n## Decisions\n- Ship ten percent on August 20.\n";
+        let note = assemble_note_with_template(None, &vars, malformed);
+        assert_eq!(fence_lines(&note), 2, "exactly one YAML document: {note}");
+        assert_eq!(
+            note.lines()
+                .filter(|line| line.starts_with("title:"))
+                .count(),
+            1,
+            "the malformed model title must not leak into the body: {note}"
+        );
+        assert!(
+            note.contains("# Real body"),
+            "body must be preserved: {note}"
+        );
+        assert!(
+            note.contains("## Decisions\n- Ship ten percent on August 20."),
+            "decision body must be preserved: {note}"
+        );
+    }
+
+    #[test]
+    fn malformed_front_matter_recovery_never_strips_horizontal_rule_prose() {
+        for ordinary_body in [
+            "---\nThis is prose, not YAML.\n# Real body\n",
+            "---\ntitle: appears in prose\nbut this line is ordinary prose\n# Real body\n",
+            "---\ntitle: guessed\n- actual body bullet\n# Real body\n",
+        ] {
+            let (yaml, body) = split_model_front_matter(ordinary_body);
+            assert!(yaml.is_empty());
+            assert_eq!(body, ordinary_body);
+        }
+    }
+
+    /// The measured Qwen failures were classification/polarity failures, not missing transcript
+    /// facts. Bind the shared provider prompt to the concrete coverage rules used to close them.
+    #[test]
+    fn summary_prompt_requires_decision_commitment_coverage_and_polarity() {
+        let prompt = default_template();
+        for needle in [
+            "Do not write \"None recorded\"",
+            "exact date, amount, and scope",
+            "Preserve polarity and modality",
+            "Suggestions, possibilities, and open questions are not tasks",
+        ] {
+            assert!(prompt.contains(needle), "missing `{needle}` in: {prompt}");
+        }
+        let pl = language_directive("pl");
+        assert!(pl.contains("`## Decyzje`"), "{pl}");
+        assert!(pl.contains("`## Zadania`"), "{pl}");
+        assert!(pl.contains("never `## Akcje`"), "{pl}");
     }
 
     /// The model's guessed lists are RE-READ (so nothing the user expects is lost) but never
