@@ -661,6 +661,25 @@ fn normalize_for_match(s: &str) -> String {
 /// EGRESS: rides the SAME consent-gated reasoner as every other floor answer (a Cloud reasoner routes
 /// through `make_provider`'s consent gate + RedactingProvider). No new egress class; the ONLY content
 /// that reaches the model is the already-gated current meeting.
+pub(crate) fn current_meeting_isolated_prompt(
+    literal_command: &str,
+    current_content: &str,
+) -> (&'static str, String) {
+    let system = "You are summarizing the meeting the user is currently in. Answer their question \
+                  about it CONCISELY (2-4 sentences) using ONLY the transcript and notes provided \
+                  below — do not use any other source and do not invent facts. Do NOT preface your \
+                  answer with a label or heading (no \"This meeting:\"); answer naturally. Write \
+                  your answer in the SAME language the user actually wrote in — look at the user's \
+                  OWN words below, NOT the language of this instruction or of the transcript. If the \
+                  user wrote in Polish, answer in Polish; NEVER default to English.";
+    let user = format!(
+        "User's request (their own words): {}\n\nThe meeting's transcript and the user's notes:\n{}",
+        literal_command.trim(),
+        current_content.trim()
+    );
+    (system, user)
+}
+
 pub(crate) fn answer_current_meeting_isolated(
     intent_kind: &str,
     literal_command: &str,
@@ -746,17 +765,7 @@ pub(crate) fn answer_current_meeting_isolated(
 
     // ISOLATED SYNTHESIS over ONLY the current meeting. No "THIS MEETING" label the model can parrot;
     // no instruction to consult the vault or the web. Language directive mirrors the fan-out floor.
-    let system = "You are summarizing the meeting the user is currently in. Answer their question \
-                  about it CONCISELY (2-4 sentences) using ONLY the transcript and notes provided \
-                  below — do not use any other source and do not invent facts. Do NOT preface your \
-                  answer with a label or heading (no \"This meeting:\"); answer naturally. Write \
-                  your answer in the SAME language the user actually wrote in — look at the user's \
-                  OWN words below, NOT the language of this instruction or of the transcript. If the \
-                  user wrote in Polish, answer in Polish; NEVER default to English.";
-    let user = format!(
-        "User's request (their own words): {}\n\nThe meeting's transcript and the user's notes:\n{content}",
-        literal_command.trim()
-    );
+    let (system, user) = current_meeting_isolated_prompt(literal_command, content);
     // P0.3: LIVE answer preset — bounded decode so the isolated Tier-1 synthesis can't run away.
     match reasoner.reason_with(system, &user, GenOptions::live_answer()) {
         Ok(answer) if !answer.trim().is_empty() => VoiceActionResult {

@@ -21,7 +21,10 @@ fn run_artifact_oracle(mode: &str) {
 }
 
 #[test]
-fn final_quality_artifacts_round_trip_offline() {
+/// The score-replay manifest deliberately keeps its source-bound strict schema. This separate,
+/// Rust-invoked oracle binds that manifest together with R1/R2, combined, the exact synthetic
+/// fixture snapshot, and the complete all-string inventory, then runs mutation selftests.
+fn final_quality_artifacts_and_adjacent_fixture_inventory_bindings_round_trip_offline() {
     run_artifact_oracle("--final");
 }
 

@@ -33,7 +33,7 @@ HISTORY_CONTENT_INVENTORY = (
     RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-history-content-inventory.json"
 )
 
-FINAL_EVIDENCE_SHA256 = "73eb8325bf536dc0e5c47ad739502b853fb37722c82f362b080884dac9de6c44"
+FINAL_EVIDENCE_SHA256 = "b1072eea1601449812ed8c9cccd02cc3a0214e0f8b26fac2b10616af89db72de"
 FINAL_FIXTURE_SHA256 = "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2"
 FINAL_CONTENT_INVENTORY_SHA256 = (
     "5ce634a6bff61e48fdbcec19b2c08bf91f3aaae29c78d8028ac79d8679afac28"
@@ -256,8 +256,8 @@ FINAL_COMBINED_TOP_LEVEL_KEYS = {
     "schemaVersion", "sourceFingerprintSha256",
 }
 FINAL_EVIDENCE_TOP_LEVEL_KEYS = {
-    "combined", "contentInventory", "evidenceMethod", "fixtureSnapshot", "kind",
-    "producerSnapshot", "repetitions", "runtimeIdentities", "schemaVersion",
+    "combined", "evidenceMethod", "kind", "producerSnapshot", "repetitions",
+    "runtimeIdentities", "schemaVersion",
 }
 
 # Filled from canonical, path-aware inventories of the immutable artifacts.
@@ -274,8 +274,8 @@ FINAL_REPORT_TEXT_SHA256 = {
 }
 FINAL_COMBINED_SCHEMA_SHA256 = "8e38f627ea5fb2a38d1accb354415c2d9d0e3f20828e66cbafb7bece5493580b"
 FINAL_COMBINED_TEXT_SHA256 = "299e507ebad955b0f699acc6ae9b73bc8dec3ba488107eac08076b71e1c8212b"
-FINAL_EVIDENCE_SCHEMA_SHA256 = "6b14f024761786be7cadc3d43b4ca6804321b7292f6939466d327568e612306c"
-FINAL_EVIDENCE_TEXT_SHA256 = "02ed6d20692ad2d3e64fc5e3a278919523be0870e9d27859d97b94834b891fb0"
+FINAL_EVIDENCE_SCHEMA_SHA256 = "fb27ea815d9ea4ead0b0a2fb2b8fb5f0955d4a7cd8d012fc032026fd8d8d05c4"
+FINAL_EVIDENCE_TEXT_SHA256 = "4886d55c9ce3db79f6f754f34fd97fa58b14d963c713536306846306f00cefd1"
 
 FORBIDDEN_ARTIFACT_BYTES = (
     b"/users/",
@@ -667,15 +667,6 @@ def validate_fixture_commitments(
 
 
 def validate_generation_fixture_snapshot(evidence: dict[str, Any]) -> None:
-    entry = evidence.get("fixtureSnapshot")
-    require(
-        entry
-        == {
-            "path": FINAL_FIXTURE_SNAPSHOT.as_posix(),
-            "sha256": FINAL_FIXTURE_SHA256,
-        },
-        "generation fixture snapshot: path or hash differs",
-    )
     fixture_bytes = read_repository_file(FINAL_FIXTURE_SNAPSHOT)
     require(
         sha256(fixture_bytes) == FINAL_FIXTURE_SHA256,
@@ -893,15 +884,6 @@ def validate_content_inventory(
     evidence: dict[str, Any],
     reports: dict[str, dict[str, Any]],
 ) -> None:
-    entry = evidence.get("contentInventory")
-    require(
-        entry
-        == {
-            "path": FINAL_CONTENT_INVENTORY.as_posix(),
-            "sha256": FINAL_CONTENT_INVENTORY_SHA256,
-        },
-        "content inventory: path or hash differs",
-    )
     inventory_bytes = read_repository_file(FINAL_CONTENT_INVENTORY)
     require(
         sha256(inventory_bytes) == FINAL_CONTENT_INVENTORY_SHA256,
@@ -1458,6 +1440,14 @@ def run_selftests() -> None:
     committed_inventory = load_object(
         read_repository_file(FINAL_CONTENT_INVENTORY),
         "selftest content inventory",
+    )
+    inventory_bytes = read_repository_file(FINAL_CONTENT_INVENTORY)
+    expect_failure(
+        lambda: require(
+            sha256(inventory_bytes + b" ") == FINAL_CONTENT_INVENTORY_SHA256,
+            "selftest content inventory source hash differs",
+        ),
+        "a mutated content inventory artifact",
     )
     expect_failure(
         lambda: require(

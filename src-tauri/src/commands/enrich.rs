@@ -573,7 +573,8 @@ pub(crate) async fn note_assistant_action_impl(
     // provider inference below awaits and can span a relock or open-folder move.
     let (row, note_folder_id, note_seal_epoch) = {
         let _lifecycle = lifecycle_guard(state);
-        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&req.note_id)?
+        let Some((folder_id, _created_at, _updated_at)) =
+            state.db.note_gate_anchor(&req.note_id)?
         else {
             return Err(AppError::InvalidArg(format!("no note {}", req.note_id)));
         };
@@ -705,12 +706,7 @@ pub(crate) async fn note_assistant_action_impl(
         req.selection.chars().count(),
     ));
     let input_words = note_edit_word_count(&req.selection);
-    require_current_note_assist_snapshot(
-        state,
-        &req.note_id,
-        &note_folder_id,
-        note_seal_epoch,
-    )?;
+    require_current_note_assist_snapshot(state, &req.note_id, &note_folder_id, note_seal_epoch)?;
     let (mut suggestion, meta) = generate_note_edit(
         provider.as_ref(),
         &action,
@@ -720,12 +716,7 @@ pub(crate) async fn note_assistant_action_impl(
         input_words,
     )
     .await?;
-    require_current_note_assist_snapshot(
-        state,
-        &req.note_id,
-        &note_folder_id,
-        note_seal_epoch,
-    )?;
+    require_current_note_assist_snapshot(state, &req.note_id, &note_folder_id, note_seal_epoch)?;
     suggestion = suggestion.trim().to_string();
 
     // Artifacts carry a title (email subject / note title). Derive it from the note's own title for
@@ -887,11 +878,12 @@ pub(crate) fn gather_note_enhance_citations(
         let doc_hits = if let Some(embedder) = semantic_embedder {
             let qvecs = embedder.embed_query(std::slice::from_ref(&query))?;
             match qvecs.into_iter().next() {
-                Some(qvec) => {
-                    state
-                        .db
-                        .search_doc_chunks_visible(&qvec, MAX_CITATIONS as i64, 0.0, &unlocked)?
-                }
+                Some(qvec) => state.db.search_doc_chunks_visible(
+                    &qvec,
+                    MAX_CITATIONS as i64,
+                    0.0,
+                    &unlocked,
+                )?,
                 None => Vec::new(),
             }
         } else {
@@ -1157,7 +1149,11 @@ pub(crate) fn build_note_assist_prompt(
                  below) ONLY — never external knowledge. Flag any claim in the selection that \
                  CONTRADICTS or is UNSUPPORTED by the material, quoting the conflicting source. If \
                  everything checks out, say so briefly. This is an ANSWER, not an edit — do NOT \
-                 rewrite the selection. Reply in {lang}. Output ONLY your findings — no preamble."
+                 rewrite the selection. Preserve the source's exact subject, scope, location, and \
+                 modality in every correction: never broaden a pilot into the whole project, one \
+                 cohort into the rollout, or a possibility into a fact. Quote the smallest exact \
+                 source span that carries those qualifiers. Reply in {lang}. Output ONLY your \
+                 findings — no preamble."
             );
             let user = format!(
                 "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO FACT-CHECK:\n{sel}"
@@ -1183,10 +1179,23 @@ pub(crate) fn build_note_assist_prompt(
             (system, user)
         }
         "action_items" => {
+            let contrastive = match note_language.trim().to_ascii_lowercase().as_str() {
+                "pl" => "Przykład: `Iga wyśle plan. Może kiedyś zmienimy dostawcę; brak właściciela i terminu.` \
+                         staje się WYŁĄCZNIE `- [ ] Iga — wysłać plan`.",
+                "en" => "Example: `Iga will send the plan. Maybe change vendor someday; no owner or date.` \
+                         becomes ONLY `- [ ] Iga — send the plan`.",
+                _ => "Contrastive rule: extract only an explicitly assigned future commitment; \
+                      omit any unassigned suggestion from the same passage.",
+            };
             let system = format!(
                 "You extract action items / TODOs from a passage of the user's own note into a \
                  markdown checklist. Each task is its own `- [ ] ` line; capture the owner and any \
-                 due date if stated; do NOT invent tasks. If there are no action items, reply with an \
+                 due date if stated; do NOT invent tasks. An unchecked item is unfinished: preserve \
+                 a future commitment as a future task and never rewrite it as already completed. \
+                 Suggestions, possibilities, open questions, and unassigned ideas are NOT tasks; \
+                 never invent meta-tasks such as choosing an owner, setting a deadline, investigating, \
+                 or confirming unless the passage explicitly assigns that work. {contrastive} If \
+                 there are no explicit commitments, reply with an \
                  empty line. This is an ADDITIVE list to insert AFTER the selection — do NOT reproduce \
                  the original. Reply in {lang}. Output ONLY the checklist — no preamble, no heading."
             );
@@ -1249,6 +1258,81 @@ pub(crate) fn build_note_assist_prompt(
             let user = format!("{preceding}SELECTION TO TURN INTO A NEW NOTE:\n{sel}");
             (system, user)
         }
+    }
+}
+
+#[cfg(test)]
+mod quality_prompt_tests {
+    use super::*;
+
+    fn request(action: &str, selection: &str) -> NoteAssistRequest {
+        NoteAssistRequest {
+            note_id: "quality-prompt".to_string(),
+            action: action.to_string(),
+            selection: selection.to_string(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        }
+    }
+
+    /// RED-before-GREEN from the Qwen popup result: it changed a future commitment into completed
+    /// past tense and promoted an unowned suggestion into two invented meta-tasks.
+    #[test]
+    fn action_items_prompt_preserves_commitment_tense_and_rejects_meta_tasks() {
+        let req = request(
+            "action_items",
+            "Iga committed to send the plan. Someone suggested changing vendor someday.",
+        );
+        let (system, _) = build_note_assist_prompt("action_items", &req, &[], &[], "en");
+        for needle in [
+            "preserve a future commitment as a future task",
+            "never rewrite it as already completed",
+            "Suggestions, possibilities, open questions, and unassigned ideas are NOT tasks",
+            "never invent meta-tasks",
+        ] {
+            assert!(system.contains(needle), "missing `{needle}` in: {system}");
+        }
+        let pl_req = request(
+            "action_items",
+            "Iga wyśle plan. Może kiedyś zmienimy dostawcę.",
+        );
+        let (pl_system, _) = build_note_assist_prompt("action_items", &pl_req, &[], &[], "pl");
+        assert!(pl_system.contains("Iga wyśle plan"), "{pl_system}");
+        assert!(pl_system.contains("Iga — wysłać plan"), "{pl_system}");
+        assert!(!pl_system.contains("Iga will send the plan"), "{pl_system}");
+
+        let mismatch = request(
+            "action_items",
+            "Iga will send the plan. Maybe change vendor someday.",
+        );
+        let (mismatch_system, _) =
+            build_note_assist_prompt("action_items", &mismatch, &[], &[], "pl");
+        assert!(mismatch_system.contains("Reply in language code 'pl'"));
+        assert!(!mismatch_system.contains("the same language as the selected text"));
+
+        let (auto_system, _) = build_note_assist_prompt("action_items", &pl_req, &[], &[], "auto");
+        assert!(auto_system.contains("the same language as the selected text"));
+        assert!(auto_system.contains("Contrastive rule:"));
+        assert!(!auto_system.contains("becomes ONLY"));
+        assert!(!auto_system.contains("staje się WYŁĄCZNIE"));
+    }
+
+    /// RED-before-GREEN from the grounded fact-check: the local model broadened a Krakow pilot date
+    /// into a claim about the whole project.
+    #[test]
+    fn fact_check_prompt_preserves_the_sources_exact_subject_scope() {
+        let req = request("fact_check", "Project Orchid starts November 10.");
+        let (system, _) = build_note_assist_prompt("fact_check", &req, &[], &[], "en");
+        assert!(
+            system.contains("exact subject, scope, location, and modality"),
+            "{system}"
+        );
+        assert!(
+            system.contains("never broaden a pilot into the whole project"),
+            "{system}"
+        );
     }
 }
 

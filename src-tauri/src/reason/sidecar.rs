@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::error::{AppError, Result};
-use crate::reason::{parse_first_json, GenOptions, LocalReasoner};
+use crate::reason::{parse_first_json, GenOptions, LocalReasoner, StructuredObservation};
 
 /// The FROZEN NDJSON wire protocol, shared verbatim with the child (`crates/murmur-brain`). Included
 /// (not re-declared) so any drift is a compile error. Three `../` from `src-tauri/src/reason/` reach
@@ -1135,12 +1135,27 @@ impl SidecarReasoner {
         json_schema: &Value,
         opts: GenOptions,
     ) -> Result<Value> {
+        Ok(self
+            .structured_observation_inner(system, user, json_schema, opts)?
+            .value)
+    }
+
+    fn structured_observation_inner(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+    ) -> Result<StructuredObservation> {
         // The child instructs the schema in the prompt (matching the old in-process path) and, when
         // opted-in with a tiny schema, tries a grammar-constrained decode with a graceful fallback —
         // ALL host-transparent. We pass the schema so the child prompts on it, and recover the object
         // here via the SAME robust extractor the old path used.
         let text = dispatch(&self.model_path, system, user, opts, Some(json_schema))?;
-        parse_first_json(&text)
+        Ok(StructuredObservation {
+            value: parse_first_json(&text)?,
+            raw_text: Some(text),
+        })
     }
 }
 
@@ -1169,6 +1184,16 @@ impl LocalReasoner for SidecarReasoner {
         opts: GenOptions,
     ) -> Result<Value> {
         self.structured_inner(system, user, json_schema, opts)
+    }
+
+    fn structured_with_observation(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+    ) -> Result<StructuredObservation> {
+        self.structured_observation_inner(system, user, json_schema, opts)
     }
 }
 
