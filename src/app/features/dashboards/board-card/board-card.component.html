@@ -83,16 +83,33 @@
         <path d="M12 15v5" />
       </svg>
     </button>
+    @if (confirming()) {
+      <button
+        type="button"
+        class="icon-btn confirm-cancel"
+        (click)="cancelRemove($event)"
+        [attr.aria-label]="'Keep ' + board().title"
+      >
+        Keep
+      </button>
+    }
     <button
       type="button"
       class="icon-btn danger"
+      [class.is-confirming]="confirming()"
       (click)="onRemove($event)"
-      [attr.aria-label]="'Delete ' + board().title"
+      [attr.aria-label]="
+        (confirming() ? 'Confirm delete ' : 'Delete ') + board().title
+      "
     >
+      @if (confirming()) {
+        <span class="confirm-word">Delete?</span>
+      } @else {
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
            stroke-linecap="round" stroke-linejoin="round">
         <path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12" />
       </svg>
+      }
     </button>
   </div>
 </div>
