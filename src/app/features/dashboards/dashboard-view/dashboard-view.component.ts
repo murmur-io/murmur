@@ -252,6 +252,28 @@ export class DashboardViewComponent {
   // ── board Ask ──────────────────────────────────────────────────────────────
   readonly turns = signal<BoardTurn[]>([]);
 
+  /** Monotonic ask token — the per-REQUEST half of the stale-async guard. */
+  private askToken = 0;
+
+  /**
+   * Switching boards starts a new conversation.
+   *
+   * `/dashboards/:id` reuses this component across board→board navigation, so without
+   * this the thread — including the user turn `ask()` appends synchronously before its
+   * first await — follows the user onto a board it was never about. Bumping the token
+   * in the same pass orphans any in-flight request's data writes while still letting
+   * it clear the spinner it set.
+   */
+  private readonly _resetOnBoardChange = effect(() => {
+    this.id();
+    untracked(() => {
+      this.askToken += 1;
+      this.turns.set([]);
+      this.draft.set("");
+      this.asking.set(false);
+    });
+  });
+
   // ── rename ────────────────────────────────────────────────────────────────
   //
   // The board's name was write-once: `DashboardsService.update` shipped accepting
@@ -441,8 +463,20 @@ export class DashboardViewComponent {
     this.draft.set("");
     this.turns.update((t) => [...t, { role: "user", text: question }]);
     this.asking.set(true);
+    // TWO different questions, and conflating them is a bug of its own.
+    //
+    // `owns()` guards DATA writes: an answer, an error, a source count belong to the
+    // board AND the request that asked for them. `current()` guards the BUSY flag,
+    // which is per-request only — gating the spinner on the board too means that after
+    // navigating away mid-flight nothing ever clears it, and the NEW board sits
+    // disabled forever waiting on a request that was never its own.
+    const boardId = this.id();
+    const token = ++this.askToken;
+    const current = () => this.askToken === token;
+    const owns = () => current() && this.id() === boardId;
     try {
-      const sources = await this.ipc.getDashboardSources(this.id());
+      const sources = await this.ipc.getDashboardSources(boardId);
+      if (!owns()) return;
       this.sourceCount.set(sources.length);
       if (sources.length === 0) {
         this.turns.update((t) => [
@@ -455,6 +489,8 @@ export class DashboardViewComponent {
         return;
       }
       const result = await this.ipc.askVault(question, this.askHistory(), undefined, sources);
+      // The answer belongs to the board — and the request — that asked for it.
+      if (!owns()) return;
       this.turns.update((t) => [
         ...t,
         {
@@ -464,12 +500,15 @@ export class DashboardViewComponent {
         },
       ]);
     } catch (e) {
+      if (!owns()) return;
       this.turns.update((t) => [
         ...t,
         { role: "error", text: this.errors.humanize(e, "generic"), retry: question },
       ]);
     } finally {
-      this.asking.set(false);
+      // The LATEST request clears the spinner, whichever board is on screen now. A
+      // superseded ask must not; a navigated-away one still must, or it never comes up.
+      if (current()) this.asking.set(false);
     }
   }
 
