@@ -2,6 +2,23 @@ import { expect, test } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
+ * Open the Ask column. It starts collapsed to a rail — the scope count stays on
+ * screen, the empty transcript does not — so any test that types a question expands
+ * it first, which is the same click a user makes.
+ */
+async function openAsk(page: import("@playwright/test").Page): Promise<void> {
+  // Wait for the panel to EXIST before deciding. A bare `count()` races Angular's
+  // first render and silently no-ops, which then surfaces as a `fill` timeout on a
+  // field that was never revealed.
+  const panel = page.locator("aside.ask");
+  await panel.waitFor();
+  const rail = panel.locator("button.ask-rail");
+  if (await rail.count()) await rail.click();
+  await page.getByRole("textbox", { name: /Ask a question/i }).waitFor();
+}
+
+
+/**
  * Dashboards — the DENSITY oracle (Phase 1 of the 2026-08-04 rebuild).
  *
  * These are RED-before-GREEN tests for a bug that had no failing check: a real
@@ -204,6 +221,7 @@ test("Dashboards: a failed Ask is a banner with a retry, not a grey bubble that 
   );
 
   await page.goto("/dashboards/b-dense");
+  await openAsk(page);
   await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is late?");
   await page.getByRole("button", { name: "Ask", exact: true }).click();
 
@@ -234,6 +252,7 @@ test("Dashboards: an answer renders as markdown, not as literal asterisks", asyn
   );
 
   await page.goto("/dashboards/b-dense");
+  await openAsk(page);
   await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is the risk?");
   await page.getByRole("button", { name: "Ask", exact: true }).click();
 
@@ -292,4 +311,44 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
 
   // The row is rendered ONCE on the board, not twice.
   await expect(page.getByText("Send the Acme paperwork")).toHaveCount(1);
+});
+
+test("Dashboards: the Ask column is a rail until it has something to say", async ({ page }) => {
+  // The scope readout is the feature's claim made visible, so it stays on screen; the
+  // empty transcript is not, and it was spending a third of the width on three
+  // suggestion buttons.
+  await mockTauri(
+    page,
+    { ask_vault: () => ({ answer: "Two are late.", sources: [], citations: [] }) },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [{ kind: "note", id: "n-1" }],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  const ask = page.locator("aside.ask");
+  await expect(ask).toHaveClass(/is-rail/);
+  // …and the count is still readable while collapsed.
+  await expect(ask.getByText(/in scope/)).toBeVisible();
+  const railWidth = (await ask.boundingBox())!.width;
+  expect(railWidth).toBeLessThan(60);
+
+  await ask.getByRole("button", { name: /Ask this board/ }).click();
+  await expect(ask).not.toHaveClass(/is-rail/);
+  // The width TRANSITIONS, so a single read lands mid-animation. Poll instead of
+  // measuring once — and the composer being reachable is the real invariant anyway.
+  await expect(page.getByRole("textbox", { name: /Ask a question/i })).toBeVisible();
+  await expect
+    .poll(async () => (await ask.boundingBox())!.width)
+    .toBeGreaterThan(railWidth * 3);
+
+  // Once there is a conversation it STAYS open — a thread you cannot see is worse
+  // than a wide column.
+  await openAsk(page);
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("who is late?");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await expect(page.getByText("Two are late.")).toBeVisible();
+  await expect(ask).not.toHaveClass(/is-rail/);
 });

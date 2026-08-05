@@ -233,6 +233,23 @@ export class DashboardViewComponent {
 
   // ── board Ask ──────────────────────────────────────────────────────────────
   readonly turns = signal<BoardTurn[]>([]);
+
+  /**
+   * Whether the Ask column is open, versus collapsed to its rail.
+   *
+   * Opens on demand and STAYS open once there is a conversation — a thread the user
+   * can no longer see is worse than a wide column. The rail keeps the scope count on
+   * screen either way, because that readout is the feature's actual claim: this board,
+   * and nothing else, is what an answer may be built from. The empty transcript has no
+   * such claim to make, and it was spending a third of the width on three suggestion
+   * buttons.
+   */
+  private readonly _askOpen = signal(false);
+  readonly askExpanded = computed(() => this._askOpen() || this.turns().length > 0);
+
+  expandAsk(): void {
+    this._askOpen.set(true);
+  }
   readonly asking = signal(false);
   readonly draft = signal("");
   readonly sourceCount = signal(0);
