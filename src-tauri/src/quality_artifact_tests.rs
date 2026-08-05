@@ -24,3 +24,8 @@ fn run_artifact_oracle(mode: &str) {
 fn final_quality_artifacts_round_trip_offline() {
     run_artifact_oracle("--final");
 }
+
+#[test]
+fn historical_quality_artifacts_round_trip_offline() {
+    run_artifact_oracle("--history");
+}
