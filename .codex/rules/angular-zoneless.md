@@ -411,6 +411,31 @@ went to a real bug the tests structurally could not see.
    open. Without that, "the click never landed" and "the panel never painted" look identical from
    outside — and you cannot tell which half to fix.
 
+**CORRECTION (2026-08-05, measured with `scripts/wkwebview-probe`).** The diagnosis above was
+WRONG, and it is left standing only so the correction is legible. `:modal` was never the cause.
+Executing JS inside the real shipping WKWebView returns:
+
+    matches(":modal") threw: null      // it does not throw
+    showModal() threw:     null        // it is not refused
+    :modal after showModal: true       // it works correctly
+
+The actual cause was the wire contract — snake_case payload fields against a camelCase FE (T6
+below), found by inspecting the payload rather than the component. Three of the six fixes were
+built on a hypothesis nobody could falsify, because until now nothing in this repo could run a
+line of JavaScript in the engine we ship.
+
+**The discipline in T5 stands; only its example was false.** Reproduce first. Get a RED check. Do
+not depend on an API you have not verified *in the shipping engine* — and now you can:
+
+```bash
+swiftc -O -o /tmp/wkprobe scripts/wkwebview-probe/main.swift
+/tmp/wkprobe --url http://localhost:1420/ --eval 'return CSS.supports("color","color-mix(in srgb, red, blue)")'
+```
+
+No accessibility grant, no signing, no GUI. When a UI failure will not reproduce in Playwright,
+that is the tool that tells you whether the engine is actually the difference — in seconds, instead
+of three speculative rounds.
+
 ### T6 — a hand-written IPC mock DEFINES a contract; it does not verify one
 
 **The failure (2026-08-04, PR #566/#568).** Six rounds went to the Add-tile palette's positioning.
