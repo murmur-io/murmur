@@ -113,7 +113,11 @@ pub struct TileRow {
 /// against the real serializer, because the e2e fixtures are written from the TS type and so can
 /// only ever assert the shape they already assume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TileData {
     /// The tile's source exists but is sealed and not session-unlocked. Carries NOTHING.
     Locked,
@@ -510,7 +514,9 @@ pub fn update_dashboard_tile(
     state
         .db
         .update_dashboard_tile(&id, title.as_deref(), span, config.as_deref())?;
-    state.db.touch_dashboard(&existing.dashboard_id, &now_iso())?;
+    state
+        .db
+        .touch_dashboard(&existing.dashboard_id, &now_iso())?;
     // Same reason as `add_dashboard_tile`: never return the raw row. Reachable proof this
     // mattered — the Arrange-mode resize control fires for a SEALED tile, so returning the row
     // would push that tile's stored title/config into the webview.
@@ -563,7 +569,9 @@ pub fn set_dashboard_answer(
     state
         .db
         .update_dashboard_tile(&id, None, None, Some(&encoded))?;
-    state.db.touch_dashboard(&existing.dashboard_id, &now_iso())?;
+    state
+        .db
+        .touch_dashboard(&existing.dashboard_id, &now_iso())?;
     Ok(())
 }
 
@@ -621,6 +629,31 @@ pub fn get_dashboard(
     }))
 }
 
+/// Could this tile's payload NOT be fully resolved for the current session?
+///
+/// ONE definition, deliberately shared by [`redact_tile_chrome`] (which strips the
+/// stored title/config) and [`dashboard_brief_inner`] (which drops the tile from the
+/// prompt entirely). Two copies of this predicate would drift, and the direction
+/// they drift in is a leak: a brief that used a looser notion of "withheld" than
+/// the redactor would put a sealed tile's material into a model call.
+///
+/// The `Drift`/`Numbers`/`Pulse` arm is the subtle one. Those kinds degrade to an
+/// EMPTY VIEW rather than to `Locked` when their entity stops being visible, so
+/// the payload still carries `weekly` / `total` / `quiet_days`. Keying on
+/// `entity == ENTITY_HIDDEN` is what stops a "quiet for 9d" chip from leaking
+/// timing about a sealed entity.
+pub(crate) fn tile_is_withheld(data: &TileData) -> bool {
+    match data {
+        TileData::Locked | TileData::Missing | TileData::Unconfigured => true,
+        // `entity_name` yields the placeholder when the entity is not visible.
+        TileData::Drift { entity, .. }
+        | TileData::Numbers { entity, .. }
+        | TileData::Pulse { entity, .. } => entity == ENTITY_HIDDEN,
+        TileData::LivingAnswer { withheld, .. } => *withheld,
+        _ => false,
+    }
+}
+
 /// Strip the tile's stored chrome whenever its payload could NOT be fully resolved.
 ///
 /// Defense-in-depth for a leak found by review (2026-08-03). The first line of defence is that the
@@ -637,15 +670,7 @@ pub fn get_dashboard(
 /// `ref_id`, `span` and `position` stay: pure layout, no content, and the FE needs them to keep the
 /// board's shape stable while a folder is sealed.
 pub(crate) fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> DashboardTile {
-    let withheld = match data {
-        TileData::Locked | TileData::Missing | TileData::Unconfigured => true,
-        // `entity_name` yields the placeholder when the entity is not visible.
-        TileData::Drift { entity, .. }
-        | TileData::Numbers { entity, .. }
-        | TileData::Pulse { entity, .. } => entity == ENTITY_HIDDEN,
-        TileData::LivingAnswer { withheld, .. } => *withheld,
-        _ => false,
-    };
+    let withheld = tile_is_withheld(data);
     if withheld {
         tile.title = None;
         tile.config = None;
@@ -666,6 +691,228 @@ pub fn get_dashboard_sources(
     let tiles = state.db.list_dashboard_tiles(&id)?;
     let unlocked = super::unlocked_snapshot(state.inner())?;
     dashboard_sources_inner(&state.db, tiles, &unlocked)
+}
+
+/// The header the board brief is packed under. Instructional on purpose: without
+/// the second clause the model re-derives the ledger it was just handed, and the
+/// answer reads as if the board were not there.
+const BRIEF_HEADER: &str =
+    "WHAT THIS BOARD ALREADY SHOWS (the user composed these views; do not re-derive them):";
+
+/// Flat hard cap on the brief. [`brief_allowance`] additionally limits it to one
+/// quarter of the resolved corpus budget, so small providers retain source room.
+const MAX_BRIEF_CHARS: usize = 4000;
+
+/// What a board's DERIVED tiles SAY, as prompt text.
+///
+/// THE ASYMMETRY THIS CLOSES. `get_dashboard_sources` maps only note/meeting/
+/// document to a `SourceRef` — correct, and unchanged here, because `SourceRef.kind`
+/// is a `LinkKind` and a drift lane is not a retrievable document. But nothing else
+/// carried the other seven kinds into the prompt either, while `tools.rs::tool_specs`
+/// exposes `get_dashboard` to the agentic loop and the local MCP server. Board Ask
+/// pins its sources, and `ask_vault` routes any non-empty pinned list to the
+/// deterministic floor — so the agentic path, and with it that tool, is SKIPPED.
+///
+/// The result was that the in-app "Ask this board" saw strictly LESS of the board
+/// than Claude Code did over MCP: a user could look at a Promise ledger, click the
+/// board's own suggested question — "Who owes me something on this board?" — and
+/// the model could not see that tile.
+///
+/// This adds no new gated reader and no new egress class. It walks the SHIPPED
+/// path (`resolve_tile` → [`tile_is_withheld`] → `render_tile_for_agent`), which is
+/// the same one the MCP surface already reads, so the two cannot disagree about
+/// what a tile says.
+pub(crate) fn dashboard_brief_inner(
+    db: &crate::storage::Db,
+    tiles: Vec<DashboardTile>,
+    unlocked: &std::collections::HashSet<String>,
+    max_chars: usize,
+) -> Result<String, AppError> {
+    let mut lines: Vec<String> = Vec::new();
+    for tile in tiles {
+        // Material kinds are already packed as SOURCES, with their full text. Repeating
+        // a snippet here would spend budget to say something the corpus says better.
+        if matches!(tile.kind.as_str(), "note" | "meeting" | "document") {
+            continue;
+        }
+        let data = resolve_tile(db, &tile, unlocked)?;
+        // A withheld tile contributes NOTHING — not a title, not a count, not a kind
+        // label. `render_tile_for_agent` would print a neutral "[sealed tile]" marker,
+        // which is right for MCP (an agent listing a board should know something is
+        // there) and pointless here: the prompt gains nothing, and the safest number
+        // of bytes to spend on a sealed tile is zero.
+        if tile_is_withheld(&data) {
+            continue;
+        }
+        // NO EXTRA FILTER HERE, deliberately.
+        //
+        // An earlier cut suppressed row-list tiles whose rows were all empty, on the
+        // grounds that `- promises` with nothing under it is a heading that says
+        // nothing. Review was right that this is wrong, for two reasons:
+        //
+        //   1. An empty ledger IS an answer. "Nobody currently owes anything" is a
+        //      real reply to the board's own suggested question, and suppressing the
+        //      tile made the floor fall through to the generic "no meeting notes to
+        //      search yet" instead.
+        //   2. `get_dashboard` and the MCP surface render the same tile through the
+        //      same `render_tile_for_agent`. A filter applied at THIS sink only
+        //      recreates the very asymmetry this change exists to remove — board Ask
+        //      seeing less of the board than an external agent does — just pointing
+        //      the other way.
+        //
+        // The only suppression is `tile_is_withheld` above, which is the LOCK gate and
+        // is shared with `redact_tile_chrome`. If a rendered view should ever change
+        // shape, change the shared renderer so every sink changes together.
+        let tile = redact_tile_chrome(tile, &data);
+        let rendered = render_tile_for_agent(&tile, &data);
+        if !rendered.trim().is_empty() {
+            lines.push(rendered);
+        }
+    }
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    // The cap must bound the OUTPUT, so a budget too small to hold the label yields
+    // nothing rather than a header that already breaches it.
+    if max_chars < BRIEF_HEADER.chars().count() {
+        return Ok(String::new());
+    }
+    let mut out = String::from(BRIEF_HEADER);
+    let mut wrote = 0usize;
+    for tile_text in lines {
+        let remaining = max_chars.saturating_sub(out.chars().count());
+        // The whole tile fits — the common case.
+        // `+ 1` is the newline this push would add; clippy prefers the strict form.
+        if tile_text.chars().count() < remaining {
+            out.push('\n');
+            out.push_str(&tile_text);
+            wrote += 1;
+            continue;
+        }
+        // It does not. Dropping it WHOLESALE was a real defect: on a small provider
+        // budget a single Promise ledger with enough rows exceeded the allowance and
+        // vanished, so the one case this feature exists for produced an empty brief.
+        //
+        // Keep the heading and as many COMPLETE rows as fit, then say how many were
+        // left out. A partial row would be the lie the whole-tile rule guards against;
+        // a COUNTED remainder is not — the model can see it is looking at a prefix.
+        //
+        // `truncate_tile` yields "" when not even ONE complete row fits. Counting that
+        // as written left a BARE HEADER — the exact "views that do not exist" lie the
+        // empty-board path is careful to avoid, reintroduced by an unconditional
+        // increment. Nothing written means nothing counted.
+        let partial = truncate_tile(&tile_text, remaining);
+        if !partial.is_empty() {
+            out.push_str(&partial);
+            wrote += 1;
+        }
+        break;
+    }
+    // A bare header is the same "views that do not exist" lie an empty board is
+    // careful to avoid.
+    if wrote == 0 {
+        return Ok(String::new());
+    }
+    Ok(out)
+}
+
+/// Keep a rendered tile's heading plus whole rows within `budget`, and count the rest.
+///
+/// Returns `""` when not even the heading and one row fit, so the caller emits nothing
+/// rather than a heading with no content under it.
+fn truncate_tile(tile_text: &str, budget: usize) -> String {
+    let mut rows = tile_text.lines();
+    let Some(heading) = rows.next() else {
+        return String::new();
+    };
+    let rows: Vec<&str> = rows.collect();
+    let mut kept: Vec<&str> = Vec::new();
+    // Reserve room for the marker up front, so adding it can never breach the budget.
+    let marker_room = 24;
+    let mut used = heading.chars().count() + 1;
+    for row in &rows {
+        let next = used + row.chars().count() + 1;
+        if next + marker_room > budget {
+            break;
+        }
+        used = next;
+        kept.push(row);
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    let dropped = rows.len() - kept.len();
+    let mut out = format!("\n{heading}");
+    for row in kept {
+        out.push('\n');
+        out.push_str(row);
+    }
+    if dropped > 0 {
+        out.push_str(&format!("\n    · … {dropped} more"));
+    }
+    out
+}
+
+/// The board's derived tiles as prompt text, for `ask_vault`. `""` when there are none.
+///
+/// DELIBERATELY NOT A `#[tauri::command]`. The frontend passes a board ID and the
+/// backend derives the text; letting the FE hand a finished string into the prompt
+/// would be a new injection surface AND would put content generation outside the
+/// gate. It also means this adds no IPC surface and no `generate_handler!` entry.
+///
+/// Takes the caller's `unlocked` snapshot rather than taking its own: `ask_vault`
+/// already holds one, and gating the brief against a SECOND, later snapshot is
+/// exactly the TOCTOU that `get_dashboard`'s `lifecycle_guard` exists to prevent.
+pub(crate) fn dashboard_brief_for_ask(
+    db: &crate::storage::Db,
+    dashboard_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+    corpus_budget: usize,
+) -> Result<String, AppError> {
+    let tiles = db.list_dashboard_tiles(dashboard_id)?;
+    dashboard_brief_inner(db, tiles, unlocked, brief_allowance(corpus_budget))
+}
+
+/// The board-scoped input `ask_vault` hands to the floor prompt builder.
+///
+/// `None` ⇒ not asked from a board; every other Ask surface is byte-identical.
+/// `Some(brief)` ⇒ asked from a board, and the brief MAY BE EMPTY — an all-sealed
+/// board has nothing to show but still scopes the question. Collapsing that to
+/// `None` is the routing defect review caught: the ask fell through to a
+/// vault-wide search and answered from content the user never composed.
+///
+/// This exists as one function so the composition can be TESTED rather than read.
+/// Its two halves — the blank-id normalization and the empty-brief preservation —
+/// previously lived inline in `ask_vault`, where no test could reach them without a
+/// Tauri `State`, so a recurrence of that exact routing bug would have gone
+/// unnoticed with every added test still green.
+pub(crate) fn board_scoped_brief(
+    db: &crate::storage::Db,
+    dashboard_id: Option<&str>,
+    unlocked: &std::collections::HashSet<String>,
+    corpus_budget: usize,
+) -> Result<Option<String>, AppError> {
+    let Some(id) = dashboard_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(dashboard_brief_for_ask(
+        db,
+        id,
+        unlocked,
+        corpus_budget,
+    )?))
+}
+
+/// How much of the prompt the brief may take.
+///
+/// `MAX_BRIEF_CHARS` where the budget allows it, but never more than a QUARTER of
+/// the corpus budget: `budget_for` is 4000 chars TOTAL on ollama, so the flat cap
+/// alone would let the brief consume the entire prompt and leave nothing for the
+/// sources the answer has to stand on. Stated as a function, and tested, rather
+/// than buried as an inline `/ 8` at the packing site — which is where it lived
+/// when it silently reduced a contracted ~4000-char brief to ~500.
+pub(crate) fn brief_allowance(corpus_budget: usize) -> usize {
+    MAX_BRIEF_CHARS.min((corpus_budget / 4).max(1))
 }
 
 /// The scope rule itself, free of `AppState` so it can be tested directly.
@@ -820,9 +1067,7 @@ pub(crate) fn resolve_tile(
                 // strips the tile's chrome for `Missing`, so no legacy copied name survives here.
                 return Ok(TileData::Missing);
             };
-            let open = db
-                .list_open_commitments(unlocked, Some(&node.name))?
-                .len() as i64;
+            let open = db.list_open_commitments(unlocked, Some(&node.name))?.len() as i64;
             Ok(TileData::Person {
                 id: node.id,
                 name: node.name,
@@ -1213,11 +1458,7 @@ fn format_epoch_day(ms_or_s: i64) -> String {
     // Rendered in the user's LOCAL zone — a due date shown as "Jun 13" when the reminder fires on
     // the 14th is the same off-by-a-day bug as in `commitment_status`.
     chrono::DateTime::from_timestamp(secs, 0)
-        .map(|d| {
-            d.with_timezone(&chrono::Local)
-                .format("%b %-d")
-                .to_string()
-        })
+        .map(|d| d.with_timezone(&chrono::Local).format("%b %-d").to_string())
         .unwrap_or_default()
 }
 
@@ -1235,3 +1476,7 @@ mod dashboard_cmd_tests;
 #[cfg(test)]
 #[path = "tests/dashboard_source_scope_tests.rs"]
 mod dashboard_source_scope_tests;
+
+#[cfg(test)]
+#[path = "tests/dashboard_brief_tests.rs"]
+mod dashboard_brief_tests;

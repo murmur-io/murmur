@@ -7,6 +7,18 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
 ## Recurring patterns
 <!-- Curated, binding. Keep ≤ ~20 bullets. -->
 
+- **A hypothesis you cannot falsify is not a diagnosis — build the instrument first.** Three of six
+  palette fixes rested on "`:modal` throws in the shipping WKWebView". Nobody could check, because
+  nothing here could run JS in that engine. `scripts/wkwebview-probe` now can, and the first thing
+  it did was DISPROVE that hypothesis in ten seconds (`:modal` does not throw; the cause was the
+  wire contract). When a report will not reproduce in your tools, the next move is to get a tool
+  that can see it — not a fourth variant of the same guess.
+- **When a fix does not hold, change the LAYER you are looking at — do not iterate inside it.** Six
+  rounds went to the Add-tile palette's positioning (teleport, non-transform layout, native
+  `<dialog>`, fallbacks) and the palette was never the bug: the tile payload shipped snake_case
+  while the FE read camelCase, so a tile threw while rendering and took the board with it. Two
+  failed fixes in the same layer is the signal to move DOWN a layer — component → payload →
+  contract — not to try a fourth variant of the same idea.
 - **A user-reported failure against green gates means the ORACLE is wrong, not the code.** The
   correct first move is to fix the measurement, not to patch the implementation. On PR #566 I
   shipped three speculative fixes because my e2e ran in a newer engine than the app does; the bug

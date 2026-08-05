@@ -10,6 +10,30 @@ import type {
 } from "../core/models";
 
 /**
+ * Split a leading emoji off a board name: `"🚀 Atlas GA"` → `{emoji: "🚀", title: "Atlas GA"}`.
+ *
+ * The `emoji` column, `TINTS`, and `board-card`'s emoji slot all shipped with the
+ * feature and nothing ever WROTE them — `create(title)` and `update({pinned})` were
+ * the only callers, so six SCSS tint mappings and a whole DTO field were dead. This
+ * is the cheapest way to make them live: no picker, no extra chrome, and it matches
+ * how people already name things.
+ *
+ * The class is `Extended_Pictographic` with its combining tail — variation selectors,
+ * skin-tone modifiers, and ZWJ sequences — so `"👨‍👩‍👧 Family"` yields the whole
+ * cluster rather than a lone man. A name with no leading emoji is returned unchanged,
+ * and an emoji with nothing after it stays part of the TITLE (a board called "🚀" is
+ * a board named "🚀", not a nameless board with a picture).
+ */
+export function splitLeadingEmoji(raw: string): { emoji?: string; title: string } {
+  const m =
+    /^(\p{Extended_Pictographic}(?:\uFE0F|[\u{1F3FB}-\u{1F3FF}]|\u200D\p{Extended_Pictographic}|\uFE0F)*)\s+(\S.*)$/u.exec(
+      raw.trim(),
+    );
+  if (!m) return { title: raw.trim() };
+  return { emoji: m[1], title: m[2].trim() };
+}
+
+/**
  * Root signal store for the Dashboards section.
  *
  * `providedIn: "root"` is load-bearing, not incidental: `/dashboards` is a LIST
