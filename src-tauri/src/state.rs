@@ -782,6 +782,20 @@ mod tests {
         p
     }
 
+    /// A private DIRECTORY for a test that writes locked-audio fixtures.
+    ///
+    /// `repair_and_finalize_locked_at_rest` scans the PARENT of each locked audio path and refuses
+    /// any staging artifact it cannot account for. With fixtures written straight into
+    /// `std::env::temp_dir()`, that parent is the shared temp root, so a concurrently-running test's
+    /// artifact fails this one — intermittently, and with whichever test happens to lose the race.
+    /// Owning the directory is what makes the scan see only this test's own files.
+    fn tmp_audio_dir(tag: &str) -> PathBuf {
+        let dir = crate::storage::db::unique_temp_path(&format!("murmur-state-{tag}-dir"), "d");
+        let _ = std::fs::remove_file(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// Build a real SQLCipher-encrypted DB (keyed with `GOOD_KEY`) by seeding a plaintext DB and
     /// running the production encrypt-in-place path.
     fn seed_encrypted_db(path: &std::path::Path) {
@@ -1178,7 +1192,11 @@ mod tests {
         mark_folder_locked_recoverable(&db, "f1");
 
         // Sibling files derived from the unique db path so concurrent test runs never collide.
-        let base = p.to_string_lossy().to_string();
+        // Fixtures live in a directory this test OWNS — see `tmp_audio_dir`.
+        let base = tmp_audio_dir("reconcile")
+            .join("audio")
+            .to_string_lossy()
+            .to_string();
         let mic_plain = format!("{base}.m1.mic.wav");
         let mic_enc = format!("{base}.m1.mic.wav.enc");
         let sys_plain = format!("{base}.m1.sys.wav");
@@ -1291,7 +1309,11 @@ mod tests {
         .unwrap();
         db.seal_note("m1", "claude_code", &note_blob).unwrap();
 
-        let base = p.to_string_lossy().to_string();
+        // Fixtures live in a directory this test OWNS — see `tmp_audio_dir`.
+        let base = tmp_audio_dir("reconcile")
+            .join("audio")
+            .to_string_lossy()
+            .to_string();
         let mic_enc = format!("{base}.m1.mic.wav.enc");
         let mic_source = format!("{base}.m1.mic.source.wav");
         std::fs::write(&mic_source, b"MIC-MASTER").unwrap();
