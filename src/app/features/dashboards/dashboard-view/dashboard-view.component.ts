@@ -2,16 +2,21 @@ import {
   ChangeDetectionStrategy,
   Component,
   DestroyRef,
+  ElementRef,
   computed,
   effect,
   inject,
   signal,
   untracked,
+  viewChild,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import { ActivatedRoute, Router } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
-import { DashboardsService } from "../../../services/dashboards.service";
+import {
+  DashboardsService,
+  splitLeadingEmoji,
+} from "../../../services/dashboards.service";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
@@ -233,6 +238,47 @@ export class DashboardViewComponent {
 
   // ── board Ask ──────────────────────────────────────────────────────────────
   readonly turns = signal<BoardTurn[]>([]);
+
+  // ── rename ────────────────────────────────────────────────────────────────
+  //
+  // The board's name was write-once: `DashboardsService.update` shipped accepting
+  // `title`/`emoji`/`tint`, and the only caller ever passed `{pinned}`. A board named
+  // the wrong thing stayed named the wrong thing.
+  readonly renaming = signal(false);
+  readonly renameDraft = signal("");
+  private readonly renameField =
+    viewChild<ElementRef<HTMLInputElement>>("renameField");
+  private readonly _focusRename = effect(() => {
+    this.renameField()?.nativeElement.select();
+  });
+
+  startRename(): void {
+    const b = this.board();
+    if (!b) return;
+    // Round-trips through the same convention `create` uses, so renaming is also how
+    // you add or change the emoji: "🚀 Atlas GA".
+    this.renameDraft.set(b.emoji ? `${b.emoji} ${b.title}` : b.title);
+    this.renaming.set(true);
+  }
+
+  onRenameInput(event: Event): void {
+    this.renameDraft.set((event.target as HTMLInputElement).value);
+  }
+
+  cancelRename(): void {
+    this.renaming.set(false);
+  }
+
+  async commitRename(): Promise<void> {
+    const typed = this.renameDraft().trim();
+    const b = this.board();
+    if (!typed || !b) return;
+    this.renaming.set(false);
+    const { emoji, title } = splitLeadingEmoji(typed);
+    if (title === b.title && (emoji ?? null) === (b.emoji ?? null)) return;
+    // `emoji: ""` clears it — dropping the field would leave the old one in place.
+    await this.service.update(b.id, { title, emoji: emoji ?? "" });
+  }
 
   /**
    * Whether the Ask column is open, versus collapsed to its rail.
