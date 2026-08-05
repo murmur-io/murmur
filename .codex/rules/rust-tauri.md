@@ -33,6 +33,32 @@
 - Emit progress/state to the FE via the typed helpers in `src-tauri/src/events.rs`, not by
   inventing ad-hoc event names at the call site.
 
+### 2b. Every DTO that crosses IPC is camelCase — and on an ENUM that needs TWO attributes
+
+The FE reads camelCase. A struct gets that from `#[serde(rename_all = "camelCase")]`. An **enum with
+data-carrying variants needs BOTH**, because they do different jobs:
+
+```rust
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+//                    ^ renames the VARIANTS   ^ renames the FIELDS INSIDE them
+```
+
+**The bug this cost (2026-08-04, PR #566/#568).** `TileData` carried only the first. The variants
+tagged correctly (`"meeting"`), so it looked right — while the meeting tile shipped `started_at`,
+`duration_s`, `has_audio` and the FE read `startedAt`, `durationS`, `hasAudio`. Every one resolved
+to `undefined`, the tile threw while rendering, and it took the whole board down with it. **Six
+fixes went to the palette's positioning before anyone looked at the payload.**
+
+Why nothing caught it: `cargo test --lib` never asserted the serialized key names, and the e2e
+mocks were hand-written in camelCase — so the tests validated a contract the FE and the fixtures
+had agreed on between themselves, and which the backend did not honour. A hand-written mock
+DEFINES a shape; it does not verify one.
+
+**RULE:** any DTO crossing the IPC boundary needs a test that asserts the SERIALIZED key names, not
+just a round-trip through the same Rust type (which passes regardless of naming). Pattern:
+`serde_json::to_value(&dto)` and assert every key matches `^[a-z][a-zA-Z0-9]*$` with no `_`. See
+`commands/tests/dashboard_cmd_tests.rs` — the camelCase wire oracle.
+
 ## 3. Storage — SQLCipher; `PRAGMA key` FIRST
 
 - The whole DB is SQLCipher-encrypted. Open ONLY through `storage/db.rs::Db::open` (pulls the

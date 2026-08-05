@@ -307,6 +307,63 @@ fn living_answer_config_round_trips_its_readable_snapshot() {
     assert!(legacy.answer.is_some());
 }
 
+/// THE AGENT-SURFACE LEAK ORACLE. `render_tile_for_agent` feeds BOTH the local MCP server and the
+/// in-app agentic Ask loop, so a withheld tile that printed its stored title there would leak to a
+/// surface the screen-side redaction never sees. Every withheld state must print its state ONLY.
+#[test]
+fn agent_rendering_of_a_withheld_tile_prints_no_stored_chrome() {
+    let tile = |kind: &str, title: &str, config: Option<&str>| {
+        crate::storage::models::DashboardTile {
+            id: "t1".into(),
+            dashboard_id: "b1".into(),
+            kind: kind.into(),
+            ref_id: Some("x".into()),
+            title: Some(title.into()),
+            span: 4,
+            position: 0,
+            config: config.map(str::to_string),
+            created_at: "2026-08-03T10:00:00Z".into(),
+        }
+    };
+
+    for data in [TileData::Locked, TileData::Missing, TileData::Unconfigured] {
+        let out = render_tile_for_agent(&tile("note", "Acme — termination terms", None), &data);
+        assert!(
+            !out.contains("termination"),
+            "a withheld tile must not print its stored title to an agent: {out}"
+        );
+    }
+
+    // A withheld living answer prints the question but never the cached text.
+    let out = render_tile_for_agent(
+        &tile(
+            "living_answer",
+            "Will they renew?",
+            Some(r#"{"answer":"No — they are churning"}"#),
+        ),
+        &TileData::LivingAnswer {
+            question: "Will they renew?".into(),
+            answer: None,
+            answered_at: None,
+            withheld: true,
+        },
+    );
+    assert!(out.contains("withheld"), "the agent is told WHY: {out}");
+    assert!(!out.contains("churning"), "cached answer leaked: {out}");
+
+    // CONTROL: a visible tile does render its content, so the assertions above are not vacuous.
+    let out = render_tile_for_agent(
+        &tile("note", "Atlas GA checklist", None),
+        &TileData::Note {
+            id: "n1".into(),
+            title: "Atlas GA checklist".into(),
+            snippet: "auth migration is the blocker".into(),
+            updated_at: 0,
+        },
+    );
+    assert!(out.contains("Atlas GA checklist") && out.contains("auth migration"));
+}
+
 #[test]
 fn snippets_are_bounded_and_ellipsized() {
     assert_eq!(snippet_of("  short  ", 10), "short");
@@ -386,4 +443,128 @@ fn every_tile_kind_is_resolvable() {
         );
     }
     assert_eq!(handled.len(), TILE_KINDS.len(), "no stale handled kind");
+}
+
+/// EVERY tile payload field must reach the FE in camelCase.
+///
+/// `#[serde(tag = "kind", rename_all = "camelCase")]` on an ENUM renames the VARIANTS, not the
+/// fields inside them — `rename_all_fields` is the attribute that does the latter. Without it a
+/// meeting tile shipped `started_at` / `duration_s` / `has_audio` while the FE reads `startedAt` /
+/// `durationS` / `hasAudio`, so every one of those was `undefined` in the browser.
+///
+/// That was not a cosmetic mismatch. `DashboardTileComponent.formatDate` does `Date.parse(iso)`
+/// and then `iso.slice(0, 10)` when that is NaN, so `undefined` made it THROW — and an exception
+/// raised from a template binding aborts the REST of that change-detection pass. The visible
+/// symptom was somewhere else entirely: the Add-a-tile palette, rendered later in the same pass,
+/// came up as an empty box. A board holding only note tiles was fine, so it read as a
+/// tile-COUNT bug and cost six fixes aimed at the palette's own positioning.
+///
+/// The e2e suite structurally could not see it: its fixtures were written from the TypeScript
+/// type, so they always sent camelCase and never the shape the backend actually produces. This
+/// test asks the REAL serializer, which is the only place that question can be answered.
+#[test]
+fn every_tile_payload_field_is_camel_case_on_the_wire() {
+    let samples = vec![
+        TileData::Note {
+            id: "n".into(),
+            title: "t".into(),
+            snippet: "s".into(),
+            updated_at: 1,
+        },
+        TileData::Meeting {
+            id: "m".into(),
+            title: "t".into(),
+            started_at: "2026-08-04T10:00:00Z".into(),
+            duration_s: 60,
+            has_audio: true,
+        },
+        TileData::Document {
+            id: "d".into(),
+            title: "t".into(),
+            snippet: "s".into(),
+        },
+        TileData::Person {
+            id: "p".into(),
+            name: "n".into(),
+            mention_count: 1,
+            open_commitments: 2,
+        },
+        TileData::Reminders {
+            rows: vec![],
+            due_count: 0,
+        },
+        TileData::Drift {
+            entity: "e".into(),
+            predicate: "p".into(),
+            rows: vec![],
+        },
+        TileData::Numbers {
+            entity: "e".into(),
+            rows: vec![],
+        },
+        TileData::Pulse {
+            entity: "e".into(),
+            weekly: vec![1],
+            total: 1,
+            quiet_days: Some(3),
+        },
+        TileData::Promises {
+            owner: None,
+            rows: vec![],
+        },
+        TileData::LivingAnswer {
+            question: "q".into(),
+            answer: Some("a".into()),
+            answered_at: Some("2026-08-04T10:00:00Z".into()),
+            withheld: false,
+        },
+    ];
+
+    for data in samples {
+        let value = serde_json::to_value(&data).unwrap();
+        let obj = value.as_object().expect("a tile payload is a JSON object");
+        for key in obj.keys() {
+            assert!(
+                !key.contains('_'),
+                "tile payload key `{key}` is snake_case on the wire while the FE reads camelCase \
+                 (the enum needs `rename_all_fields`). Full payload: {value}"
+            );
+        }
+    }
+}
+
+/// The three fields the meeting tile's own template reads, pinned BY NAME.
+///
+/// The sweep above catches the class; this catches the exact regression with an unmistakable
+/// message, because these are the keys whose absence made change detection throw.
+#[test]
+fn a_meeting_tile_ships_started_at_as_camel_case() {
+    let json = serde_json::to_value(TileData::Meeting {
+        id: "m".into(),
+        title: "t".into(),
+        started_at: "2026-08-04T10:00:00Z".into(),
+        duration_s: 60,
+        has_audio: true,
+    })
+    .unwrap();
+    assert!(json.get("startedAt").is_some(), "the FE reads `startedAt`: {json}");
+    assert!(json.get("durationS").is_some(), "the FE reads `durationS`: {json}");
+    assert!(json.get("hasAudio").is_some(), "the FE reads `hasAudio`: {json}");
+}
+
+/// A note tile's timestamp, same class, different variant.
+///
+/// This one did NOT throw — `relative()` guards `!ms` and returns "recently" — so every note tile
+/// on every board has been quietly rendering "edited recently" regardless of its real timestamp.
+/// That silent-wrong-answer is the half of the bug a crash would never have revealed.
+#[test]
+fn a_note_tile_ships_updated_at_as_camel_case() {
+    let json = serde_json::to_value(TileData::Note {
+        id: "n".into(),
+        title: "t".into(),
+        snippet: "s".into(),
+        updated_at: 1_760_000_000_000,
+    })
+    .unwrap();
+    assert!(json.get("updatedAt").is_some(), "the FE reads `updatedAt`: {json}");
 }

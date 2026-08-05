@@ -14,7 +14,12 @@ import {
   viewChild,
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
-import type { LinkKind, NoteCitation, SourceRef } from "../../core/models";
+import type {
+  DashboardSummary,
+  LinkKind,
+  NoteCitation,
+  SourceRef,
+} from "../../core/models";
 import { DebounceService } from "../../services/debounce.service";
 import { RepositionOnScrollDirective } from "../../features/notes/note-brain-popover/reposition-on-scroll.directive";
 import { TeleportToBodyDirective } from "../teleport-to-body.directive";
@@ -87,6 +92,15 @@ export class SourcePickerComponent {
   /** Optional hard cap. Removal remains available at the cap unless disabled. */
   readonly selectionLimit = input<number | null>(null);
   /**
+   * Offer the user's DASHBOARDS as pickable scopes. Picking one expands it into
+   * the board's own VISIBLE sources (`get_dashboard_sources`, which drops sealed
+   * ones) and adds them, so a board becomes usable as context anywhere this
+   * picker is — Ask, note chat, reminders — without any command learning a new
+   * parameter. Default ON: a board is the user's own declaration of what belongs
+   * together, which is exactly what a source picker is for.
+   */
+  readonly allowDashboards = input(true);
+  /**
    * Candidate kinds this instance may expose. Defaults to the historical Brain
    * picker set; callers such as Reminders can narrow it to note + meeting.
    */
@@ -101,6 +115,19 @@ export class SourcePickerComponent {
   readonly query = signal("");
   /** The live candidate rows for the current query (already kind-filtered). */
   readonly candidates = signal<NoteCitation[]>([]);
+  /** The user's boards, loaded once when the popover first opens. */
+  private readonly _dashboards = signal<DashboardSummary[]>([]);
+  /** Boards matching the current query — shown above the note/meeting rows. */
+  readonly dashboardRows = computed(() => {
+    if (!this.allowDashboards()) return [];
+    const q = this.query().trim().toLowerCase();
+    return this._dashboards()
+      .filter((d) => d.tileCount > 0)
+      .filter((d) => !q || d.title.toLowerCase().includes(q))
+      .slice(0, 6);
+  });
+  /** Board id currently being expanded, so the row can show progress. */
+  readonly expandingBoard = signal<string | null>(null);
   /** Keyboard-highlighted row index. */
   readonly activeIndex = signal(0);
   /** True while the (debounced) fetch for the CURRENT query is in flight. */
@@ -232,6 +259,9 @@ export class SourcePickerComponent {
     this.query.set("");
     this.candidates.set([]);
     this.activeIndex.set(0);
+    // Boards are few and content-free at this level (title + tile count), so one
+    // lazy load on first open is enough — no per-keystroke fetch.
+    void this.loadDashboards();
     // Focus the search field + first fetch (empty prefix → recent candidates)
     // once the popover renders. afterNextRender is the zoneless-safe one-shot;
     // the injector is required outside field-init context.
@@ -427,6 +457,52 @@ export class SourcePickerComponent {
       },
       { injector: this.injector },
     );
+  }
+
+  /**
+   * Expand a board into its own VISIBLE sources and add them all.
+   *
+   * The board is a SCOPE, not a source: `SourceRef.kind` is a `LinkKind`
+   * (meeting/note/document), so a dashboard cannot be one. Expanding here rather
+   * than teaching every consumer a `dashboardIds` parameter is what makes boards
+   * work as context EVERYWHERE this picker is used, with no protocol change and
+   * no new backend seam. The backend drops sealed sources from that list, so
+   * picking a board can never widen scope past what the session may read.
+   */
+  async pickDashboard(board: DashboardSummary): Promise<void> {
+    if (this.disabled() || this.selectionLimitReached()) return;
+    this.expandingBoard.set(board.id);
+    try {
+      const sources = await this.ipc.getDashboardSources(board.id);
+      const allowed = this.allowedKindSet();
+      const limit = this.selectionLimit();
+      this.selected.update((list) => {
+        const seen = new Set(list.map((s) => s.kind + s.id));
+        const out = [...list];
+        for (const src of sources) {
+          if (!allowed.has(src.kind)) continue;
+          if (seen.has(src.kind + src.id)) continue;
+          if (limit !== null && Number.isInteger(limit) && out.length >= limit) {
+            break;
+          }
+          seen.add(src.kind + src.id);
+          out.push(src);
+        }
+        return out;
+      });
+    } finally {
+      this.expandingBoard.set(null);
+    }
+  }
+
+  /** Load the boards once, when the popover first opens. */
+  private async loadDashboards(): Promise<void> {
+    if (!this.allowDashboards() || this._dashboards().length > 0) return;
+    try {
+      this._dashboards.set(await this.ipc.listDashboards());
+    } catch {
+      this._dashboards.set([]);
+    }
   }
 
   remove(ref: SourceRef): void {

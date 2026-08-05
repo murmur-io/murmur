@@ -110,7 +110,12 @@ impl AssistantScope {
         ) {
             return false;
         }
-        const VAULT_READS: [&str; 9] = [
+        const VAULT_READS: [&str; 11] = [
+            // Dashboards: `list_dashboards` is metadata-only; `get_dashboard` resolves each tile
+            // through the gated readers, so it is exactly the class of `get_meeting` — an owned
+            // vault read that a sealed folder redacts.
+            "list_dashboards",
+            "get_dashboard",
             "search_meetings",
             "search_semantic",
             "get_meeting",
@@ -259,6 +264,14 @@ pub enum ToolCall {
     /// Local-MCP-only discovery of visible note folders, visible row counts, and typed columns.
     /// Intentionally absent from [`tool_specs`] and [`GatedToolExecutor`].
     ListNoteFolders,
+    /// The user's DASHBOARDS — boards they composed by hand. Metadata only (title, tile count,
+    /// tile kinds): no board reads a source here, so this carries no gated content and is safe at
+    /// every scope. It exists so an agent can DISCOVER the boards before scoping to one.
+    ListDashboards,
+    /// ONE dashboard, every tile resolved through the SAME gated resolver the UI uses
+    /// (`commands::dashboards::resolve_tile`). A sealed source yields a redacted tile, exactly as
+    /// on screen — a board is never a back door.
+    GetDashboard { dashboard_id: String },
     /// LOCAL-MCP-ONLY knowledge diff / decision ledger for one entity: what changed between two
     /// instants (`from`/`to` ISO-8601), the chronological supersession ledger, and a separate,
     /// explicitly-HISTORICAL read-time context from Decisions / Risks / Open Questions sections in
@@ -385,6 +398,33 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "includeNote": { "type": "boolean", "description": "Include the note on the first page (default true)." }
                 },
                 "required": ["meetingId"]
+            }),
+            write: false,
+        },
+        ToolSpec {
+            name: "list_dashboards".into(),
+            description: "List the user's DASHBOARDS — boards they composed by hand out of \
+                          meetings, notes, documents, people and derived views. Returns titles + \
+                          ids only. When a question is about a project/deal/topic the user tracks, \
+                          check here first: a board is the user's OWN declaration of what belongs \
+                          together, which is better scope than a search guess."
+                .into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_dashboard".into(),
+            description: "Read one dashboard by id: every tile, already resolved — the notes and \
+                          recordings on it, who is on it, what values drifted, what was promised \
+                          and whether it landed. Sealed sources come back redacted. Use it to \
+                          answer from exactly the context the user curated."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "dashboardId": { "type": "string", "description": "The board id from list_dashboards." }
+                },
+                "required": ["dashboardId"]
             }),
             write: false,
         },
@@ -1077,6 +1117,69 @@ pub fn execute_tool(
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))
+        }
+        ToolCall::ListDashboards => {
+            let boards = db
+                .list_dashboards()
+                .map_err(|e| AppError::Storage(format!("dashboard list failed: {e}")))?;
+            if boards.is_empty() {
+                return Ok("No dashboards yet.".to_string());
+            }
+            let kinds = db
+                .dashboard_tile_kinds()
+                .map_err(|e| AppError::Storage(format!("dashboard tile kinds failed: {e}")))?;
+            Ok(boards
+                .iter()
+                .map(|b| {
+                    let mut tile_kinds: Vec<&str> = kinds
+                        .iter()
+                        .filter(|(board_id, _, _)| board_id == &b.id)
+                        .map(|(_, kind, _)| kind.as_str())
+                        .collect();
+                    tile_kinds.sort_unstable();
+                    tile_kinds.dedup();
+                    format!(
+                        "- {} · id:{} · tiles:{} · kinds:{}",
+                        b.title,
+                        b.id,
+                        kinds.iter().filter(|(bid, _, _)| bid == &b.id).count(),
+                        if tile_kinds.is_empty() {
+                            "none".to_string()
+                        } else {
+                            tile_kinds.join(",")
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        ToolCall::GetDashboard { dashboard_id } => {
+            let Some(board) = db
+                .get_dashboard(dashboard_id)
+                .map_err(|e| AppError::Storage(format!("dashboard read failed: {e}")))?
+            else {
+                return Ok(format!("No dashboard with id {dashboard_id}."));
+            };
+            let tiles = db
+                .list_dashboard_tiles(dashboard_id)
+                .map_err(|e| AppError::Storage(format!("dashboard tiles failed: {e}")))?;
+            let mut out = format!("# {} (dashboard)\n", board.title);
+            if tiles.is_empty() {
+                out.push_str("(no tiles yet)");
+                return Ok(out);
+            }
+            for tile in &tiles {
+                // The SAME gated resolver the UI uses. A sealed source renders redacted here too.
+                let data = crate::commands::resolve_tile(db, tile, unlocked)?;
+                // Redact BEFORE rendering, exactly as `get_dashboard` does for the UI. The agent
+                // path calls `resolve_tile` directly, so without this the renderer would still see
+                // a withheld tile's stored `title`/`config` — and a legacy row (written by a build
+                // that copied the source's title) would hand a sealed source's name to an agent.
+                let tile = crate::commands::redact_tile_chrome(tile.clone(), &data);
+                out.push_str(&crate::commands::render_tile_for_agent(&tile, &data));
+                out.push('\n');
+            }
+            Ok(out.trim_end().to_string())
         }
         ToolCall::ListNoteFolders => {
             let folders = db
@@ -3212,6 +3315,22 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             ));
         }
         match name {
+            // Dashboards — the user's own curated scope. Same gated executor, same visibility
+            // snapshot as every other vault read here.
+            "list_dashboards" => execute_tool(
+                &ToolCall::ListDashboards,
+                self.db,
+                &unlocked,
+                self.config,
+            ),
+            "get_dashboard" => execute_tool(
+                &ToolCall::GetDashboard {
+                    dashboard_id: s("dashboardId"),
+                },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
             "search_meetings" => execute_tool(
                 &ToolCall::SearchMeetings { query: s("query") },
                 self.db,
@@ -3555,6 +3674,156 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// THE AGENT-PATH LEAK ORACLE, end to end through `execute_tool`.
+    ///
+    /// The renderer is tested in isolation elsewhere, but the agent path calls `resolve_tile`
+    /// DIRECTLY — it does not go through the command layer — so the redaction has to be applied
+    /// here too. A legacy row (written by a build that copied the source's title into the tile)
+    /// plus a sealed folder is exactly the shape that would hand an agent a sealed source's name.
+    #[test]
+    fn get_dashboard_tool_redacts_a_sealed_tile_for_agents() {
+        use crate::storage::models::{Folder, MeetingStatus, NoteRecord};
+
+        let db = tmp_db();
+        db.insert_folder(&Folder {
+            id: "f-sealed".to_string(),
+            name: "Legal".to_string(),
+            path: "Legal".to_string(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-08-01T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_meeting(&crate::storage::models::Meeting {
+            id: "m-sealed".to_string(),
+            started_at: "2026-08-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Acme termination call".to_string()),
+            duration_s: 600,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: Some("f-sealed".to_string()),
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m-sealed".to_string(),
+            provider_id: "test".to_string(),
+            markdown: "they are not renewing".to_string(),
+            created_at: "2026-08-01T09:00:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_note_folder("m-sealed", Some("f-sealed")).unwrap();
+
+        db.insert_dashboard("b1", "Deals", None, None, "2026-08-03T10:00:00Z")
+            .unwrap();
+        // The tile carries a copied source title, as an older build would have written it.
+        db.insert_dashboard_tile(
+            "t1",
+            "b1",
+            "meeting",
+            Some("m-sealed"),
+            Some("Acme termination call"),
+            4,
+            None,
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let nothing_unlocked = HashSet::new();
+        let out = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &nothing_unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("Acme termination call") && !out.contains("not renewing"),
+            "a sealed tile must reach an agent redacted: {out}"
+        );
+        assert!(out.contains("sealed"), "and it must say so: {out}");
+
+        // CONTROL: session-unlock the folder and the SAME call returns the real content, so the
+        // assertion above is not passing merely because the tool returns nothing useful.
+        let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+        let out = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Acme termination call"),
+            "unlocking must restore the tile for agents too: {out}"
+        );
+    }
+
+    /// The INVARIANT test for the agent path, on the exact shape that used to leak: a
+    /// `living_answer` tile with a cached answer, NO question and a stored title.
+    ///
+    /// HONEST LIMIT, measured rather than assumed. Two independent layers now protect this — the
+    /// `redact_tile_chrome` call in `GetDashboard`, and `render_tile_for_agent` no longer falling
+    /// back to the stored title for a withheld answer — and EITHER alone is sufficient. I neutered
+    /// the redaction call and this test still passed, so it is NOT red-before-green proof of that
+    /// layer; it pins the end-to-end invariant, which is what actually must hold.
+    ///
+    /// The layers are covered separately where each is observable in isolation:
+    /// `commands/tests/dashboard_cmd_tests.rs::agent_rendering_of_a_withheld_tile_prints_no_stored_chrome`
+    /// drives the renderer with an UNREDACTED tile (red if the renderer regresses), and
+    /// `…::locked_tile_sheds_its_user_authored_chrome` covers `redact_tile_chrome` itself.
+    #[test]
+    fn agent_path_withholds_a_living_answer_title_and_cached_text() {
+        let db = tmp_db();
+        db.insert_dashboard("b1", "Deals", None, None, "2026-08-03T10:00:00Z")
+            .unwrap();
+        // A legacy-shaped row: cached answer, no question, and a title copied from the source.
+        db.insert_dashboard_tile(
+            "t1",
+            "b1",
+            "living_answer",
+            None,
+            Some("Acme termination terms"),
+            4,
+            Some(r#"{"answer":"They are not renewing"}"#),
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let nothing_unlocked = HashSet::new();
+        let out = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &nothing_unlocked,
+            &cfg,
+        )
+        .unwrap();
+
+        // The answer has no recorded readable-folder snapshot ⇒ un-gateable ⇒ withheld, and with
+        // it goes the stored title.
+        assert!(
+            !out.contains("Acme termination terms"),
+            "a withheld living answer must not hand an agent its stored title: {out}"
+        );
+        assert!(
+            !out.contains("not renewing"),
+            "nor the cached answer text: {out}"
+        );
+        assert!(out.contains("withheld"), "and it must say why: {out}");
     }
 
     #[test]

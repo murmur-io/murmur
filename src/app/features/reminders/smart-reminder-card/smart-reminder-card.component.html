@@ -1,9 +1,19 @@
-<section class="smart-card card" aria-label="Reminders for this source">
+<section
+  class="smart-card"
+  [class.card]="hasContent()"
+  [class.is-strip]="!hasContent()"
+  aria-label="Reminders for this source"
+>
   <header class="smart-head">
-    <div>
-      <span class="smart-kicker">✦ Smart reminders</span>
-      <h3>Don’t let this slip</h3>
-    </div>
+    <!-- The branded heading is earned, not unconditional. With nothing to show
+         this collapses to a single quiet row, which is what makes promoting the
+         surface above the fold affordable. -->
+    @if (hasContent()) {
+      <div>
+        <span class="smart-kicker">✦ Smart reminders</span>
+        <h3>Don’t let this slip</h3>
+      </div>
+    }
     <button
       type="button"
       class="btn btn-ghost"
@@ -28,9 +38,12 @@
     </div>
   }
 
-  @if (loading() && rows().length === 0) {
-    <p class="smart-status">Reviewing this source locally…</p>
-  } @else if (rows().length > 0) {
+  <!-- No loading branch. `_suggestions` is component-local and wiped on every
+       remount, so gating on `loading()` flashed "Reviewing this source locally…"
+       on EVERY note open — tolerable at the bottom of the page, but above the
+       fold it reads as the page stuttering. The idle strip just stays until
+       rows arrive. -->
+  @if (rows().length > 0) {
     <p class="smart-intro">
       Review these local suggestions. Murmur never creates them automatically.
     </p>
@@ -66,9 +79,5 @@
         </li>
       }
     </ul>
-  } @else if (!error()) {
-    <p class="smart-status">
-      No reminder suggestions here. You can still create one manually.
-    </p>
   }
 </section>
