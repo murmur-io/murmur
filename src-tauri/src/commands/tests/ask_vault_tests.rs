@@ -251,8 +251,10 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
     // Empty memory brief ⇒ the floor prompt must stay BYTE-IDENTICAL to the pre-memory build.
     let (want_system, want_user) = crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-    match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None, None)
-        .unwrap()
+    match build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, q, &history, "", None, None, None, None,
+    )
+    .unwrap()
     {
         AskFloorPrompt::Ready {
             system,
@@ -284,7 +286,7 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
 
     // The empty-vault early return keeps the EXACT pre-change canned answer.
     let empty = tmp_db();
-    match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None)
+    match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None, None)
         .unwrap()
     {
         AskFloorPrompt::Empty(r) => {
@@ -329,6 +331,7 @@ fn ask_floor_preserves_no_consent_error_semantics() {
         "",
         None,
         &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
         None,
         None,
     ));
