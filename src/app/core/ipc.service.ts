@@ -1903,6 +1903,7 @@ export class IpcService {
     askThreadId?: string,
     explicitSources?: SourceRef[],
     pinnedOrgItemId?: string,
+    dashboardId?: string,
   ): Promise<AskVaultResult> {
     return invoke<AskVaultResult>("ask_vault", {
       question,
@@ -1912,6 +1913,14 @@ export class IpcService {
       // Org-item viewer: pin a read-only SHARED (org-feed) note into the Ask context server-side
       // (the local Brain never retrieves org content via search, so pinning is what grounds it).
       ...(pinnedOrgItemId ? { pinnedOrgItemId } : {}),
+      // Board-scoped Ask: the board's DERIVED tiles (promises, drift, pulse, reminders,
+      // person, living answer) are what the user is looking at, but they are not
+      // retrievable documents, so `get_dashboard_sources` deliberately never turns them
+      // into a `SourceRef`. Sending the board ID lets the BACKEND render them through the
+      // same gated path MCP already reads. An ID, never the finished text — handing a
+      // string straight into a prompt would be an injection surface and would build
+      // content outside the gate.
+      ...(dashboardId ? { dashboardId } : {}),
     });
   }
 

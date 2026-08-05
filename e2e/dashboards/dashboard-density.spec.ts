@@ -498,3 +498,73 @@ test("Dashboards: navigating away mid-ask does not leave the next board stuck bu
   await expect(page.getByText("slow question")).toHaveCount(0);
   await expect(page.getByText("answer for the first board")).toHaveCount(0);
 });
+test("Dashboards: sealed material-only board still asks with its board id", async ({ page }) => {
+  // The board scopes the ask even when it has nothing readable to SHOW. Deciding on
+  // the resolved payload made this unreachable: every tile resolves to `locked`, the
+  // old count was zero, and the UI told the user to add tiles to a board that has
+  // them — while the backend's "scoped but empty" path never ran, which is the one
+  // thing that stops such a board answering from the whole vault.
+  await mockTauri(
+    page,
+    {
+      ask_vault: (args: any) => {
+        (globalThis as any).__askArgs = args;
+        // The REAL string the board-scoped empty path returns (`commands/ask.rs`,
+        // pinned by `a_board_scoped_empty_ask_does_not_tell_the_user_to_record`).
+        // A mock stands in for the TRANSPORT, not for the contract — inventing a
+        // nicer sentence here would have this spec assert a message that never ships.
+        return {
+          answer:
+            "Nothing on this board is readable right now — unlock its folders, or add " +
+            "tiles with content you can see.",
+          sources: [],
+          citations: [],
+        };
+      },
+      // A board-scoped answer may contain DERIVED-tile material — rows the board
+      // composed, not documents the user pinned. Nothing may persist it: the
+      // living-answer cache is gated by a stamp of readable folders, and only
+      // `refreshAnswer` writes that cache — deliberately calling `askVault` with FOUR
+      // arguments, so `dashboardId` stays `undefined` and no brief is rendered into a
+      // stored answer. That property is implicit; it survives only while nobody adds a
+      // sixth argument there, which is why it is pinned rather than left to a comment.
+      set_dashboard_answer: () => {
+        (globalThis as any).__setDashboardAnswerCalls =
+          ((globalThis as any).__setDashboardAnswerCalls ?? 0) + 1;
+        return null;
+      },
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: {
+        ...BOARDS[0],
+        tiles: [
+          tile("t-sealed-note", "note", { kind: "locked" }, 0),
+          tile("t-sealed-meeting", "meeting", { kind: "locked" }, 1),
+          tile("t-sealed-document", "document", { kind: "locked" }, 2),
+        ],
+      },
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-dense");
+  await expect(page.locator("app-dashboard-tile")).toHaveCount(3);
+
+  // The Ask column starts collapsed to its rail, so expand it the way a user does.
+  await openAsk(page);
+  await page.getByRole("textbox", { name: /Ask a question/i }).fill("who owes me?");
+  await page.getByRole("button", { name: "Ask", exact: true }).click();
+
+  // It ASKED — no dead end, and the answer names the real situation (locked tiles)
+  // rather than telling the user to go record a meeting.
+  await expect(page.getByText(/Nothing on this board is readable/)).toBeVisible();
+  // …and it sent the board id, which is what makes the backend scope the request
+  // instead of falling through to a vault-wide search.
+  const sent = await page.evaluate(() => (globalThis as any).__askArgs);
+  expect(sent?.dashboardId).toBe("b-dense");
+  const persisted = await page.evaluate(
+    () => (globalThis as any).__setDashboardAnswerCalls ?? 0,
+  );
+  expect(persisted).toBe(0);
+});
