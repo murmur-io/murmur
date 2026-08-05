@@ -9,6 +9,22 @@
   prefer `computed()`, and write signals from an `effect()` only when it genuinely orchestrates an
   async IPC fetch, with a stale-result guard. Mirrors: `entity-detail.component.ts`,
   `graph.component.ts`.
+- **A UI bug starts with a REPRO, never with reading the component (T5).** When a user reports "it
+  does nothing" and the gates are green, open it live (Playwright MCP), click it, look. If it will
+  not reproduce in your engine, that IS the finding — the difference is the environment, so go find
+  which API differs instead of reading more CSS. Measured cost of ignoring this: four rounds on one
+  palette bug (PR #566), of which the first three were hypotheses from code.
+- **RED-before-GREEN binds for UI as hard as for Rust.** `11/11` green before and after a fix proves
+  nothing. When the failure lives in an engine you cannot run, get RED by STUBBING the newer API
+  (`Element.prototype.matches` throwing on `:modal`, `showModal()` refusing) and asserting the UI
+  still works — that check is red on the unpatched code and green after.
+- **Playwright's engines are NEWER than the shipping WKWebView.** A modern web API can therefore
+  throw only for the user: `matches(":modal")` outside a `try` skipped `el.open`, and an unopened
+  `<dialog>` is `display:none`. Guard every modern call or answer the question with an older API.
+- **Give the UI observability before you start guessing.** A trigger that opens a modal should
+  reflect its state ("Add tile" ⇄ "Close"); otherwise "the click never landed" and "the panel never
+  painted" are indistinguishable from outside, and you cannot tell which half to debug. Adding that
+  one label resolved in a single screenshot what three rounds of CSS analysis had not.
 - **Import-cycle `ɵcmp` (T2):** mutually-recursive standalone components (tree ↔ row) must use
   `forwardRef(() => Other)` in BOTH `imports:` arrays, or the first `@for` throws
   `getComponentDef(undefined)`.

@@ -45,6 +45,12 @@
   line-height: 1;
 }
 
+.arrange-hint {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .board {
   display: flex;
   gap: var(--space-3);
@@ -138,16 +144,30 @@
   padding: var(--space-4);
 }
 
+.thread .banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: 0.8rem;
+}
+
 .bubble {
   padding: var(--space-3);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   border-bottom-left-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--surface-input);
   color: var(--text-secondary);
   font-size: 0.8rem;
   line-height: 1.6;
-  white-space: pre-wrap;
+
+  // `white-space: pre-wrap` belongs to text that is NOT parsed. An assistant turn
+  // now renders through `app-markdown`, where pre-wrap would preserve the source
+  // newlines around every block element and double the spacing.
+  &.me {
+    white-space: pre-wrap;
+  }
 
   &.me {
     align-self: flex-end;
@@ -227,7 +247,13 @@
 
 // Narrow windows: the Ask column drops under the canvas rather than squeezing it.
 @media (max-width: 1080px) {
-  .board {
+  .arrange-hint {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.board {
     flex-direction: column;
   }
 
