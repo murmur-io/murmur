@@ -69,7 +69,27 @@
     }
   </section>
 
-  <aside class="ask" aria-label="Ask this board">
+  <aside class="ask" [class.is-rail]="!askExpanded()" aria-label="Ask this board">
+    @if (!askExpanded()) {
+      <!--
+        Collapsed. The SCOPE COUNT stays on screen because it is the feature's whole
+        claim made visible — this board, and nothing else, is what an answer may come
+        from. An empty transcript is not; it was taking a third of the width to show
+        three suggestion buttons.
+      -->
+      <button
+        type="button"
+        class="ask-rail"
+        (click)="expandAsk()"
+        [attr.aria-label]="'Ask this board — ' + sourceCount() + ' readable sources'"
+      >
+        <mur-icon icon="ask" />
+        <span class="rail-label">
+          Ask this board
+          <span class="rail-count">{{ sourceCount() }} in scope</span>
+        </span>
+      </button>
+    } @else {
     <header class="ask-head">
       <mur-icon icon="ask" />
       <h2>Ask this board</h2>
@@ -132,6 +152,7 @@
         Ask
       </button>
     </form>
+    }
   </aside>
 </div>
 
