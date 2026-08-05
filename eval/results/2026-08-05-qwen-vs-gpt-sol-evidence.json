@@ -20,14 +20,6 @@
     "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined.json",
     "sha256": "6db53789cc979743ab6deaf74a0aba093c94df2825abef32ea93cb801effd3cc"
   },
-  "fixtureSnapshot": {
-    "path": "eval/results/2026-08-05-local-cloud-quality-fixture.json",
-    "sha256": "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2"
-  },
-  "contentInventory": {
-    "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-content-inventory.json",
-    "sha256": "5ce634a6bff61e48fdbcec19b2c08bf91f3aaae29c78d8028ac79d8679afac28"
-  },
   "producerSnapshot": {
     "repositoryCommit": "57ced723867d2a6612d4a61b67cdad4413bafdd6",
     "sourceFingerprintSha256": "c8169e4ac77327ca3f7ad232e2e843f163efbc62a04afe664407f1a929dd7ec3",

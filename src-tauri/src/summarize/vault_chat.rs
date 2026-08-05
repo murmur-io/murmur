@@ -3,6 +3,15 @@
 
 use crate::storage::models::ChatTurn;
 
+/// Shared coordinate/polarity discipline for both the deterministic corpus floor and the agentic
+/// Ask persona. The Qwen bake-off exposed a clause-contamination failure: an OPEN budget was used
+/// to negate a separately approved launch. Single-sourcing keeps the two Ask routes aligned.
+const FACT_COORDINATE_RULES: &str = "\
+- Answer every sub-question separately; do not collapse independent decisions or statuses.\n\
+- Preserve the exact owners, dates, numbers, locations, and decision status stated in the source.\n\
+- Preserve polarity per clause: one negative or open status must never negate a separate approved decision.\n\
+- Do not omit a stated owner deadline when the user asks for that deadline; do not volunteer unrelated details.";
+
 /// Build the (system, user) prompt pair: the meeting-notes corpus as system context, the
 /// running conversation + question as the user message.
 ///
@@ -27,11 +36,13 @@ invent facts, decisions, or attributions.\n\
 - Cite the meetings you rely on inline using their [[Title]] exactly as given.\n\
 - When something evolved across meetings, trace it chronologically.\n\
 - Be concise and concrete.\n\
+{coordinates}\n\
 - Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight bullets \
 or short `##` sections. A tasteful emoji in a section header is welcome (e.g. ## ✅ Decisions). \
 Never output YAML or front-matter.\n\n\
 {memory}MEETING NOTES:\n{corpus}",
         memory = memory_block(memory_brief),
+        coordinates = FACT_COORDINATE_RULES,
     );
 
     (system, render_conversation(history, question))
@@ -94,11 +105,19 @@ pub fn agentic_system(memory_brief: &str, org_available: bool) -> String {
      it; attribute web facts as \"(via web)\".\n\
      - When something evolved across meetings, trace it chronologically.\n\
      - Be concise and concrete.\n\
+     {coordinates}\n\
+     - For a direct fact, decision, owner, or date question, use search_meetings / \
+     search_semantic first; do not start with list_dashboards unless the user asks about a \
+     dashboard/board or broad curated scope. A search hit can include a useful snippet; if it does \
+     not contain every fact the user asked for, do not declare those facts unknown yet. Open one \
+     matching `[meeting:<id>]` with get_meeting or `[document:<kind>:<id>]` with get_document first. \
+     For dashboard facts, follow list_dashboards with get_dashboard.\n\
      - Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight \
      bullets or short `##` sections. A tasteful emoji in a section header is welcome (e.g. \
      ## ✅ Decisions). Never output YAML or front-matter.{org}{memory}",
         org = org_fallback_suffix(org_available),
         memory = agentic_memory_suffix(memory_brief),
+        coordinates = FACT_COORDINATE_RULES,
     )
 }
 
@@ -166,6 +185,22 @@ mod tests {
         assert!(s.contains("[[Sync]]"));
         assert!(u.contains("User: What shipped?"));
         assert!(u.trim_end().ends_with("Assistant:"));
+    }
+
+    /// RED-before-GREEN from the local Qwen bake-off: one negative budget status must not negate an
+    /// independently approved launch, and stated owner deadlines must not disappear from a
+    /// multi-part answer.
+    #[test]
+    fn floor_prompt_pins_subquestion_coverage_exact_coordinates_and_polarity() {
+        let (system, _) = build("corpus", &[], "question", "");
+        for needle in [
+            "Answer every sub-question separately",
+            "exact owners, dates, numbers, locations, and decision status",
+            "one negative or open status must never negate a separate approved decision",
+            "Do not omit a stated owner deadline",
+        ] {
+            assert!(system.contains(needle), "missing `{needle}` in: {system}");
+        }
     }
 
     /// EMPTY memory brief ⇒ the floor prompt is BYTE-IDENTICAL to the pre-memory prompt (no block,
@@ -269,25 +304,17 @@ mod tests {
         }
     }
 
-    /// `org_available=false` is BYTE-IDENTICAL to the pre-org-parameter persona (no `org` param at
-    /// all) — proven by pinning it against the exact historical rule text, so a future edit can't
-    /// silently start emitting the org sentence for `false`.
+    /// `org_available=false` must omit only the org fallback while retaining the current shared
+    /// factual-coordinate and unknown-after-search retry contract.
     #[test]
-    fn agentic_system_org_unavailable_is_byte_identical_to_pre_org_persona() {
-        let historical = "You answer questions across a user's PAST MEETINGS, imported documents, and brain notes \
-     (their private, on-device vault).\n\
-     Rules:\n\
-     - Ground every claim in tool results — search before answering unless you already have \
-     enough grounding. If the answer isn't in the vault, say you don't know. Never invent \
-     facts, decisions, or attributions.\n\
-     - Cite the meetings you rely on inline using their [[Title]] exactly as the tools return \
-     it; attribute web facts as \"(via web)\".\n\
-     - When something evolved across meetings, trace it chronologically.\n\
-     - Be concise and concrete.\n\
-     - Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight \
-     bullets or short `##` sections. A tasteful emoji in a section header is welcome (e.g. \
-     ## ✅ Decisions). Never output YAML or front-matter.";
-        assert_eq!(agentic_system("", false), historical);
+    fn agentic_system_org_unavailable_keeps_grounding_without_org_hint() {
+        let prompt = agentic_system("", false);
+        assert!(!prompt.contains("org_brain_search"));
+        assert!(prompt.contains("Answer every sub-question separately"));
+        assert!(prompt.contains("do not declare those facts unknown yet"));
+        assert!(prompt.contains("`[meeting:<id>]` with get_meeting"));
+        assert!(prompt.contains("`[document:<kind>:<id>]` with get_document"));
+        assert!(prompt.contains("follow list_dashboards with get_dashboard"));
     }
 
     /// `agentic_system_jit` threads `org_available` through unchanged: false ⇒ no org sentence in
