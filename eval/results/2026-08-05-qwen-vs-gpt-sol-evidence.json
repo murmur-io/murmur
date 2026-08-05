@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "kind": "murmur_local_cloud_quality_evidence",
+  "evidenceMethod": "deterministic_code_owned_oracles_no_model_judge",
+  "repetitions": {
+    "1": {
+      "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1.json.gz",
+      "archiveSha256": "fc7c70eb07595b8ae768a9a53d2d8e6d12544b086a5d4173540acb873618fb2f",
+      "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1.json",
+      "logicalSha256": "3308ec93608ca21a190e6bf14f0082d98f8cde545e1c9f8fe017f9c2f07bac51"
+    },
+    "2": {
+      "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2.json.gz",
+      "archiveSha256": "0142628e94dd3756cbad3d2d067def02b19b830e95107c7be82dbcc3344aa6cf",
+      "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2.json",
+      "logicalSha256": "393ddee23d7bdff7604a2333f0303d3fea8c398769e1732519d4bfc479973d64"
+    }
+  },
+  "combined": {
+    "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined.json",
+    "sha256": "6db53789cc979743ab6deaf74a0aba093c94df2825abef32ea93cb801effd3cc"
+  },
+  "fixtureSnapshot": {
+    "path": "eval/results/2026-08-05-local-cloud-quality-fixture.json",
+    "sha256": "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2"
+  },
+  "contentInventory": {
+    "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-content-inventory.json",
+    "sha256": "5ce634a6bff61e48fdbcec19b2c08bf91f3aaae29c78d8028ac79d8679afac28"
+  },
+  "producerSnapshot": {
+    "repositoryCommit": "57ced723867d2a6612d4a61b67cdad4413bafdd6",
+    "sourceFingerprintSha256": "c8169e4ac77327ca3f7ad232e2e843f163efbc62a04afe664407f1a929dd7ec3",
+    "manifestSha256": "21ea3cc236b8c4058f18043b538bac87e93e933c86bd8b0c3696f5b67d45f01d",
+    "evaluatorFileSha256": "b0feaaff5cb533fa2767a60ecd70844d3af3ee2f79be2b09b401eebf7b5f9363",
+    "fixtureFileSha256": "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2",
+    "repeatValidatorFileSha256": "48d66559c713cc0da346d5d92fc0051be4b67ebb1b6b6f4422e3024101312198",
+    "trackedDiffSha256": "2abc82dbb45b82c7eff771a038f95039e71cf26a46f549e5ceb52d4df05628a8",
+    "workingTreeDirty": true
+  },
+  "runtimeIdentities": {
+    "local": {
+      "version": "murmur-brain-workspace-build",
+      "sha256": "a47b8ec18d8597f59caad79aedf9aa9c7d86a5e2444ff036785ddea4fd2d4c37"
+    },
+    "codex": {
+      "version": "codex-cli 0.146.0",
+      "sha256": "ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02"
+    }
+  }
+}
