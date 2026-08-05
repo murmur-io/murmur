@@ -1,12 +1,39 @@
 <header class="head">
   <div class="head-text">
     <button type="button" class="crumb" (click)="back()">← Dashboards</button>
-    <h1>
-      @if (board()?.emoji; as emoji) {
-        <span class="emoji">{{ emoji }}</span>
-      }
-      {{ board()?.title ?? "Board" }}
-    </h1>
+    @if (renaming()) {
+      <form class="rename" (submit)="commitRename(); $event.preventDefault()">
+        <input
+          #renameField
+          class="rename-field"
+          type="text"
+          [value]="renameDraft()"
+          (input)="onRenameInput($event)"
+          (keydown.escape)="cancelRename()"
+          aria-label="Board name"
+        />
+        <button type="submit" class="btn btn-primary btn-sm" [disabled]="!renameDraft().trim()">
+          Save
+        </button>
+        <button type="button" class="btn btn-ghost btn-sm" (click)="cancelRename()">Cancel</button>
+      </form>
+    } @else {
+      <h1>
+        <!-- The title IS the rename affordance. A board named the wrong thing was
+             permanent: `update` was only ever called with `{pinned}`. -->
+        <button
+          type="button"
+          class="title-edit"
+          (click)="startRename()"
+          [attr.aria-label]="'Rename this board — ' + (board()?.title ?? '')"
+        >
+          @if (board()?.emoji; as emoji) {
+            <span class="emoji">{{ emoji }}</span>
+          }
+          {{ board()?.title ?? "Board" }}
+        </button>
+      </h1>
+    }
   </div>
 
   <button type="button" class="btn btn-ghost" (click)="toggleEditing()">

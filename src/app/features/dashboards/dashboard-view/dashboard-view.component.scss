@@ -315,3 +315,46 @@
     max-height: 420px;
   }
 }
+
+// ── rename ───────────────────────────────────────────────────────────────────
+// The title doubles as the rename control, so it must look like a heading until
+// hovered — a button that shouts is chrome the header does not need.
+.title-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  margin-left: calc(var(--space-2) * -1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: text;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast);
+
+  &:hover,
+  &:focus-visible {
+    border-color: var(--border-subtle);
+    background: var(--surface-input);
+  }
+}
+
+.rename {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.rename-field {
+  min-width: 260px;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-size: 1.05rem;
+  font-weight: 640;
+}
