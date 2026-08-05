@@ -84,6 +84,7 @@
           [attr.draggable]="editing() ? 'true' : null"
           (dragstart)="onDragStart(tile, $event)"
           (dragover)="onDragOver(tile, $event)"
+          (dragleave)="onDragLeave(tile)"
           (drop)="onDrop(tile, $event)"
           (dragend)="onDragEnd()"
           (remove)="removeTile(tile)"

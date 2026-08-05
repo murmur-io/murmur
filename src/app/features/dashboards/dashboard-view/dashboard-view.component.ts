@@ -208,6 +208,19 @@ export class DashboardViewComponent {
     if (this.dropTargetId() !== tile.id) this.dropTargetId.set(tile.id);
   }
 
+  /**
+   * Clear the highlight when the pointer leaves this tile.
+   *
+   * `dragover` only ever SETS a target, so dragging off the grid entirely left the
+   * last-hovered tile lit as a drop target that no longer existed. Guarded on identity
+   * because `dragleave` also fires when the pointer crosses into a CHILD element —
+   * clearing unconditionally would flicker the highlight off and on across every row
+   * inside the tile you are actually hovering.
+   */
+  onDragLeave(tile: ResolvedTile): void {
+    if (this.dropTargetId() === tile.id) this.dropTargetId.set(null);
+  }
+
   onDragEnd(): void {
     this.draggingId.set(null);
     this.dropTargetId.set(null);
