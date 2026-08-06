@@ -23,8 +23,10 @@ fn run_artifact_oracle(mode: &str) {
 #[test]
 /// The score-replay manifest deliberately keeps its source-bound strict schema. This separate,
 /// Rust-invoked oracle binds that manifest together with R1/R2, combined, the exact synthetic
-/// fixture snapshot, and the complete all-string inventory, then runs mutation selftests.
-fn final_quality_artifacts_and_adjacent_fixture_inventory_bindings_round_trip_offline() {
+/// fixture snapshot, complete all-string inventory, and bounded review projection, then runs
+/// mutation selftests. The projection keeps the large generated JSON reviewable without becoming
+/// a second source of truth: the Python oracle must regenerate it exactly from the bound artifacts.
+fn final_quality_artifacts_fixture_inventory_and_review_projection_round_trip_offline() {
     run_artifact_oracle("--final");
 }
 
