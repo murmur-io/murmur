@@ -2933,7 +2933,11 @@ fn fold_manual_notes(markdown: &str, manual_notes: &str) -> String {
 ///   `murmur_enhanced: true` front-matter marker instead (the FE badge + honest provenance).
 /// - anything else (append mode, empty buffer, unknown mode) ⇒ the legacy verbatim fold,
 ///   whose empty case is byte-identical passthrough. Pure + Db-free (unit-testable).
-fn finalize_note_markdown(generated: &str, manual_notes: &str, notes_mode: &str) -> String {
+pub(crate) fn finalize_note_markdown(
+    generated: &str,
+    manual_notes: &str,
+    notes_mode: &str,
+) -> String {
     if notes_mode == "enhance" && !manual_notes.trim().is_empty() {
         mark_enhanced(generated)
     } else {
@@ -3141,7 +3145,7 @@ fn resolve_model_path(config: &AppConfig) -> Result<PathBuf> {
 /// Derive a note title from the generated markdown's YAML front-matter `title:` key, or
 /// the first `# heading`, falling back to a date-stamped default. Pure text — no PII
 /// concerns beyond what the user already sees in the note.
-fn derive_title(markdown: &str, date_iso: &str) -> String {
+pub(crate) fn derive_title(markdown: &str, date_iso: &str) -> String {
     // Try front-matter `title:` first.
     for line in markdown.lines().take(20) {
         let trimmed = line.trim();
@@ -3229,7 +3233,7 @@ fn resolve_template_vars(
 ///
 /// Every leg degrades to empty rather than failing: a note is never failed by a variable that would
 /// not resolve.
-fn resolve_vars_from_note(
+pub(crate) fn resolve_vars_from_note(
     gated_entities: Vec<String>,
     title: &str,
     date_iso: &str,
@@ -3237,7 +3241,7 @@ fn resolve_vars_from_note(
     language: Option<&str>,
     model_markdown: &str,
 ) -> template::ResolvedVars {
-    let (model_yaml, model_body) = crate::storage::db::split_front_matter(model_markdown);
+    let (model_yaml, model_body) = template::split_model_front_matter(model_markdown);
 
     let participants = template::front_matter_list(&model_yaml, "participants");
 

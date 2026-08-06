@@ -60,6 +60,266 @@ pub struct AgentStep {
     pub ok: bool,
 }
 
+/// Policy-only state kept separate from the public tool trace. Source ids must never enter
+/// `AgentOutcome.steps`: callers may render or debug that trace, whose contract is tool name + ok
+/// only and therefore content-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroundingStep {
+    ok: bool,
+    /// Code-owned source tags parsed from a positive meeting/semantic search. Kept private and
+    /// in-memory only; the quality retry policy uses them to match a later getter to this result.
+    locator_targets: Vec<ContentTarget>,
+    /// The canonical source targeted by a get call, even when that successful read returns the
+    /// shared no-data sentinel. This lets an honest unknown answer converge after a real attempt.
+    read_target: Option<ContentTarget>,
+    /// Whether a successful canonical read returned content or the deliberately ambiguous masked
+    /// no-data sentinel. Private and ephemeral: it prevents the retry policy from turning
+    /// locked/absent/empty into an unsupported claim that the source does not exist.
+    read_outcome: Option<ContentReadOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentTarget {
+    Meeting(String),
+    Document(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentReadOutcome {
+    Content,
+    MaskedNoData,
+}
+
+/// Whether a converged model answer may be accepted after a positive search result.
+///
+/// Most agentic surfaces keep the historical [`Any`](Self::Any) behavior. Ask-vault uses
+/// [`RetryUnknownAfterUnopenedSearchHit`](Self::RetryUnknownAfterUnopenedSearchHit): the measured
+/// cloud failure declared facts "unknown" immediately after locating the relevant meeting. The
+/// narrow retry heuristic asks for one matching canonical read before accepting an absence claim.
+/// It is deliberately NOT a general grounding guarantee: factual answers supported by search
+/// snippets, direct discovery questions, honest no-hits, and history-grounded follow-ups retain the
+/// historical behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerGroundingPolicy {
+    Any,
+    RetryUnknownAfterUnopenedSearchHit,
+}
+
+impl AnswerGroundingPolicy {
+    fn accepts(self, steps: &[GroundingStep], answer: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::RetryUnknownAfterUnopenedSearchHit => {
+                if !answer_claims_unknown(answer) && !answer_claims_nonexistence(answer) {
+                    return true;
+                }
+                let Some(latest_targets) = steps
+                    .iter()
+                    .rev()
+                    .find(|step| step.ok && !step.locator_targets.is_empty())
+                    .map(|step| &step.locator_targets)
+                else {
+                    // A no-hit, direct list/aggregate answer, or history-grounded follow-up has no
+                    // positive tagged source to open and must remain byte-for-byte compatible.
+                    return true;
+                };
+                // Coverage is monotonic by source id: if a refinement search returns a source that
+                // was already opened, the exact-call no-repeat guard must not force a second read.
+                // One matching candidate is intentionally enough for the six-step Ask budget. This
+                // is a retry heuristic, not proof that every result in a large result set is absent.
+                latest_targets.iter().any(|target| {
+                    steps.iter().any(|step| {
+                        if !step.ok || step.read_target.as_ref() != Some(target) {
+                            return false;
+                        }
+                        match step.read_outcome {
+                            Some(ContentReadOutcome::Content) => true,
+                            Some(ContentReadOutcome::MaskedNoData) => {
+                                answer_is_qualified_retrieval_unknown(answer)
+                                    && !answer_claims_nonexistence(answer)
+                            }
+                            None => false,
+                        }
+                    })
+                })
+            }
+        }
+    }
+}
+
+fn answer_claims_unknown(answer: &str) -> bool {
+    let normalized = answer.to_lowercase().replace('’', "'");
+    [
+        "i don't know",
+        "i do not know",
+        "could not find",
+        "couldn't find",
+        "could not retrieve",
+        "couldn't retrieve",
+        "could not confirm",
+        "could not verify",
+        "couldn't verify",
+        "cannot confirm",
+        "cannot verify",
+        "can't verify",
+        "no information",
+        "no data",
+        "not specified",
+        "does not specify",
+        "doesn't specify",
+        "does not include",
+        "doesn't include",
+        "cannot determine",
+        "can't determine",
+        "unknown",
+        "nie wiem",
+        "nie udało",
+        "nie znalaz",
+        "brak danych",
+        "brak informacji",
+        "nie ma informacji",
+        "nie wskaz",
+        "nie wiadomo",
+        "nieznan",
+        "nie określ",
+        "nie podano",
+        "nie zawiera",
+        "nie mogę ustalić",
+        "nie można ustalić",
+        "nie mogę odczytać",
+        "nie mogę potwierdzić",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn answer_claims_nonexistence(answer: &str) -> bool {
+    let normalized = answer.to_lowercase().replace('’', "'");
+    [
+        "does not exist",
+        "doesn't exist",
+        "no such meeting",
+        "no such document",
+        "there is no meeting",
+        "there is no document",
+        "nie istnieje",
+        "nie ma takiego spotkania",
+        "nie ma takiego dokumentu",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn answer_is_qualified_retrieval_unknown(answer: &str) -> bool {
+    let normalized = answer.to_lowercase().replace('’', "'");
+    [
+        "could not retrieve",
+        "couldn't retrieve",
+        "could not confirm",
+        "couldn't confirm",
+        "cannot confirm",
+        "could not verify",
+        "couldn't verify",
+        "cannot verify",
+        "can't verify",
+        "could not access",
+        "couldn't access",
+        "cannot access",
+        "nie mogę odczytać",
+        "nie można odczytać",
+        "nie udało się odczytać",
+        "nie mogę potwierdzić",
+        "nie można potwierdzić",
+        "nie udało się potwierdzić",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn locator_targets(tool: &str, output: &str) -> Vec<ContentTarget> {
+    if !matches!(tool, "search_meetings" | "search_semantic") {
+        return Vec::new();
+    }
+    output
+        .lines()
+        .filter_map(|line| {
+            let token_start = line.find('[')? + 1;
+            let token_end = line[token_start..].find(']')? + token_start;
+            let token = &line[token_start..token_end];
+            if let Some(id) = token.strip_prefix("meeting:") {
+                let id = id.trim();
+                return (!id.is_empty()).then(|| ContentTarget::Meeting(id.to_string()));
+            }
+            let mut parts = token.splitn(3, ':');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("document"), Some("note" | "document"), Some(id))
+                    if !id.trim().is_empty() =>
+                {
+                    Some(ContentTarget::Document(id.trim().to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn getter_target(tool: &str, args: &serde_json::Value) -> Option<ContentTarget> {
+    let initial_page = args
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        == 0;
+    if !initial_page {
+        return None;
+    }
+    let value = match tool {
+        "get_meeting"
+            if args
+                .get("includeNote")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true) =>
+        {
+            args.get("meetingId")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| (true, id))
+        }
+        "get_document" => args
+            .get("documentId")
+            .and_then(serde_json::Value::as_str)
+            .map(|id| (false, id)),
+        _ => None,
+    }?;
+    let id = value.1.trim();
+    if id.is_empty() {
+        None
+    } else if value.0 {
+        Some(ContentTarget::Meeting(id.to_string()))
+    } else {
+        Some(ContentTarget::Document(id.to_string()))
+    }
+}
+
+fn classify_read_outcome(
+    target: Option<&ContentTarget>,
+    output: &str,
+) -> Option<ContentReadOutcome> {
+    target.map(|target| {
+        let masked = match target {
+            ContentTarget::Meeting(_) => {
+                output.starts_with("No data for meeting ") && output.ends_with('.')
+            }
+            ContentTarget::Document(_) => {
+                output.starts_with("No data for document ") && output.ends_with('.')
+            }
+        };
+        if masked {
+            ContentReadOutcome::MaskedNoData
+        } else {
+            ContentReadOutcome::Content
+        }
+    })
+}
+
 /// The gated surface the loop calls. `specs()` is the per-caller allowlist (the ONLY tools the model
 /// is told about this turn); `run()` executes ONE call, GATED. The model can only name a tool + pass
 /// string args, so it can never reach the DB directly or skip the visibility gate.
@@ -236,6 +496,32 @@ pub fn run_agentic_loop(
     sink: Option<&dyn DeltaSink>,
     opts: GenOptions,
 ) -> Result<Option<AgentOutcome>> {
+    run_agentic_loop_with_policy(
+        reasoner,
+        system,
+        user,
+        executor,
+        max_steps,
+        sink,
+        opts,
+        AnswerGroundingPolicy::Any,
+    )
+}
+
+/// The policy-aware variant used by Ask-vault. Keeping the default wrapper above preserves every
+/// existing caller byte-for-byte while giving the one retrieval-heavy surface a narrow retry for
+/// the measured unknown-after-positive-search failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_agentic_loop_with_policy(
+    reasoner: &dyn LocalReasoner,
+    system: &str,
+    user: &str,
+    executor: &dyn ToolExecutor,
+    max_steps: usize,
+    sink: Option<&dyn DeltaSink>,
+    opts: GenOptions,
+    answer_policy: AnswerGroundingPolicy,
+) -> Result<Option<AgentOutcome>> {
     let catalog = render_catalog(&executor.specs());
     let agent_system = format!(
         "{system}\n\nYou can use these tools to ground your answer in the user's own data:\n{catalog}\n\n\
@@ -252,6 +538,7 @@ pub fn run_agentic_loop(
     let step_schema = serde_json::json!({ "type": "object" });
 
     let mut steps: Vec<AgentStep> = Vec::new();
+    let mut grounding_steps: Vec<GroundingStep> = Vec::new();
     let mut gathered = String::new();
     let mut transcript = LoopTranscript::new(user);
     // Per-turn no-repeat guard (ReAct non-termination): a (tool,args) pair already run is skipped.
@@ -293,6 +580,17 @@ pub fn run_agentic_loop(
         if let Some(answer) = v.get("answer").and_then(|a| a.as_str()) {
             let answer = answer.trim();
             if !answer.is_empty() {
+                if !answer_policy.accepts(&grounding_steps, answer) {
+                    transcript.push_marker(
+                        "[That unknown/absence answer was rejected. Read one matching \
+                         [meeting:<id>] with get_meeting or [document:<kind>:<id>] with \
+                         get_document before claiming missing facts. If that matching read returns \
+                         unavailable/no data, say only that you could not retrieve or confirm it — \
+                         do not claim the item or fact does not exist.]"
+                            .to_string(),
+                    );
+                    continue;
+                }
                 return Ok(Some(AgentOutcome {
                     answer: answer.to_string(),
                     steps,
@@ -307,6 +605,7 @@ pub fn run_agentic_loop(
                 .get("args")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
+            let read_target = getter_target(&name, &args);
             let key = format!("{name}:{args}");
             if seen.contains(&key) {
                 // Already retrieved this exact call — tell the model, don't burn the budget on a repeat.
@@ -323,6 +622,7 @@ pub fn run_agentic_loop(
             match executor.run(&name, &args) {
                 Ok(out) => {
                     let out = out.trim();
+                    let read_outcome = classify_read_outcome(read_target.as_ref(), out);
                     if let Some(s) = sink {
                         s.tool_done(&name, true, out.chars().count());
                     }
@@ -341,9 +641,16 @@ pub fn run_agentic_loop(
                         "[{name} result]\n{}",
                         truncate_with_marker(out, RESULT_BUDGET)
                     ));
+                    let targets = locator_targets(&name, out);
                     steps.push(AgentStep {
                         tool: name,
                         ok: true,
+                    });
+                    grounding_steps.push(GroundingStep {
+                        ok: true,
+                        locator_targets: targets,
+                        read_target,
+                        read_outcome,
                     });
                 }
                 Err(e) => {
@@ -356,6 +663,12 @@ pub fn run_agentic_loop(
                     steps.push(AgentStep {
                         tool: name,
                         ok: false,
+                    });
+                    grounding_steps.push(GroundingStep {
+                        ok: false,
+                        locator_targets: Vec::new(),
+                        read_target,
+                        read_outcome: None,
                     });
                 }
             }
@@ -488,6 +801,23 @@ mod tests {
         }
     }
 
+    struct GroundingExec {
+        search_result: &'static str,
+        meeting_result: &'static str,
+    }
+    impl ToolExecutor for GroundingExec {
+        fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+            crate::tools::tool_specs()
+        }
+        fn run(&self, name: &str, _a: &Value) -> Result<String> {
+            match name {
+                "search_meetings" => Ok(self.search_result.to_string()),
+                "get_meeting" => Ok(self.meeting_result.to_string()),
+                other => Err(AppError::InvalidArg(format!("unexpected tool {other}"))),
+            }
+        }
+    }
+
     /// Records every `user` transcript the loop hands the model, then keeps asking for another
     /// tool with distinct args (so blocks keep accumulating) until the countdown runs dry, then
     /// answers "done". Shared by the compaction tests + the false-boundary probes.
@@ -581,6 +911,301 @@ mod tests {
                 "run:search_meetings".to_string(),
                 "done:search_meetings:true".to_string()
             ]
+        );
+    }
+
+    /// RED-before-GREEN from the Sol Ask route: after locating Orchid, the model prematurely said
+    /// the requested owner/budget facts were unknown. The narrow policy retries that disposition,
+    /// opens a matching canonical source, and then lets the turn converge.
+    #[test]
+    fn ask_unknown_retry_opens_a_matching_positive_search_hit() {
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "orchid" } }),
+            serde_json::json!({ "answer": "I do not know the owner." }),
+            serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "m1" } }),
+            serde_json::json!({ "answer": "Iga owns it." }),
+        ]);
+        let executor = GroundingExec {
+            search_result: "- [meeting:m1] Orchid — incident playbook",
+            meeting_result: "TITLE: [[Orchid]]\n\nNOTE:\nIga owns it.",
+        };
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "who owns it?",
+            &executor,
+            4,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("the matching read lets the turn converge");
+        assert_eq!(out.answer, "Iga owns it.");
+        assert_eq!(
+            out.steps
+                .iter()
+                .map(|step| step.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["search_meetings", "get_meeting"]
+        );
+        let seen = r.seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|turn| turn.contains("That unknown/absence answer was rejected")),
+            "the rejected unknown must receive deterministic source-tag steering: {seen:?}"
+        );
+    }
+
+    /// RED-before-GREEN from the frozen Sol R2 Quartz output. The answer is epistemically unknown
+    /// even though it avoids the older "I don't know" wording, so a positive locator must still be
+    /// opened before the loop may converge.
+    #[test]
+    fn ask_unknown_retry_recognizes_cannot_verify_after_positive_search_hit() {
+        let frozen_unknown =
+            "I can’t verify the three requested details from the available search \
+snippet alone. The launch window, rollback drill owner, and security-exception status are not \
+shown. The relevant source is [[Quartz review]], but its meeting note wasn’t provided.";
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "quartz" } }),
+            serde_json::json!({ "answer": frozen_unknown }),
+            serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "synthetic-quartz" } }),
+            serde_json::json!({ "answer": "Quartz launches January 14. Theo owns the rollback drill. The security exception was rejected." }),
+        ]);
+        let executor = GroundingExec {
+            search_result: "- [meeting:synthetic-quartz] Quartz review — launch window",
+            meeting_result: "TITLE: [[Quartz review]]\n\nNOTE:\nQuartz launches January 14. Theo owns the rollback drill. The security exception was rejected.",
+        };
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "What did we decide about Quartz?",
+            &executor,
+            4,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("the frozen cannot-verify paraphrase must trigger a matching canonical read");
+        assert_eq!(
+            out.steps
+                .iter()
+                .map(|step| step.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["search_meetings", "get_meeting"]
+        );
+        assert_eq!(
+            out.answer,
+            "Quartz launches January 14. Theo owns the rollback drill. The security exception was rejected."
+        );
+    }
+
+    #[test]
+    fn ask_unknown_retry_accepts_an_honest_search_no_hit() {
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "missing" } }),
+            serde_json::json!({ "answer": "I could not find that in your notes." }),
+        ]);
+        let executor = GroundingExec {
+            search_result: "No meetings match that query.",
+            meeting_result: "unused",
+        };
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "where is it?",
+            &executor,
+            2,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("a successful locator no-hit supports an honest absence answer");
+        assert_eq!(out.answer, "I could not find that in your notes.");
+    }
+
+    #[test]
+    fn ask_unknown_retry_preserves_an_immediate_history_grounded_follow_up() {
+        let r = ScriptReasoner::ok(vec![serde_json::json!({ "answer": "Friday." })]);
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "and when?",
+            &EchoExec,
+            1,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("a follow-up may answer from conversation history without a forced tool call");
+        assert_eq!(out.answer, "Friday.");
+        assert!(out.steps.is_empty());
+    }
+
+    #[test]
+    fn ask_unknown_retry_does_not_force_a_get_for_a_factual_snippet_answer() {
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "atlas" } }),
+            serde_json::json!({ "answer": "Atlas ships Friday." }),
+        ]);
+        let executor = GroundingExec {
+            search_result: "- [meeting:atlas] Atlas — ships Friday",
+            meeting_result: "unused",
+        };
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "when does Atlas ship?",
+            &executor,
+            2,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("a factual answer supported by the search snippet stays accepted");
+        assert_eq!(out.answer, "Atlas ships Friday.");
+        assert_eq!(out.steps.len(), 1);
+    }
+
+    #[test]
+    fn ask_unknown_retry_requires_the_matching_id_and_accepts_qualified_no_data() {
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "sealed" } }),
+            serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "other" } }),
+            serde_json::json!({ "answer": "No data is available." }),
+            serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "sealed" } }),
+            serde_json::json!({ "answer": "I could not retrieve it, therefore this meeting does not exist." }),
+            serde_json::json!({ "answer": "I could not retrieve or confirm it." }),
+        ]);
+        let executor = GroundingExec {
+            search_result: "- [meeting:sealed] Sealed",
+            meeting_result: "No data for meeting sealed.",
+        };
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "what does it say?",
+            &executor,
+            6,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("a successful matching read attempt supports qualified retrieval uncertainty");
+        assert_eq!(out.answer, "I could not retrieve or confirm it.");
+        assert_eq!(
+            out.steps
+                .iter()
+                .map(|step| step.tool.as_str())
+                .collect::<Vec<_>>(),
+            vec!["search_meetings", "get_meeting", "get_meeting"]
+        );
+    }
+
+    #[test]
+    fn ask_unknown_retry_source_coverage_is_monotonic_across_refinement_searches() {
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "atlas" } }),
+            serde_json::json!({ "tool": "get_meeting", "args": { "meetingId": "atlas" } }),
+            serde_json::json!({ "tool": "search_meetings", "args": { "query": "atlas deadline" } }),
+            serde_json::json!({ "answer": "The note does not specify that deadline." }),
+        ]);
+        let executor = GroundingExec {
+            search_result: "- [meeting:atlas] Atlas",
+            meeting_result: "TITLE: [[Atlas]]\n\nNOTE:\nNo deadline stated.",
+        };
+        let out = run_agentic_loop_with_policy(
+            &r,
+            "sys",
+            "what is the deadline?",
+            &executor,
+            4,
+            None,
+            GenOptions::default(),
+            AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
+        )
+        .unwrap()
+        .expect("a repeated tag remains covered by its earlier successful read");
+        assert_eq!(out.answer, "The note does not specify that deadline.");
+    }
+
+    #[test]
+    fn ask_unknown_retry_parses_meeting_and_document_source_tags() {
+        assert!(answer_claims_unknown(
+            "W dostępnych wynikach nie ma informacji o właścicielu."
+        ));
+        assert!(answer_claims_unknown(
+            "The result doesn’t include the approved details."
+        ));
+        assert!(answer_claims_nonexistence("This meeting doesn’t exist."));
+        assert!(answer_claims_nonexistence("Ten dokument nie istnieje."));
+        assert!(answer_is_qualified_retrieval_unknown(
+            "Nie mogę odczytać ani potwierdzić tej notatki."
+        ));
+        assert!(
+            !answer_claims_unknown("Budżet nie został zatwierdzony."),
+            "a grounded negative fact is not an epistemic unknown"
+        );
+        assert_eq!(
+            locator_targets(
+                "search_semantic",
+                "- [meeting:m1] A\nDOCUMENTS:\n- [document:note:n1] N\n- [document:document:d1] D"
+            ),
+            vec![
+                ContentTarget::Meeting("m1".to_string()),
+                ContentTarget::Document("n1".to_string()),
+                ContentTarget::Document("d1".to_string()),
+            ]
+        );
+        assert_eq!(
+            getter_target("get_meeting", &serde_json::json!({"meetingId": "m1"})),
+            Some(ContentTarget::Meeting("m1".to_string()))
+        );
+        assert_eq!(
+            getter_target("get_document", &serde_json::json!({"documentId": "d1"})),
+            Some(ContentTarget::Document("d1".to_string()))
+        );
+        assert_eq!(
+            getter_target(
+                "get_meeting",
+                &serde_json::json!({"meetingId": "m1", "offset": 20})
+            ),
+            None,
+            "a later page cannot stand in for the initial canonical read"
+        );
+        assert_eq!(
+            getter_target(
+                "get_meeting",
+                &serde_json::json!({"meetingId": "m1", "includeNote": false})
+            ),
+            None,
+            "a transcript-only read cannot establish absence from the note"
+        );
+        assert_eq!(
+            classify_read_outcome(
+                Some(&ContentTarget::Meeting("m1".to_string())),
+                "No data for meeting m1."
+            ),
+            Some(ContentReadOutcome::MaskedNoData)
+        );
+        assert_eq!(
+            classify_read_outcome(
+                Some(&ContentTarget::Document("d1".to_string())),
+                "No data for document d1."
+            ),
+            Some(ContentReadOutcome::MaskedNoData)
+        );
+        assert_eq!(
+            classify_read_outcome(
+                Some(&ContentTarget::Document("d1".to_string())),
+                "TITLE: [[D1]]\nKIND: document\n\nBODY:\n"
+            ),
+            Some(ContentReadOutcome::Content)
         );
     }
 

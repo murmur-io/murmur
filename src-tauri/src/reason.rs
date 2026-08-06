@@ -48,8 +48,9 @@ pub mod sidecar;
 pub mod afm;
 
 /// The Murmur Brain engine CLASS a registry model serves. `Light` = fast, small-context work run
-/// during a recording (realtime reactions, fact-triple extraction, short classification); `Heavy` =
-/// note/Ask summarization + post-call analysis. The posture presets resolve "the light model" / "the
+/// during a recording (realtime reactions, live fact-triple extraction, short classification);
+/// `Heavy` = note/Ask summarization + post-call analysis, including durable fact extraction in the
+/// Fully Local posture. The posture presets resolve "the light model" / "the
 /// heavy model" through this tag rather than hardcoding ids (spec §3.1). Serialized lowercase for the
 /// FE picker (`light` / `heavy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -106,7 +107,7 @@ pub struct BrainModel {
 /// documented naming patterns; a wrong filename fails the download LOUDLY (HTTP 404 → graceful `Err`),
 /// never silently. `sha256` is `None` until pinned from HF (a release-gate task — see [`BrainModel`]).
 pub static BRAIN_MODELS: &[BrainModel] = &[
-    // ── Light class (realtime reactions + fact extraction; run during a recording) ──────────────
+    // ── Light class (realtime reactions + live extraction; run during a recording) ─────────────
     BrainModel {
         id: "qwen3-1.7b",
         name: "Qwen3 1.7B (light · multilingual)",
@@ -337,6 +338,19 @@ pub fn class_model_id(cfg: &AppConfig, class: ModelClass) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
         .or_else(|| default_model_for_class(class).map(|m| m.id.to_string()))
+}
+
+/// Choose the local class for durable post-call fact extraction while Brain Live is enabled.
+/// Fully Local already provisions and budgets the heavy engine for Notes/Ask, so it can reuse that
+/// model for the quality-sensitive structured pass. Hybrid intentionally provisions only the light
+/// engine and may run on an 8/16 GB Mac, so it keeps the existing light route rather than silently
+/// adding a second resident model. Pure so the posture/RAM boundary has a deterministic oracle.
+fn brain_live_extraction_class(cfg: &AppConfig) -> ModelClass {
+    if crate::settings::postures::derive_posture(cfg) == crate::settings::Posture::FullyLocal {
+        ModelClass::Heavy
+    } else {
+        ModelClass::Light
+    }
 }
 
 /// A fixed call-overhead RAM budget (GB) for the combined-residency guard: the OS + a Zoom/Meet call
@@ -804,10 +818,11 @@ impl ReasonerCell {
         }
     }
 
-    /// The LIGHT-engine handle for Brain-Live features (realtime reactions, fact extraction). Resolves
-    /// the posture's light model to a LOADED local instance, or the dependency-free [`StubReasoner`]
-    /// when its GGUF is absent/unloadable — **NEVER a cloud fallback** (P1 invariant: a missing local
-    /// model DEGRADES the feature, it does not silently egress). Presence is rechecked per call.
+    /// The LIGHT-engine handle for Brain-Live features (realtime reactions and live extraction).
+    /// Resolves the posture's light model to a LOADED local instance, or the dependency-free
+    /// [`StubReasoner`] when its GGUF is absent/unloadable — **NEVER a cloud fallback** (P1
+    /// invariant: a missing local model DEGRADES the feature, it does not silently egress).
+    /// Presence is rechecked per call.
     /// Callers consult this ONLY when Brain Live is ON; with it OFF the existing role-resolved paths
     /// apply unchanged. (Adversarial review, code-truth #1/#3 + product #1: the v0.1 "else the
     /// role-resolved reasoner" order would have silently egressed facts on a missing model.)
@@ -845,16 +860,21 @@ impl ReasonerCell {
         }
     }
 
-    /// The reasoner for FACT / user-memory / pre-analysis EXTRACTION. When Brain Live is ON it is the
-    /// LOCAL light engine ([`light`](Self::light) — local-or-stub, NEVER cloud), so fact extraction
-    /// stops egressing (the enablement card's "facts go fully local" promise; spec §3.4). When OFF it
-    /// is the role-resolved Notes reasoner EXACTLY as today (cloud by default). Rechecked per call.
+    /// The reasoner for durable post-call FACT / user-memory EXTRACTION. With Brain Live ON it is
+    /// always LOCAL-or-stub and NEVER cloud (the enablement card's "facts go fully local" promise;
+    /// spec §3.4). Fully Local uses the heavy engine: the measured 1.7B light model could not satisfy
+    /// the structured fact contract, while the installed 4B heavy model passed the same PL/EN cases.
+    /// Hybrid deliberately stays on the light engine so enabling local reactions on an 8/16 GB Mac
+    /// does not implicitly provision or co-reside a second multi-GB model. When Brain Live is OFF it
+    /// remains the role-resolved Notes reasoner exactly as before (cloud by default). Rechecked per
+    /// call.
     pub fn extraction_reasoner(&self) -> Arc<dyn LocalReasoner> {
         self.extraction_reasoner_with_token(None)
     }
 
-    /// Exact-session extraction dispatch used by recording postprocess. Both the Brain-Live light
-    /// route and the role-resolved Notes route carry the same recording identity into local work.
+    /// Exact-session extraction dispatch used by recording postprocess. Both the posture-selected
+    /// Brain-Live local route and the role-resolved Notes route carry the same recording identity
+    /// into local work.
     pub(crate) fn extraction_reasoner_for_recording(
         &self,
         token: crate::perf::RecordingSessionToken,
@@ -866,9 +886,13 @@ impl ReasonerCell {
         &self,
         recording_token: Option<crate::perf::RecordingSessionToken>,
     ) -> Arc<dyn LocalReasoner> {
-        let brain_live = self.config.lock().map(|c| c.brain_live).unwrap_or(false);
+        let (brain_live, class) = self
+            .config
+            .lock()
+            .map(|cfg| (cfg.brain_live, brain_live_extraction_class(&cfg)))
+            .unwrap_or((false, ModelClass::Light));
         if brain_live {
-            self.class_or_stub(ModelClass::Light, recording_token)
+            self.class_or_stub(class, recording_token)
         } else {
             self.current_for_with_token(Role::Notes, recording_token)
         }
@@ -1101,6 +1125,16 @@ impl GenOptions {
     }
 }
 
+/// Structured decode plus the raw model envelope when the backend can expose it. Production
+/// callers continue using `structured*` and see only the parsed value; the opt-in quality evaluator
+/// uses this observation to prove that a valid object was not preceded by Qwen thinking/prose that
+/// the tolerant JSON extractor would otherwise hide.
+#[derive(Debug, Clone)]
+pub struct StructuredObservation {
+    pub value: Value,
+    pub raw_text: Option<String>,
+}
+
 /// A local (on-device, no-egress) reasoning model. Synchronous: the real impl runs a local model
 /// to completion on a worker thread; the stub is pure. All methods are deterministic for a given
 /// input in the stub.
@@ -1145,6 +1179,21 @@ pub trait LocalReasoner: Send + Sync {
         _opts: GenOptions,
     ) -> Result<Value> {
         self.structured(system, user, json_schema)
+    }
+
+    /// Observe a structured decode without changing the production value-only contract. Backends
+    /// that own the raw generation override this; other implementations honestly return `None`.
+    fn structured_with_observation(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+    ) -> Result<StructuredObservation> {
+        Ok(StructuredObservation {
+            value: self.structured_with(system, user, json_schema, opts)?,
+            raw_text: None,
+        })
     }
 }
 
@@ -1364,6 +1413,11 @@ pub struct CloudReasoner {
     /// `None` in every production path (including the exact-session constructor used by
     /// [`ReasonerCell::current_for_recording`]).
     provider_override: Option<Arc<dyn SummarizerProvider>>,
+    /// TEST/EVALUATOR-ONLY explicit ledger destination. The real-model bake-off runs without a
+    /// Tauri `AppState`, so it injects a fresh SQLCipher sink while retaining the canonical
+    /// provider/consent/redaction factory. Every production constructor leaves this `None`.
+    #[cfg(test)]
+    egress_sink_override: Option<Arc<dyn crate::summarize::egress_log::EgressSink>>,
 }
 
 impl CloudReasoner {
@@ -1401,7 +1455,24 @@ impl CloudReasoner {
             heavy,
             recording_token,
             provider_override: None,
+            #[cfg(test)]
+            egress_sink_override: None,
         }
+    }
+
+    /// Build the real role-resolved cloud reasoner with an explicit content-free audit sink. Kept
+    /// under `cfg(test)` because only the opt-in real-model evaluator lacks application startup;
+    /// release builds always use the process-global `DbEgressSink` installed from `AppState`.
+    #[cfg(test)]
+    pub(crate) fn for_role_with_egress_sink(
+        config: Arc<Mutex<AppConfig>>,
+        role: Role,
+        heavy: Arc<tokio::sync::Semaphore>,
+        sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+    ) -> Self {
+        let mut reasoner = Self::for_role(config, role, heavy);
+        reasoner.egress_sink_override = Some(sink);
+        reasoner
     }
 
     /// TEST-ONLY: build a CloudReasoner that delegates to an injected provider instead of the real
@@ -1418,6 +1489,7 @@ impl CloudReasoner {
             heavy: Arc::new(tokio::sync::Semaphore::new(1)),
             recording_token: None,
             provider_override: Some(provider),
+            egress_sink_override: None,
         }
     }
 
@@ -1437,6 +1509,15 @@ impl CloudReasoner {
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone();
+        #[cfg(test)]
+        if let Some(sink) = &self.egress_sink_override {
+            return crate::summarize::provider_for_with_egress_sink(
+                self.role,
+                &cfg,
+                &self.heavy,
+                Arc::clone(sink),
+            );
+        }
         match self.recording_token.clone() {
             Some(token) => {
                 crate::summarize::provider_for_recording(self.role, &cfg, &self.heavy, token)
@@ -1486,6 +1567,18 @@ impl LocalReasoner for CloudReasoner {
     }
 
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value> {
+        Ok(self
+            .structured_with_observation(system, user, json_schema, GenOptions::default())?
+            .value)
+    }
+
+    fn structured_with_observation(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+    ) -> Result<StructuredObservation> {
         // Cloud providers have no native constrained decode — embed the schema as an instruction and
         // recover the object from the (possibly fenced/prose-wrapped) reply via the robust extractor.
         let schema = serde_json::to_string(json_schema)
@@ -1494,8 +1587,11 @@ impl LocalReasoner for CloudReasoner {
             "{system}\n\nRespond with ONLY a JSON object conforming to this schema: {schema}. \
              No prose, no fences."
         );
-        let text = self.reason(&augmented_system, user)?;
-        parse_first_json(&text)
+        let text = self.reason_with(&augmented_system, user, opts)?;
+        Ok(StructuredObservation {
+            value: parse_first_json(&text)?,
+            raw_text: Some(text),
+        })
     }
 }
 
@@ -2541,9 +2637,9 @@ mod tests {
         }
     }
 
-    /// P2 (spec §3.4): fact / user-memory / pre-analysis extraction routes to the LOCAL light engine
-    /// when Brain Live is ON (facts stop egressing) and to the cloud Notes reasoner when OFF (today's
-    /// behavior). The ON path must NEVER be a cloud reasoner.
+    /// P2 (spec §3.4): fact / user-memory extraction stays LOCAL when Brain Live is ON (facts stop
+    /// egressing) and uses the role-resolved Notes reasoner when OFF. The ON path must NEVER be a
+    /// cloud reasoner, independent of which local class its posture selects.
     #[test]
     fn extraction_reasoner_is_local_when_brain_live_and_cloud_otherwise() {
         // OFF (default) ⇒ the legacy Notes dispatch (cloud under the default backend).
@@ -2558,7 +2654,7 @@ mod tests {
                 .starts_with("cloud:"),
             "Brain Live OFF keeps the legacy cloud Notes extraction"
         );
-        // ON ⇒ the local light engine (local-or-stub), never cloud — even with cloud consent.
+        // ON ⇒ a posture-selected local engine (local-or-stub), never cloud — even with consent.
         let on = shared(AppConfig {
             brain_live: true,
             brain_backend: BrainBackend::Cloud,
@@ -2573,5 +2669,31 @@ mod tests {
             !id.starts_with("cloud:"),
             "Brain Live ON must route fact extraction LOCAL, never cloud (got {id})"
         );
+    }
+
+    /// RED-before-GREEN from the real-model bake-off: Qwen 1.7B failed both structured durable-fact
+    /// cases while Qwen 4B passed both. Fully Local already budgets/provisions the heavy engine, so
+    /// post-call extraction uses it; Hybrid retains light to avoid an implicit second-model download
+    /// and co-residency increase. The choice is class-based, never a hard-coded model id.
+    #[test]
+    fn post_call_extraction_is_heavy_only_in_fully_local_posture() {
+        let mut fully_local = AppConfig::default();
+        crate::settings::postures::apply_posture(
+            &mut fully_local,
+            crate::settings::Posture::FullyLocal,
+        );
+        assert_eq!(brain_live_extraction_class(&fully_local), ModelClass::Heavy);
+
+        let mut hybrid = AppConfig::default();
+        crate::settings::postures::apply_posture(&mut hybrid, crate::settings::Posture::Hybrid);
+        assert_eq!(brain_live_extraction_class(&hybrid), ModelClass::Light);
+
+        // A hand-tuned mixed/cloud posture keeps the conservative light route as well.
+        hybrid.role_notes_connection = crate::summarize::roles::CONN_LOCAL.to_string();
+        assert_eq!(
+            crate::settings::postures::derive_posture(&hybrid),
+            crate::settings::Posture::Custom
+        );
+        assert_eq!(brain_live_extraction_class(&hybrid), ModelClass::Light);
     }
 }

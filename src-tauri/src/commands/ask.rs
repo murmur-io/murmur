@@ -350,7 +350,7 @@ pub(crate) fn ask_vault_loop(
     let system =
         crate::summarize::vault_chat::agentic_system_jit(memory_brief, jit_listing, org_available);
     let user = crate::summarize::vault_chat::render_conversation(history, question);
-    let Some(outcome) = crate::agent::run_agentic_loop(
+    let Some(outcome) = crate::agent::run_agentic_loop_with_policy(
         reasoner,
         &system,
         &user,
@@ -358,6 +358,7 @@ pub(crate) fn ask_vault_loop(
         ASK_MAX_STEPS,
         sink,
         opts,
+        crate::agent::AnswerGroundingPolicy::RetryUnknownAfterUnopenedSearchHit,
     )?
     else {
         return Ok(None);

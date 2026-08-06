@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "kind": "murmur_local_cloud_quality_evidence",
+  "evidenceMethod": "deterministic_code_owned_oracles_no_model_judge",
+  "repetitions": {
+    "1": {
+      "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json.gz",
+      "archiveSha256": "8fa8e7c4fbc02c0f64ce3d149b8ffa2881e65d5aa8b3c307fd55df72d7955cbb",
+      "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json",
+      "logicalSha256": "5b469273bd07cdb7dbc6cba14812a2dcbc1f068aa795e29d732f9237c57cb913"
+    },
+    "2": {
+      "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json.gz",
+      "archiveSha256": "b622d9ddbe3f7d8a4cbb191f9b3009185024768d48cecad564fb84561db5ba07",
+      "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json",
+      "logicalSha256": "b83faa807cf093421a51021769ef638cc96ea2a8323794838bdf09f6b05307e9"
+    }
+  },
+  "combined": {
+    "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined-verified.json",
+    "sha256": "8f9070220eef6e09ab0cb44cfb94ae4a6b077d18f1d39707c043918ff07d24f7"
+  },
+  "producerSnapshot": {
+    "repositoryCommit": "e139cbeefed98fbb3c1da20c74da6a9d4c2dd3e6",
+    "sourceFingerprintSha256": "e88bd005e9b45f714c10e289d8b7d977c113addb5c1038e823b0d86fd53fc538",
+    "manifestSha256": "21ea3cc236b8c4058f18043b538bac87e93e933c86bd8b0c3696f5b67d45f01d",
+    "evaluatorFileSha256": "b0feaaff5cb533fa2767a60ecd70844d3af3ee2f79be2b09b401eebf7b5f9363",
+    "fixtureFileSha256": "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2",
+    "repeatValidatorFileSha256": "48d66559c713cc0da346d5d92fc0051be4b67ebb1b6b6f4422e3024101312198",
+    "trackedDiffSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "workingTreeDirty": false
+  },
+  "runtimeIdentities": {
+    "local": {
+      "version": "murmur-brain-workspace-build",
+      "sha256": "a47b8ec18d8597f59caad79aedf9aa9c7d86a5e2444ff036785ddea4fd2d4c37"
+    },
+    "codex": {
+      "version": "codex-cli 0.146.0",
+      "sha256": "ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02"
+    }
+  }
+}

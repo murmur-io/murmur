@@ -1660,9 +1660,9 @@ fn current_meeting_title(
 /// up to all three tiers back-to-back). Tier 1 answers from injected content (no retrieval tool), so
 /// it converges in one model turn — a budget of 2 leaves room for a `propose_note` + answer. Tier 2
 /// (vault retrieval) gets 4; Tier 3 (connectors) gets 3.
-const TIER1_MAX_STEPS: usize = 2;
-const TIER2_MAX_STEPS: usize = 4;
-const TIER3_MAX_STEPS: usize = 3;
+pub(crate) const TIER1_MAX_STEPS: usize = 2;
+pub(crate) const TIER2_MAX_STEPS: usize = 4;
+pub(crate) const TIER3_MAX_STEPS: usize = 3;
 
 /// Run the CURRENT-FIRST BRAIN CASCADE (Phase 5): Tier 1 (current meeting in isolation) → Tier 2
 /// (vault) → Tier 3 (connectors), each with a STRUCTURALLY-scoped executor. Returns
@@ -2873,7 +2873,7 @@ fn tail_chars(s: &str, n: usize) -> String {
 /// to the pre-feature output (the section is simply absent). Both the injected transcript AND the typed
 /// notes egress through the SAME redaction firewall as every other prompt
 /// (`RedactingProvider::complete` scrubs `system` + `user`) — they are NOT a new egress class.
-fn assistant_system_prompt(
+pub(crate) fn assistant_system_prompt(
     live_transcript: &str,
     typed_notes: &str,
     memory_brief: &str,

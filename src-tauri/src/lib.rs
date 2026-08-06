@@ -46,6 +46,9 @@ pub mod user_memory;
 pub mod verify;
 pub mod voice_action;
 
+#[cfg(test)]
+mod quality_artifact_tests;
+
 use tauri::window::{Effect, EffectsBuilder};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};

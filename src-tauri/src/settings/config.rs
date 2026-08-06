@@ -84,8 +84,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub provider_model: String,
     /// Brain/AI reasoning EFFORT for the active cloud provider: `""` (provider default), `"low"`,
-    /// `"medium"`, or `"high"`. ONLY the direct `anthropic` HTTP provider honors it (adaptive
-    /// thinking + output effort); the `claude_code` CLI has NO effort flag, so it is a no-op there.
+    /// `"medium"`, or `"high"`. The direct `anthropic` HTTP provider uses adaptive thinking +
+    /// output effort; the isolated `codex_cli` provider forwards it as `model_reasoning_effort`.
+    /// The `claude_code` CLI has no effort flag, so it remains a no-op there.
     /// `#[serde(default)]` ⇒ a config persisted before this field existed loads as `""`.
     #[serde(default)]
     pub provider_effort: String,
@@ -381,19 +382,21 @@ pub struct AppConfig {
     #[serde(default)]
     pub brain_backend: BrainBackend,
     /// Murmur Brain LIVE master switch (spec §2.2). When ON, the on-device LIGHT engine powers
-    /// Realtime Reactions + local fact extraction, and the enablement flow downloads the light model.
-    /// OPT-IN, default OFF. DISTINCT from `realtime_reactions` (the wake-word voice-action gate) — this
-    /// gates the model-driven whisper layer and re-routes fact extraction fully on-device. When OFF the
-    /// brain behaves EXACTLY as today. `#[serde(default)]` ⇒ a pre-existing config loads as `false`.
+    /// realtime work; durable fact extraction is also local, using HEAVY in Fully Local and LIGHT in
+    /// Hybrid. OPT-IN, default OFF. DISTINCT from `realtime_reactions` (the wake-word voice-action
+    /// gate) — this gates the model-driven whisper layer and re-routes fact extraction fully
+    /// on-device. When OFF the brain behaves EXACTLY as today. `#[serde(default)]` ⇒ a pre-existing
+    /// config loads as `false`.
     #[serde(default)]
     pub brain_live: bool,
-    /// The selected LIGHT-class on-device model id (realtime reactions / fact extraction). `None`
-    /// (the default) ⇒ the registry's default light model (`reason::default_model_for_class`). Resolved
-    /// LOCAL-or-stub, NEVER cloud (P1 invariant). `#[serde(default)]`.
+    /// The selected LIGHT-class on-device model id (realtime reactions and Hybrid fact extraction).
+    /// `None` (the default) ⇒ the registry's default light model
+    /// (`reason::default_model_for_class`). Resolved LOCAL-or-stub, NEVER cloud (P1 invariant).
+    /// `#[serde(default)]`.
     #[serde(default)]
     pub brain_light_model_id: Option<String>,
-    /// The selected HEAVY-class on-device model id (local Notes/Ask + post-call analysis). `None`
-    /// (the default) ⇒ the registry's default heavy model. `#[serde(default)]`.
+    /// The selected HEAVY-class on-device model id (local Notes/Ask and Fully Local post-call
+    /// analysis). `None` (the default) ⇒ the registry's default heavy model. `#[serde(default)]`.
     #[serde(default)]
     pub brain_heavy_model_id: Option<String>,
     /// Realtime Reactions CONTRADICTION sub-toggle (spec §4.2). Default OFF: contradiction detection
@@ -609,7 +612,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub role_notes_model: String,
     /// Model-role override — the reasoning EFFORT for the Notes role (`""`/`low`/`medium`/`high`;
-    /// honored by the `anthropic` provider only, like `provider_effort`). Consulted only when
+    /// honored by `anthropic` and `codex_cli`, like `provider_effort`). Consulted only when
     /// `role_notes_connection` is set. `#[serde(default)]` ⇒ `""`.
     #[serde(default)]
     pub role_notes_effort: String,
@@ -2767,7 +2770,10 @@ mod tests {
         // Fail-closed defaults: both flags OFF until explicitly set/granted.
         let cfg = AppConfig::load(&db).unwrap();
         assert!(!cfg.notion_enabled, "notion must default OFF");
-        assert!(!cfg.notion_consented, "notion consent must default ungranted");
+        assert!(
+            !cfg.notion_consented,
+            "notion consent must default ungranted"
+        );
 
         let cfg = AppConfig {
             notion_enabled: true,

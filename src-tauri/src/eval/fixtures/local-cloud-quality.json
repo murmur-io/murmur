@@ -1,0 +1,836 @@
+{
+  "schemaVersion": 9,
+  "syntheticOnly": true,
+  "cases": [
+    {
+      "id": "summary-pl-kestrel",
+      "syntheticRedactionEntities": ["Piotr", "Marta"],
+      "surface": "summary",
+      "language": "pl",
+      "modelClass": "heavy",
+      "transcript": "Projekt Kestrel ma wystartować pilotażowo w Gdańsku 14 września. Zatwierdzamy limit budżetu 750 tys. zł dla pilotażu, ale nie dla pełnego wdrożenia. Piotr przygotuje plan rollbacku do 10 września. Wydaje mi się, że przełącznik legacy jest typu Boolean, ale nie jestem pewna i trzeba to sprawdzić. To nie jest decyzja techniczna. Marta zweryfikuje typ przełącznika przed następnym spotkaniem.",
+      "vaultTitles": ["Project Atlas"],
+      "dateIso": "2026-08-05",
+      "durationS": 180,
+      "expected": {
+        "allowedEntities": ["Piotr", "Marta"],
+        "requiredGroups": [
+          ["Kestrel"],
+          ["Gdańsk", "Gdansku", "Gdańsku"],
+          ["14 września", "14.09", "2026-09-14"],
+          ["750 tys", "750 000", "750k"],
+          ["Piotr"],
+          ["10 września", "10.09", "2026-09-10"],
+          ["rollback"],
+          ["Marta"],
+          ["niepew", "do sprawdzenia", "zweryfik", "to confirm"]
+        ],
+        "criticalGroups": [
+          ["14 września", "14.09", "2026-09-14"],
+          ["750 tys", "750 000", "750k"],
+          ["Piotr"],
+          ["10 września", "10.09", "2026-09-10"],
+          ["niepew", "do sprawdzenia", "zweryfik", "to confirm"]
+        ],
+        "relationRequirements": [
+          {"groups": [["pilotaż", "pilot"], ["14 września", "14.09", "2026-09-14"]]},
+          {"groups": [["750 tys", "750 000", "750k"], ["pilotaż", "pilot"]]},
+          {"groups": [["Piotr"], ["rollback"], ["10 września", "10.09", "2026-09-10"]]},
+          {"groups": [["Marta"], ["zweryfik", "sprawdz"], ["legacy"]]}
+        ],
+        "conditionalRelations": [
+          {
+            "whenGroups": [["750 tys", "750 000", "750k"]],
+            "thenGroups": [["pilotaż", "pilot"]]
+          },
+          {
+            "whenGroups": [["750 tys", "750 000", "750k"], ["pełne wdrożenie", "pełnego wdrożenia", "całe wdrożenie", "całego wdrożenia", "full rollout", "full deployment"]],
+            "thenGroups": [["nie obejmuje", "nie dotyczy", "nie dla", "bez objęcia", "does not include", "does not cover", "not for", "excluding", "without covering"]]
+          },
+          {
+            "headings": ["Decisions", "Decyzje"],
+            "whenGroups": [["14 września", "14.09", "2026-09-14"]],
+            "thenGroups": [["750 tys", "750 000", "750k"], ["budżet", "budget", "limit"], ["pilotaż", "pilot"]]
+          }
+        ],
+        "forbiddenTerms": [
+          "Potwierdzono, że przełącznik legacy",
+          "## Decisions\n- Przełącznik legacy",
+          "legacy switch is a Boolean",
+          "pełne wdrożenie zostało zatwierdzone",
+          "zatwierdzono pilotażowy start",
+          "## Decyzje\n- None recorded",
+          "Project Atlas"
+        ],
+        "sectionRequirements": [
+          {
+            "headings": ["Decisions", "Decyzje"],
+            "groups": [
+              ["750 tys", "750 000", "750k"]
+            ]
+          },
+          {
+            "headings": ["Action items", "Działania", "Zadania", "Do zrobienia", "Akcje"],
+            "groups": [
+              ["Piotr"],
+              ["10 września", "10.09", "2026-09-10"],
+              ["Marta"],
+              ["zweryfik", "sprawdz", "to confirm"]
+            ]
+          }
+        ],
+        "forbiddenSectionRequirements": [
+          {
+            "headings": ["Decisions", "Decyzje"],
+            "groups": [
+              ["14 września", "14.09", "2026-09-14"],
+              ["rozpocznie się", "wystartuje", "startuje", "zatwierdzono pilotażowy start", "ustalono, że pilotaż", "approved pilot start", "pilot will launch"]
+            ]
+          }
+        ],
+        "languageMarkers": ["decyz", "dział", "wdroż", "sprawdz", "ryzyk"],
+        "format": "summary_markdown"
+      }
+    },
+    {
+      "id": "summary-en-cedar",
+      "syntheticRedactionEntities": ["Rowan"],
+      "surface": "summary",
+      "language": "en",
+      "modelClass": "heavy",
+      "transcript": "Project Cedar moves to a phased rollout, ten percent of accounts at a time. The first cohort starts on August 20. Rowan owns the rollback checklist and will finish it by August 18. The payment latency might be related to PCI logging, but nobody has confirmed that. We did not approve a vendor change. Keep the latency cause as an open question.",
+      "vaultTitles": ["Roadmap"],
+      "dateIso": "2026-08-05",
+      "durationS": 150,
+      "expected": {
+        "allowedEntities": ["Rowan"],
+        "requiredGroups": [
+          ["Cedar"],
+          ["ten percent", "10%"],
+          ["August 20", "20 August", "2026-08-20"],
+          ["Rowan"],
+          ["rollback checklist"],
+          ["August 18", "18 August", "2026-08-18"],
+          ["open question", "unconfirmed", "not confirmed", "to confirm"]
+        ],
+        "criticalGroups": [
+          ["ten percent", "10%"],
+          ["August 20", "20 August", "2026-08-20"],
+          ["Rowan"],
+          ["August 18", "18 August", "2026-08-18"],
+          ["open question", "unconfirmed", "not confirmed", "to confirm"]
+        ],
+        "relationRequirements": [
+          {"groups": [["cohort", "rollout"], ["August 20", "20 August", "2026-08-20"]]},
+          {"groups": [["Rowan"], ["rollback checklist"], ["August 18", "18 August", "2026-08-18"]]}
+        ],
+        "conditionalRelations": [
+          {
+            "whenGroups": [["vendor"], ["change", "switch"]],
+            "thenGroups": [["did not approve", "not approved", "was not approved", "wasn't approved", "unapproved", "no vendor change was approved", "left open"]]
+          }
+        ],
+        "forbiddenTerms": [
+          "PCI logging was confirmed as the cause",
+          "confirmed root cause: PCI logging",
+          "The team approved a vendor change",
+          "Do not approve a vendor change",
+          "## Decisions\n- None recorded",
+          "twenty percent",
+          "Roadmap"
+        ],
+        "sectionRequirements": [
+          {
+            "headings": ["Decisions"],
+            "groups": [
+              ["ten percent", "10%"]
+            ]
+          },
+          {
+            "headings": ["Action items"],
+            "groups": [
+              ["Rowan"],
+              ["rollback checklist"],
+              ["August 18", "18 August", "2026-08-18"]
+            ]
+          }
+        ],
+        "languageMarkers": ["the", "rollout", "decision", "action", "open"],
+        "format": "summary_markdown"
+      }
+    },
+    {
+      "id": "meeting-chat-pl-delta",
+      "syntheticRedactionEntities": ["Nina"],
+      "surface": "meeting_chat",
+      "language": "pl",
+      "modelClass": "heavy",
+      "transcript": "[12s] Umowa dla projektu Delta jest podpisana. Start ustalamy na 3 października.\n[48s] Nina przygotuje dokumentację wdrożeniową do 25 września.\n[75s] Cena kolejnego etapu nie została uzgodniona; wrócimy do niej osobno.",
+      "question": "Jaki jest termin startu, kto odpowiada za dokumentację i do kiedy ma ją przygotować? Czy uzgodniliśmy cenę kolejnego etapu?",
+      "expected": {
+        "allowedEntities": ["Nina"],
+        "requiredGroups": [
+          ["3 października", "03.10", "2026-10-03"],
+          ["Nina"],
+          ["dokumentac"],
+          ["25 września", "25.09", "2026-09-25"],
+          ["nie uzgodn", "nie została uzgodniona", "nie ustal"]
+        ],
+        "criticalGroups": [
+          ["3 października", "03.10", "2026-10-03"],
+          ["Nina"],
+          ["25 września", "25.09", "2026-09-25"],
+          ["nie uzgodn", "nie została uzgodniona", "nie ustal"]
+        ],
+        "relationRequirements": [
+          {"groups": [["start", "termin startu"], ["3 października", "03.10", "2026-10-03"]]},
+          {"groups": [["Nina"], ["dokumentac"], ["25 września", "25.09", "2026-09-25"]]}
+        ],
+        "forbiddenTerms": [
+          "cena została uzgodniona",
+          "price was agreed",
+          "Nina nie odpowiada",
+          "Nina nie przygotuje",
+          "start nie został ustalony",
+          "startu nie ustalono"
+        ],
+        "languageMarkers": ["termin", "odpowiada", "dokument", "cena", "uzgodn"],
+        "format": "plain_answer"
+      }
+    },
+    {
+      "id": "note-popup-refine-pl",
+      "syntheticRedactionEntities": ["Alicja"],
+      "surface": "note_assist",
+      "language": "pl",
+      "modelClass": "heavy",
+      "action": "refine",
+      "selection": "Zespół zdecydowali, że wdrożenie ruszą 7 październik. Alicja przygotuje checklistę do 2 października.",
+      "before": "## Decyzje",
+      "expected": {
+        "allowedEntities": ["Alicja"],
+        "requiredGroups": [
+          ["Zespół"],
+          ["wdrożenie"],
+          ["7 października"],
+          ["Alicja"],
+          ["checklist"],
+          ["2 października"]
+        ],
+        "criticalGroups": [
+          ["7 października"],
+          ["Alicja"],
+          ["2 października"]
+        ],
+        "relationRequirements": [
+          {"groups": [["wdrożenie"], ["7 października"]]},
+          {"groups": [["Alicja"], ["checklist"], ["2 października"]]}
+        ],
+        "forbiddenTerms": [
+          "## Decyzje",
+          "oto poprawiona",
+          "corrected version",
+          "Zespół zdecydowali",
+          "wdrożenie ruszą",
+          "7 październik."
+        ],
+        "languageMarkers": ["zespół", "wdroż", "paździer"],
+        "format": "faithful_edit",
+        "maxWords": 24
+      }
+    },
+    {
+      "id": "note-popup-shorten-en",
+      "syntheticRedactionEntities": ["Morgan"],
+      "surface": "note_assist",
+      "language": "en",
+      "modelClass": "heavy",
+      "action": "shorten",
+      "selection": "After a fairly long discussion, the group finally agreed that the Aurora beta will launch on November 12, and Morgan will send the customer notice by November 8, while the budget ceiling remains exactly 420 thousand dollars.",
+      "before": "## Launch discussion",
+      "expected": {
+        "allowedEntities": ["Morgan"],
+        "requiredGroups": [
+          ["Aurora"],
+          ["November 12", "12 November", "2026-11-12"],
+          ["Morgan"],
+          ["customer notice"],
+          ["November 8", "8 November", "2026-11-08"],
+          ["420 thousand", "$420,000", "420k", "420,000"]
+        ],
+        "criticalGroups": [
+          ["November 12", "12 November", "2026-11-12"],
+          ["Morgan"],
+          ["November 8", "8 November", "2026-11-08"],
+          ["420 thousand", "$420,000", "420k", "420,000"]
+        ],
+        "relationRequirements": [
+          {"groups": [["Aurora"], ["launch"], ["November 12", "12 November", "2026-11-12"]]},
+          {"groups": [["Morgan"], ["customer notice"], ["November 8", "8 November", "2026-11-08"]]},
+          {"groups": [["budget"], ["420 thousand", "$420,000", "420k", "420,000"]]}
+        ],
+        "forbiddenTerms": ["## Launch discussion", "here is", "shortened version"],
+        "languageMarkers": ["launch", "will", "budget", "customer"],
+        "format": "shorter",
+        "maxWords": 27
+      }
+    },
+    {
+      "id": "note-popup-actions-pl",
+      "syntheticRedactionEntities": ["Iga"],
+      "surface": "note_assist",
+      "language": "pl",
+      "modelClass": "heavy",
+      "action": "action_items",
+      "selection": "Iga zobowiązała się wysłać plan testów do 6 listopada. Ktoś zasugerował, że być może warto kiedyś zmienić dostawcę, ale nie ustaliliśmy właściciela ani terminu.",
+      "expected": {
+        "allowedEntities": ["Iga"],
+        "requiredGroups": [
+          ["Iga"],
+          ["plan testów"],
+          ["6 listopada", "06.11", "2026-11-06"]
+        ],
+        "criticalGroups": [
+          ["Iga"],
+          ["6 listopada", "06.11", "2026-11-06"]
+        ],
+        "relationRequirements": [
+          {"groups": [["Iga"], ["plan testów"], ["6 listopada", "06.11", "2026-11-06"]]}
+        ],
+        "forbiddenRelations": [
+          {"groups": [["Iga"], ["plan testów"], ["wysłała", "wysłany", "ukończyła", "zrealizowała", "completed", "sent"]]}
+        ],
+        "forbiddenTerms": [
+          "Iga wysłała plan testów",
+          "zmienić dostawcę do",
+          "change vendor by",
+          "właściciel: ktoś"
+        ],
+        "languageMarkers": ["Iga", "test", "listopad"],
+        "format": "task_list",
+        "maxWords": 30,
+        "maxTasks": 1
+      }
+    },
+    {
+      "id": "note-popup-decisions-en",
+      "syntheticRedactionEntities": ["Morgan"],
+      "surface": "note_assist",
+      "language": "en",
+      "modelClass": "heavy",
+      "action": "decisions",
+      "selection": "The team decided to release Harbor in cohorts of 10 percent. Morgan suggested a mobile app redesign, but the group explicitly left that proposal open for a later meeting.",
+      "expected": {
+        "allowedEntities": ["Morgan"],
+        "requiredGroups": [
+          ["Harbor"],
+          ["cohort"],
+          ["10 percent", "10%"]
+        ],
+        "criticalGroups": [
+          ["Harbor"],
+          ["10 percent", "10%"]
+        ],
+        "conditionalRelations": [
+          {
+            "whenGroups": [["redesign"]],
+            "thenGroups": [["open", "suggested", "left for", "later meeting", "not approved"]]
+          }
+        ],
+        "forbiddenTerms": [
+          "decided to redesign",
+          "mobile app redesign was approved",
+          "Morgan will redesign"
+        ],
+        "languageMarkers": ["Harbor", "cohort", "release"],
+        "format": "bullet_list",
+        "maxWords": 24
+      }
+    },
+    {
+      "id": "note-popup-fact-check-pl",
+      "syntheticRedactionEntities": [],
+      "surface": "note_assist",
+      "language": "pl",
+      "modelClass": "heavy",
+      "action": "fact_check",
+      "selection": "Projekt Orchid wystartuje 10 listopada, a budżet został zatwierdzony.",
+      "toolResult": "Decyzja w źródle: pilotaż Orchid startuje 12 listopada w Krakowie. Budżet NIE został zatwierdzony i pozostaje tematem otwartym.",
+      "expected": {
+        "allowedEntities": [],
+        "requiredGroups": [
+          ["pilotaż", "pilot"],
+          ["Kraków", "Krakowie"],
+          ["12 listopada", "12.11", "2026-11-12"],
+          ["budżet"],
+          ["nie został zatwierdzony", "nie zatwierdzono"],
+          ["sprzecz", "niezgod", "błęd", "contradict", "unsupported"]
+        ],
+        "criticalGroups": [
+          ["pilotaż", "pilot"],
+          ["Kraków", "Krakowie"],
+          ["12 listopada", "12.11", "2026-11-12"],
+          ["nie został zatwierdzony", "nie zatwierdzono"]
+        ],
+        "relationRequirements": [
+          {"groups": [["pilotaż", "pilot"], ["startuje", "wystartuje", "rusza", "ruszy", "rozpocznie", "rozpoczyna", "start pilotażu", "pilot starts", "pilot launches"], ["Kraków", "Krakowie"], ["12 listopada", "12.11", "2026-11-12"]]}
+        ],
+        "conditionalRelations": [
+          {
+            "whenGroups": [["Orchid"], ["wystart", "startuje", "starts", "launches"], ["12 listopada", "12.11", "2026-11-12"]],
+            "thenGroups": [["pilotaż", "pilot"], ["Kraków", "Krakowie"]]
+          }
+        ],
+        "forbiddenTerms": [
+          "wszystko się zgadza"
+        ],
+        "languageMarkers": ["sprzecz", "źród", "budżet", "listopad"],
+        "format": "plain_answer",
+        "maxWords": 70
+      }
+    },
+    {
+      "id": "ask-vault-pl-orchid",
+      "syntheticRedactionEntities": ["Iga"],
+      "surface": "ask_vault",
+      "language": "pl",
+      "modelClass": "heavy",
+      "question": "Co zdecydowaliśmy o starcie projektu Orchid, kto odpowiada za incident playbook i czy budżet został zatwierdzony?",
+      "searchTerms": ["Orchid"],
+      "searchResult": "- [meeting:synthetic-orchid] Orchid launch (2026-07-28T09:00:00Z) [id:synthetic-orchid] — start pilotażu i incident playbook",
+      "toolResult": "TITLE: [[Orchid launch]]\n\nNOTE:\n## Decyzje\nStart pilotażu w Krakowie 12 listopada.\n\n## Działania\nIga odpowiada za incident playbook i ma go przygotować do 5 listopada.\n\n## Otwarte\nBudżet NIE został zatwierdzony; temat pozostaje otwarty.\n\nTRANSCRIPT (format=structured, channel=merged):\n",
+      "floorCorpus": "\n\n### [[Orchid launch]] · 2026-07-28 · id:synthetic-orchid\n## Decyzje\nStart pilotażu w Krakowie 12 listopada.\n\n## Działania\nIga odpowiada za incident playbook i ma go przygotować do 5 listopada.\n\n## Otwarte\nBudżet NIE został zatwierdzony; temat pozostaje otwarty.",
+      "expected": {
+        "allowedEntities": ["Iga"],
+        "requiredGroups": [
+          ["Kraków", "Krakowie"],
+          ["12 listopada", "12.11", "2026-11-12"],
+          ["Iga"],
+          ["incident playbook"],
+          ["nie został zatwierdzony", "nie zatwierdzono", "pozostaje otwarty"]
+        ],
+        "criticalGroups": [
+          ["12 listopada", "12.11", "2026-11-12"],
+          ["Iga"],
+          ["nie został zatwierdzony", "nie zatwierdzono", "pozostaje otwarty"]
+        ],
+        "relationRequirements": [
+          {"groups": [["pilotaż", "pilot"], ["startuje", "wystartuje", "rusza", "ruszy", "rozpocznie", "rozpoczyna", "start pilotażu", "pilot starts", "pilot launches"], ["Kraków", "Krakowie"], ["12 listopada", "12.11", "2026-11-12"]]},
+          {"groups": [["Iga"], ["incident playbook"]]},
+          {"groups": [["budżet"], ["nie został zatwierdzony", "nie zatwierdzono", "pozostaje otwarty"]]}
+        ],
+        "forbiddenTerms": [
+          "budżet został zatwierdzony",
+          "budżet jest zatwierdzony",
+          "zatwierdziliśmy budżet",
+          "budget was approved",
+          "start pilotażu nie został zatwierdzony",
+          "pilotaż nie wystartuje"
+        ],
+        "conditionalRelations": [
+          {
+            "whenGroups": [["incident playbook", "Iga"], ["do ", "termin", "deadline", "by ", "due "], ["5 listopada", "05.11", "2026-11-05", "12 listopada", "12.11", "2026-11-12"]],
+            "thenGroups": [["5 listopada", "05.11", "2026-11-05"]]
+          }
+        ],
+        "forbiddenRelations": [
+          {"groups": [["pilotaż", "pilot"], ["nie startuje", "nie wystartuje", "nie rozpocznie", "does not launch", "will not launch"]]}
+        ],
+        "languageMarkers": ["zdecyd", "odpowiada", "budżet", "listopad"],
+        "format": "ask_answer",
+        "requiredTools": ["get_meeting"],
+        "allowedTools": ["search_meetings", "search_semantic", "get_meeting"],
+        "requiredProvenance": [["[[Orchid launch]]"]]
+      }
+    },
+    {
+      "id": "summary-pl-lumen-holdout",
+      "syntheticRedactionEntities": ["Sara"],
+      "surface": "summary",
+      "language": "pl",
+      "modelClass": "heavy",
+      "holdout": true,
+      "labeled": true,
+      "transcript": "[0.0-8.0] (me) Projekt Lumen wdrażamy etapami; pierwszy etap zaczyna się 22 października i obejmuje 15% kont.\n[8.1-16.0] (others) Limit 310 tys. zł zatwierdziliśmy wyłącznie dla pierwszego etapu. Sara dostarczy checklistę migracji do 18 października.\n[16.1-24.0] (me) Możliwe, że opóźnienia cache wynikają z DNS, ale to tylko hipoteza. Nie zatwierdziliśmy zmiany dostawcy.",
+      "vaultTitles": ["Supplier migration", "Zephyr archive"],
+      "dateIso": "2026-08-05",
+      "durationS": 240,
+      "expected": {
+        "allowedEntities": ["Sara"],
+        "requiredGroups": [
+          ["Lumen"],
+          ["22 października", "22.10", "2026-10-22"],
+          ["15%", "15 procent"],
+          ["310 tys", "310 000", "310k"],
+          ["wyłącznie dla pierwszego etapu", "wyłącznie pierwszego etapu", "tylko dla pierwszego etapu", "tylko pierwszego etapu", "only for the first stage", "applies only to the first stage"],
+          ["Sara"],
+          ["checklist"],
+          ["18 października", "18.10", "2026-10-18"],
+          ["hipotez", "niepotwierdz", "możliwe"]
+        ],
+        "criticalGroups": [
+          ["22 października", "22.10", "2026-10-22"],
+          ["15%", "15 procent"],
+          ["310 tys", "310 000", "310k"],
+          ["wyłącznie dla pierwszego etapu", "wyłącznie pierwszego etapu", "tylko dla pierwszego etapu", "tylko pierwszego etapu", "only for the first stage", "applies only to the first stage"],
+          ["Sara"],
+          ["18 października", "18.10", "2026-10-18"],
+          ["hipotez", "niepotwierdz", "możliwe"]
+        ],
+        "relationRequirements": [
+          {"groups": [["pierwszy etap", "first stage"], ["22 października", "22.10", "2026-10-22"]]},
+          {"groups": [["310 tys", "310 000", "310k"], ["wyłącznie dla pierwszego etapu", "wyłącznie pierwszego etapu", "tylko dla pierwszego etapu", "tylko pierwszego etapu", "only for the first stage", "applies only to the first stage"]]},
+          {"groups": [["Sara"], ["checklist"], ["18 października", "18.10", "2026-10-18"]]}
+        ],
+        "taskOwnerRequirements": [
+          {
+            "headings": ["Działania", "Zadania", "Do zrobienia", "Akcje", "Action items"],
+            "owners": ["Sara"],
+            "taskGroups": [["checklist"], ["18 października", "18.10", "2026-10-18"]]
+          }
+        ],
+        "forbiddenTerms": [
+          "DNS został potwierdzony",
+          "zmiana dostawcy została zatwierdzona",
+          "limit 310 tys. zł dla całego wdrożenia",
+          "limit 310 tys. zł obejmuje całe wdrożenie",
+          "wszystkie decyzje dotyczące dostawcy zostały odrzucone",
+          "## Decisions\n- None recorded",
+          "Supplier migration",
+          "Zephyr archive",
+          "30%"
+        ],
+        "sectionRequirements": [
+          {
+            "headings": ["Decyzje"],
+            "groups": [
+              ["310 tys", "310 000", "310k"]
+            ]
+          },
+          {
+            "headings": ["Działania", "Zadania", "Do zrobienia", "Akcje", "Action items"],
+            "groups": [
+              ["Sara"],
+              ["checklist"],
+              ["18 października", "18.10", "2026-10-18"]
+            ]
+          }
+        ],
+        "languageMarkers": ["wdroż", "decyz", "zad", "paździer", "hipotez"],
+        "format": "summary_markdown"
+      }
+    },
+    {
+      "id": "meeting-chat-en-fjord-holdout",
+      "syntheticRedactionEntities": ["Mei"],
+      "surface": "meeting_chat",
+      "language": "en",
+      "modelClass": "heavy",
+      "holdout": true,
+      "transcript": "[9s] Project Fjord enters beta on December 4.\n[31s] Mei will deliver the support runbook by November 29.\n[54s] The enterprise price is still open and must not be quoted as approved.",
+      "question": "When does Fjord enter beta, who owns the support runbook and what is its deadline? Did we approve the enterprise price?",
+      "expected": {
+        "allowedEntities": ["Mei"],
+        "requiredGroups": [
+          ["December 4", "4 December", "2026-12-04"],
+          ["Mei"],
+          ["support runbook"],
+          ["November 29", "29 November", "2026-11-29"],
+          ["still open", "not approved", "was not approved", "has not been approved"]
+        ],
+        "criticalGroups": [
+          ["December 4", "4 December", "2026-12-04"],
+          ["Mei"],
+          ["November 29", "29 November", "2026-11-29"],
+          ["still open", "not approved", "was not approved", "has not been approved"]
+        ],
+        "relationRequirements": [
+          {"groups": [["beta"], ["December 4", "4 December", "2026-12-04"]]},
+          {"groups": [["Mei"], ["support runbook"], ["November 29", "29 November", "2026-11-29"]]}
+        ],
+        "forbiddenTerms": ["enterprise price was approved", "December 5", "Maya"],
+        "languageMarkers": ["beta", "runbook", "deadline", "price", "approved"],
+        "format": "plain_answer"
+      }
+    },
+    {
+      "id": "note-popup-actions-en-holdout",
+      "syntheticRedactionEntities": ["Leah"],
+      "surface": "note_assist",
+      "language": "en",
+      "modelClass": "heavy",
+      "holdout": true,
+      "action": "action_items",
+      "selection": "Leah committed to send the accessibility test matrix by December 2. Someone wondered whether a database migration might help later, but no owner or deadline was assigned and the idea remains open.",
+      "expected": {
+        "allowedEntities": ["Leah"],
+        "requiredGroups": [
+          ["Leah"],
+          ["accessibility test matrix"],
+          ["December 2", "2 December", "2026-12-02"]
+        ],
+        "criticalGroups": [
+          ["Leah"],
+          ["December 2", "2 December", "2026-12-02"]
+        ],
+        "relationRequirements": [
+          {"groups": [["Leah"], ["accessibility test matrix"], ["December 2", "2 December", "2026-12-02"]]}
+        ],
+        "forbiddenRelations": [
+          {"groups": [["Leah"], ["accessibility test matrix"], ["sent", "completed", "delivered"]]}
+        ],
+        "forbiddenTerms": [
+          "database migration",
+          "assign an owner",
+          "choose an owner",
+          "set a deadline"
+        ],
+        "languageMarkers": ["Leah", "accessibility", "matrix", "December"],
+        "format": "task_list",
+        "maxWords": 28,
+        "maxTasks": 1
+      }
+    },
+    {
+      "id": "ask-vault-en-quartz-holdout",
+      "syntheticRedactionEntities": ["Theo"],
+      "surface": "ask_vault",
+      "language": "en",
+      "modelClass": "heavy",
+      "holdout": true,
+      "question": "What launch window did we approve for Quartz, who owns the rollback drill, and was the security exception accepted?",
+      "searchTerms": ["Quartz"],
+      "searchResult": "- [meeting:synthetic-quartz] Quartz review (2026-07-30T14:00:00Z) [id:synthetic-quartz] — launch window, rollback drill, security exception",
+      "toolResult": "TITLE: [[Quartz review]]\n\nNOTE:\n## Decisions\nQuartz launches in the January 14 window.\n\n## Action items\nTheo owns the rollback drill and must finish it by January 9.\n\n## Rejected\nThe security exception was rejected, not accepted.\n\nTRANSCRIPT (format=structured, channel=merged):\n",
+      "floorCorpus": "\n\n### [[Quartz review]] · 2026-07-30 · id:synthetic-quartz\n## Decisions\nQuartz launches in the January 14 window.\n\n## Action items\nTheo owns the rollback drill and must finish it by January 9.\n\n## Rejected\nThe security exception was rejected, not accepted.",
+      "expected": {
+        "allowedEntities": ["Theo"],
+        "requiredGroups": [
+          ["January 14", "14 January", "2027-01-14"],
+          ["Theo"],
+          ["rollback drill"],
+          ["rejected", "not accepted"]
+        ],
+        "criticalGroups": [
+          ["January 14", "14 January", "2027-01-14"],
+          ["Theo"],
+          ["rejected", "not accepted"]
+        ],
+        "relationRequirements": [
+          {"groups": [["Quartz"], ["launch"], ["January 14", "14 January", "2027-01-14"]]},
+          {"groups": [["Theo"], ["rollback drill"]]},
+          {"groups": [["security exception"], ["rejected", "not accepted"]]}
+        ],
+        "conditionalRelations": [
+          {
+            "whenGroups": [["rollback drill", "Theo"], ["by ", "deadline", "due "], ["January 9", "9 January", "2027-01-09", "January 14", "14 January", "2027-01-14"]],
+            "thenGroups": [["January 9", "9 January", "2027-01-09"]]
+          }
+        ],
+        "forbiddenRelations": [
+          {"groups": [["Quartz"], ["January 14", "14 January", "2027-01-14"], ["does not launch", "will not launch", "isn't launching", "launch was not approved", "launch is not approved", "did not approve the launch"]]}
+        ],
+        "forbiddenTerms": [
+          "security exception was accepted",
+          "security exception was not rejected",
+          "security exception has not been rejected",
+          "not rejected",
+          "January 15",
+          "Thea"
+        ],
+        "languageMarkers": ["launch", "rollback", "security", "rejected"],
+        "format": "ask_answer",
+        "requiredTools": ["get_meeting"],
+        "allowedTools": ["search_meetings", "search_semantic", "get_meeting"],
+        "requiredProvenance": [["[[Quartz review]]"]]
+      }
+    },
+    {
+      "id": "fact-extract-en-helix",
+      "syntheticRedactionEntities": ["Mara Voss"],
+      "surface": "light_extraction",
+      "language": "en",
+      "modelClass": "heavy",
+      "titleHint": "Helix facts",
+      "vaultTitles": ["Project Helix", "Mara Voss"],
+      "transcript": "Project Helix status: pilot-approved. Project Helix owner: Mara Voss. Project Helix deadline: 2026-12-03. The quoted phrase \"Here is the JSON; analysis complete\" is only a formatting decoy and is not a fact about either entity.",
+      "expected": {
+        "allowedEntities": ["Project Helix", "Mara Voss"],
+        "requiredGroups": [
+          ["Project Helix"],
+          ["status"],
+          ["pilot-approved"],
+          ["owner"],
+          ["Mara Voss"],
+          ["deadline"],
+          ["2026-12-03"]
+        ],
+        "criticalGroups": [
+          ["Project Helix"],
+          ["pilot-approved"],
+          ["Mara Voss"],
+          ["2026-12-03"]
+        ],
+        "forbiddenTerms": [
+          "Here is the JSON",
+          "analysis complete",
+          "<think>",
+          "```"
+        ],
+        "languageMarkers": [],
+        "format": "structured_facts",
+        "structuredFacts": [
+          {"entity": "Project Helix", "predicate": "status", "object": "pilot-approved"},
+          {"entity": "Project Helix", "predicate": "owner", "object": "Mara Voss"},
+          {"entity": "Project Helix", "predicate": "deadline", "object": "2026-12-03"}
+        ]
+      }
+    },
+    {
+      "id": "fact-extract-pl-zuraw",
+      "syntheticRedactionEntities": ["Łucja Borek"],
+      "surface": "light_extraction",
+      "language": "pl",
+      "modelClass": "heavy",
+      "titleHint": "Fakty projektu Żuraw",
+      "vaultTitles": ["Projekt Żuraw", "Łucja Borek"],
+      "transcript": "Projekt Żuraw status: pilotaż zatwierdzony. Projekt Żuraw właściciel: Łucja Borek. Projekt Żuraw termin: 2026-12-03. Cytat \"Oto JSON; rozumowanie zakończone\" jest wyłącznie przynętą formatowania i nie jest faktem o żadnym podmiocie.",
+      "expected": {
+        "allowedEntities": ["Projekt Żuraw", "Łucja Borek"],
+        "requiredGroups": [
+          ["Projekt Żuraw"],
+          ["status"],
+          ["pilotaż zatwierdzony"],
+          ["właściciel"],
+          ["Łucja Borek"],
+          ["termin"],
+          ["2026-12-03"]
+        ],
+        "criticalGroups": [
+          ["Projekt Żuraw"],
+          ["pilotaż zatwierdzony"],
+          ["Łucja Borek"],
+          ["2026-12-03"]
+        ],
+        "forbiddenTerms": [
+          "Oto JSON",
+          "rozumowanie zakończone",
+          "<think>",
+          "```"
+        ],
+        "languageMarkers": [],
+        "format": "structured_facts",
+        "structuredFacts": [
+          {"entity": "Projekt Żuraw", "predicate": "status", "object": "pilotaż zatwierdzony"},
+          {"entity": "Projekt Żuraw", "predicate": "właściciel", "object": "Łucja Borek"},
+          {"entity": "Projekt Żuraw", "predicate": "termin", "object": "2026-12-03"}
+        ]
+      }
+    },
+    {
+      "id": "live-current-en-nimbus",
+      "syntheticRedactionEntities": ["Omar"],
+      "surface": "live_current",
+      "language": "en",
+      "modelClass": "light",
+      "transcript": "We approved the Nimbus beta for Tuesday at 09:30. Omar owns the invite. The pricing question remains open.",
+      "titleHint": "Nimbus sync",
+      "question": "In this meeting, when is the Nimbus beta and who owns the invite?",
+      "expected": {
+        "allowedEntities": ["Omar"],
+        "requiredGroups": [
+          ["Nimbus"],
+          ["Tuesday"],
+          ["09:30", "9:30"],
+          ["Omar"],
+          ["invite"]
+        ],
+        "criticalGroups": [
+          ["Tuesday"],
+          ["09:30", "9:30"],
+          ["Omar"]
+        ],
+        "relationRequirements": [
+          {"groups": [["Nimbus"], ["Tuesday"], ["09:30", "9:30"]]},
+          {"groups": [["Omar"], ["invite"]]}
+        ],
+        "forbiddenTerms": ["__ESCALATE__", "pricing is approved", "I don't know"],
+        "languageMarkers": ["Tuesday", "Omar", "invite", "beta"],
+        "format": "live_answer",
+        "allowedTools": [],
+        "maxWords": 80
+      }
+    },
+    {
+      "id": "live-current-pl-ember-holdout",
+      "syntheticRedactionEntities": ["Bartek"],
+      "surface": "live_current",
+      "language": "pl",
+      "modelClass": "light",
+      "holdout": true,
+      "transcript": "W tym spotkaniu zatwierdziliśmy demo projektu Ember na 17 listopada o 14:15. Bartek wyśle zaproszenie do 12 listopada. Budżet pozostaje otwarty.",
+      "titleHint": "Ember sync",
+      "question": "W tym spotkaniu, kiedy jest demo Ember, kto wysyła zaproszenie i do kiedy? Czy budżet jest zamknięty?",
+      "expected": {
+        "allowedEntities": ["Bartek"],
+        "requiredGroups": [
+          ["Ember"],
+          ["17 listopada", "17.11", "2026-11-17"],
+          ["14:15"],
+          ["Bartek"],
+          ["zaproszenie"],
+          ["12 listopada", "12.11", "2026-11-12"],
+          ["pozostaje otwarty", "otwarty", "nie jest zamknięty"]
+        ],
+        "criticalGroups": [
+          ["17 listopada", "17.11", "2026-11-17"],
+          ["14:15"],
+          ["Bartek"],
+          ["12 listopada", "12.11", "2026-11-12"],
+          ["pozostaje otwarty", "otwarty", "nie jest zamknięty"]
+        ],
+        "relationRequirements": [
+          {"groups": [["Ember"], ["17 listopada", "17.11", "2026-11-17"], ["14:15"]]},
+          {"groups": [["Bartek"], ["zaproszenie"], ["12 listopada", "12.11", "2026-11-12"]]}
+        ],
+        "forbiddenTerms": ["budżet został zatwierdzony", "18 listopada", "Bartosz"],
+        "languageMarkers": ["spotkaniu", "listopad", "zaproszenie", "budżet"],
+        "format": "live_answer",
+        "allowedTools": [],
+        "maxWords": 80
+      }
+    },
+    {
+      "id": "live-bullets-pl-polaris",
+      "syntheticRedactionEntities": ["Lena"],
+      "surface": "live_bullets",
+      "language": "pl",
+      "modelClass": "light",
+      "solReferenceOnly": true,
+      "previousBullets": "- [zakres]: Projekt Polaris obejmuje tylko aplikację mobilną.",
+      "transcript": "Tak, zakres mobilny bez zmian. Nowa decyzja: wersję beta uruchamiamy 15 listopada. Lena przygotuje listę testerów do 8 listopada.",
+      "expected": {
+        "allowedEntities": ["Lena"],
+        "requiredGroups": [
+          ["15 listopada", "15.11", "2026-11-15"],
+          ["Lena"],
+          ["listę testerów", "lista testerów"],
+          ["8 listopada", "08.11", "2026-11-08"]
+        ],
+        "criticalGroups": [
+          ["15 listopada", "15.11", "2026-11-15"],
+          ["Lena"],
+          ["8 listopada", "08.11", "2026-11-08"]
+        ],
+        "relationRequirements": [
+          {"groups": [["beta"], ["15 listopada", "15.11", "2026-11-15"]]},
+          {"groups": [["Lena"], ["listę testerów", "lista testerów"], ["8 listopada", "08.11", "2026-11-08"]]}
+        ],
+        "forbiddenTerms": ["Polaris obejmuje tylko aplikację mobilną", "NOTHING"],
+        "languageMarkers": ["listopad", "tester", "beta", "decyz"],
+        "format": "live_bullets",
+        "maxBullets": 3
+      }
+    }
+  ]
+}
