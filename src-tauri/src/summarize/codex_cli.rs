@@ -114,6 +114,7 @@ fn verified_codex_binary_cache() -> &'static Mutex<Option<CodexBinaryIdentity>> 
 struct CodexCliProvider {
     binary: String,
     model: String,
+    effort: String,
     #[cfg(test)]
     runtime_probe: Option<CodexRuntimeProbe>,
 }
@@ -130,6 +131,7 @@ impl CodexCliProvider {
         Self {
             binary: DEFAULT_BINARY.to_string(),
             model: String::new(),
+            effort: String::new(),
             #[cfg(test)]
             runtime_probe: None,
         }
@@ -140,11 +142,17 @@ impl CodexCliProvider {
         self
     }
 
+    fn with_effort(mut self, effort: String) -> Self {
+        self.effort = effort;
+        self
+    }
+
     #[cfg(test)]
     fn with_binary(binary: String) -> Self {
         Self {
             binary,
             model: String::new(),
+            effort: String::new(),
             runtime_probe: None,
         }
     }
@@ -268,7 +276,7 @@ impl CodexCliProvider {
                 probe.use_inner_network_sandbox,
             );
         }
-        build_codex_command(bin, &self.model, runtime_home)
+        build_codex_command_with_effort(bin, &self.model, &self.effort, runtime_home)
     }
 }
 
@@ -439,8 +447,12 @@ fn resolve_codex_binary_from(
 /// The only content-capable construction seam. The concrete provider remains private to this
 /// module, so crate callers cannot bypass `summarize::make_provider_resolved` and its
 /// consent/redaction/ledger wrapper.
-pub(super) fn provider(model: String) -> Arc<dyn SummarizerProvider> {
-    Arc::new(CodexCliProvider::new().with_model(model))
+pub(super) fn provider(model: String, effort: String) -> Arc<dyn SummarizerProvider> {
+    Arc::new(
+        CodexCliProvider::new()
+            .with_model(model)
+            .with_effort(effort),
+    )
 }
 
 /// Availability-only surface for Settings. It returns no content-capable provider object.
@@ -450,6 +462,26 @@ pub(crate) async fn probe_availability() -> Availability {
 
 fn build_codex_command(bin: &str, model: &str, codex_home: &Path) -> Command {
     configure_codex_command(Command::new(bin), model, codex_home)
+}
+
+fn build_codex_command_with_effort(
+    bin: &str,
+    model: &str,
+    effort: &str,
+    codex_home: &Path,
+) -> Command {
+    // Preserve the exact pre-effort command path for an empty or rejected value. Besides keeping
+    // existing installs byte-for-byte compatible, this makes the no-override construction remain
+    // exercised by production rather than only by its command-shape tests.
+    if effort_args(effort).is_empty() {
+        return build_codex_command(bin, model, codex_home);
+    }
+    finish_codex_command_with_effort(
+        configure_codex_command_prefix(Command::new(bin)),
+        model,
+        effort,
+        codex_home,
+    )
 }
 
 async fn verify_supported_codex_cli(bin: &str) -> crate::error::Result<()> {
@@ -819,12 +851,36 @@ pub(crate) fn model_args(model: &str) -> Vec<String> {
     vec!["--model".to_string(), model.trim().to_string()]
 }
 
-fn finish_codex_command(mut cmd: Command, model: &str, codex_home: &Path) -> Command {
+/// The strict-config override for Codex reasoning effort. Unknown values are omitted rather than
+/// forwarded: this field is persisted user input and must never become an arbitrary CLI config
+/// expression. Empty means Codex's provider default, matching every pre-existing install.
+pub(crate) fn effort_args(effort: &str) -> Vec<String> {
+    let effort = effort.trim();
+    if !matches!(effort, "low" | "medium" | "high") {
+        return Vec::new();
+    }
+    vec![
+        "--config".to_string(),
+        format!("model_reasoning_effort=\"{effort}\""),
+    ]
+}
+
+fn finish_codex_command(cmd: Command, model: &str, codex_home: &Path) -> Command {
+    finish_codex_command_with_effort(cmd, model, "", codex_home)
+}
+
+fn finish_codex_command_with_effort(
+    mut cmd: Command,
+    model: &str,
+    effort: &str,
+    codex_home: &Path,
+) -> Command {
     // The public JSONL stream intentionally omits internal unsupported-call events. Restrict the
     // child logger to the tool router's errors so Murmur can reject such an event without enabling
     // request/prompt tracing or recording content.
     cmd.env("RUST_LOG", CODEX_TOOL_ROUTER_LOG);
     cmd.args(model_args(model));
+    cmd.args(effort_args(effort));
     cmd.arg("--json")
         .arg("-")
         .stdin(Stdio::piped())
@@ -3646,7 +3702,42 @@ mod tests {
         let provider = CodexCliProvider::with_binary("custom-codex".into());
         assert_eq!(provider.binary, "custom-codex");
         assert!(provider.model.is_empty());
-        let provider = provider.with_model("gpt-5.6-sol".into());
+        assert!(provider.effort.is_empty());
+        let provider = provider
+            .with_model("gpt-5.6-sol".into())
+            .with_effort("high".into());
         assert_eq!(provider.model, "gpt-5.6-sol");
+        assert_eq!(provider.effort, "high");
+    }
+
+    #[test]
+    fn effort_is_allowlisted_and_reaches_the_isolated_command() {
+        assert_eq!(
+            effort_args(" high "),
+            vec![
+                "--config".to_string(),
+                "model_reasoning_effort=\"high\"".to_string()
+            ]
+        );
+        assert!(effort_args("").is_empty());
+        assert!(effort_args("xhigh").is_empty());
+        assert!(effort_args("high --sandbox danger-full-access").is_empty());
+
+        let command = build_codex_command_with_effort(
+            "codex",
+            "gpt-5.6-sol",
+            "high",
+            Path::new("/tmp/murmur-codex-test"),
+        );
+        let argv = args(&command);
+        let effort_pos = argv
+            .windows(2)
+            .position(|pair| pair == ["--config", "model_reasoning_effort=\"high\""])
+            .expect("effort must be a strict-config pair");
+        let model_pos = argv
+            .windows(2)
+            .position(|pair| pair == ["--model", "gpt-5.6-sol"])
+            .expect("model must be forwarded");
+        assert!(effort_pos > model_pos);
     }
 }

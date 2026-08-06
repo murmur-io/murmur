@@ -151,7 +151,8 @@ pub fn apply_posture(cfg: &mut AppConfig, posture: Posture) {
         Posture::FullyLocal => {
             // Zero egress: notes + ask on the heavy engine; @brain on the light engine (its agentic
             // loop degrades to the deterministic floor by the existing local-only gate — the posture
-            // UI states this). brain_live powers realtime + local fact extraction.
+            // UI states this). brain_live powers light realtime work; durable post-call fact
+            // extraction reuses the already-provisioned heavy engine.
             cfg.brain_live = true;
             let heavy = class_model_id(cfg, ModelClass::Heavy).unwrap_or_default();
             let light = class_model_id(cfg, ModelClass::Light).unwrap_or_default();
