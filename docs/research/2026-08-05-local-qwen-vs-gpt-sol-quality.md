@@ -16,9 +16,9 @@ obserwacji wobec `29/34 = 85.3%` dla Sol. Luka to
 jedna odpowiedź (`2.9 p.p.`); macro po surface wynosi `83.3%` local i `82.0%` Sol.
 
 Nie oznacza to parytetu modeli. W osobnej próbie z tym samym evaluator-owned system/user envelope i
-jednym zewnętrznym wywołaniem providera lokalny composite ma `26/36 = 72.2%`, a Sol `33/36 =
-91.7%`. Luka jednowywołaniowego same-envelope model-stack wynosi więc `19.5 p.p.`, macro `66.7%`
-vs `91.7%`, a błędów krytycznych jest `10` vs `3`. Produkcyjne prompty, parsery, routing,
+jednym zewnętrznym wywołaniem providera lokalny composite ma `26/36 = 72.2%`, a Sol `34/36 =
+94.4%`. Luka jednowywołaniowego same-envelope model-stack wynosi więc `22.2 p.p.`, macro `66.7%`
+vs `95.2%`, a błędów krytycznych jest `10` vs `2`. Produkcyjne prompty, parsery, routing,
 stan i bounded orchestration
 kompensują dużą część słabości małych modeli lokalnych.
 
@@ -42,7 +42,7 @@ Rekomendacja:
 | Lane | Co porównuje | Local | Sol | Luka Sol-local |
 | --- | --- | ---: | ---: | ---: |
 | candidate product system, wspólne przypadki | rzeczywiste role, prompty, parsery, routing i orchestration z tego worktree | 82.4% (28/34) | 85.3% (29/34) | 2.9 p.p. |
-| same caller envelope/model-stack | jeden `complete_with_meta`, wspólny envelope i wspólna projekcja | 72.2% (26/36) | 91.7% (33/36) | 19.5 p.p. |
+| same caller envelope/model-stack | jeden `complete_with_meta`, wspólny envelope i wspólna projekcja | 72.2% (26/36) | 94.4% (34/36) | 22.2 p.p. |
 
 Pierwszy wiersz odpowiada na pytanie „jak candidate backend product paths zachowały się na tych
 syntetycznych probes?”. Nie jest pełnym testem aplikacji/UI ani realnego vaultu. Drugi pokazuje, ile
@@ -68,7 +68,7 @@ matched wyniku.
 | Qwen 1.7B, live current + bullets | 6 | 100.0% | 100.0% | 0 | 100.0 |
 | Local composite, wszystkie lokalne ścieżki | 36 | 83.3% | 85.7% | 6 | 91.5 |
 | Local composite, tylko wspólne z Sol | 34 | 82.4% | 83.3% | 6 | 91.0 |
-| Sol, te same 34 product paths | 34 | 85.3% | 82.0% | 5 | 92.5 |
+| Sol, te same 34 product paths | 34 | 85.3% | 82.0% | 5 | 92.4 |
 
 | Surface | Local candidate route | Sol candidate/reference route | Odczyt |
 | --- | ---: | ---: | --- |
@@ -88,25 +88,28 @@ dobrego retrieval ani niezawodności produktu.
 - Qwen 4B, `ask-vault-pl-orchid`: miesza otwarty budżet z zatwierdzonym startem i pomija datę.
 - Qwen 4B, `note-popup-actions-pl`: skraca relację `plan testów` do `plan`.
 - Qwen 4B, `summary-en-cedar`: opisuje zatwierdzony rollout w prozie, ale deklaruje brak decyzji.
-- Sol, `ask-vault-en-quartz-holdout`: w obu product-path repetycjach kończy bez narzędzi; nie
-  dostarcza wymaganych faktów, provenance ani staged search/open.
+- Sol, `ask-vault-en-quartz-holdout`: w R1 kończy bez narzędzi i nie dostarcza wymaganych faktów ani
+  provenance; w R2 przechodzi po staged search/open, więc ten przypadek jest jedynym flipem.
 - Sol, `summary-pl-kestrel`: w obu repetycjach miesza zatwierdzony limit budżetu z planowanym
   terminem startu pilotażu.
-- Sol, `ask-vault-pl-orchid`: nie przechodzi w R1 i przechodzi w R2; to jedyny flip `casePass` w
-  finalnym product lane. Wszystkie finalne lokalne outcome'y, w tym przypadki inne niż fakty, oraz
+- Sol, `ask-vault-pl-orchid`: nie przechodzi w żadnej repetycji; w obu kończy bez narzędzi i
+  provenance, więc nie dostarcza wymaganych faktów.
+  Wszystkie finalne lokalne outcome'y, w tym przypadki inne niż fakty, oraz
   ich `outputSha256` były stabilne między R1 i R2. Cloud nie był deterministyczny: zmienił output
-  w 7 z 18 przypadków między repetycjami.
+  w 10 z 18 rekordów route-specific, czyli w 10 z 17 product paths; offline live-bullets ceiling
+  pozostał stabilny. W same-envelope lane Sol zmienił 9 z 18 outputów bez zmiany verdictów, a oba
+  ramiona lokalne pozostały byte-stable.
 
 ## Wyniki same caller envelope/model-stack
 
 | Kandydat | N | casePass | surface macro | Krytyczne | score |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Qwen 4B | 30 | 73.3% | 73.3% | 8 | 86.4 |
-| Sol na tych samych przypadkach | 30 | 90.0% | 88.3% | 3 | 94.9 |
+| Sol na tych samych przypadkach | 30 | 93.3% | 93.3% | 2 | 96.6 |
 | Qwen 1.7B | 6 | 66.7% | 50.0% | 2 | 83.0 |
 | Sol na tych samych przypadkach | 6 | 100% | 100% | 0 | 100.0 |
 | Local composite | 36 | 72.2% | 66.7% | 10 | 85.8 |
-| Sol | 36 | 91.7% | 91.7% | 3 | 95.8 |
+| Sol | 36 | 94.4% | 95.2% | 2 | 97.2 |
 
 Produktowa ścieżka live-bullets 1.7B przechodzi dzięki parserowi i regułom stanu, podczas gdy
 jednowywołaniowa projekcja model-only nie utrzymuje poprawnie zakresu i powtarza wcześniejszy fakt.
@@ -120,7 +123,7 @@ same-envelope model-stack.
 | Stan | Matched local product | Sol | Luka score | Krytyczne local |
 | --- | ---: | ---: | ---: | ---: |
 | przed zmianą, fakty na 1.7B | 70.6% (24/34) | 85.3% (29/34) | 7.4 | 10 |
-| final, fakty na 4B w Fully Local | 82.4% (28/34) | 85.3% (29/34) | 1.5 | 6 |
+| final, fakty na 4B w Fully Local | 82.4% (28/34) | 85.3% (29/34) | 1.4 | 6 |
 
 W A/B lokalnym wszystkie cztery obserwacje faktów zmieniły się z fail na pass, a 32 obserwacje
 pozostałych lokalnych product paths (16 przypadków razy dwie repetycje) zachowały identyczne
@@ -207,9 +210,9 @@ nie jest to niezależny replay transformacji raw-response -> projekcja, bo raw r
 commitment, co jawnie ogranicza siłę dowodu tego lane'u.
 
 Cloud nadal przechodzi przez canonical consent/redaction/ledger seam. Tymczasowy SQLCipher ledger
-zapisał `36/36` content-free receipts w R1 i `40/40` w R2, bez failure; różnica pochodzi z liczby
+zapisał `36/36` content-free receipts w R1 i `41/41` w R2, bez failure; różnica pochodzi z liczby
 kroków cloud agent loop, nie z brakujących rekordów. Następnie DB usunięto. Product route
-odnotował 5 podstawień wzorca telefonu w R1 i 9 w R2 (kontrolowane daty/ranges w fixture); nie
+odnotował 5 podstawień wzorca telefonu w R1 i 10 w R2 (kontrolowane daty/ranges w fixture); nie
 osłabiono regexu ani nie ominięto firewalla. Same-envelope lane używa odwracalnych,
 kandydat-independent tokenów semantycznych przed canonical firewall; wszystkie 18 cloud receipts
 na run miało zero redakcji, więc Sol nie dostał dat oznaczonych jako `PHONE`.
@@ -231,10 +234,13 @@ promptów użytkownika, sekretów ani PII. Produkcyjny egress ledger pozostaje c
   `src/settings/postures.rs`; odczyt brakującej zależności failuje, a selftest wymaga braku
   duplikatów, istnienia plików, wymaganych zależności i identycznej listy Rust/Python. Nadal nie
   jest to automatyczny graf wszystkich tranzytywnych zależności;
-- `--verify-evidence` sprawdza zapisany `trackedDiffSha256=2abc82db…`, lecz celowo nie przelicza go
-  z bieżącego Git; snapshot był brudnym worktree przy pomiarze, a pełny Harness wiąże osobno exact
-  diff. Sam manifest nie dowodzi, że późniejszy checkout ma ten sam diff;
+- `--verify-evidence` sprawdza zapisany `trackedDiffSha256=e3b0c442…` i
+  `workingTreeDirty=false`; pomiar powstał na czystym commicie. Validator celowo nie przelicza
+  późniejszego bieżącego diffu Git, a pełny Harness wiąże osobno exact diff artefaktów i raportu;
 - tool steps są content-free evidence sesyjnym, nie uwierzytelnionym transkryptem wywołań;
+- pełny zewnętrzny log runnera nie jest commitowany ze względu na prywatne ścieżki i kontekst;
+  dlatego historyczny status wyjścia wrappera nie jest częścią tego dowodu. Certyfikowana jest
+  kompletność i odtwarzalność zachowanych raportów, nie provenance zakończenia procesu;
 - same-envelope records nie zachowują plaintext raw response; wiążą je tylko przez
   `rawOutputSha256`/`rawOutputChars`, więc replay ponownie ocenia projekcję, ale nie dowodzi
   niezależnie poprawności transformacji raw-response -> projekcja;
@@ -250,9 +256,9 @@ product-path przypadku. `p50` i `p95` poniżej to nearest-rank po połączonych 
 
 | Ramię | N | mean | p50 | p95 | min-max |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen 4B | 30 | 5.96 s | 3.74 s | 20.11 s | 0.75-23.31 s |
-| Qwen 1.7B | 6 | 1.75 s | 1.48 s | 2.62 s | 1.02-2.62 s |
-| Sol, requested high | 34 | 7.53 s | 5.43 s | 14.26 s | 3.31-47.69 s |
+| Qwen 4B | 30 | 5.80 s | 2.93 s | 20.12 s | 0.76-25.05 s |
+| Qwen 1.7B | 6 | 1.53 s | 1.47 s | 2.12 s | 1.03-2.12 s |
+| Sol, requested high | 34 | 7.22 s | 5.00 s | 16.68 s | 3.40-44.33 s |
 
 To diagnostyka, nie SLA. Sidecar był rezydentny w ramach ramienia, a próbka jest zbyt mała do
 decyzji o wydajności lub termice.
@@ -275,16 +281,19 @@ decyzji o wydajności lub termice.
 
 Final:
 
-- R1 archive `fc7c70eb07595b8ae768a9a53d2d8e6d12544b086a5d4173540acb873618fb2f`,
-  logical JSON `3308ec93608ca21a190e6bf14f0082d98f8cde545e1c9f8fe017f9c2f07bac51`;
-- R2 archive `0142628e94dd3756cbad3d2d067def02b19b830e95107c7be82dbcc3344aa6cf`,
-  logical JSON `393ddee23d7bdff7604a2333f0303d3fea8c398769e1732519d4bfc479973d64`;
-- combined `6db53789cc979743ab6deaf74a0aba093c94df2825abef32ea93cb801effd3cc`;
+- R1 archive `8fa8e7c4fbc02c0f64ce3d149b8ffa2881e65d5aa8b3c307fd55df72d7955cbb`,
+  logical JSON `5b469273bd07cdb7dbc6cba14812a2dcbc1f068aa795e29d732f9237c57cb913`;
+- R2 archive `b622d9ddbe3f7d8a4cbb191f9b3009185024768d48cecad564fb84561db5ba07`,
+  logical JSON `b83faa807cf093421a51021769ef638cc96ea2a8323794838bdf09f6b05307e9`;
+- versioned combined `8f9070220eef6e09ab0cb44cfb94ae4a6b077d18f1d39707c043918ff07d24f7`;
 - jawny snapshot syntetycznego fixture
   `b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2`;
-- jawny inventory wszystkich tekstowych wartości R1/R2
-  `5ce634a6bff61e48fdbcec19b2c08bf91f3aaae29c78d8028ac79d8679afac28`;
-- evidence manifest `b1072eea1601449812ed8c9cccd02cc3a0214e0f8b26fac2b10616af89db72de`.
+- jawny inventory wszystkich tekstowych wartości R1/R2: deterministyczne archiwum
+  `69ba4e3d507ca2de74fb26afdbbfdf9c1810d738ffa18d6b2ece71a7d8c6ab0c`, logiczny JSON
+  `7cf5eb7bd8e8d53504e56842482c76a3b23987ea1431b270ccf8464b736e270a`;
+- evidence manifest `ed4b4ccbce0e76d42681e33b05f431a5306409abb348b9cb19d582c9c388cd2b`;
+- tekstowa review projection
+  `4d01dbaad9b489896742551112ed7d843987f92578fe905ceb7ceb50190a1136`.
 
 W evidence `logicalPath` jest wirtualną nazwą zdekompresowanego JSON, nie drugim plikiem w repo.
 Ścisły evidence manifest schema v1 wiąże fizyczne archiwa `.json.gz`, ich logiczną treść, combined
@@ -292,11 +301,20 @@ oraz producer snapshot. Celowo nie ma w nim dodatkowych kluczy snapshot/inventor
 repeat validator odrzuca zmianę tego schematu. Te dwa są wiązane osobno przez stałe ścieżki i SHA w
 `verify_local_cloud_quality_artifacts.py`; ten oracle jest uruchamiany przez test Rust razem z
 mutation selftestami obu plików. Snapshot pozwala odtworzyć każdy `casePayloadSha256`, a inventory
-publikuje wszystkie 728 unikalnych stringów z 4 744 wystąpień wraz z commitmentami ścieżek per
+publikuje wszystkie 721 unikalnych stringów z 4 748 wystąpień wraz z commitmentami ścieżek per
 repeat. Raw reports mają schema v9, combined schema v5, inventory schema v2.
+Odświeżone R1/R2 oraz inventory mają nowe, wersjonowane ścieżki; starsze pliki z bazy pozostają
+historycznymi wejściami i nie są po cichu nadpisywane. R1/R2 i inventory są deterministycznymi,
+jednoczłonowymi archiwami gzip bez nazwy pliku i z `mtime=0`; combined pozostaje zwykłym UTF-8
+JSON-em dla niezależnego replayu source-bound validatora. Nie ma lokalnej reguły `.gitattributes`,
+więc hash exact diffu nie zależy od tego, czy Git liczy go z checkoutu bazy, czy kandydata.
+Sąsiadująca, kompaktowa tekstowa review projection publikuje load-bearing bindingi, agregaty, failure'y,
+flipy, stabilność, retrieval, egress/redakcje i commitment inventory bez plaintext outputów. Oracle
+odtwarza ją dokładnie z R1/R2, combined, evidence i inventory, porównuje kanoniczne bajty oraz
+odrzuca ponownie zahashowaną zmianę semantyczną; nadal otwiera i waliduje pełną logiczną treść.
 
-Finalne runy wiążą base commit `57ced723867d2a6612d4a61b67cdad4413bafdd6`, source fingerprint
-`c8169e4ac77327ca3f7ad232e2e843f163efbc62a04afe664407f1a929dd7ec3`, manifest
+Finalne runy wiążą clean merge commit `e139cbeefed98fbb3c1da20c74da6a9d4c2dd3e6`, source fingerprint
+`e88bd005e9b45f714c10e289d8b7d977c113addb5c1038e823b0d86fd53fc538`, manifest
 `21ea3cc236b8c4058f18043b538bac87e93e933c86bd8b0c3696f5b67d45f01d`, evaluator
 `b0feaaff5cb533fa2767a60ecd70844d3af3ee2f79be2b09b401eebf7b5f9363`, fixture
 `b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2` i validator
@@ -329,11 +347,12 @@ bezpośredni A/B dla Sol, bo pierwotny run nie żądał `high`.
 
 ## Stan weryfikacji
 
-Real-model R1 zakończył test sukcesem; zewnętrzny runner zalogował `finished in 699.23s`. R2
-zapisał kompletny raport, a test zakończył się `ok` (`1 passed`, `0 failed`); runner zalogował
-`finished in 756.83s`. Dopiero potem wrapper zgłosił `survivor group 10069 still owns the lane via
-guardian 46993` i `supervisor error: [Errno 1] Operation not permitted`. Te czasy i komunikat
-guardiana są obserwacją z zewnętrznego logu runnera, nie elementem związanym przez evidence manifest.
-Python validator przyjął oba pełne artefakty i odtworzył final combined. Deterministyczny replay,
-pełne bramki projektu i dokładny werdykt Harnessu są raportowane w PR/receipt; nie należy mylić
-samego uruchomienia modeli z końcowym PASS zmiany.
+Po catch-upie do trunku zachowano dwa kompletne real-model raporty związane z dokładnym źródłem
+kandydata. Każdy zawiera wszystkie oczekiwane ramiona i przypadki, a ich kolejność jest odwrócona
+między R1 i R2. Python validator przyjął oba artefakty, odtworzył combined i zweryfikował
+runtime/source binding oraz `workingTreeDirty=false` dla obu snapshotów. Commitowany dowód celowo
+nie stawia claimu o historycznym kodzie wyjścia zewnętrznego wrappera; kompletność wynika z
+zamkniętych schematów, hashy, pełnego inventory i niezależnego replayu wyników.
+Deterministyczny replay jest częścią offline oracle'a. Pełne bramki projektu i dokładny werdykt
+Harnessu zostaną raportowane w PR/receipt dopiero po ich zakończeniu; ten raport sam ich nie
+atestuje i nie należy mylić uruchomienia modeli z końcowym PASS zmiany.

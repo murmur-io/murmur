@@ -21,7 +21,11 @@ RESULTS_PREFIX = Path("eval/results")
 FINAL_EVIDENCE = RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-evidence.json"
 FINAL_FIXTURE_SNAPSHOT = RESULTS_PREFIX / "2026-08-05-local-cloud-quality-fixture.json"
 FINAL_CONTENT_INVENTORY = (
-    RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-final-content-inventory.json"
+    RESULTS_PREFIX
+    / "2026-08-05-qwen-vs-gpt-sol-final-content-inventory-verified.json.gz"
+)
+FINAL_REVIEW_PROJECTION = (
+    RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-final-review-projection.json"
 )
 RETRIEVAL_FIXTURE_SOURCE = Path(
     "src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json"
@@ -33,10 +37,13 @@ HISTORY_CONTENT_INVENTORY = (
     RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-history-content-inventory.json"
 )
 
-FINAL_EVIDENCE_SHA256 = "b1072eea1601449812ed8c9cccd02cc3a0214e0f8b26fac2b10616af89db72de"
+FINAL_EVIDENCE_SHA256 = "ed4b4ccbce0e76d42681e33b05f431a5306409abb348b9cb19d582c9c388cd2b"
 FINAL_FIXTURE_SHA256 = "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2"
 FINAL_CONTENT_INVENTORY_SHA256 = (
-    "5ce634a6bff61e48fdbcec19b2c08bf91f3aaae29c78d8028ac79d8679afac28"
+    "69ba4e3d507ca2de74fb26afdbbfdf9c1810d738ffa18d6b2ece71a7d8c6ab0c"
+)
+FINAL_REVIEW_PROJECTION_SHA256 = (
+    "4d01dbaad9b489896742551112ed7d843987f92578fe905ceb7ceb50190a1136"
 )
 BASELINE_BUNDLE_SHA256 = "05f248da2a6e1104b9311d2fd21422c9dc2af10c1cf0492472812295509f2186"
 DECISION_BUNDLE_SHA256 = "18521020093fe4c3f1d39027e319fd4e9dea8ee9758464c48b7e0bb81349a5ed"
@@ -82,21 +89,21 @@ MAX_GZIP_ARCHIVE_BYTES = 2 * 1024 * 1024
 MAX_GZIP_LOGICAL_BYTES = 8 * 1024 * 1024
 FINAL_REPETITIONS = {
     "1": {
-        "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1.json.gz",
-        "archiveSha256": "fc7c70eb07595b8ae768a9a53d2d8e6d12544b086a5d4173540acb873618fb2f",
-        "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1.json",
-        "logicalSha256": "3308ec93608ca21a190e6bf14f0082d98f8cde545e1c9f8fe017f9c2f07bac51",
+        "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json.gz",
+        "archiveSha256": "8fa8e7c4fbc02c0f64ce3d149b8ffa2881e65d5aa8b3c307fd55df72d7955cbb",
+        "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json",
+        "logicalSha256": "5b469273bd07cdb7dbc6cba14812a2dcbc1f068aa795e29d732f9237c57cb913",
     },
     "2": {
-        "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2.json.gz",
-        "archiveSha256": "0142628e94dd3756cbad3d2d067def02b19b830e95107c7be82dbcc3344aa6cf",
-        "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2.json",
-        "logicalSha256": "393ddee23d7bdff7604a2333f0303d3fea8c398769e1732519d4bfc479973d64",
+        "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json.gz",
+        "archiveSha256": "b622d9ddbe3f7d8a4cbb191f9b3009185024768d48cecad564fb84561db5ba07",
+        "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json",
+        "logicalSha256": "b83faa807cf093421a51021769ef638cc96ea2a8323794838bdf09f6b05307e9",
     },
 }
 FINAL_COMBINED = {
-    "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined.json",
-    "sha256": "6db53789cc979743ab6deaf74a0aba093c94df2825abef32ea93cb801effd3cc",
+    "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined-verified.json",
+    "sha256": "8f9070220eef6e09ab0cb44cfb94ae4a6b077d18f1d39707c043918ff07d24f7",
 }
 FINAL_CASE_IDS = {
     "ask-vault-en-quartz-holdout",
@@ -265,17 +272,17 @@ FINAL_EVIDENCE_TOP_LEVEL_KEYS = {
 # commitment detects any substituted name, address, unsupported-language text,
 # model output, path, or other string even when it uses a benign-looking key.
 FINAL_REPORT_SCHEMA_SHA256 = {
-    "1": "873fb4d6585db2ba4e590f618c2176885e05527e7699165e22ec84422dcda7a1",
-    "2": "e7b8a009e46b9c611864163537bf82c4c1739ad559eaee76c36367534bf9a8a7",
+    "1": "263283c5f27f1edc99ed199c291fa12b93e75eccd30a7fa5f4849e0ccad56047",
+    "2": "4a38645c75a77671a7f4d1c2b4557ba8312ca529b19b548a3ab6b45ff6d808f5",
 }
 FINAL_REPORT_TEXT_SHA256 = {
-    "1": "51850a2cea70dfc85d7f11182c510c13c88db4a79fe4832632faaea3fd116d51",
-    "2": "cf58eb74f3fdbb9fe57fd23c8859b2a4e1fafa0d9ca9ee2e083dc8dbf402c4e3",
+    "1": "8853699b0092a775e265197151b0979b6175e1044105ed4e27cafc37ee9f36eb",
+    "2": "f8a3865315967526e7097500245a8501bcffbe7f2444f9b0dc39a41e1acb06fd",
 }
 FINAL_COMBINED_SCHEMA_SHA256 = "8e38f627ea5fb2a38d1accb354415c2d9d0e3f20828e66cbafb7bece5493580b"
-FINAL_COMBINED_TEXT_SHA256 = "299e507ebad955b0f699acc6ae9b73bc8dec3ba488107eac08076b71e1c8212b"
+FINAL_COMBINED_TEXT_SHA256 = "0f0ee25a63ec10fe73212a3c9007e3597873db1fe5ff7826c3c5838ac7dc4c1a"
 FINAL_EVIDENCE_SCHEMA_SHA256 = "fb27ea815d9ea4ead0b0a2fb2b8fb5f0955d4a7cd8d012fc032026fd8d8d05c4"
-FINAL_EVIDENCE_TEXT_SHA256 = "4886d55c9ce3db79f6f754f34fd97fa58b14d963c713536306846306f00cefd1"
+FINAL_EVIDENCE_TEXT_SHA256 = "a7dd46aaa977bb243f7c90d876b7f17719280a0bde2d24329993a076843faeb1"
 
 FORBIDDEN_ARTIFACT_BYTES = (
     b"/users/",
@@ -365,6 +372,18 @@ CONTENT_INVENTORY_FIELDS = (
     "error",
     "toolSteps",
 )
+REVIEW_PROJECTION_FORBIDDEN_KEYS = {
+    "criticalErrors",
+    "output",
+    "projection",
+    "provenance",
+    "rawModelOutput",
+    "rawOutput",
+    "rows",
+    "surfaceOutput",
+    "toolSteps",
+    "uniqueStrings",
+}
 PROVENANCE_ALLOWLIST = {
     "[[Ember sync]]",
     "[[Nimbus sync]]",
@@ -883,11 +902,15 @@ def content_inventory_entries(
 def validate_content_inventory(
     evidence: dict[str, Any],
     reports: dict[str, dict[str, Any]],
-) -> None:
-    inventory_bytes = read_repository_file(FINAL_CONTENT_INVENTORY)
+) -> dict[str, Any]:
+    inventory_archive = read_repository_file(FINAL_CONTENT_INVENTORY)
     require(
-        sha256(inventory_bytes) == FINAL_CONTENT_INVENTORY_SHA256,
+        sha256(inventory_archive) == FINAL_CONTENT_INVENTORY_SHA256,
         "content inventory: SHA-256 differs",
+    )
+    inventory_bytes = decode_deterministic_gzip(
+        inventory_archive,
+        "content inventory",
     )
     inventory = load_object(inventory_bytes, "content inventory")
     string_values: list[str] = []
@@ -916,6 +939,852 @@ def validate_content_inventory(
         "content inventory: decoded archive content binding differs",
     )
     scan_privacy(inventory_bytes, "content inventory")
+    return inventory
+
+
+def review_projection_bytes(value: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def review_quality_summary(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label}: aggregate must be an object")
+    result: dict[str, Any] = {}
+    for key in (
+        "observations",
+        "cases",
+        "callSuccessRate",
+        "casePassRate",
+        "surfaceMacroPassRate",
+        "criticalFailureObservations",
+        "criticalFailureCases",
+        "diagnosticScoreMean",
+    ):
+        if key in value:
+            result[key] = value[key]
+    require(
+        "callSuccessRate" in result and "casePassRate" in result,
+        f"{label}: aggregate summary fields missing",
+    )
+    return result
+
+
+def review_arm_summary(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label}: arm must be an object")
+    cohorts = value.get("cohorts")
+    languages = value.get("languages")
+    require(
+        isinstance(cohorts, dict) and set(cohorts) == {"all", "calibration", "holdout"},
+        f"{label}: cohort inventory differs",
+    )
+    require(
+        isinstance(languages, dict) and set(languages) == {"en", "pl"},
+        f"{label}: language inventory differs",
+    )
+    overall = cohorts["all"]
+    require(isinstance(overall, dict), f"{label}: overall aggregate missing")
+    surface_rates = overall.get("surfacePassRates", {})
+    dimensions = overall.get("dimensions", {})
+    require(isinstance(surface_rates, dict), f"{label}: surface rates differ")
+    require(isinstance(dimensions, dict), f"{label}: dimensions differ")
+    result: dict[str, Any] = {}
+    for key in ("armId", "modelRequested"):
+        if key in value:
+            result[key] = value[key]
+    result.update(
+        {
+            "overall": review_quality_summary(overall, f"{label} overall"),
+            "cohorts": {
+                cohort: review_quality_summary(cohorts[cohort], f"{label} {cohort}")
+                for cohort in ("calibration", "holdout")
+            },
+            "languages": {
+                language: review_quality_summary(languages[language], f"{label} {language}")
+                for language in ("en", "pl")
+            },
+            "surfacePassRates": copy.deepcopy(surface_rates),
+            "dimensionCoverageAndPass": copy.deepcopy(dimensions),
+        }
+    )
+    return result
+
+
+def review_paired_scope(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label}: paired scope must be an object")
+    local = value.get("local")
+    reference = value.get("reference")
+    require(isinstance(local, dict), f"{label}: local aggregate missing")
+    require(isinstance(reference, dict), f"{label}: reference aggregate missing")
+    return {
+        "matchedObservations": value.get("matchedObservations"),
+        "local": review_quality_summary(local, f"{label} local"),
+        "reference": review_quality_summary(reference, f"{label} reference"),
+        "referenceMinusLocalDiagnosticMean": value.get(
+            "referenceMinusLocalDiagnosticMean"
+        ),
+    }
+
+
+def review_product_pair(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label}: pair must be an object")
+    cohorts = value.get("cohorts")
+    languages = value.get("languages")
+    route_pairs = value.get("routeProfilePairs")
+    require(
+        isinstance(cohorts, dict) and set(cohorts) == {"all", "calibration", "holdout"},
+        f"{label}: pair cohorts differ",
+    )
+    require(
+        isinstance(languages, dict) and set(languages) == {"en", "pl"},
+        f"{label}: pair languages differ",
+    )
+    require(isinstance(route_pairs, list), f"{label}: route profiles missing")
+    profile_fields = (
+        "comparisonKind",
+        "localGenerationProfile",
+        "referenceGenerationProfile",
+        "localProductRoute",
+        "referenceProductRoute",
+    )
+    distinct_profiles = sorted(
+        {
+            tuple(route.get(field) for field in profile_fields)
+            for route in route_pairs
+            if isinstance(route, dict)
+        }
+    )
+    require(
+        len(distinct_profiles) > 0
+        and all(all(isinstance(item, str) for item in profile) for profile in distinct_profiles),
+        f"{label}: route profile fields differ",
+    )
+    identical_route_inputs = sum(
+        route.get("localRouteInputSha256") == route.get("referenceRouteInputSha256")
+        for route in route_pairs
+        if isinstance(route, dict)
+    )
+    return {
+        "localArm": value.get("localArm"),
+        "referenceArm": value.get("referenceArm"),
+        "comparisonType": value.get("comparisonType"),
+        "cohorts": {
+            cohort: review_paired_scope(cohorts[cohort], f"{label} {cohort}")
+            for cohort in ("all", "calibration", "holdout")
+        },
+        "languages": {
+            language: review_paired_scope(languages[language], f"{label} {language}")
+            for language in ("en", "pl")
+        },
+        "routeComparison": {
+            "observations": len(route_pairs),
+            "identicalRouteInputObservations": identical_route_inputs,
+            "differentRouteInputObservations": len(route_pairs) - identical_route_inputs,
+            "routeProfilePairsCommitmentSha256": canonical_sha256(route_pairs),
+            "distinctProfiles": [
+                dict(zip(profile_fields, profile))
+                for profile in distinct_profiles
+            ],
+        },
+    }
+
+
+def review_lane_cases(
+    report: dict[str, Any],
+    lane: str,
+    label: str,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    if lane == "productRoute":
+        arms = report.get("arms")
+        arm_id_field = "metadata"
+    else:
+        stack = report.get("sameCallerEnvelopeModelStack")
+        require(isinstance(stack, dict), f"{label}: same-caller stack missing")
+        arms = stack.get("arms")
+        arm_id_field = "armId"
+    require(isinstance(arms, list), f"{label}: arm list missing")
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for arm in arms:
+        require(isinstance(arm, dict), f"{label}: arm record differs")
+        if arm_id_field == "metadata":
+            metadata = arm.get("metadata")
+            require(isinstance(metadata, dict), f"{label}: arm metadata missing")
+            arm_id = metadata.get("armId")
+        else:
+            arm_id = arm.get("armId")
+        cases = arm.get("cases")
+        require(isinstance(arm_id, str), f"{label}: arm ID missing")
+        require(isinstance(cases, list), f"{label}: cases missing")
+        for case in cases:
+            require(isinstance(case, dict), f"{label}: case record differs")
+            case_id = case.get("caseId")
+            require(isinstance(case_id, str), f"{label}: case ID missing")
+            key = (arm_id, case_id)
+            require(key not in result, f"{label}: duplicate arm/case observation")
+            result[key] = case
+    return result
+
+
+def review_failed_checks(score: Any, label: str) -> list[str]:
+    require(isinstance(score, dict), f"{label}: score missing")
+    return sorted(
+        key
+        for key, value in score.items()
+        if key != "casePass" and key.endswith("Pass") and value is False
+    )
+
+
+def review_failures(
+    reports: dict[str, dict[str, Any]],
+    lane: str,
+) -> list[dict[str, Any]]:
+    failures: dict[tuple[str, str], dict[str, Any]] = {}
+    for repetition in ("1", "2"):
+        cases = review_lane_cases(reports[repetition], lane, f"{lane} R{repetition}")
+        for (arm_id, case_id), case in cases.items():
+            score = case.get("score")
+            require(isinstance(score, dict), f"{lane}: score missing")
+            if score.get("casePass") is not False:
+                continue
+            record = failures.setdefault(
+                (arm_id, case_id),
+                {
+                    "armId": arm_id,
+                    "caseId": case_id,
+                    "surface": case.get("surface"),
+                    "language": case.get("language"),
+                    "casePayloadSha256": case.get("casePayloadSha256"),
+                    "failingRepetitions": [],
+                    "criticalFailureRepetitions": [],
+                    "diagnosticScoreByRepetition": {},
+                    "failedChecksByRepetition": {},
+                    "errorPresentByRepetition": {},
+                },
+            )
+            record["failingRepetitions"].append(repetition)
+            if score.get("criticalFailure") is True:
+                record["criticalFailureRepetitions"].append(repetition)
+            record["diagnosticScoreByRepetition"][repetition] = score.get(
+                "diagnosticScore"
+            )
+            record["failedChecksByRepetition"][repetition] = review_failed_checks(
+                score, f"{lane} {arm_id}/{case_id} R{repetition}"
+            )
+            record["errorPresentByRepetition"][repetition] = case.get("error") is not None
+    return [failures[key] for key in sorted(failures)]
+
+
+def new_stability_bucket(
+    include_surface_output: bool,
+    include_envelope: bool,
+) -> dict[str, Any]:
+    bucket: dict[str, Any] = {
+        "comparableObservations": 0,
+        "identicalFinalOutputHashes": 0,
+        "changedFinalOutputHashes": 0,
+        "identicalRawOutputHashes": 0,
+        "changedRawOutputHashes": 0,
+        "stablePassOutcomes": 0,
+        "passFlips": 0,
+        "stableCriticalFailureOutcomes": 0,
+        "criticalFailureFlips": 0,
+        "changedFinalOutputCaseIds": [],
+        "changedRawOutputCaseIds": [],
+        "passFlipCaseIds": [],
+        "criticalFailureFlipCaseIds": [],
+    }
+    if include_surface_output:
+        bucket.update(
+            {
+                "comparableSurfaceOutputHashes": 0,
+                "identicalSurfaceOutputHashes": 0,
+                "changedSurfaceOutputHashes": 0,
+                "changedSurfaceOutputCaseIds": [],
+            }
+        )
+    if include_envelope:
+        bucket.update(
+            {
+                "identicalEnvelopeHashes": 0,
+                "changedEnvelopeHashes": 0,
+                "changedEnvelopeCaseIds": [],
+            }
+        )
+    return bucket
+
+
+def update_stability_bucket(
+    bucket: dict[str, Any],
+    case_id: str,
+    first: dict[str, Any],
+    second: dict[str, Any],
+    raw_hash_field: str,
+    surface_hash_field: str | None,
+    envelope_hash_field: str | None,
+) -> None:
+    bucket["comparableObservations"] += 1
+    for source_field, identical_key, changed_key, changed_ids_key in (
+        (
+            "outputSha256",
+            "identicalFinalOutputHashes",
+            "changedFinalOutputHashes",
+            "changedFinalOutputCaseIds",
+        ),
+        (
+            raw_hash_field,
+            "identicalRawOutputHashes",
+            "changedRawOutputHashes",
+            "changedRawOutputCaseIds",
+        ),
+    ):
+        if first.get(source_field) == second.get(source_field):
+            bucket[identical_key] += 1
+        else:
+            bucket[changed_key] += 1
+            bucket[changed_ids_key].append(case_id)
+    if surface_hash_field is not None and not (
+        first.get(surface_hash_field) is None and second.get(surface_hash_field) is None
+    ):
+        bucket["comparableSurfaceOutputHashes"] += 1
+        if first.get(surface_hash_field) == second.get(surface_hash_field):
+            bucket["identicalSurfaceOutputHashes"] += 1
+        else:
+            bucket["changedSurfaceOutputHashes"] += 1
+            bucket["changedSurfaceOutputCaseIds"].append(case_id)
+    if envelope_hash_field is not None:
+        if first.get(envelope_hash_field) == second.get(envelope_hash_field):
+            bucket["identicalEnvelopeHashes"] += 1
+        else:
+            bucket["changedEnvelopeHashes"] += 1
+            bucket["changedEnvelopeCaseIds"].append(case_id)
+
+    first_score = first.get("score")
+    second_score = second.get("score")
+    require(isinstance(first_score, dict), "output stability: R1 score missing")
+    require(isinstance(second_score, dict), "output stability: R2 score missing")
+    if first_score.get("casePass") == second_score.get("casePass"):
+        bucket["stablePassOutcomes"] += 1
+    else:
+        bucket["passFlips"] += 1
+        bucket["passFlipCaseIds"].append(case_id)
+    if first_score.get("criticalFailure") == second_score.get("criticalFailure"):
+        bucket["stableCriticalFailureOutcomes"] += 1
+    else:
+        bucket["criticalFailureFlips"] += 1
+        bucket["criticalFailureFlipCaseIds"].append(case_id)
+
+
+def review_output_stability(
+    reports: dict[str, dict[str, Any]],
+    lane: str,
+) -> dict[str, Any]:
+    first = review_lane_cases(reports["1"], lane, f"{lane} R1 stability")
+    second = review_lane_cases(reports["2"], lane, f"{lane} R2 stability")
+    require(set(first) == set(second), f"{lane}: repetition case inventory differs")
+    raw_hash_field = "rawModelOutputSha256" if lane == "productRoute" else "rawOutputSha256"
+    surface_hash_field = "surfaceOutputSha256" if lane == "productRoute" else None
+    envelope_hash_field = "envelopeSha256" if lane == "sameCaller" else None
+    overall = new_stability_bucket(surface_hash_field is not None, envelope_hash_field is not None)
+    by_arm: dict[str, dict[str, Any]] = {}
+    pass_flips: list[dict[str, Any]] = []
+    critical_flips: list[dict[str, Any]] = []
+    for arm_id, case_id in sorted(first):
+        first_case = first[(arm_id, case_id)]
+        second_case = second[(arm_id, case_id)]
+        arm_bucket = by_arm.setdefault(
+            arm_id,
+            new_stability_bucket(
+                surface_hash_field is not None,
+                envelope_hash_field is not None,
+            ),
+        )
+        update_stability_bucket(
+            overall,
+            f"{arm_id}:{case_id}",
+            first_case,
+            second_case,
+            raw_hash_field,
+            surface_hash_field,
+            envelope_hash_field,
+        )
+        update_stability_bucket(
+            arm_bucket,
+            case_id,
+            first_case,
+            second_case,
+            raw_hash_field,
+            surface_hash_field,
+            envelope_hash_field,
+        )
+        first_score = first_case["score"]
+        second_score = second_case["score"]
+        base_flip = {
+            "armId": arm_id,
+            "caseId": case_id,
+            "surface": first_case.get("surface"),
+            "language": first_case.get("language"),
+        }
+        if first_score.get("casePass") != second_score.get("casePass"):
+            pass_flips.append(
+                {
+                    **base_flip,
+                    "r1CasePass": first_score.get("casePass"),
+                    "r2CasePass": second_score.get("casePass"),
+                }
+            )
+        if first_score.get("criticalFailure") != second_score.get("criticalFailure"):
+            critical_flips.append(
+                {
+                    **base_flip,
+                    "r1CriticalFailure": first_score.get("criticalFailure"),
+                    "r2CriticalFailure": second_score.get("criticalFailure"),
+                }
+            )
+    return {
+        "overall": overall,
+        "byArm": [
+            {"armId": arm_id, **by_arm[arm_id]}
+            for arm_id in sorted(by_arm)
+        ],
+        "passFlips": pass_flips,
+        "criticalFailureFlips": critical_flips,
+    }
+
+
+def percentage(numerator: int, denominator: int) -> float | None:
+    if denominator == 0:
+        return None
+    return round(100.0 * numerator / denominator, 1)
+
+
+def review_surface_summaries(
+    reports: dict[str, dict[str, Any]],
+    lane: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for repetition in ("1", "2"):
+        for (arm_id, _), case in review_lane_cases(
+            reports[repetition], lane, f"{lane} R{repetition} surfaces"
+        ).items():
+            surface = case.get("surface")
+            require(isinstance(surface, str), f"{lane}: surface missing")
+            grouped.setdefault((arm_id, surface), []).append(case)
+    result: dict[str, dict[str, Any]] = {}
+    for (arm_id, surface), cases in sorted(grouped.items()):
+        scores = [case.get("score") for case in cases]
+        require(
+            all(isinstance(score, dict) for score in scores),
+            f"{lane}: surface score missing",
+        )
+        diagnostic_scores = [score.get("diagnosticScore") for score in scores]
+        require(
+            all(isinstance(score, (int, float)) for score in diagnostic_scores),
+            f"{lane}: diagnostic score differs",
+        )
+        result.setdefault(arm_id, {})[surface] = {
+            "observations": len(cases),
+            "callSuccessRate": percentage(
+                sum(case.get("error") is None for case in cases), len(cases)
+            ),
+            "casePassRate": percentage(
+                sum(score.get("casePass") is True for score in scores), len(cases)
+            ),
+            "criticalFailureObservations": sum(
+                score.get("criticalFailure") is True for score in scores
+            ),
+            "diagnosticScoreMean": round(sum(diagnostic_scores) / len(cases), 1),
+        }
+    return [
+        {"armId": arm_id, "surfaces": result[arm_id]}
+        for arm_id in sorted(result)
+    ]
+
+
+def count_string_field(rows: list[Any], field: str, label: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        require(isinstance(row, dict), f"{label}: ledger row differs")
+        value = row.get(field)
+        require(isinstance(value, str), f"{label}: {field} missing")
+        counts[value] = counts.get(value, 0) + 1
+    return {key: counts[key] for key in sorted(counts)}
+
+
+def review_egress(ledger: Any, label: str) -> dict[str, Any]:
+    require(isinstance(ledger, dict), f"{label}: egress ledger missing")
+    rows = ledger.get("rows")
+    require(isinstance(rows, list), f"{label}: egress rows missing")
+    redaction_fields = {
+        "email": "redactionsEmail",
+        "card": "redactionsCard",
+        "phone": "redactionsPhone",
+        "name": "redactionsName",
+    }
+    redactions: dict[str, int] = {}
+    for output_name, source_name in redaction_fields.items():
+        values = [row.get(source_name) for row in rows if isinstance(row, dict)]
+        require(
+            len(values) == len(rows)
+            and all(isinstance(value, int) and value >= 0 for value in values),
+            f"{label}: redaction count differs",
+        )
+        redactions[output_name] = sum(values)
+    redactions["total"] = sum(redactions.values())
+    redactions["rowsWithAnyRedaction"] = sum(
+        any(row.get(field, 0) > 0 for field in redaction_fields.values())
+        for row in rows
+        if isinstance(row, dict)
+    )
+    system_bytes = [row.get("systemBytes") for row in rows if isinstance(row, dict)]
+    user_bytes = [row.get("userBytes") for row in rows if isinstance(row, dict)]
+    require(
+        len(system_bytes) == len(rows)
+        and all(isinstance(value, int) and value >= 0 for value in system_bytes),
+        f"{label}: system byte count differs",
+    )
+    require(
+        len(user_bytes) == len(rows)
+        and all(isinstance(value, int) and value >= 0 for value in user_bytes),
+        f"{label}: user byte count differs",
+    )
+    served_models = sorted(
+        {
+            row.get("modelServed")
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("modelServed"), str)
+        }
+    )
+    return {
+        "required": ledger.get("required"),
+        "sqlitePersistenceVerified": ledger.get("sqlitePersistenceVerified"),
+        "temporaryDatabaseCleaned": ledger.get("temporaryDatabaseCleaned"),
+        "attemptedRows": ledger.get("attemptedRows"),
+        "persistedRows": ledger.get("persistedRows"),
+        "persistenceFailures": ledger.get("persistenceFailures"),
+        "projectedRowCount": len(rows),
+        "contentFreeRowsSha256": ledger.get("contentFreeRowsSha256"),
+        "providerIds": copy.deepcopy(ledger.get("providerIds")),
+        "callKinds": copy.deepcopy(ledger.get("callKinds")),
+        "providerRowCounts": count_string_field(rows, "providerId", label),
+        "destinationRowCounts": count_string_field(rows, "destination", label),
+        "callKindRowCounts": count_string_field(rows, "callKind", label),
+        "requestedModelRowCounts": count_string_field(rows, "modelRequested", label),
+        "servedModelsObserved": served_models,
+        "rowsWithoutServedModelAttestation": sum(
+            row.get("modelServed") is None for row in rows if isinstance(row, dict)
+        ),
+        "systemBytes": sum(system_bytes),
+        "userBytes": sum(user_bytes),
+        "redactions": redactions,
+    }
+
+
+def review_repetition(
+    repetition: str,
+    report: dict[str, Any],
+    producer: dict[str, Any],
+) -> dict[str, Any]:
+    environment = report.get("environment")
+    start = report.get("snapshotStart")
+    end = report.get("snapshotEnd")
+    arms = report.get("arms")
+    require(isinstance(environment, dict), f"R{repetition}: environment missing")
+    require(isinstance(start, dict), f"R{repetition}: start snapshot missing")
+    require(isinstance(end, dict), f"R{repetition}: end snapshot missing")
+    require(isinstance(arms, list), f"R{repetition}: arms missing")
+    clean_and_unchanged = (
+        start == end
+        and start.get("workingTreeDirty") is False
+        and start.get("trackedDiffSha256") == sha256(b"")
+        and environment.get("workingTreeDirty") is False
+        and environment.get("trackedDiffSha256") == sha256(b"")
+    )
+    producer_fields = (
+        "repositoryCommit",
+        "sourceFingerprintSha256",
+        "manifestSha256",
+        "evaluatorFileSha256",
+        "fixtureFileSha256",
+        "repeatValidatorFileSha256",
+        "trackedDiffSha256",
+        "workingTreeDirty",
+    )
+    source_matches_producer = all(
+        start.get(field) == producer.get(field) and end.get(field) == producer.get(field)
+        for field in producer_fields
+    )
+    environment_projection = {
+        key: copy.deepcopy(value)
+        for key, value in environment.items()
+        if key
+        not in {
+            "armOrder",
+            "repetition",
+            "trackedDiffSha256",
+            "workingTreeDirty",
+        }
+    }
+    return {
+        "repetition": repetition,
+        "runLabel": report.get("runLabel"),
+        "generatedAt": report.get("generatedAt"),
+        "armOrder": copy.deepcopy(environment.get("armOrder")),
+        "environment": environment_projection,
+        "snapshotStart": copy.deepcopy(start),
+        "snapshotEnd": copy.deepcopy(end),
+        "cleanAndUnchanged": clean_and_unchanged,
+        "sourceBindingsMatchProducer": source_matches_producer,
+        "arms": [copy.deepcopy(arm.get("metadata")) for arm in arms],
+        "egress": review_egress(report.get("egressLedger"), f"R{repetition}"),
+    }
+
+
+def review_retrieval(
+    reports: dict[str, dict[str, Any]],
+    combined: dict[str, Any],
+) -> dict[str, Any]:
+    retrieval = combined.get("retrievalQuality")
+    require(isinstance(retrieval, dict), "review projection: retrieval missing")
+    repeated = {
+        repetition: reports[repetition].get("retrievalQuality")
+        for repetition in ("1", "2")
+    }
+    require(
+        all(isinstance(value, dict) for value in repeated.values()),
+        "review projection: repeated retrieval missing",
+    )
+    case_metrics = retrieval.get("cases")
+    require(isinstance(case_metrics, list), "review projection: retrieval cases missing")
+    projected_cases: list[dict[str, Any]] = []
+    for case in case_metrics:
+        require(isinstance(case, dict), "review projection: retrieval case differs")
+        projected_cases.append(
+            {
+                "caseId": case.get("caseId"),
+                "language": case.get("language"),
+                "queryPayloadSha256": case.get("queryPayloadSha256"),
+                "expectedMeetings": case.get("expectedMeetings"),
+                "metrics": copy.deepcopy(case.get("metrics")),
+            }
+        )
+    excluded = {"aggregates", "cases"}
+    metadata = {
+        key: copy.deepcopy(value)
+        for key, value in retrieval.items()
+        if key not in excluded
+    }
+    return {
+        "metadata": metadata,
+        "aggregates": copy.deepcopy(retrieval.get("aggregates")),
+        "caseMetrics": projected_cases,
+        "repetitionBindings": {
+            "canonicalSha256ByRepetition": {
+                repetition: canonical_sha256(repeated[repetition])
+                for repetition in ("1", "2")
+            },
+            "combinedCanonicalSha256": canonical_sha256(retrieval),
+            "allRepetitionsEqualCombined": (
+                repeated["1"] == repeated["2"] == retrieval
+            ),
+        },
+    }
+
+
+def build_final_review_projection(
+    evidence: dict[str, Any],
+    reports: dict[str, dict[str, Any]],
+    combined: dict[str, Any],
+    inventory: dict[str, Any],
+) -> dict[str, Any]:
+    producer = evidence.get("producerSnapshot")
+    runtime_identities = evidence.get("runtimeIdentities")
+    require(isinstance(producer, dict), "review projection: producer missing")
+    require(isinstance(runtime_identities, dict), "review projection: runtimes missing")
+    for field in (
+        "benchmarkDesign",
+        "evidenceScope",
+        "evidenceLimits",
+        "holdoutInterpretation",
+        "promptVersion",
+    ):
+        require(
+            reports["1"].get(field) == reports["2"].get(field),
+            f"review projection: repetition {field} differs",
+        )
+
+    artifact_bindings = {
+        "evidence": {
+            "path": FINAL_EVIDENCE.as_posix(),
+            "sha256": FINAL_EVIDENCE_SHA256,
+        },
+        "fixtureSnapshot": {
+            "path": FINAL_FIXTURE_SNAPSHOT.as_posix(),
+            "sha256": FINAL_FIXTURE_SHA256,
+        },
+        "repetitions": copy.deepcopy(evidence.get("repetitions")),
+        "combined": copy.deepcopy(evidence.get("combined")),
+        "contentInventory": {
+            "path": FINAL_CONTENT_INVENTORY.as_posix(),
+            "sha256": FINAL_CONTENT_INVENTORY_SHA256,
+        },
+    }
+    repetition_projection = [
+        review_repetition(repetition, reports[repetition], producer)
+        for repetition in ("1", "2")
+    ]
+    product_arms = combined.get("arms")
+    product_pairs = combined.get("paired")
+    same_caller = combined.get("sameCallerEnvelopeModelStack")
+    local_composite = combined.get("localComposite")
+    require(isinstance(product_arms, list), "review projection: product arms missing")
+    require(isinstance(product_pairs, list), "review projection: product pairs missing")
+    require(isinstance(same_caller, dict), "review projection: same-caller missing")
+    require(isinstance(local_composite, dict), "review projection: local composite missing")
+    same_caller_arms = same_caller.get("arms")
+    require(isinstance(same_caller_arms, list), "review projection: same-caller arms missing")
+
+    scope = {
+        "benchmarkDesign": reports["1"].get("benchmarkDesign"),
+        "evidenceScope": reports["1"].get("evidenceScope"),
+        "evidenceLimits": copy.deepcopy(reports["1"].get("evidenceLimits")),
+        "combinedDesign": combined.get("design"),
+        "holdoutInterpretation": combined.get("holdoutInterpretation"),
+        "dimensionAttribution": copy.deepcopy(combined.get("dimensionAttribution")),
+    }
+    measurement_integrity = {
+        "pairwiseReversedArmOrder": (
+            repetition_projection[1]["armOrder"]
+            == list(reversed(repetition_projection[0]["armOrder"]))
+        ),
+        "allSnapshotsCleanAndUnchanged": all(
+            repetition["cleanAndUnchanged"] for repetition in repetition_projection
+        ),
+        "allSourceBindingsMatchProducer": all(
+            repetition["sourceBindingsMatchProducer"]
+            for repetition in repetition_projection
+        ),
+    }
+    require(
+        all(measurement_integrity.values()),
+        "review projection: arm order or clean source binding differs",
+    )
+    projection = {
+        "schemaVersion": 1,
+        "kind": "murmur_local_cloud_quality_final_review_projection",
+        "syntheticOnly": True,
+        "contentPolicy": {
+            "containsRawOutputs": False,
+            "omittedSourceFields": sorted(REVIEW_PROJECTION_FORBIDDEN_KEYS),
+        },
+        "evidenceMethod": evidence.get("evidenceMethod"),
+        "scope": scope,
+        "artifactBindings": artifact_bindings,
+        "artifactBindingsCanonicalSha256": canonical_sha256(artifact_bindings),
+        "producerSnapshot": copy.deepcopy(producer),
+        "runtimeIdentities": copy.deepcopy(runtime_identities),
+        "measurementIntegrity": measurement_integrity,
+        "repetitions": repetition_projection,
+        "productRoute": {
+            "comparisonType": combined.get("comparisonType"),
+            "rawAggregatePolicy": combined.get("rawAggregatePolicy"),
+            "arms": [
+                review_arm_summary(arm, f"product arm {index}")
+                for index, arm in enumerate(product_arms)
+            ],
+            "localComposite": review_arm_summary(
+                local_composite, "product local composite"
+            ),
+            "paired": [
+                review_product_pair(pair, f"product pair {index}")
+                for index, pair in enumerate(product_pairs)
+            ],
+            "failures": review_failures(reports, "productRoute"),
+            "outputStability": review_output_stability(reports, "productRoute"),
+        },
+        "sameCallerEnvelopeModelStack": {
+            "laneId": same_caller.get("laneId"),
+            "entrypoint": same_caller.get("entrypoint"),
+            "equalityBoundary": same_caller.get("equalityBoundary"),
+            "providerRenderedPromptsByteIdentical": same_caller.get(
+                "providerRenderedPromptsByteIdentical"
+            ),
+            "effectiveModelInputsAttestedIdentical": same_caller.get(
+                "effectiveModelInputsAttestedIdentical"
+            ),
+            "interpretation": same_caller.get("interpretation"),
+            "arms": [
+                review_arm_summary(arm, f"same-caller arm {index}")
+                for index, arm in enumerate(same_caller_arms)
+            ],
+            "paired": copy.deepcopy(same_caller.get("paired")),
+            "surfaceAggregates": review_surface_summaries(reports, "sameCaller"),
+            "failures": review_failures(reports, "sameCaller"),
+            "outputStability": review_output_stability(reports, "sameCaller"),
+        },
+        "retrievalQuality": review_retrieval(reports, combined),
+        "contentInventory": {
+            "schemaVersion": inventory.get("schemaVersion"),
+            "kind": inventory.get("kind"),
+            "syntheticOnly": inventory.get("syntheticOnly"),
+            "logicalSha256ByRepetition": copy.deepcopy(
+                inventory.get("logicalSha256ByRepetition")
+            ),
+            "pathAndOccurrenceCommitmentSha256ByRepetition": copy.deepcopy(
+                inventory.get("pathAndOccurrenceCommitmentSha256ByRepetition")
+            ),
+            "stringLeafCountByRepetition": copy.deepcopy(
+                inventory.get("stringLeafCountByRepetition")
+            ),
+            "uniqueStringCount": inventory.get("uniqueStringCount"),
+            "uniqueStringsCommitmentSha256": canonical_sha256(
+                inventory.get("uniqueStrings")
+            ),
+        },
+    }
+    for key, _ in walk_json(projection):
+        require(
+            key not in REVIEW_PROJECTION_FORBIDDEN_KEYS,
+            "review projection: raw/content-bearing field retained",
+        )
+    return projection
+
+
+def validate_review_projection_bytes(
+    data: bytes,
+    expected: dict[str, Any],
+    pinned_sha256: str,
+    label: str,
+) -> None:
+    require(is_sha256(pinned_sha256), f"{label}: invalid pinned SHA-256")
+    require(sha256(data) == pinned_sha256, f"{label}: SHA-256 differs")
+    actual = load_object(data, label)
+    require(actual == expected, f"{label}: derived content differs")
+    require(
+        data == review_projection_bytes(expected),
+        f"{label}: encoding is not canonical pretty JSON",
+    )
+    for key, _ in walk_json(actual):
+        require(
+            key not in REVIEW_PROJECTION_FORBIDDEN_KEYS,
+            f"{label}: raw/content-bearing field retained",
+        )
+    scan_privacy(data, label)
+
+
+def validate_review_projection(expected: dict[str, Any]) -> None:
+    data = read_repository_file(FINAL_REVIEW_PROJECTION)
+    validate_review_projection_bytes(
+        data,
+        expected,
+        FINAL_REVIEW_PROJECTION_SHA256,
+        "final review projection",
+    )
 
 
 def validate_manifest_paths(evidence: dict[str, Any]) -> None:
@@ -929,15 +1798,7 @@ def validate_manifest_paths(evidence: dict[str, Any]) -> None:
     )
 
 
-def validate_gzip(
-    archive: bytes,
-    archive_sha256: Any,
-    logical_sha256: Any,
-    label: str,
-) -> tuple[bytes, dict[str, Any]]:
-    require(is_sha256(archive_sha256), f"{label}: invalid archive SHA-256")
-    require(is_sha256(logical_sha256), f"{label}: invalid logical SHA-256")
-    require(sha256(archive) == archive_sha256, f"{label}: archive SHA-256 differs")
+def decode_deterministic_gzip(archive: bytes, label: str) -> bytes:
     require(len(archive) <= MAX_GZIP_ARCHIVE_BYTES, f"{label}: gzip archive exceeds size limit")
     require(len(archive) >= 10, f"{label}: truncated gzip header")
     require(
@@ -958,6 +1819,19 @@ def validate_gzip(
     require(decompressor.eof, f"{label}: incomplete gzip stream")
     require(not decompressor.unused_data, f"{label}: concatenated/trailing gzip data forbidden")
     require(not decompressor.unconsumed_tail, f"{label}: unconsumed gzip data forbidden")
+    return logical
+
+
+def validate_gzip(
+    archive: bytes,
+    archive_sha256: Any,
+    logical_sha256: Any,
+    label: str,
+) -> tuple[bytes, dict[str, Any]]:
+    require(is_sha256(archive_sha256), f"{label}: invalid archive SHA-256")
+    require(is_sha256(logical_sha256), f"{label}: invalid logical SHA-256")
+    require(sha256(archive) == archive_sha256, f"{label}: archive SHA-256 differs")
+    logical = decode_deterministic_gzip(archive, label)
     require(sha256(logical) == logical_sha256, f"{label}: logical SHA-256 differs")
     report = load_object(logical, f"{label} logical JSON")
     require(report.get("syntheticOnly") is True, f"{label}: syntheticOnly must be true")
@@ -1068,7 +1942,7 @@ def validate_final() -> None:
         set(RETRIEVAL_FIXTURE_ORACLE),
     )
     validate_retrieval_source_bindings([*reports.values(), combined])
-    validate_content_inventory(evidence, reports)
+    inventory = validate_content_inventory(evidence, reports)
     require(
         combined.get("inputResultSha256ByRepetition") == logical_hashes,
         "final combined: repetition logical hashes differ",
@@ -1121,6 +1995,10 @@ def validate_final() -> None:
         require(isinstance(identity, dict), "final evidence: runtime identity invalid")
         require(is_sha256(identity.get("sha256")), "final evidence: runtime SHA-256 invalid")
         require(isinstance(identity.get("version"), str), "final evidence: runtime version invalid")
+
+    validate_review_projection(
+        build_final_review_projection(evidence, reports, combined, inventory)
+    )
 
     scan_privacy(evidence_bytes, "final evidence")
     scan_privacy(combined_bytes, "final combined")
@@ -1437,14 +2315,14 @@ def run_selftests() -> None:
             changed_output = True
             break
     require(changed_output, "selftest fixture has no output field")
+    inventory_archive = read_repository_file(FINAL_CONTENT_INVENTORY)
     committed_inventory = load_object(
-        read_repository_file(FINAL_CONTENT_INVENTORY),
+        decode_deterministic_gzip(inventory_archive, "selftest content inventory"),
         "selftest content inventory",
     )
-    inventory_bytes = read_repository_file(FINAL_CONTENT_INVENTORY)
     expect_failure(
         lambda: require(
-            sha256(inventory_bytes + b" ") == FINAL_CONTENT_INVENTORY_SHA256,
+            sha256(inventory_archive + b" ") == FINAL_CONTENT_INVENTORY_SHA256,
             "selftest content inventory source hash differs",
         ),
         "a mutated content inventory artifact",
@@ -1477,6 +2355,44 @@ def run_selftests() -> None:
             "selftest combined hash differs",
         ),
         "a forged combined hash",
+    )
+    second = evidence["repetitions"]["2"]
+    second_report = load_object(
+        gzip.decompress(repository_path(second["archivePath"], "selftest R2").read_bytes()),
+        "selftest final R2",
+    )
+    combined_entry = evidence["combined"]
+    combined = load_object(
+        repository_path(combined_entry["path"], "selftest combined").read_bytes(),
+        "selftest combined",
+    )
+    expected_projection = build_final_review_projection(
+        evidence,
+        {"1": report, "2": second_report},
+        combined,
+        committed_inventory,
+    )
+    projection_bytes = read_repository_file(FINAL_REVIEW_PROJECTION)
+    expect_failure(
+        lambda: validate_review_projection_bytes(
+            projection_bytes + b" ",
+            expected_projection,
+            FINAL_REVIEW_PROJECTION_SHA256,
+            "selftest mutated review projection bytes",
+        ),
+        "a byte-mutated review projection",
+    )
+    mutated_projection = copy.deepcopy(expected_projection)
+    mutated_projection["productRoute"]["arms"][0]["overall"]["casePassRate"] += 0.1
+    mutated_projection_bytes = review_projection_bytes(mutated_projection)
+    expect_failure(
+        lambda: validate_review_projection_bytes(
+            mutated_projection_bytes,
+            expected_projection,
+            sha256(mutated_projection_bytes),
+            "selftest rehashed review projection",
+        ),
+        "a rehashed semantic review-projection mutation",
     )
 
 
@@ -1556,8 +2472,9 @@ def main() -> int:
             validate_final()
             print(
                 "final quality artifacts verified: deterministic gzip, archive/logical/combined "
-                "hashes, closed PL/EN source/fixture/text/schema commitments, human-readable "
-                "content inventory, repetition bindings, producer commitments, and privacy scan"
+                "hashes, closed PL/EN source/fixture/text/schema commitments, decoded all-string "
+                "content inventory, hash-bound review projection, repetition bindings, producer "
+                "commitments, and privacy scan"
             )
         else:
             validate_history()
