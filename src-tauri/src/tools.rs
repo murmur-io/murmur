@@ -101,7 +101,7 @@ impl AssistantScope {
     /// (`has_app`/`note_drafts`/`allow_writes`) in [`GatedToolExecutor::specs`]. The vault READ tools
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
-    fn allows(self, tool: &str) -> bool {
+    pub(crate) fn allows(self, tool: &str) -> bool {
         // Local-MCP discovery helpers are intentionally absent from every cloud-capable assistant
         // scope. They can be dispatched only by the loopback MCP mapper into `execute_tool`.
         if matches!(
@@ -405,9 +405,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "list_dashboards".into(),
             description: "List the user's DASHBOARDS — boards they composed by hand out of \
                           meetings, notes, documents, people and derived views. Returns titles + \
-                          ids only. When a question is about a project/deal/topic the user tracks, \
-                          check here first: a board is the user's OWN declaration of what belongs \
-                          together, which is better scope than a search guess."
+                          ids only. Use it when the user asks about a dashboard/board or needs broad \
+                          curated project scope: a board is the user's OWN declaration of what \
+                          belongs together. For a direct fact, decision, owner, or date question, \
+                          search meetings/documents first instead of listing every dashboard."
                 .into(),
             parameters: serde_json::json!({ "type": "object", "properties": {} }),
             write: false,
@@ -3317,12 +3318,9 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
         match name {
             // Dashboards — the user's own curated scope. Same gated executor, same visibility
             // snapshot as every other vault read here.
-            "list_dashboards" => execute_tool(
-                &ToolCall::ListDashboards,
-                self.db,
-                &unlocked,
-                self.config,
-            ),
+            "list_dashboards" => {
+                execute_tool(&ToolCall::ListDashboards, self.db, &unlocked, self.config)
+            }
             "get_dashboard" => execute_tool(
                 &ToolCall::GetDashboard {
                     dashboard_id: s("dashboardId"),

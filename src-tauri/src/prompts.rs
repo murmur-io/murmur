@@ -13,7 +13,7 @@
 /// The prompt-set version stamp. Bump when any shared prompt constant changes semantically, so
 /// eval artifacts / bake-off reports can attribute a metric shift to a prompt change (spec §L3:
 /// "eval artifacts stamp the version"). Never PII.
-pub const PROMPT_VERSION: &str = "v2026-07-10";
+pub const PROMPT_VERSION: &str = "v2026-08-05-q1";
 
 // ── Cascade tier SUFFIXES (moved verbatim from `transcribe::live`) ──────────────────────────────
 // Each is appended to the shared `assistant_system_prompt` (which injects the current-meeting live

@@ -31,6 +31,10 @@ pub mod bakeoff;
 pub mod calibration;
 pub mod corpus;
 pub mod diarization;
+#[cfg(test)]
+mod generation_quality;
+#[cfg(test)]
+mod generation_retrieval;
 pub mod notes_bakeoff;
 
 use serde::{Deserialize, Serialize};

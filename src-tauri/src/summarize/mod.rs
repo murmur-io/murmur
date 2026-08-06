@@ -164,6 +164,64 @@ pub fn provider_for(
     )
 }
 
+/// Test/evaluator-only variant of [`provider_for`] that injects an explicit egress sink while still
+/// constructing the real Codex CLI provider through [`make_provider_resolved`]. This exists so the
+/// opt-in real-model quality runner can own a fresh SQLCipher ledger instead of depending on the
+/// application-global startup sink. It is deliberately restricted to Codex: no production caller
+/// can use it and no new generic provider-bypass surface is compiled into release builds.
+#[cfg(test)]
+pub(crate) fn provider_for_with_egress_sink(
+    role: roles::Role,
+    config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
+    sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    provider_for_with_test_egress_sink(
+        role,
+        config,
+        heavy,
+        sink,
+        codex_cli::provider(
+            roles::provider_target(role, config).model,
+            roles::provider_target(role, config).effort,
+        ),
+    )
+}
+
+/// Shared construction seam for the real evaluator helper above and a focused fake-provider test.
+/// Keeping the fake at the innermost transport boundary lets the test exercise the exact role
+/// resolution, consent, regex/structural redaction, destination classification, and injected
+/// durable sink path. The synthetic evaluator deliberately pins the optional name-NER layer to its
+/// dependency-free no-op: otherwise files installed outside the repository could silently change
+/// candidate inputs between repetitions. Production provider construction continues selecting the
+/// active on-device NER model.
+#[cfg(test)]
+pub(crate) fn provider_for_with_test_egress_sink(
+    role: roles::Role,
+    config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
+    sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+    codex_inner: Arc<dyn SummarizerProvider>,
+) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    let target = roles::provider_target(role, config);
+    if target.connection != PROVIDER_CODEX_CLI {
+        return Err(crate::error::AppError::InvalidArg(
+            "the explicit evaluator egress sink is restricted to codex_cli".into(),
+        ));
+    }
+    make_provider_resolved(
+        &target,
+        config,
+        heavy,
+        None,
+        Some(ProviderTestOverrides {
+            codex_inner,
+            names: Arc::new(crate::summarize::redact::NoopNameRedactor),
+            sink,
+        }),
+    )
+}
+
 /// Recording postprocess provider: identical consent/redaction/ledger seam, with the exact session
 /// token threaded into every on-device model stage (local GGUF, loopback Ollama, and NER).
 pub(crate) fn provider_for_recording(
@@ -279,10 +337,10 @@ fn make_provider_resolved(
             if let Some(overrides) = &test_overrides {
                 overrides.codex_inner.clone()
             } else {
-                codex_cli::provider(target.model.clone())
+                codex_cli::provider(target.model.clone(), target.effort.clone())
             }
             #[cfg(not(test))]
-            codex_cli::provider(target.model.clone())
+            codex_cli::provider(target.model.clone(), target.effort.clone())
         }
         PROVIDER_ANTHROPIC => {
             // Resolve the key from the Keychain here so providers never touch secrets.
