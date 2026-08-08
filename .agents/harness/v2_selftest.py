@@ -895,6 +895,86 @@ def profile_cases(test: Tests) -> None:
         ["npm-lock", "ng-lint", "ng-build"],
     )
 
+    quality_archives = [
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json.gz",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json.gz",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-content-inventory-verified.json.gz",
+    ]
+    for quality_archive in quality_archives:
+        archive_checks, _, _ = _profile([quality_archive])
+        test.equal(
+            f"PROFILE quality archive {quality_archive} gets only its archive oracle",
+            archive_checks,
+            ["quality-archives"],
+        )
+
+    quality_archive_inputs = [
+        "eval/results/2026-08-05-local-cloud-quality-fixture.json",
+        "src-tauri/src/eval/fixtures/local-cloud-quality.json",
+        "src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json",
+        "src-tauri/src/eval/corpus.rs",
+    ]
+    for quality_input in quality_archive_inputs:
+        input_checks, _, _ = _profile([quality_input])
+        expected = (
+            ["rust-lib", "rust-clippy", "quality-archives"]
+            if quality_input.startswith("src-tauri/src/")
+            else ["quality-archives"]
+        )
+        test.equal(
+            f"PROFILE quality archive input {quality_input} cannot bypass its oracle",
+            input_checks,
+            expected,
+        )
+
+    checks, _, _ = _profile(
+        quality_archives
+        + [
+            "eval/results/2026-08-05-qwen-vs-gpt-sol-evidence.json",
+        ]
+    )
+    test.equal(
+        "PROFILE quality archive stage gets the archive oracle only",
+        checks,
+        ["quality-archives"],
+    )
+    test.true(
+        "PROFILE quality archive stage excludes the complete artifact oracle",
+        "quality-artifacts" not in checks,
+    )
+
+    checks, _, _ = _profile(
+        quality_archives
+        + [
+            "eval/results/2026-08-05-qwen-vs-gpt-sol-evidence.json",
+            "eval/results/verify_local_cloud_quality_artifacts.py",
+            "eval/results/2026-08-05-local-cloud-quality-fixture.json",
+        ]
+    )
+    test.equal(
+        "PROFILE mixed archive and complete stage must pass both oracles",
+        checks,
+        ["quality-archives", "quality-artifacts"],
+    )
+
+    quality_derived = [
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-evidence.json",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined-verified.json",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-review-projection.json",
+        "eval/results/verify_local_cloud_quality_artifacts.py",
+        "docs/research/2026-08-05-local-qwen-vs-gpt-sol-quality.md",
+    ]
+    for quality_artifact in quality_derived:
+        artifact_checks, _, _ = _profile([quality_artifact])
+        test.equal(
+            f"PROFILE derived quality artifact {quality_artifact} gets only its complete oracle",
+            artifact_checks,
+            ["quality-artifacts"],
+        )
+
+    checks, _, _ = _profile(["eval/results/unrelated-quality-note.json"])
+    test.equal("PROFILE unrelated eval output gets no quality oracle", checks, [])
+
     checks, _, _ = _profile(
         ["src-tauri/src/lib.rs", "src/app/core/ipc.service.ts"]
     )
@@ -1010,6 +1090,12 @@ def profile_cases(test: Tests) -> None:
         harness_cli._protected_v2_paths([".agents/harness"]),
         [".agents/harness"],
     )
+    quality_oracle_path = ".agents/harness/checks/quality-artifacts.py"
+    test.equal(
+        "PROFILE quality oracle is protected from self-certification",
+        harness_cli._protected_v2_paths([quality_oracle_path]),
+        [quality_oracle_path],
+    )
     harness_python = runtime.load_config()["canonical_checks"][
         "harness-python"
     ]
@@ -1069,6 +1155,29 @@ def profile_cases(test: Tests) -> None:
         set(runtime.load_config()["canonical_checks"]),
         verifier.ALLOWED_PROBES,
     )
+    test.equal(
+        "PROFILE quality archive oracle uses its staged selftest mode",
+        runtime.load_config()["canonical_checks"]["quality-archives"],
+        "python3 -B .agents/harness/checks/quality-artifacts.py --archive-stage --selftest",
+    )
+    test.equal(
+        "PROFILE complete quality oracle uses its final selftest mode",
+        runtime.load_config()["canonical_checks"]["quality-artifacts"],
+        "python3 -B .agents/harness/checks/quality-artifacts.py --final --selftest",
+    )
+    for quality_check_id in ("quality-archives", "quality-artifacts"):
+        quality_check_result = subprocess.run(
+            shlex.split(runtime.load_config()["canonical_checks"][quality_check_id]),
+            cwd=str(ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        test.equal(
+            f"PROFILE canonical {quality_check_id} command executes",
+            quality_check_result.returncode,
+            0,
+        )
 
 
 def npm_lock_evidence_cases(test: Tests) -> None:
@@ -6256,6 +6365,21 @@ def protocol_and_runtime_cases(test: Tests) -> None:
         test.true(
             "PROTOCOL manifest includes its v2 fault suite",
             ".agents/harness/v2_selftest.py" in manifest,
+        )
+        test.true(
+            "PROTOCOL manifest includes the executed quality artifact oracle",
+            ".agents/harness/checks/quality-artifacts.py" in manifest,
+        )
+        quality_oracle = fixture / ".agents/harness/checks/quality-artifacts.py"
+        quality_before = verifier.protocol_bundle(fixture)["protocol_sha256"]
+        quality_oracle.write_text(
+            quality_oracle.read_text(encoding="utf-8") + "\n# quality oracle drift\n",
+            encoding="utf-8",
+        )
+        quality_after = verifier.protocol_bundle(fixture)["protocol_sha256"]
+        test.true(
+            "PROTOCOL quality artifact oracle drift changes protocol hash",
+            quality_before != quality_after,
         )
         test.true(
             "PROTOCOL manifest includes all canonical check scripts",
