@@ -59,6 +59,8 @@
               "rust-clippy",
               "protocol-server",
               "npm-lock",
+              "quality-archives",
+              "quality-artifacts",
               "tauri-boot",
               "ng-lint",
               "ng-build",
