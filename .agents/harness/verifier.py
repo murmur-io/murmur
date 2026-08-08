@@ -46,6 +46,8 @@ ALLOWED_PROBES = {
     "rust-clippy",
     "protocol-server",
     "npm-lock",
+    "quality-archives",
+    "quality-artifacts",
     "tauri-boot",
     "ng-lint",
     "ng-build",
@@ -528,6 +530,53 @@ def _harness_surface(paths: Sequence[str]) -> bool:
     return any(_matches(path, patterns) for path in paths)
 
 
+QUALITY_ARCHIVE_STAGE_PATHS = frozenset(
+    {
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json.gz",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json.gz",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-content-inventory-verified.json.gz",
+    }
+)
+QUALITY_ARCHIVE_INPUT_PATHS = frozenset(
+    {
+        # These fixed, synthetic inputs are read by the protected archive
+        # oracle.  A source-only edit must not bypass the artifact bindings.
+        "eval/results/2026-08-05-local-cloud-quality-fixture.json",
+        "src-tauri/src/eval/fixtures/local-cloud-quality.json",
+        "src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json",
+        "src-tauri/src/eval/corpus.rs",
+    }
+)
+QUALITY_ARTIFACT_PATHS = frozenset(
+    {
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-evidence.json",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined-verified.json",
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-final-review-projection.json",
+        "eval/results/verify_local_cloud_quality_artifacts.py",
+        "docs/research/2026-08-05-local-qwen-vs-gpt-sol-quality.md",
+    }
+)
+QUALITY_ARCHIVE_STAGE_COMPANION_PATHS = frozenset(
+    {
+        # The archive stage updates the hash manifest that names R1/R2.  Every
+        # other derived artifact belongs to the following complete stage.
+        "eval/results/2026-08-05-qwen-vs-gpt-sol-evidence.json",
+    }
+)
+
+
+def _quality_archive_stage_surface(paths: Sequence[str]) -> bool:
+    return any(path in QUALITY_ARCHIVE_STAGE_PATHS for path in paths)
+
+
+def _quality_archive_input_surface(paths: Sequence[str]) -> bool:
+    return any(path in QUALITY_ARCHIVE_INPUT_PATHS for path in paths)
+
+
+def _quality_artifact_surface(paths: Sequence[str]) -> bool:
+    return any(path in QUALITY_ARTIFACT_PATHS for path in paths)
+
+
 def derive_profile(
     paths: Sequence[str],
     claims: Sequence[str],
@@ -566,6 +615,21 @@ def derive_profile(
         require("rust-clippy")
     if _package_lock_surface(paths):
         require("npm-lock")
+    # The quality corpus lands in two independently reviewable, stacked commits.
+    # Only its hash manifest may accompany an archive-only stage. If combined,
+    # projection, report, or the product-side verifier changes beside an archive,
+    # both checks are mandatory; this prevents precedence from green-washing a
+    # mixed stage and makes the intended following derived commit enforceable.
+    archive_stage = _quality_archive_stage_surface(paths)
+    archive_input = _quality_archive_input_surface(paths)
+    complete_stage = _quality_artifact_surface(paths)
+    if archive_stage or archive_input:
+        require("quality-archives")
+    complete_only_paths = QUALITY_ARTIFACT_PATHS - QUALITY_ARCHIVE_STAGE_COMPANION_PATHS
+    if complete_stage and (
+        not archive_stage or any(path in complete_only_paths for path in paths)
+    ):
+        require("quality-artifacts")
     if _angular_surface(paths):
         require("ng-lint")
         require("ng-build")
