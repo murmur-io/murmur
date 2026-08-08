@@ -1,6 +1,8 @@
 # Local Qwen vs GPT-5.6-Sol: jakość na ścieżkach Murmura
 
-Data pomiaru: 2026-08-05
+Pierwotny pomiar: 2026-08-05. Source-bound refresh po historii Ask Brain: 2026-08-08. Bieżące
+bootstrap runy to `ask-brain-chat-history-final-r1` (`2026-08-08T18:09:13.734113+00:00`) oraz
+`ask-brain-chat-history-final-r2` (`2026-08-08T18:22:20.559772+00:00`).
 
 Zakres: summary, Brain w notatce/meeting chat, popup na zaznaczonym tekście, Ask Brain po vault,
 Brain w bieżącym spotkaniu, live bullets, trwała ekstrakcja faktów oraz retrieval Ask.
@@ -12,13 +14,13 @@ atestuje modelu faktycznie obsłużonego ani efektywnego effortu.
 
 Po remediacji zaimplementowanej w kandydackim worktree lokalne **candidate product paths** są
 blisko referencji na tej małej, syntetycznej kohorcie: `28/34 = 82.4%` zaliczonych, wspólnych
-obserwacji wobec `29/34 = 85.3%` dla Sol. Luka to
-jedna odpowiedź (`2.9 p.p.`); macro po surface wynosi `83.3%` local i `82.0%` Sol.
+obserwacji wobec `30/34 = 88.2%` dla Sol. Luka to
+dwie odpowiedzi (`5.8 p.p.`); macro po surface wynosi `83.3%` local i `86.1%` Sol.
 
 Nie oznacza to parytetu modeli. W osobnej próbie z tym samym evaluator-owned system/user envelope i
-jednym zewnętrznym wywołaniem providera lokalny composite ma `26/36 = 72.2%`, a Sol `34/36 =
-94.4%`. Luka jednowywołaniowego same-envelope model-stack wynosi więc `22.2 p.p.`, macro `66.7%`
-vs `95.2%`, a błędów krytycznych jest `10` vs `2`. Produkcyjne prompty, parsery, routing,
+jednym zewnętrznym wywołaniem providera lokalny composite ma `26/36 = 72.2%`, a Sol `32/36 =
+88.9%`. Luka jednowywołaniowego same-envelope model-stack wynosi więc `16.7 p.p.`, macro `66.7%`
+vs `90.5%`, a błędów krytycznych jest `10` vs `4`. Produkcyjne prompty, parsery, routing,
 stan i bounded orchestration
 kompensują dużą część słabości małych modeli lokalnych.
 
@@ -41,8 +43,8 @@ Rekomendacja:
 
 | Lane | Co porównuje | Local | Sol | Luka Sol-local |
 | --- | --- | ---: | ---: | ---: |
-| candidate product system, wspólne przypadki | rzeczywiste role, prompty, parsery, routing i orchestration z tego worktree | 82.4% (28/34) | 85.3% (29/34) | 2.9 p.p. |
-| same caller envelope/model-stack | jeden `complete_with_meta`, wspólny envelope i wspólna projekcja | 72.2% (26/36) | 94.4% (34/36) | 22.2 p.p. |
+| candidate product system, wspólne przypadki | rzeczywiste role, prompty, parsery, routing i orchestration z tego worktree | 82.4% (28/34) | 88.2% (30/34) | 5.8 p.p. |
+| same caller envelope/model-stack | jeden `complete_with_meta`, wspólny envelope i wspólna projekcja | 72.2% (26/36) | 88.9% (32/36) | 16.7 p.p. |
 
 Pierwszy wiersz odpowiada na pytanie „jak candidate backend product paths zachowały się na tych
 syntetycznych probes?”. Nie jest pełnym testem aplikacji/UI ani realnego vaultu. Drugi pokazuje, ile
@@ -68,14 +70,14 @@ matched wyniku.
 | Qwen 1.7B, live current + bullets | 6 | 100.0% | 100.0% | 0 | 100.0 |
 | Local composite, wszystkie lokalne ścieżki | 36 | 83.3% | 85.7% | 6 | 91.5 |
 | Local composite, tylko wspólne z Sol | 34 | 82.4% | 83.3% | 6 | 91.0 |
-| Sol, te same 34 product paths | 34 | 85.3% | 82.0% | 5 | 92.4 |
+| Sol, te same 34 product paths | 34 | 88.2% | 86.1% | 4 | 93.9 |
 
 | Surface | Local candidate route | Sol candidate/reference route | Odczyt |
 | --- | ---: | ---: | --- |
 | Summary | Qwen 4B: 66.7% (4/6) | 66.7% (4/6) | oba mają krytyczne błędy; brak parytetu ogólnego |
 | Brain w meeting/note chat | Qwen 4B: 100% (4/4) | 100% (4/4) | pozytywny, lecz bardzo mały test |
 | Popup zaznaczonego tekstu | Qwen 4B: 83.3% (10/12) | 100% (12/12) | nadal materialna luka lokalna |
-| Ask Brain / vault | Qwen 4B: 50% (2/4) | 25% (1/4) | Sol zalicza jeden z czterech runów i ma jeden flip |
+| Ask Brain / vault | Qwen 4B: 50% (2/4) | 50% (2/4) | local stabilnie przechodzi EN i oblewa PL; Sol zamienia verdict między przypadkami w R1/R2 |
 | Trwałe fakty post-call | Qwen 4B: 100% (4/4) | 100% (4/4) | routing naprawił zmierzoną klasę błędu |
 | Brain live current | Qwen 1.7B: 100% (4/4) | 100% (4/4) | utrzymać 1.7B, ale powiększyć próbkę |
 | Live bullets | Qwen 1.7B: 100% (2/2) | nieporównywalny product route | Sol jest tylko offline ceiling |
@@ -83,38 +85,46 @@ matched wyniku.
 `callSuccessRate=100%` oznacza brak błędu procesu providera. Nie oznacza poprawnej odpowiedzi,
 dobrego retrieval ani niezawodności produktu.
 
-### Stabilne błędy końcowe
+### Błędy końcowe product route i stabilność
 
-- Qwen 4B, `ask-vault-pl-orchid`: miesza otwarty budżet z zatwierdzonym startem i pomija datę.
-- Qwen 4B, `note-popup-actions-pl`: skraca relację `plan testów` do `plan`.
-- Qwen 4B, `summary-en-cedar`: opisuje zatwierdzony rollout w prozie, ale deklaruje brak decyzji.
-- Sol, `ask-vault-en-quartz-holdout`: w R1 kończy bez narzędzi i nie dostarcza wymaganych faktów ani
-  provenance; w R2 przechodzi po staged search/open, więc ten przypadek jest jedynym flipem.
-- Sol, `summary-pl-kestrel`: w obu repetycjach miesza zatwierdzony limit budżetu z planowanym
-  terminem startu pilotażu.
-- Sol, `ask-vault-pl-orchid`: nie przechodzi w żadnej repetycji; w obu kończy bez narzędzi i
-  provenance, więc nie dostarcza wymaganych faktów.
-  Wszystkie finalne lokalne outcome'y, w tym przypadki inne niż fakty, oraz
-  ich `outputSha256` były stabilne między R1 i R2. Cloud nie był deterministyczny: zmienił output
-  w 10 z 18 rekordów route-specific, czyli w 10 z 17 product paths; offline live-bullets ceiling
-  pozostał stabilny. W same-envelope lane Sol zmienił 9 z 18 outputów bez zmiany verdictów, a oba
-  ramiona lokalne pozostały byte-stable.
+- Qwen 4B, `ask-vault-pl-orchid`: fail w R1/R2; nie przechodzi `forbiddenPass` ani
+  `relationPass`.
+- Qwen 4B, `note-popup-actions-pl`: fail w R1/R2 na `relationPass`.
+- Qwen 4B, `summary-en-cedar`: fail w R1/R2 na `forbiddenPass` i `sectionPass`.
+- Sol, `summary-pl-kestrel`: fail w R1/R2 na `forbiddenPass`, `relationPass` i `sectionPass`.
+- Sol, `ask-vault-en-quartz-holdout`: fail w R1, pass w R2; w R1 nie przechodzi
+  `provenancePass`, `relationPass` ani `toolPolicyPass`.
+- Sol, `ask-vault-pl-orchid`: pass w R1, fail w R2; w R2 nie przechodzi `languagePass`,
+  `provenancePass`, `relationPass` ani `toolPolicyPass`.
+
+Wszystkie finalne lokalne outcome'y, w tym przypadki inne niż fakty, oraz ich `outputSha256` były
+stabilne między R1 i R2. Cloud nie był deterministyczny: zmienił finalny output w 10 z 18 rekordów
+route-specific, czyli w 9 z 17 product paths oraz w offline live-bullets ceiling; dwa przypadki Ask
+zmieniły również pass/critical verdict. W same-envelope lane Sol zmienił 8 z 18 outputów bez zmiany
+verdictów, a oba ramiona lokalne pozostały byte-stable.
 
 ## Wyniki same caller envelope/model-stack
 
-| Kandydat | N | casePass | surface macro | Krytyczne | score |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen 4B | 30 | 73.3% | 73.3% | 8 | 86.4 |
-| Sol na tych samych przypadkach | 30 | 93.3% | 93.3% | 2 | 96.6 |
-| Qwen 1.7B | 6 | 66.7% | 50.0% | 2 | 83.0 |
-| Sol na tych samych przypadkach | 6 | 100% | 100% | 0 | 100.0 |
-| Local composite | 36 | 72.2% | 66.7% | 10 | 85.8 |
-| Sol | 36 | 94.4% | 95.2% | 2 | 97.2 |
+| Para | Local casePass / macro / krytyczne / score | Sol casePass / macro / krytyczne | Luka score Sol-local |
+| --- | ---: | ---: | ---: |
+| Qwen 4B vs Sol, N=30 | 73.3% / 73.3% / 8 / 86.4 | 86.7% / 86.7% / 4 | 6.8 |
+| Qwen 1.7B vs Sol, N=6 | 66.7% / 50.0% / 2 / 83.0 | 100% / 100% / 0 | 17.0 |
+| Local composite vs Sol, N=36 | 72.2% / 66.7% / 10 / 85.8 | 88.9% / 90.5% / 4 | 8.5 |
 
-Produktowa ścieżka live-bullets 1.7B przechodzi dzięki parserowi i regułom stanu, podczas gdy
-jednowywołaniowa projekcja model-only nie utrzymuje poprawnie zakresu i powtarza wcześniejszy fakt.
-To dobry przykład, dlaczego candidate product path może wypaść dużo lepiej niż jednowywołaniowy
-same-envelope model-stack.
+| Surface | Local same-envelope | Sol same-envelope |
+| --- | ---: | ---: |
+| Summary | Qwen 4B: 33.3% (2/6), critical 4, score 66.0 | 33.3% (2/6), critical 4, score 66.0 |
+| Meeting chat | Qwen 4B: 100% (4/4) | 100% (4/4) |
+| Popup/note assist | Qwen 4B: 83.3% (10/12), critical 2, score 91.5 | 100% (12/12), score 100.0 |
+| Ask Brain | Qwen 4B: 50% (2/4), critical 2, score 74.5 | 100% (4/4), score 100.0 |
+| Trwałe fakty | Qwen 4B: 100% (4/4) | 100% (4/4) |
+| Live current | Qwen 1.7B: 100% (4/4) | 100% (4/4) |
+| Live bullets | Qwen 1.7B: 0% (0/2), critical 2, score 49.0 | 100% (2/2), score 100.0 |
+
+Produktowa ścieżka live-bullets 1.7B przechodzi 2/2, podczas gdy ten sam surface w
+jednowywołaniowym same-envelope lane przechodzi 0/2 i w obu repetycjach oblewa
+`forbiddenPass`. To pokazuje, dlaczego candidate product path może wypaść dużo lepiej niż
+jednowywołaniowy same-envelope model-stack.
 
 ## Efekt remediacji
 
@@ -123,7 +133,7 @@ same-envelope model-stack.
 | Stan | Matched local product | Sol | Luka score | Krytyczne local |
 | --- | ---: | ---: | ---: | ---: |
 | przed zmianą, fakty na 1.7B | 70.6% (24/34) | 85.3% (29/34) | 7.4 | 10 |
-| final, fakty na 4B w Fully Local | 82.4% (28/34) | 85.3% (29/34) | 1.4 | 6 |
+| final, fakty na 4B w Fully Local | 82.4% (28/34) | 88.2% (30/34) | 2.9 | 6 |
 
 W A/B lokalnym wszystkie cztery obserwacje faktów zmieniły się z fail na pass, a 32 obserwacje
 pozostałych lokalnych product paths (16 przypadków razy dwie repetycje) zachowały identyczne
@@ -131,8 +141,8 @@ pozostałych lokalnych product paths (16 przypadków razy dwie repetycje) zachow
 z nim oznaczenie eval route/profile; osobno skorygowano bookkeeping oczekiwanej liczby wywołań w
 validatorze, bez zmiany lokalnych outputów ani score'a.
 
-Sol nie jest zamrożonym ramieniem kontrolnym: między decision point i finalnym rerunem zmieniał
-outputy oraz pojedyncze outcome'y, choć zagregowany `29/34` przypadkiem pozostał taki sam. Dlatego
+Sol nie jest zamrożonym ramieniem kontrolnym: między decision point i kolejnym source-bound
+refreshem zmieniał outputy, a agregat przesunął się z `29/34` do `30/34`. Dlatego
 bezpośredni wniosek przyczynowy dotyczy poprawy local `24/34 -> 28/34`, nie stabilności cloud.
 Historyczny punkt pre-routing nie ma też osobnego evidence manifestu/replay binding, więc jego
 atrybucja jest słabiej związana niż wynik finalny. Routing wybiera `ModelClass::Heavy`, nie
@@ -210,12 +220,12 @@ nie jest to niezależny replay transformacji raw-response -> projekcja, bo raw r
 commitment, co jawnie ogranicza siłę dowodu tego lane'u.
 
 Cloud nadal przechodzi przez canonical consent/redaction/ledger seam. Tymczasowy SQLCipher ledger
-zapisał `36/36` content-free receipts w R1 i `41/41` w R2, bez failure; różnica pochodzi z liczby
-kroków cloud agent loop, nie z brakujących rekordów. Następnie DB usunięto. Product route
-odnotował 5 podstawień wzorca telefonu w R1 i 10 w R2 (kontrolowane daty/ranges w fixture); nie
-osłabiono regexu ani nie ominięto firewalla. Same-envelope lane używa odwracalnych,
-kandydat-independent tokenów semantycznych przed canonical firewall; wszystkie 18 cloud receipts
-na run miało zero redakcji, więc Sol nie dostał dat oznaczonych jako `PHONE`.
+zapisał `39/39` content-free receipts zarówno w R1, jak i R2, bez failure; oba runy mają po `36`
+wpisów `complete` i `3` `summarize`. Następnie DB usunięto. Projekcja odnotowała po `8`
+podstawień wzorca telefonu w każdym runie, w `6` wierszach z redakcją; redakcje
+card/email/name pozostały zerowe. Same-envelope lane obejmuje 18 jednowywołaniowych cloud
+observations na run. Projekcja publikuje tylko agregat redakcji dla wszystkich 39 cloud calls na
+run, dlatego tych 8 podstawień nie przypisujemy osobnemu lane'owi.
 
 Name NER był celowo ustawiony na deterministyczny `NoopNameRedactor`, ponieważ corpus jest
 syntetyczny. Pomiar nie testuje więc skuteczności redakcji nazw własnych w trybie produkcyjnym.
@@ -247,21 +257,15 @@ promptów użytkownika, sekretów ani PII. Produkcyjny egress ledger pozostaje c
 - jeden outer provider call nie dowodzi braku retry wewnątrz providera; same-caller-envelope
   model-stack nie izoluje samych wag i nie atestuje parity efektywnego promptu po adapterze;
 - Sol ma requested `gpt-5.6-sol/high`, lecz brak served-model i effective-effort attestation;
-- latency jest warm/resident na jednym Macu, bez cold-startu, RAM, energii i tokens/s.
+- finalna content-free review projection nie publikuje timingów, RAM, energii ani tokens/s; ten
+  raport nie stawia więc wniosku wydajnościowego.
 
-## Latencja pomocnicza
+## Latencja
 
-Mac16,5, Apple M4 Max, 64 GiB, macOS 26.5 (build 25F71); dwie repetycje, pełny czas
-product-path przypadku. `p50` i `p95` poniżej to nearest-rank po połączonych repetycjach.
-
-| Ramię | N | mean | p50 | p95 | min-max |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen 4B | 30 | 5.80 s | 2.93 s | 20.12 s | 0.76-25.05 s |
-| Qwen 1.7B | 6 | 1.53 s | 1.47 s | 2.12 s | 1.03-2.12 s |
-| Sol, requested high | 34 | 7.22 s | 5.00 s | 16.68 s | 3.40-44.33 s |
-
-To diagnostyka, nie SLA. Sidecar był rezydentny w ramach ramienia, a próbka jest zbyt mała do
-decyzji o wydajności lub termice.
+Surowe raporty zachowują per-case `durationMs`, ale końcowa, content-free review projection nie
+publikuje odtwarzalnych agregatów czasu. Poprzednią tabelę usunięto, aby nie mieszać metryk z innej
+repetycji ani warstwy evidence. Wydajność wymaga osobnego pomiaru cold/warm, RAM, energii i
+tokens/s na docelowych Macach; ten benchmark rozstrzyga wyłącznie jakość.
 
 ## Następny plan jakości
 
@@ -279,21 +283,21 @@ decyzji o wydajności lub termice.
 
 ## Artefakty
 
-Final:
+Bieżący bootstrap przed powtórzeniem na commicie C1:
 
-- R1 archive `8fa8e7c4fbc02c0f64ce3d149b8ffa2881e65d5aa8b3c307fd55df72d7955cbb`,
-  logical JSON `5b469273bd07cdb7dbc6cba14812a2dcbc1f068aa795e29d732f9237c57cb913`;
-- R2 archive `b622d9ddbe3f7d8a4cbb191f9b3009185024768d48cecad564fb84561db5ba07`,
-  logical JSON `b83faa807cf093421a51021769ef638cc96ea2a8323794838bdf09f6b05307e9`;
-- versioned combined `8f9070220eef6e09ab0cb44cfb94ae4a6b077d18f1d39707c043918ff07d24f7`;
+- R1 archive `c044a7f5cde805e9c949df45aac180d91840579a73f19e13aec2aa7f91164c3f`,
+  logical JSON `beee7f543eb38e9283dcbea27ed16946e011d4b41e9e453120645679f22c1488`;
+- R2 archive `640d3a775ff09e6efae88ab0bac727cddb82b8b1c25a334b60e474b468aa755b`,
+  logical JSON `2344f13087c36ff059116f2d55e448502b50056e45d0bd65eaed84807ff959b0`;
+- versioned combined `420d3cbb7495aba364e5d45c34261a7bd0d76f36e75fbdf37ac77ff126c69749`;
 - jawny snapshot syntetycznego fixture
   `b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2`;
 - jawny inventory wszystkich tekstowych wartości R1/R2: deterministyczne archiwum
-  `69ba4e3d507ca2de74fb26afdbbfdf9c1810d738ffa18d6b2ece71a7d8c6ab0c`, logiczny JSON
-  `7cf5eb7bd8e8d53504e56842482c76a3b23987ea1431b270ccf8464b736e270a`;
-- evidence manifest `ed4b4ccbce0e76d42681e33b05f431a5306409abb348b9cb19d582c9c388cd2b`;
+  `54027418a91b6c47c53e357724cf424b13aa344e969032aaa824e786341c40fc`, logiczny JSON
+  `00fa7c6af7ececadddd36a500b7ff1aa4179239e5e9fd9d9d616d47c7ea07258`;
+- evidence manifest `68a933943a9bb942e276ec2d3eb1e5a9b916f1074b1bc9100ea1bd3e85d41fe4`;
 - tekstowa review projection
-  `4d01dbaad9b489896742551112ed7d843987f92578fe905ceb7ceb50190a1136`.
+  `add2b40cabbc76fd87b67f623cf614f60cc2d93e77090aad55ea50899170caac`.
 
 W evidence `logicalPath` jest wirtualną nazwą zdekompresowanego JSON, nie drugim plikiem w repo.
 Ścisły evidence manifest schema v1 wiąże fizyczne archiwa `.json.gz`, ich logiczną treść, combined
@@ -301,7 +305,7 @@ oraz producer snapshot. Celowo nie ma w nim dodatkowych kluczy snapshot/inventor
 repeat validator odrzuca zmianę tego schematu. Te dwa są wiązane osobno przez stałe ścieżki i SHA w
 `verify_local_cloud_quality_artifacts.py`; ten oracle jest uruchamiany przez test Rust razem z
 mutation selftestami obu plików. Snapshot pozwala odtworzyć każdy `casePayloadSha256`, a inventory
-publikuje wszystkie 721 unikalnych stringów z 4 748 wystąpień wraz z commitmentami ścieżek per
+publikuje wszystkie 724 unikalne stringi z 4 751 wystąpień wraz z commitmentami ścieżek per
 repeat. Raw reports mają schema v9, combined schema v5, inventory schema v2.
 Odświeżone R1/R2 oraz inventory mają nowe, wersjonowane ścieżki; starsze pliki z bazy pozostają
 historycznymi wejściami i nie są po cichu nadpisywane. R1/R2 i inventory są deterministycznymi,
@@ -313,17 +317,19 @@ flipy, stabilność, retrieval, egress/redakcje i commitment inventory bez plain
 odtwarza ją dokładnie z R1/R2, combined, evidence i inventory, porównuje kanoniczne bajty oraz
 odrzuca ponownie zahashowaną zmianę semantyczną; nadal otwiera i waliduje pełną logiczną treść.
 
-Finalne runy wiążą clean merge commit `e139cbeefed98fbb3c1da20c74da6a9d4c2dd3e6`, source fingerprint
-`e88bd005e9b45f714c10e289d8b7d977c113addb5c1038e823b0d86fd53fc538`, manifest
+Bieżące bootstrap runy wiążą clean snapshot commit `d672583e3181a33631b6930b28feef0a2fdacf2f`, source fingerprint
+`3201e12357f49442a259e131ba27192316def7cf7980c79f8006258bbfdad442`, manifest
 `21ea3cc236b8c4058f18043b538bac87e93e933c86bd8b0c3696f5b67d45f01d`, evaluator
-`b0feaaff5cb533fa2767a60ecd70844d3af3ee2f79be2b09b401eebf7b5f9363`, fixture
+`41e828e449382fb9df672b20ebd833d962b68aa3455e671477ff936bd20a89f9`, fixture
 `b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2` i validator
-`48d66559c713cc0da346d5d92fc0051be4b67ebb1b6b6f4422e3024101312198`.
+`2ebe73a29054f68a3c93a3682778f0ff32ec2d40e3ce8c6a0e156be9379a1431`.
 
 Runtime local to `murmur-brain-workspace-build`, SHA-256
-`a47b8ec18d8597f59caad79aedf9aa9c7d86a5e2444ff036785ddea4fd2d4c37`; runtime cloud to
+`1fa8425a068784b4659bafe48fed6cb7b737902dfeb85e04de4a2b220f0758ab`; runtime cloud to
 `codex-cli 0.146.0`, SHA-256
-`ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02`. Wagi 4B miały
+`ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02`. Produkcyjne proofy
+izolacji są celowo przypięte do linii `0.146.x`; znalezione `0.147.0` failuje zamknięcie zamiast
+być po cichu dopuszczone bez ponownej weryfikacji kontraktu. Wagi 4B miały
 2,497,280,736 B i SHA-256 `2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e`;
 wagi 1.7B miały 1,282,439,584 B i SHA-256
 `72c5c3cb38fa32d5256e2fe30d03e7a64c6c79e668ad84057e3bd66e250b24fb`.
@@ -347,12 +353,15 @@ bezpośredni A/B dla Sol, bo pierwotny run nie żądał `high`.
 
 ## Stan weryfikacji
 
-Po catch-upie do trunku zachowano dwa kompletne real-model raporty związane z dokładnym źródłem
-kandydata. Każdy zawiera wszystkie oczekiwane ramiona i przypadki, a ich kolejność jest odwrócona
-między R1 i R2. Python validator przyjął oba artefakty, odtworzył combined i zweryfikował
+Po catch-upie do trunku zachowano dwa kompletne bootstrapowe real-model raporty związane z clean
+snapshotem `d672583e3181a33631b6930b28feef0a2fdacf2f`. Nie atestują jeszcze bieżącego exact diffu
+ani przyszłego C1. Każdy zawiera wszystkie oczekiwane ramiona i przypadki, a ich kolejność jest
+odwrócona między R1 i R2. Python validator przyjął oba artefakty, odtworzył combined i zweryfikował
 runtime/source binding oraz `workingTreeDirty=false` dla obu snapshotów. Commitowany dowód celowo
 nie stawia claimu o historycznym kodzie wyjścia zewnętrznego wrappera; kompletność wynika z
 zamkniętych schematów, hashy, pełnego inventory i niezależnego replayu wyników.
 Deterministyczny replay jest częścią offline oracle'a. Pełne bramki projektu i dokładny werdykt
 Harnessu zostaną raportowane w PR/receipt dopiero po ich zakończeniu; ten raport sam ich nie
-atestuje i nie należy mylić uruchomienia modeli z końcowym PASS zmiany.
+atestuje i nie należy mylić uruchomienia modeli z końcowym PASS zmiany. Po commicie C1 oba runy
+zostaną wykonane ponownie na jego czystym SHA, a ta sekcja i wszystkie bindingi zostaną zastąpione
+finalnym evidence w osobnej, exact-diff warstwie C2.

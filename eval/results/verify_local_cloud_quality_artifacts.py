@@ -37,13 +37,13 @@ HISTORY_CONTENT_INVENTORY = (
     RESULTS_PREFIX / "2026-08-05-qwen-vs-gpt-sol-history-content-inventory.json"
 )
 
-FINAL_EVIDENCE_SHA256 = "ed4b4ccbce0e76d42681e33b05f431a5306409abb348b9cb19d582c9c388cd2b"
+FINAL_EVIDENCE_SHA256 = "68a933943a9bb942e276ec2d3eb1e5a9b916f1074b1bc9100ea1bd3e85d41fe4"
 FINAL_FIXTURE_SHA256 = "b5f63efbc135a8629366614444bdba8d9501e28209d054e967b8e9debeddd9b2"
 FINAL_CONTENT_INVENTORY_SHA256 = (
-    "69ba4e3d507ca2de74fb26afdbbfdf9c1810d738ffa18d6b2ece71a7d8c6ab0c"
+    "54027418a91b6c47c53e357724cf424b13aa344e969032aaa824e786341c40fc"
 )
 FINAL_REVIEW_PROJECTION_SHA256 = (
-    "4d01dbaad9b489896742551112ed7d843987f92578fe905ceb7ceb50190a1136"
+    "add2b40cabbc76fd87b67f623cf614f60cc2d93e77090aad55ea50899170caac"
 )
 BASELINE_BUNDLE_SHA256 = "05f248da2a6e1104b9311d2fd21422c9dc2af10c1cf0492472812295509f2186"
 DECISION_BUNDLE_SHA256 = "18521020093fe4c3f1d39027e319fd4e9dea8ee9758464c48b7e0bb81349a5ed"
@@ -90,20 +90,20 @@ MAX_GZIP_LOGICAL_BYTES = 8 * 1024 * 1024
 FINAL_REPETITIONS = {
     "1": {
         "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json.gz",
-        "archiveSha256": "8fa8e7c4fbc02c0f64ce3d149b8ffa2881e65d5aa8b3c307fd55df72d7955cbb",
+        "archiveSha256": "c044a7f5cde805e9c949df45aac180d91840579a73f19e13aec2aa7f91164c3f",
         "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r1-verified.json",
-        "logicalSha256": "5b469273bd07cdb7dbc6cba14812a2dcbc1f068aa795e29d732f9237c57cb913",
+        "logicalSha256": "beee7f543eb38e9283dcbea27ed16946e011d4b41e9e453120645679f22c1488",
     },
     "2": {
         "archivePath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json.gz",
-        "archiveSha256": "b622d9ddbe3f7d8a4cbb191f9b3009185024768d48cecad564fb84561db5ba07",
+        "archiveSha256": "640d3a775ff09e6efae88ab0bac727cddb82b8b1c25a334b60e474b468aa755b",
         "logicalPath": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-r2-verified.json",
-        "logicalSha256": "b83faa807cf093421a51021769ef638cc96ea2a8323794838bdf09f6b05307e9",
+        "logicalSha256": "2344f13087c36ff059116f2d55e448502b50056e45d0bd65eaed84807ff959b0",
     },
 }
 FINAL_COMBINED = {
     "path": "eval/results/2026-08-05-qwen-vs-gpt-sol-final-combined-verified.json",
-    "sha256": "8f9070220eef6e09ab0cb44cfb94ae4a6b077d18f1d39707c043918ff07d24f7",
+    "sha256": "420d3cbb7495aba364e5d45c34261a7bd0d76f36e75fbdf37ac77ff126c69749",
 }
 FINAL_CASE_IDS = {
     "ask-vault-en-quartz-holdout",
@@ -272,17 +272,17 @@ FINAL_EVIDENCE_TOP_LEVEL_KEYS = {
 # commitment detects any substituted name, address, unsupported-language text,
 # model output, path, or other string even when it uses a benign-looking key.
 FINAL_REPORT_SCHEMA_SHA256 = {
-    "1": "263283c5f27f1edc99ed199c291fa12b93e75eccd30a7fa5f4849e0ccad56047",
-    "2": "4a38645c75a77671a7f4d1c2b4557ba8312ca529b19b548a3ab6b45ff6d808f5",
+    "1": "ffe45c3b9bcadb568f0d57b5321995270a11d8546709061eae92af29c350b6c7",
+    "2": "c61f33c9c8d9eee6ef91efd943d8b9f9ee332dcf521e4af5af903b397bf7ae36",
 }
 FINAL_REPORT_TEXT_SHA256 = {
-    "1": "8853699b0092a775e265197151b0979b6175e1044105ed4e27cafc37ee9f36eb",
-    "2": "f8a3865315967526e7097500245a8501bcffbe7f2444f9b0dc39a41e1acb06fd",
+    "1": "70f5d9b877f34ea031582a7fc94a2e9a495003cdd9fdd61802c498e08f560bed",
+    "2": "7ee900a192384d4ea7d641f7ce39496138b5889277c23f1e250638f05214687c",
 }
 FINAL_COMBINED_SCHEMA_SHA256 = "8e38f627ea5fb2a38d1accb354415c2d9d0e3f20828e66cbafb7bece5493580b"
-FINAL_COMBINED_TEXT_SHA256 = "0f0ee25a63ec10fe73212a3c9007e3597873db1fe5ff7826c3c5838ac7dc4c1a"
+FINAL_COMBINED_TEXT_SHA256 = "b8db644ac0d924d7a9882cc695908abc773e9f9dd7af809a4ed222d058f24b56"
 FINAL_EVIDENCE_SCHEMA_SHA256 = "fb27ea815d9ea4ead0b0a2fb2b8fb5f0955d4a7cd8d012fc032026fd8d8d05c4"
-FINAL_EVIDENCE_TEXT_SHA256 = "a7dd46aaa977bb243f7c90d876b7f17719280a0bde2d24329993a076843faeb1"
+FINAL_EVIDENCE_TEXT_SHA256 = "e1d4ff7fc000a687fc49bf2695c5628f346d92a59c737865bb33cffbd705388f"
 
 FORBIDDEN_ARTIFACT_BYTES = (
     b"/users/",
