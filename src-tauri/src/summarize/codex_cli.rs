@@ -32,6 +32,21 @@ use crate::summarize::provider::{Availability, SummarizeRequest, SummarizerProvi
 use crate::summarize::template;
 
 const DEFAULT_BINARY: &str = "codex";
+const DEFAULT_SEARCH_RELATIVE_DIRS: &[&str] = &[
+    ".local/bin",
+    ".bun/bin",
+    ".deno/bin",
+    ".volta/bin",
+    ".npm-global/bin",
+    ".asdf/shims",
+    ".fnm/aliases/default/bin",
+    ".nodenv/shims",
+    ".n/bin",
+    ".local/share/pnpm",
+    "Library/pnpm",
+];
+const DEFAULT_SEARCH_SYSTEM_DIRS: &[&str] =
+    &["/opt/homebrew/bin", "/opt/local/bin", "/usr/local/bin"];
 const PROVIDER_LABEL: &str = "Codex CLI";
 const EMPTY_CWD: &str = "/var/empty";
 const SUPPORTED_CODEX_MAJOR: u64 = 0;
@@ -106,9 +121,39 @@ struct CodexBinaryIdentity {
     modified_nanoseconds: u128,
 }
 
-fn verified_codex_binary_cache() -> &'static Mutex<Option<CodexBinaryIdentity>> {
-    static CACHE: OnceLock<Mutex<Option<CodexBinaryIdentity>>> = OnceLock::new();
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedCodexBinary {
+    identity: CodexBinaryIdentity,
+    boundary: VersionProbeNetworkBoundary,
+    #[cfg(test)]
+    version: String,
+}
+
+fn verified_codex_binary_cache() -> &'static Mutex<Option<VerifiedCodexBinary>> {
+    static CACHE: OnceLock<Mutex<Option<VerifiedCodexBinary>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Evaluator-only capability token binding model attribution to one vetted executable identity.
+/// The absolute path alone is insufficient because its inode can be replaced during a long run.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct PinnedCodexRuntime {
+    pub(crate) path: PathBuf,
+    pub(crate) version: String,
+    identity: CodexBinaryIdentity,
+}
+
+#[cfg(test)]
+impl PinnedCodexRuntime {
+    pub(crate) fn assert_unchanged(&self) -> crate::error::Result<()> {
+        if codex_binary_identity(&self.path)? != self.identity {
+            return Err(AppError::Unavailable(
+                "pinned Codex runtime changed during the quality run".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct CodexCliProvider {
@@ -117,6 +162,8 @@ struct CodexCliProvider {
     effort: String,
     #[cfg(test)]
     runtime_probe: Option<CodexRuntimeProbe>,
+    #[cfg(test)]
+    pinned_runtime: Option<Arc<PinnedCodexRuntime>>,
 }
 
 #[cfg(test)]
@@ -134,6 +181,8 @@ impl CodexCliProvider {
             effort: String::new(),
             #[cfg(test)]
             runtime_probe: None,
+            #[cfg(test)]
+            pinned_runtime: None,
         }
     }
 
@@ -154,7 +203,15 @@ impl CodexCliProvider {
             model: String::new(),
             effort: String::new(),
             runtime_probe: None,
+            pinned_runtime: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_pinned_runtime(mut self, runtime: Arc<PinnedCodexRuntime>) -> Self {
+        self.binary = runtime.path.to_string_lossy().into_owned();
+        self.pinned_runtime = Some(runtime);
+        self
     }
 
     #[cfg(test)]
@@ -181,6 +238,8 @@ impl CodexCliProvider {
         ensure_empty_cwd()?;
         validate_model(&self.model)?;
         let bin = resolve_codex_binary(&self.binary)?;
+        #[cfg(test)]
+        self.assert_pinned_runtime_unchanged(&bin)?;
         verify_supported_codex_cli(&bin).await?;
         let mut runtime_home = self.prepare_runtime_home()?;
         let mut cmd = self.build_command(&bin, runtime_home.path());
@@ -237,6 +296,9 @@ impl CodexCliProvider {
             }
         };
 
+        #[cfg(test)]
+        self.assert_pinned_runtime_unchanged(&bin)?;
+
         if !output.status.success() {
             let code = output.status.code().unwrap_or(-1);
             tracing::debug!(
@@ -277,6 +339,19 @@ impl CodexCliProvider {
             );
         }
         build_codex_command_with_effort(bin, &self.model, &self.effort, runtime_home)
+    }
+
+    #[cfg(test)]
+    fn assert_pinned_runtime_unchanged(&self, bin: &str) -> crate::error::Result<()> {
+        let Some(runtime) = &self.pinned_runtime else {
+            return Ok(());
+        };
+        if Path::new(bin) != runtime.path {
+            return Err(AppError::Unavailable(
+                "quality provider selected a different Codex runtime".into(),
+            ));
+        }
+        runtime.assert_unchanged()
     }
 }
 
@@ -382,6 +457,40 @@ fn resolve_codex_binary(binary: &str) -> crate::error::Result<String> {
     resolve_codex_binary_from(binary, user_home.as_deref(), None)
 }
 
+/// Resolve the exact default CLI candidate production generation would execute. The quality
+/// evaluator uses this seam so its runtime version/hash cannot drift to a different package-manager
+/// install than [`CodexCliProvider::run_prompt`].
+#[cfg(test)]
+pub(crate) fn resolve_default_binary_path() -> crate::error::Result<PathBuf> {
+    let resolved = resolve_codex_binary(DEFAULT_BINARY)?;
+    fs::canonicalize(resolved)
+        .map_err(|_| AppError::Unavailable("Codex executable identity could not be read".into()))
+}
+
+/// Resolve, vet and locally version-probe one immutable evaluator runtime token. The quality
+/// runner passes this same token through every canonical provider wrapper and CloudReasoner build.
+#[cfg(test)]
+pub(crate) async fn resolve_pinned_default_runtime() -> crate::error::Result<PinnedCodexRuntime> {
+    let path = resolve_default_binary_path()?;
+    let path_string = path
+        .to_str()
+        .ok_or_else(|| AppError::Unavailable("Codex executable path is not UTF-8".into()))?;
+    let verified = probe_supported_codex_version_production(path_string).await?;
+    Ok(PinnedCodexRuntime {
+        path: verified.identity.canonical_path.clone(),
+        version: verified.version,
+        identity: verified.identity,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_default_binary_path_from(
+    user_home: Option<&Path>,
+    discovery_path: Option<&std::ffi::OsStr>,
+) -> crate::error::Result<PathBuf> {
+    resolve_codex_binary_from(DEFAULT_BINARY, user_home, discovery_path).map(PathBuf::from)
+}
+
 fn resolve_codex_binary_from(
     binary: &str,
     user_home: Option<&Path>,
@@ -402,32 +511,24 @@ fn resolve_codex_binary_from(
         search_dirs.extend(std::env::split_paths(discovery_path));
     }
     if let Some(home) = user_home {
-        for relative in [
-            ".local/bin",
-            ".bun/bin",
-            ".deno/bin",
-            ".volta/bin",
-            ".npm-global/bin",
-            ".asdf/shims",
-            ".fnm/aliases/default/bin",
-            ".nodenv/shims",
-            ".n/bin",
-            ".local/share/pnpm",
-            "Library/pnpm",
-        ] {
+        for relative in DEFAULT_SEARCH_RELATIVE_DIRS {
             search_dirs.push(home.join(relative));
         }
         if let Ok(node_versions) = fs::read_dir(home.join(".nvm/versions/node")) {
-            search_dirs.extend(
-                node_versions
-                    .filter_map(std::result::Result::ok)
-                    .map(|entry| entry.path().join("bin")),
-            );
+            let mut version_dirs = node_versions
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path().join("bin"))
+                .collect::<Vec<_>>();
+            version_dirs.sort();
+            search_dirs.extend(version_dirs);
         }
     }
-    search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    search_dirs.push(PathBuf::from("/opt/local/bin"));
-    search_dirs.push(PathBuf::from("/usr/local/bin"));
+    search_dirs.extend(
+        DEFAULT_SEARCH_SYSTEM_DIRS
+            .iter()
+            .copied()
+            .map(PathBuf::from),
+    );
 
     for directory in search_dirs {
         let candidate = directory.join(binary);
@@ -452,6 +553,22 @@ pub(super) fn provider(model: String, effort: String) -> Arc<dyn SummarizerProvi
         CodexCliProvider::new()
             .with_model(model)
             .with_effort(effort),
+    )
+}
+
+/// Evaluator-only raw transport constructor. Callers may use it only as the inner provider passed
+/// to `make_provider_resolved`, which remains the owner of consent, redaction and ledger writes.
+#[cfg(test)]
+pub(crate) fn provider_with_pinned_runtime(
+    model: String,
+    effort: String,
+    runtime: Arc<PinnedCodexRuntime>,
+) -> Arc<dyn SummarizerProvider> {
+    Arc::new(
+        CodexCliProvider::new()
+            .with_model(model)
+            .with_effort(effort)
+            .with_pinned_runtime(runtime),
     )
 }
 
@@ -501,6 +618,14 @@ async fn verify_supported_codex_cli(bin: &str) -> crate::error::Result<()> {
 
 #[cfg_attr(test, allow(dead_code))]
 async fn verify_supported_codex_cli_production(bin: &str) -> crate::error::Result<()> {
+    probe_supported_codex_version_production(bin)
+        .await
+        .map(|_| ())
+}
+
+async fn probe_supported_codex_version_production(
+    bin: &str,
+) -> crate::error::Result<VerifiedCodexBinary> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = bin;
@@ -511,12 +636,12 @@ async fn verify_supported_codex_cli_production(bin: &str) -> crate::error::Resul
     }
     #[cfg(target_os = "macos")]
     {
-        verify_supported_codex_cli_with_boundary(bin, VersionProbeNetworkBoundary::MacosSeatbelt)
+        probe_supported_codex_version_with_boundary(bin, VersionProbeNetworkBoundary::MacosSeatbelt)
             .await
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VersionProbeNetworkBoundary {
     #[cfg(target_os = "macos")]
     MacosSeatbelt,
@@ -524,19 +649,30 @@ enum VersionProbeNetworkBoundary {
     InheritedTestSandbox,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 async fn verify_supported_codex_cli_with_boundary(
     bin: &str,
     boundary: VersionProbeNetworkBoundary,
 ) -> crate::error::Result<()> {
+    probe_supported_codex_version_with_boundary(bin, boundary)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn probe_supported_codex_version_with_boundary(
+    bin: &str,
+    boundary: VersionProbeNetworkBoundary,
+) -> crate::error::Result<VerifiedCodexBinary> {
     let identity = codex_binary_identity(Path::new(bin))?;
-    if verified_codex_binary_cache()
+    if let Some(verified) = verified_codex_binary_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        == Some(&identity)
     {
-        return Ok(());
+        if verified.identity == identity && verified.boundary == boundary {
+            return Ok(verified.clone());
+        }
     }
 
     let mut command = codex_version_probe_command(bin, boundary);
@@ -558,10 +694,22 @@ async fn verify_supported_codex_cli_with_boundary(
     let version = String::from_utf8(output.stdout)
         .map_err(|_| AppError::Unavailable("Codex version output was not UTF-8".into()))?;
     validate_supported_codex_version(&version)?;
+    let post_probe_identity = codex_binary_identity(Path::new(bin))?;
+    if post_probe_identity != identity {
+        return Err(AppError::Unavailable(
+            "Codex executable changed during the bounded version probe".into(),
+        ));
+    }
+    let verified = VerifiedCodexBinary {
+        identity,
+        boundary,
+        #[cfg(test)]
+        version: version.trim().to_string(),
+    };
     *verified_codex_binary_cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
-    Ok(())
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verified.clone());
+    Ok(verified)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1566,7 +1714,6 @@ fn parse_codex_jsonl(stdout: &str) -> crate::error::Result<String> {
                 "Codex returned an event without a type; no content was accepted".into(),
             )
         })?;
-
         match event_type {
             "thread.started" => {
                 if state != CodexJsonlState::AwaitingThread {
@@ -1616,8 +1763,13 @@ fn parse_codex_jsonl(stdout: &str) -> crate::error::Result<String> {
                         "Codex returned an untyped item event; no content was accepted".into(),
                     )
                 })?;
-                let pre_turn_hook_notice = state == CodexJsonlState::AwaitingTurn
-                    && item_event == "item.completed"
+                // Codex emits this process-local trust advisory independently of model output.
+                // Admit only its exact completed error shape before the active turn, including
+                // before thread.started; every other pre-thread/pre-turn item still fails closed.
+                let pre_turn_hook_notice = matches!(
+                    state,
+                    CodexJsonlState::AwaitingThread | CodexJsonlState::AwaitingTurn
+                ) && item_event == "item.completed"
                     && item_type == "error"
                     && item
                         .get("message")
@@ -2265,6 +2417,93 @@ mod tests {
         assert!(!stderr_reports_tool_activity(
             b"Codex completed a tool-free text response"
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn version_probe_cache_is_scoped_to_the_network_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::storage::db::unique_temp_path("murmur-codex-boundary-cache", "dir");
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("codex");
+        let counter = root.join("runs");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n/usr/bin/printf x >> \"{}\"\n/usr/bin/printf 'codex-cli 0.146.0\\n'\n",
+                counter.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = binary.to_str().unwrap();
+
+        let network_boundary = schema_test_network_boundary();
+        probe_supported_codex_version_with_boundary(
+            binary,
+            VersionProbeNetworkBoundary::InheritedTestSandbox,
+        )
+        .await
+        .unwrap();
+        let production_result = probe_supported_codex_version_with_boundary(
+            binary,
+            VersionProbeNetworkBoundary::MacosSeatbelt,
+        )
+        .await;
+        match network_boundary {
+            SchemaNetworkBoundary::InnerDenyAll => {
+                production_result.unwrap();
+                assert_eq!(fs::read(&counter).unwrap(), b"xx");
+            }
+            SchemaNetworkBoundary::InheritedNonLoopbackDenied => {
+                assert!(
+                    production_result.is_err(),
+                    "a cache entry from the inherited test boundary must not satisfy the production boundary"
+                );
+                assert_eq!(
+                    fs::read(&counter).unwrap(),
+                    b"x",
+                    "nested Seatbelt rejection must happen before the production child executes"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn installed_default_runtime_pin_uses_the_production_bounded_probe_when_available() {
+        let Some(binary) =
+            installed_codex_for_runtime_proof("MURMUR_CODEX_RUNTIME_PIN_SKIPPED cli=absent")
+        else {
+            return;
+        };
+        let expected = fs::canonicalize(binary).unwrap();
+        let network_boundary = schema_test_network_boundary();
+        let result = resolve_pinned_default_runtime().await;
+        match network_boundary {
+            SchemaNetworkBoundary::InnerDenyAll => {
+                let runtime = result.expect(
+                    "installed default Codex must pass the production bounded version probe",
+                );
+                assert_eq!(runtime.path, expected);
+                validate_supported_codex_version(&runtime.version).unwrap();
+                runtime.assert_unchanged().unwrap();
+                emit_runner_marker(
+                    "MURMUR_CODEX_RUNTIME_PIN_EXECUTED supported_0_146_x=true bounded=true identity=true network_boundary=inner_deny_all",
+                );
+            }
+            SchemaNetworkBoundary::InheritedNonLoopbackDenied => {
+                assert!(
+                    result.is_err(),
+                    "production runtime pin must fail closed when deny-all Seatbelt cannot be nested"
+                );
+                emit_runner_marker(
+                    "MURMUR_CODEX_RUNTIME_PIN_EXECUTED child_started=false bounded=false identity=false fail_closed=true network_boundary=inherited_outer_plus_inner_rejected",
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -3209,6 +3448,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn default_resolver_sorts_nvm_candidates_deterministically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::storage::db::unique_temp_path("murmur-codex-nvm-order", "dir");
+        let v20 = root.join(".nvm/versions/node/v20/bin/codex");
+        let v18 = root.join(".nvm/versions/node/v18/bin/codex");
+        fs::create_dir_all(v20.parent().unwrap()).unwrap();
+        fs::create_dir_all(v18.parent().unwrap()).unwrap();
+        for binary in [&v20, &v18] {
+            fs::write(binary, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(binary, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        assert_eq!(
+            resolve_codex_binary_from(DEFAULT_BINARY, Some(&root), None).unwrap(),
+            v18.to_string_lossy()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_provider_rejects_runtime_identity_drift_before_generation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::storage::db::unique_temp_path("murmur-codex-runtime-pin", "dir");
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("codex");
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical = fs::canonicalize(&binary).unwrap();
+        let runtime = Arc::new(PinnedCodexRuntime {
+            path: canonical.clone(),
+            version: "codex-cli 0.146.0".into(),
+            identity: codex_binary_identity(&canonical).unwrap(),
+        });
+        let provider = CodexCliProvider::new().with_pinned_runtime(Arc::clone(&runtime));
+        provider
+            .assert_pinned_runtime_unchanged(canonical.to_str().unwrap())
+            .unwrap();
+
+        fs::write(&binary, b"#!/bin/sh\n/usr/bin/printf drift\nexit 0\n").unwrap();
+        assert!(provider
+            .assert_pinned_runtime_unchanged(canonical.to_str().unwrap())
+            .is_err());
+        assert!(runtime.assert_unchanged().is_err());
+        let error = provider
+            .complete("system sentinel", "user sentinel")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Unavailable(message)
+            if message == "pinned Codex runtime changed during the quality run"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn runtime_home_exposes_only_validated_auth_not_ambient_config() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -3430,6 +3726,10 @@ mod tests {
             "codex-cli 1.146.0",
             "codex 0.146.0",
             "codex-cli unknown",
+            "codex-cli 0.146",
+            "codex-cli 0.146.0.1",
+            "codex-cli 0.146.0-beta.1",
+            "codex-cli 0.146.-1",
         ] {
             assert!(
                 validate_supported_codex_version(unsupported).is_err(),
@@ -3526,6 +3826,34 @@ mod tests {
             "{\"type\":\"turn.completed\"}\n"
         );
         assert_eq!(parse_codex_jsonl(jsonl).unwrap(), "hello");
+    }
+
+    #[test]
+    fn parser_accepts_exact_hook_notice_before_thread_start_only() {
+        const HOOK_NOTICE: &str = "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.";
+        let jsonl = format!(
+            concat!(
+                "{{\"type\":\"item.completed\",\"item\":{{\"id\":\"pre-thread\",\"type\":\"error\",\"message\":{notice}}}}}\n",
+                "{{\"type\":\"thread.started\",\"thread_id\":\"t\"}}\n",
+                "{{\"type\":\"item.completed\",\"item\":{{\"id\":\"pre-turn\",\"type\":\"error\",\"message\":{notice}}}}}\n",
+                "{{\"type\":\"turn.started\"}}\n",
+                "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"hello\"}}}}\n",
+                "{{\"type\":\"turn.completed\"}}\n"
+            ),
+            notice = serde_json::to_string(HOOK_NOTICE).unwrap()
+        );
+        assert_eq!(parse_codex_jsonl(&jsonl).unwrap(), "hello");
+
+        for forbidden in [
+            jsonl.replace(HOOK_NOTICE, "arbitrary pre-thread error"),
+            jsonl.replace("\"type\":\"error\"", "\"type\":\"command_execution\""),
+            jsonl.replace("\"type\":\"item.completed\"", "\"type\":\"item.started\""),
+        ] {
+            assert!(
+                parse_codex_jsonl(&forbidden).is_err(),
+                "only the exact completed hook advisory may precede thread.started"
+            );
+        }
     }
 
     #[test]

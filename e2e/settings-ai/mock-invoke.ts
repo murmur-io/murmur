@@ -115,6 +115,72 @@ export async function mockTauri(
           ),
         };
       };
+      const rememberAskSourceTitles = (cmd: string, value: unknown): unknown => {
+        const remember = (
+          window as unknown as {
+            __demoRememberAskSourceTitles?: (
+              sources: Array<{ kind: string; id: string; title: string }>,
+            ) => void;
+          }
+        ).__demoRememberAskSourceTitles;
+        if (!remember) return value;
+        if (cmd === "list_link_candidates" && Array.isArray(value)) {
+          remember(
+            value.filter(
+              (row): row is { kind: string; id: string; title: string } =>
+                typeof row === "object" &&
+                row !== null &&
+                typeof row.kind === "string" &&
+                typeof row.id === "string" &&
+                typeof row.title === "string",
+            ),
+          );
+        } else if (cmd === "list_links" && Array.isArray(value)) {
+          remember(
+            value.flatMap((row) => {
+              if (
+                typeof row !== "object" ||
+                row === null ||
+                !("otherKind" in row) ||
+                !("otherId" in row) ||
+                !("otherTitle" in row)
+              ) {
+                return [];
+              }
+              return [
+                {
+                  kind: String(row.otherKind),
+                  id: String(row.otherId),
+                  title: String(row.otherTitle),
+                },
+              ];
+            }),
+          );
+        } else if (cmd === "get_note" && typeof value === "object" && value) {
+          const note = value as { id?: unknown; title?: unknown };
+          if (typeof note.id === "string" && typeof note.title === "string") {
+            remember([{ kind: "note", id: note.id, title: note.title }]);
+          }
+        } else if (
+          cmd === "get_meeting_detail" &&
+          typeof value === "object" &&
+          value &&
+          "meeting" in value
+        ) {
+          const meeting = (value as { meeting?: { id?: unknown; title?: unknown } })
+            .meeting;
+          if (
+            meeting &&
+            typeof meeting.id === "string" &&
+            typeof meeting.title === "string"
+          ) {
+            remember([
+              { kind: "meeting", id: meeting.id, title: meeting.title },
+            ]);
+          }
+        }
+        return value;
+      };
       eventPluginInternals.unregisterListener = (
         event: string,
         eventId: number,
@@ -203,7 +269,9 @@ export async function mockTauri(
             "args",
             `return (${config.overrides[cmd]})(args);`,
           );
-          return Promise.resolve(fn(args ?? {}));
+          return Promise.resolve(fn(args ?? {})).then((value) =>
+            rememberAskSourceTitles(cmd, value),
+          );
         }
         if (cmd === "get_analytics") {
           // The screenshot fixture has a fixed historical anchor. Keep only the
@@ -211,7 +279,9 @@ export async function mockTauri(
           // chart remains non-uniform when the calendar advances.
           return orig(cmd, args).then(refreshDemoAnalyticsWindow);
         }
-        return orig(cmd, args);
+        return orig(cmd, args).then((value) =>
+          rememberAskSourceTitles(cmd, value),
+        );
       };
     },
     {

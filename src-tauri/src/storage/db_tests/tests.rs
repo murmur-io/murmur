@@ -557,10 +557,22 @@ fn delete_org_state_atomically_purges_the_complete_replica() {
         Some(&crate::embed::StubEmbedder),
     )
     .unwrap();
+    db.persist_ask_exchange(
+        &crate::storage::models::AskConversationScope::Vault,
+        None,
+        "question",
+        "legacy opaque derived answer (defense-only fixture)",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-08-06T12:00:00Z",
+    )
+    .unwrap();
 
     db.delete_org_state("org-1").unwrap();
 
-    let counts: (i64, i64, i64, i64) = {
+    let counts: (i64, i64, i64, i64, i64) = {
         let conn = db.lock();
         (
             conn.query_row("SELECT COUNT(*) FROM org_state", [], |r| r.get(0))
@@ -571,9 +583,36 @@ fn delete_org_state_atomically_purges_the_complete_replica() {
                 .unwrap(),
             conn.query_row("SELECT COUNT(*) FROM org_vec_chunks", [], |r| r.get(0))
                 .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM ask_conversations", [], |r| r.get(0))
+                .unwrap(),
         )
     };
-    assert_eq!(counts, (0, 0, 0, 0));
+    assert_eq!(counts, (0, 0, 0, 0, 0));
+}
+
+#[test]
+fn membership_withdrawal_purges_stale_history_even_with_empty_replica() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    db.persist_ask_exchange(
+        &crate::storage::models::AskConversationScope::Vault,
+        None,
+        "question",
+        "legacy opaque derived copy (defense-only fixture)",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-08-06T12:00:00Z",
+    )
+    .unwrap();
+
+    assert!(db.delete_org_state("org-1").unwrap());
+    let count: i64 = db
+        .lock()
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 /// The publish HTTP response can arrive after leave/removal committed. Its best-effort owner
@@ -587,23 +626,25 @@ fn local_org_replica_commit_after_leave_cannot_restore_plaintext() {
         Db::prepare_org_item_index("Late publish", "t", "withdrawn plaintext", None).unwrap();
 
     db.delete_org_state("org-1").unwrap();
-    db.commit_local_org_replica(
-        "it-late",
-        "org-1",
-        9,
-        "anna",
-        "Late publish",
-        "withdrawn plaintext",
-        "t",
-        1,
-        1,
-        &sha32(38),
-        None,
-        Some("author-1"),
-        &prepared,
-        None,
-    )
-    .unwrap();
+    let superseded_evicted = db
+        .commit_local_org_replica(
+            "it-late",
+            "org-1",
+            9,
+            "anna",
+            "Late publish",
+            "withdrawn plaintext",
+            "t",
+            1,
+            1,
+            &sha32(38),
+            None,
+            Some("author-1"),
+            &prepared,
+            None,
+        )
+        .unwrap();
+    assert!(!superseded_evicted);
 
     let counts: (i64, i64) = {
         let conn = db.lock();
@@ -648,23 +689,25 @@ fn local_org_replica_refresh_preserves_feed_vectors_for_same_item() {
     assert!(vectors_before > 0);
 
     let fts_only = Db::prepare_org_item_index("Vectorized", "t", "semantic body", None).unwrap();
-    db.commit_local_org_replica(
-        "it-live",
-        "org-1",
-        12,
-        "anna",
-        "Vectorized",
-        "semantic body",
-        "t",
-        1,
-        1,
-        &sha,
-        None,
-        Some("author-1"),
-        &fts_only,
-        None,
-    )
-    .unwrap();
+    let superseded_evicted = db
+        .commit_local_org_replica(
+            "it-live",
+            "org-1",
+            12,
+            "anna",
+            "Vectorized",
+            "semantic body",
+            "t",
+            1,
+            1,
+            &sha,
+            None,
+            Some("author-1"),
+            &fts_only,
+            None,
+        )
+        .unwrap();
+    assert!(!superseded_evicted);
 
     let vectors_after: i64 = db
         .lock()
@@ -679,6 +722,92 @@ fn local_org_replica_refresh_preserves_feed_vectors_for_same_item() {
             .as_deref(),
         Some("author-1")
     );
+}
+
+/// The supersede result must come from the SAME transaction that tombstones the predecessor. A
+/// pre-read can race a feed ingest and miss the visibility reduction, leaving open Ask plaintext
+/// without an epoch bump/event even though the transaction already purged durable history.
+#[test]
+fn local_org_replica_commit_reports_transactional_supersede_once() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    let old_sha = sha32(39);
+    db.upsert_org_item(
+        "it-old",
+        "org-1",
+        10,
+        "anna",
+        "Old",
+        "old body",
+        "t",
+        1,
+        1,
+        &old_sha,
+        None,
+        Some("author-1"),
+        None,
+    )
+    .unwrap();
+    db.persist_ask_exchange(
+        &crate::storage::models::AskConversationScope::Vault,
+        None,
+        "question",
+        "legacy opaque derived answer (defense-only fixture)",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-08-06T12:00:00Z",
+    )
+    .unwrap();
+
+    let new_sha = sha32(40);
+    let prepared = Db::prepare_org_item_index("New", "t2", "new body", None).unwrap();
+    let first = db
+        .commit_local_org_replica(
+            "it-new",
+            "org-1",
+            11,
+            "anna",
+            "New",
+            "new body",
+            "t2",
+            2,
+            1,
+            &new_sha,
+            None,
+            Some("author-1"),
+            &prepared,
+            Some("it-old"),
+        )
+        .unwrap();
+    assert!(first, "the transaction evicted a live predecessor");
+    assert!(db.org_replica_state("it-old").unwrap().unwrap().tombstoned);
+    let ask_rows: i64 = db
+        .lock()
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ask_rows, 0, "supersede atomically purges derived Ask history");
+
+    let second = db
+        .commit_local_org_replica(
+            "it-new",
+            "org-1",
+            11,
+            "anna",
+            "New",
+            "new body",
+            "t2",
+            2,
+            1,
+            &new_sha,
+            None,
+            Some("author-1"),
+            &prepared,
+            Some("it-old"),
+        )
+        .unwrap();
+    assert!(!second, "an already tombstoned predecessor is a no-op");
 }
 
 /// Model-switch org rebuild is vector-only: purge removes old-space vectors but leaves the
@@ -891,6 +1020,18 @@ fn org_tombstone_evicts_from_retrieval_and_viewer() {
         Some(&emb),
     )
     .unwrap();
+    db.persist_ask_exchange(
+        &crate::storage::models::AskConversationScope::Vault,
+        None,
+        "question",
+        "legacy opaque derived answer (defense-only fixture)",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-08-06T12:00:00Z",
+    )
+    .unwrap();
     assert_eq!(
         db.search_org_chunks_fts("atlas acquisition", 10)
             .unwrap()
@@ -928,6 +1069,11 @@ fn org_tombstone_evicts_from_retrieval_and_viewer() {
         )
         .unwrap();
     assert_eq!(n, 0, "org_chunks purged on tombstone");
+    let ask_count: i64 = db
+        .lock()
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(ask_count, 0, "org tombstone must purge global-derived Ask");
     // Idempotent re-tombstone.
     db.tombstone_org_item("it-t").unwrap();
 }

@@ -7,17 +7,43 @@
         your vault — with links to the meetings it came from.
       </p>
     </div>
-    @if (conversation().length) {
+    <div class="ask-head-actions">
       <button
         type="button"
-        class="btn btn-ghost ask-clear"
-        (click)="clear()"
-        [disabled]="pending()"
+        class="btn btn-ghost ask-head-action"
+        aria-label="Conversation history"
+        [attr.aria-pressed]="historyOpen()"
+        (click)="toggleHistory()"
+        [disabled]="pending() || !historyPrivacyReady()"
       >
-        Clear
+        <mur-icon icon="history" />
+        <span>History</span>
       </button>
-    }
+      <button
+        type="button"
+        class="btn btn-ghost ask-head-action"
+        aria-label="New conversation"
+        (click)="newConversation()"
+        [disabled]="pending() || !historyPrivacyReady()"
+      >
+        <mur-icon icon="plus" />
+        <span>New</span>
+      </button>
+    </div>
   </header>
+
+  @if (historyPrivacyError(); as privacyError) {
+    <div class="ask-error" role="alert">
+      <span class="ask-error-text">{{ privacyError }}</span>
+      <button
+        type="button"
+        class="btn btn-ghost ask-retry"
+        (click)="retryHistoryPrivacy()"
+      >
+        Retry
+      </button>
+    </div>
+  }
 
   @if (loading()) {
     <div class="card state-card">
@@ -35,6 +61,19 @@
     </div>
   } @else {
     <div class="ask-panel card">
+      @if (historyOpen()) {
+        <mur-chat-history
+          class="ask-history"
+          [threads]="history()"
+          [loading]="historyLoading()"
+          [error]="historyError()"
+          [notice]="historyActionError()"
+          [activeThreadId]="conversationId()"
+          [loadingThreadId]="historyResumeId()"
+          (selected)="resumeConversation($event)"
+          (retryRequested)="retryHistory()"
+        />
+      } @else {
       <!-- Message list (also the scroll region) -->
       <div
         #scroller
@@ -62,6 +101,7 @@
                   type="button"
                   class="ask-chip"
                   [style.--i]="$index"
+                  [disabled]="!historyPrivacyReady()"
                   (click)="ask(s)"
                 >
                   {{ s }}
@@ -151,7 +191,7 @@
               type="button"
               class="btn btn-ghost ask-retry"
               (click)="retry()"
-              [disabled]="pending()"
+              [disabled]="pending() || !historyPrivacyReady()"
             >
               Retry
             </button>
@@ -164,6 +204,7 @@
       <mur-source-picker
         class="ask-sources"
         [(selected)]="sources"
+        [disabled]="pending() || !historyPrivacyReady()"
         triggerLabel="Sources"
         placeholder="Scope to a note or meeting…"
       />
@@ -180,7 +221,7 @@
           aria-label="Your question"
           placeholder="Ask anything about your meetings…"
           [value]="draft()"
-          [disabled]="pending()"
+          [disabled]="pending() || !historyPrivacyReady()"
           (input)="onDraftInput($event)"
           (keydown)="onKeydown($event)"
         ></textarea>
@@ -197,6 +238,7 @@
           }
         </button>
       </form>
+      }
     </div>
   }
 </section>

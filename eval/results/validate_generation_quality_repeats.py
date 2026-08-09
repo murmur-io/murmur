@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,24 @@ QWEN1_BYTES = 1_282_439_584
 QWEN4_SHA256 = "2fde00ce69dd4899c70d020845e2638353015bba0fdf161b3eb965f2bca4464e"
 QWEN1_SHA256 = "72c5c3cb38fa32d5256e2fe30d03e7a64c6c79e668ad84057e3bd66e250b24fb"
 LOCAL_RUNTIME_VERSION = "murmur-brain-workspace-build"
-CODEX_BINARY = Path("/opt/homebrew/bin/codex")
+CODEX_SEARCH_RELATIVE_DIRS = (
+    ".local/bin",
+    ".bun/bin",
+    ".deno/bin",
+    ".volta/bin",
+    ".npm-global/bin",
+    ".asdf/shims",
+    ".fnm/aliases/default/bin",
+    ".nodenv/shims",
+    ".n/bin",
+    ".local/share/pnpm",
+    "Library/pnpm",
+)
+CODEX_SYSTEM_DIRS = (
+    Path("/opt/homebrew/bin"),
+    Path("/opt/local/bin"),
+    Path("/usr/local/bin"),
+)
 EXPECTED_ORDERS = {
     "1": [QWEN4, QWEN1, SOL],
     "2": [SOL, QWEN1, QWEN4],
@@ -634,6 +652,38 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def resolve_codex_binary(
+    user_home: Path | None = None,
+    system_dirs: tuple[Path, ...] | None = None,
+) -> Path:
+    """Mirror CodexCliProvider's trusted, configuration-free default search order."""
+    home = Path.home() if user_home is None else user_home
+    search_dirs = [home / relative for relative in CODEX_SEARCH_RELATIVE_DIRS]
+    nvm_root = home / ".nvm/versions/node"
+    try:
+        search_dirs.extend(entry / "bin" for entry in sorted(nvm_root.iterdir()))
+    except OSError:
+        pass
+    search_dirs.extend(CODEX_SYSTEM_DIRS if system_dirs is None else system_dirs)
+
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    for directory in search_dirs:
+        candidate = directory / "codex"
+        try:
+            canonical = candidate.resolve(strict=True)
+            metadata = canonical.stat()
+        except OSError:
+            continue
+        if not canonical.is_file():
+            continue
+        if current_uid is not None and metadata.st_uid != current_uid:
+            continue
+        if metadata.st_mode & 0o002 or metadata.st_mode & 0o111 == 0:
+            continue
+        return candidate
+    raise ValueError("current Codex runtime is absent from the trusted provider search paths")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -2756,20 +2806,12 @@ def validate_and_combine(
         require(sidecar_path.is_file(), f"current local runtime is missing: {sidecar_path}")
         current_local_runtime_version = LOCAL_RUNTIME_VERSION
         current_local_runtime_sha = sha256_file(sidecar_path)
-        require(CODEX_BINARY.is_file(), f"current Codex runtime is missing: {CODEX_BINARY}")
-        current_codex_runtime_sha = sha256_file(CODEX_BINARY)
-        codex_version_result = subprocess.run(
-            [str(CODEX_BINARY), "--version"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        current_codex_runtime_version = codex_version_result.stdout.strip()
-        require(
-            codex_version_result.returncode == 0 and bool(current_codex_runtime_version),
-            "cannot re-identify the current Codex runtime",
-        )
+        codex_binary = resolve_codex_binary()
+        current_codex_runtime_sha = sha256_file(codex_binary)
+        # Rust recorded this value through its bounded, environment-hardened, deny-network probe.
+        # Re-running a raw CLI from the validator would create a weaker second execution boundary;
+        # an exact runtime hash match makes the attested version stable without another process.
+        current_codex_runtime_version = first_arms[SOL]["metadata"]["runtimeVersion"]
     else:
         require(
             set(runtime_identities) == {"local", "codex"}
@@ -3107,6 +3149,71 @@ def verify_committed_evidence(manifest_path: Path) -> None:
 
 
 def run_selftests() -> None:
+    codex_provider_source = (
+        REPO_ROOT / "src-tauri/src/summarize/codex_cli.rs"
+    ).read_text(encoding="utf-8")
+
+    def rust_string_array(name: str) -> tuple[str, ...]:
+        match = re.search(
+            rf"const {re.escape(name)}: &\[&str\]\s*=\s*&\[(.*?)\];",
+            codex_provider_source,
+            re.DOTALL,
+        )
+        require(match is not None, f"selftest: Rust Codex resolver array {name} is missing")
+        return tuple(re.findall(r'"([^"]+)"', match.group(1)))
+
+    require(
+        rust_string_array("DEFAULT_SEARCH_RELATIVE_DIRS")
+        == CODEX_SEARCH_RELATIVE_DIRS,
+        "selftest: Python and production Rust Codex package-manager search order differ",
+    )
+    require(
+        rust_string_array("DEFAULT_SEARCH_SYSTEM_DIRS")
+        == tuple(str(path) for path in CODEX_SYSTEM_DIRS),
+        "selftest: Python and production Rust Codex system search order differ",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="murmur-codex-provenance-") as temp_root:
+        root = Path(temp_root)
+        selected = root / "home/.local/bin/codex"
+        fallback = root / "fallback/codex"
+        selected.parent.mkdir(parents=True)
+        fallback.parent.mkdir(parents=True)
+        selected.write_bytes(b"selected-runtime")
+        fallback.write_bytes(b"fallback-runtime")
+        selected.chmod(0o700)
+        fallback.chmod(0o700)
+        require(
+            resolve_codex_binary(root / "home", (fallback.parent,)) == selected,
+            "selftest: Codex resolver ignored provider package-manager precedence",
+        )
+        selected.chmod(0o702)
+        require(
+            resolve_codex_binary(root / "home", (fallback.parent,)) == fallback,
+            "selftest: Codex resolver accepted a world-writable candidate",
+        )
+        fallback.chmod(0o600)
+        try:
+            resolve_codex_binary(root / "home", (fallback.parent,))
+        except ValueError:
+            pass
+        else:
+            raise ValueError("selftest: Codex resolver accepted an unexecutable candidate")
+
+        nvm_home = root / "nvm-home"
+        nvm_v20 = nvm_home / ".nvm/versions/node/v20/bin/codex"
+        nvm_v18 = nvm_home / ".nvm/versions/node/v18/bin/codex"
+        nvm_v20.parent.mkdir(parents=True)
+        nvm_v18.parent.mkdir(parents=True)
+        nvm_v20.write_bytes(b"v20-runtime")
+        nvm_v18.write_bytes(b"v18-runtime")
+        nvm_v20.chmod(0o700)
+        nvm_v18.chmod(0o700)
+        require(
+            resolve_codex_binary(nvm_home, ()) == nvm_v18,
+            "selftest: Codex NVM resolution is not deterministic",
+        )
+
     require(
         REQUIRED_SOURCE_FILES.issubset(SOURCE_FILES),
         "selftest: a required source dependency is absent from the fingerprint",

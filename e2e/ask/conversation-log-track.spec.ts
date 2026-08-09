@@ -5,8 +5,9 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * Regression for the Ask conversation log's `@for` tracking. The turns array is
  * NOT append-only: `retry()` (ask.component.ts) pops the dangling user turn and
  * `send()` re-appends it, landing back at the same array INDEX it previously
- * occupied. `AskTurn` carries a stable `id` (minted by a monotonic counter) and
- * the template tracks `turn.id` — never `$index` — precisely so Angular mints a
+ * occupied. A pending/failed turn carries a fresh ephemeral monotonic `id`; a
+ * committed turn is re-keyed to the UUID returned by the backend. The template
+ * tracks `turn.id` — never `$index` — precisely so Angular mints a
  * FRESH DOM node for the retried bubble instead of reusing the old one (which
  * would silently skip its one-shot `bubble-in` entrance animation, the
  * `.ask-row` CSS rule in ask.component.scss).
@@ -39,13 +40,16 @@ test("Ask conversation log mints a fresh DOM node for a retried turn (not an ind
     // Overrides run PAGE-SIDE, re-parsed from a serialized string (see
     // mockTauri) — no closures over outer scope, so the call counter is
     // stashed on `window` instead.
-    ask_vault: () => {
+    ask_vault_persisted: (args: { conversationId?: string }) => {
       const w = window as unknown as { __askVaultCalls?: number };
       w.__askVaultCalls = (w.__askVaultCalls ?? 0) + 1;
       if (w.__askVaultCalls === 2) {
         throw new Error("simulated ask_vault failure");
       }
       return {
+        conversationId: args.conversationId ?? "conversation-1",
+        userMessageId: crypto.randomUUID(),
+        assistantMessageId: crypto.randomUUID(),
         answer: "Answer #" + w.__askVaultCalls,
         sources: [],
         citations: [],

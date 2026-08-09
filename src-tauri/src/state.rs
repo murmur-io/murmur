@@ -385,6 +385,128 @@ pub struct AppState {
     pub heavy_inference: Arc<tokio::sync::Semaphore>,
 }
 
+type ContentDispatchValidator = dyn Fn(&AppState) -> Result<()> + Send + Sync + 'static;
+
+/// An owned authorization capability for a model/provider dispatch that derives from visible
+/// content. The production gate retains the [`tauri::AppHandle`] so every asynchronous poll can
+/// resolve the one managed [`AppState`], take its non-reentrant lifecycle mutex, and revalidate the
+/// exact caller snapshot before the provider is allowed to make progress.
+///
+/// The guard intentionally covers ONE `Future::poll` only. It is released whenever the provider
+/// yields `Pending`, then reacquired + revalidated before the next continuation. A relock can
+/// therefore revoke a future suspended in NER, process startup, HTTP readiness, or any other await
+/// without pinning the lifecycle mutex across network/model latency.
+#[derive(Clone)]
+pub struct ContentDispatchAdmission {
+    gate: Arc<ContentDispatchGate>,
+}
+
+enum ContentDispatchGate {
+    App {
+        app: tauri::AppHandle,
+        validate: Arc<ContentDispatchValidator>,
+    },
+    #[cfg(test)]
+    Test {
+        lifecycle: Arc<Mutex<()>>,
+        validate: Arc<dyn Fn() -> Result<()> + Send + Sync + 'static>,
+    },
+}
+
+impl ContentDispatchAdmission {
+    pub(crate) fn new(
+        app: &tauri::AppHandle,
+        validate: impl Fn(&AppState) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            gate: Arc::new(ContentDispatchGate::App {
+                app: app.clone(),
+                validate: Arc::new(validate),
+            }),
+        }
+    }
+
+    /// Headless oracle seam. Production cannot construct an admission without an `AppHandle`.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        lifecycle: Arc<Mutex<()>>,
+        validate: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            gate: Arc::new(ContentDispatchGate::Test {
+                lifecycle,
+                validate: Arc::new(validate),
+            }),
+        }
+    }
+
+    fn with_authorization<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+        match self.gate.as_ref() {
+            ContentDispatchGate::App { app, validate } => {
+                use tauri::Manager;
+                let state = app.state::<AppState>();
+                let _lifecycle = state
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                validate(state.inner())?;
+                Ok(f())
+            }
+            #[cfg(test)]
+            ContentDispatchGate::Test {
+                lifecycle,
+                validate,
+            } => {
+                let _lifecycle = lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                validate()?;
+                Ok(f())
+            }
+        }
+    }
+
+    /// Validate a synchronous/local dispatch, releasing the lifecycle guard before model work.
+    /// Local inference does not egress; the stronger every-poll wrapper is reserved for async
+    /// provider futures whose poll is the actual external-dispatch boundary.
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.with_authorization(|| ())
+    }
+
+    /// Construct and drive one provider future while validating under the lifecycle mutex before
+    /// the factory is invoked AND on every poll. The mutex is never retained across
+    /// `Pending`/`.await`. Keeping the factory inside the first authorized interval also covers a
+    /// trait implementation whose method-call boundary performs synchronous dispatch setup before
+    /// returning its future.
+    pub(crate) async fn run<F, T>(&self, factory: impl FnOnce() -> F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let mut factory = Some(factory);
+        let mut future = None;
+        std::future::poll_fn(|cx| {
+            self.with_authorization(|| {
+                if future.is_none() {
+                    let Some(make_future) = factory.take() else {
+                        return std::task::Poll::Ready(Err(AppError::Other(anyhow::anyhow!(
+                            "provider future factory state was unavailable"
+                        ))));
+                    };
+                    future = Some(Box::pin(make_future()));
+                }
+                match future.as_mut() {
+                    Some(future) => future.as_mut().poll(cx),
+                    None => std::task::Poll::Ready(Err(AppError::Other(anyhow::anyhow!(
+                        "provider future was unavailable after construction"
+                    )))),
+                }
+            })
+            .unwrap_or_else(|error| std::task::Poll::Ready(Err(error)))
+        })
+        .await
+    }
+}
+
 impl AppState {
     /// Return the exact Live-session token only when `meeting_id` names the capture currently held
     /// in the recorder slot. Transitional Starting/Draining/Postprocess phases and mismatched or
