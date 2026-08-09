@@ -66,6 +66,13 @@ The behavioral prompt cannot add shell commands. The derived plan is the sole
 executable evidence profile. Reviewers are fresh, read-only, and tool-free.
 They may request only a typed, allowlisted probe that the runner executes.
 
+A gating reviewer's residual proof gaps stay hash-bound in the receipt and are
+counted in the PASS reason, but do not override that reviewer's own `PASS`.
+Missing evidence that prevents approval is `BLOCKED`; a typed probe request from
+a gating review also blocks until the runner executes it. A gating review's
+`MAJOR`/`BLOCKER` findings always forbid PASS. Advisory-review artifacts remain
+recorded but do not vote or spend a probe execution.
+
 `review_authority` in `config.json` decides which review can forbid a PASS. A
 kind set to `advisory` still runs, and its findings, proof gaps, and probe
 requests are still recorded in the receipt, but on any plan that keeps another
@@ -102,8 +109,14 @@ claiming every review passed.
 
 Green checkpoints for an unchanged exact diff survive interruption.
 `NEEDS_FIX` means edit the worktree and verify the new diff.
-`NEEDS_EVIDENCE`, `PAUSED_RETRYABLE`, and `INTERRUPTED` resume without throwing
-away completed evidence.
+`PAUSED_RETRYABLE` and `INTERRUPTED` resume without throwing away completed
+evidence. When `verify` has collected a typed gating probe and returns
+`NEEDS_EVIDENCE`, `resume` runs fresh reviews over that bound output; a
+retryable probe is retried from `PAUSED_RETRYABLE`. A bare reviewer `BLOCKED`
+without a probe is different: an unchanged `resume` reuses the same review
+checkpoint and returns the same state. Add the missing proof to the exact diff
+and run `verify`, or abandon and reopen when the task contract needs a new
+claim.
 
 ## Protected control-plane changes
 

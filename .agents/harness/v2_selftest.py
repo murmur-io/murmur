@@ -1788,9 +1788,10 @@ def verdict_cases(test: Tests) -> None:
             }
         ],
     }
-    # A gap is the reviewer's own "I could not verify this", not "this is broken" — the protocol
-    # gives it FAIL and MAJOR for the latter. Overriding its PASS could not terminate: closing a gap
-    # creates a new claim that the next round questions one link further out.
+    # A gap is bounded residual uncertainty that does not prevent the reviewer from deciding. Proof
+    # required for that decision must yield BLOCKED (and optionally a typed probe); an implementation
+    # defect yields FAIL/MAJOR. Overriding a genuine residual gap could not terminate: closing one
+    # creates a new claim that the next round can question one link further out.
     test.equal(
         "VERDICT PASS plus proof gap passes, because the reviewer chose PASS",
         verifier.review_result_state(gap),
@@ -1871,17 +1872,21 @@ def verdict_cases(test: Tests) -> None:
         )[0],
         "NEEDS_FIX",
     )
-    test.equal(
-        "VERDICT advisory combined proof gap does not forbid PASS",
-        verifier.aggregate_verdict(
-            [green_check],
-            [review("combined", gap), review("egress-security", base)],
-            demoted_config,
-        )[0],
-        "PASSED",
+    advisory_gap = verifier.aggregate_verdict(
+        [green_check],
+        [review("combined", gap), review("egress-security", base)],
+        demoted_config,
     )
-    # A gap from a GATING reviewer that still voted PASS no longer forbids PASS — but the reason
-    # line has to say so, because it is now the only place the gap reaches the operator.
+    test.equal(
+        "VERDICT advisory combined proof gap does not vote or enter the reason",
+        (
+            advisory_gap[0],
+            "non-blocking proof gap(s) recorded" in advisory_gap[1],
+        ),
+        ("PASSED", False),
+    )
+    # A gap from a GATING reviewer that still voted PASS no longer forbids PASS. Its full detail
+    # remains hash-bound in the receipt, while the reason line must expose it in the status summary.
     combined_gap_gating = verifier.aggregate_verdict(
         [green_check],
         [review("combined", gap), review("egress-security", base)],
@@ -1894,7 +1899,7 @@ def verdict_cases(test: Tests) -> None:
     )
     test.true(
         "VERDICT a passed gap is named in the reason line",
-        "proof gap(s) recorded as advisory" in combined_gap_gating[1],
+        "non-blocking proof gap(s) recorded" in combined_gap_gating[1],
     )
     specialist_gap = verifier.aggregate_verdict(
         [green_check],
@@ -1908,7 +1913,19 @@ def verdict_cases(test: Tests) -> None:
     )
     test.true(
         "VERDICT a specialist gap is named in the reason line",
-        "proof gap(s) recorded as advisory" in specialist_gap[1],
+        "non-blocking proof gap(s) recorded" in specialist_gap[1],
+    )
+    test.equal(
+        "VERDICT a gating probe request names the actionable evidence state",
+        verifier.aggregate_verdict(
+            [green_check],
+            [review("combined", probe_request)],
+            gating_config,
+        ),
+        (
+            "NEEDS_EVIDENCE",
+            "a gating review is BLOCKED, non-PASS, or has an unresolved probe request",
+        ),
     )
     test.equal(
         "VERDICT unknown review kind fails closed as blocking",
@@ -2015,8 +2032,8 @@ def verdict_cases(test: Tests) -> None:
         ("NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"),
     )
     # THE CONSEQUENCE, stated rather than hidden: with no deterministic checks in the plan, a gating
-    # reviewer's PASS is now sufficient even when it filed gaps — so the reason line naming those
-    # gaps is the only thing standing between "advisory" and "silently dropped". Assert both.
+    # reviewer's PASS is sufficient when it records only residual gaps. The receipt preserves their
+    # full detail and the reason prevents the status headline from hiding them. Assert both.
     check_free = verifier.aggregate_verdict([], [review("combined", gap)], demoted_config)
     test.equal(
         "VERDICT a check-free plan passes on a gating review that chose PASS",
@@ -2025,7 +2042,7 @@ def verdict_cases(test: Tests) -> None:
     )
     test.true(
         "VERDICT a check-free PASS still names its proof gaps",
-        "proof gap(s) recorded as advisory" in check_free[1],
+        "non-blocking proof gap(s) recorded" in check_free[1],
     )
     # The unrelated guard this must NOT weaken: no checks AND no gating review certifies nothing.
     test.equal(
@@ -4565,6 +4582,13 @@ def probe_precedence_flow_cases(test: Tests) -> None:
                         bound["reviews"],
                         runtime.load_config(),
                     )
+                    verdict, reason = verifier.aggregate_verdict(
+                        [*bound["checks"], *bound["probes"]],
+                        bound["reviews"],
+                        runtime.load_config(),
+                    )
+                    bound["verdict"] = verdict
+                    bound["reason"] = reason
                     bound["evidence_sha256"] = verifier.document_hash(
                         bound, "evidence_sha256"
                     )
@@ -6736,7 +6760,9 @@ def commit_recovery_cases(test: Tests) -> None:
             ],
         }
 
-        def bind_review_result(result: Mapping[str, Any]) -> None:
+        def bind_review_result(
+            result: Mapping[str, Any], *, recompute_verdict: bool = False
+        ) -> None:
             """Rewrite the bound review artifact and its receipt in place."""
 
             runtime.atomic_write_json(original_result_path, result)
@@ -6751,6 +6777,14 @@ def commit_recovery_cases(test: Tests) -> None:
                 bound["reviews"],
                 runtime.load_config(),
             )
+            if recompute_verdict:
+                verdict, reason = verifier.aggregate_verdict(
+                    [*bound["checks"], *bound["probes"]],
+                    bound["reviews"],
+                    runtime.load_config(),
+                )
+                bound["verdict"] = verdict
+                bound["reason"] = reason
             bound["evidence_sha256"] = verifier.document_hash(
                 bound, "evidence_sha256"
             )
@@ -6761,11 +6795,10 @@ def commit_recovery_cases(test: Tests) -> None:
                 contract, task_dir, allow_test_adapter=True
             )
 
-        # This fixture's plan has no deterministic check, so under the shipped
-        # config the generalist is this plan's only gate and every one of these
-        # mutations must still forbid the receipt. That is the property the
-        # demotion may not break: nothing may mint a PASS on a plan where no
-        # gate could have refused.
+        # This fixture's plan has no deterministic check, so under the shipped config the
+        # generalist remains its sole gate. Its MAJOR/BLOCKER and executable probe request must
+        # still refuse the receipt. A residual proof gap must remain recorded without overriding
+        # the reviewer's own PASS.
         test.equal(
             "EVIDENCE a check-free plan keeps its generalist gate",
             verifier.gating_review_kinds(
@@ -6780,17 +6813,37 @@ def commit_recovery_cases(test: Tests) -> None:
                 verify_receipt,
                 "unresolved MAJOR/BLOCKER",
             )
-        bind_review_result(gap_result)
+        bind_review_result(gap_result, recompute_verdict=True)
+        try:
+            gap_receipt = verify_receipt()
+            gap_receipt_summary: Any = (
+                gap_receipt["verdict"],
+                [item["review"] for item in gap_receipt["proof_gaps"]],
+                "non-blocking proof gap(s) recorded" in gap_receipt["reason"],
+            )
+        except Exception as exc:  # noqa: BLE001 - retain the exact RED in selftest output
+            gap_receipt_summary = f"{type(exc).__name__}: {exc}"
+        test.equal(
+            "EVIDENCE bound sole-gate PASS records a proof gap without rejecting receipt",
+            gap_receipt_summary,
+            ("PASSED", ["combined"], True),
+        )
+        stale_reason = runtime.load_json(evidence_path)
+        stale_reason["reason"] = "all planned checks and reviews passed"
+        stale_reason["evidence_sha256"] = verifier.document_hash(
+            stale_reason, "evidence_sha256"
+        )
+        runtime.atomic_write_json(evidence_path, stale_reason)
         test.raises(
-            "EVIDENCE bound sole-gate proof gap cannot verify PASS",
+            "EVIDENCE a rehashed stale reason cannot hide a bound proof gap",
             verify_receipt,
-            "unresolved proof gaps",
+            "verdict/reason differs from its bound checks and reviews",
         )
         bind_review_result(probe_result)
         test.raises(
             "EVIDENCE bound sole-gate probe request cannot verify PASS",
             verify_receipt,
-            "unresolved proof gaps",
+            "unresolved probe requests",
         )
         bind_review_result(severe_results["BLOCKER"])
         recorded = runtime.load_json(evidence_path)
@@ -7079,6 +7132,244 @@ def commit_recovery_cases(test: Tests) -> None:
         test.true(
             "CLEAN removes the linked committed worktree",
             not repo.exists(),
+        )
+
+
+def legacy_prompt_catchup_cases(test: Tests) -> None:
+    """A policy/template upgrade must not strand an old committed receipt."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-legacy-prompt-") as raw:
+        root = Path(raw)
+        primary = root / "primary"
+        primary.mkdir(parents=True)
+        _git(primary, "init", "-q", "-b", "murmur")
+        _git(primary, "config", "user.name", "QueaT")
+        _git(primary, "config", "user.email", "kgm004a@gmail.com")
+        for relative in verifier.protocol_relative_paths(ROOT):
+            source = ROOT / relative
+            target = primary / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+        policy_relative = ".agents/harness/prompts/combined-reviewer.md"
+        policy_path = primary / policy_relative
+        current_policy = policy_path.read_text(encoding="utf-8")
+        marker_count = current_policy.count(
+            verifier.NONBLOCKING_PROOF_GAP_POLICY_MARKER
+        )
+        test.equal(
+            "PROMPT shipped policy has one closing-version marker",
+            marker_count,
+            1,
+        )
+        if marker_count != 1:
+            return
+        legacy_policy = current_policy.replace(
+            "Do not claim that compilation, a synthetic test, or a mocked UI proves real\n"
+            "security/runtime behavior. If missing proof prevents you from deciding a\n"
+            "contract or security property, return `BLOCKED` and optionally request a typed\n"
+            "probe. Use `proof_gap` only for bounded residual uncertainty that does not\n"
+            "prevent your verdict.\n",
+            "Do not claim that compilation, a synthetic test, or a mocked UI proves real\n"
+            "security/runtime behavior. Record missing proof as a `proof_gap`.\n",
+        ).replace(
+            "- `PASS` requires complete contract coverage, no unresolved `MAJOR`/`BLOCKER`,\n"
+            "  and no probe request. A residual `proof_gap` may accompany PASS only when it\n"
+            "  records bounded uncertainty that does not prevent you from approving the diff.\n"
+            "- `FAIL` means the current diff must change.\n"
+            "- `BLOCKED` means the code may be correct but evidence required to decide the\n"
+            "  contract or a security property is unavailable. Do not label that condition\n"
+            "  PASS plus a proof gap.\n",
+            "- `PASS` requires complete contract coverage, no unresolved `MAJOR`/`BLOCKER`,\n"
+            "  and no proof gap or probe request.\n"
+            "- `FAIL` means the current diff must change.\n"
+            "- `BLOCKED` means the code may be correct but required evidence is unavailable.\n",
+        )
+        legacy_fixture_ok = (
+            legacy_policy != current_policy
+            and verifier.NONBLOCKING_PROOF_GAP_POLICY_MARKER not in legacy_policy
+        )
+        test.true(
+            "PROMPT catch-up fixture selects the legacy closing version",
+            legacy_fixture_ok,
+        )
+        if not legacy_fixture_ok:
+            return
+        policy_path.write_text(legacy_policy, encoding="utf-8")
+
+        owned_relative = "docs/legacy-prompt-receipt.md"
+        owned = primary / owned_relative
+        owned.parent.mkdir(parents=True, exist_ok=True)
+        owned.write_text("base\n", encoding="utf-8")
+        _git(primary, "add", ".")
+        _git(primary, "commit", "-q", "-m", "legacy prompt base")
+        base = _git(primary, "rev-parse", "HEAD")
+
+        repo = root / "task" / "meetnotes"
+        repo.parent.mkdir()
+        branch = "agent/v2/legacy-prompt-catchup"
+        _git(
+            primary,
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            str(repo),
+            base,
+        )
+        common = Path(
+            _git(
+                primary,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            )
+        )
+        task_id = "legacy-prompt-catchup"
+        task_dir = harness_cli.v2_task_dir(common, task_id)
+        task_dir.mkdir(parents=True)
+        contract: Dict[str, Any] = {
+            "schema_version": 2,
+            "task_id": task_id,
+            "description": "preserve a receipt created by the legacy prompt template",
+            "kind": "docs",
+            "base_sha": base,
+            "contract_sha256": "",
+            "repo_realpath": str(primary.resolve()),
+            "git_common_dir": str(common.resolve()),
+            "worktree_path": str(repo.resolve()),
+            "branch": branch,
+            "owned_paths": [owned_relative],
+            "claims": [],
+            "reviewer": "fake",
+            "expected_change": True,
+            "created_at": runtime.utc_now(),
+        }
+        contract["contract_sha256"] = verifier.document_hash(
+            contract, "contract_sha256"
+        )
+        runtime.atomic_write_json(task_dir / "task.json", contract)
+        runtime.atomic_write_json(
+            task_dir / "runtime.json",
+            {
+                "schema_version": 2,
+                "task_root": str(root),
+                "shared_node_modules": None,
+                "server_worktree": None,
+                "server_source": str(root / "murmur-server"),
+                "server_revision": None,
+            },
+        )
+        harness_cli.set_v2_state(task_dir, "OPEN", phase="open")
+        (repo / owned_relative).write_text("base\nlegacy receipt\n", encoding="utf-8")
+
+        def task_python(body: str, *, cwd: Path = repo) -> subprocess.CompletedProcess[str]:
+            harness_python = str(repo / ".agents" / "harness")
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    (
+                        "import argparse,os,pathlib,sys;"
+                        f"sys.path.insert(0,{harness_python!r});"
+                        "import cli,runtime;"
+                        f"task=pathlib.Path({str(task_dir)!r});"
+                        "contract=runtime.load_json(task/'task.json');"
+                        + body
+                    ),
+                ],
+                cwd=str(cwd),
+                env={
+                    **os.environ,
+                    "MURMUR_HARNESS_FAKE_REVIEW_VERDICT": "PASS",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        verified = task_python(
+            "verdict=cli.verify_task(contract,task,allow_test_adapter=True);"
+            "print('VERDICT='+verdict)"
+        )
+        test.true(
+            "PROMPT legacy task creates a real PASS with its own protocol bytes",
+            verified.returncode == 0 and "VERDICT=PASSED" in verified.stdout,
+        )
+        if verified.returncode != 0:
+            test.failures.append(
+                "PROMPT legacy verify stderr: " + verified.stderr.strip()
+            )
+            return
+        committed = task_python(
+            "raise SystemExit(cli.cmd_v2_commit(argparse.Namespace("
+            "task_id='legacy-prompt-catchup',message='legacy prompt receipt',"
+            "_allow_test_adapter=True)))"
+        )
+        committed_head = _git(repo, "rev-parse", "HEAD")
+        test.true(
+            "PROMPT legacy task finalizes a committed receipt",
+            committed.returncode == 0
+            and harness_cli.load_v2_state(task_dir)["status"] == "COMMITTED",
+        )
+        if committed.returncode != 0:
+            test.failures.append(
+                "PROMPT legacy commit stderr: " + committed.stderr.strip()
+            )
+            return
+
+        # Advance the prompt policy to the new version and merge it as a clean trunk catch-up.
+        # The current verifier must rebuild the old prompt from the policy at `committed_head`, not
+        # from the policy now present in the worktree.
+        policy_path.write_text(current_policy, encoding="utf-8")
+        _git(primary, "add", policy_relative)
+        _git(primary, "commit", "-q", "-m", "advance prompt template")
+        trunk_tip = _git(primary, "rev-parse", "HEAD")
+        _git(primary, "update-ref", "refs/remotes/origin/murmur", trunk_tip)
+        _git(
+            repo,
+            "-c",
+            "user.name=QueaT",
+            "-c",
+            "user.email=kgm004a@gmail.com",
+            "merge",
+            "--no-ff",
+            "-q",
+            "-m",
+            "merge new prompt template",
+            "origin/murmur",
+        )
+        catchup = task_python(
+            "receipt=cli.verify_v2_committed("
+            "contract,task,allow_test_adapter=True);"
+            "print('RECEIPT='+receipt['commit_sha'])"
+        )
+        test.equal(
+            "PROMPT new builder verifies the attested legacy closing",
+            (catchup.returncode, catchup.stdout.strip().splitlines()[-1]),
+            (0, "RECEIPT=" + committed_head),
+        )
+        if catchup.returncode != 0:
+            test.failures.append(
+                "PROMPT catch-up verify stderr: " + catchup.stderr.strip()
+            )
+            return
+        cleaned = task_python(
+            "raise SystemExit(cli.cmd_clean(argparse.Namespace("
+            "task_id='legacy-prompt-catchup',abandon=False,"
+            "_allow_test_adapter=True)))",
+            cwd=primary,
+        )
+        test.equal(
+            "PROMPT catch-up clean remains lossless and terminal",
+            (
+                cleaned.returncode,
+                harness_cli.load_v2_state(task_dir)["status"],
+                repo.exists(),
+            ),
+            (0, "CLOSED", False),
         )
 
 
@@ -8749,6 +9040,7 @@ def main() -> int:
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
     commit_recovery_cases(test)
+    legacy_prompt_catchup_cases(test)
     build_root_isolation_cases(test)
     plan_and_probe_cases(test)
     local_settings_policy_cases(test)
