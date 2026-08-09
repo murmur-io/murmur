@@ -40,9 +40,7 @@ use std::time::{Duration, Instant};
 
 use brain_ipc::{ChildMsg, ErrorKind, GenOptsWire, HostMsg};
 
-use mistralrs::{
-    Constraint, GgufModelBuilder, Model, RequestBuilder, TextMessageRole,
-};
+use mistralrs::{Constraint, GgufModelBuilder, Model, RequestBuilder, TextMessageRole};
 
 /// KV / activation / runtime headroom factor applied to a GGUF's on-disk (weights) size to estimate
 /// its true peak resident footprint (P0.3, perf-memory-audit §2). `1.5×` is DELIBERATELY CONSERVATIVE
@@ -400,14 +398,21 @@ fn load_model(
     model_path: &str,
 ) -> std::result::Result<(Model, String), (ErrorKind, String)> {
     let path = Path::new(model_path);
-    let model_dir = path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| (ErrorKind::InvalidArg, "brain model path has no parent dir".into()))?;
+    let model_dir = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        (
+            ErrorKind::InvalidArg,
+            "brain model path has no parent dir".into(),
+        )
+    })?;
     let model_file = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| (ErrorKind::InvalidArg, "brain model path has no filename".into()))?
+        .ok_or_else(|| {
+            (
+                ErrorKind::InvalidArg,
+                "brain model path has no filename".into(),
+            )
+        })?
         .to_string();
 
     // P0.3 — REFUSE-don't-OOM: gate the load on measured free RAM. We refuse ONLY when we AFFIRMATIVELY
@@ -482,7 +487,9 @@ fn run_generation(
 ) -> std::result::Result<String, (ErrorKind, String)> {
     // Structured with a constraint attempt?
     if let Some(schema) = json_schema {
-        let schema_bytes = serde_json::to_string(schema).map(|s| s.len()).unwrap_or(usize::MAX);
+        let schema_bytes = serde_json::to_string(schema)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
         if grammar_constraint_applies(opts.use_grammar_constraint, schema_bytes) {
             let constraint = Constraint::JsonSchema(schema.clone());
             match generate_once(rt, model, system, user, opts, Some(constraint)) {
@@ -555,10 +562,7 @@ fn generate_once(
         // block_on's worker thread panicked (message is content-free).
         Ok(Err(msg)) => Err((ErrorKind::Summarize, msg)),
         // The generation closure itself panicked — NO PII: a fixed message, never the prompt.
-        Err(_) => Err((
-            ErrorKind::Summarize,
-            "brain generation panicked".into(),
-        )),
+        Err(_) => Err((ErrorKind::Summarize, "brain generation panicked".into())),
     }
 }
 
@@ -666,11 +670,7 @@ fn main() {
         last_activity_ms.clone(),
         in_generation.clone(),
     );
-    spawn_heartbeat(
-        out.clone(),
-        in_generation.clone(),
-        current_id.clone(),
-    );
+    spawn_heartbeat(out.clone(), in_generation.clone(), current_id.clone());
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -840,8 +840,14 @@ mod tests {
     #[test]
     fn ram_permits_load_ok_when_free_and_refuses_under_pressure() {
         let big = 6 * GB + GB / 2; // ~6.3 GB
-        assert!(ram_permits_load(Some(24 * GB), big), "24 GB free must permit a 6.3 GB model");
-        assert!(!ram_permits_load(Some(4 * GB), big), "4 GB free must refuse a 6.3 GB model");
+        assert!(
+            ram_permits_load(Some(24 * GB), big),
+            "24 GB free must permit a 6.3 GB model"
+        );
+        assert!(
+            !ram_permits_load(Some(4 * GB), big),
+            "4 GB free must refuse a 6.3 GB model"
+        );
         let needed = big * MODEL_RAM_HEADROOM_NUM / MODEL_RAM_HEADROOM_DEN;
         assert!(ram_permits_load(Some(needed), big));
         assert!(!ram_permits_load(Some(needed - 1), big));
@@ -858,7 +864,10 @@ mod tests {
     fn ram_permits_load_small_model_always_ok() {
         let tiny = MODEL_RAM_GUARD_MIN_DISK_BYTES - 1;
         assert!(ram_permits_load(Some(100 * 1024 * 1024), tiny));
-        assert!(!ram_permits_load(Some(GB), MODEL_RAM_GUARD_MIN_DISK_BYTES + GB));
+        assert!(!ram_permits_load(
+            Some(GB),
+            MODEL_RAM_GUARD_MIN_DISK_BYTES + GB
+        ));
     }
 
     /// The grammar-constraint size-threshold decision (the only headless-testable part).
@@ -867,9 +876,15 @@ mod tests {
         assert!(!grammar_constraint_applies(false, 0));
         assert!(!grammar_constraint_applies(false, 100));
         assert!(grammar_constraint_applies(true, 0));
-        assert!(grammar_constraint_applies(true, GRAMMAR_SCHEMA_MAX_BYTES - 1));
+        assert!(grammar_constraint_applies(
+            true,
+            GRAMMAR_SCHEMA_MAX_BYTES - 1
+        ));
         assert!(!grammar_constraint_applies(true, GRAMMAR_SCHEMA_MAX_BYTES));
-        assert!(!grammar_constraint_applies(true, GRAMMAR_SCHEMA_MAX_BYTES + 1));
+        assert!(!grammar_constraint_applies(
+            true,
+            GRAMMAR_SCHEMA_MAX_BYTES + 1
+        ));
         assert!(!grammar_constraint_applies(true, usize::MAX));
     }
 

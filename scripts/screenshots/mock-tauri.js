@@ -392,6 +392,87 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
 
   const ASK_ANSWER = `Across your last quarter, **Project Atlas** is the recurring throughline. The team made sync-layer latency the gating priority (target **p95 < 180 ms**), committed to a **design partner** track by **Aug 15**, and deferred the mobile redesign to Q4 once Atlas removed the shared-sync dependency. Marcus owns the Windows loopback spike; Sarah owns the migration plan.`;
 
+  // Durable Ask-history demo store. Page-local only: it mirrors the SQLite IPC
+  // shape for screenshots/E2E without writing chat plaintext to browser storage.
+  const ASK_CONVERSATIONS = new Map();
+  const ASK_SOURCE_TITLES = new Map();
+  const askScopeKey = (scope) => `${scope.kind}:${scope.refId || ""}`;
+  const askSourceKey = (source) => `${source.kind}:${source.id}`;
+  // Test/demo parity with production: chat rows persist source identity only.
+  // Titles are remembered from a backend-owned, visibility-gated source read and
+  // hydrated only when a conversation is loaded again.
+  window.__demoRememberAskSourceTitles = (sources) => {
+    for (const source of sources || []) {
+      if (source && source.kind && source.id && source.title) {
+        ASK_SOURCE_TITLES.set(askSourceKey(source), source.title);
+      }
+    }
+  };
+  const hydrateAskSources = (sources) =>
+    (sources || []).flatMap((source) => {
+      const title = ASK_SOURCE_TITLES.get(askSourceKey(source));
+      return title ? [{ kind: source.kind, id: source.id, title }] : [];
+    });
+  const askTitle = (question) => {
+    const normalized = String(question).trim().split(/\s+/u).join(" ");
+    const chars = Array.from(normalized);
+    return chars.length > 56 ? `${chars.slice(0, 56).join("").trimEnd()}…` : chars.join("");
+  };
+  const sendPersistedAsk = (scope, args, answer = ASK_ANSWER) => {
+    const now = new Date().toISOString();
+    const id = args.conversationId || crypto.randomUUID();
+    const existing = ASK_CONVERSATIONS.get(id);
+    if (existing && askScopeKey(existing.scope) !== askScopeKey(scope)) {
+      throw new Error("conversation is unavailable");
+    }
+    const conversation = existing || {
+      id,
+      scope,
+      title: askTitle(args.question),
+      selectedSources: [],
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const ordinal = conversation.messages.length;
+    const userMessageId = crypto.randomUUID();
+    const assistantMessageId = crypto.randomUUID();
+    conversation.selectedSources = (args.explicitSources || []).map((source) => ({
+      kind: source.kind,
+      id: source.id,
+    }));
+    conversation.updatedAt = now;
+    conversation.messages.push(
+      {
+        id: userMessageId,
+        ordinal,
+        role: "user",
+        content: args.question,
+        sources: [],
+        citations: [],
+        createdAt: now,
+      },
+      {
+        id: assistantMessageId,
+        ordinal: ordinal + 1,
+        role: "assistant",
+        content: answer,
+        sources: [],
+        citations: [],
+        createdAt: now,
+      },
+    );
+    ASK_CONVERSATIONS.set(id, conversation);
+    return {
+      conversationId: id,
+      userMessageId,
+      assistantMessageId,
+      answer,
+      sources: [],
+      citations: [],
+    };
+  };
+
   // ── The command router ──────────────────────────────────────────────────────
   function currentConfig() {
     return Object.assign({}, DEFAULT_CONFIG, window.__demoConfig || {});
@@ -673,6 +754,39 @@ scope to the GA-critical path only.
           ],
           citations: ["[[Q2 Roadmap Planning]]", "[[Project Atlas — Kickoff]]"],
         };
+      case "list_ask_conversations":
+        return Array.from(ASK_CONVERSATIONS.values())
+          .filter((c) => askScopeKey(c.scope) === askScopeKey(args.scope))
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .map((c) => ({
+            id: c.id,
+            scope: c.scope,
+            title: c.title,
+            createdAt: c.createdAt,
+            updatedAt: c.updatedAt,
+            messageCount: c.messages.length,
+          }));
+      case "load_ask_conversation": {
+        const conversation = ASK_CONVERSATIONS.get(args.conversationId);
+        if (
+          !conversation ||
+          askScopeKey(conversation.scope) !== askScopeKey(args.scope)
+        ) {
+          throw new Error("conversation is unavailable");
+        }
+        return structuredClone({
+          ...conversation,
+          selectedSources: hydrateAskSources(conversation.selectedSources),
+        });
+      }
+      case "ask_vault_persisted":
+        return sendPersistedAsk(args.scope, args);
+      case "chat_meeting_persisted":
+        return sendPersistedAsk(
+          { kind: "meeting", refId: args.meetingId },
+          args,
+          "The transcript confirms the decision and its owner.",
+        );
       case "list_builtin_recipes": return BUILTIN_RECIPES;
       case "list_saved_recipes": return [];
       case "run_recipe": return "Drafted from the transcript…";

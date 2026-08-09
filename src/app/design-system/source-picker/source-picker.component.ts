@@ -193,6 +193,13 @@ export class SourcePickerComponent {
 
   /** Monotonic request token — a late reply for a superseded query is dropped. */
   private requestSeq = 0;
+  /**
+   * Privacy-generation token for the async paths that do not share
+   * `requestSeq` (dashboard inventory + dashboard expansion). Relock/content
+   * invalidation bumps it synchronously so a pre-invalidation reply can never
+   * repopulate titles or selected sources after the scrub.
+   */
+  private privacyEpoch = 0;
   /** True when the last page came back full, so another page may exist. */
   private hasMore = false;
   /** Re-entrancy guard: one append fetch at a time. */
@@ -285,6 +292,33 @@ export class SourcePickerComponent {
       },
       { injector: this.injector },
     );
+  }
+
+  /**
+   * Synchronously remove every source-derived label owned by this component.
+   *
+   * Ask hosts call this directly from the process-wide privacy invalidation
+   * listener. Merely clearing the parent's `selected` model is insufficient:
+   * the teleported popover owns candidate/dashboard caches and may have IPC
+   * replies in flight. Both request generations are advanced before any
+   * signal is cleared so those late replies are discarded.
+   */
+  scrubPrivateState(): void {
+    this.requestSeq++;
+    this.privacyEpoch++;
+    this.debounce.cancel(DEBOUNCE_KEY);
+    this.open.set(false);
+    this.query.set("");
+    this.candidates.set([]);
+    this._dashboards.set([]);
+    this.selected.set([]);
+    this.expandingBoard.set(null);
+    this.activeIndex.set(0);
+    this._loading.set(false);
+    this.hasMore = false;
+    this.loadingMore = false;
+    this.rawOffset = PAGE_SIZE;
+    this._chipsExpanded.set(false);
   }
 
   // --- Search input + keyboard nav -----------------------------------------
@@ -471,9 +505,11 @@ export class SourcePickerComponent {
    */
   async pickDashboard(board: DashboardSummary): Promise<void> {
     if (this.disabled() || this.selectionLimitReached()) return;
+    const epoch = this.privacyEpoch;
     this.expandingBoard.set(board.id);
     try {
       const sources = await this.ipc.getDashboardSources(board.id);
+      if (epoch !== this.privacyEpoch) return;
       const allowed = this.allowedKindSet();
       const limit = this.selectionLimit();
       this.selected.update((list) => {
@@ -491,17 +527,25 @@ export class SourcePickerComponent {
         return out;
       });
     } finally {
-      this.expandingBoard.set(null);
+      if (epoch === this.privacyEpoch) {
+        this.expandingBoard.set(null);
+      }
     }
   }
 
   /** Load the boards once, when the popover first opens. */
   private async loadDashboards(): Promise<void> {
     if (!this.allowDashboards() || this._dashboards().length > 0) return;
+    const epoch = this.privacyEpoch;
     try {
-      this._dashboards.set(await this.ipc.listDashboards());
+      const dashboards = await this.ipc.listDashboards();
+      if (epoch === this.privacyEpoch) {
+        this._dashboards.set(dashboards);
+      }
     } catch {
-      this._dashboards.set([]);
+      if (epoch === this.privacyEpoch) {
+        this._dashboards.set([]);
+      }
     }
   }
 

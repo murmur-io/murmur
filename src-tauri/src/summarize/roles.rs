@@ -179,9 +179,7 @@ fn legacy_default_target(cfg: &AppConfig) -> RoleTarget {
     let model = match cfg.provider_id.as_str() {
         crate::summarize::PROVIDER_CLAUDE_CODE
         | crate::summarize::PROVIDER_CODEX_CLI
-        | crate::summarize::PROVIDER_ANTHROPIC => {
-            cfg.provider_model.clone()
-        }
+        | crate::summarize::PROVIDER_ANTHROPIC => cfg.provider_model.clone(),
         _ => String::new(),
     };
     RoleTarget {

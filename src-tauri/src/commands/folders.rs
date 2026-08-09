@@ -356,8 +356,14 @@ fn reexport_notes_under_subtree(state: &AppState, folder_id: &str) -> Result<(),
 ///  - **OPEN (now) →** move every note to the vault ROOT (`folder_id = NULL`), delete the folder row,
 ///    and remove the (now-empty) vault subdir. Notes survive at "All notes".
 #[tauri::command]
-pub fn delete_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
-    delete_folder_inner(state.inner(), folder_id)
+pub fn delete_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), AppError> {
+    delete_folder_inner(state.inner(), folder_id)?;
+    emit_ask_history_invalidated_fail_closed(&app);
+    Ok(())
 }
 
 /// Inner of [`delete_folder`] taking `&AppState` (so tests can drive it without a `tauri::State`).
@@ -429,6 +435,7 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
 
     // Delete the folder row, then remove the (now note-free) vault subdir. Row first: a leftover
     // empty dir is harmless/reconcilable; a dangling row is not.
+    bump_seal_epoch(state);
     state.db.delete_folder(&folder_id)?;
     if let Some(vault) = vault_path(state) {
         let vault_root = std::path::Path::new(&vault);

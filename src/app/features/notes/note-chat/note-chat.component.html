@@ -12,7 +12,29 @@
       }
     </div>
     <div class="chat-head-actions">
-      @if (conversation().length) {
+      @if (historyEnabled()) {
+        <button
+          type="button"
+          class="btn btn-ghost chat-head-action"
+          aria-label="Conversation history"
+          [attr.aria-pressed]="historyOpen()"
+          (click)="toggleHistory()"
+          [disabled]="pending() || !historyPrivacyReady()"
+        >
+          <mur-icon icon="history" />
+          <span>History</span>
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost chat-head-action"
+          aria-label="New conversation"
+          (click)="newConversation()"
+          [disabled]="pending() || !historyPrivacyReady()"
+        >
+          <mur-icon icon="plus" />
+          <span>New</span>
+        </button>
+      } @else if (conversation().length) {
         <button
           type="button"
           class="btn btn-ghost chat-clear"
@@ -35,6 +57,32 @@
     </div>
   </div>
 
+  @if (historyPrivacyError(); as privacyError) {
+    <div class="chat-error" role="alert">
+      <span class="chat-error-text">{{ privacyError }}</span>
+      <button
+        type="button"
+        class="btn btn-ghost chat-retry"
+        (click)="retryHistoryPrivacy()"
+      >
+        Retry
+      </button>
+    </div>
+  }
+
+  @if (historyEnabled() && historyOpen()) {
+    <mur-chat-history
+      class="chat-history"
+      [threads]="history()"
+      [loading]="historyLoading()"
+      [error]="historyError()"
+      [notice]="historyActionError()"
+      [activeThreadId]="conversationId()"
+      [loadingThreadId]="historyResumeId()"
+      (selected)="resumeConversation($event)"
+      (retryRequested)="retryHistory()"
+    />
+  } @else {
   <!-- Message list (also the scroll region) -->
   <div
     #scroller
@@ -62,6 +110,7 @@
               type="button"
               class="chat-chip"
               [style.--i]="$index"
+              [disabled]="!historyPrivacyReady()"
               (click)="ask(s)"
             >
               {{ s }}
@@ -70,7 +119,7 @@
         </div>
       </div>
     } @else {
-      @for (turn of conversation(); track $index) {
+      @for (turn of conversation(); track turn.id) {
         <div
           class="chat-row"
           [class.is-user]="turn.role === 'user'"
@@ -111,7 +160,7 @@
           type="button"
           class="btn btn-ghost chat-retry"
           (click)="retry()"
-          [disabled]="pending()"
+          [disabled]="pending() || !historyPrivacyReady()"
         >
           Retry
         </button>
@@ -124,6 +173,7 @@
   <mur-source-picker
     class="chat-sources"
     [(selected)]="sources"
+    [disabled]="pending() || !historyPrivacyReady()"
     triggerLabel="Sources"
     placeholder="Scope to a note or meeting…"
   />
@@ -140,7 +190,7 @@
       aria-label="Your question"
       placeholder="Ask about this note…"
       [value]="draft()"
-      [disabled]="pending()"
+      [disabled]="pending() || !historyPrivacyReady()"
       (input)="onDraftInput($event)"
       (keydown)="onKeydown($event)"
     ></textarea>
@@ -157,4 +207,5 @@
       }
     </button>
   </form>
+  }
 </div>

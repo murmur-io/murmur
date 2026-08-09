@@ -1505,6 +1505,53 @@ export interface ChatTurn {
   content: string;
 }
 
+/** Exact durable Ask-history namespace. Org and dashboard Ask stay stateless. */
+export type AskConversationScope =
+  | { kind: "vault" }
+  | { kind: "note" | "meeting"; refId: string };
+
+/** One bounded, newest-first row in the durable Ask-history browser. */
+export interface AskConversationSummary {
+  id: string;
+  scope: AskConversationScope;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+}
+
+/** One canonical, ordered message loaded from SQLite for a durable Ask thread. */
+export interface AskConversationMessage {
+  id: string;
+  ordinal: number;
+  role: "user" | "assistant";
+  content: string;
+  sources: VaultSource[];
+  citations: string[];
+  createdAt: string;
+}
+
+/** A durable Ask thread plus the source selection saved with its latest turn. */
+export interface AskConversation {
+  id: string;
+  scope: AskConversationScope;
+  title: string;
+  selectedSources: SourceRef[];
+  messages: AskConversationMessage[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Successful atomic send: the backend owns persistence and canonical thread id. */
+export interface AskConversationSendResult {
+  conversationId: string;
+  userMessageId: string;
+  assistantMessageId: string;
+  answer: string;
+  sources: VaultSource[];
+  citations: string[];
+}
+
 export interface BuiltinRecipe {
   id: string;
   label: string;
