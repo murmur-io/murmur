@@ -74,13 +74,20 @@ Reviewers are fresh, tool-free sessions. They receive only the runner-built
 immutable diff/evidence bundle and have no filesystem or shell tools. A
 transient review gets one bounded retry. Reviewers may request only typed
 allowlisted probes, which the runner executes canonically before a fresh
-review. No PASS is valid with a MAJOR/BLOCKER, proof gap, unresolved probe,
-stale diff, or changed protocol hash.
+review. No gating PASS is valid with a MAJOR/BLOCKER, unresolved probe, stale
+diff, or changed protocol hash. A gating reviewer's residual proof gap stays
+recorded and named in the PASS reason but does not override its own PASS;
+evidence required to decide the contract must produce `BLOCKED`. Advisory
+review artifacts remain recorded but do not vote or spend a probe execution.
 
 If verification returns:
 
 - `NEEDS_FIX`: repair the worktree yourself, then rerun `verify`.
-- `NEEDS_EVIDENCE`: use `resume`; it runs only the missing evidence.
+- `NEEDS_EVIDENCE` after `verify` collected a typed gating probe: use `resume`
+  to run fresh reviews over its bound output. For a bare reviewer `BLOCKED`
+  without a probe, unchanged `resume` reuses the same checkpoint; add the
+  missing proof to the diff and run `verify`, or abandon and reopen if the
+  contract needs a new claim.
 - `PAUSED_RETRYABLE` or `INTERRUPTED`: use `resume`; green checkpoints survive.
 - `PASSED`: use only `commit`; keep the task through push, PR, CI, and merge,
   then `clean`.

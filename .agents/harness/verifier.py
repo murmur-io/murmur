@@ -1079,9 +1079,10 @@ def review_result_state(result: Mapping[str, Any]) -> str:
     #
     # They used to: any non-empty `proof_gaps` forced NEEDS_EVIDENCE even when the reviewer had
     # chosen PASS and filed nothing severe. That second-guesses the reviewer in a direction the
-    # reviewer did not take — the protocol already gives it FAIL and MAJOR for "this is not proven
-    # enough to merge", and a gap is by construction the weaker statement "I could not verify this",
-    # not "this is broken".
+    # reviewer did not take — the protocol already gives it BLOCKED plus a typed probe request for
+    # required missing proof, and FAIL/MAJOR for an implementation defect. A gap is by construction
+    # the weaker statement "this remains uncertain after review", not "this is required before
+    # merge".
     #
     # It also could not terminate. Measured on the task that produced this change: after all three
     # reviewers returned PASS with zero severe findings, four consecutive rounds returned
@@ -1684,6 +1685,28 @@ def specialist_source_context(
     }
 
 
+NONBLOCKING_PROOF_GAP_POLICY_MARKER = "A residual `proof_gap` may accompany PASS"
+LEGACY_REVIEW_CLOSING = (
+    "Return every finding and every missing proof. PASS is forbidden when a "
+    "MAJOR/BLOCKER remains. If an empirical proof is missing, use proof_gaps "
+    "and optionally a typed probe_requests entry from the context-eligible "
+    "IDs above; never ask for or attempt arbitrary shell access. A prior "
+    "proof gap may disappear only when the exact shown probe command and "
+    "output address its recorded rationale; a green but unrelated command "
+    "is not evidence."
+)
+NONBLOCKING_PROOF_GAP_REVIEW_CLOSING = (
+    "Return every finding and every missing proof. PASS is forbidden when a "
+    "MAJOR/BLOCKER remains. If empirical proof is required to decide, return "
+    "BLOCKED and optionally add a typed probe_requests entry from the "
+    "context-eligible IDs above. Use proof_gaps only for bounded residual "
+    "uncertainty that does not prevent your verdict; never ask for or attempt "
+    "arbitrary shell access. A prior proof gap may disappear only when the "
+    "exact shown probe command and output address its recorded rationale; a "
+    "green but unrelated command is not evidence."
+)
+
+
 def combined_review_prompt(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1695,6 +1718,7 @@ def combined_review_prompt(
     *,
     probes: Sequence[Mapping[str, Any]] = (),
     policy_text: Optional[str] = None,
+    proof_gap_policy_text: Optional[str] = None,
 ) -> str:
     if policy_text is not None:
         policy = policy_text
@@ -1702,6 +1726,23 @@ def combined_review_prompt(
         policy = runtime.read_prompt("combined-reviewer")
     else:
         policy = runtime.read_prompt(kind + "-reviewer")
+    if proof_gap_policy_text is None:
+        proof_gap_policy = (
+            policy
+            if kind == "combined"
+            else runtime.read_prompt("combined-reviewer")
+        )
+    else:
+        proof_gap_policy = proof_gap_policy_text
+    # The closing bytes are part of the review prompt hash. Select their version from the
+    # combined-review policy that is itself loaded from the attested commit during receipt
+    # verification. That preserves existing committed receipts while allowing the policy and its
+    # closing instruction to advance together for new attempts.
+    review_closing = (
+        NONBLOCKING_PROOF_GAP_REVIEW_CLOSING
+        if NONBLOCKING_PROOF_GAP_POLICY_MARKER in proof_gap_policy
+        else LEGACY_REVIEW_CLOSING
+    )
     check_summary = [
         _review_evidence_summary(
             item, task_dir, channel="planned-check", review_kind=kind
@@ -1740,13 +1781,7 @@ def combined_review_prompt(
         # own non-negotiable closing instruction stays last, so no learnings
         # line is the last thing the reviewer reads before deciding.
         f"{learnings}"
-        "Return every finding and every missing proof. PASS is forbidden when a "
-        "MAJOR/BLOCKER remains. If an empirical proof is missing, use proof_gaps "
-        "and optionally a typed probe_requests entry from the context-eligible "
-        "IDs above; never ask for or attempt arbitrary shell access. A prior "
-        "proof gap may disappear only when the exact shown probe command and "
-        "output address its recorded rationale; a green but unrelated command "
-        "is not evidence."
+        f"{review_closing}"
     )
 
 
@@ -2115,22 +2150,24 @@ def aggregate_verdict(
     if "NEEDS_FIX" in review_states:
         return "NEEDS_FIX", "a review has unresolved FAIL/MAJOR/BLOCKER findings"
     if "NEEDS_EVIDENCE" in review_states:
-        return "NEEDS_EVIDENCE", "a review has unresolved proof gaps or missing evidence"
+        return (
+            "NEEDS_EVIDENCE",
+            "a gating review is BLOCKED, non-PASS, or has an unresolved probe request",
+        )
     # A PASS whose advisory reviewer filed findings must not tell the operator
     # that every review passed: the reason line is the only prose `cmd_status`
     # and the `verify` status JSON carry, so it names what was recorded but not
     # gated.
     recorded = advisory_findings(checks, reviews, config)
-    # Proof gaps no longer block a PASS (see `review_result_state`), so the reason line is now the
-    # only place they surface to the operator. Counting them here is what keeps "advisory" from
-    # meaning "silently dropped": a PASS that hid eight unproven claims would be a worse lie than
-    # the unbounded gate this replaced.
+    # Proof gaps no longer block a PASS (see `review_result_state`), so the reason line names every
+    # residual gap filed by a review that still votes. Advisory-review gaps remain in the bound
+    # evidence but do not affect the verdict or its reason.
     gaps = sum(
         len(review.get("result", {}).get("proof_gaps", []) or [])
         for review in reviews
         if str(review.get("kind", "")) in gating
     )
-    gap_note = f"; {gaps} proof gap(s) recorded as advisory" if gaps else ""
+    gap_note = f"; {gaps} non-blocking proof gap(s) recorded" if gaps else ""
     if recorded:
         severe = sum(
             1
@@ -2995,6 +3032,7 @@ def verify_v2_evidence(
             )
         if attested_commit_sha is None:
             policy_text = None
+            proof_gap_policy_text = None
         else:
             policy_name = (
                 "combined-reviewer"
@@ -3007,6 +3045,15 @@ def verify_v2_evidence(
                     attested_commit_sha,
                     f".agents/harness/prompts/{policy_name}.md",
                 ).decode("utf-8")
+                proof_gap_policy_text = (
+                    policy_text
+                    if policy_name == "combined-reviewer"
+                    else git_file_at_commit(
+                        worktree,
+                        attested_commit_sha,
+                        ".agents/harness/prompts/combined-reviewer.md",
+                    ).decode("utf-8")
+                )
             except UnicodeDecodeError as exc:
                 raise runtime.HarnessError(
                     f"v2 attested review policy is not UTF-8: {policy_name}"
@@ -3021,6 +3068,7 @@ def verify_v2_evidence(
             task_dir,
             probes=probe_records,
             policy_text=policy_text,
+            proof_gap_policy_text=proof_gap_policy_text,
         )
         validate_review_checkpoint(
             record,
@@ -3070,9 +3118,9 @@ def verify_v2_evidence(
                 raise runtime.HarnessError(
                     "v2 PASS contains unresolved MAJOR/BLOCKER findings"
                 )
-            if result.get("proof_gaps") or result.get("probe_requests"):
+            if result.get("probe_requests"):
                 raise runtime.HarnessError(
-                    "v2 PASS contains unresolved proof gaps"
+                    "v2 PASS contains unresolved probe requests"
                 )
             raise runtime.HarnessError(
                 f"v2 review {declared['kind']} is not an admissible PASS"
@@ -3166,8 +3214,23 @@ def verify_v2_evidence(
         )
     ):
         raise runtime.HarnessError("v2 PASS contains unresolved MAJOR/BLOCKER findings")
-    if blocking_review_items(
-        evidence.get("proof_gaps", []), demoted_kinds
-    ) or blocking_review_items(evidence.get("probe_requests", []), demoted_kinds):
-        raise runtime.HarnessError("v2 PASS contains unresolved proof gaps")
+    # A reviewer's residual proof gaps remain hash-bound above, but do not override that reviewer's
+    # own PASS. A typed probe request is different: it names executable evidence the runner can
+    # still collect, so it remains receipt-blocking for every gating review.
+    if blocking_review_items(evidence.get("probe_requests", []), demoted_kinds):
+        raise runtime.HarnessError("v2 PASS contains unresolved probe requests")
+    # Hash integrity alone cannot make a derived summary truthful: an attacker who can rewrite and
+    # re-hash the local bundle could otherwise add a proof gap while retaining the stale, clean
+    # reason line. Re-derive both fields from the already-verified checks, probes, reviews, and the
+    # attested profile config so every admitted receipt exposes exactly what its bound records say.
+    expected_verdict, expected_reason = aggregate_verdict(
+        gate_context, review_records, profile_config
+    )
+    if (
+        evidence.get("verdict"),
+        evidence.get("reason"),
+    ) != (expected_verdict, expected_reason):
+        raise runtime.HarnessError(
+            "v2 evidence verdict/reason differs from its bound checks and reviews"
+        )
     return evidence

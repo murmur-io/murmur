@@ -101,7 +101,7 @@ button { font:inherit; }
         <div class="life-node"><span>6</span><strong>commit</strong><small>receipt po PASS</small></div>
         <div class="life-node"><span>7</span><strong>clean</strong><small>po merge’u</small></div>
       </div>
-      <div class="outcomes"><span>✓ PASSED → commit → push → PR → clean</span><span>↻ NEEDS_FIX → edycja → verify</span><span>⏸ brak dowodu / retry → resume</span></div>
+      <div class="outcomes"><span>✓ PASSED → commit → push → PR → clean</span><span>↻ NEEDS_FIX → edycja → verify</span><span>⏸ zebrany probe → resume review · bare BLOCKED → dowód + verify</span></div>
     </article>
 
     <!-- 06 -->
@@ -157,7 +157,7 @@ claims: []</pre></section><section class="explain-list"><div><code>cli.py</code>
     <!-- 12 -->
     <article class="slide" data-id="12-improve">
       <header class="slide-head"><div><p class="eyebrow">11 · gdy coś failuje</p><h2>Stan mówi dokładnie, co zrobić dalej.</h2></div></header>
-      <div class="fail-grid"><section><span class="tag red">NEEDS_FIX</span><h3>Kod albo kontrakt nie spełnia wymagań.</h3><ol><li>Czytasz finding i runner-owned log.</li><li>Naprawiasz ten sam worktree.</li><li>Uruchamiasz <code>verify</code>.</li><li>Nowy diff dostaje nowy attempt.</li></ol></section><section><span class="tag orange">NEEDS_EVIDENCE / RETRY</span><h3>Kod nie musi się zmieniać.</h3><ol><li>Brakuje proofu albo zewnętrzny proces przerwał pracę.</li><li>Uruchamiasz <code>resume</code>.</li><li>Zielone checkpointy są ponownie użyte.</li><li>Nie przenosisz patcha ręcznie.</li></ol></section></div>
+      <div class="fail-grid"><section><span class="tag red">NEEDS_FIX</span><h3>Kod albo kontrakt nie spełnia wymagań.</h3><ol><li>Czytasz finding i runner-owned log.</li><li>Naprawiasz ten sam worktree.</li><li>Uruchamiasz <code>verify</code>.</li><li>Nowy diff dostaje nowy attempt.</li></ol></section><section><span class="tag orange">NEEDS_EVIDENCE / RETRY</span><h3>Najpierw rozpoznaj przyczynę.</h3><ol><li><code>verify</code> zebrał probe: <code>resume</code> uruchamia świeże review nad jego wynikiem.</li><li>Probe retryable: <code>resume</code> wykonuje jego ograniczoną próbę ponownie.</li><li>Bare <code>BLOCKED</code> bez probe: dodajesz dowód do diffu i robisz <code>verify</code>; brakujący claim wymaga abandon + reopen.</li><li>Nie przenosisz patcha ręcznie.</li></ol></section></div>
     </article>
 
     <!-- 13 -->
@@ -201,7 +201,7 @@ agent-harness clean &lt;id&gt;</pre></section></div><p class="bottom-explain"><c
     { id: "09-guards", eyebrow: "08 · twarde ochrony", title: "Checki, hooki i sandbox zatrzymują rzeczy, których prompt nie powinien pilnować.", note: "Jeśli błąd da się wykryć programem, nie ufamy pamięci modelu: dodajemy test, hook albo odcięcie zasobów." },
     { id: "10-resume", eyebrow: "09 · resume", title: "Przerwanie nie zeruje dowodu.", note: "Dokładnie związane zielone checkpointy przeżywają timeout, 429 i crash. Resume wykonuje tylko brakujący fragment." },
     { id: "11-clean", eyebrow: "10 · sprzątanie", title: "Clean kończy bez utraty pracy.", note: "Najpierw archive, potem prywatne snapshoty i worktree. Doctor pokazuje ghosty i GC debt." },
-    { id: "12-improve", eyebrow: "11 · gdy coś failuje", title: "Stan mówi, co zrobić dalej.", note: "NEEDS_FIX wymaga edycji i verify. NEEDS_EVIDENCE lub retry wymaga resume. Nie odtwarzasz taska od zera." },
+    { id: "12-improve", eyebrow: "11 · gdy coś failuje", title: "Stan mówi, co zrobić dalej.", note: "NEEDS_FIX wymaga edycji i verify. Po zebraniu probe resume odpala świeże review; retry ponawia probe. Bare BLOCKED wymaga nowego dowodu i verify albo reopen z claimem." },
     { id: "13-daily", eyebrow: "12 · codzienne użycie", title: "Ty dajesz cel. System pilnuje pracy. Ty decydujesz o publikacji.", note: "Normalnie zlecasz feature. Jawne komendy służą do obserwacji i reprodukcji. Runner nie pushuje sam kodu na GitHub." },
     { id: "14-map", eyebrow: "13 · zapamiętaj", title: "Najkrótsza mapa całego systemu.", note: "Cli prowadzi lifecycle, runtime izoluje procesy, verifier wiąże exact diff, checks i hooks chronią, doctor oraz metrics pokazują operacje." }
   ];
