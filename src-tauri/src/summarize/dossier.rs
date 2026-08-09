@@ -545,7 +545,10 @@ mod tests {
         );
         // The sealed meeting's Atlas-OWNED commitment reappears on unlock (owner match survives).
         assert!(
-            data2.commitments.iter().any(|c| c.text.contains("sign the deal")),
+            data2
+                .commitments
+                .iter()
+                .any(|c| c.text.contains("sign the deal")),
             "the unlocked Atlas-owned commitment must reappear"
         );
     }
@@ -582,7 +585,9 @@ mod tests {
         db.add_mention(&klaudia, "m-review").unwrap();
 
         let nothing = HashSet::new();
-        let data = build_dossier_data(&db, &klaudia, &nothing).unwrap().unwrap();
+        let data = build_dossier_data(&db, &klaudia, &nothing)
+            .unwrap()
+            .unwrap();
 
         assert!(
             data.commitments

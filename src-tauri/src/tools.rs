@@ -84,6 +84,9 @@ impl TranscriptChannel {
 ///   while reaching out.
 /// - [`Self::Full`]: the pre-cascade full catalog (per surface flags) — the DELIBERATELY vault-wide
 ///   surfaces (the Ask page, MCP-shaped read executors) keep this so their behavior is unchanged.
+/// - [`Self::DurableAsk`]: the full owned-vault + external-connector catalog used only by durable
+///   Ask, with mutable org-replica reads structurally absent so persisted answers cannot acquire an
+///   untracked org dependency. Stateless Org/Dashboard Ask remains on [`Self::Full`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistantScope {
     /// Tier 1 — the current meeting in isolation (no retrieval tools).
@@ -94,6 +97,8 @@ pub enum AssistantScope {
     Connectors,
     /// The full per-surface catalog (deliberately vault-wide surfaces: Ask page, MCP-shaped reads).
     Full,
+    /// Durable Ask: full catalog except mutable local Shared Brain replica reads.
+    DurableAsk,
 }
 
 impl AssistantScope {
@@ -102,6 +107,9 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     pub(crate) fn allows(self, tool: &str) -> bool {
+        if self == AssistantScope::DurableAsk && tool == "org_brain_search" {
+            return false;
+        }
         // Local-MCP discovery helpers are intentionally absent from every cloud-capable assistant
         // scope. They can be dispatched only by the loopback MCP mapper into `execute_tool`.
         if matches!(
@@ -148,7 +156,10 @@ impl AssistantScope {
         // lower tier can never advertise or run one — without this, an unknown-name tool would
         // fall through Tier 1/2's list checks and leak egress to an isolation tier.
         if tool.starts_with("mcp_") {
-            return matches!(self, AssistantScope::Connectors | AssistantScope::Full);
+            return matches!(
+                self,
+                AssistantScope::Connectors | AssistantScope::Full | AssistantScope::DurableAsk
+            );
         }
         match self {
             // Tier 1 reaches NEITHER vault reads NOR connectors — it answers from injected
@@ -162,7 +173,7 @@ impl AssistantScope {
             // Tier 3 reaches connectors AND (for grounding) the vault reads.
             AssistantScope::Connectors => true,
             // The full catalog leaves the tier gate open; the surface flags alone decide.
-            AssistantScope::Full => true,
+            AssistantScope::Full | AssistantScope::DurableAsk => true,
         }
     }
 }
@@ -3241,7 +3252,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
         // discovery happens at CALL time inside the connector, where server text is tool-result
         // DATA truncated by the loop's RESULT_BUDGET. Unlike web/jira/slack, no AppHandle is
         // needed (the MCP client runs on config + DB rows only), so `has_app` does not gate it.
-        if matches!(scope, AssistantScope::Connectors | AssistantScope::Full) {
+        if matches!(
+            scope,
+            AssistantScope::Connectors | AssistantScope::Full | AssistantScope::DurableAsk
+        ) {
             for row in self.db.list_mcp_servers().unwrap_or_default() {
                 if !row.enabled || !row.consented {
                     continue;
@@ -3270,8 +3284,35 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
     }
 
     fn run(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+        self.run_with_admission(name, args, None)
+    }
+
+    fn run_admitted(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<String> {
+        // Bind EVERY durable tool dispatch to the captured content lifecycle, including local
+        // reads/writes. Connector branches additionally keep the stronger factory + every-poll
+        // wrapper below because their async poll is the external-dispatch boundary.
+        admission.validate()?;
+        self.run_with_admission(name, args, Some(admission))
+    }
+}
+
+impl GatedToolExecutor<'_> {
+    fn run_with_admission(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        admission: Option<&crate::state::ContentDispatchAdmission>,
+    ) -> Result<String> {
         // ENFORCE the allowlist: the model can NEVER run a tool we did not advertise this turn.
-        if !self.specs().iter().any(|s| s.name == name) {
+        if !crate::agent::ToolExecutor::specs(self)
+            .iter()
+            .any(|s| s.name == name)
+        {
             return Err(AppError::InvalidArg(format!(
                 "tool '{name}' is not available"
             )));
@@ -3308,12 +3349,10 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 .into_iter()
                 .find(|r| r.id == server_id && r.enabled && r.consented)
                 .ok_or_else(|| AppError::InvalidArg(format!("tool '{name}' is not available")))?;
-            return block_on_tool(execute_mcp_query(
-                &row,
-                &s("query"),
-                self.config,
-                self.recording_token.as_ref(),
-            ));
+            let query = s("query");
+            return block_on_admitted_tool(admission, || {
+                execute_mcp_query(&row, &query, self.config, self.recording_token.as_ref())
+            });
         }
         match name {
             // Dashboards — the user's own curated scope. Same gated executor, same visibility
@@ -3457,55 +3496,63 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 self.config,
             ),
             "web_search" => match self.app {
-                Some(_) => block_on_tool(execute_web_search(
-                    &s("query"),
-                    self.config,
-                    self.recording_token.as_ref(),
-                )),
+                Some(_) => {
+                    let query = s("query");
+                    block_on_admitted_tool(admission, || {
+                        execute_web_search(&query, self.config, self.recording_token.as_ref())
+                    })
+                }
                 None => Err(AppError::InvalidArg("web_search needs an AppHandle".into())),
             },
             "calendar_lookup" => match self.app {
-                Some(app) => block_on_tool(execute_calendar_search(&s("query"), app)),
+                Some(app) => {
+                    let query = s("query");
+                    block_on_admitted_tool(admission, || execute_calendar_search(&query, app))
+                }
                 None => Err(AppError::InvalidArg(
                     "calendar_lookup needs an AppHandle".into(),
                 )),
             },
             "jira_search" => match self.app {
-                Some(_) => block_on_tool(execute_jira_search(
-                    &s("query"),
-                    self.config,
-                    self.recording_token.as_ref(),
-                )),
+                Some(_) => {
+                    let query = s("query");
+                    block_on_admitted_tool(admission, || {
+                        execute_jira_search(&query, self.config, self.recording_token.as_ref())
+                    })
+                }
                 None => Err(AppError::InvalidArg(
                     "jira_search needs an AppHandle".into(),
                 )),
             },
             "slack_search" => match self.app {
-                Some(_) => block_on_tool(execute_slack_search(
-                    &s("query"),
-                    self.config,
-                    self.recording_token.as_ref(),
-                )),
+                Some(_) => {
+                    let query = s("query");
+                    block_on_admitted_tool(admission, || {
+                        execute_slack_search(&query, self.config, self.recording_token.as_ref())
+                    })
+                }
                 None => Err(AppError::InvalidArg(
                     "slack_search needs an AppHandle".into(),
                 )),
             },
             "notion_search" => match self.app {
-                Some(_) => block_on_tool(execute_notion_search(
-                    &s("query"),
-                    self.config,
-                    self.recording_token.as_ref(),
-                )),
+                Some(_) => {
+                    let query = s("query");
+                    block_on_admitted_tool(admission, || {
+                        execute_notion_search(&query, self.config, self.recording_token.as_ref())
+                    })
+                }
                 None => Err(AppError::InvalidArg(
                     "notion_search needs an AppHandle".into(),
                 )),
             },
             "clickup_search" => match self.app {
-                Some(_) => block_on_tool(execute_clickup_search(
-                    &s("query"),
-                    self.config,
-                    self.recording_token.as_ref(),
-                )),
+                Some(_) => {
+                    let query = s("query");
+                    block_on_admitted_tool(admission, || {
+                        execute_clickup_search(&query, self.config, self.recording_token.as_ref())
+                    })
+                }
                 None => Err(AppError::InvalidArg(
                     "clickup_search needs an AppHandle".into(),
                 )),
@@ -3654,6 +3701,24 @@ fn block_on_tool(fut: impl std::future::Future<Output = Result<String>> + Send) 
     })
 }
 
+/// Drive one connector future under the durable Ask lifecycle admission when present. The future
+/// factory is deliberately passed, not a pre-built future: `ContentDispatchAdmission::run` then
+/// validates before connector setup and again on every poll, releasing the lifecycle mutex across
+/// `Pending`. Stateless callers pass `None` and retain the pre-existing path byte-for-byte.
+fn block_on_admitted_tool<F, Fut>(
+    admission: Option<&crate::state::ContentDispatchAdmission>,
+    factory: F,
+) -> Result<String>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<String>> + Send,
+{
+    match admission {
+        Some(admission) => block_on_tool(admission.run(factory)),
+        None => block_on_tool(factory()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3672,6 +3737,122 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// RED-before-GREEN oracle for durable Ask connector dispatch. The simulated connector's first
+    /// poll is pending (transport not dispatched yet); a relock then invalidates the admission and
+    /// wakes it. The second poll must be refused BEFORE the future can dispatch externally or append
+    /// its content-free egress ledger row. Without `block_on_admitted_tool`'s every-poll admission,
+    /// both counters become 1.
+    #[test]
+    fn durable_connector_pending_then_relock_has_zero_dispatch_and_zero_ledger() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::task::{Context, Poll, Waker};
+
+        struct PendingConnector {
+            ready_tx: Option<mpsc::Sender<()>>,
+            waker: Arc<Mutex<Option<Waker>>>,
+            external_dispatches: Arc<AtomicUsize>,
+            ledger_entries: Arc<AtomicUsize>,
+        }
+
+        impl Future for PendingConnector {
+            type Output = Result<String>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if let Some(ready_tx) = self.ready_tx.take() {
+                    *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                    ready_tx.send(()).unwrap();
+                    return Poll::Pending;
+                }
+                self.external_dispatches.fetch_add(1, Ordering::SeqCst);
+                self.ledger_entries.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok("connector result".into()))
+            }
+        }
+
+        let lifecycle = Arc::new(Mutex::new(()));
+        let visible = Arc::new(AtomicBool::new(true));
+        let validate_visible = Arc::clone(&visible);
+        let admission =
+            crate::state::ContentDispatchAdmission::for_test(Arc::clone(&lifecycle), move || {
+                if validate_visible.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(AppError::Locked("scope relocked".into()))
+                }
+            });
+        let external_dispatches = Arc::new(AtomicUsize::new(0));
+        let ledger_entries = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(Mutex::new(None));
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let dispatches_for_future = Arc::clone(&external_dispatches);
+        let ledger_for_future = Arc::clone(&ledger_entries);
+        let waker_for_future = Arc::clone(&waker);
+        let worker = std::thread::spawn(move || {
+            block_on_admitted_tool(Some(&admission), move || PendingConnector {
+                ready_tx: Some(ready_tx),
+                waker: waker_for_future,
+                external_dispatches: dispatches_for_future,
+                ledger_entries: ledger_for_future,
+            })
+        });
+
+        ready_rx.recv().unwrap();
+        {
+            let _guard = lifecycle.lock().unwrap();
+            visible.store(false, Ordering::SeqCst);
+        }
+        waker.lock().unwrap().take().unwrap().wake();
+
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(AppError::Locked(_))), "{result:?}");
+        assert_eq!(external_dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(ledger_entries.load(Ordering::SeqCst), 0);
+    }
+
+    /// Durable Ask entry admission covers synchronous/local tools too, while its read-only
+    /// executor structurally refuses the external `create_reminder` write before osascript can run.
+    #[test]
+    fn durable_tool_entry_revalidates_local_and_refuses_external_write() {
+        use crate::agent::ToolExecutor;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = Mutex::new(HashSet::new());
+        // `Full` mirrors durable Ask; `exec_at` is read-only (`allow_writes: false`).
+        let exec = exec_at(&db, &unlocked, &cfg, AssistantScope::Full);
+        let lifecycle = Arc::new(Mutex::new(()));
+        let visible = Arc::new(AtomicBool::new(false));
+        let validate_visible = Arc::clone(&visible);
+        let admission =
+            crate::state::ContentDispatchAdmission::for_test(Arc::clone(&lifecycle), move || {
+                if validate_visible.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(AppError::Locked("scope relocked".into()))
+                }
+            });
+
+        let local = exec.run_admitted("list_dashboards", &serde_json::json!({}), &admission);
+        assert!(matches!(local, Err(AppError::Locked(_))), "{local:?}");
+
+        visible.store(true, Ordering::SeqCst);
+        let reminder = exec.run_admitted(
+            "create_reminder",
+            &serde_json::json!({ "text": "must not execute" }),
+            &admission,
+        );
+        assert!(
+            matches!(reminder, Err(AppError::InvalidArg(_))),
+            "durable Ask must refuse create_reminder before external write: {reminder:?}"
+        );
     }
 
     /// THE AGENT-PATH LEAK ORACLE, end to end through `execute_tool`.
@@ -5683,6 +5864,10 @@ mod tests {
     fn org_brain_search_is_tier3_only() {
         assert!(AssistantScope::Connectors.allows("org_brain_search"));
         assert!(AssistantScope::Full.allows("org_brain_search"));
+        assert!(
+            !AssistantScope::DurableAsk.allows("org_brain_search"),
+            "durable Ask history must never ingest mutable org replica content"
+        );
         assert!(!AssistantScope::Vault.allows("org_brain_search"));
         assert!(!AssistantScope::CurrentMeeting.allows("org_brain_search"));
     }

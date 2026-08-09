@@ -18,7 +18,10 @@ test("a long Ask citation wraps INSIDE the drawer pane (no horizontal overflow)"
   page.on("pageerror", (e) => consoleErrors.push(String(e)));
 
   await mockNotes(page, {
-    ask_vault: () => ({
+    ask_vault_persisted: () => ({
+      conversationId: "note-conversation-1",
+      userMessageId: crypto.randomUUID(),
+      assistantMessageId: crypto.randomUUID(),
       answer:
         "Based on the note, here is the source: [[Test nagrania — prośba o analizę pogody na następny tydzień]] — it covers everything.",
       citations: [],

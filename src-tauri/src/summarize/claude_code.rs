@@ -1176,7 +1176,12 @@ mod tests {
         }
         // ...and a legitimate unlisted id DOES reach the command, or the guard would be vacuous:
         // a builder that never passed `--model` at all would satisfy every assertion above.
-        let args = args_of(&build_claude_command("claude", "SYSTEM", "claude-opus-6", false));
+        let args = args_of(&build_claude_command(
+            "claude",
+            "SYSTEM",
+            "claude-opus-6",
+            false,
+        ));
         let flag = args.iter().position(|arg| arg == "--model");
         assert!(flag.is_some(), "a valid id must still reach argv: {args:?}");
         assert_eq!(args[flag.unwrap() + 1], "claude-opus-6");

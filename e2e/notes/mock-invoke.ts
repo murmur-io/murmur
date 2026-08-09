@@ -24,6 +24,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
 export async function mockNotes(
   page: Page,
   extra: Record<string, (args: any) => unknown> = {},
+  delayedEventListeners: string[] = [],
 ): Promise<void> {
   await mockTauri(page, {
     // --- config (note-assistant toggles ON so the popover shows every action) ---
@@ -231,5 +232,5 @@ export async function mockNotes(
 
     // --- per-spec overrides win over the Notes defaults above ---
     ...extra,
-  });
+  }, {}, [], delayedEventListeners);
 }

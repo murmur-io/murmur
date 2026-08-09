@@ -629,6 +629,25 @@ pub fn emit_reminder_visibility_invalidated(app: &AppHandle) -> bool {
     }
 }
 
+/// Global, content-free privacy barrier for every Ask Brain renderer cache. Emitted immediately
+/// after a successful visibility reduction or destructive purge; consumers synchronously discard
+/// loaded messages, history summaries, source labels and any in-flight result token.
+pub const EVENT_ASK_HISTORY_INVALIDATED: &str = "murmur://ask-history-invalidated";
+
+pub fn emit_ask_history_invalidated(app: &AppHandle) -> bool {
+    match app.emit(EVENT_ASK_HISTORY_INVALIDATED, ()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                target: "ask_history",
+                error = %e,
+                "failed to emit Ask history visibility invalidation"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +692,15 @@ mod tests {
         assert_eq!(
             EVENT_REMINDER_VISIBILITY_INVALIDATED,
             "murmur://reminder-visibility-invalidated"
+        );
+        assert_eq!(serde_json::to_string(&()).unwrap(), "null");
+    }
+
+    #[test]
+    fn ask_history_invalidated_event_is_stable_and_content_free() {
+        assert_eq!(
+            EVENT_ASK_HISTORY_INVALIDATED,
+            "murmur://ask-history-invalidated"
         );
         assert_eq!(serde_json::to_string(&()).unwrap(), "null");
     }
