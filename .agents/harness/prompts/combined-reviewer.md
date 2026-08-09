@@ -43,7 +43,10 @@ contract-authoring mistake as informational.
 
 Treat runner-owned check results as evidence, not as a substitute for review.
 Do not claim that compilation, a synthetic test, or a mocked UI proves real
-security/runtime behavior. Record missing proof as a `proof_gap`.
+security/runtime behavior. If missing proof prevents you from deciding a
+contract or security property, return `BLOCKED` and optionally request a typed
+probe. Use `proof_gap` only for bounded residual uncertainty that does not
+prevent your verdict.
 
 For a bug fix, require a focused regression test and green runner-owned language
 suite. Do not demand or accept a developer's prose reconstruction as empirical
@@ -58,8 +61,11 @@ forbidden.
 Verdict rules:
 
 - `PASS` requires complete contract coverage, no unresolved `MAJOR`/`BLOCKER`,
-  and no proof gap or probe request.
+  and no probe request. A residual `proof_gap` may accompany PASS only when it
+  records bounded uncertainty that does not prevent you from approving the diff.
 - `FAIL` means the current diff must change.
-- `BLOCKED` means the code may be correct but required evidence is unavailable.
+- `BLOCKED` means the code may be correct but evidence required to decide the
+  contract or a security property is unavailable. Do not label that condition
+  PASS plus a proof gap.
 - Include every finding, including minor/informational ones. A PASS with an
   unresolved MAJOR/BLOCKER is invalid regardless of the verdict field.

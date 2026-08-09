@@ -188,6 +188,50 @@ Any new invocation must be checked the same way before it is trusted: run one ta
 fixture file actually changed on disk. `files_changed: []` on an `expected_change: true` task is an
 instrument failure, not a result.
 
+### Full Track C run — 2026-08-09
+
+The proof-gap receipt-policy change was measured with the required production envelope comparison:
+
+```bash
+python3 eval/agents/matrix.py \
+  --agent 'claude=claude -p --permission-mode acceptEdits' \
+  --scaffold none --scaffold full --repeat 3 --seed 1 \
+  --json eval/agents/results/harness-proof-gap-receipt.json
+```
+
+Claude Code 2.1.226 produced 48 records in 6404.4 s, all anchored to repo SHA `7a9d689` with the
+working diff present. Four final calls hit the Claude session limit and are `ERROR`, not behavioural
+failures. The raw scored table is:
+
+| task | `none` | `full` | observed delta |
+|---|---:|---:|---:|
+| `additive-migration` | 2/3 | 3/3 | +33 pp |
+| `analysis-only` | 0/3 | 2/3 | +67 pp |
+| `angular22-noop` | 3/3 | 3/3 | 0 pp — ceiling |
+| `csp-style-src-nonce` | 3/3 | 3/3 | 0 pp — ceiling |
+| `lock-masked-dto` | 3/3 | 3/3 | 0 pp — ceiling |
+| `overlay-opaque-surface` | 3/3 | 3/3 | 0 pp — ceiling |
+| `seal-verify-before-destroy` | 3/3 | 3/3 | 0 pp — ceiling, one control run out of scope |
+| `secret-sk-proj` | 0/1, 2 ERROR | 0/1, 2 ERROR | not comparable |
+| **TOTAL** | **17/22, 2 ERROR** | **20/22, 2 ERROR** | **+14 pp descriptive only** |
+
+The positive cells are a smoke signal at n=3, not a causal estimate. Six tasks remain ceilings or
+otherwise cannot separate this frontier model cleanly. `secret-sk-proj` lost two thirds of each arm
+to transport and its only scored run in each arm failed, so it supports no arm comparison.
+
+The generic runner still does not enforce `allowed_paths`, and this run exposed that limit four
+times. `seal-verify-before-destroy/none #3` changed `Cargo.toml` and `src/lib.rs` in addition to the
+allowed `src/seal.rs`. The scored `secret-sk-proj` runs in both arms changed
+`tools/test_secret_scan.py` in addition to `tools/secret_scan.py`; its partially executed
+`none #2` ERROR also created `tests/test_secret_scan.py` and `tests/vectors.txt`. These records stay
+in the immutable result artifact but are instrument findings, not clean evidence. No **scored**
+`expected_change: true` run had an empty `files_changed` list.
+
+Finally, none of the eight tasks exercises the Harness's proof-gap receipt semantics. This matrix
+measures the general scaffold after a reviewer-policy edit; it does not prove the policy change
+itself. RED-before-GREEN receipt, stale-reason, legacy-policy, specialist-policy and clean-reopen
+coverage in `.agents/harness/v2_selftest.py` provides that deterministic evidence.
+
 ## The scaffold arms — what makes this a comparison
 
 Until 2026-08-01 `--mode agent` measured a **bare model**, not the envelope: `materialize` copied
