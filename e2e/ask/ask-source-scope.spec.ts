@@ -39,13 +39,23 @@ test("Ask page threads the picked source into ask_vault's explicitSources (empty
     list_link_candidates: () => [
       { kind: "meeting", id: "m9", title: "Planning sync" },
     ],
-    ask_vault: (args: { explicitSources?: unknown }) => {
+    ask_vault_persisted: (args: {
+      conversationId?: string;
+      explicitSources?: unknown;
+    }) => {
       const w = window as unknown as {
         __askCalls?: { explicitSources: unknown }[];
       };
       w.__askCalls = w.__askCalls ?? [];
       w.__askCalls.push({ explicitSources: args.explicitSources ?? null });
-      return { answer: "Answer.", sources: [], citations: [] };
+      return {
+        conversationId: args.conversationId ?? "conversation-1",
+        userMessageId: crypto.randomUUID(),
+        assistantMessageId: crypto.randomUUID(),
+        answer: "Answer.",
+        sources: [],
+        citations: [],
+      };
     },
   });
 

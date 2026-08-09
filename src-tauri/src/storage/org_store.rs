@@ -164,14 +164,20 @@ impl Db {
     /// context (`search_org_chunks_knn`/`_fts`). The ONLY mutator (mirrors `set_org_consented`) — a
     /// status/feed refresh (`upsert_org_state`) never touches this column. Disabling never deletes the
     /// local replica; re-enabling is instant with no re-sync.
-    pub fn set_org_context_enabled(&self, org_id: &str, enabled: bool) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_state SET context_enabled = ?2 WHERE org_id = ?1",
+    pub fn set_org_context_enabled(&self, org_id: &str, enabled: bool) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx.execute(
+            "UPDATE org_state SET context_enabled = ?2
+               WHERE org_id = ?1 AND context_enabled != ?2",
             rusqlite::params![org_id, enabled as i64],
         )
         .map_err(map_err)?;
-        Ok(())
+        if !enabled && changed > 0 {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(changed > 0)
     }
 
     /// Advance the synced feed cursor for an org (monotonic; a caller never rewinds it below the
@@ -206,18 +212,23 @@ impl Db {
     /// claim their sequence against this same membership row inside their own transaction, so SQLite's
     /// serialized writer order yields only two safe outcomes: commit-before-leave is purged here;
     /// leave-before-commit makes the feed claim fail before any plaintext insert.
-    pub fn delete_org_state(&self, org_id: &str) -> Result<()> {
+    pub fn delete_org_state(&self, org_id: &str) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         let items = Self::purge_org_replica_tx(&tx, org_id)?;
-        tx.execute(
+        let removed = tx.execute(
             "DELETE FROM org_state WHERE org_id = ?1",
             rusqlite::params![org_id],
         )
         .map_err(map_err)?;
+        if removed > 0 {
+            // Membership withdrawal invalidates global-derived Ask even when the decrypted org
+            // replica was already empty and the durable conversation is the only derived copy.
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
         tx.commit().map_err(map_err)?;
         tracing::info!(target: "org", items, "atomically removed org membership and decrypted replica");
-        Ok(())
+        Ok(removed > 0)
     }
 
     /// Insert a fresh outbound org share in the `queued` state (the "Share to Brain" action). The
@@ -822,7 +833,10 @@ impl Db {
     /// byte-for-byte; only a known author id may be filled in. A tombstone is never resurrected.
     ///
     /// `superseded_item_id` is tombstoned in this SAME transaction for republish, so readers cannot
-    /// observe the new local card without the old local card being evicted (or vice versa).
+    /// observe the new local card without the old local card being evicted (or vice versa). The
+    /// returned boolean is the transaction-authoritative visibility-reduction result: callers use it
+    /// to bump the lifecycle epoch and invalidate open Ask renderers exactly when a live predecessor
+    /// was actually evicted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_local_org_replica(
         &self,
@@ -840,14 +854,14 @@ impl Db {
         author_user_id: Option<&str>,
         prepared: &PreparedOrgItemIndex,
         superseded_item_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         if !Self::org_membership_exists_tx(&tx, org_id)? {
             // The server publish may have raced a local leave/removal. The remote item remains the
             // server's concern, but withdrawn membership must never be followed by a plaintext local
             // replica resurrection.
-            return Ok(());
+            return Ok(false);
         }
         let existing = tx
             .query_row(
@@ -906,11 +920,12 @@ impl Db {
             .map_err(map_err)?;
         }
 
-        if let Some(old_item_id) = superseded_item_id.filter(|old| *old != item_id) {
-            let _evicted = Self::tombstone_org_item_tx(&tx, old_item_id)?;
-        }
+        let superseded_evicted = match superseded_item_id.filter(|old| *old != item_id) {
+            Some(old_item_id) => Self::tombstone_org_item_tx(&tx, old_item_id)?,
+            None => false,
+        };
         tx.commit().map_err(map_err)?;
-        Ok(())
+        Ok(superseded_evicted)
     }
 
     /// Commit one already-prepared live feed item and advance the org cursor to this action's exact
@@ -1057,20 +1072,31 @@ impl Db {
 
     /// Commit one tombstone and its exact feed sequence atomically. Later page entries remain
     /// replayable if the process stops immediately after this transaction.
+    #[cfg(test)]
     pub(crate) fn commit_org_feed_tombstone(
         &self,
         org_id: &str,
         item_id: &str,
         seq: u64,
     ) -> Result<bool> {
+        self.commit_org_feed_tombstone_outcome(org_id, item_id, seq)
+            .map(|(applied, _)| applied)
+    }
+
+    pub(crate) fn commit_org_feed_tombstone_outcome(
+        &self,
+        org_id: &str,
+        item_id: &str,
+        seq: u64,
+    ) -> Result<(bool, bool)> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
-            return Ok(false);
+            return Ok((false, false));
         }
-        let _evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
+        let evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
         tx.commit().map_err(map_err)?;
-        Ok(true)
+        Ok((true, evicted))
     }
 
     /// Advance past one terminal, permanently un-ingestable feed entry. This is intentionally a
@@ -1126,6 +1152,9 @@ impl Db {
             rusqlite::params![item_id],
         )
         .map_err(map_err)?;
+        if was_live {
+            Self::purge_all_ask_conversations_tx(tx)?;
+        }
         Ok(was_live)
     }
 
@@ -1197,6 +1226,9 @@ impl Db {
                 rusqlite::params![org_id],
             )
             .map_err(map_err)?;
+        if items > 0 {
+            Self::purge_all_ask_conversations_tx(tx)?;
+        }
         Ok(items)
     }
 

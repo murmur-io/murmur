@@ -326,6 +326,46 @@ fn classify_read_outcome(
 pub trait ToolExecutor: Send + Sync {
     fn specs(&self) -> Vec<crate::tools::ToolSpec>;
     fn run(&self, name: &str, args: &serde_json::Value) -> Result<String>;
+
+    /// Execute one tool under a durable content lifecycle admission. Executors that can dispatch
+    /// async connector work override this so authorization covers the future factory and every
+    /// poll. The default keeps stateless/local executors source-compatible while still refusing a
+    /// dispatch whose durable scope is already stale.
+    fn run_admitted(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<String> {
+        admission.validate()?;
+        self.run(name, args)
+    }
+}
+
+/// Narrow adapter used only by durable Ask. Existing stateless agent callers keep their exact
+/// executor behavior; durable Ask routes every model-selected tool through `run_admitted`.
+pub(crate) struct AdmittedToolExecutor<'a> {
+    inner: &'a dyn ToolExecutor,
+    admission: crate::state::ContentDispatchAdmission,
+}
+
+impl<'a> AdmittedToolExecutor<'a> {
+    pub(crate) fn new(
+        inner: &'a dyn ToolExecutor,
+        admission: crate::state::ContentDispatchAdmission,
+    ) -> Self {
+        Self { inner, admission }
+    }
+}
+
+impl ToolExecutor for AdmittedToolExecutor<'_> {
+    fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+        self.inner.specs()
+    }
+
+    fn run(&self, name: &str, args: &serde_json::Value) -> Result<String> {
+        self.inner.run_admitted(name, args, &self.admission)
+    }
 }
 
 /// Live progress sink for the loop — drives the FE tool-trace chips ("Searching notes… ✓ 12").

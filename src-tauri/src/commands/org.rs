@@ -44,6 +44,7 @@ use super::*;
 // Brought into scope (rather than spelled out at the call site) so the `org-feed-updated` notice is
 // callable on a `&dyn` notifier — the seam that makes "did this command tell the FE to re-fetch?"
 // unit-testable without a Tauri runtime.
+#[cfg(test)]
 use crate::events::OrgFeedNotifier;
 
 /// Resolve only exact-owner images referenced by outgoing Markdown. Missing/foreign markers are
@@ -187,6 +188,32 @@ impl OrgWorkPolicy {
             None => commit().map(Some),
         }
     }
+}
+
+pub(crate) trait AskHistoryInvalidationNotifier: Send + Sync {
+    fn ask_history_invalidated(&self);
+}
+
+impl AskHistoryInvalidationNotifier for AppHandle {
+    fn ask_history_invalidated(&self) {
+        emit_ask_history_invalidated_fail_closed(self);
+    }
+}
+
+pub(crate) fn commit_org_visibility_reduction(
+    state: &AppState,
+    notifier: Option<&dyn AskHistoryInvalidationNotifier>,
+    mutation: impl FnOnce() -> Result<bool, AppError>,
+) -> Result<bool, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let changed = mutation()?;
+    if changed {
+        bump_seal_epoch(state);
+        if let Some(notifier) = notifier {
+            notifier.ask_history_invalidated();
+        }
+    }
+    Ok(changed)
 }
 
 /// One row of `list_my_shares` (camelCase). Content-free by construction — the server holds no
@@ -1013,17 +1040,28 @@ pub async fn list_share_inbox(state: State<'_, AppState>) -> Result<Vec<ShareInb
 /// `accept_share(share_id, folder_id?)` — THE HIGH-BAR vault WRITE. See the module invariants above.
 #[tauri::command]
 pub async fn accept_share(
+    app: AppHandle,
     state: State<'_, AppState>,
     share_id: String,
     folder_id: Option<String>,
 ) -> Result<AcceptedShare, AppError> {
-    accept_share_inner(state.inner(), share_id, folder_id).await
+    accept_share_inner_with_app(state.inner(), share_id, folder_id, Some(&app)).await
 }
 
+#[cfg(test)]
 pub(crate) async fn accept_share_inner(
     state: &AppState,
     share_id: String,
     folder_id: Option<String>,
+) -> Result<AcceptedShare, AppError> {
+    accept_share_inner_with_app(state, share_id, folder_id, None).await
+}
+
+async fn accept_share_inner_with_app(
+    state: &AppState,
+    share_id: String,
+    folder_id: Option<String>,
+    app: Option<&AppHandle>,
 ) -> Result<AcceptedShare, AppError> {
     // (1) IDEMPOTENT on share_id — a re-accept returns the existing meeting, never a duplicate note.
     if let Some(mid) = state.db.inbound_share_meeting(&share_id)? {
@@ -1052,7 +1090,7 @@ pub(crate) async fn accept_share_inner(
     //      inbox and a re-accept 404s, so without the durable resume record the share would be lost.
     //      Re-fetch (the blob stays fetchable while `accepted`) + re-verify + ingest from the record.
     if let Some(pending) = state.db.get_pending_share_accept(&share_id)? {
-        return resume_pending_accept(state, pending).await;
+        return resume_pending_accept(state, pending, app).await;
     }
 
     // (2) WRITE-GATE the target folder FIRST (mirror `ingest_into_folder`). Default = an auto-created
@@ -1137,6 +1175,7 @@ pub(crate) async fn accept_share_inner(
         &share_id,
         item.rev,
         item.key_generation,
+        app,
     )
     .await
 }
@@ -1160,9 +1199,10 @@ async fn finalize_accepted_share(
     share_id: &str,
     rev: u32,
     key_generation: u32,
+    app: Option<&AppHandle>,
 ) -> Result<AcceptedShare, AppError> {
     let content_cell = client.get_blob(access, blob_id).await?;
-    let result = accept_ingest_verified(
+    let result = accept_ingest_verified_with_app(
         state,
         target,
         recipient,
@@ -1173,6 +1213,7 @@ async fn finalize_accepted_share(
         share_id,
         rev,
         key_generation,
+        app,
     )?;
     // Pin ONLY NOW — after the grant verified (§4.8) and the note landed — so a forged/failed item
     // never leaves a poisoned pin. Then drop the resume record (the strand window is closed).
@@ -1199,6 +1240,7 @@ async fn finalize_accepted_share(
 async fn resume_pending_accept(
     state: &AppState,
     pending: crate::storage::PendingShareAccept,
+    app: Option<&AppHandle>,
 ) -> Result<AcceptedShare, AppError> {
     // (2) WRITE-GATE the saved target folder FIRST — refuse if it was sealed since the flip.
     let target = state
@@ -1249,6 +1291,7 @@ async fn resume_pending_accept(
         &pending.share_id,
         pending.rev,
         pending.key_generation,
+        app,
     )
     .await
 }
@@ -1309,6 +1352,7 @@ pub(crate) fn get_or_create_shared_folder(state: &AppState) -> Result<Folder, Ap
 /// replayed / swapped / gen-mismatch), (b) decrypts the content cell, and ONLY THEN (c) ingests the
 /// note into the (already write-gated) folder. On ANY verification/decrypt failure it returns
 /// `AppError::InvalidArg` and writes NOTHING.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn accept_ingest_verified(
     state: &AppState,
@@ -1321,6 +1365,35 @@ pub(crate) fn accept_ingest_verified(
     share_id: &str,
     rev: u32,
     key_generation: u32,
+) -> Result<AcceptedShare, AppError> {
+    accept_ingest_verified_with_app(
+        state,
+        target,
+        recipient,
+        sender_fp,
+        sender_user_id,
+        up,
+        content_cell,
+        share_id,
+        rev,
+        key_generation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_ingest_verified_with_app(
+    state: &AppState,
+    target: &Folder,
+    recipient: &crate::e2ee::keys::IdentityKeypair,
+    sender_fp: &str,
+    sender_user_id: &str,
+    up: &crate::e2ee::wrap::UnpackedGrant,
+    content_cell: &[u8],
+    share_id: &str,
+    rev: u32,
+    key_generation: u32,
+    app: Option<&AppHandle>,
 ) -> Result<AcceptedShare, AppError> {
     let recipient_fp = crate::e2ee::key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
     // (a) §4.8 VERIFY before any write. The pinned pk_sig is the one we unpacked + fingerprint-attested.
@@ -1348,13 +1421,14 @@ pub(crate) fn accept_ingest_verified(
         AppError::InvalidArg("shared note failed to decrypt — refusing to ingest".into())
     })?;
     // (c) Ingest into the write-gated folder.
-    ingest_shared_note(state, target, &env, sender_fp, sender_user_id, share_id)
+    ingest_shared_note_with_app(state, target, &env, sender_fp, sender_user_id, share_id, app)
 }
 
 /// Write a VERIFIED shared note into the vault + DB: a new `Exported` meeting (audio `None`) + a
 /// `"shared"` note carrying `shared-by`/`shared-at`/`share-id` provenance frontmatter, atomically
 /// exported to the folder's vault subdir, and an `inbound_shares` idempotency record. The new meeting
 /// is a NORMAL row → it participates in every existing gate automatically.
+#[cfg(test)]
 pub(crate) fn ingest_shared_note(
     state: &AppState,
     target: &Folder,
@@ -1362,6 +1436,27 @@ pub(crate) fn ingest_shared_note(
     sender_fp: &str,
     sender_user_id: &str,
     share_id: &str,
+) -> Result<AcceptedShare, AppError> {
+    ingest_shared_note_with_app(
+        state,
+        target,
+        env,
+        sender_fp,
+        sender_user_id,
+        share_id,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_shared_note_with_app(
+    state: &AppState,
+    target: &Folder,
+    env: &murmur_protocol::envelope::ShareEnvelope,
+    sender_fp: &str,
+    sender_user_id: &str,
+    share_id: &str,
+    app: Option<&AppHandle>,
 ) -> Result<AcceptedShare, AppError> {
     // Authenticate and validate the complete manifest before the first DB/vault write. Wire ids
     // are remapped so accepting the same payload twice cannot collide with another local owner.
@@ -1465,7 +1560,14 @@ pub(crate) fn ingest_shared_note(
     ) {
         // This meeting was minted by this ingest and has not been exported. Roll it back so a
         // residual DB failure cannot leave a note with broken private markers.
-        let _ = state.db.delete_meeting(&meeting_id);
+        // Retrieval can run off-thread after releasing the lifecycle guard, so even this short-lived
+        // row may have entered an in-flight Ask context. Delete + purge atomically, advance the
+        // generation, and invalidate the renderer while this lifecycle interval is still held.
+        bump_seal_epoch(state);
+        let _ = rollback_unpublished_shared_meeting(state, &meeting_id);
+        if let Some(app) = app {
+            emit_ask_history_invalidated_fail_closed(app);
+        }
         return Err(e);
     }
 
@@ -1509,6 +1611,22 @@ pub(crate) fn ingest_shared_note(
         "accepted a shared note into the vault"
     );
     Ok(AcceptedShare { meeting_id, title })
+}
+
+pub(crate) fn rollback_unpublished_shared_meeting(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    let mut conn = state.db.lock();
+    let tx = conn
+        .transaction()
+        .map_err(|error| AppError::Storage(format!("begin unpublished rollback: {error}")))?;
+    tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![meeting_id])
+        .map_err(|error| AppError::Storage(format!("rollback unpublished shared meeting: {error}")))?;
+    crate::storage::Db::purge_all_ask_conversations_tx(&tx)?;
+    tx.commit()
+        .map_err(|error| AppError::Storage(format!("commit unpublished rollback: {error}")))?;
+    Ok(())
 }
 
 /// `decline_share(share_id)` — drop the wrapped key server-side + flip the local state. Idempotent.
@@ -1964,20 +2082,40 @@ pub(crate) async fn org_list_statuses_inner(state: &AppState) -> Result<Vec<OrgS
 /// server call — purely local.
 #[tauri::command]
 pub fn org_set_context_enabled(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     enabled: bool,
 ) -> Result<(), AppError> {
-    org_set_context_enabled_inner(state.inner(), &org_id, enabled)
+    org_set_context_enabled_notifying(state.inner(), &org_id, enabled, Some(&app))
 }
 
+#[cfg(test)]
 pub(crate) fn org_set_context_enabled_inner(
     state: &AppState,
     org_id: &str,
     enabled: bool,
 ) -> Result<(), AppError> {
+    org_set_context_enabled_notifying(state, org_id, enabled, None)
+}
+
+fn org_set_context_enabled_notifying(
+    state: &AppState,
+    org_id: &str,
+    enabled: bool,
+    app: Option<&AppHandle>,
+) -> Result<(), AppError> {
     resolve_org(state, org_id)?; // membership re-check
-    state.db.set_org_context_enabled(org_id, enabled)
+    if enabled {
+        state.db.set_org_context_enabled(org_id, true)?;
+    } else {
+        commit_org_visibility_reduction(
+            state,
+            app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+            || state.db.set_org_context_enabled(org_id, false),
+        )?;
+    }
+    Ok(())
 }
 
 /// Build the content-free [`OrgStatus`] for ONE locally-joined org. Refreshes name/role/generation +
@@ -2064,8 +2202,8 @@ pub(crate) async fn org_status_for(
 /// `org_state` (add invited orgs, drop departed ones). Best-effort; offline / logged-out = no-op. The
 /// FE triggers this on settings-open so an org you were just invited to appears without a re-login.
 #[tauri::command]
-pub async fn org_refresh(state: State<'_, AppState>) -> Result<(), AppError> {
-    org_reconcile_memberships(state.inner()).await
+pub async fn org_refresh(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+    org_reconcile_memberships_notifying(state.inner(), Some(&app)).await
 }
 
 /// Reconcile the LOCAL `org_state` set against the server's authoritative membership list
@@ -2084,13 +2222,17 @@ pub async fn org_refresh(state: State<'_, AppState>) -> Result<(), AppError> {
 ///
 /// Offline / not-logged-in = NO-OP: the cached rows are kept untouched (never destructive on a
 /// transient network failure). No PII in logs — ids/counts only.
-pub(crate) async fn org_reconcile_memberships(state: &AppState) -> Result<(), AppError> {
-    org_reconcile_memberships_with_policy(state, OrgWorkPolicy::manual()).await
+pub(crate) async fn org_reconcile_memberships_notifying(
+    state: &AppState,
+    app: Option<&AppHandle>,
+) -> Result<(), AppError> {
+    org_reconcile_memberships_with_policy(state, OrgWorkPolicy::manual(), app).await
 }
 
 async fn org_reconcile_memberships_with_policy(
     state: &AppState,
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
     if !policy.is_current() {
         return Ok(());
@@ -2122,7 +2264,8 @@ async fn org_reconcile_memberships_with_policy(
 
     // Apply the ADD/REMOVE against the local DB (pure, testable without a network) and learn which
     // orgs are NEW (so we can best-effort acquire their OCK) and which we dropped (to purge OCKs).
-    let Some(outcome) = reconcile_org_state_into_db_with_policy(state, &server_orgs, policy)?
+    let Some(outcome) =
+        reconcile_org_state_into_db_with_policy(state, &server_orgs, policy, app)?
     else {
         return Ok(());
     };
@@ -2173,7 +2316,12 @@ pub(crate) fn reconcile_org_state_into_db(
     state: &AppState,
     server_orgs: &[crate::share::org_dto::OrgSummary],
 ) -> Result<ReconcileOutcome, AppError> {
-    match reconcile_org_state_into_db_with_policy(state, server_orgs, OrgWorkPolicy::manual())? {
+    match reconcile_org_state_into_db_with_policy(
+        state,
+        server_orgs,
+        OrgWorkPolicy::manual(),
+        None,
+    )? {
         Some(outcome) => Ok(outcome),
         None => Err(AppError::Unavailable(
             "manual org membership reconciliation was unexpectedly deferred".into(),
@@ -2185,6 +2333,7 @@ fn reconcile_org_state_into_db_with_policy(
     state: &AppState,
     server_orgs: &[crate::share::org_dto::OrgSummary],
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<Option<ReconcileOutcome>, AppError> {
     if !policy.is_current() {
         return Ok(None);
@@ -2253,19 +2402,24 @@ fn reconcile_org_state_into_db_with_policy(
             if !policy.is_current() {
                 return Ok(None);
             }
-            if policy
+            let Some(was_removed) = policy
                 .commit(|| {
-                    state.db.delete_org_state(org_id)?;
+                    let removed = commit_org_visibility_reduction(
+                        state,
+                        app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+                        || state.db.delete_org_state(org_id),
+                    )?;
                     if let Ok(mut cache) = state.org_ock_cache.lock() {
                         cache.retain(|(oid, _), _| oid != org_id);
                     }
-                    Ok(())
+                    Ok(removed)
                 })?
-                .is_none()
-            {
+            else {
                 return Ok(None);
+            };
+            if was_removed {
+                removed += 1;
             }
-            removed += 1;
         }
     }
 
@@ -2483,7 +2637,11 @@ pub(crate) async fn org_remove_member_inner(
 /// already-published items (use `revoke_org_share` for that first if desired). Resolves the FE-picked
 /// org (membership-checked), never the first via `.next()` — a leave must purge the RIGHT org.
 #[tauri::command]
-pub async fn org_leave(state: State<'_, AppState>, org_id: String) -> Result<(), AppError> {
+pub async fn org_leave(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    org_id: String,
+) -> Result<(), AppError> {
     let org = resolve_org(state.inner(), &org_id)?;
     let base = share_base_url(state.inner())?;
     let access = valid_access_token(state.inner()).await?;
@@ -2495,7 +2653,9 @@ pub async fn org_leave(state: State<'_, AppState>, org_id: String) -> Result<(),
     // plaintext replica lingered forever and `org_search` / the `org_brain_search` tool would still
     // return it (leak/consent invariant). Belt-and-braces beside the `org_brain_available` gate on
     // the retrieval seam (a purged replica is empty either way).
-    state.inner().db.delete_org_state(&org.org_id)?;
+    commit_org_visibility_reduction(state.inner(), Some(&app), || {
+        state.inner().db.delete_org_state(&org.org_id)
+    })?;
     // Drop every cached OCK for this org.
     {
         let mut cache = state
@@ -2813,7 +2973,15 @@ pub async fn share_meeting_to_org(
     meeting_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    let entry = share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await?;
+    let entry = share_to_org_notifying(
+        state.inner(),
+        &org_id,
+        Some(meeting_id),
+        None,
+        scrub,
+        Some(&app),
+    )
+    .await?;
     // A successful share now lives in the local replica (`publish_org_body` upserts it) AND the server
     // feed — ping every open org view (Notes list + Settings shared-brain) to re-fetch immediately, so
     // the shared note appears without a manual "Sync now". Content-free count-only event; a best-effort
@@ -2831,19 +2999,39 @@ pub async fn share_document_to_org(
     document_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    let entry = share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await?;
+    let entry = share_to_org_notifying(
+        state.inner(),
+        &org_id,
+        None,
+        Some(document_id),
+        scrub,
+        Some(&app),
+    )
+    .await?;
     // See `share_meeting_to_org`: ping open org views so the freshly-shared note appears without a
     // manual "Sync now". Content-free; best-effort.
     crate::events::emit_org_feed_updated(&app, 1);
     Ok(entry)
 }
 
+#[cfg(test)]
 pub(crate) async fn share_to_org_inner(
     state: &AppState,
     org_id: &str,
     meeting_id: Option<String>,
     document_id: Option<String>,
     scrub: bool,
+) -> Result<OrgShareEntry, AppError> {
+    share_to_org_notifying(state, org_id, meeting_id, document_id, scrub, None).await
+}
+
+async fn share_to_org_notifying(
+    state: &AppState,
+    org_id: &str,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+    app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
     share_to_org_inner_with_policy(
         state,
@@ -2852,6 +3040,7 @@ pub(crate) async fn share_to_org_inner(
         document_id,
         scrub,
         OrgWorkPolicy::manual(),
+        app,
     )
     .await
 }
@@ -2863,6 +3052,7 @@ async fn share_to_org_inner_with_policy(
     document_id: Option<String>,
     scrub: bool,
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
     if !policy.is_current() {
         return Err(AppError::Unavailable(
@@ -2892,6 +3082,7 @@ async fn share_to_org_inner_with_policy(
         meeting_id.as_deref(),
         document_id.as_deref(),
         policy,
+        app,
     )
     .await?
     {
@@ -2935,6 +3126,7 @@ async fn collapse_org_share_dups_for_source(
     meeting_id: Option<&str>,
     document_id: Option<&str>,
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<Option<crate::storage::OrgShareRow>, AppError> {
     // Oldest-first, so `remove(0)` is the canonical keeper and the remainder are the extras.
     let mut rows =
@@ -2952,7 +3144,7 @@ async fn collapse_org_share_dups_for_source(
         if let Some(item_id) = extra.item_id.clone() {
             // Tombstone the redundant copy. Swallow errors — `revoke_org_share_inner` marks the row
             // `revoke_pending` first, so an interrupted tombstone is completed by the launch sweep.
-            let _ = revoke_org_share_inner_with_policy(state, item_id, policy).await;
+            let _ = revoke_org_share_inner_with_policy(state, item_id, policy, app).await;
             if !policy.is_current() {
                 return Ok(Some(keeper));
             }
@@ -3257,7 +3449,7 @@ async fn publish_org_body_with_policy(
                 None,
             ) {
                 Ok(prepared) => match policy.commit(|| {
-                    state.db.commit_local_org_replica(
+                    let superseded_evicted = state.db.commit_local_org_replica(
                         &published.item_id,
                         &org.org_id,
                         published.seq,
@@ -3274,6 +3466,7 @@ async fn publish_org_body_with_policy(
                         &prepared,
                         None,
                     )?;
+                    debug_assert!(!superseded_evicted);
                     state
                         .db
                         .replace_org_item_attachment_bundle(&published.item_id, &local_attachments)
@@ -3346,6 +3539,7 @@ async fn publish_org_body_with_policy(
 ///  - SCRUB INTENT: `org_shares` does not persist the original scrub flag, so republish defaults scrub
 ///    ON (fail-safe toward LESS egress — matches the launch sweep's documented default). An edit must
 ///    never silently DOWNGRADE scrubbing.
+#[cfg(test)]
 pub(crate) async fn republish_org_shares_for_source(
     state: &AppState,
     meeting_id: Option<&str>,
@@ -3356,6 +3550,23 @@ pub(crate) async fn republish_org_shares_for_source(
         meeting_id,
         document_id,
         OrgWorkPolicy::manual(),
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn republish_org_shares_for_source_notifying(
+    state: &AppState,
+    meeting_id: Option<&str>,
+    document_id: Option<&str>,
+    app: &AppHandle,
+) -> Result<u32, AppError> {
+    republish_org_shares_for_source_with_policy(
+        state,
+        meeting_id,
+        document_id,
+        OrgWorkPolicy::manual(),
+        Some(app),
     )
     .await
 }
@@ -3365,6 +3576,7 @@ async fn republish_org_shares_for_source_with_policy(
     meeting_id: Option<&str>,
     document_id: Option<&str>,
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<u32, AppError> {
     if !policy.is_current() {
         return Ok(0);
@@ -3388,8 +3600,15 @@ async fn republish_org_shares_for_source_with_policy(
         if !policy.is_current() {
             return Ok(0);
         }
-        let _ = collapse_org_share_dups_for_source(state, org_id, meeting_id, document_id, policy)
-            .await;
+        let _ = collapse_org_share_dups_for_source(
+            state,
+            org_id,
+            meeting_id,
+            document_id,
+            policy,
+            app,
+        )
+        .await;
         if !policy.is_current() {
             return Ok(0);
         }
@@ -3695,7 +3914,8 @@ async fn republish_org_shares_for_source_with_policy(
                     None,
                 ) {
                     Ok(prepared) => policy.commit(|| {
-                        state.db.commit_local_org_replica(
+                        let _lifecycle = lifecycle_guard(state);
+                        let superseded_evicted = state.db.commit_local_org_replica(
                             &published.item_id,
                             &org.org_id,
                             published.seq,
@@ -3712,6 +3932,12 @@ async fn republish_org_shares_for_source_with_policy(
                             &prepared,
                             row.item_id.as_deref(),
                         )?;
+                        if superseded_evicted {
+                            bump_seal_epoch(state);
+                            if let Some(app) = app {
+                                emit_ask_history_invalidated_fail_closed(app);
+                            }
+                        }
                         state.db.replace_org_item_attachment_bundle(
                             &published.item_id,
                             &local_attachments,
@@ -3974,13 +4200,22 @@ pub async fn revoke_org_share(
     state: State<'_, AppState>,
     item_id: String,
 ) -> Result<(), AppError> {
-    revoke_org_share_notifying(state.inner(), item_id, &app).await
+    revoke_org_share_inner_with_policy(
+        state.inner(),
+        item_id,
+        OrgWorkPolicy::manual(),
+        Some(&app),
+    )
+    .await?;
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(())
 }
 
 /// Inner of [`revoke_org_share`] with the FE notice expressed as the testable
 /// [`crate::events::OrgFeedNotifier`] seam instead of a concrete `AppHandle`. The notice fires ONLY
 /// after the revoke fully succeeded — a failed revoke changed nothing worth re-fetching, and the row
 /// the FE already shows is still the truth.
+#[cfg(test)]
 pub(crate) async fn revoke_org_share_notifying(
     state: &AppState,
     item_id: String,
@@ -3991,17 +4226,19 @@ pub(crate) async fn revoke_org_share_notifying(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn revoke_org_share_inner(
     state: &AppState,
     item_id: String,
 ) -> Result<(), AppError> {
-    revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual()).await
+    revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual(), None).await
 }
 
 async fn revoke_org_share_inner_with_policy(
     state: &AppState,
     item_id: String,
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
     if !policy.is_current() {
         return Err(AppError::Unavailable(
@@ -4062,14 +4299,18 @@ async fn revoke_org_share_inner_with_policy(
     //     The server tombstone and the eviction are both idempotent, so the launch sweep re-drives the
     //     row harmlessly and completes the flip. Strictly safer: the interrupted state is a stale
     //     bookkeeping row, never live withdrawn content.
-    if policy
-        .commit(|| state.db.evict_org_item(&item_id).map(|_| ()))?
-        .is_none()
-    {
+    let Some(_evicted) = policy.commit(|| {
+        commit_org_visibility_reduction(
+            state,
+            app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+            || state.db.evict_org_item(&item_id),
+        )
+    })?
+    else {
         return Err(AppError::Unavailable(
             "background org revoke deferred for recording".into(),
         ));
-    }
+    };
     if policy
         .commit(|| state.db.set_org_share_state(&row.id, "revoked", &now))?
         .is_none()
@@ -4216,6 +4457,7 @@ pub(crate) fn folder_active_shares_inner(
 /// the launch sweep never egresses it. Idempotent (an already-revoked share is simply re-listed out).
 #[tauri::command]
 pub async fn revoke_shares_for_folder(
+    app: AppHandle,
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
@@ -4231,7 +4473,18 @@ pub async fn revoke_shares_for_folder(
     }
     for (row_id, item_id, _title) in org {
         let res = match item_id {
-            Some(id) => revoke_org_share_inner(st, id).await,
+            // Keep the AppHandle on the uploaded-item path: a productive local replica eviction
+            // purges global-derived Ask history and must invalidate any open history panel before
+            // this command returns, even if the caller's subsequent folder seal fails.
+            Some(id) => {
+                revoke_org_share_inner_with_policy(
+                    st,
+                    id,
+                    OrgWorkPolicy::manual(),
+                    Some(&app),
+                )
+                .await
+            }
             None => {
                 // Never uploaded — cancel locally so the launch sweep skips it (no server item).
                 let now = chrono::Utc::now().to_rfc3339();
@@ -4269,16 +4522,25 @@ pub async fn revoke_shares_for_folder(
 /// surfaced — the caller (delete) fails loud rather than silently deleting local content while a
 /// dangling live share survives on the server. Idempotent: an already-revoked row is excluded by
 /// `org_shares_for_source` (only `uploaded`/stuck-`failed` rows are live).
-pub(crate) async fn revoke_org_shares_for_source(
+pub(crate) async fn revoke_org_shares_for_source_notifying(
     state: &AppState,
     meeting_id: Option<&str>,
     document_id: Option<&str>,
+    app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
     let rows = state.db.org_shares_for_source(meeting_id, document_id)?;
     let mut first_err: Option<AppError> = None;
     for row in rows {
         let res = match row.item_id {
-            Some(item_id) => revoke_org_share_inner(state, item_id).await,
+            Some(item_id) => {
+                revoke_org_share_inner_with_policy(
+                    state,
+                    item_id,
+                    OrgWorkPolicy::manual(),
+                    app,
+                )
+                .await
+            }
             None => {
                 // Never uploaded (a queued/stuck row with no live server item) — cancel locally so
                 // the launch sweep never tries to publish it for a source that no longer exists.
@@ -4328,28 +4590,32 @@ pub const ORG_SYNC_TICK_SECS: u64 = 60;
 /// Returns `true` when the local replica actually CHANGED this tick (≥1 ingest or tombstone from the
 /// live pull, or ≥1 row converged by the sweep) — the caller (`lib.rs` loop) uses this to fire a
 /// content-free [`crate::events::EVENT_ORG_FEED_UPDATED`] so an open FE view re-fetches WITHOUT
-/// polling. Returns `false` on a no-op / error tick. Emitting is done by the loop (which holds the
-/// `AppHandle`); the tick signature stays `&AppState`, unchanged for the other internal callers.
-pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
+/// polling. Returns `false` on a no-op / error tick. An optional `AppHandle` is threaded through
+/// production callers so productive visibility reductions can emit the history invalidation while
+/// the lifecycle guard is still held.
+pub(crate) async fn org_background_sync_tick(
+    state: &AppState,
+    app: Option<AppHandle>,
+) -> bool {
     let policy = OrgWorkPolicy::background(crate::perf::background_epoch());
     if !policy.is_current() {
         return false;
     }
     // Reconcile membership FIRST so a newly-invited org is present (and synced this same tick) and a
     // departed org is dropped before we pull its feed. Best-effort — a failure never blocks the sync.
-    if let Err(e) = org_reconcile_memberships_with_policy(state, policy).await {
+    if let Err(e) = org_reconcile_memberships_with_policy(state, policy, app.as_ref()).await {
         tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile tick failed");
     }
     if !policy.is_current() {
         return false;
     }
-    if let Err(e) = org_sweep_pending_with_policy(state, policy).await {
+    if let Err(e) = org_sweep_pending_with_policy(state, policy, app.as_ref()).await {
         tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
     }
     if !policy.is_current() {
         return false;
     }
-    let report = match org_sync_now_inner_with_policy(state, policy).await {
+    let report = match org_sync_now_inner_with_policy(state, policy, app.clone()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "org", error = %e, "org feed sync tick failed");
@@ -4370,7 +4636,7 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
     // any org is genuinely behind, every page budget goes to catching it up; the sweep only spends a
     // budget once the live cursor is idle. Best-effort: a failure never kills the loop.
     if !live_changed && report.pulled == 0 && policy.is_current() {
-        match org_reconcile_tick_with_policy(state, policy).await {
+        match org_reconcile_tick_with_policy(state, policy, app).await {
             Ok(changed) => return changed > 0,
             Err(e) => {
                 tracing::warn!(target: "org", error = %brief_err(&e), "org reconcile tick failed");
@@ -4400,17 +4666,22 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
 /// re-seal it re-reads the SOURCE note, so the per-row re-share still passes the READ-GATE (a source
 /// sealed since queueing refuses and the row is left `failed`, never egressing sealed content).
 #[tauri::command]
-pub async fn org_sweep_pending(state: State<'_, AppState>) -> Result<u32, AppError> {
-    org_sweep_pending_inner(state.inner()).await
+pub async fn org_sweep_pending(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32, AppError> {
+    org_sweep_pending_with_policy(state.inner(), OrgWorkPolicy::manual(), Some(&app)).await
 }
 
+#[cfg(test)]
 pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, AppError> {
-    org_sweep_pending_with_policy(state, OrgWorkPolicy::manual()).await
+    org_sweep_pending_with_policy(state, OrgWorkPolicy::manual(), None).await
 }
 
 async fn org_sweep_pending_with_policy(
     state: &AppState,
     policy: OrgWorkPolicy,
+    app: Option<&AppHandle>,
 ) -> Result<u32, AppError> {
     if !policy.is_current() {
         return Ok(0);
@@ -4448,7 +4719,13 @@ async fn org_sweep_pending_with_policy(
             continue;
         }
         if policy
-            .commit(|| state.db.evict_org_item(item_id))?
+            .commit(|| {
+                commit_org_visibility_reduction(
+                    state,
+                    app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+                    || state.db.evict_org_item(item_id),
+                )
+            })?
             .unwrap_or(false)
         {
             repaired += 1;
@@ -4485,7 +4762,7 @@ async fn org_sweep_pending_with_policy(
         }
         if let Some(item_id) = extra.item_id.clone() {
             attempted += 1;
-            if revoke_org_share_inner_with_policy(state, item_id, policy)
+            if revoke_org_share_inner_with_policy(state, item_id, policy, app)
                 .await
                 .is_ok()
             {
@@ -4515,7 +4792,7 @@ async fn org_sweep_pending_with_policy(
             continue;
         };
         attempted += 1;
-        if revoke_org_share_inner_with_policy(state, item_id, policy)
+        if revoke_org_share_inner_with_policy(state, item_id, policy, app)
             .await
             .is_ok()
         {
@@ -4555,6 +4832,7 @@ async fn org_sweep_pending_with_policy(
                     row.meeting_id.as_deref(),
                     row.document_id.as_deref(),
                     policy,
+                    app,
                 )
                 .await
                 .map(|n| n > 0)
@@ -4580,6 +4858,7 @@ async fn org_sweep_pending_with_policy(
                 // to scrubbing.
                 true,
                 policy,
+                app,
             )
             .await;
             if res.is_ok() {
@@ -4611,6 +4890,7 @@ async fn org_sweep_pending_with_policy(
 /// while the normal background cadence still services every joined org fairly.
 #[tauri::command]
 pub async fn org_sync_now(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: Option<String>,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
@@ -4618,10 +4898,16 @@ pub async fn org_sync_now(
     // pass `None` (→ sync the next round-robin org). This is the command-boundary
     // dispatch of the multi-org fix: a user-triggered "Sync now" from a picked org must not sync (or
     // report against) the wrong org.
-    match org_id {
-        Some(id) => org_sync_one_now_inner(state.inner(), &id).await,
-        None => org_sync_now_inner(state.inner()).await,
-    }
+    let report = match org_id {
+        Some(id) => org_sync_one_now_with_app(state.inner(), &id, Some(app.clone())).await,
+        None => org_sync_now_inner_with_policy(
+            state.inner(),
+            OrgWorkPolicy::manual(),
+            Some(app.clone()),
+        )
+        .await,
+    }?;
+    Ok(report)
 }
 
 /// One deliberately small feed page per org-sync invocation. A protocol-valid org blob may be up to
@@ -4740,9 +5026,18 @@ pub(crate) fn repair_missing_org_embeddings(
 /// the org (membership-checked, never `.next()`), then runs the same per-org pull/ingest via
 /// `org_sync_one` used by the round-robin scheduler. Offline / logged-out ⇒ an empty report (no-op),
 /// matching the untargeted path.
+#[cfg(test)]
 pub(crate) async fn org_sync_one_now_inner(
     state: &AppState,
     org_id: &str,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    org_sync_one_now_with_app(state, org_id, None).await
+}
+
+async fn org_sync_one_now_with_app(
+    state: &AppState,
+    org_id: &str,
+    app: Option<AppHandle>,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
     let mut report = crate::storage::models::OrgSyncReport::default();
     let org = resolve_org(state, org_id)?;
@@ -4762,6 +5057,7 @@ pub(crate) async fn org_sync_one_now_inner(
         &org,
         &mut report,
         OrgWorkPolicy::manual(),
+        app,
     )
     .await?;
     tracing::info!(
@@ -4776,15 +5072,17 @@ pub(crate) async fn org_sync_one_now_inner(
     Ok(report)
 }
 
+#[cfg(test)]
 pub(crate) async fn org_sync_now_inner(
     state: &AppState,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
-    org_sync_now_inner_with_policy(state, OrgWorkPolicy::manual()).await
+    org_sync_now_inner_with_policy(state, OrgWorkPolicy::manual(), None).await
 }
 
 async fn org_sync_now_inner_with_policy(
     state: &AppState,
     policy: OrgWorkPolicy,
+    app: Option<AppHandle>,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
     let mut report = crate::storage::models::OrgSyncReport::default();
 
@@ -4817,7 +5115,7 @@ async fn org_sync_now_inner_with_policy(
     let index =
         ORG_SYNC_ROUND_ROBIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % orgs.len();
     let org = &orgs[index];
-    if let Err(e) = org_sync_one(state, &client, &access, org, &mut report, policy).await {
+    if let Err(e) = org_sync_one(state, &client, &access, org, &mut report, policy, app).await {
         if policy.is_current() {
             report
                 .errors
@@ -4847,6 +5145,7 @@ async fn org_sync_one(
     org: &crate::storage::OrgState,
     report: &mut crate::storage::models::OrgSyncReport,
     policy: OrgWorkPolicy,
+    app: Option<AppHandle>,
 ) -> Result<(), AppError> {
     if !policy.is_current() {
         return Ok(());
@@ -5082,6 +5381,7 @@ async fn org_sync_one(
         let db = state.db.clone();
         let org_id = org.org_id.clone();
         let background_epoch = policy.background_epoch;
+        let app_for_apply = app;
         let (tombstoned, ingested, fts_only) = crate::perf::run_heavy(
             &state.heavy_inference,
             move || -> Result<(u32, u32, bool), AppError> {
@@ -5102,8 +5402,33 @@ async fn org_sync_one(
                     }
                     match action {
                         FeedAction::Tombstone { item_id, seq } => {
-                            let Some(applied) = policy
-                                .commit(|| db.commit_org_feed_tombstone(&org_id, &item_id, seq))?
+                            let Some((applied, _evicted)) = policy
+                                .commit(|| {
+                                    if let Some(handle) = app_for_apply.as_ref() {
+                                        let app_state = handle.state::<AppState>();
+                                        let mut outcome = (false, false);
+                                        commit_org_visibility_reduction(
+                                            app_state.inner(),
+                                            Some(handle),
+                                            || {
+                                                outcome = db
+                                                    .commit_org_feed_tombstone_outcome(
+                                                        &org_id,
+                                                        &item_id,
+                                                        seq,
+                                                    )?;
+                                                Ok(outcome.1)
+                                            },
+                                        )?;
+                                        Ok(outcome)
+                                    } else {
+                                        db.commit_org_feed_tombstone_outcome(
+                                            &org_id,
+                                            &item_id,
+                                            seq,
+                                        )
+                                    }
+                                })?
                             else {
                                 break;
                             };
@@ -5261,7 +5586,7 @@ async fn org_sync_one(
 /// `org_background_sync_tick`; this is the direct entry point for internal callers and for the
 /// regression tests that drive the sweep against a mock feed.
 pub async fn org_reconcile_now_inner(state: &AppState) -> Result<u32, AppError> {
-    org_reconcile_tick_with_policy(state, OrgWorkPolicy::manual()).await
+    org_reconcile_tick_with_policy(state, OrgWorkPolicy::manual(), None).await
 }
 
 /// One anti-entropy reconcile tick: pick one joined org (round-robin) and walk one bounded
@@ -5283,6 +5608,7 @@ pub async fn org_reconcile_now_inner(state: &AppState) -> Result<u32, AppError> 
 async fn org_reconcile_tick_with_policy(
     state: &AppState,
     policy: OrgWorkPolicy,
+    app: Option<AppHandle>,
 ) -> Result<u32, AppError> {
     if !policy.is_current() {
         return Ok(0);
@@ -5306,7 +5632,7 @@ async fn org_reconcile_tick_with_policy(
     let index =
         ORG_RECONCILE_ROUND_ROBIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % orgs.len();
     let org = &orgs[index];
-    org_reconcile_one(state, &client, &access, org, policy).await
+    org_reconcile_one(state, &client, &access, org, policy, app).await
 }
 
 /// Is the last COMPLETED reconcile pass still inside [`ORG_RECONCILE_PASS_COOLDOWN_SECS`]?
@@ -5351,6 +5677,7 @@ async fn org_reconcile_one(
     access: &str,
     org: &crate::storage::OrgState,
     policy: OrgWorkPolicy,
+    app: Option<AppHandle>,
 ) -> Result<u32, AppError> {
     if !policy.is_current() {
         return Ok(0);
@@ -5521,6 +5848,7 @@ async fn org_reconcile_one(
     let db = state.db.clone();
     let org_id = org.org_id.clone();
     let background_epoch = policy.background_epoch;
+    let app_for_apply = app;
     let (changed, progress) = crate::perf::run_heavy(
         &state.heavy_inference,
         move || -> Result<(u32, u64), AppError> {
@@ -5538,7 +5866,18 @@ async fn org_reconcile_one(
                 match action {
                     ReconcileAction::Skip { seq } => progress = seq,
                     ReconcileAction::Evict { item_id, seq } => {
-                        let Some(evicted) = policy.commit(|| db.evict_org_item(&item_id))? else {
+                        let Some(evicted) = policy.commit(|| {
+                            if let Some(handle) = app_for_apply.as_ref() {
+                                let app_state = handle.state::<AppState>();
+                                commit_org_visibility_reduction(
+                                    app_state.inner(),
+                                    Some(handle),
+                                    || db.evict_org_item(&item_id),
+                                )
+                            } else {
+                                db.evict_org_item(&item_id)
+                            }
+                        })? else {
                             break;
                         };
                         if evicted {
@@ -5768,18 +6107,36 @@ pub async fn org_update_own_item(
     title: String,
     markdown: String,
 ) -> Result<String, AppError> {
-    let new_item_id = org_update_own_item_inner(state.inner(), &item_id, &title, &markdown).await?;
+    let new_item_id = org_update_own_item_notifying(
+        state.inner(),
+        &item_id,
+        &title,
+        &markdown,
+        Some(&app),
+    )
+    .await?;
     // Ping every open org view (Notes list + Settings shared-brain) to re-fetch — the edit superseded
     // the item (new id) + tombstoned the old. Content-free; best-effort (never affects the result).
     crate::events::emit_org_feed_updated(&app, 1);
     Ok(new_item_id)
 }
 
+#[cfg(test)]
 pub(crate) async fn org_update_own_item_inner(
     state: &AppState,
     item_id: &str,
     title: &str,
     markdown: &str,
+) -> Result<String, AppError> {
+    org_update_own_item_notifying(state, item_id, title, markdown, None).await
+}
+
+async fn org_update_own_item_notifying(
+    state: &AppState,
+    item_id: &str,
+    title: &str,
+    markdown: &str,
+    app: Option<&AppHandle>,
 ) -> Result<String, AppError> {
     // Resolve the item's edit context (org, current rev, original created_at/source_kind, author id).
     let ctx = state
@@ -5927,7 +6284,8 @@ pub(crate) async fn org_update_own_item_inner(
                 None,
             )
             .and_then(|prepared| {
-                state.db.commit_local_org_replica(
+                let _lifecycle = lifecycle_guard(state);
+                let superseded_evicted = state.db.commit_local_org_replica(
                     &published.item_id,
                     &org.org_id,
                     published.seq,
@@ -5944,6 +6302,12 @@ pub(crate) async fn org_update_own_item_inner(
                     &prepared,
                     Some(item_id),
                 )?;
+                if superseded_evicted {
+                    bump_seal_epoch(state);
+                    if let Some(app) = app {
+                        emit_ask_history_invalidated_fail_closed(app);
+                    }
+                }
                 state
                     .db
                     .replace_org_item_attachment_bundle(&published.item_id, &local_attachments)
@@ -6026,16 +6390,25 @@ pub async fn delete_org_item_as_author(
     state: State<'_, AppState>,
     item_id: String,
 ) -> Result<(), AppError> {
-    delete_org_item_as_author_inner(state.inner(), &item_id).await?;
+    delete_org_item_as_author_notifying(state.inner(), &item_id, Some(&app)).await?;
     crate::events::emit_org_feed_updated(&app, 1);
     Ok(())
 }
 
 /// Inner of [`delete_org_item_as_author`] taking `&AppState` (unit-testable ownership gate + the
 /// fail-closed server-then-local tombstone ordering).
+#[cfg(test)]
 pub(crate) async fn delete_org_item_as_author_inner(
     state: &AppState,
     item_id: &str,
+) -> Result<(), AppError> {
+    delete_org_item_as_author_notifying(state, item_id, None).await
+}
+
+async fn delete_org_item_as_author_notifying(
+    state: &AppState,
+    item_id: &str,
+    app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
     let item_id = item_id.trim();
     if item_id.is_empty() {
@@ -6073,7 +6446,15 @@ pub(crate) async fn delete_org_item_as_author_inner(
     // device's own copy can never leave a dangling "removed here but still live on the server"
     // state. Reuses the SAME local tombstone primitive the feed's own `FeedAction::Tombstone` arm
     // uses (`Db::tombstone_org_item`) — not a bespoke delete.
-    state.db.tombstone_org_item(item_id)?;
+    {
+        let _lifecycle = lifecycle_guard(state);
+        if state.db.evict_org_item(item_id)? {
+            bump_seal_epoch(state);
+            if let Some(app) = app {
+                emit_ask_history_invalidated_fail_closed(app);
+            }
+        }
+    }
 
     // The ORIGIN device (if this isn't it) still has its own separate local `documents`/`meetings`
     // source row, untouched by design — it picks up this tombstone on its OWN next `org_sync_one`

@@ -175,16 +175,15 @@ pub(crate) fn provider_for_with_egress_sink(
     config: &AppConfig,
     heavy: &Arc<tokio::sync::Semaphore>,
     sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+    codex_runtime: Arc<codex_cli::PinnedCodexRuntime>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    let target = roles::provider_target(role, config);
     provider_for_with_test_egress_sink(
         role,
         config,
         heavy,
         sink,
-        codex_cli::provider(
-            roles::provider_target(role, config).model,
-            roles::provider_target(role, config).effort,
-        ),
+        codex_cli::provider_with_pinned_runtime(target.model, target.effort, codex_runtime),
     )
 }
 

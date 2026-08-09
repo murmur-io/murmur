@@ -63,10 +63,17 @@ test("Ask-about-this-note opens in the drawer, pre-fills note + its links, and s
       }
       return [];
     },
-    ask_vault: (args: { explicitSources?: unknown }) => {
+    ask_vault_persisted: (args: { explicitSources?: unknown }) => {
       (window as unknown as { __askVaultSources?: unknown }).__askVaultSources =
         args.explicitSources ?? null;
-      return { answer: "Grounded answer.", sources: [], citations: [] };
+      return {
+        conversationId: "note-conversation-1",
+        userMessageId: crypto.randomUUID(),
+        assistantMessageId: crypto.randomUUID(),
+        answer: "Grounded answer.",
+        sources: [],
+        citations: [],
+      };
     },
   });
 

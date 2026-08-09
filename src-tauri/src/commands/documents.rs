@@ -452,7 +452,8 @@ pub async fn delete_document(
     // see `TabKind` in `tab-keys.ts`), so only fire the delete-fan-out event for that case: emitting
     // it for an id nothing tracks is harmless, but this stays precise about what was actually deleted.
     let was_note = matches!(state.db.note_gate_anchor(&id), Ok(Some(_)));
-    delete_document_inner(state.inner(), &id).await?;
+    delete_document_inner_notifying(state.inner(), &id, Some(&app)).await?;
+    emit_ask_history_invalidated_fail_closed(&app);
     if was_note {
         crate::events::emit_content_deleted(&app, "note", &id);
     }
@@ -463,7 +464,16 @@ pub async fn delete_document(
 
 /// Inner of [`delete_document`] taking `&AppState` (unit-testable gate). `async` for the org-share
 /// revoke cascade (network round-trip); the gate + DB delete themselves stay synchronous internally.
+#[cfg(test)]
 pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    delete_document_inner_notifying(state, id, None).await
+}
+
+async fn delete_document_inner_notifying(
+    state: &AppState,
+    id: &str,
+    app: Option<&AppHandle>,
+) -> Result<(), AppError> {
     let Some(folder_id) = state.db.folder_for_document(id)? else {
         return Ok(()); // unknown id → idempotent no-op.
     };
@@ -477,7 +487,7 @@ pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
     // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
-    revoke_org_shares_for_source(state, None, Some(id)).await?;
+    revoke_org_shares_for_source_notifying(state, None, Some(id), app).await?;
     // The generic surface can also delete a `kind='note'` document. Re-check the gate under the
     // lifecycle mutex after the network await and remove every tracked image while its row still
     // carries retry metadata. Plain imported documents have no attachment owner and skip this leg.
@@ -501,6 +511,7 @@ pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<
             "could not remove an exported image before deleting the note",
         )?;
     }
+    bump_seal_epoch(state);
     state.db.delete_document(id)?;
     tracing::info!(target: "documents", document_id = %id, "document deleted");
     Ok(())

@@ -41,10 +41,17 @@ test("meeting chat pre-fills this meeting + its links and sends chat_meeting wit
       }
       return [];
     },
-    chat_meeting: (args: { explicitSources?: unknown }) => {
+    chat_meeting_persisted: (args: { explicitSources?: unknown }) => {
       (window as unknown as { __chatSources?: unknown }).__chatSources =
         args.explicitSources ?? null;
-      return "Grounded meeting answer.";
+      return {
+        conversationId: "meeting-conversation-1",
+        userMessageId: crypto.randomUUID(),
+        assistantMessageId: crypto.randomUUID(),
+        answer: "Grounded meeting answer.",
+        sources: [],
+        citations: [],
+      };
     },
   });
 

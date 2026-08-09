@@ -624,13 +624,18 @@ impl Db {
     /// — the fact simply stops being current, so it drops out of `list_user_facts_visible` and the
     /// regenerated brief. Returns `true` iff a row was closed by this call.
     pub fn forget_user_fact(&self, id: &str, at: &str) -> Result<bool> {
-        let conn = self.lock();
-        let n = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let n = tx
             .execute(
                 "UPDATE user_facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
                 rusqlite::params![id, at],
             )
             .map_err(map_err)?;
+        if n > 0 {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(n > 0)
     }
 
@@ -647,13 +652,18 @@ impl Db {
     /// delete, so the history stays on the record and only the CURRENT view changes. Idempotent —
     /// an already-closed row is untouched. Returns `true` iff this call closed a row.
     pub fn forget_entity_fact(&self, id: &str, at: &str) -> Result<bool> {
-        let conn = self.lock();
-        let n = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let n = tx
             .execute(
                 "UPDATE facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
                 rusqlite::params![id, at],
             )
             .map_err(map_err)?;
+        if n > 0 {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(n > 0)
     }
 
@@ -661,13 +671,18 @@ impl Db {
     /// never delete — closed history stays for the record). After this the brief regenerates empty and
     /// the audit view is empty. Returns the number of facts closed.
     pub fn clear_user_facts(&self, at: &str) -> Result<usize> {
-        let conn = self.lock();
-        let n = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let n = tx
             .execute(
                 "UPDATE user_facts SET valid_to = ?1 WHERE valid_to IS NULL",
                 rusqlite::params![at],
             )
             .map_err(map_err)?;
+        if n > 0 {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(n)
     }
 

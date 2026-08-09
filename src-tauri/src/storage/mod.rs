@@ -1,4 +1,5 @@
 pub(crate) mod ask_store;
+pub(crate) mod ask_conversation_store;
 pub mod attachment_store;
 pub(crate) mod audit_store;
 pub(crate) mod brief_store;
