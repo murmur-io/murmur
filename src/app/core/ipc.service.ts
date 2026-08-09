@@ -42,6 +42,10 @@ import type {
   ReindexResult,
   DocImportProgress,
   InputDeviceInfo,
+  AskConversation,
+  AskConversationScope,
+  AskConversationSendResult,
+  AskConversationSummary,
   AskVaultResult,
   AssistantThreadRow,
   BrainOverview,
@@ -203,6 +207,9 @@ export const EVENT_REMINDER_SOURCE_UPDATED =
 /** No-payload privacy barrier: every cached reminder source title must be discarded immediately. */
 export const EVENT_REMINDER_VISIBILITY_INVALIDATED =
   "murmur://reminder-visibility-invalidated";
+/** No-payload privacy barrier: every durable Ask history cache must be purged immediately. */
+export const EVENT_ASK_HISTORY_INVALIDATED =
+  "murmur://ask-history-invalidated";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -1924,6 +1931,61 @@ export class IpcService {
     });
   }
 
+  /** Newest-first durable Ask conversations for one exact local scope. */
+  listAskConversations(
+    scope: AskConversationScope,
+  ): Promise<AskConversationSummary[]> {
+    return invoke<AskConversationSummary[]>("list_ask_conversations", {
+      scope,
+    });
+  }
+
+  /** Load one canonical, visibility-gated conversation in its exact scope. */
+  loadAskConversation(
+    scope: AskConversationScope,
+    conversationId: string,
+  ): Promise<AskConversation> {
+    return invoke<AskConversation>("load_ask_conversation", {
+      scope,
+      conversationId,
+    });
+  }
+
+  /**
+   * Persisted vault/note Ask. Canonical history stays backend-owned;
+   * `askTraceId` is distinct and routes only this request's live tool events.
+   */
+  askVaultPersisted(
+    scope: AskConversationScope,
+    question: string,
+    conversationId?: string,
+    explicitSources?: SourceRef[],
+    askTraceId?: string,
+  ): Promise<AskConversationSendResult> {
+    return invoke<AskConversationSendResult>("ask_vault_persisted", {
+      scope,
+      question,
+      conversationId,
+      askTraceId,
+      ...(explicitSources?.length ? { explicitSources } : {}),
+    });
+  }
+
+  /** Persisted meeting Ask, preserving the dedicated transcript-chat core. */
+  chatMeetingPersisted(
+    meetingId: string,
+    question: string,
+    conversationId?: string,
+    explicitSources?: SourceRef[],
+  ): Promise<AskConversationSendResult> {
+    return invoke<AskConversationSendResult>("chat_meeting_persisted", {
+      meetingId,
+      question,
+      conversationId,
+      ...(explicitSources?.length ? { explicitSources } : {}),
+    });
+  }
+
   /** Generate a Weekly Vault Digest over the last `days` days (writes to vault Digests/). */
   generateDigest(days: number): Promise<DigestResult> {
     return invoke<DigestResult>("generate_digest", { days });
@@ -3174,5 +3236,13 @@ export class IpcService {
    */
   onReminderVisibilityInvalidated(cb: () => void): Promise<UnlistenFn> {
     return listen<void>(EVENT_REMINDER_VISIBILITY_INVALIDATED, () => cb());
+  }
+
+  /**
+   * A lock, move, or delete invalidated durable Ask history. The event carries
+   * no content; mounted consumers synchronously drop all conversation state.
+   */
+  onAskHistoryInvalidated(cb: () => void): Promise<UnlistenFn> {
+    return listen<void>(EVENT_ASK_HISTORY_INVALIDATED, () => cb());
   }
 }

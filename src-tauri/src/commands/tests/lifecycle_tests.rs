@@ -2450,7 +2450,7 @@
         assert!(state.db.get_note_row(&r.note_id).unwrap().is_some());
 
         let skipped = block_on(delete_empty_companion_after_confirmed_flush(
-            &state, "m-empty", false,
+            &state, "m-empty", false, None,
         ))
         .unwrap();
         assert!(!skipped, "unconfirmed flush skips empty-stub deletion");
@@ -2460,7 +2460,7 @@
         );
 
         let deleted = block_on(delete_empty_companion_after_confirmed_flush(
-            &state, "m-empty", true,
+            &state, "m-empty", true, None,
         ))
         .unwrap();
         assert!(deleted, "a body-empty companion note is deleted");
@@ -9647,6 +9647,300 @@
         ));
     }
 
+    /// RED-before-GREEN Ask-history oracle: a relock/delete generation change after inference must
+    /// prevent BOTH the IPC result and the atomic user+assistant write. No orphan thread survives.
+    #[test]
+    fn ask_history_post_await_epoch_change_writes_zero_rows() {
+        let state = build_state("ask-history-post-await");
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        bump_seal_epoch(&state);
+
+        let error = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "question",
+            "stale answer",
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "stale post-await result must persist no rows");
+    }
+
+    #[test]
+    fn durable_agentic_dispatch_refuses_before_the_reasoner_is_invoked() {
+        struct SpyReasoner(std::sync::atomic::AtomicUsize);
+        impl crate::reason::LocalReasoner for SpyReasoner {
+            fn id(&self) -> &str {
+                "spy"
+            }
+            fn reason(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("unexpected".into())
+            }
+            fn structured(
+                &self,
+                _system: &str,
+                _user: &str,
+                _schema: &serde_json::Value,
+            ) -> crate::error::Result<serde_json::Value> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"answer":"unexpected"}))
+            }
+        }
+
+        let state = build_state("ask-history-pre-dispatch");
+        let spy = SpyReasoner(std::sync::atomic::AtomicUsize::new(0));
+        bump_seal_epoch(&state);
+        let admission = crate::state::ContentDispatchAdmission::for_test(
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+            || Err(AppError::Locked("stale exact snapshot".into())),
+        );
+        let guarded = durable_dispatch_reasoner(&spy, admission);
+
+        let error = crate::reason::LocalReasoner::structured(
+            &guarded,
+            "system containing canonical history",
+            "user",
+            &serde_json::json!({"type":"object"}),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        assert_eq!(spy.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn durable_floor_and_note_snapshot_refuses_after_visibility_change() {
+        let state = build_state("ask-history-floor-admission");
+        make_open_folder(&state.db, "f-note", "Note");
+        seed_note_doc_cmd(&state.db, "n-admission", "f-note", "Plan", "secret body");
+
+        let vault = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        let note = capture_durable_scope_under_lifecycle(
+            &state,
+            &crate::storage::models::AskConversationScope::Note {
+                ref_id: "n-admission".into(),
+            },
+        )
+        .unwrap();
+        bump_seal_epoch(&state);
+
+        for snapshot in [&vault, &note] {
+            let result = require_durable_scope_for_dispatch(&state, snapshot);
+            assert!(matches!(result, Err(AppError::Locked(_))));
+        }
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn durable_meeting_snapshot_refuses_after_relock() {
+        let state = build_state("ask-history-meeting-admission");
+        make_open_folder(&state.db, "f-meeting", "Meeting");
+        seed_meeting(&state.db, "m-admission", "# body", Some("f-meeting"));
+        let snapshot = capture_meeting_content_snapshot(&state, "m-admission").unwrap();
+        bump_seal_epoch(&state);
+
+        let result =
+            require_current_meeting_content_snapshot(&state, "m-admission", &snapshot);
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Defense in depth: even if a future visibility-reduction caller forgets the epoch bump, a
+    /// folder visible at context capture but hidden at persistence time prevents the plaintext row.
+    #[test]
+    fn ask_history_post_await_dependency_narrowing_writes_zero_rows_without_epoch_bump() {
+        let state = build_state("ask-history-post-await-dependency-narrow");
+        make_open_folder(&state.db, "f-visible", "Visible");
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        let dependencies = state.db.visible_folder_ids(&HashSet::new()).unwrap();
+        state
+            .db
+            .lock()
+            .execute("UPDATE folders SET locked = 1 WHERE id = 'f-visible'", [])
+            .unwrap();
+
+        let error = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "question",
+            "stale answer",
+            &[],
+            &[],
+            &[],
+            &dependencies,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// A visibility increase does not advance `seal_epoch`. If a folder becomes session-visible
+    /// while the provider is running, the post-await persistence seam must include it in the
+    /// durable dependency union; otherwise a later relock could leave the derived answer readable.
+    #[test]
+    fn ask_history_post_await_unions_newly_visible_folder_dependency() {
+        let state = build_state("ask-history-post-await-widen");
+        make_open_folder(&state.db, "f-visible", "Visible");
+        make_open_folder(&state.db, "f-late", "Late");
+        lock_folder_inner(&state, "f-late".into()).unwrap();
+
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        let initial_dependencies = state.db.visible_folder_ids(&HashSet::new()).unwrap();
+        assert_eq!(initial_dependencies, vec!["f-visible".to_string()]);
+
+        state.unlocked_folders.lock().unwrap().insert("f-late".into());
+        let committed = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "question",
+            "answer using the newly visible folder",
+            &[],
+            &[],
+            &[],
+            &initial_dependencies,
+        )
+        .unwrap();
+
+        let dependencies = {
+            let conn = state.db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT dependency_ref FROM ask_conversation_dependencies
+                      WHERE conversation_id = ?1 ORDER BY dependency_ref",
+                )
+                .unwrap();
+            stmt.query_map([committed.conversation_id], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(dependencies, vec!["f-late".to_string(), "f-visible".to_string()]);
+    }
+
+    /// An idempotent retry of an already-locked empty folder has no meeting/document ids for the
+    /// chunk purge helpers. It must still purge global-derived Ask plaintext.
+    #[test]
+    fn ask_history_already_locked_empty_folder_retry_still_purges() {
+        let state = build_state("ask-history-empty-lock-retry");
+        make_open_folder(&state.db, "f-empty", "Empty");
+        lock_folder_inner(&state, "f-empty".into()).unwrap();
+        state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "question",
+                "answer",
+                &[],
+                &[],
+                &[],
+                &[],
+                "2026-08-06T12:00:00Z",
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-empty".into()).unwrap();
+
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Retrieval may observe an unpublished shared row from its off-thread DB read even while the
+    /// ingest owns lifecycle. Rollback therefore purges global-derived Ask history atomically.
+    #[test]
+    fn unpublished_shared_meeting_rollback_purges_ask_history() {
+        let state = build_state("ask-history-share-rollback");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-unpublished".into(),
+                started_at: "2026-08-06T12:00:00Z".into(),
+                ended_at: None,
+                title: Some("Unpublished".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Exported,
+                folder_id: None,
+            })
+            .unwrap();
+        let conversation_id = state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "existing question",
+                "existing answer",
+                &[],
+                &[],
+                &[],
+                &[],
+                "2026-08-06T12:00:00Z",
+            )
+            .unwrap();
+
+        rollback_unpublished_shared_meeting(&state, "m-unpublished").unwrap();
+
+        assert!(state.db.get_meeting("m-unpublished").unwrap().is_none());
+        assert!(state
+            .db
+            .load_ask_conversation(
+                &crate::storage::models::AskConversationScope::Vault,
+                &conversation_id,
+                &HashSet::new(),
+            )
+            .unwrap()
+            .is_none());
+    }
+
     /// Folder identity is part of a single-meeting authorization snapshot because an ordinary
     /// OPEN→OPEN move does not bump the global seal epoch.
     #[test]
@@ -9981,6 +10275,7 @@
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = crate::pipeline::SalvageLockFinalizer {
+                app: None,
                 state: &state,
                 meeting_id: "m-panic",
                 seal_context: None,
@@ -15380,6 +15675,16 @@
     fn pack_pinned_org_item_grounds_live_and_gates_tombstoned_and_disabled() {
         let state = build_state("pack-pinned-org");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_meeting(
+            &state.db,
+            "m-poison",
+            "POISON_FALLBACK must never enter an org-pinned prompt.",
+            None,
+        );
+        let org_body = format!(
+            "GPT via the Cloud Gateway is cheap and worthwhile. {}",
+            "bounded-shared-context ".repeat(800)
+        );
         state
             .db
             .upsert_org_item(
@@ -15388,7 +15693,7 @@
                 1,
                 "anna",
                 "Konga costs",
-                "GPT via the Cloud Gateway is cheap and worthwhile.",
+                &org_body,
                 "2026-07-10T09:00:00Z",
                 1,
                 1,
@@ -15398,8 +15703,39 @@
                 None,
             )
             .unwrap();
+        let config = AppConfig {
+            provider_id: "ollama".into(),
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let floor = || {
+            build_ask_vault_floor_prompt(
+                &state.db,
+                &config,
+                &HashSet::new(),
+                "What are the Konga costs?",
+                &[],
+                "",
+                None,
+                None,
+                Some("it-p"),
+                None,
+            )
+            .unwrap()
+        };
+        let assert_empty_without_disclosure = |prompt: AskFloorPrompt| match prompt {
+            AskFloorPrompt::Empty(result) => {
+                assert!(result.sources.is_empty() && result.citations.is_empty());
+                assert!(!result.answer.contains("POISON_FALLBACK"));
+                assert!(!result.answer.contains("Cloud Gateway"));
+            }
+            AskFloorPrompt::Ready { system, .. } => {
+                panic!("an unreadable pinned org item must not fall back to the vault: {system}")
+            }
+        };
 
-        // LIVE: the item's title + content are packed (with a citation header).
+        // LIVE: the item's title + content are packed (with a citation header), through the exact
+        // Ask-floor route used by NoteChat. One pinned item owns one bounded local-model budget.
         let packed =
             crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
                 .unwrap();
@@ -15407,8 +15743,28 @@
             packed.contains("Konga costs") && packed.contains("Cloud Gateway"),
             "a live pinned org item must ground its title + content"
         );
+        match floor() {
+            AskFloorPrompt::Ready {
+                system, sources, ..
+            } => {
+                let corpus = system
+                    .split_once("MEETING NOTES:\n")
+                    .expect("vault-chat prompt must label its corpus")
+                    .1;
+                assert!(corpus.contains("Konga costs") && corpus.contains("Cloud Gateway"));
+                assert!(!corpus.contains("POISON_FALLBACK"));
+                assert_eq!(corpus.matches("### [[").count(), 1);
+                assert!(
+                    corpus.chars().count()
+                        <= crate::summarize::vault_context::budget_for("ollama"),
+                    "the pinned Org corpus must honor the resolved local-provider budget"
+                );
+                assert!(sources.is_empty(), "an Org item is not a local VaultSource");
+            }
+            AskFloorPrompt::Empty(_) => panic!("a live pinned org item must yield a ready prompt"),
+        }
 
-        // DISABLED org ⇒ NOTHING packed (the per-instance toggle withdraws org content from Ask).
+        // DISABLED org ⇒ NOTHING packed and, critically, no fallback to the readable local meeting.
         state.db.set_org_context_enabled("org-1", false).unwrap();
         assert!(
             crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
@@ -15416,9 +15772,10 @@
                 .is_empty(),
             "a disabled org's item must contribute NOTHING to the Ask context"
         );
+        assert_empty_without_disclosure(floor());
         state.db.set_org_context_enabled("org-1", true).unwrap();
 
-        // TOMBSTONED ⇒ NOTHING packed (a withdrawn item never grounds an answer).
+        // TOMBSTONED ⇒ NOTHING packed (a withdrawn item never grounds an answer or falls back).
         state.db.tombstone_org_item("it-p").unwrap();
         assert!(
             crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
@@ -15426,6 +15783,7 @@
                 .is_empty(),
             "a tombstoned org item must contribute NOTHING to the Ask context"
         );
+        assert_empty_without_disclosure(floor());
 
         // Unknown id ⇒ NOTHING.
         assert!(
@@ -15433,6 +15791,26 @@
                 .unwrap()
                 .is_empty()
         );
+
+        // Membership is the outer gate, not merely an ingest-time assumption. Leaving purges the
+        // replica; even a malformed orphan row inserted without an org_state membership cannot be
+        // viewed or packed, and the pinned scope still cannot widen to the local vault.
+        assert!(state.db.delete_org_state("org-1").unwrap());
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO org_items
+                    (item_id, org_id, seq, author_hint, title, markdown, created_at,
+                     rev, generation, content_sha256, tombstoned)
+                 VALUES ('it-p', 'org-1', 2, 'mallory', 'Orphan title',
+                         'Cloud Gateway orphan secret', '2026-07-10T10:00:00Z',
+                         1, 1, X'01', 0)",
+                [],
+            )
+            .unwrap();
+        assert!(state.db.get_org_item("it-p").unwrap().is_none());
+        assert_empty_without_disclosure(floor());
     }
 
     /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `get_org_item` — the single-item read behind
@@ -16870,6 +17248,21 @@
                 .unwrap()
                 .context_enabled
         );
+        state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "question",
+                "legacy opaque derived answer (defense-only fixture)",
+                &[],
+                &[],
+                &[],
+                &[],
+                "2026-08-06T12:00:00Z",
+            )
+            .unwrap();
+        let epoch = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst);
         org_set_context_enabled_inner(&state, "org-1", false).unwrap();
         assert!(
             !state
@@ -16878,6 +17271,18 @@
                 .unwrap()
                 .unwrap()
                 .context_enabled
+        );
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 1
         );
 
         // Refuses a non-member — never toggles an org the caller isn't in.
@@ -16921,6 +17326,92 @@
                 .unwrap()
                 .context_enabled
         );
+    }
+
+    #[test]
+    fn org_visibility_reduction_atomically_purges_bumps_and_notifies_once() {
+        struct RecordingNotifier(std::sync::atomic::AtomicUsize);
+        impl AskHistoryInvalidationNotifier for RecordingNotifier {
+            fn ask_history_invalidated(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let state = build_state("org-ask-history-atomic");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "it-1",
+                "org-1",
+                1,
+                "author",
+                "Title",
+                "secret org body",
+                "2026-08-06T12:00:00Z",
+                1,
+                1,
+                &[7; 32],
+                None,
+                None,
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+        state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "question",
+                "legacy opaque derived answer (defense-only fixture)",
+                &[],
+                &[],
+                &[],
+                &[],
+                "2026-08-06T12:00:00Z",
+            )
+            .unwrap();
+        let notifier = RecordingNotifier(std::sync::atomic::AtomicUsize::new(0));
+        let epoch = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(commit_org_visibility_reduction(&state, Some(&notifier), || {
+            state.db.evict_org_item("it-1")
+        })
+        .unwrap());
+        assert_eq!(
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 1
+        );
+        assert_eq!(notifier.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        assert!(!commit_org_visibility_reduction(&state, Some(&notifier), || {
+            state.db.evict_org_item("it-1")
+        })
+        .unwrap());
+        assert_eq!(
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 1,
+            "idempotent no-op must not bump"
+        );
+        assert_eq!(
+            notifier.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "idempotent no-op must not notify"
+        );
+
+        let refused = commit_org_visibility_reduction(&state, Some(&notifier), || {
+            Err(AppError::Auth("refused".into()))
+        });
+        assert!(matches!(refused, Err(AppError::Auth(_))));
+        assert_eq!(notifier.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display

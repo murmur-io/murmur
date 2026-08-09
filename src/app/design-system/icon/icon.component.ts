@@ -14,6 +14,7 @@ export type ShellIcon =
   | "ask"
   | "settings"
   | "search"
+  | "history"
   | "plus"
   | "sidebar"
   | "topbar"

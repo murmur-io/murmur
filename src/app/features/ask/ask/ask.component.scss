@@ -31,7 +31,16 @@
   font-size: 0.9375rem;
   line-height: 1.55;
 }
-.ask-clear {
+.ask-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+.ask-head-action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
   flex: none;
   height: 32px;
   padding: 0 var(--space-3);
@@ -63,6 +72,11 @@
 .ask-panel > * {
   position: relative;
   z-index: 1;
+}
+
+.ask-history {
+  min-height: 220px;
+  max-height: 56vh;
 }
 
 /* --- Message log (scroll region) --- */
@@ -443,4 +457,3 @@
     scroll-behavior: auto;
   }
 }
-    
