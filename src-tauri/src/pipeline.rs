@@ -690,11 +690,13 @@ fn persist_master_pointer_or_reconcile(
 }
 
 fn apply_deferred_seal(
+    app: &AppHandle,
     state: &AppState,
     meeting_id: &str,
     mut result: PipelineResult,
 ) -> Result<PipelineResult> {
     if let Some(folder_id) = result.deferred_seal_folder_id.take() {
+        crate::commands::emit_ask_history_invalidated_fail_closed(app);
         crate::commands::seal_auto_filed_note(state, meeting_id, &folder_id)?;
     }
     Ok(result)
@@ -1123,6 +1125,7 @@ async fn run_file_backed_inner(
     if let Some(folder_id) = result.deferred_seal_folder_id.as_deref() {
         // The generation is RETIRED and every private plaintext source is gone before the meeting
         // becomes logically governed by the locked folder.
+        crate::commands::emit_ask_history_invalidated_fail_closed(app);
         crate::commands::seal_auto_filed_note(state, meeting_id, folder_id)?;
     }
     let _ = echo_suppressed;
@@ -1227,6 +1230,7 @@ pub async fn run_salvage_from_disk(
     let _salvage_permit = crate::commands::begin_active_salvage(state, meeting_id)?;
     let seal_context = crate::commands::capture_salvage_seal_context(state, meeting_id)?;
     let _finalizer = SalvageLockFinalizer {
+        app: Some(app),
         state,
         meeting_id,
         seal_context,
@@ -1292,7 +1296,7 @@ pub async fn run_salvage_from_disk(
         None,
     )
     .await
-    .and_then(|result| apply_deferred_seal(state, meeting_id, result));
+    .and_then(|result| apply_deferred_seal(app, state, meeting_id, result));
     if let Err(error) = &result {
         let _ = state
             .db
@@ -1308,6 +1312,7 @@ pub async fn run_salvage_from_disk(
 /// a lock. Drop is unwind-safe: the body is `catch_unwind`-wrapped (a panic escaping `Drop`
 /// during an unwind would abort the process) and the finalizer itself is best-effort.
 pub(crate) struct SalvageLockFinalizer<'a> {
+    pub(crate) app: Option<&'a AppHandle>,
     pub(crate) state: &'a AppState,
     pub(crate) meeting_id: &'a str,
     pub(crate) seal_context: Option<crate::commands::SalvageSealContext>,
@@ -1315,10 +1320,19 @@ pub(crate) struct SalvageLockFinalizer<'a> {
 
 impl Drop for SalvageLockFinalizer<'_> {
     fn drop(&mut self) {
-        let (state, meeting_id) = (self.state, self.meeting_id);
+        let (app, state, meeting_id) = (self.app, self.state, self.meeting_id);
         let seal_context = self.seal_context.as_ref();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::commands::finalize_salvage_lock_state(state, meeting_id, seal_context);
+            crate::commands::finalize_salvage_lock_state_with_notice(
+                state,
+                meeting_id,
+                seal_context,
+                || {
+                    if let Some(app) = app {
+                        crate::commands::emit_ask_history_invalidated_fail_closed(app);
+                    }
+                },
+            );
         }));
     }
 }
@@ -1951,7 +1965,7 @@ async fn run_inner(
         None,
     )
     .await
-    .and_then(|result| apply_deferred_seal(state, meeting_id, result));
+    .and_then(|result| apply_deferred_seal(app, state, meeting_id, result));
     tracing::info!(
         target: "perf",
         stage = "summarize_and_export",
@@ -3117,7 +3131,7 @@ pub async fn resummarize_existing(
     )
     .await
     {
-        Ok(result) => apply_deferred_seal(state, meeting_id, result),
+        Ok(result) => apply_deferred_seal(app, state, meeting_id, result),
         Err(e) => {
             let _ = state
                 .db

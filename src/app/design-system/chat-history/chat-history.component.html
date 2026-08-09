@@ -1,0 +1,64 @@
+<section class="history" aria-label="Conversation history">
+  @if (loading() && rows().length === 0) {
+    <div class="history-state" role="status">
+      <span class="history-spinner" aria-hidden="true"></span>
+      <span>Loading conversations…</span>
+    </div>
+  } @else if (error() && rows().length === 0) {
+    <div class="history-state history-error" role="alert">
+      <span>{{ error() }}</span>
+      <button
+        type="button"
+        class="btn btn-ghost history-retry"
+        (click)="retryRequested.emit()"
+      >
+        Retry
+      </button>
+    </div>
+  } @else {
+    @if (error(); as message) {
+      <div class="history-notice" role="alert">
+        <span>{{ message }}</span>
+        <button
+          type="button"
+          class="btn btn-ghost history-retry"
+          (click)="retryRequested.emit()"
+        >
+          Retry
+        </button>
+      </div>
+    }
+    @if (notice(); as message) {
+      <div class="history-notice" role="alert">{{ message }}</div>
+    }
+    <div class="history-list">
+      @for (row of rows(); track row.thread.id) {
+        <button
+          type="button"
+          class="history-row"
+          [class.is-active]="row.thread.id === activeThreadId()"
+          [attr.aria-current]="
+            row.thread.id === activeThreadId() ? 'true' : null
+          "
+          [attr.aria-busy]="
+            row.thread.id === loadingThreadId() ? 'true' : null
+          "
+          [disabled]="row.thread.id === loadingThreadId()"
+          (click)="selected.emit(row.thread.id)"
+        >
+          <span class="history-title">{{ row.thread.title }}</span>
+          <span class="history-updated">{{ row.updatedLabel }}</span>
+        </button>
+      } @empty {
+        <div class="history-state">
+          <span class="history-empty-mark" aria-hidden="true"></span>
+          <strong>No conversations yet</strong>
+          <span>Your first successful answer will appear here.</span>
+        </div>
+      }
+    </div>
+    @if (loading() && rows().length > 0) {
+      <span class="history-refresh" role="status">Refreshing…</span>
+    }
+  }
+</section>

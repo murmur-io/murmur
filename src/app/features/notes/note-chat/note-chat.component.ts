@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   Injector,
   afterNextRender,
@@ -13,11 +14,26 @@ import {
   viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { ChatTurn, SourceRef } from "../../../core/models";
+import type {
+  AskConversation,
+  AskConversationScope,
+  AskConversationSummary,
+  ChatTurn,
+  SourceRef,
+} from "../../../core/models";
 import { SourceScopeService } from "../../../services/source-scope.service";
 import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { ChatHistoryComponent } from "../../../design-system/chat-history/chat-history.component";
+import { FoldersService } from "../../../services/folders.service";
+import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import { NotesService } from "../../../services/notes.service";
+import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+
+interface NoteChatTurn extends ChatTurn {
+  id: string;
+}
 
 /** The starter prompts shown in the empty state — tap to ask immediately. */
 const STARTERS: readonly string[] = [
@@ -35,9 +51,9 @@ const STARTERS: readonly string[] = [
  * The one shape difference from the meeting twin is grounding: it answers via
  * {@link IpcService.askVault} PINNED to this note's source scope (the note +
  * its active links, pre-filled into the `<mur-source-picker>`), rather than a
- * per-meeting transcript chat. Like meeting-chat it is STATELESS — no thread
- * persistence — so `askVault`'s `askThreadId` is left `undefined` and the FULL
- * prior conversation is re-sent as history each turn.
+ * per-meeting transcript chat. Local authored notes use SQLite-canonical durable
+ * history; the shared Org-item caller remains intentionally stateless and keeps
+ * sending its in-memory prior turns through the legacy `askVault` contract.
  *
  * Lives in its own file so its scoped styles get their own per-component
  * `anyComponentStyle` budget.
@@ -45,7 +61,12 @@ const STARTERS: readonly string[] = [
 @Component({
   selector: "app-note-chat",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, SourcePickerComponent],
+  imports: [
+    MarkdownComponent,
+    SourcePickerComponent,
+    ChatHistoryComponent,
+    MurIconComponent,
+  ],
   templateUrl: "./note-chat.component.html",
   styleUrl: "./note-chat.component.scss",
 })
@@ -54,6 +75,10 @@ export class NoteChatComponent {
   private readonly injector = inject(Injector);
   private readonly sourceScope = inject(SourceScopeService);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly folders = inject(FoldersService);
+  private readonly notes = inject(NotesService);
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly historyPrivacy = inject(AskHistoryPrivacyBarrierService);
 
   /** The note whose content grounds every answer (the pre-fill anchor). */
   readonly noteId = input.required<string>();
@@ -91,7 +116,7 @@ export class NoteChatComponent {
   readonly closed = output<void>();
 
   /** The running conversation (optimistic user turns + grounded replies). */
-  readonly conversation = signal<ChatTurn[]>([]);
+  readonly conversation = signal<NoteChatTurn[]>([]);
   /** True while an {@link IpcService.askVault} call is in flight. */
   readonly pending = signal(false);
   /** Inline error message (with a Retry affordance); null when clear. */
@@ -106,6 +131,38 @@ export class NoteChatComponent {
    * itself is one of the sources, so the scope is never whole-vault by default).
    */
   readonly sources = signal<SourceRef[]>([]);
+  private readonly defaultSources = signal<SourceRef[]>([]);
+
+  /** Durable history is local-authored-note only; Org stays intentionally stateless. */
+  readonly historyEnabled = computed(() => this.anchorKind() === "note");
+  readonly conversationId = signal<string | null>(null);
+  readonly historyOpen = signal(false);
+  readonly history = signal<AskConversationSummary[]>([]);
+  readonly historyLoading = signal(false);
+  readonly historyError = signal<string | null>(null);
+  readonly historyActionError = signal<string | null>(null);
+  readonly historyResumeId = signal<string | null>(null);
+  readonly historyPrivacyReady = this.historyPrivacy.ready;
+  readonly historyPrivacyError = this.historyPrivacy.error;
+  private historyLoadSeq = 0;
+  private requestSeq = 0;
+  private nextTurnId = 1;
+  private visibleFolders: Set<string> | null = null;
+  private activeAnchorKey: string | null = null;
+  private removeHistoryInvalidator: (() => void) | null = null;
+
+  constructor() {
+    this.removeHistoryInvalidator = this.historyPrivacy.registerInvalidator(
+      () => {
+        this.sourcePicker()?.scrubPrivateState();
+        this.resetConversation(true);
+      },
+    );
+    this.destroyRef.onDestroy(() => {
+      this.removeHistoryInvalidator?.();
+      this.removeHistoryInvalidator = null;
+    });
+  }
 
   /** Starter prompts for the empty state. */
   protected readonly starters = STARTERS;
@@ -121,23 +178,70 @@ export class NoteChatComponent {
     const kind = this.anchorKind();
     const id = this.noteId();
     const title = this.anchorTitle() ?? undefined;
+    const privacyReady = this.historyPrivacy.ready();
+    const key = `${kind}:${id}`;
+    if (this.activeAnchorKey !== null && this.activeAnchorKey !== key) {
+      this.resetConversation(true);
+    }
+    this.activeAnchorKey = key;
     const seq = ++this.prefillSeq;
     if (kind !== "note") {
       // Org anchor: pinned server-side via `pinnedOrgItemId`; an org item is not a local SourceRef,
       // so prefilling a note scope for its id would be wrong. Start the picker empty.
+      this.defaultSources.set([]);
+      this.sources.set([]);
+      return;
+    }
+    if (!privacyReady) {
+      this.defaultSources.set([]);
       this.sources.set([]);
       return;
     }
     void this.sourceScope.defaultSources("note", id, title).then((defaults) => {
-      if (seq === this.prefillSeq) {
+      if (
+        this.anchorKind() !== "note" ||
+        this.noteId() !== id ||
+        seq !== this.prefillSeq
+      ) {
+        return;
+      }
+      this.defaultSources.set(defaults);
+      if (this.conversationId() === null) {
         this.sources.set(defaults);
       }
     });
   });
 
+  /**
+   * Org remains stateless, but it can still hold local source titles and an
+   * answer derived from them. Every NoteChat therefore joins the same privacy
+   * barrier; `historyEnabled` controls persistence UI only.
+   */
+  private readonly _ensureAskPrivacy = effect(() => {
+    this.anchorKind();
+    void this.historyPrivacy.ensureReady();
+  });
+
+  /** Local-note durable history is global-derived and leaves DOM on any lock reduction. */
+  private readonly _dropOnVisibilityReduction = effect(() => {
+    const enabled = this.historyEnabled();
+    const next = this.collectVisibleFolderIds(
+      this.folders.tree(),
+      this.notes.noteFolders(),
+    );
+    const previous = this.visibleFolders;
+    this.visibleFolders = next;
+    if (enabled && previous && [...previous].some((id) => !next.has(id))) {
+      this.resetConversation(true);
+    }
+  });
+
   /** A submit is allowed only with non-empty text and no in-flight request. */
   readonly canSend = computed(
-    () => !this.pending() && this.draft().trim().length > 0,
+    () =>
+      this.historyPrivacyReady() &&
+      !this.pending() &&
+      this.draft().trim().length > 0,
   );
 
   /** Mirror the textarea value into the `draft` signal. */
@@ -161,7 +265,7 @@ export class NoteChatComponent {
 
   /** Fill + send a starter chip's question. */
   ask(question: string): void {
-    if (this.pending()) {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
     this.draft.set(question);
@@ -170,7 +274,7 @@ export class NoteChatComponent {
 
   /** Re-send the last user question after an error (it's still in the log). */
   retry(): void {
-    if (this.pending()) {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
     const turns = this.conversation();
@@ -195,60 +299,295 @@ export class NoteChatComponent {
     this.error.set(null);
   }
 
+  toggleHistory(): void {
+    if (
+      !this.historyEnabled() ||
+      this.pending() ||
+      !this.historyPrivacyReady()
+    ) {
+      return;
+    }
+    if (this.historyOpen()) {
+      this.historyOpen.set(false);
+      return;
+    }
+    this.historyOpen.set(true);
+    void this.loadHistory();
+  }
+
+  newConversation(): void {
+    if (
+      this.historyEnabled() &&
+      !this.pending() &&
+      this.historyPrivacyReady()
+    ) {
+      this.resetConversation(false);
+      this.focusComposer();
+    }
+  }
+
+  retryHistory(): void {
+    if (this.historyEnabled() && this.historyPrivacyReady()) {
+      void this.loadHistory();
+    }
+  }
+
+  retryHistoryPrivacy(): void {
+    this.resetConversation(true);
+    void this.historyPrivacy.ensureReady();
+  }
+
+  async resumeConversation(id: string): Promise<void> {
+    if (
+      !this.historyEnabled() ||
+      this.pending() ||
+      !this.historyPrivacyReady()
+    ) {
+      return;
+    }
+    const seq = ++this.historyLoadSeq;
+    const scope = this.scope();
+    this.historyResumeId.set(id);
+    this.historyActionError.set(null);
+    try {
+      const detail = await this.ipc.loadAskConversation(scope, id);
+      if (seq !== this.historyLoadSeq || !this.sameScope(scope, this.scope())) {
+        return;
+      }
+      this.requestSeq++;
+      this.prefillSeq++;
+      this.conversationId.set(detail.id);
+      this.sources.set(detail.selectedSources);
+      this.conversation.set(this.renderTurns(detail));
+      this.draft.set("");
+      this.error.set(null);
+      this.historyActionError.set(null);
+      this.historyOpen.set(false);
+      this.scrollToLatest();
+      this.focusComposer();
+    } catch (e) {
+      if (seq === this.historyLoadSeq) {
+        this.historyActionError.set(
+          this.errorCopy.because("Couldn’t load this conversation", e),
+        );
+      }
+    } finally {
+      if (seq === this.historyLoadSeq) {
+        this.historyResumeId.set(null);
+      }
+    }
+  }
+
   /**
    * Ask the current question, grounded in this note's source scope. Captures the
    * question + the PRIOR history (the conversation before this turn),
    * optimistically appends the user turn, awaits the grounded reply, then
    * appends the assistant turn. On failure the user's question is kept (an inline
-   * Retry re-runs it). Stateless like the meeting twin: no `askThreadId`.
+   * Retry re-runs it). Authored notes continue a backend-owned durable id;
+   * shared Org items stay on the legacy stateless branch below.
    */
   async send(): Promise<void> {
     const question = this.draft().trim();
-    if (!question || this.pending()) {
+    if (!question || this.pending() || !this.historyPrivacyReady()) {
       return;
     }
 
     // History as seen by the model = everything BEFORE this turn.
-    const priorHistory = this.conversation();
+    const priorHistory: ChatTurn[] = this.conversation().map((turn) => ({
+      role: turn.role,
+      content: turn.content,
+    }));
     // Source-scoped Brain: pin the answer to this note + its links.
-    const scope = this.sources();
+    const selectedSources = this.sources();
 
+    const requestSeq = ++this.requestSeq;
+    const scopeKind = this.anchorKind();
+    const conversationScope = this.scope();
+    const anchorKey = `${scopeKind}:${this.noteId()}`;
+    const conversationId = this.conversationId() ?? undefined;
+    const optimisticUserId = `local-${this.nextTurnId++}`;
     this.error.set(null);
     this.draft.set("");
     this.conversation.set([
-      ...priorHistory,
-      { role: "user", content: question },
+      ...this.conversation(),
+      { id: optimisticUserId, role: "user", content: question },
     ]);
     this.pending.set(true);
     this.scrollToLatest();
 
     try {
-      const result = await this.ipc.askVault(
-        question,
-        priorHistory,
-        undefined,
-        scope.length ? scope : undefined,
-        // Org anchor: pin the shared note server-side so the answer is always grounded in it
-        // (works for the local Brain too, which otherwise never retrieves org-feed content).
-        this.anchorKind() === "org" ? this.noteId() : undefined,
-      );
+      let answer: string;
+      let persistedConversationId: string | null = null;
+      let persistedUserMessageId: string | null = null;
+      let persistedAssistantMessageId: string | null = null;
+      if (scopeKind === "org") {
+        const result = await this.ipc.askVault(
+          question,
+          priorHistory,
+          undefined,
+          selectedSources.length ? selectedSources : undefined,
+          this.noteId(),
+        );
+        answer = result.answer;
+      } else {
+        const result = await this.ipc.askVaultPersisted(
+          conversationScope,
+          question,
+          conversationId,
+          selectedSources.length ? selectedSources : undefined,
+        );
+        answer = result.answer;
+        persistedConversationId = result.conversationId;
+        persistedUserMessageId = result.userMessageId;
+        persistedAssistantMessageId = result.assistantMessageId;
+      }
+      if (
+        requestSeq !== this.requestSeq ||
+        anchorKey !== `${this.anchorKind()}:${this.noteId()}`
+      ) {
+        return;
+      }
+      if (persistedConversationId)
+        this.conversationId.set(persistedConversationId);
       this.conversation.update((turns) => [
-        ...turns,
-        { role: "assistant", content: result.answer },
+        ...turns.map((turn) =>
+          persistedUserMessageId && turn.id === optimisticUserId
+            ? { ...turn, id: persistedUserMessageId }
+            : turn,
+        ),
+        {
+          id: persistedAssistantMessageId ?? `local-${this.nextTurnId++}`,
+          role: "assistant",
+          content: answer,
+        },
       ]);
     } catch (e) {
       // Keep the user's question in the log so Retry can re-send it.
-      this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
+      if (requestSeq === this.requestSeq) {
+        this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
+      }
     } finally {
-      this.pending.set(false);
-      this.scrollToLatest();
+      if (requestSeq === this.requestSeq) {
+        this.pending.set(false);
+        this.scrollToLatest();
+      }
     }
+  }
+
+  private scope(): AskConversationScope {
+    return { kind: "note", refId: this.noteId() };
+  }
+
+  private async loadHistory(): Promise<void> {
+    if (!this.historyEnabled() || !this.historyPrivacyReady()) {
+      return;
+    }
+    const seq = ++this.historyLoadSeq;
+    const scope = this.scope();
+    this.historyLoading.set(true);
+    this.historyError.set(null);
+    this.historyActionError.set(null);
+    try {
+      const rows = await this.ipc.listAskConversations(scope);
+      if (seq === this.historyLoadSeq && this.sameScope(scope, this.scope())) {
+        this.history.set(rows);
+      }
+    } catch (e) {
+      if (seq === this.historyLoadSeq) {
+        this.historyError.set(
+          this.errorCopy.because("Couldn’t load conversation history", e),
+        );
+      }
+    } finally {
+      if (seq === this.historyLoadSeq) {
+        this.historyLoading.set(false);
+      }
+    }
+  }
+
+  private resetConversation(clearHistoryRows: boolean): void {
+    this.requestSeq++;
+    this.historyLoadSeq++;
+    this.pending.set(false);
+    this.conversationId.set(null);
+    this.conversation.set([]);
+    this.draft.set("");
+    this.error.set(null);
+    if (clearHistoryRows) {
+      this.prefillSeq++;
+      this.defaultSources.set([]);
+      this.sources.set([]);
+    } else {
+      this.sources.set(this.defaultSources());
+    }
+    this.historyOpen.set(false);
+    this.historyLoading.set(false);
+    this.historyError.set(null);
+    this.historyActionError.set(null);
+    this.historyResumeId.set(null);
+    if (clearHistoryRows) {
+      this.history.set([]);
+    }
+  }
+
+  private renderTurns(detail: AskConversation): NoteChatTurn[] {
+    return detail.messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+    }));
+  }
+
+  private sameScope(a: AskConversationScope, b: AskConversationScope): boolean {
+    if (a.kind === "vault" || b.kind === "vault") {
+      return a.kind === b.kind;
+    }
+    return a.kind === b.kind && a.refId === b.refId;
+  }
+
+  private collectVisibleFolderIds(
+    nodes: readonly {
+      id: string;
+      locked: boolean;
+      unlocked: boolean;
+      children?: unknown[];
+    }[],
+    noteFolders: readonly {
+      id: string;
+      locked: boolean;
+      unlocked: boolean;
+    }[],
+  ): Set<string> {
+    const visible = new Set<string>();
+    const visit = (items: typeof nodes): void => {
+      for (const node of items) {
+        if (!node.locked || node.unlocked) {
+          visible.add(`meeting:${node.id}`);
+        }
+        visit((node.children ?? []) as typeof nodes);
+      }
+    };
+    visit(nodes);
+    for (const folder of noteFolders) {
+      if (!folder.locked || folder.unlocked) {
+        visible.add(`note:${folder.id}`);
+      }
+    }
+    return visible;
   }
 
   // --- Auto-scroll ---------------------------------------------------------
 
   /** The scrollable message log. */
   private readonly scroller = viewChild<ElementRef<HTMLDivElement>>("scroller");
+  private readonly composer = viewChild<ElementRef<HTMLTextAreaElement>>("input");
+  private readonly sourcePicker = viewChild(SourcePickerComponent);
+
+  private focusComposer(): void {
+    afterNextRender(() => this.composer()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
+  }
 
   /**
    * Pin the log to the newest message. Runs after the next render so the new

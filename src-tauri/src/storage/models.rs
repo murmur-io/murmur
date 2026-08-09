@@ -1092,6 +1092,102 @@ pub struct ChatTurn {
     pub content: String,
 }
 
+/// Durable Ask Brain scope. `refId` is absent for vault and required for note/meeting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AskConversationScope {
+    Vault,
+    Note { ref_id: String },
+    Meeting { ref_id: String },
+}
+
+impl AskConversationScope {
+    pub(crate) fn storage_parts(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::Vault => ("vault", None),
+            Self::Note { ref_id } => ("note", Some(ref_id.as_str())),
+            Self::Meeting { ref_id } => ("meeting", Some(ref_id.as_str())),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> crate::error::Result<()> {
+        match self {
+            Self::Vault => Ok(()),
+            Self::Note { ref_id } | Self::Meeting { ref_id } if ref_id.trim().is_empty() => Err(
+                crate::error::AppError::InvalidArg("conversation scope reference is empty".into()),
+            ),
+            Self::Note { .. } | Self::Meeting { .. } => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskConversationSummary {
+    pub id: String,
+    pub scope: AskConversationScope,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskConversationMessage {
+    pub id: String,
+    pub ordinal: u32,
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub sources: Vec<VaultSource>,
+    #[serde(default)]
+    pub citations: Vec<String>,
+    pub created_at: String,
+}
+
+/// A source reference returned by durable Ask history. Identity is persisted as `kind + id` only;
+/// `title` is resolved at load time through the live visibility gate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskConversationSourceRef {
+    pub kind: crate::links::LinkKind,
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskConversation {
+    pub id: String,
+    pub scope: AskConversationScope,
+    pub title: String,
+    pub selected_sources: Vec<AskConversationSourceRef>,
+    pub messages: Vec<AskConversationMessage>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Successful durable send. Every canonical identity is minted by the backend: `conversationId`
+/// names the SQLite thread, while the message IDs identify the atomic pair just committed.
+/// `askTraceId` remains a separate ephemeral value used only to route live tool-trace events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskConversationSendResult {
+    pub conversation_id: String,
+    pub user_message_id: String,
+    pub assistant_message_id: String,
+    pub answer: String,
+    #[serde(default)]
+    pub sources: Vec<VaultSource>,
+    #[serde(default)]
+    pub citations: Vec<String>,
+}
+
 /// A built-in recipe (prompt template) shown as a quick chip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

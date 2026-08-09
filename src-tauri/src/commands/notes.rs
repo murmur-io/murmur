@@ -419,7 +419,7 @@ pub async fn update_note_doc(
     })
     .await?;
     // See `update_note`: ping open org views when the edit re-published ≥1 org copy. Best-effort.
-    if republish_org_shares_for_source(state.inner(), None, Some(&id))
+    if republish_org_shares_for_source_notifying(state.inner(), None, Some(&id), &app)
         .await
         .unwrap_or(0)
         > 0
@@ -585,6 +585,13 @@ pub fn move_note_doc(
     id: String,
     folder_id: String,
 ) -> Result<(), AppError> {
+    let target_locked = state
+        .db
+        .folder_by_id(&folder_id)?
+        .is_some_and(|folder| folder.locked);
+    if target_locked {
+        emit_ask_history_invalidated_fail_closed(&app);
+    }
     move_note_doc_inner(state.inner(), &id, &folder_id)?;
     // A move INTO a locked folder seals + purges ALL pending audit findings; an open-target move
     // purges nothing — the count-only ping is correct (and cheap) either way.
@@ -676,6 +683,7 @@ pub(crate) fn move_note_doc_inner(
         );
     }
     if target_locked {
+        bump_seal_epoch(state);
         let title = row.title.clone().unwrap_or_else(|| row.name.clone());
         let updated_at = row.updated_at.unwrap_or(row.created_at);
         let blob = sealed_document_blob(state, folder_id, id, &row.text)?;
@@ -715,6 +723,7 @@ pub(crate) fn move_note_doc_inner(
         // (the rollup posture; this note's title may be cited in third-party evidence no id can
         // match). The other seal paths purge inside their chunk-purge txs; this path has none.
         state.db.purge_all_pending_audit_findings()?;
+        state.db.purge_all_ask_conversations()?;
     } else {
         remove_note_export_before_move(row.exported_path.as_deref())?;
         remove_attachment_exports_before_move(&attachment_rows)?;
@@ -761,7 +770,8 @@ pub async fn delete_note(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), AppError> {
-    delete_note_inner(state.inner(), &id).await?;
+    delete_note_inner_notifying(state.inner(), &id, Some(&app)).await?;
+    emit_ask_history_invalidated_fail_closed(&app);
     crate::events::emit_content_deleted(&app, "note", &id);
     // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
@@ -770,7 +780,16 @@ pub async fn delete_note(
 
 /// Inner of [`delete_note`] taking `&AppState` (unit-testable gate). `async` for the org-share revoke
 /// cascade (network round-trip); the gate + DB delete themselves stay synchronous internally.
+#[cfg(test)]
 pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    delete_note_inner_notifying(state, id, None).await
+}
+
+async fn delete_note_inner_notifying(
+    state: &AppState,
+    id: &str,
+    app: Option<&AppHandle>,
+) -> Result<(), AppError> {
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Ok(()); // unknown id → idempotent no-op.
     };
@@ -784,7 +803,7 @@ pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), 
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
     // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
-    revoke_org_shares_for_source(state, None, Some(id)).await?;
+    revoke_org_shares_for_source_notifying(state, None, Some(id), app).await?;
     // The revoke awaited the network. Re-check under the lifecycle mutex before touching plaintext
     // exports or rows; a concurrent relock may have changed the source gate meanwhile.
     let _lifecycle = lifecycle_guard(state);
@@ -812,6 +831,7 @@ pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), 
     if let Some(path) = &row.exported_path {
         let _ = std::fs::remove_file(path);
     }
+    bump_seal_epoch(state);
     state.db.delete_document(id)?;
     tracing::info!(target: "notes", note_id = %id, "note deleted");
     Ok(())
@@ -1083,11 +1103,17 @@ pub fn rename_note_folder(
 
 /// Delete a note-folder (reuses the meeting-folder delete machinery). Gated to a note-folder id.
 #[tauri::command]
-pub fn delete_note_folder(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+pub fn delete_note_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), AppError> {
     if state.db.note_folder_by_id(&id)?.is_none() {
         return Err(AppError::InvalidArg(format!("no note folder {id}")));
     }
-    delete_folder_inner(state.inner(), id)
+    delete_folder_inner(state.inner(), id)?;
+    emit_ask_history_invalidated_fail_closed(&app);
+    Ok(())
 }
 
 /// Reparent a note-folder. Gated to a note-folder id; the new parent (if any) must also be a
