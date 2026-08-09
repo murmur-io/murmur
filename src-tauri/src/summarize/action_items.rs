@@ -300,7 +300,10 @@ mod tests {
                   - [ ] (owner unspecified) — book the room\n\
                   - [ ] (TBD) — sign the contract\n\
                   - [ ]  (unassigned)  — chase the invoice\n";
-        let owners: Vec<_> = parse_action_items(md).into_iter().map(|i| i.owner).collect();
+        let owners: Vec<_> = parse_action_items(md)
+            .into_iter()
+            .map(|i| i.owner)
+            .collect();
         assert_eq!(
             owners,
             vec![None, None, None, None],
@@ -320,16 +323,25 @@ mod tests {
             .into_iter()
             .filter_map(|i| i.owner)
             .collect();
-        assert_eq!(owners, vec!["Anna (QA)", "me (Ali)", "me (YuYakob)", "(a) b"]);
+        assert_eq!(
+            owners,
+            vec!["Anna (QA)", "me (Ali)", "me (YuYakob)", "(a) b"]
+        );
     }
 
     /// The balance walk, directly — nesting must not read as "content outside".
     #[test]
     fn parenthetical_detection_walks_the_balance() {
         assert!(is_parenthetical_only("(a (b))"), "nested is still wrapped");
-        assert!(is_parenthetical_only("  (unspecified)  "), "padding is trimmed");
+        assert!(
+            is_parenthetical_only("  (unspecified)  "),
+            "padding is trimmed"
+        );
         assert!(!is_parenthetical_only("(a) b"), "closes before the end");
-        assert!(!is_parenthetical_only("b (a)"), "trailing bracket is not a wrapper");
+        assert!(
+            !is_parenthetical_only("b (a)"),
+            "trailing bracket is not a wrapper"
+        );
         assert!(!is_parenthetical_only("Anna"), "no brackets at all");
         assert!(!is_parenthetical_only(")a("), "unbalanced never underflows");
         assert!(!is_parenthetical_only("(a"), "unterminated is not wrapped");

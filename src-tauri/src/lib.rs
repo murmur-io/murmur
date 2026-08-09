@@ -343,6 +343,10 @@ pub fn run() {
             commands::delete_meeting,
             commands::rename_meeting,
             commands::chat_meeting,
+            commands::chat_meeting_persisted,
+            commands::list_ask_conversations,
+            commands::load_ask_conversation,
+            commands::ask_vault_persisted,
             commands::export_audio,
             commands::export_mic_master,
             commands::export_sys_master,
@@ -991,7 +995,12 @@ pub fn run() {
                             // Settings shared-brain list) re-fetches without polling. Best-effort:
                             // a failed emit never breaks the loop. The count is aggregated across
                             // orgs by the all-orgs tick, so we report `1` (≥1 org changed).
-                            if crate::commands::org_background_sync_tick(state.inner()).await {
+                            if crate::commands::org_background_sync_tick(
+                                state.inner(),
+                                Some(handle.clone()),
+                            )
+                            .await
+                            {
                                 crate::events::emit_org_feed_updated(&handle, 1);
                             }
                         }

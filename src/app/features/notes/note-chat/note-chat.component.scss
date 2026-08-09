@@ -62,6 +62,18 @@
   max-height: none;
   padding: var(--space-4) var(--space-5) var(--space-2);
 }
+.chat.is-bare .chat-history {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--space-2) var(--space-3) var(--space-3);
+}
+.chat.is-bare .chat-head-action {
+  width: 30px;
+  padding: 0;
+}
+.chat.is-bare .chat-head-action span {
+  display: none;
+}
 .chat.is-bare .chat-sources {
   padding: 0 var(--space-5);
   margin-bottom: 0;
@@ -102,6 +114,16 @@
   padding: 0 var(--space-3);
   font-size: 0.8125rem;
 }
+.chat-head-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  flex: none;
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+}
 .chat-head-actions {
   display: inline-flex;
   align-items: center;
@@ -122,7 +144,9 @@
   font-size: 1.25rem;
   line-height: 1;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
 }
 .chat-close:hover {
   background: var(--surface-hover);
@@ -144,6 +168,11 @@
   padding: var(--space-1) var(--space-1) var(--space-2);
   scroll-behavior: smooth;
   overscroll-behavior: contain;
+}
+
+.chat-history {
+  min-height: 132px;
+  max-height: 440px;
 }
 
 /* --- Empty state --- */
@@ -397,4 +426,3 @@
     scroll-behavior: auto;
   }
 }
-    

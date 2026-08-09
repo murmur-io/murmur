@@ -141,7 +141,11 @@ fn cap_doc(text: &str) -> String {
 /// YAML front-matter — the command prepends deterministic front-matter): a tight anti-slop
 /// `## Summary` → `## Outline` → `## Action items` (owners + dates when stated). Grounded: it must
 /// stick to the document, never invent. Output language follows `note_language`.
-pub fn build_synthesis_prompt(source_name: &str, text: &str, note_language: &str) -> (String, String) {
+pub fn build_synthesis_prompt(
+    source_name: &str,
+    text: &str,
+    note_language: &str,
+) -> (String, String) {
     let system = format!(
         "You turn ONE already-extracted document (a whiteboard photo, screenshot, slide deck, or \
 pasted notes) into a clean, scannable Obsidian note. Output ONLY the note BODY in Markdown — NO \
@@ -222,7 +226,11 @@ pub fn structure_mirror_schema() -> serde_json::Value {
 /// transcription. The model TRANSCRIBES the document's structure verbatim into `{fields, tables,
 /// sections}`; it computes nothing. §10 is load-bearing here: every value is an opaque string, so
 /// an invoice/receipt/form is mirrored, never totalled.
-pub fn build_structure_prompt(source_name: &str, text: &str, note_language: &str) -> (String, String) {
+pub fn build_structure_prompt(
+    source_name: &str,
+    text: &str,
+    note_language: &str,
+) -> (String, String) {
     let system = format!(
         "You TRANSCRIBE the structure of ONE already-extracted document (a form, invoice, receipt, \
 spreadsheet, or table) into JSON. You are a faithful transcriber, NOT an analyst.\n\
@@ -506,7 +514,10 @@ mod tests {
         );
         // Amounts are copied verbatim — never a computed total row.
         assert!(md1.contains("$30.00") && md1.contains("$20.00"));
-        assert!(!md1.contains("$50.00"), "the renderer must NEVER sum amounts");
+        assert!(
+            !md1.contains("$50.00"),
+            "the renderer must NEVER sum amounts"
+        );
         assert!(md1.contains("## Terms") && md1.contains("Net 30."));
     }
 

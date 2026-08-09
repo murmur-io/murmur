@@ -1521,6 +1521,77 @@ mod tests {
         ModelLifecycleTestGuard { _serial: serial }
     }
 
+    struct BarrierNameRedactor {
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl NameRedactor for BarrierNameRedactor {
+        fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
+            self.entered.wait();
+            self.release.wait();
+            (text.to_string(), Vec::new())
+        }
+    }
+
+    /// The admitted wrapper covers the WHOLE redaction decorator future. If async NER yields and
+    /// content is relocked before it resumes, the next poll is refused before the inner provider
+    /// can dispatch.
+    #[test]
+    fn admitted_redacting_provider_refuses_inner_dispatch_after_ner_relock() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let _model_lifecycle = model_lifecycle_test_guard();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner: Arc<dyn SummarizerProvider> = Arc::new(DispatchCounterProvider {
+            provider_id: crate::summarize::PROVIDER_ANTHROPIC,
+            calls: Arc::clone(&calls),
+        });
+        let provider = Arc::new(
+            RedactingProvider::with_name_redactor_sink_and_model_admission(
+                inner,
+                Arc::new(BarrierNameRedactor {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                }),
+                Arc::new(NoopEgressSink),
+                crate::summarize::PROVIDER_ANTHROPIC.into(),
+                "api.anthropic.com".into(),
+                "fixture".into(),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                None,
+            ),
+        );
+        let lifecycle = Arc::new(std::sync::Mutex::new(()));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let validator = Arc::clone(&allowed);
+        let admission =
+            crate::state::ContentDispatchAdmission::for_test(Arc::clone(&lifecycle), move || {
+                if validator.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(AppError::Locked("relocked during NER".into()))
+                }
+            });
+
+        let worker = std::thread::spawn(move || {
+            block_on(admission.run(|| provider.complete("system", "user")))
+        });
+        entered.wait();
+        {
+            let _guard = lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            allowed.store(false, Ordering::SeqCst);
+        }
+        release.wait();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     static PROXY_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Temporarily route reqwest's system HTTP proxy to a controlled loopback listener.

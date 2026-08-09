@@ -502,6 +502,53 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_assistant_interactions_meeting
                ON assistant_interactions(meeting_id);
+             -- Durable Ask Brain conversations. These are deliberately separate from the
+             -- recording-time assistant_interactions schema: they are normalized, scope-bound,
+             -- bounded on every reader, and v1 content is conservatively global-derived because
+             -- current Ask provenance does not provide typed IDs for every accessed source.
+             CREATE TABLE IF NOT EXISTS ask_history_state (
+               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+               visibility_generation INTEGER NOT NULL CHECK(visibility_generation >= 0)
+             );
+             INSERT OR IGNORE INTO ask_history_state(singleton, visibility_generation)
+               VALUES (1, 0);
+             CREATE TABLE IF NOT EXISTS ask_conversations (
+               id TEXT PRIMARY KEY,
+               scope_kind TEXT NOT NULL CHECK(scope_kind IN ('vault', 'note', 'meeting')),
+               scope_ref TEXT,
+               title TEXT NOT NULL,
+               selected_sources_json TEXT NOT NULL DEFAULT '[]',
+               provenance_mode TEXT NOT NULL CHECK(provenance_mode = 'globalDerived'),
+               visibility_generation INTEGER NOT NULL DEFAULT 0 CHECK(visibility_generation >= 0),
+               revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               CHECK((scope_kind = 'vault' AND scope_ref IS NULL) OR
+                     (scope_kind IN ('note', 'meeting') AND length(scope_ref) > 0))
+             );
+             CREATE INDEX IF NOT EXISTS idx_ask_conversations_scope_updated
+               ON ask_conversations(scope_kind, scope_ref, updated_at DESC, id DESC);
+             CREATE TABLE IF NOT EXISTS ask_conversation_messages (
+               id TEXT PRIMARY KEY,
+               conversation_id TEXT NOT NULL,
+               ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+               role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+               content TEXT NOT NULL CHECK(length(trim(content)) > 0),
+               sources_json TEXT NOT NULL DEFAULT '[]',
+               citations_json TEXT NOT NULL DEFAULT '[]',
+               created_at TEXT NOT NULL,
+               UNIQUE(conversation_id, ordinal),
+               FOREIGN KEY (conversation_id) REFERENCES ask_conversations(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_ask_conversation_messages_order
+               ON ask_conversation_messages(conversation_id, ordinal);
+             CREATE TABLE IF NOT EXISTS ask_conversation_dependencies (
+               conversation_id TEXT NOT NULL,
+               dependency_kind TEXT NOT NULL CHECK(dependency_kind = 'folder'),
+               dependency_ref TEXT NOT NULL CHECK(length(dependency_ref) > 0),
+               PRIMARY KEY (conversation_id, dependency_kind, dependency_ref),
+               FOREIGN KEY (conversation_id) REFERENCES ask_conversations(id) ON DELETE CASCADE
+             );
              -- Brain v2 L4: CRASH-RECOVERY row for the incremental live bullets of a recording in
              -- progress (`transcribe::bullets`). RAM (`AppState::live_bullets`) is authoritative
              -- during the recording; this row lets a crash-salvaged meeting still feed its bullets
@@ -639,6 +686,20 @@ impl Db {
                ON supersessions(source_meeting_id);",
         )
         .map_err(map_err)?;
+        // Ask history hardening: additive generation + optimistic revision columns for databases
+        // created before durable history gained crash-proof invalidation and resume CAS.
+        Self::add_column_if_missing(
+            &conn,
+            "ask_conversations",
+            "visibility_generation",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(visibility_generation >= 0)",
+        )?;
+        Self::add_column_if_missing(
+            &conn,
+            "ask_conversations",
+            "revision",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)",
+        )?;
         // Guarded ALTERs — notes gain a folder association + a sealed-content blob (AES-GCM
         // markdown when the folder is locked; NULL when open). migrate() re-runs each launch and
         // `ALTER ADD COLUMN` errors if the column already exists, so check pragma_table_info first.
@@ -2394,6 +2455,7 @@ impl Db {
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
         let rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
+        Self::purge_all_ask_conversations_tx(&tx)?;
         Self::purge_retired_recording_generations_tx(&tx, id)?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
@@ -3111,6 +3173,9 @@ impl Db {
         // id to match, e.g. a stale finding's `see [[superseding note]]`; a seal anywhere
         // invalidates the pass's visibility snapshot). Resolved rows were blanked on resolve.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
+        // Ask history v1 is global-derived because current citations are not a complete typed
+        // provenance log. Any seal therefore revokes every durable conversation atomically.
+        Self::purge_all_ask_conversations_tx(&tx)?;
         // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is a
         // just-sealed meeting in this SAME seal tx — a link names a neighbour (its title/existence
         // reveals a possibly-sealed item), so it must not survive at rest for a sealed endpoint.
@@ -4163,6 +4228,7 @@ impl Db {
         // Vault Audit: a pending finding sourcing or targeting this document/note quotes its
         // content/title — drop it in the same delete tx (mirrors `delete_meeting`'s purge).
         Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
+        Self::purge_all_ask_conversations_tx(&tx)?;
         tx.execute("DELETE FROM documents WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
@@ -4463,6 +4529,7 @@ impl Db {
         // may cite third-party titles no document id can match). Findings are cheap re-derivable
         // rows — the next pass re-stages anything still true (never content loss).
         Self::purge_all_pending_audit_findings_tx(&tx)?;
+        Self::purge_all_ask_conversations_tx(&tx)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -5699,6 +5766,7 @@ impl Db {
         let n = tx
             .execute("DELETE FROM folders WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
+        Self::purge_all_ask_conversations_tx(&tx)?;
         tx.commit().map_err(map_err)?;
         Ok(n)
     }

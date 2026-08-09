@@ -7,6 +7,7 @@ import {
   OnInit,
   afterNextRender,
   computed,
+  effect,
   inject,
   signal,
   viewChild,
@@ -15,7 +16,9 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import type {
   AssistantToolPayload,
-  ChatTurn,
+  AskConversation,
+  AskConversationScope,
+  AskConversationSummary,
   SourceRef,
   VaultSource,
 } from "../../../core/models";
@@ -23,6 +26,11 @@ import { SourcePickerComponent } from "../../../design-system/source-picker/sour
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { SourcesComponent } from "../../../shared/sources/sources.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { ChatHistoryComponent } from "../../../design-system/chat-history/chat-history.component";
+import { FoldersService } from "../../../services/folders.service";
+import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import { NotesService } from "../../../services/notes.service";
+import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
 
 /**
  * A conversation turn as rendered on the Ask page. It mirrors {@link ChatTurn}
@@ -36,7 +44,7 @@ interface AskTurn {
    * which would land back at the same index and fool an index-tracked `@for`
    * into reusing the old DOM node (silently skipping its entrance animation).
    */
-  id: number;
+  id: string;
   role: "user" | "assistant";
   content: string;
   /** Present on assistant turns only — the meetings that grounded the answer. */
@@ -82,7 +90,13 @@ const STARTERS: readonly string[] = [
 @Component({
   selector: "app-ask",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, SourcesComponent, SourcePickerComponent],
+  imports: [
+    MarkdownComponent,
+    SourcesComponent,
+    SourcePickerComponent,
+    ChatHistoryComponent,
+    MurIconComponent,
+  ],
   templateUrl: "./ask.component.html",
   styleUrl: "./ask.component.scss",
 })
@@ -91,6 +105,9 @@ export class AskComponent implements OnInit {
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly folders = inject(FoldersService);
+  private readonly notes = inject(NotesService);
+  private readonly historyPrivacy = inject(AskHistoryPrivacyBarrierService);
 
   /** True while the initial "any meetings?" probe is in flight. */
   readonly loading = signal(true);
@@ -114,6 +131,21 @@ export class AskComponent implements OnInit {
    */
   readonly sources = signal<SourceRef[]>([]);
 
+  /** Durable SQLite conversation id; distinct from the per-request trace id. */
+  readonly conversationId = signal<string | null>(null);
+  /** In-flow history browser state. The current conversation remains intact behind it. */
+  readonly historyOpen = signal(false);
+  readonly history = signal<AskConversationSummary[]>([]);
+  readonly historyLoading = signal(false);
+  readonly historyError = signal<string | null>(null);
+  readonly historyActionError = signal<string | null>(null);
+  readonly historyResumeId = signal<string | null>(null);
+  readonly historyPrivacyReady = this.historyPrivacy.ready;
+  readonly historyPrivacyError = this.historyPrivacy.error;
+  private readonly conversationScope: AskConversationScope = { kind: "vault" };
+  private historyLoadSeq = 0;
+  private requestSeq = 0;
+
   /** Live tool-trace chips for the IN-FLIGHT question (cleared when it lands). */
   readonly trace = signal<AskTraceStep[]>([]);
   /**
@@ -124,17 +156,56 @@ export class AskComponent implements OnInit {
   private activeAskId: string | null = null;
   /** Monotonic id source for trace chips (stable `@for` keys). */
   private nextTraceId = 1;
-  /** Monotonic id source for conversation turns (stable `@for` keys). */
+  /** Ephemeral key source until a successful durable send returns backend message UUIDs. */
   private nextTurnId = 1;
   private unlistenAskTool: UnlistenFn | null = null;
+  private removeHistoryInvalidator: (() => void) | null = null;
+  private destroyed = false;
+  private visibleFolders: Set<string> | null = null;
+
+  /**
+   * Durable v1 answers are conservatively global-derived. If any previously
+   * visible folder becomes hidden/removed, immediately evict every plaintext
+   * turn/title/source from this mounted WebView while the backend purges SQLite.
+   */
+  private readonly _dropOnVisibilityReduction = effect(() => {
+    const next = this.collectVisibleFolderIds(
+      this.folders.tree(),
+      this.notes.noteFolders(),
+    );
+    const previous = this.visibleFolders;
+    this.visibleFolders = next;
+    if (previous && [...previous].some((id) => !next.has(id))) {
+      this.resetConversation(true);
+    }
+  });
 
   /** Starter prompts for the empty state. */
   protected readonly starters = STARTERS;
 
   /** A submit is allowed only with non-empty text and no in-flight request. */
   readonly canSend = computed(
-    () => !this.pending() && this.draft().trim().length > 0,
+    () =>
+      this.historyPrivacyReady() &&
+      !this.pending() &&
+      this.draft().trim().length > 0,
   );
+
+  constructor() {
+    this.removeHistoryInvalidator = this.historyPrivacy.registerInvalidator(
+      () => {
+        this.sourcePicker()?.scrubPrivateState();
+        this.resetConversation(true);
+      },
+    );
+    void this.historyPrivacy.ensureReady();
+    this.destroyRef.onDestroy(() => {
+      this.destroyed = true;
+      this.unlistenAskTool?.();
+      this.removeHistoryInvalidator?.();
+      this.removeHistoryInvalidator = null;
+    });
+  }
 
   /**
    * Probe whether there is ANYTHING to ask about — meetings OR notes (Ask
@@ -168,8 +239,9 @@ export class AskComponent implements OnInit {
    */
   private async listenAskTool(): Promise<void> {
     try {
-      this.unlistenAskTool = await this.ipc.onAskTool((p) => this.onAskTool(p));
-      this.destroyRef.onDestroy(() => this.unlistenAskTool?.());
+      const unlisten = await this.ipc.onAskTool((p) => this.onAskTool(p));
+      if (this.destroyed) unlisten();
+      else this.unlistenAskTool = unlisten;
     } catch {
       // Not running under Tauri (browser smoke without the mock): no chips.
     }
@@ -270,7 +342,7 @@ export class AskComponent implements OnInit {
 
   /** Fill + send a starter chip's question. */
   ask(question: string): void {
-    if (this.pending()) {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
     this.draft.set(question);
@@ -279,7 +351,7 @@ export class AskComponent implements OnInit {
 
   /** Re-send the last user question after an error (it's still in the log). */
   retry(): void {
-    if (this.pending()) {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
     const turns = this.conversation();
@@ -295,13 +367,76 @@ export class AskComponent implements OnInit {
     void this.send();
   }
 
-  /** Clear the whole conversation back to the empty state. */
-  clear(): void {
-    if (this.pending()) {
+  /** Open/close the in-flow history browser and refresh its bounded rows. */
+  toggleHistory(): void {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
-    this.conversation.set([]);
-    this.error.set(null);
+    if (this.historyOpen()) {
+      this.historyOpen.set(false);
+      return;
+    }
+    this.historyOpen.set(true);
+    void this.loadHistory();
+  }
+
+  /** Start a blank draft without deleting the durable conversation. */
+  newConversation(): void {
+    if (!this.pending() && this.historyPrivacyReady()) {
+      this.resetConversation(false);
+      this.focusComposer();
+    }
+  }
+
+  /** Retry the newest-first list without touching the conversation underneath. */
+  retryHistory(): void {
+    if (this.historyPrivacyReady()) {
+      void this.loadHistory();
+    }
+  }
+
+  retryHistoryPrivacy(): void {
+    this.resetConversation(true);
+    void this.historyPrivacy.ensureReady();
+  }
+
+  /** Load and resume one canonical conversation, including its saved sources. */
+  async resumeConversation(id: string): Promise<void> {
+    if (this.pending() || !this.historyPrivacyReady()) {
+      return;
+    }
+    const seq = ++this.historyLoadSeq;
+    this.historyResumeId.set(id);
+    this.historyActionError.set(null);
+    try {
+      const detail = await this.ipc.loadAskConversation(
+        this.conversationScope,
+        id,
+      );
+      if (seq !== this.historyLoadSeq) {
+        return;
+      }
+      this.requestSeq++;
+      this.conversationId.set(detail.id);
+      this.sources.set(detail.selectedSources);
+      this.conversation.set(this.renderTurns(detail));
+      this.draft.set("");
+      this.error.set(null);
+      this.historyActionError.set(null);
+      this.historyOpen.set(false);
+      this.scrollToLatest();
+      this.focusComposer();
+    } catch (e) {
+      if (seq === this.historyLoadSeq) {
+        this.historyActionError.set(
+          this.errorCopy.because("Couldn’t load this conversation", e),
+        );
+      }
+    } finally {
+      if (seq === this.historyLoadSeq) {
+        this.historyResumeId.set(null);
+      }
+    }
   }
 
   /**
@@ -314,30 +449,30 @@ export class AskComponent implements OnInit {
    * Each question mints a fresh `askThreadId` that keys its live tool-trace
    * (`murmur://ask-tool` chips route strictly by it); the chips are cleared
    * when the turn lands — the answer's source chips remain the durable record.
-   * We ship the FULL conversation as history: the backend caps it at the last
-   * 12 messages itself, so no FE-side truncation.
+   * Durable conversation context is loaded and bounded by the backend from
+   * SQLite; the WebView sends only the durable id and the new question.
    */
   async send(): Promise<void> {
     const question = this.draft().trim();
-    if (!question || this.pending()) {
+    if (!question || this.pending() || !this.historyPrivacyReady()) {
       return;
     }
 
-    // History as seen by the model = everything BEFORE this turn, reduced to
-    // the {role, content} shape the IPC contract takes (drop source metadata).
-    const priorHistory: ChatTurn[] = this.conversation().map((t) => ({
-      role: t.role,
-      content: t.content,
-    }));
-
     const askThreadId = crypto.randomUUID();
+    const requestSeq = ++this.requestSeq;
+    const conversationId = this.conversationId() ?? undefined;
+    const optimisticUserId = `local-${this.nextTurnId++}`;
     this.activeAskId = askThreadId;
     this.trace.set([]);
     this.error.set(null);
     this.draft.set("");
     this.conversation.update((turns) => [
       ...turns,
-      { id: this.nextTurnId++, role: "user", content: question },
+      {
+        id: optimisticUserId,
+        role: "user",
+        content: question,
+      },
     ]);
     this.pending.set(true);
     this.scrollToLatest();
@@ -346,16 +481,25 @@ export class AskComponent implements OnInit {
     // a non-empty selection pins the answer to those sources + their links.
     const scope = this.sources();
     try {
-      const result = await this.ipc.askVault(
+      const result = await this.ipc.askVaultPersisted(
+        this.conversationScope,
         question,
-        priorHistory,
-        askThreadId,
+        conversationId,
         scope.length ? scope : undefined,
+        askThreadId,
       );
+      if (requestSeq !== this.requestSeq) {
+        return;
+      }
+      this.conversationId.set(result.conversationId);
       this.conversation.update((turns) => [
-        ...turns,
+        ...turns.map((turn) =>
+          turn.id === optimisticUserId
+            ? { ...turn, id: result.userMessageId }
+            : turn,
+        ),
         {
-          id: this.nextTurnId++,
+          id: result.assistantMessageId,
           role: "assistant",
           content: result.answer,
           sources: result.sources,
@@ -363,20 +507,121 @@ export class AskComponent implements OnInit {
       ]);
     } catch (e) {
       // Keep the user's question in the log so Retry can re-send it.
-      this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
+      if (requestSeq === this.requestSeq) {
+        this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
+      }
     } finally {
-      // Retire this turn's trace: late tool events for it are dropped.
-      this.activeAskId = null;
-      this.trace.set([]);
-      this.pending.set(false);
-      this.scrollToLatest();
+      if (requestSeq === this.requestSeq) {
+        // Retire this turn's trace: late tool events for it are dropped.
+        this.activeAskId = null;
+        this.trace.set([]);
+        this.pending.set(false);
+        this.scrollToLatest();
+      }
     }
+  }
+
+  private async loadHistory(): Promise<void> {
+    if (!this.historyPrivacyReady()) {
+      return;
+    }
+    const seq = ++this.historyLoadSeq;
+    this.historyLoading.set(true);
+    this.historyError.set(null);
+    this.historyActionError.set(null);
+    try {
+      const rows = await this.ipc.listAskConversations(this.conversationScope);
+      if (seq === this.historyLoadSeq) {
+        this.history.set(rows);
+      }
+    } catch (e) {
+      if (seq === this.historyLoadSeq) {
+        this.historyError.set(
+          this.errorCopy.because("Couldn’t load conversation history", e),
+        );
+      }
+    } finally {
+      if (seq === this.historyLoadSeq) {
+        this.historyLoading.set(false);
+      }
+    }
+  }
+
+  private resetConversation(clearHistoryRows: boolean): void {
+    this.requestSeq++;
+    this.historyLoadSeq++;
+    this.activeAskId = null;
+    this.trace.set([]);
+    this.pending.set(false);
+    this.conversationId.set(null);
+    this.conversation.set([]);
+    this.draft.set("");
+    this.error.set(null);
+    this.sources.set([]);
+    this.historyOpen.set(false);
+    this.historyLoading.set(false);
+    this.historyError.set(null);
+    this.historyActionError.set(null);
+    this.historyResumeId.set(null);
+    if (clearHistoryRows) {
+      this.history.set([]);
+    }
+  }
+
+  private renderTurns(detail: AskConversation): AskTurn[] {
+    return detail.messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+      ...(message.role === "assistant" && message.sources.length
+        ? { sources: message.sources }
+        : {}),
+    }));
+  }
+
+  private collectVisibleFolderIds(
+    nodes: readonly {
+      id: string;
+      locked: boolean;
+      unlocked: boolean;
+      children?: unknown[];
+    }[],
+    noteFolders: readonly {
+      id: string;
+      locked: boolean;
+      unlocked: boolean;
+    }[],
+  ): Set<string> {
+    const visible = new Set<string>();
+    const visit = (items: typeof nodes): void => {
+      for (const node of items) {
+        if (!node.locked || node.unlocked) {
+          visible.add(`meeting:${node.id}`);
+        }
+        visit((node.children ?? []) as typeof nodes);
+      }
+    };
+    visit(nodes);
+    for (const folder of noteFolders) {
+      if (!folder.locked || folder.unlocked) {
+        visible.add(`note:${folder.id}`);
+      }
+    }
+    return visible;
   }
 
   // --- Auto-scroll ---------------------------------------------------------
 
   /** The scrollable message log. */
   private readonly scroller = viewChild<ElementRef<HTMLDivElement>>("scroller");
+  private readonly composer = viewChild<ElementRef<HTMLTextAreaElement>>("input");
+  private readonly sourcePicker = viewChild(SourcePickerComponent);
+
+  private focusComposer(): void {
+    afterNextRender(() => this.composer()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
+  }
 
   /**
    * Pin the log to the newest message. Runs after the next render so the new

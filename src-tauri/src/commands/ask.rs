@@ -196,6 +196,74 @@ pub(crate) fn gated_meeting_thread_turns(state: &AppState, meeting_id: &str) -> 
 /// the deliberately vault-wide Ask page gets a little more room to search + read — still bounded.
 const ASK_MAX_STEPS: usize = 6;
 
+pub(crate) struct DurableDispatchReasoner<'a> {
+    inner: &'a dyn crate::reason::LocalReasoner,
+    admission: crate::state::ContentDispatchAdmission,
+}
+
+pub(crate) fn durable_dispatch_reasoner<'a>(
+    inner: &'a dyn crate::reason::LocalReasoner,
+    admission: crate::state::ContentDispatchAdmission,
+) -> DurableDispatchReasoner<'a> {
+    DurableDispatchReasoner { inner, admission }
+}
+
+impl crate::reason::LocalReasoner for DurableDispatchReasoner<'_> {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn model_admission_managed(&self) -> bool {
+        self.inner.model_admission_managed()
+    }
+
+    fn reason(&self, system: &str, user: &str) -> crate::error::Result<String> {
+        self.inner.reason_admitted(system, user, &self.admission)
+    }
+
+    fn reason_with(
+        &self,
+        system: &str,
+        user: &str,
+        opts: crate::reason::GenOptions,
+    ) -> crate::error::Result<String> {
+        self.inner
+            .reason_with_admitted(system, user, opts, &self.admission)
+    }
+
+    fn structured(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &serde_json::Value,
+    ) -> crate::error::Result<serde_json::Value> {
+        self.inner
+            .structured_admitted(system, user, schema, &self.admission)
+    }
+
+    fn structured_with(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &serde_json::Value,
+        opts: crate::reason::GenOptions,
+    ) -> crate::error::Result<serde_json::Value> {
+        self.inner
+            .structured_with_admitted(system, user, schema, opts, &self.admission)
+    }
+
+    fn structured_with_observation(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &serde_json::Value,
+        opts: crate::reason::GenOptions,
+    ) -> crate::error::Result<crate::reason::StructuredObservation> {
+        self.inner
+            .structured_with_observation_admitted(system, user, schema, opts, &self.admission)
+    }
+}
+
 /// Cap the incoming Ask history to the last [`CHAT_CONTEXT_TURNS`] turns — the same discipline as
 /// the in-meeting chat panel, closing the unbounded-prompt-growth gap the pre-agentic `ask_vault`
 /// had (it rendered the whole history uncapped).
@@ -205,18 +273,21 @@ pub(crate) fn capped_ask_history(history: &[ChatTurn]) -> &[ChatTurn] {
 }
 
 /// Run the vault-scoped agentic attempt for [`ask_vault`]. Returns `Some(result)` ONLY when the
-/// loop CONVERGED; `None` on non-convergence or ANY loop error — incl. `Unavailable` (no cloud
-/// consent) — so the caller floors to the pre-agentic path with its original semantics.
+/// loop CONVERGED; `None` on non-convergence or ordinary loop errors — incl. `Unavailable` (no cloud
+/// consent) — so the caller floors to the pre-agentic path with its original semantics. A
+/// visibility `Locked` error propagates and MUST NOT fall through to another provider path.
 pub(crate) fn ask_vault_agentic_attempt(
     app: &AppHandle,
     question: &str,
     history: &[ChatTurn],
     thread_id: &str,
-) -> Option<AskVaultResult> {
+    dispatch_admission: crate::state::ContentDispatchAdmission,
+    durable_history: bool,
+) -> Result<Option<AskVaultResult>, AppError> {
     let state = app.state::<AppState>();
     let config = match state.config.lock() {
         Ok(c) => c.clone(),
-        Err(_) => return None, // poisoned config ⇒ floor (which will surface its own error)
+        Err(_) => return Ok(None), // poisoned config ⇒ floor (which will surface its own error)
     };
     // Re-resolved per turn (never a startup snapshot): consent/provider/backend changes apply.
     // ASK role — under the legacy fallback this dispatches exactly like the pre-role `current()`.
@@ -239,7 +310,11 @@ pub(crate) fn ask_vault_agentic_attempt(
         // The Ask page is DELIBERATELY vault-wide (Phase 5 preserves it unchanged) — the FULL
         // per-surface catalog, NOT a cascade tier: it is not the in-meeting @brain surface the
         // current-first cascade governs.
-        scope: crate::tools::AssistantScope::Full,
+        scope: if durable_history {
+            crate::tools::AssistantScope::DurableAsk
+        } else {
+            crate::tools::AssistantScope::Full
+        },
         // Seal-on-write handles (residual W1): read-only today (`allow_writes: false`), but the
         // executor carries the live seam so a future write surface can never silently skip it.
         seal: Some(crate::tools::SealAccess {
@@ -294,9 +369,16 @@ pub(crate) fn ask_vault_agentic_attempt(
     let opts = crate::reason::GenOptions::ask_answer()
         .with_transcript_compaction(config.loop_transcript_compaction)
         .with_grammar_constraint(config.brain_heavy_grammar_enabled);
-    let org_available = crate::tools::org_brain_available(&state.db, &config);
+    // Persisted conversations intentionally never ingest mutable org-replica content: v1 has no
+    // typed org provenance on each exchange. Keep both the catalog and persona hint aligned.
+    let org_available = !durable_history && crate::tools::org_brain_available(&state.db, &config);
+    // Durable Ask must bind BOTH model/provider dispatch and every model-selected connector
+    // future to the same lifecycle admission. The adapter preserves every stateless caller while
+    // making relock/reseal cancellation cover connector factory + every async poll.
+    let executor = crate::agent::AdmittedToolExecutor::new(&executor, dispatch_admission.clone());
+    let reasoner = durable_dispatch_reasoner(&*reasoner, dispatch_admission);
     match ask_vault_loop(
-        &*reasoner,
+        &reasoner,
         &executor,
         &state.db,
         &state.unlocked_folders,
@@ -308,7 +390,8 @@ pub(crate) fn ask_vault_agentic_attempt(
         Some(&sink as &dyn crate::agent::DeltaSink),
         opts,
     ) {
-        Ok(converged) => converged,
+        Ok(converged) => Ok(converged),
+        Err(AppError::Locked(message)) => Err(AppError::Locked(message)),
         Err(e) => {
             // PII rule: the error only — never the question/history text.
             tracing::debug!(
@@ -316,7 +399,7 @@ pub(crate) fn ask_vault_agentic_attempt(
                 error = %e,
                 "ask agentic loop unavailable/failed; flooring to corpus completion"
             );
-            None
+            Ok(None)
         }
     }
 }

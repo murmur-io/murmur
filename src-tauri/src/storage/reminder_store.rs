@@ -972,6 +972,9 @@ impl Db {
             ));
         }
         Self::purge_all_reminder_derived_tx(&tx)?;
+        // The lock publication is the exact durable visibility reduction. Ask v1 conversations
+        // are global-derived, so purge them here too; this also covers an otherwise-empty folder.
+        Self::purge_all_ask_conversations_tx(&tx)?;
         tx.commit().map_err(map_err)
     }
 

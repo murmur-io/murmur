@@ -5,7 +5,7 @@
 //! lifecycle fails here even though the command wrappers need a Tauri `State`.
 
 use super::*;
-use crate::storage::models::{Folder, Meeting, MeetingStatus, NoteRecord};
+use crate::storage::models::{AskConversationScope, Folder, Meeting, MeetingStatus, NoteRecord};
 
 /// Fixed SQLCipher key for file-backed test DBs (NOT the Keychain DEK).
 const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1701,6 +1701,18 @@ fn forget_entity_fact_closes_the_row_and_is_idempotent() {
         .expect("the junk owner row")
         .id
         .clone();
+    db.persist_ask_exchange(
+        &AskConversationScope::Vault,
+        None,
+        "Who owns the project?",
+        "claude_code owns it.",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-06-01T12:00:00Z",
+    )
+    .unwrap();
 
     assert!(
         db.forget_entity_fact(&junk, "2026-06-02T00:00:00Z").unwrap(),
@@ -1710,6 +1722,10 @@ fn forget_entity_fact_closes_the_row_and_is_idempotent() {
         !db.forget_entity_fact(&junk, "2026-06-02T00:00:00Z").unwrap(),
         "re-forget is a no-op (idempotent)"
     );
+    assert!(db
+        .list_ask_conversations(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap()
+        .is_empty());
 
     // `list_facts_visible` deliberately returns the FULL bitemporal ledger (open + closed), because
     // knowledge_diff needs the history. What must change is which facts are still OPEN — that is
@@ -1748,6 +1764,18 @@ fn forget_and_clear_user_facts() {
     let visible = db.list_user_facts_visible(&HashSet::new()).unwrap();
     assert_eq!(visible.len(), 2);
     let target = visible[0].id.clone();
+    db.persist_ask_exchange(
+        &AskConversationScope::Vault,
+        None,
+        "What do you remember?",
+        "You prefer Polish.",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-06-01T12:00:00Z",
+    )
+    .unwrap();
 
     // Forget one → it is closed and drops out.
     assert!(
@@ -1760,6 +1788,10 @@ fn forget_and_clear_user_facts() {
             .unwrap(),
         "re-forget is a no-op"
     );
+    assert!(db
+        .list_ask_conversations(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap()
+        .is_empty());
     let after = db.list_user_facts_visible(&HashSet::new()).unwrap();
     assert_eq!(
         after.len(),
@@ -1775,6 +1807,18 @@ fn forget_and_clear_user_facts() {
     );
 
     // Clear all → nothing visible; every open fact closed.
+    db.persist_ask_exchange(
+        &AskConversationScope::Vault,
+        None,
+        "What is my role?",
+        "You are a PM.",
+        &[],
+        &[],
+        &[],
+        &[],
+        "2026-06-02T12:00:00Z",
+    )
+    .unwrap();
     let n = db.clear_user_facts("2026-06-03T00:00:00Z").unwrap();
     assert_eq!(n, 1, "one remaining open fact closed");
     assert!(
@@ -1783,6 +1827,10 @@ fn forget_and_clear_user_facts() {
             .is_empty(),
         "no user memory after clear"
     );
+    assert!(db
+        .list_ask_conversations(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap()
+        .is_empty());
 }
 
 /// PURGE-ON-SEAL (task C2.a, DB layer): the same atomic seal tx that purges facts also DELETES the
