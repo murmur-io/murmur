@@ -1151,12 +1151,36 @@ pub trait LocalReasoner: Send + Sync {
     /// Free-form reasoning: run `system` + `user` and return the model's text.
     fn reason(&self, system: &str, user: &str) -> Result<String>;
 
+    /// Content-snapshot admitted counterpart. Local implementations validate once and release the
+    /// lifecycle mutex before bounded on-device work. CloudReasoner overrides this seam so the
+    /// provider future is revalidated on every async poll at the actual egress boundary.
+    fn reason_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<String> {
+        admission.validate()?;
+        self.reason(system, user)
+    }
+
     /// Free-form reasoning WITH generation options (a token cap etc. — Brain v2 P0.3). Default:
     /// IGNORE the options and delegate to [`reason`](Self::reason) — the Stub / Cloud / AFM
     /// reasoners have no local sampler to bound, so this is non-breaking for every implementor.
     /// [`sidecar::SidecarReasoner`] OVERRIDES it to honor the cap on the on-device GGUF path.
     fn reason_with(&self, system: &str, user: &str, _opts: GenOptions) -> Result<String> {
         self.reason(system, user)
+    }
+
+    fn reason_with_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        opts: GenOptions,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<String> {
+        admission.validate()?;
+        self.reason_with(system, user, opts)
     }
 
     /// Structured reasoning: run `system` + `user` and return a JSON value. `json_schema` is the
@@ -1166,6 +1190,17 @@ pub trait LocalReasoner: Send + Sync {
     /// `Constraint::JsonSchema` — it overflowed the context on Bielik-11B); the stub likewise ignores
     /// the schema but still returns valid JSON through the same extractor.
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value>;
+
+    fn structured_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<Value> {
+        admission.validate()?;
+        self.structured(system, user, json_schema)
+    }
 
     /// Structured reasoning WITH generation options (a token cap etc.). Default: IGNORE the options
     /// and delegate to [`structured`](Self::structured) — the Stub / Cloud / AFM reasoners have no
@@ -1181,6 +1216,18 @@ pub trait LocalReasoner: Send + Sync {
         self.structured(system, user, json_schema)
     }
 
+    fn structured_with_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<Value> {
+        admission.validate()?;
+        self.structured_with(system, user, json_schema, opts)
+    }
+
     /// Observe a structured decode without changing the production value-only contract. Backends
     /// that own the raw generation override this; other implementations honestly return `None`.
     fn structured_with_observation(
@@ -1194,6 +1241,18 @@ pub trait LocalReasoner: Send + Sync {
             value: self.structured_with(system, user, json_schema, opts)?,
             raw_text: None,
         })
+    }
+
+    fn structured_with_observation_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<StructuredObservation> {
+        admission.validate()?;
+        self.structured_with_observation(system, user, json_schema, opts)
     }
 }
 
@@ -1418,6 +1477,10 @@ pub struct CloudReasoner {
     /// provider/consent/redaction factory. Every production constructor leaves this `None`.
     #[cfg(test)]
     egress_sink_override: Option<Arc<dyn crate::summarize::egress_log::EgressSink>>,
+    /// The one runtime identity attributed by the real-model evaluator. Every lazily rebuilt
+    /// provider receives this same token, so role dispatch cannot silently re-resolve another CLI.
+    #[cfg(test)]
+    codex_runtime_override: Option<Arc<crate::summarize::codex_cli::PinnedCodexRuntime>>,
 }
 
 impl CloudReasoner {
@@ -1457,6 +1520,8 @@ impl CloudReasoner {
             provider_override: None,
             #[cfg(test)]
             egress_sink_override: None,
+            #[cfg(test)]
+            codex_runtime_override: None,
         }
     }
 
@@ -1469,9 +1534,11 @@ impl CloudReasoner {
         role: Role,
         heavy: Arc<tokio::sync::Semaphore>,
         sink: Arc<dyn crate::summarize::egress_log::EgressSink>,
+        codex_runtime: Arc<crate::summarize::codex_cli::PinnedCodexRuntime>,
     ) -> Self {
         let mut reasoner = Self::for_role(config, role, heavy);
         reasoner.egress_sink_override = Some(sink);
+        reasoner.codex_runtime_override = Some(codex_runtime);
         reasoner
     }
 
@@ -1490,6 +1557,7 @@ impl CloudReasoner {
             recording_token: None,
             provider_override: Some(provider),
             egress_sink_override: None,
+            codex_runtime_override: None,
         }
     }
 
@@ -1511,11 +1579,16 @@ impl CloudReasoner {
             .clone();
         #[cfg(test)]
         if let Some(sink) = &self.egress_sink_override {
+            let runtime = self
+                .codex_runtime_override
+                .as_ref()
+                .ok_or_else(|| AppError::Config("evaluator Codex runtime pin is missing".into()))?;
             return crate::summarize::provider_for_with_egress_sink(
                 self.role,
                 &cfg,
                 &self.heavy,
                 Arc::clone(sink),
+                Arc::clone(runtime),
             );
         }
         match self.recording_token.clone() {
@@ -1555,6 +1628,28 @@ fn block_on_complete(
     })
 }
 
+fn block_on_complete_admitted(
+    provider: &Arc<dyn SummarizerProvider>,
+    system: &str,
+    user: &str,
+    admission: &crate::state::ContentDispatchAdmission,
+) -> Result<String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        AppError::Summarize(format!("cloud reasoner: runtime build failed: {e}"))
+                    })?;
+                rt.block_on(admission.run(|| provider.complete(system, user)))
+            })
+            .join()
+            .map_err(|_| AppError::Summarize("cloud reasoner: worker thread panicked".into()))?
+    })
+}
+
 impl LocalReasoner for CloudReasoner {
     fn id(&self) -> &str {
         &self.id
@@ -1566,9 +1661,60 @@ impl LocalReasoner for CloudReasoner {
         block_on_complete(&provider, system, user)
     }
 
+    fn reason_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<String> {
+        let provider = self.build_provider()?;
+        block_on_complete_admitted(&provider, system, user, admission)
+    }
+
+    fn reason_with_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        _opts: GenOptions,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<String> {
+        self.reason_admitted(system, user, admission)
+    }
+
     fn structured(&self, system: &str, user: &str, json_schema: &Value) -> Result<Value> {
         Ok(self
             .structured_with_observation(system, user, json_schema, GenOptions::default())?
+            .value)
+    }
+
+    fn structured_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<Value> {
+        Ok(self
+            .structured_with_observation_admitted(
+                system,
+                user,
+                json_schema,
+                GenOptions::default(),
+                admission,
+            )?
+            .value)
+    }
+
+    fn structured_with_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<Value> {
+        Ok(self
+            .structured_with_observation_admitted(system, user, json_schema, opts, admission)?
             .value)
     }
 
@@ -1593,11 +1739,173 @@ impl LocalReasoner for CloudReasoner {
             raw_text: Some(text),
         })
     }
+
+    fn structured_with_observation_admitted(
+        &self,
+        system: &str,
+        user: &str,
+        json_schema: &Value,
+        opts: GenOptions,
+        admission: &crate::state::ContentDispatchAdmission,
+    ) -> Result<StructuredObservation> {
+        let schema = serde_json::to_string(json_schema)
+            .map_err(|e| AppError::Summarize(format!("cloud reasoner: schema serialize: {e}")))?;
+        let augmented_system = format!(
+            "{system}\n\nRespond with ONLY a JSON object conforming to this schema: {schema}. \
+             No prose, no fences."
+        );
+        let text = self.reason_with_admitted(&augmented_system, user, opts, admission)?;
+        Ok(StructuredObservation {
+            value: parse_first_json(&text)?,
+            raw_text: Some(text),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DelayedJsonProvider {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SummarizerProvider for DelayedJsonProvider {
+        fn id(&self) -> &str {
+            crate::summarize::PROVIDER_ANTHROPIC
+        }
+
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+
+        async fn summarize(
+            &self,
+            _req: &crate::summarize::provider::SummarizeRequest,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(r#"{"answer":"ok"}"#.into())
+        }
+    }
+
+    struct ImmediateJsonProvider(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl SummarizerProvider for ImmediateJsonProvider {
+        fn id(&self) -> &str {
+            crate::summarize::PROVIDER_ANTHROPIC
+        }
+
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+
+        async fn summarize(
+            &self,
+            _req: &crate::summarize::provider::SummarizeRequest,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(r#"{"answer":"ok"}"#.into())
+        }
+    }
+
+    /// Agentic `structured_with` must carry the durable admission all the way through
+    /// CloudReasoner to the provider's next poll. `Locked` propagates unchanged (the caller must not
+    /// floor to a second provider), while an unchanged authorization dispatches exactly once.
+    #[test]
+    fn cloud_reasoner_admitted_structured_dispatch_stops_after_relock_and_happy_calls_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cloud = CloudReasoner::with_provider(
+            AppConfig::default(),
+            Arc::new(DelayedJsonProvider {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let lifecycle = Arc::new(std::sync::Mutex::new(()));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let validator = Arc::clone(&allowed);
+        let admission =
+            crate::state::ContentDispatchAdmission::for_test(Arc::clone(&lifecycle), move || {
+                if validator.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(AppError::Locked(
+                        "relocked before cloud continuation".into(),
+                    ))
+                }
+            });
+        let guarded = crate::commands::durable_dispatch_reasoner(&cloud, admission);
+        let error = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                LocalReasoner::structured_with(
+                    &guarded,
+                    "system",
+                    "user",
+                    &serde_json::json!({"type":"object"}),
+                    GenOptions::ask_answer(),
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                entered.load(Ordering::SeqCst),
+                "provider future never reached its first await"
+            );
+            {
+                let _guard = lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                allowed.store(false, Ordering::SeqCst);
+            }
+            release.notify_one();
+            worker.join().unwrap().unwrap_err()
+        });
+        assert!(matches!(error, AppError::Locked(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let happy_calls = Arc::new(AtomicUsize::new(0));
+        let happy_cloud = CloudReasoner::with_provider(
+            AppConfig::default(),
+            Arc::new(ImmediateJsonProvider(Arc::clone(&happy_calls))),
+        );
+        let happy_admission = crate::state::ContentDispatchAdmission::for_test(
+            Arc::new(std::sync::Mutex::new(())),
+            || Ok(()),
+        );
+        let happy = crate::commands::durable_dispatch_reasoner(&happy_cloud, happy_admission);
+        let value = LocalReasoner::structured_with(
+            &happy,
+            "system",
+            "user",
+            &serde_json::json!({"type":"object"}),
+            GenOptions::ask_answer(),
+        )
+        .unwrap();
+        assert_eq!(value["answer"], "ok");
+        assert_eq!(happy_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn cloud_role_recording_dispatch_retains_the_exact_session_token() {

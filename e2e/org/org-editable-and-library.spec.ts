@@ -216,6 +216,23 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     await expect(
       pane.getByRole("heading", { name: "Ask about this note" }),
     ).toBeVisible();
+    await expect(
+      pane.getByRole("button", { name: "Conversation history" }),
+    ).toHaveCount(0);
+    await expect(
+      pane.getByRole("button", { name: "New conversation" }),
+    ).toHaveCount(0);
+    expect(
+      await page.evaluate(() =>
+        (
+          window as unknown as {
+            __demoEventListenerRegistrationCount: (event: string) => number;
+          }
+        ).__demoEventListenerRegistrationCount(
+          "murmur://ask-history-invalidated",
+        ),
+      ),
+    ).toBe(1);
 
     // Split view: the content column and the Ask pane are ADJACENT + NON-OVERLAPPING (the pane's
     // left edge sits at the content column's right edge).
@@ -233,5 +250,156 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     await expect(page.locator(".note-chat-drawer")).toHaveCount(0);
 
     expect(consoleErrors).toEqual([]);
+  });
+
+  test("ask — stateless Org chat scrubs local-source and answer caches on privacy invalidation", async ({
+    page,
+  }) => {
+    await mockTauri(page, {
+      org_resolve_source: () => null,
+      org_get_item: () => ({
+        itemId: "it-1",
+        authorHint: "kasia",
+        title: "Acme onboarding brief",
+        createdAt: "2026-07-10T09:00:00Z",
+        rev: 3,
+        markdown: "# Acme onboarding brief\n\nConfidential body",
+      }),
+      org_refresh: () => null,
+      org_list_statuses: ORG_STATUSES,
+      list_org_items: ORG_ITEMS,
+      list_link_candidates: () => [
+        {
+          kind: "note",
+          id: "local-sealed-note",
+          title: "Local sealed source title",
+        },
+      ],
+      ask_vault: () => ({
+        answer: "Answer derived from a local sealed source",
+        sources: [],
+        citations: [],
+      }),
+    });
+    await page.goto("/org-item/it-1");
+    await page.getByRole("button", { name: "Ask Brain" }).click();
+    const chat = page.locator(".note-chat-drawer app-note-chat");
+
+    await chat.locator("mur-source-picker .sp-trigger").click();
+    await page.getByText("Local sealed source title", { exact: true }).click();
+    await page.locator(".sp-scrim").click();
+    await expect(chat.locator(".sp-chip-title")).toHaveText([
+      "Local sealed source title",
+    ]);
+    await chat.locator(".chat-input").fill("Use the local source");
+    await chat.locator(".chat-input").press("Enter");
+    await expect(
+      chat.getByText("Answer derived from a local sealed source", { exact: true }),
+    ).toBeVisible();
+
+    await chat.locator("mur-source-picker .sp-trigger").click();
+    await expect(
+      page.getByRole("option", { name: "Local sealed source title" }),
+    ).toBeVisible();
+    await page.evaluate(() => {
+      (
+        window as unknown as {
+          __demoEmit: (event: string, payload: unknown) => void;
+        }
+      ).__demoEmit("murmur://reminder-visibility-invalidated", null);
+    });
+
+    await expect(page.locator(".sp-pop")).toHaveCount(0);
+    await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
+    await expect(
+      chat.getByText("Answer derived from a local sealed source", { exact: true }),
+    ).toHaveCount(0);
+    await expect(chat.locator(".chat-row")).toHaveCount(0);
+  });
+
+  test("ask — a late pinned Org answer is discarded after privacy invalidation", async ({
+    page,
+  }) => {
+    await mockTauri(page, {
+      org_resolve_source: () => null,
+      org_get_item: () => ({
+        itemId: "it-1",
+        authorHint: "kasia",
+        title: "Acme onboarding brief",
+        createdAt: "2026-07-10T09:00:00Z",
+        rev: 3,
+        markdown: "# Acme onboarding brief\n\nConfidential body",
+      }),
+      org_refresh: () => null,
+      org_list_statuses: ORG_STATUSES,
+      list_org_items: ORG_ITEMS,
+      ask_vault: (args: { pinnedOrgItemId?: string }) =>
+        new Promise((resolve) => {
+          (
+            window as unknown as {
+              __lateOrgAskArgs?: unknown;
+              __resolveLateOrgAsk?: () => void;
+            }
+          ).__lateOrgAskArgs = args;
+          (
+            window as unknown as {
+              __resolveLateOrgAsk?: () => void;
+            }
+          ).__resolveLateOrgAsk = () =>
+            resolve({
+              answer: "LATE_ORG_SECRET must never render",
+              sources: [
+                {
+                  meetingId: "m-late-secret",
+                  title: "Late secret source",
+                  startedAt: "2026-07-10T09:00:00Z",
+                },
+              ],
+              citations: ["[[Late secret source]]"],
+            });
+        }),
+    });
+    await page.goto("/org-item/it-1");
+    await page.getByRole("button", { name: "Ask Brain" }).click();
+    const chat = page.locator(".note-chat-drawer app-note-chat");
+
+    await chat.locator(".chat-input").fill("Reveal the shared secret");
+    await chat.locator(".chat-input").press("Enter");
+    await expect(chat.locator(".chat-typing")).toBeVisible();
+    expect(
+      await page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              __lateOrgAskArgs?: { pinnedOrgItemId?: string };
+            }
+          ).__lateOrgAskArgs?.pinnedOrgItemId,
+      ),
+    ).toBe("it-1");
+
+    // Keep the viewer mounted: this must be request-generation invalidation, not teardown.
+    await page.evaluate(() => {
+      (
+        window as unknown as {
+          __demoEmit: (event: string, payload: unknown) => void;
+        }
+      ).__demoEmit("murmur://ask-history-invalidated", null);
+    });
+    await expect(page.locator(".oi-title")).toHaveText("Acme onboarding brief");
+    await expect(chat.locator(".chat-row")).toHaveCount(0);
+    await expect(chat.locator(".chat-typing")).toHaveCount(0);
+
+    await page.evaluate(() => {
+      (
+        window as unknown as {
+          __resolveLateOrgAsk?: () => void;
+        }
+      ).__resolveLateOrgAsk?.();
+    });
+    await expect(
+      chat.getByText("LATE_ORG_SECRET must never render", { exact: true }),
+    ).toHaveCount(0);
+    await expect(chat.locator(".chat-row")).toHaveCount(0);
+    await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
   });
 });
