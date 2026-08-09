@@ -41,7 +41,9 @@ fn model_id_shape_is_safe(model: &str, max_chars: usize) -> bool {
     !model.is_empty()
         && model.len() <= max_chars
         && !model.starts_with('-')
-        && !model.split('/').any(|segment| segment == ".." || segment == ".")
+        && !model
+            .split('/')
+            .any(|segment| segment == ".." || segment == ".")
         && model
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '/' | '@'))
@@ -71,7 +73,9 @@ pub fn valid_catalog_model_id(model: &str) -> bool {
     !model.is_empty()
         && model.len() <= CATALOG_MODEL_ID_MAX_CHARS
         && !model.starts_with('-')
-        && !model.split('/').any(|segment| segment == ".." || segment == ".")
+        && !model
+            .split('/')
+            .any(|segment| segment == ".." || segment == ".")
         && !model.chars().any(char::is_control)
         && !model.chars().any(char::is_whitespace)
 }
@@ -440,5 +444,119 @@ mod tests {
             CallMeta::default(),
             "default impl must return empty CallMeta"
         );
+    }
+
+    struct PendingThenDispatch {
+        yielded: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::future::Future for PendingThenDispatch {
+        type Output = Result<String>;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok("dispatched".into()))
+        }
+    }
+
+    struct NoopWake;
+
+    impl std::task::Wake for NoopWake {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+
+    /// TOCTOU oracle: construction is refused when already stale; after one authorized Pending,
+    /// revocation is observed before the next continuation and the inner dispatch body stays at 0.
+    /// The unchanged authorized arm reaches the body exactly once.
+    #[test]
+    fn admitted_future_validates_factory_and_every_poll() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let waker = std::task::Waker::from(Arc::new(NoopWake));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let stale_lifecycle = Arc::new(Mutex::new(()));
+        let stale_allowed = Arc::new(AtomicBool::new(false));
+        let stale_validator = Arc::clone(&stale_allowed);
+        let stale = crate::state::ContentDispatchAdmission::for_test(stale_lifecycle, move || {
+            if stale_validator.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(crate::error::AppError::Locked("stale".into()))
+            }
+        });
+        let stale_factories = Arc::new(AtomicUsize::new(0));
+        let stale_calls = Arc::new(AtomicUsize::new(0));
+        let stale_factory_count = Arc::clone(&stale_factories);
+        let stale_dispatch_count = Arc::clone(&stale_calls);
+        let mut stale_future = Box::pin(stale.run(|| {
+            stale_factory_count.fetch_add(1, Ordering::SeqCst);
+            PendingThenDispatch {
+                yielded: false,
+                calls: stale_dispatch_count,
+            }
+        }));
+        assert!(matches!(
+            std::future::Future::poll(stale_future.as_mut(), &mut cx),
+            std::task::Poll::Ready(Err(crate::error::AppError::Locked(_)))
+        ));
+        assert_eq!(stale_factories.load(Ordering::SeqCst), 0);
+        assert_eq!(stale_calls.load(Ordering::SeqCst), 0);
+
+        let lifecycle = Arc::new(Mutex::new(()));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let validator = Arc::clone(&allowed);
+        let admission =
+            crate::state::ContentDispatchAdmission::for_test(Arc::clone(&lifecycle), move || {
+                if validator.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(crate::error::AppError::Locked("relocked".into()))
+                }
+            });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatch_count = Arc::clone(&calls);
+        let mut future = Box::pin(admission.run(|| PendingThenDispatch {
+            yielded: false,
+            calls: dispatch_count,
+        }));
+        assert!(matches!(
+            std::future::Future::poll(future.as_mut(), &mut cx),
+            std::task::Poll::Pending
+        ));
+        {
+            let _guard = lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            allowed.store(false, Ordering::SeqCst);
+        }
+        assert!(matches!(
+            std::future::Future::poll(future.as_mut(), &mut cx),
+            std::task::Poll::Ready(Err(crate::error::AppError::Locked(_)))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        allowed.store(true, Ordering::SeqCst);
+        let happy_calls = Arc::new(AtomicUsize::new(0));
+        let happy_dispatch_count = Arc::clone(&happy_calls);
+        let mut happy = Box::pin(admission.run(|| PendingThenDispatch {
+            yielded: true,
+            calls: happy_dispatch_count,
+        }));
+        assert!(matches!(
+            std::future::Future::poll(happy.as_mut(), &mut cx),
+            std::task::Poll::Ready(Ok(ref value)) if value == "dispatched"
+        ));
+        assert_eq!(happy_calls.load(Ordering::SeqCst), 1);
     }
 }

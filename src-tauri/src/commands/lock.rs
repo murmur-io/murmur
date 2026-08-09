@@ -66,6 +66,9 @@ pub fn lock_folder(
 /// content-free Tauri event bus itself fails, tear down the renderer and terminate the app instead
 /// of leaving a stale source title that could reappear when a merely hidden window is shown again.
 fn emit_reminder_visibility_invalidated_fail_closed(app: &AppHandle) {
+    // Ask caches carry full message/source content, so they share the same synchronous privacy
+    // barrier as reminder source titles on every lock-authority transition.
+    emit_ask_history_invalidated_fail_closed(app);
     if crate::events::emit_reminder_visibility_invalidated(app) {
         return;
     }
@@ -430,6 +433,10 @@ fn finish_folder_lock_after_seal(
     state
         .db
         .purge_doc_chunks_for_documents(&sealed_document_ids)?;
+    // Both chunk purge helpers deliberately no-op on an empty id list. An already-locked empty
+    // folder still represents a visibility authority transition, so close that hole explicitly
+    // while the caller holds the lifecycle guard.
+    state.db.purge_all_ask_conversations()?;
 
     let doc_export_rows = state.db.note_exported_path_rows_in_folder(folder_id)?;
     ensure_no_external_edit_siblings(
@@ -1204,17 +1211,24 @@ pub async fn discard_unrecoverable_folder_lock(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    let node = discard_unrecoverable_folder_lock_inner(state.inner(), folder_id).await?;
+    let node = discard_unrecoverable_folder_lock_with_enumeration(
+        state.inner(),
+        folder_id,
+        None,
+        || emit_ask_history_invalidated_fail_closed(&app),
+    )
+    .await?;
     // The discard purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(node)
 }
 
+#[cfg(test)]
 pub(crate) async fn discard_unrecoverable_folder_lock_inner(
     state: &AppState,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    discard_unrecoverable_folder_lock_with_enumeration(state, folder_id, None).await
+    discard_unrecoverable_folder_lock_with_enumeration(state, folder_id, None, || {}).await
 }
 
 #[cfg(test)]
@@ -1223,7 +1237,13 @@ pub(crate) async fn discard_unrecoverable_folder_lock_with_candidates_for_test(
     folder_id: String,
     candidates: Zeroizing<Vec<[u8; 32]>>,
 ) -> Result<FolderNode, AppError> {
-    discard_unrecoverable_folder_lock_with_enumeration(state, folder_id, Some(Ok(candidates))).await
+    discard_unrecoverable_folder_lock_with_enumeration(
+        state,
+        folder_id,
+        Some(Ok(candidates)),
+        || {},
+    )
+    .await
 }
 
 /// Execute the destructive-discard state machine with either the production
@@ -1235,6 +1255,7 @@ async fn discard_unrecoverable_folder_lock_with_enumeration(
     state: &AppState,
     folder_id: String,
     injected_enumeration: Option<Result<Zeroizing<Vec<[u8; 32]>>, AppError>>,
+    visibility_will_change: impl FnOnce(),
 ) -> Result<FolderNode, AppError> {
     let folder = state
         .db
@@ -1295,6 +1316,10 @@ async fn discard_unrecoverable_folder_lock_with_enumeration(
     // Serialize with the rest of the lock state machine (acquired AFTER the awaits above so the guard
     // never crosses a suspend point).
     let _lifecycle = lifecycle_guard(state);
+    // Discard changes both the key/content generation and the protection domain. Invalidate any
+    // post-await Ask writer before the first attachment/seal mutation.
+    bump_seal_epoch(state);
+    visibility_will_change();
     // `discard_folder_seal` returns ONLY the SEALED `.enc` audio paths (a never-sealed plaintext WAV
     // is readable content and is preserved, both on disk and in the DB). Best-effort unlink each.
     discard_attachments_in_folder(state, &folder_id)?;
@@ -1390,7 +1415,13 @@ pub async fn discard_unrecoverable_meeting_lock(
     if !folder.locked {
         return Ok(None);
     }
-    let node = discard_unrecoverable_folder_lock_inner(state.inner(), folder_id).await?;
+    let node = discard_unrecoverable_folder_lock_with_enumeration(
+        state.inner(),
+        folder_id,
+        None,
+        || emit_ask_history_invalidated_fail_closed(&app),
+    )
+    .await?;
     // The discard purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(Some(node))

@@ -23,6 +23,32 @@ use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
 use tauri::Emitter;
 
+/// A successful visibility reduction must synchronously revoke every Ask renderer cache. If the
+/// content-free event bus itself fails, destroy the renderer and terminate instead of leaving
+/// plaintext messages/source labels available from a stale slideout cache.
+pub(crate) fn emit_ask_history_invalidated_fail_closed(app: &AppHandle) {
+    if crate::events::emit_ask_history_invalidated(app) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(error) = window.hide() {
+            tracing::error!(
+                target: "ask_history",
+                error = %error,
+                "failed to hide Murmur after Ask history invalidation failure"
+            );
+        }
+        if let Err(error) = window.destroy() {
+            tracing::error!(
+                target: "ask_history",
+                error = %error,
+                "failed to destroy renderer after Ask history invalidation failure"
+            );
+        }
+    }
+    app.exit(1);
+}
+
 // ── Command submodules (God-file split) ─────────────────────────────────────────────────────────
 // `commands` is being decomposed into per-domain files under `commands/`. Each submodule is
 // glob-re-exported here so EVERY existing path — `generate_handler![commands::save_recipe]` in
@@ -119,6 +145,10 @@ pub use audio_commands::*;
 #[path = "ask.rs"]
 mod ask_commands;
 pub use ask_commands::*;
+
+#[path = "ask_history.rs"]
+mod ask_history_commands;
+pub use ask_history_commands::*;
 
 // Meetings read / detail / tags / speaker-reconcile commands (a GATED domain — `get_meeting_detail`
 // masks to a sealed DTO, `get_timeline` returns empty, `list_meetings`/`search_meetings`/
@@ -428,6 +458,16 @@ pub(crate) fn require_current_meeting_content_snapshot(
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
     require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)
+}
+
+pub(crate) fn meeting_dispatch_admission(
+    app: &AppHandle,
+    meeting_id: String,
+    snapshot: MeetingContentSnapshot,
+) -> crate::state::ContentDispatchAdmission {
+    crate::state::ContentDispatchAdmission::new(app, move |state| {
+        require_current_meeting_content_snapshot_under_lifecycle(state, &meeting_id, &snapshot)
+    })
 }
 
 /// Authored-note counterpart of [`MeetingContentSnapshot`]. The content-free gate anchor is read
@@ -1680,11 +1720,12 @@ async fn delete_empty_companion_after_confirmed_flush(
     state: &AppState,
     meeting_id: &str,
     companion_flush_completed: bool,
+    app: Option<&AppHandle>,
 ) -> Result<bool, AppError> {
     if !companion_flush_completed {
         return Ok(false);
     }
-    delete_companion_note_if_empty_inner(state, meeting_id).await
+    delete_companion_note_if_empty_inner_notifying(state, meeting_id, app).await
 }
 
 async fn stop_recording_owner(
@@ -1968,14 +2009,19 @@ async fn stop_recording_owner(
         if !delete_empty_companion {
             tracing::info!(target: "notes", meeting_id = %meeting_id, "empty-companion cleanup skipped because durable flush was not confirmed");
         }
-        if let Err(error) = delete_empty_companion_after_confirmed_flush(
+        match delete_empty_companion_after_confirmed_flush(
             &state,
             &meeting_id,
             delete_empty_companion,
+            Some(&task_app),
         )
         .await
         {
-            tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %error, "empty-companion cleanup skipped (Stop unaffected)");
+            Ok(true) => emit_ask_history_invalidated_fail_closed(&task_app),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %error, "empty-companion cleanup skipped (Stop unaffected)");
+            }
         }
 
         // DETACHED, panic-mapped pipeline execution (2026-07-16). The verified production wedge:
@@ -2197,7 +2243,12 @@ pub async fn update_note(
     .await?;
     // If the edit re-published ≥1 org copy, ping open org views (Notes list + Settings) so the fresh
     // title/body shows without a manual "Sync now". Best-effort — a republish failure never fails the save.
-    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+    if republish_org_shares_for_source_notifying(
+        state.inner(),
+        Some(&meeting_id),
+        None,
+        &app,
+    )
         .await
         .unwrap_or(0)
         > 0
@@ -2792,16 +2843,32 @@ fn companion_body_is_empty(markdown: &str) -> bool {
 /// because [`delete_note_inner`] runs the org-share revoke cascade.
 #[tauri::command]
 pub async fn delete_companion_note_if_empty(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<bool, AppError> {
-    delete_companion_note_if_empty_inner(state.inner(), &meeting_id).await
+    let deleted =
+        delete_companion_note_if_empty_inner_notifying(state.inner(), &meeting_id, Some(&app))
+            .await?;
+    if deleted {
+        emit_ask_history_invalidated_fail_closed(&app);
+    }
+    Ok(deleted)
 }
 
 /// Inner of [`delete_companion_note_if_empty`] taking `&AppState` (unit-testable gate).
+#[cfg(test)]
 pub(crate) async fn delete_companion_note_if_empty_inner(
     state: &AppState,
     meeting_id: &str,
+) -> Result<bool, AppError> {
+    delete_companion_note_if_empty_inner_notifying(state, meeting_id, None).await
+}
+
+async fn delete_companion_note_if_empty_inner_notifying(
+    state: &AppState,
+    meeting_id: &str,
+    app: Option<&AppHandle>,
 ) -> Result<bool, AppError> {
     if meeting_id.trim().is_empty() {
         return Ok(false); // nothing recording → nothing to clean up.
@@ -2824,7 +2891,7 @@ pub(crate) async fn delete_companion_note_if_empty_inner(
     }
     // The revoke can await the network. Re-read under lifecycle afterwards so a concurrent edit
     // cannot turn this stale empty snapshot into destructive authority.
-    revoke_org_shares_for_source(state, None, Some(&note_id)).await?;
+    revoke_org_shares_for_source_notifying(state, None, Some(&note_id), app).await?;
     delete_companion_after_revoke_if_still_empty(state, meeting_id, &note_id)
 }
 
@@ -2867,6 +2934,7 @@ fn delete_companion_after_revoke_if_still_empty(
     if let Some(path) = &row.exported_path {
         let _ = std::fs::remove_file(path);
     }
+    bump_seal_epoch(state);
     state.db.delete_document(expected_note_id)?;
     tracing::info!(target: "notes", note_id = %expected_note_id, meeting_id = %meeting_id, "empty companion note deleted");
     Ok(true)
@@ -3322,7 +3390,20 @@ pub async fn plan_organize_notes(
 /// — both-sides folder gate + re-export). Non-destructive + best-effort per move (a single failure
 /// logs IDs/stage and continues; the rest still apply). Idempotent on an already-filed note.
 #[tauri::command]
-pub fn apply_organize_plan(state: State<'_, AppState>, plan: OrganizePlan) -> Result<(), AppError> {
+pub fn apply_organize_plan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    plan: OrganizePlan,
+) -> Result<(), AppError> {
+    let may_reduce_visibility = plan.moves.iter().any(|mv| {
+        mv.to_folder_id
+            .as_deref()
+            .and_then(|id| state.db.folder_by_id(id).ok().flatten())
+            .is_some_and(|folder| folder.locked)
+    });
+    if may_reduce_visibility {
+        emit_ask_history_invalidated_fail_closed(&app);
+    }
     apply_organize_plan_inner(state.inner(), plan)
 }
 
@@ -3387,7 +3468,8 @@ pub async fn delete_meeting(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<(), AppError> {
-    delete_meeting_inner(state.inner(), &meeting_id).await?;
+    delete_meeting_inner_notifying(state.inner(), &meeting_id, Some(&app)).await?;
+    emit_ask_history_invalidated_fail_closed(&app);
     crate::events::emit_content_deleted(&app, "meeting", &meeting_id);
     // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
@@ -3396,9 +3478,18 @@ pub async fn delete_meeting(
 
 /// Inner of [`delete_meeting`] taking `&AppState` (unit-testable). `async` for the org-share revoke
 /// cascade (network round-trip); the file/DB cascade itself stays synchronous internally.
+#[cfg(test)]
 pub(crate) async fn delete_meeting_inner(
     state: &AppState,
     meeting_id: &str,
+) -> Result<(), AppError> {
+    delete_meeting_inner_notifying(state, meeting_id, None).await
+}
+
+async fn delete_meeting_inner_notifying(
+    state: &AppState,
+    meeting_id: &str,
+    app: Option<&AppHandle>,
 ) -> Result<(), AppError> {
     // Gate before the network revoke without selecting title/audio/note content. The await below can
     // span a relock, so this is only the early refusal; destructive authority is reacquired below.
@@ -3418,7 +3509,7 @@ pub(crate) async fn delete_meeting_inner(
     // BEFORE the local rows disappear, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
     // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
-    revoke_org_shares_for_source(state, Some(meeting_id), None).await?;
+    revoke_org_shares_for_source_notifying(state, Some(meeting_id), None, app).await?;
 
     // Serialize against Start/Stop/seal. The content-free generation preflight MUST happen before
     // the first unlink; Db::delete_meeting repeats it transactionally before row deletion.
@@ -3471,6 +3562,7 @@ pub(crate) async fn delete_meeting_inner(
     // Brain v2 L2.1: the delete tx purges ALL memory rollups (they may paraphrase this meeting's
     // facts) and returns their exported vault paths — remove those files here, the same layer that
     // removed the note `.md`/audio above. Rollups regenerate from visible facts on the next pass.
+    bump_seal_epoch(state);
     let rollup_exports = state.db.delete_meeting(meeting_id)?;
     remove_rollup_export_files(&rollup_exports);
     Ok(())
@@ -3602,16 +3694,44 @@ pub(crate) fn pack_chat_pinned_sources(
 /// provider answers strictly from the transcript, explicitly pinned sources, and running history.
 #[tauri::command]
 pub async fn chat_meeting(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     question: String,
     history: Vec<ChatTurn>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<String, AppError> {
+    chat_meeting_inner(
+        &app,
+        state.inner(),
+        meeting_id,
+        question,
+        history,
+        explicit_sources,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn chat_meeting_inner(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: String,
+    question: String,
+    history: Vec<ChatTurn>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    authoritative_snapshot: Option<MeetingContentSnapshot>,
+) -> Result<String, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
-    let visibility = capture_meeting_content_snapshot(state.inner(), &meeting_id)?;
+    let visibility = match authoritative_snapshot {
+        Some(snapshot) => {
+            require_current_meeting_content_snapshot(state, &meeting_id, &snapshot)?;
+            snapshot
+        }
+        None => capture_meeting_content_snapshot(state, &meeting_id)?,
+    };
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg(
@@ -3633,7 +3753,7 @@ pub async fn chat_meeting(
     // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
     // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
     // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
-    let unlocked = unlocked_snapshot(state.inner())?;
+    let unlocked = unlocked_snapshot(state)?;
     // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation: when the FE pins explicit sources (the
     // linked notes/meetings the user chose above the chat input), APPEND their gated PINNED corpus
     // (+ capped, gated link-expansion) to this meeting's transcript grounding — the meeting stays the
@@ -3655,7 +3775,7 @@ pub async fn chat_meeting(
         &config,
         &state.heavy_inference,
     )?;
-    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
+    let memory_brief = gated_memory_brief_for_injection(state, &unlocked, &question);
     let (system, user) = crate::summarize::chat::build_with_sources(
         &transcript,
         &pinned_sources,
@@ -3663,8 +3783,12 @@ pub async fn chat_meeting(
         &question,
         &memory_brief,
     );
-    let answer = provider.complete(&system, &user).await?;
-    require_current_meeting_content_snapshot(state.inner(), &meeting_id, &visibility)?;
+    let dispatch_admission =
+        meeting_dispatch_admission(app, meeting_id.clone(), visibility.clone());
+    let answer = dispatch_admission
+        .run(|| provider.complete(&system, &user))
+        .await?;
+    require_current_meeting_content_snapshot(state, &meeting_id, &visibility)?;
     Ok(answer)
 }
 
@@ -4448,10 +4572,39 @@ pub async fn ask_vault(
     // FE camelCase `dashboardId`. `None`/empty ⇒ byte-identical to before.
     dashboard_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
+    ask_vault_inner(
+        &app,
+        state.inner(),
+        question,
+        history,
+        ask_thread_id,
+        explicit_sources,
+        pinned_org_item_id,
+        dashboard_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ask_vault_inner(
+    app: &AppHandle,
+    state: &AppState,
+    question: String,
+    history: Vec<ChatTurn>,
+    ask_thread_id: Option<String>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    pinned_org_item_id: Option<String>,
+    dashboard_id: Option<String>,
+    authoritative_snapshot: Option<DurableScopeSnapshot>,
+) -> Result<AskVaultResult, AppError> {
+    let durable_history = authoritative_snapshot.is_some();
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
-    let visibility = capture_content_visibility_snapshot(state.inner());
+    let visibility = authoritative_snapshot
+        .unwrap_or_else(|| DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(state)));
+    let dispatch_admission = durable_dispatch_admission(app, visibility.clone());
     let config = {
         state
             .config
@@ -4486,14 +4639,14 @@ pub async fn ask_vault(
         // suppresses the RESULT, not the disclosure. The guard is dropped before the
         // await below; it is held only for the reads it has to bracket.
         let (unlocked, board_brief) =
-            board_scoped_floor_inputs(state.inner(), &config, board_id.as_deref())?;
-        let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
+            board_scoped_floor_inputs(state, &config, board_id.as_deref())?;
+        let memory_brief = gated_memory_brief_for_injection(state, &unlocked, &question);
         let reranker = crate::rerank::active_reranker(
             state
                 .reasoner
                 .current_for(crate::summarize::roles::Role::Ask),
         );
-        let result = ask_vault_floor(
+        let result = ask_vault_floor_authorized(
             &state.db,
             &config,
             &unlocked,
@@ -4505,9 +4658,10 @@ pub async fn ask_vault(
             pinned_sources,
             pinned_org,
             board_brief.as_deref(),
+            dispatch_admission.clone(),
         )
         .await?;
-        require_current_content_visibility_snapshot(state.inner(), visibility)?;
+        require_durable_scope_for_dispatch(state, &visibility)?;
         return Ok(result);
     }
 
@@ -4524,13 +4678,21 @@ pub async fn ask_vault(
         let handle = app.clone();
         let q = question.clone();
         let h = history.clone();
+        let attempt_admission = dispatch_admission.clone();
         let attempt = tokio::task::spawn_blocking(move || {
-            ask_vault_agentic_attempt(&handle, &q, &h, &thread_id)
+            ask_vault_agentic_attempt(
+                &handle,
+                &q,
+                &h,
+                &thread_id,
+                attempt_admission,
+                durable_history,
+            )
         })
         .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("ask task join failed: {e}")))?;
+        .map_err(|e| AppError::Other(anyhow::anyhow!("ask task join failed: {e}")))??;
         if let Some(result) = attempt {
-            require_current_content_visibility_snapshot(state.inner(), visibility)?;
+            require_durable_scope_for_dispatch(state, &visibility)?;
             return Ok(result);
         }
     }
@@ -4538,11 +4700,11 @@ pub async fn ask_vault(
     // THE FLOOR — the pre-agentic behavior, unchanged (RED-first equivalence-tested).
     // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
     // again, while sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
-    let unlocked = unlocked_snapshot(state.inner())?;
+    let unlocked = unlocked_snapshot(state)?;
     // Gated cross-meeting USER MEMORY brief (parity with the @brain loop): VISIBLE facts only under
     // this same unlock snapshot, empty when memory is disabled ⇒ the floor prompt is byte-identical.
     // L2.2: relevance-filtered against the question (full-list fallback on zero hits).
-    let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
+    let memory_brief = gated_memory_brief_for_injection(state, &unlocked, &question);
     // Brain v2 L1.4 — the Ask-only reranker: resolve from the LIVE Ask-role reasoner.
     // `active_reranker` degrades stub/cloud reasoners to the identity StubReranker (rerank is
     // strictly on-device — a cloud reasoner would turn each pointwise judgment into egress).
@@ -4551,7 +4713,7 @@ pub async fn ask_vault(
             .reasoner
             .current_for(crate::summarize::roles::Role::Ask),
     );
-    let result = ask_vault_floor(
+    let result = ask_vault_floor_authorized(
         &state.db,
         &config,
         &unlocked,
@@ -4563,9 +4725,10 @@ pub async fn ask_vault(
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
         None, // …and no pinned org item — this is the vault-wide fallthrough.
         None, // …and no board: a board-scoped ask never reaches this branch.
+        dispatch_admission,
     )
     .await?;
-    require_current_content_visibility_snapshot(state.inner(), visibility)?;
+    require_durable_scope_for_dispatch(state, &visibility)?;
     Ok(result)
 }
 
@@ -4629,7 +4792,39 @@ pub(crate) fn with_board_scoped_floor_inputs<T>(
 // one gated-Ask parameter set, whose three SCOPE pins are mutually exclusive. Bundling
 // them into a struct would hide that exclusivity without removing an argument.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn ask_vault_floor(
+    db: &std::sync::Arc<crate::storage::Db>,
+    config: &AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+    question: &str,
+    history: &[ChatTurn],
+    memory_brief: &str,
+    reranker: Option<Box<dyn crate::rerank::Reranker>>,
+    heavy: &std::sync::Arc<tokio::sync::Semaphore>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    pinned_org_item_id: Option<String>,
+    board_brief: Option<&str>,
+) -> Result<AskVaultResult, AppError> {
+    ask_vault_floor_core(
+        db,
+        config,
+        unlocked,
+        question,
+        history,
+        memory_brief,
+        reranker,
+        heavy,
+        explicit_sources,
+        pinned_org_item_id,
+        board_brief,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ask_vault_floor_authorized(
     db: &std::sync::Arc<crate::storage::Db>,
     config: &AppConfig,
     unlocked: &std::collections::HashSet<String>,
@@ -4644,6 +4839,39 @@ async fn ask_vault_floor(
     // non-board caller, which keeps the packed prompt byte-identical for them;
     // `Some("")` is a board that scopes the ask but has nothing readable to show.
     board_brief: Option<&str>,
+    dispatch_admission: crate::state::ContentDispatchAdmission,
+) -> Result<AskVaultResult, AppError> {
+    ask_vault_floor_core(
+        db,
+        config,
+        unlocked,
+        question,
+        history,
+        memory_brief,
+        reranker,
+        heavy,
+        explicit_sources,
+        pinned_org_item_id,
+        board_brief,
+        Some(dispatch_admission),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ask_vault_floor_core(
+    db: &std::sync::Arc<crate::storage::Db>,
+    config: &AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+    question: &str,
+    history: &[ChatTurn],
+    memory_brief: &str,
+    reranker: Option<Box<dyn crate::rerank::Reranker>>,
+    heavy: &std::sync::Arc<tokio::sync::Semaphore>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    pinned_org_item_id: Option<String>,
+    board_brief: Option<&str>,
+    dispatch_admission: Option<crate::state::ContentDispatchAdmission>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -4688,7 +4916,10 @@ async fn ask_vault_floor(
             // brain_backend (the pre-role floor ignored it) — original error/consent semantics.
             let provider =
                 crate::summarize::provider_for(crate::summarize::roles::Role::Ask, config, heavy)?;
-            let answer = provider.complete(&system, &user).await?;
+            let answer = match dispatch_admission {
+                Some(admission) => admission.run(|| provider.complete(&system, &user)).await?,
+                None => provider.complete(&system, &user).await?,
+            };
             Ok(AskVaultResult {
                 answer,
                 sources,
@@ -5570,7 +5801,12 @@ pub async fn resummarize(
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
     // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
     // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
-    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+    if republish_org_shares_for_source_notifying(
+        state.inner(),
+        Some(&meeting_id),
+        None,
+        &app,
+    )
         .await
         .unwrap_or(0)
         > 0
@@ -6475,6 +6711,16 @@ fn move_note_command_body(
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
+    let target_locked = match folder_id.as_deref() {
+        Some(folder_id) => state
+            .db
+            .folder_by_id(folder_id)?
+            .is_some_and(|folder| folder.locked),
+        None => false,
+    };
+    if target_locked {
+        emit_ask_history_invalidated_fail_closed(app);
+    }
     move_note_inner_impl(state.inner(), meeting_id, folder_id)?;
     emit_audit_updated_after_purge(app, state.inner());
     Ok(())
@@ -6853,10 +7099,20 @@ pub(crate) fn capture_salvage_seal_context(
 ///
 /// Best-effort by contract: every failure is logged (ids/counts only) and swallowed — the
 /// finalizer must never mask the pipeline's own result.
+#[cfg(test)]
 pub(crate) fn finalize_salvage_lock_state(
     state: &AppState,
     meeting_id: &str,
     seal_context: Option<&SalvageSealContext>,
+) {
+    finalize_salvage_lock_state_with_notice(state, meeting_id, seal_context, || {});
+}
+
+pub(crate) fn finalize_salvage_lock_state_with_notice(
+    state: &AppState,
+    meeting_id: &str,
+    seal_context: Option<&SalvageSealContext>,
+    visibility_will_reduce: impl FnOnce(),
 ) {
     let locked_folder = match state
         .db
@@ -6874,6 +7130,9 @@ pub(crate) fn finalize_salvage_lock_state(
     let Some(folder) = locked_folder else {
         return; // unfiled or open folder — the normal plaintext outcome is correct.
     };
+    // From this point either seal path purges global-derived Ask history. Invalidate before the
+    // best-effort finalizer can partially mutate and then return an error.
+    visibility_will_reduce();
     let session_unlocked = state
         .unlocked_folders
         .lock()
@@ -6922,6 +7181,7 @@ pub(crate) fn finalize_salvage_lock_state(
         tracing::error!(target: "lock", meeting_id = %meeting_id, "salvage folder key generation changed before exact-output seal; output retained without destructive writes");
         return;
     }
+    bump_seal_epoch(state);
     if let Err(e) = seal_moved_note(state, &context.folder_id, meeting_id, &context.ck) {
         tracing::error!(target: "lock", meeting_id = %meeting_id, error = %e, "salvage exact-output seal after relock failed; output retained for recovery");
     } else {
@@ -9828,6 +10088,7 @@ pub async fn account_send_code(state: State<'_, AppState>, email: String) -> Res
 /// `mkWrapPw` via the login `export_key`; keep MK for the session; store tokens in the Keychain.
 #[tauri::command]
 pub async fn account_login(
+    app: AppHandle,
     state: State<'_, AppState>,
     email: String,
     password: String,
@@ -9926,7 +10187,7 @@ pub async fn account_login(
     // Membership discovery: reconcile the org set the server says we belong to (owned AND invited)
     // into local `org_state` now the session is cached — so an org we were invited to appears (and
     // becomes syncable) at login, not only after a create. Best-effort: a failure never blocks login.
-    if let Err(e) = org_reconcile_memberships(state.inner()).await {
+    if let Err(e) = org_reconcile_memberships_notifying(state.inner(), Some(&app)).await {
         tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile at login failed (non-fatal)");
     }
 

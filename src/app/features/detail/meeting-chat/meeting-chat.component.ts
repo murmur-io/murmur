@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   Injector,
   afterNextRender,
@@ -13,11 +14,26 @@ import {
   viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { ChatTurn, SourceRef } from "../../../core/models";
+import type {
+  AskConversation,
+  AskConversationScope,
+  AskConversationSummary,
+  ChatTurn,
+  SourceRef,
+} from "../../../core/models";
 import { SourceScopeService } from "../../../services/source-scope.service";
 import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { ChatHistoryComponent } from "../../../design-system/chat-history/chat-history.component";
+import { FoldersService } from "../../../services/folders.service";
+import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import { NotesService } from "../../../services/notes.service";
+import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+
+interface MeetingChatTurn extends ChatTurn {
+  id: string;
+}
 
 /** The starter prompts shown in the empty state — tap to ask immediately. */
 const STARTERS: readonly string[] = [
@@ -43,7 +59,12 @@ const STARTERS: readonly string[] = [
 @Component({
   selector: "app-meeting-chat",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, SourcePickerComponent],
+  imports: [
+    MarkdownComponent,
+    SourcePickerComponent,
+    ChatHistoryComponent,
+    MurIconComponent,
+  ],
   templateUrl: "./meeting-chat.component.html",
   styleUrl: "./meeting-chat.component.scss",
 })
@@ -52,6 +73,10 @@ export class MeetingChatComponent {
   private readonly injector = inject(Injector);
   private readonly sourceScope = inject(SourceScopeService);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly folders = inject(FoldersService);
+  private readonly notes = inject(NotesService);
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly historyPrivacy = inject(AskHistoryPrivacyBarrierService);
 
   /** The anchor meeting whose transcript supplies the primary grounding. */
   readonly meetingId = input.required<string>();
@@ -89,6 +114,7 @@ export class MeetingChatComponent {
    * grounding. `send()` passes `undefined` when empty (see below).
    */
   readonly sources = signal<SourceRef[]>([]);
+  private readonly defaultSources = signal<SourceRef[]>([]);
 
   /**
    * Pre-fill the picker with the default scope for THIS meeting (the meeting
@@ -101,18 +127,32 @@ export class MeetingChatComponent {
   private readonly _prefill = effect(() => {
     const id = this.meetingId();
     const title = this.anchorTitle() ?? undefined;
+    const privacyReady = this.historyPrivacy.ready();
+    if (this.activeMeetingId !== null && this.activeMeetingId !== id) {
+      this.resetConversation(true);
+    }
+    this.activeMeetingId = id;
     const seq = ++this.prefillSeq;
+    if (!privacyReady) {
+      this.defaultSources.set([]);
+      this.sources.set([]);
+      return;
+    }
     void this.sourceScope
       .defaultSources("meeting", id, title)
       .then((defaults) => {
-        if (seq === this.prefillSeq) {
+        if (this.meetingId() !== id || seq !== this.prefillSeq) {
+          return;
+        }
+        this.defaultSources.set(defaults);
+        if (this.conversationId() === null) {
           this.sources.set(defaults);
         }
       });
   });
 
   /** The running conversation (optimistic user turns + grounded replies). */
-  readonly conversation = signal<ChatTurn[]>([]);
+  readonly conversation = signal<MeetingChatTurn[]>([]);
   /** True while a {@link IpcService.chatMeeting} call is in flight. */
   readonly pending = signal(false);
   /** Inline error message (with a Retry affordance); null when clear. */
@@ -120,12 +160,58 @@ export class MeetingChatComponent {
   /** Working copy of the composer text (textarea (input) → signal). */
   readonly draft = signal("");
 
+  readonly conversationId = signal<string | null>(null);
+  readonly historyOpen = signal(false);
+  readonly history = signal<AskConversationSummary[]>([]);
+  readonly historyLoading = signal(false);
+  readonly historyError = signal<string | null>(null);
+  readonly historyActionError = signal<string | null>(null);
+  readonly historyResumeId = signal<string | null>(null);
+  readonly historyPrivacyReady = this.historyPrivacy.ready;
+  readonly historyPrivacyError = this.historyPrivacy.error;
+  private historyLoadSeq = 0;
+  private requestSeq = 0;
+  private nextTurnId = 1;
+  private visibleFolders: Set<string> | null = null;
+  private activeMeetingId: string | null = null;
+  private removeHistoryInvalidator: (() => void) | null = null;
+
+  constructor() {
+    this.removeHistoryInvalidator = this.historyPrivacy.registerInvalidator(
+      () => {
+        this.sourcePicker()?.scrubPrivateState();
+        this.resetConversation(true);
+      },
+    );
+    void this.historyPrivacy.ensureReady();
+    this.destroyRef.onDestroy(() => {
+      this.removeHistoryInvalidator?.();
+      this.removeHistoryInvalidator = null;
+    });
+  }
+
+  /** Global-derived v1 history must leave the DOM on any visibility reduction. */
+  private readonly _dropOnVisibilityReduction = effect(() => {
+    const next = this.collectVisibleFolderIds(
+      this.folders.tree(),
+      this.notes.noteFolders(),
+    );
+    const previous = this.visibleFolders;
+    this.visibleFolders = next;
+    if (previous && [...previous].some((id) => !next.has(id))) {
+      this.resetConversation(true);
+    }
+  });
+
   /** Starter prompts for the empty state. */
   protected readonly starters = STARTERS;
 
   /** A submit is allowed only with non-empty text and no in-flight request. */
   readonly canSend = computed(
-    () => !this.pending() && this.draft().trim().length > 0,
+    () =>
+      this.historyPrivacyReady() &&
+      !this.pending() &&
+      this.draft().trim().length > 0,
   );
 
   /** Mirror the textarea value into the `draft` signal. */
@@ -149,7 +235,7 @@ export class MeetingChatComponent {
 
   /** Fill + send a starter chip's question. */
   ask(question: string): void {
-    if (this.pending()) {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
     this.draft.set(question);
@@ -158,7 +244,7 @@ export class MeetingChatComponent {
 
   /** Re-send the last user question after an error (it's still in the log). */
   retry(): void {
-    if (this.pending()) {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
     const turns = this.conversation();
@@ -174,13 +260,71 @@ export class MeetingChatComponent {
     void this.send();
   }
 
-  /** Clear the whole conversation back to the empty state. */
-  clear(): void {
-    if (this.pending()) {
+  toggleHistory(): void {
+    if (this.pending() || !this.historyPrivacyReady()) {
       return;
     }
-    this.conversation.set([]);
-    this.error.set(null);
+    if (this.historyOpen()) {
+      this.historyOpen.set(false);
+      return;
+    }
+    this.historyOpen.set(true);
+    void this.loadHistory();
+  }
+
+  newConversation(): void {
+    if (!this.pending() && this.historyPrivacyReady()) {
+      this.resetConversation(false);
+      this.focusComposer();
+    }
+  }
+
+  retryHistory(): void {
+    if (this.historyPrivacyReady()) {
+      void this.loadHistory();
+    }
+  }
+
+  retryHistoryPrivacy(): void {
+    this.resetConversation(true);
+    void this.historyPrivacy.ensureReady();
+  }
+
+  async resumeConversation(id: string): Promise<void> {
+    if (this.pending() || !this.historyPrivacyReady()) {
+      return;
+    }
+    const seq = ++this.historyLoadSeq;
+    const scope = this.scope();
+    this.historyResumeId.set(id);
+    this.historyActionError.set(null);
+    try {
+      const detail = await this.ipc.loadAskConversation(scope, id);
+      if (seq !== this.historyLoadSeq || !this.sameScope(scope, this.scope())) {
+        return;
+      }
+      this.requestSeq++;
+      this.prefillSeq++;
+      this.conversationId.set(detail.id);
+      this.sources.set(detail.selectedSources);
+      this.conversation.set(this.renderTurns(detail));
+      this.draft.set("");
+      this.error.set(null);
+      this.historyActionError.set(null);
+      this.historyOpen.set(false);
+      this.scrollToLatest();
+      this.focusComposer();
+    } catch (e) {
+      if (seq === this.historyLoadSeq) {
+        this.historyActionError.set(
+          this.errorCopy.because("Couldn’t load this conversation", e),
+        );
+      }
+    } finally {
+      if (seq === this.historyLoadSeq) {
+        this.historyResumeId.set(null);
+      }
+    }
   }
 
   /**
@@ -191,49 +335,179 @@ export class MeetingChatComponent {
    */
   async send(): Promise<void> {
     const question = this.draft().trim();
-    if (!question || this.pending()) {
+    if (!question || this.pending() || !this.historyPrivacyReady()) {
       return;
     }
 
-    // History as seen by the model = everything BEFORE this turn.
-    const priorHistory = this.conversation();
-
+    const requestSeq = ++this.requestSeq;
+    const scope = this.scope();
+    const conversationId = this.conversationId() ?? undefined;
+    const optimisticUserId = `local-${this.nextTurnId++}`;
     this.error.set(null);
     this.draft.set("");
     this.conversation.set([
-      ...priorHistory,
-      { role: "user", content: question },
+      ...this.conversation(),
+      { id: optimisticUserId, role: "user", content: question },
     ]);
     this.pending.set(true);
     this.scrollToLatest();
 
     // Source-scoped Brain: an empty selection ⇒ pass undefined so the backend
     // keeps this-meeting grounding; a non-empty selection pins to those sources.
-    const scope = this.sources();
+    const selectedSources = this.sources();
     try {
-      const answer = await this.ipc.chatMeeting(
+      const result = await this.ipc.chatMeetingPersisted(
         this.meetingId(),
         question,
-        priorHistory,
-        scope.length ? scope : undefined,
+        conversationId,
+        selectedSources.length ? selectedSources : undefined,
       );
+      if (
+        requestSeq !== this.requestSeq ||
+        !this.sameScope(scope, this.scope())
+      ) {
+        return;
+      }
+      this.conversationId.set(result.conversationId);
       this.conversation.update((turns) => [
-        ...turns,
-        { role: "assistant", content: answer },
+        ...turns.map((turn) =>
+          turn.id === optimisticUserId
+            ? { ...turn, id: result.userMessageId }
+            : turn,
+        ),
+        {
+          id: result.assistantMessageId,
+          role: "assistant",
+          content: result.answer,
+        },
       ]);
     } catch (e) {
       // Keep the user's question in the log so Retry can re-send it.
-      this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
+      if (requestSeq === this.requestSeq) {
+        this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
+      }
     } finally {
-      this.pending.set(false);
-      this.scrollToLatest();
+      if (requestSeq === this.requestSeq) {
+        this.pending.set(false);
+        this.scrollToLatest();
+      }
     }
+  }
+
+  private scope(): AskConversationScope {
+    return { kind: "meeting", refId: this.meetingId() };
+  }
+
+  private async loadHistory(): Promise<void> {
+    if (!this.historyPrivacyReady()) {
+      return;
+    }
+    const seq = ++this.historyLoadSeq;
+    const scope = this.scope();
+    this.historyLoading.set(true);
+    this.historyError.set(null);
+    this.historyActionError.set(null);
+    try {
+      const rows = await this.ipc.listAskConversations(scope);
+      if (seq === this.historyLoadSeq && this.sameScope(scope, this.scope())) {
+        this.history.set(rows);
+      }
+    } catch (e) {
+      if (seq === this.historyLoadSeq) {
+        this.historyError.set(
+          this.errorCopy.because("Couldn’t load conversation history", e),
+        );
+      }
+    } finally {
+      if (seq === this.historyLoadSeq) {
+        this.historyLoading.set(false);
+      }
+    }
+  }
+
+  private resetConversation(clearHistoryRows: boolean): void {
+    this.requestSeq++;
+    this.historyLoadSeq++;
+    this.pending.set(false);
+    this.conversationId.set(null);
+    this.conversation.set([]);
+    this.draft.set("");
+    this.error.set(null);
+    if (clearHistoryRows) {
+      this.prefillSeq++;
+      this.defaultSources.set([]);
+      this.sources.set([]);
+    } else {
+      this.sources.set(this.defaultSources());
+    }
+    this.historyOpen.set(false);
+    this.historyLoading.set(false);
+    this.historyError.set(null);
+    this.historyActionError.set(null);
+    this.historyResumeId.set(null);
+    if (clearHistoryRows) {
+      this.history.set([]);
+    }
+  }
+
+  private renderTurns(detail: AskConversation): MeetingChatTurn[] {
+    return detail.messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+    }));
+  }
+
+  private sameScope(a: AskConversationScope, b: AskConversationScope): boolean {
+    if (a.kind === "vault" || b.kind === "vault") {
+      return a.kind === b.kind;
+    }
+    return a.kind === b.kind && a.refId === b.refId;
+  }
+
+  private collectVisibleFolderIds(
+    nodes: readonly {
+      id: string;
+      locked: boolean;
+      unlocked: boolean;
+      children?: unknown[];
+    }[],
+    noteFolders: readonly {
+      id: string;
+      locked: boolean;
+      unlocked: boolean;
+    }[],
+  ): Set<string> {
+    const visible = new Set<string>();
+    const visit = (items: typeof nodes): void => {
+      for (const node of items) {
+        if (!node.locked || node.unlocked) {
+          visible.add(`meeting:${node.id}`);
+        }
+        visit((node.children ?? []) as typeof nodes);
+      }
+    };
+    visit(nodes);
+    for (const folder of noteFolders) {
+      if (!folder.locked || folder.unlocked) {
+        visible.add(`note:${folder.id}`);
+      }
+    }
+    return visible;
   }
 
   // --- Auto-scroll ---------------------------------------------------------
 
   /** The scrollable message log. */
   private readonly scroller = viewChild<ElementRef<HTMLDivElement>>("scroller");
+  private readonly composer = viewChild<ElementRef<HTMLTextAreaElement>>("input");
+  private readonly sourcePicker = viewChild(SourcePickerComponent);
+
+  private focusComposer(): void {
+    afterNextRender(() => this.composer()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
+  }
 
   /**
    * Pin the log to the newest message. Runs after the next render so the new

@@ -64,14 +64,34 @@ pub(crate) fn get_user_memory_inner(
 /// so history is preserved). After this the fact drops out of `get_user_memory` and the regenerated
 /// brief. Idempotent. Content-free logging (the fact id only, never its text).
 #[tauri::command]
-pub fn forget_user_fact(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    forget_user_fact_inner(state.inner(), &id)
+pub fn forget_user_fact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), AppError> {
+    forget_user_fact_inner_with_notice(state.inner(), &id, || {
+        emit_ask_history_invalidated_fail_closed(&app)
+    })
 }
 
 /// Inner of [`forget_user_fact`] taking `&AppState` (unit-testable).
+#[allow(dead_code)] // retained as the no-Tauri test seam; production uses the notice-bearing twin.
 pub(crate) fn forget_user_fact_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    forget_user_fact_inner_with_notice(state, id, || {})
+}
+
+fn forget_user_fact_inner_with_notice(
+    state: &AppState,
+    id: &str,
+    forgotten: impl FnOnce(),
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
     let at = chrono::Utc::now().to_rfc3339();
     let closed = state.db.forget_user_fact(id, &at)?;
+    if closed {
+        bump_seal_epoch(state);
+        forgotten();
+    }
     tracing::info!(target: "user_memory", fact_id = %id, closed, "user fact forgotten (invalidated)");
     Ok(())
 }
@@ -82,14 +102,34 @@ pub(crate) fn forget_user_fact_inner(state: &AppState, id: &str) -> Result<(), A
 /// junk row nobody would ever restate stayed CURRENT forever and kept surfacing through
 /// `get_entity_dossier` as truth. Idempotent. Content-free logging (the fact id only).
 #[tauri::command]
-pub fn forget_entity_fact(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    forget_entity_fact_inner(state.inner(), &id)
+pub fn forget_entity_fact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), AppError> {
+    forget_entity_fact_inner_with_notice(state.inner(), &id, || {
+        emit_ask_history_invalidated_fail_closed(&app)
+    })
 }
 
 /// Inner of [`forget_entity_fact`] taking `&AppState` (unit-testable).
+#[allow(dead_code)] // retained as the no-Tauri test seam; production uses the notice-bearing twin.
 pub(crate) fn forget_entity_fact_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    forget_entity_fact_inner_with_notice(state, id, || {})
+}
+
+fn forget_entity_fact_inner_with_notice(
+    state: &AppState,
+    id: &str,
+    forgotten: impl FnOnce(),
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
     let at = chrono::Utc::now().to_rfc3339();
     let closed = state.db.forget_entity_fact(id, &at)?;
+    if closed {
+        bump_seal_epoch(state);
+        forgotten();
+    }
     tracing::info!(target: "facts", fact_id = %id, closed, "entity fact forgotten (invalidated)");
     Ok(())
 }
@@ -98,14 +138,29 @@ pub(crate) fn forget_entity_fact_inner(state: &AppState, id: &str) -> Result<(),
 /// closed history stays). After this `get_user_memory` and the brief are empty. Content-free logging
 /// (a count only).
 #[tauri::command]
-pub fn clear_user_memory(state: State<'_, AppState>) -> Result<(), AppError> {
-    clear_user_memory_inner(state.inner())
+pub fn clear_user_memory(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+    clear_user_memory_inner_with_notice(state.inner(), || {
+        emit_ask_history_invalidated_fail_closed(&app)
+    })
 }
 
 /// Inner of [`clear_user_memory`] taking `&AppState` (unit-testable).
+#[allow(dead_code)] // retained as the no-Tauri test seam; production uses the notice-bearing twin.
 pub(crate) fn clear_user_memory_inner(state: &AppState) -> Result<(), AppError> {
+    clear_user_memory_inner_with_notice(state, || {})
+}
+
+fn clear_user_memory_inner_with_notice(
+    state: &AppState,
+    forgotten: impl FnOnce(),
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
     let at = chrono::Utc::now().to_rfc3339();
     let n = state.db.clear_user_facts(&at)?;
+    if n > 0 {
+        bump_seal_epoch(state);
+        forgotten();
+    }
     tracing::info!(target: "user_memory", count = n, "user memory cleared (all facts invalidated)");
     Ok(())
 }

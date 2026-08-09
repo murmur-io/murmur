@@ -1166,6 +1166,8 @@ struct ArmRuntime {
     extraction_reasoner: Arc<dyn LocalReasoner>,
     egress_sink: Option<Arc<BenchmarkEgressSink>>,
     cloud_reference: bool,
+    runtime_path: PathBuf,
+    pinned_codex_runtime: Option<Arc<crate::summarize::codex_cli::PinnedCodexRuntime>>,
 }
 
 impl ArmRuntime {
@@ -1187,6 +1189,16 @@ impl ArmRuntime {
                     .to_string(),
             )
         })?;
+        let runtime_path = PathBuf::from(
+            std::env::var_os("MURMUR_BRAIN_SIDECAR")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidArg(
+                        "MURMUR_BRAIN_SIDECAR must name the exact benchmark sidecar binary"
+                            .to_string(),
+                    )
+                })?,
+        );
         let filename = model_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1246,23 +1258,27 @@ impl ArmRuntime {
             extraction_reasoner: reasoner,
             egress_sink: None,
             cloud_reference: false,
+            runtime_path,
+            pinned_codex_runtime: None,
         })
     }
 
-    fn cloud(sink: Arc<BenchmarkEgressSink>) -> Result<Self> {
+    async fn cloud(sink: Arc<BenchmarkEgressSink>) -> Result<Self> {
         if !cloud_egress_acknowledged(std::env::var("MURMUR_QUALITY_ALLOW_CLOUD").ok().as_deref()) {
             return Err(AppError::Unavailable(
                 "set MURMUR_QUALITY_ALLOW_CLOUD=1 to acknowledge synthetic benchmark egress"
                     .to_string(),
             ));
         }
-        let runtime_version = codex_runtime_version().ok_or_else(|| {
-            AppError::Unavailable("cannot identify /opt/homebrew/bin/codex runtime".to_string())
+        // Resolve and production-probe exactly once. This token pins the canonical path plus file
+        // identity and is threaded through every evaluator transport, including lazy reasoners.
+        let pinned_runtime =
+            Arc::new(crate::summarize::codex_cli::resolve_pinned_default_runtime().await?);
+        let runtime_path = pinned_runtime.path.clone();
+        let runtime_version = pinned_runtime.version.clone();
+        let runtime_sha256 = sha256_file(&runtime_path).map_err(|error| {
+            AppError::Unavailable(format!("cannot hash Codex runtime: {error}"))
         })?;
-        let runtime_sha256 =
-            sha256_file(Path::new("/opt/homebrew/bin/codex")).map_err(|error| {
-                AppError::Unavailable(format!("cannot hash Codex runtime: {error}"))
-            })?;
         let config = cloud_config();
         let heavy = Arc::new(tokio::sync::Semaphore::new(1));
         let notes_provider = crate::summarize::provider_for_with_egress_sink(
@@ -1270,12 +1286,14 @@ impl ArmRuntime {
             &config,
             &heavy,
             sink.clone(),
+            Arc::clone(&pinned_runtime),
         )?;
         let ask_provider = crate::summarize::provider_for_with_egress_sink(
             Role::Ask,
             &config,
             &heavy,
             sink.clone(),
+            Arc::clone(&pinned_runtime),
         )?;
         let shared = Arc::new(Mutex::new(config));
         let ask_reasoner: Arc<dyn LocalReasoner> =
@@ -1284,6 +1302,7 @@ impl ArmRuntime {
                 Role::Ask,
                 Arc::clone(&heavy),
                 sink.clone(),
+                Arc::clone(&pinned_runtime),
             ));
         let live_reasoner: Arc<dyn LocalReasoner> =
             Arc::new(crate::reason::CloudReasoner::for_role_with_egress_sink(
@@ -1291,6 +1310,7 @@ impl ArmRuntime {
                 Role::Live,
                 Arc::clone(&heavy),
                 sink.clone(),
+                Arc::clone(&pinned_runtime),
             ));
         let extraction_reasoner: Arc<dyn LocalReasoner> =
             Arc::new(crate::reason::CloudReasoner::for_role_with_egress_sink(
@@ -1298,6 +1318,7 @@ impl ArmRuntime {
                 Role::Notes,
                 heavy,
                 sink.clone(),
+                Arc::clone(&pinned_runtime),
             ));
         Ok(Self {
             metadata: ArmMetadata {
@@ -1328,6 +1349,8 @@ impl ArmRuntime {
             extraction_reasoner,
             egress_sink: Some(sink),
             cloud_reference: true,
+            runtime_path,
+            pinned_codex_runtime: Some(pinned_runtime),
         })
     }
 }
@@ -2391,10 +2414,6 @@ fn command_version(binary: &str, args: &[&str]) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn codex_runtime_version() -> Option<String> {
-    command_version("/opt/homebrew/bin/codex", &["--version"])
 }
 
 fn brain_runtime_version() -> Option<String> {
@@ -4454,6 +4473,16 @@ async fn run_arm(arm: ArmRuntime, manifest: &QualityManifest) -> (ArmReport, Mod
         result.case_record_sha256 = case_record_sha256(&result);
         results.push(result);
     }
+    if let Some(runtime) = &arm.pinned_codex_runtime {
+        runtime
+            .assert_unchanged()
+            .expect("pinned Codex runtime identity changed while the run was active");
+    }
+    assert_eq!(
+        sha256_file(&arm.runtime_path).ok(),
+        arm.metadata.runtime_sha256,
+        "pinned quality runtime content changed while the run was active"
+    );
     let aggregates = aggregate(&results);
     let model_only_aggregates = model_only_aggregates(&model_only_results);
     (
@@ -4471,7 +4500,7 @@ async fn run_arm(arm: ArmRuntime, manifest: &QualityManifest) -> (ArmReport, Mod
     )
 }
 
-fn assert_runtime_artifacts_unchanged(arms: &[ArmReport]) {
+fn assert_model_artifacts_unchanged(arms: &[ArmReport]) {
     for arm in arms {
         let model_path = match arm.metadata.arm_id.as_str() {
             QWEN4_ID => std::env::var_os("MURMUR_QUALITY_QWEN4").map(PathBuf::from),
@@ -4490,20 +4519,6 @@ fn assert_runtime_artifacts_unchanged(arms: &[ArmReport]) {
                 "quality model size changed while the run was active"
             );
         }
-        let runtime_path = if arm.metadata.arm_id == SOL_ID {
-            PathBuf::from("/opt/homebrew/bin/codex")
-        } else {
-            PathBuf::from(
-                std::env::var_os("MURMUR_BRAIN_SIDECAR")
-                    .filter(|value| !value.is_empty())
-                    .expect("MURMUR_BRAIN_SIDECAR disappeared while the run was active"),
-            )
-        };
-        assert_eq!(
-            sha256_file(&runtime_path).ok(),
-            arm.metadata.runtime_sha256,
-            "quality runtime changed while the run was active"
-        );
     }
 }
 
@@ -5127,31 +5142,33 @@ async fn run_local_cloud_generation_quality_from_env() {
     // Construct and provenance-check every requested runtime before the first inference. This is
     // especially important for repetition 2, where the cloud reference intentionally runs first:
     // a missing/wrong later GGUF or sidecar must fail before any paid synthetic egress occurs.
-    let runtimes = arms
-        .iter()
-        .map(|arm_id| {
-            match arm_id.as_str() {
-                QWEN4_ID => ArmRuntime::local(
-                    QWEN4_ID,
-                    required_path("MURMUR_QUALITY_QWEN4"),
-                    ModelClass::Heavy,
-                ),
-                QWEN1_ID => ArmRuntime::local(
-                    QWEN1_ID,
-                    required_path("MURMUR_QUALITY_QWEN1"),
-                    ModelClass::Light,
-                ),
-                SOL_ID => ArmRuntime::cloud(
+    let mut runtimes = Vec::with_capacity(arms.len());
+    for arm_id in &arms {
+        let runtime = match arm_id.as_str() {
+            QWEN4_ID => ArmRuntime::local(
+                QWEN4_ID,
+                required_path("MURMUR_QUALITY_QWEN4"),
+                ModelClass::Heavy,
+            ),
+            QWEN1_ID => ArmRuntime::local(
+                QWEN1_ID,
+                required_path("MURMUR_QUALITY_QWEN1"),
+                ModelClass::Light,
+            ),
+            SOL_ID => {
+                ArmRuntime::cloud(
                     benchmark_egress_sink
                         .as_ref()
                         .expect("Sol arm requires its explicit benchmark egress sink")
                         .clone(),
-                ),
-                other => panic!("unknown MURMUR_QUALITY_ARMS entry: {other}"),
+                )
+                .await
             }
-            .unwrap_or_else(|error| panic!("cannot construct {arm_id}: {}", error_kind(&error)))
-        })
-        .collect::<Vec<_>>();
+            other => panic!("unknown MURMUR_QUALITY_ARMS entry: {other}"),
+        }
+        .unwrap_or_else(|error| panic!("cannot construct {arm_id}: {}", error_kind(&error)));
+        runtimes.push(runtime);
+    }
     let mut reports = Vec::new();
     let mut model_only_arms = Vec::new();
     for runtime in runtimes {
@@ -5160,7 +5177,7 @@ async fn run_local_cloud_generation_quality_from_env() {
         model_only_arms.push(model_only_report);
     }
 
-    assert_runtime_artifacts_unchanged(&reports);
+    assert_model_artifacts_unchanged(&reports);
     crate::eval::generation_retrieval::assert_model_unchanged(&retrieval_quality)
         .expect("retrieval model unchanged during generation run");
     let local_composite = local_composite(&reports);
@@ -5958,6 +5975,45 @@ fn deterministic_oracle_accepts_good_and_rejects_bad_output() {
     assert!(!bad_score.forbidden_pass);
 }
 
+#[cfg(unix)]
+#[test]
+fn cloud_runtime_provenance_uses_the_production_codex_resolver() {
+    let root = crate::storage::db::unique_temp_path("murmur-quality-codex-provenance", "dir");
+    let selected_dir = root.join(".local/bin");
+    let lower_priority_dir = root.join(".bun/bin");
+    std::fs::create_dir_all(&selected_dir).unwrap();
+    std::fs::create_dir_all(&lower_priority_dir).unwrap();
+    let selected = selected_dir.join("codex");
+    let lower_priority = lower_priority_dir.join("codex");
+    std::fs::write(
+        &selected,
+        b"#!/bin/sh\n/usr/bin/printf 'codex-cli provenance-selected\\n'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &lower_priority,
+        b"#!/bin/sh\n/usr/bin/printf 'codex-cli wrong-runtime\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&lower_priority, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let resolved =
+        crate::summarize::codex_cli::resolve_default_binary_path_from(Some(&root), None).unwrap();
+    assert_eq!(resolved, selected);
+    assert_eq!(
+        sha256_file(&resolved).unwrap(),
+        sha256_file(&selected).unwrap()
+    );
+    assert_ne!(
+        sha256_file(&resolved).unwrap(),
+        sha256_file(&lower_priority).unwrap(),
+        "runtime provenance must not hash a lower-priority installation"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 struct BenchmarkFixtureCodexProvider {
     fail: bool,
 }
@@ -6079,6 +6135,8 @@ fn model_only_test_arm(
         extraction_reasoner: reasoner,
         egress_sink: sink,
         cloud_reference,
+        runtime_path: PathBuf::new(),
+        pinned_codex_runtime: None,
     }
 }
 
@@ -6304,26 +6362,16 @@ async fn benchmark_provider_path_persists_content_free_success_and_failure_recei
 }
 
 #[test]
-fn committed_quality_evidence_replays_without_models_or_network() {
+fn committed_quality_outputs_match_current_oracle_without_models_or_network() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("src-tauri must have a repository parent");
-    let validator = repository.join("eval/results/validate_generation_quality_repeats.py");
     let evidence = repository.join(COMMITTED_EVIDENCE_MANIFEST);
+    // B0 is immutable historical evidence for its recorded producer snapshot. Its archive,
+    // provenance and projection bindings are replayed independently by `quality_artifact_tests`.
+    // This consumer-side test has a different job: prove that every stored output still receives
+    // the same verdict from the current Rust oracle after later, non-model product changes.
     assert_committed_artifact_scores_match_current_oracle(repository, &evidence);
-    let output = std::process::Command::new("python3")
-        .arg(&validator)
-        .arg("--verify-evidence")
-        .arg(&evidence)
-        .current_dir(repository)
-        .output()
-        .expect("run committed quality evidence validator");
-    assert!(
-        output.status.success(),
-        "committed quality evidence did not replay:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn assert_model_only_record_matches_current_contract(
