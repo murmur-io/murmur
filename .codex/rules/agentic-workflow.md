@@ -53,8 +53,11 @@ parallel. They receive only the runner-built immutable diff/evidence bundle;
 they have no filesystem or shell tools. One bounded retry is allowed only for
 transient reviewer failure. They may request a typed allowlisted probe; the
 runner executes the canonical command and reruns a fresh review bound to that
-probe evidence. A MAJOR/BLOCKER, proof gap, unresolved probe, stale diff, or
-protocol drift forbids PASS.
+probe evidence. A gating review's MAJOR/BLOCKER, unresolved probe, stale diff,
+or protocol drift forbids PASS. Its residual proof gaps remain visible in the
+receipt and PASS reason but do not override its own PASS; evidence required for
+a decision must yield `BLOCKED`. Advisory-review artifacts remain recorded but
+do not vote or spend a probe execution.
 
 Completed exact-attempt green checkpoints survive interruption. State events
 are authoritative, projections repair only from those events, and a durable
