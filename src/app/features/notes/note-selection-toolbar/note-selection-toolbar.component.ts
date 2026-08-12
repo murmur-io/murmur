@@ -79,6 +79,11 @@ export class NoteSelectionToolbarComponent {
     this.format.emit(op);
   }
 
+  /** Remove the teleported box immediately when its cached owner is detached. */
+  detachFromDocument(): void {
+    this.barEl()?.nativeElement.remove();
+  }
+
   /** Position the bar ABOVE the selection rect (flips below when there's no room). */
   reposition(): void {
     afterNextRender(
