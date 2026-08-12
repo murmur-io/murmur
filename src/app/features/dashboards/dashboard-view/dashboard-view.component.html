@@ -3,184 +3,119 @@
     <button type="button" class="crumb" (click)="back()">← Dashboards</button>
     @if (renaming()) {
       <form class="rename" (submit)="commitRename(); $event.preventDefault()">
-        <input
-          #renameField
-          class="rename-field"
-          type="text"
-          [value]="renameDraft()"
-          (input)="onRenameInput($event)"
-          (keydown.escape)="cancelRename()"
-          aria-label="Board name"
-        />
-        <button type="submit" class="btn btn-primary btn-sm" [disabled]="!renameDraft().trim()">
-          Save
-        </button>
+        <input #renameField class="rename-field" type="text" [value]="renameDraft()" (input)="onRenameInput($event)" (keydown.escape)="cancelRename()" aria-label="Board name" />
+        <button type="submit" class="btn btn-primary btn-sm" [disabled]="!renameDraft().trim()">Save</button>
         <button type="button" class="btn btn-ghost btn-sm" (click)="cancelRename()">Cancel</button>
       </form>
     } @else {
       <h1>
-        <!-- The title IS the rename affordance. A board named the wrong thing was
-             permanent: `update` was only ever called with `{pinned}`. -->
-        <button
-          type="button"
-          class="title-edit"
-          (click)="startRename()"
-          [attr.aria-label]="'Rename this board — ' + (board()?.title ?? '')"
-        >
-          @if (board()?.emoji; as emoji) {
-            <span class="emoji">{{ emoji }}</span>
-          }
+        <button type="button" class="title-edit" (click)="startRename()" [attr.aria-label]="'Rename this board — ' + (board()?.title ?? '')">
+          @if (board()?.emoji; as emoji) { <span class="emoji">{{ emoji }}</span> }
           {{ board()?.title ?? "Board" }}
         </button>
       </h1>
     }
   </div>
 
-  <button type="button" class="btn btn-ghost" (click)="toggleEditing()">
-    {{ editing() ? "Done" : "Arrange" }}
-  </button>
-  @if (editing()) {
-    <span class="arrange-hint">drag tiles to reorder · ‹ › to resize</span>
+  @if (mode() === "read") {
+    <button type="button" class="btn btn-ghost secondary-action" [disabled]="!privacyReady()" (click)="openAsk()"><mur-icon icon="ask" /> Ask</button>
+    @if (!isEmpty()) { <button type="button" class="btn btn-ghost" (click)="enterCompose()">Compose</button> }
+  } @else {
+    <span class="compose-hint">Drag or use Move earlier / Move later</span>
+    <button type="button" class="btn btn-primary" [class.is-open]="paletteOpen()" (click)="togglePalette($event)">
+      <mur-icon icon="plus" /> {{ paletteOpen() ? "Close" : "Add to board" }}
+    </button>
+    <button type="button" class="btn btn-ghost" (click)="leaveCompose()">Done</button>
   }
-  <button
-    type="button"
-    class="btn btn-primary"
-    [class.is-open]="paletteOpen()"
-    (click)="togglePalette()"
-  >
-    <mur-icon icon="plus" /> {{ paletteOpen() ? "Close" : "Add tile" }}
-  </button>
 </header>
 
-@if (error(); as err) {
-  <div class="banner banner-error" role="alert">{{ err }}</div>
-}
+@if (error(); as err) { <div class="banner banner-error" role="alert">{{ err }}</div> }
 
-<div class="board">
-  <section class="canvas" aria-label="Board tiles">
-    @if (isEmpty() && loading()) {
-      <mur-empty-state>Loading this board…</mur-empty-state>
-    } @else if (isEmpty()) {
-      <mur-empty-state>
-        <strong>This board is empty.</strong>
-        <p class="empty-copy">
-          Add a note or a recording to give it something to stand on — then add a
-          drift lane, a promise ledger or a pulse, which only work because Murmur
-          heard the conversation.
-        </p>
-        <button type="button" class="btn btn-primary" (click)="openPalette()">
-          Add the first tile
-        </button>
-      </mur-empty-state>
-    } @else {
-      @for (tile of tiles(); track tile.id) {
-        <app-dashboard-tile
-          [tile]="tile"
-          [cited]="citationFor(tile)"
-          [duplicateOf]="duplicateOf(tile)"
-          [editing]="editing()"
-          [dragging]="draggingId() === tile.id"
-          [dropTarget]="dropTargetId() === tile.id"
-          [attr.draggable]="editing() ? 'true' : null"
-          (dragstart)="onDragStart(tile, $event)"
-          (dragover)="onDragOver(tile, $event)"
-          (dragleave)="onDragLeave(tile)"
-          (drop)="onDrop(tile, $event)"
-          (dragend)="onDragEnd()"
-          (remove)="removeTile(tile)"
-          (widen)="widen(tile)"
-          (narrow)="narrow(tile)"
-          (openSource)="openSource($event)"
-          (refreshAnswer)="refreshAnswer(tile)"
-        />
-      }
+@if (!privacyReady() && !privacyError()) {
+  <mur-empty-state><mur-spinner /> Establishing a secure board session…</mur-empty-state>
+} @else if (privacyRefreshing() || loading()) {
+  <mur-empty-state><mur-spinner /> Re-checking this board…</mur-empty-state>
+} @else if (boardUnavailable()) {
+  <mur-empty-state>
+    <strong>Board unavailable.</strong>
+    <p class="empty-copy">{{ privacyError() ?? "Murmur could not safely resolve this board's current readable scope." }}</p>
+    <button type="button" class="btn btn-primary" (click)="retryLoad()">Try again</button>
+  </mur-empty-state>
+} @else if (isEmpty() && !askOpen()) {
+  <mur-empty-state>
+    <strong>Start with material for this board.</strong>
+    <p class="empty-copy">Add a Note, Recording or Document. Derived views can follow once the board has something readable to work from.</p>
+    <button type="button" class="btn btn-primary" (click)="openPalette($event)">Add a Note, Recording or Document</button>
+  </mur-empty-state>
+} @else if (mode() === "compose") {
+  <section class="compose" aria-label="Compose board tiles">
+    @for (tile of tiles(); track tile.id; let first = $first; let last = $last) {
+      <app-dashboard-tile
+        [tile]="tile"
+        [editing]="true"
+        [allowRefreshAnswer]="false"
+        [duplicateOf]="duplicateOf(tile)"
+        [canMoveEarlier]="!first"
+        [canMoveLater]="!last"
+        [dragging]="draggingId() === tile.id"
+        [dropTarget]="dropTargetId() === tile.id"
+        draggable="true"
+        (dragstart)="onDragStart(tile, $event)"
+        (dragover)="onDragOver(tile, $event)"
+        (dragleave)="onDragLeave(tile)"
+        (drop)="onDrop(tile, $event)"
+        (dragend)="onDragEnd()"
+        (moveEarlier)="moveTile(tile, -1)"
+        (moveLater)="moveTile(tile, 1)"
+        (remove)="removeTile(tile)"
+        (widen)="widen(tile)"
+        (narrow)="narrow(tile)"
+        (openSource)="openSource($event)"
+      />
     }
   </section>
-
-  <aside class="ask" [class.is-rail]="!askExpanded()" aria-label="Ask this board">
-    @if (!askExpanded()) {
-      <!--
-        Collapsed. The SCOPE COUNT stays on screen because it is the feature's whole
-        claim made visible — this board, and nothing else, is what an answer may come
-        from. An empty transcript is not; it was taking a third of the width to show
-        three suggestion buttons.
-      -->
-      <button
-        type="button"
-        class="ask-rail"
-        (click)="expandAsk()"
-        [attr.aria-label]="'Ask this board — ' + sourceCount() + ' readable sources'"
-      >
-        <mur-icon icon="ask" />
-        <span class="rail-label">
-          Ask this board
-          <span class="rail-count">{{ sourceCount() }} in scope</span>
-        </span>
-      </button>
-    } @else {
-    <header class="ask-head">
-      <mur-icon icon="ask" />
-      <h2>Ask this board</h2>
-    </header>
-
-    <p class="scope">
-      Grounded in <strong>this board only</strong> — {{ sourceCount() }}
-      readable {{ sourceCount() === 1 ? "source" : "sources" }}.
-      @if (sealedCount() > 0) {
-        <span class="scope-sealed">
-          {{ sealedCount() }} sealed {{ sealedCount() === 1 ? "tile is" : "tiles are" }}
-          excluded until unlocked.
-        </span>
-      }
-    </p>
-
-    <div class="thread">
-      @for (turn of turns(); track $index) {
-        @if (turn.role === "error") {
-          <!-- A failure is chrome, not a conclusion. It used to render in the same
-               grey bubble as a real answer, with nothing to retry. -->
-          <div class="banner is-danger" role="alert">
-            <span>{{ turn.text }}</span>
-            <button type="button" class="btn btn-ghost btn-sm" (click)="retry(turn)">
-              Try again
-            </button>
-          </div>
-        } @else if (turn.role === "user") {
-          <div class="bubble me">{{ turn.text }}</div>
-        } @else {
-          <!-- The prompt in `summarize/vault_chat.rs::build` DEMANDS markdown, so
-               rendering the answer as plain text printed `**` and `[[…]]` literally.
-               `app-markdown` also turns wikilinks into gated, clickable chips —
-               dashboards was the only AI surface in the app not using it. -->
-          <div class="bubble"><app-markdown [markdown]="turn.text" compact /></div>
+} @else {
+  <div class="workspace" [class.has-ask]="askOpen()">
+    <main class="reading">
+      <nav class="lenses" aria-label="Dashboard lenses">
+        @for (item of lenses; track item.id) {
+          <button type="button" [class.active]="lens() === item.id" [attr.aria-current]="lens() === item.id ? 'page' : null" (click)="selectLens(item.id)">{{ item.label }}</button>
         }
-      } @empty {
-        <div class="suggestions">
-          @for (s of suggestions; track s) {
-            <button type="button" class="suggestion" (click)="askSuggestion(s)">{{ s }}</button>
+      </nav>
+      <app-dashboard-read [lens]="lens()" [projection]="projection()" (openSource)="openSource($event)" />
+    </main>
+
+    @if (askOpen()) {
+      <aside class="ask" aria-label="Ask this board">
+        <header class="ask-head">
+          <div><span class="eyebrow">On demand</span><h2>Ask this board</h2></div>
+          <button type="button" class="btn btn-ghost btn-sm" (click)="closeAsk()" aria-label="Close Ask">Close</button>
+        </header>
+        <p class="scope">
+          Uses {{ sourceCount() }} currently readable material {{ sourceCount() === 1 ? "source" : "sources" }}, this board's derived views, and permitted gated linked context. This is the allowed scope, not a claim that every sentence is exact cited evidence.
+          @if (projection().sealedCount > 0) { <span>{{ projection().sealedCount }} sealed {{ projection().sealedCount === 1 ? "item is" : "items are" }} excluded.</span> }
+        </p>
+        <div class="thread">
+          @for (turn of turns(); track turn.id) {
+            @if (turn.role === "error") {
+              <div class="banner is-danger" role="alert"><span>{{ turn.text }}</span><button type="button" class="btn btn-ghost btn-sm" (click)="retry(turn)">Try again</button></div>
+            } @else if (turn.role === "user") {
+              <div class="bubble me">{{ turn.text }}</div>
+            } @else {
+              <div class="bubble"><app-markdown [markdown]="turn.text" compact /></div>
+            }
+          } @empty {
+            <div class="suggestions">
+              @for (suggestion of suggestions; track suggestion) { <button type="button" class="suggestion" (click)="askSuggestion(suggestion)">{{ suggestion }}</button> }
+            </div>
           }
+          @if (asking()) { <div class="bubble thinking"><mur-spinner /> Thinking…</div> }
         </div>
-      }
-
-      @if (asking()) {
-        <div class="bubble thinking"><mur-spinner /> Thinking…</div>
-      }
-    </div>
-
-    <form class="composer" (submit)="ask(); $event.preventDefault()">
-      <input
-        class="ask-field"
-        type="text"
-        placeholder="Ask about these tiles…"
-        [value]="draft()"
-        (input)="onDraft($event)"
-        aria-label="Ask a question about this board"
-      />
-      <button type="submit" class="btn btn-primary btn-sm" [disabled]="!draft().trim() || asking()">
-        Ask
-      </button>
-    </form>
+        <form class="composer" (submit)="ask(); $event.preventDefault()">
+          <input class="ask-field" type="text" placeholder="Ask about this board…" [value]="draft()" (input)="onDraft($event)" aria-label="Ask a question about this board" />
+          <button type="submit" class="btn btn-primary btn-sm" [disabled]="!draft().trim() || asking()">Ask</button>
+        </form>
+      </aside>
     }
-  </aside>
-</div>
-
+  </div>
+}

@@ -1,22 +1,32 @@
 import { expect, test } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
-/**
- * Open the Ask column. It starts collapsed to a rail — the scope count stays on
- * screen, the empty transcript does not — so any test that types a question expands
- * it first, which is the same click a user makes.
- */
+/** Open the board's on-demand Ask surface if it is not already present. */
 async function openAsk(page: import("@playwright/test").Page): Promise<void> {
-  // Wait for the panel to EXIST before deciding. A bare `count()` races Angular's
-  // first render and silently no-ops, which then surfaces as a `fill` timeout on a
-  // field that was never revealed.
   const panel = page.locator("aside.ask");
-  await panel.waitFor();
-  const rail = panel.locator("button.ask-rail");
-  if (await rail.count()) await rail.click();
+  if (!(await panel.count())) {
+    await page.getByRole("button", { name: "Ask", exact: true }).click();
+  }
   await page.getByRole("textbox", { name: /Ask a question/i }).waitFor();
 }
 
+async function submitAsk(page: import("@playwright/test").Page): Promise<void> {
+  await page
+    .getByLabel("Ask this board")
+    .getByRole("button", { name: "Ask", exact: true })
+    .click();
+}
+
+async function enterCompose(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  if (
+    !(await page.locator('section[aria-label="Compose board tiles"]').count())
+  ) {
+    await page.getByRole("button", { name: "Compose", exact: true }).click();
+  }
+  await page.locator('section[aria-label="Compose board tiles"]').waitFor();
+}
 
 /**
  * Dashboards — the DENSITY oracle (Phase 1 of the 2026-08-04 rebuild).
@@ -85,14 +95,30 @@ const BOARD_DETAIL = {
   ...BOARDS[0],
   tiles: [
     // Never had data → must collapse.
-    tile("t-numbers", "numbers", { kind: "numbers", entity: "Brain", rows: [] }, 0),
+    tile(
+      "t-numbers",
+      "numbers",
+      { kind: "numbers", entity: "Brain", rows: [] },
+      0,
+    ),
     // Genuinely zero → GOOD NEWS → must stay a full tile.
-    tile("t-promises", "promises", { kind: "promises", owner: null, rows: [] }, 1),
+    tile(
+      "t-promises",
+      "promises",
+      { kind: "promises", owner: null, rows: [] },
+      1,
+    ),
     // Populated stat cluster → narrow.
     tile(
       "t-person",
       "person",
-      { kind: "person", id: "e-1", name: "Kuba", mentionCount: 12, openCommitments: 3 },
+      {
+        kind: "person",
+        id: "e-1",
+        name: "Kuba",
+        mentionCount: 12,
+        openCommitments: 3,
+      },
       2,
     ),
     // Populated prose.
@@ -115,16 +141,26 @@ async function openBoard(page: import("@playwright/test").Page) {
   await mockTauri(
     page,
     {},
-    { list_dashboards: BOARDS, get_dashboard: BOARD_DETAIL, get_dashboard_sources: [] },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [],
+    },
   );
   await page.goto("/dashboards/b-dense");
+  await enterCompose(page);
   await expect(page.locator("app-dashboard-tile")).toHaveCount(4);
 }
 
 /** The rendered column span, read off the resolved grid placement. */
-async function spanOf(page: import("@playwright/test").Page, id: string): Promise<number> {
+async function spanOf(
+  page: import("@playwright/test").Page,
+  id: string,
+): Promise<number> {
   return page.evaluate((tileId) => {
-    const el = document.querySelector(`app-dashboard-tile[data-tile-id="${tileId}"]`);
+    const el = document.querySelector(
+      `app-dashboard-tile[data-tile-id="${tileId}"]`,
+    );
     if (!el) return -1;
     const raw = getComputedStyle(el).gridColumn; // e.g. "span 3 / auto"
     const m = /span\s+(\d+)/.exec(raw);
@@ -155,7 +191,9 @@ test("Dashboards: a tile that never had data collapses instead of reserving a fu
     return { empty: h("t-numbers"), full: h("t-note") };
   });
   expect(heights.empty).toBeLessThan(heights.full * 0.75);
-  expect(heights.empty).toBeLessThanOrEqual(56);
+  // Compose's explicit move controls add one compact toolbar row, but an empty
+  // strip must remain materially shorter than a populated card.
+  expect(heights.empty).toBeLessThanOrEqual(88);
 });
 
 test("Dashboards: an empty PROMISES tile reads as a result, not as an absence", async ({
@@ -163,7 +201,9 @@ test("Dashboards: an empty PROMISES tile reads as a result, not as an absence", 
 }) => {
   await openBoard(page);
 
-  const promises = page.locator('app-dashboard-tile[data-tile-id="t-promises"]');
+  const promises = page.locator(
+    'app-dashboard-tile[data-tile-id="t-promises"]',
+  );
   // Zero open commitments is good news — it keeps its card and its body.
   await expect(promises).not.toHaveClass(/is-empty/);
   await expect(promises.locator(".tile-body")).toHaveCount(1);
@@ -186,7 +226,9 @@ test("Dashboards: kinds get different widths even though every stored row says s
   expect(new Set([person, note, promises]).size).toBeGreaterThan(1);
 });
 
-test("Dashboards: every tile header carries a per-kind mark", async ({ page }) => {
+test("Dashboards: every tile header carries a per-kind mark", async ({
+  page,
+}) => {
   await openBoard(page);
 
   // The single biggest visual omission versus the prototype: the shipped header
@@ -222,17 +264,23 @@ test("Dashboards: a failed Ask is a banner with a retry, not a grey bubble that 
 
   await page.goto("/dashboards/b-dense");
   await openAsk(page);
-  await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is late?");
-  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: /Ask a question/i })
+    .fill("what is late?");
+  await submitAsk(page);
 
   const banner = page.locator(".thread .banner.is-danger");
   await expect(banner).toBeVisible();
-  await expect(banner.getByRole("button", { name: /Try again/i })).toBeVisible();
+  await expect(
+    banner.getByRole("button", { name: /Try again/i }),
+  ).toBeVisible();
   // And it is NOT dressed as an answer.
   await expect(page.locator(".thread .bubble:not(.me)")).toHaveCount(0);
 });
 
-test("Dashboards: an answer renders as markdown, not as literal asterisks", async ({ page }) => {
+test("Dashboards: an answer renders as markdown, not as literal asterisks", async ({
+  page,
+}) => {
   // `summarize/vault_chat.rs::build` DEMANDS markdown from the model, and the
   // board rendered `{{ turn.text }}` with `white-space: pre-wrap`.
   await mockTauri(
@@ -253,8 +301,10 @@ test("Dashboards: an answer renders as markdown, not as literal asterisks", asyn
 
   await page.goto("/dashboards/b-dense");
   await openAsk(page);
-  await page.getByRole("textbox", { name: /Ask a question/i }).fill("what is the risk?");
-  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: /Ask a question/i })
+    .fill("what is the risk?");
+  await submitAsk(page);
 
   const answer = page.locator(".thread .bubble:not(.me)");
   await expect(answer).toBeVisible();
@@ -282,7 +332,14 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
             {
               kind: "promises",
               owner: null,
-              rows: [{ text: "Send the Acme paperwork", meta: "due 2026-07-22", status: "late", source: null }],
+              rows: [
+                {
+                  text: "Send the Acme paperwork",
+                  meta: "due 2026-07-22",
+                  status: "late",
+                  source: null,
+                },
+              ],
             },
             0,
           ),
@@ -292,7 +349,14 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
             {
               kind: "promises",
               owner: null,
-              rows: [{ text: "Send the Acme paperwork", meta: "due 2026-07-22", status: "late", source: null }],
+              rows: [
+                {
+                  text: "Send the Acme paperwork",
+                  meta: "due 2026-07-22",
+                  status: "late",
+                  source: null,
+                },
+              ],
             },
             1,
           ),
@@ -303,6 +367,7 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
   );
 
   await page.goto("/dashboards/b-dense");
+  await enterCompose(page);
   await expect(page.locator("app-dashboard-tile")).toHaveCount(2);
 
   const second = page.locator('app-dashboard-tile[data-tile-id="t-p2"]');
@@ -313,13 +378,18 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
   await expect(page.getByText("Send the Acme paperwork")).toHaveCount(1);
 });
 
-test("Dashboards: the Ask column is a rail until it has something to say", async ({ page }) => {
-  // The scope readout is the feature's claim made visible, so it stays on screen; the
-  // empty transcript is not, and it was spending a third of the width on three
-  // suggestion buttons.
+test("Dashboards: Ask is on demand and closing it preserves the in-memory thread", async ({
+  page,
+}) => {
   await mockTauri(
     page,
-    { ask_vault: () => ({ answer: "Two are late.", sources: [], citations: [] }) },
+    {
+      ask_vault: () => ({
+        answer: "Two are late.",
+        sources: [],
+        citations: [],
+      }),
+    },
     {
       list_dashboards: BOARDS,
       get_dashboard: BOARD_DETAIL,
@@ -328,29 +398,21 @@ test("Dashboards: the Ask column is a rail until it has something to say", async
   );
 
   await page.goto("/dashboards/b-dense");
-  const ask = page.locator("aside.ask");
-  await expect(ask).toHaveClass(/is-rail/);
-  // …and the count is still readable while collapsed.
-  await expect(ask.getByText(/in scope/)).toBeVisible();
-  const railWidth = (await ask.boundingBox())!.width;
-  expect(railWidth).toBeLessThan(60);
-
-  await ask.getByRole("button", { name: /Ask this board/ }).click();
-  await expect(ask).not.toHaveClass(/is-rail/);
-  // The width TRANSITIONS, so a single read lands mid-animation. Poll instead of
-  // measuring once — and the composer being reachable is the real invariant anyway.
-  await expect(page.getByRole("textbox", { name: /Ask a question/i })).toBeVisible();
-  await expect
-    .poll(async () => (await ask.boundingBox())!.width)
-    .toBeGreaterThan(railWidth * 3);
-
-  // Once there is a conversation it STAYS open — a thread you cannot see is worse
-  // than a wide column.
+  await expect(page.locator("aside.ask")).toHaveCount(0);
   await openAsk(page);
-  await page.getByRole("textbox", { name: /Ask a question/i }).fill("who is late?");
-  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  const ask = page.locator("aside.ask");
+  await expect(ask).toBeVisible();
+  await page
+    .getByRole("textbox", { name: /Ask a question/i })
+    .fill("who is late?");
+  await submitAsk(page);
   await expect(page.getByText("Two are late.")).toBeVisible();
-  await expect(ask).not.toHaveClass(/is-rail/);
+
+  await ask.getByRole("button", { name: "Close Ask" }).click();
+  await expect(ask).toHaveCount(0);
+  await openAsk(page);
+  await expect(page.getByText("who is late?")).toBeVisible();
+  await expect(page.getByText("Two are late.")).toBeVisible();
 });
 
 test("Dashboards: a board can be renamed, and a leading emoji becomes its emoji", async ({
@@ -391,7 +453,9 @@ test("Dashboards: a board can be renamed, and a leading emoji becomes its emoji"
   expect(sent.emoji).toBe("👨‍👩‍👧");
 });
 
-test("Dashboards: renaming with no emoji clears the old one", async ({ page }) => {
+test("Dashboards: renaming with no emoji clears the old one", async ({
+  page,
+}) => {
   // Dropping the field instead of sending "" would leave the previous emoji in place,
   // making the picture impossible to remove once set.
   await mockTauri(
@@ -431,11 +495,16 @@ test("Dashboards: deleting a board takes two clicks, and the first one is revers
     page,
     {
       delete_dashboard: () => {
-        (globalThis as any).__deleted = ((globalThis as any).__deleted ?? 0) + 1;
+        (globalThis as any).__deleted =
+          ((globalThis as any).__deleted ?? 0) + 1;
         return true;
       },
     },
-    { list_dashboards: BOARDS, get_dashboard: BOARD_DETAIL, get_dashboard_sources: [] },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [],
+    },
   );
 
   await page.goto("/dashboards");
@@ -443,7 +512,9 @@ test("Dashboards: deleting a board takes two clicks, and the first one is revers
 
   // FIRST click arms — it must not delete.
   await card.getByRole("button", { name: /^Delete / }).click();
-  await expect(card.getByRole("button", { name: /^Confirm delete / })).toBeVisible();
+  await expect(
+    card.getByRole("button", { name: /^Confirm delete / }),
+  ).toBeVisible();
   expect(await page.evaluate(() => (globalThis as any).__deleted ?? 0)).toBe(0);
 
   // Backing out leaves the board alone…
@@ -471,7 +542,11 @@ test("Dashboards: navigating away mid-ask does not leave the next board stuck bu
     {
       ask_vault: async () => {
         await new Promise((r) => setTimeout(r, 1500));
-        return { answer: "answer for the first board", sources: [], citations: [] };
+        return {
+          answer: "answer for the first board",
+          sources: [],
+          citations: [],
+        };
       },
     },
     {
@@ -483,8 +558,10 @@ test("Dashboards: navigating away mid-ask does not leave the next board stuck bu
 
   await page.goto("/dashboards/b-dense");
   await openAsk(page);
-  await page.getByRole("textbox", { name: /Ask a question/i }).fill("slow question");
-  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: /Ask a question/i })
+    .fill("slow question");
+  await submitAsk(page);
 
   // Leave while it is still running, then come back.
   await page.goto("/dashboards");
@@ -492,13 +569,21 @@ test("Dashboards: navigating away mid-ask does not leave the next board stuck bu
   await openAsk(page);
 
   // The Ask control is USABLE — not stuck behind a dead request…
-  await page.getByRole("textbox", { name: /Ask a question/i }).fill("a fresh question");
-  await expect(page.getByRole("button", { name: "Ask", exact: true })).toBeEnabled();
+  await page
+    .getByRole("textbox", { name: /Ask a question/i })
+    .fill("a fresh question");
+  await expect(
+    page
+      .getByLabel("Ask this board")
+      .getByRole("button", { name: "Ask", exact: true }),
+  ).toBeEnabled();
   // …and the previous board's thread did not follow us here.
   await expect(page.getByText("slow question")).toHaveCount(0);
   await expect(page.getByText("answer for the first board")).toHaveCount(0);
 });
-test("Dashboards: sealed material-only board still asks with its board id", async ({ page }) => {
+test("Dashboards: sealed material-only board still asks with its board id", async ({
+  page,
+}) => {
   // The board scopes the ask even when it has nothing readable to SHOW. Deciding on
   // the resolved payload made this unreachable: every tile resolves to `locked`, the
   // old count was zero, and the UI told the user to add tiles to a board that has
@@ -522,12 +607,9 @@ test("Dashboards: sealed material-only board still asks with its board id", asyn
         };
       },
       // A board-scoped answer may contain DERIVED-tile material — rows the board
-      // composed, not documents the user pinned. Nothing may persist it: the
-      // living-answer cache is gated by a stamp of readable folders, and only
-      // `refreshAnswer` writes that cache — deliberately calling `askVault` with FOUR
-      // arguments, so `dashboardId` stays `undefined` and no brief is rendered into a
-      // stored answer. That property is implicit; it survives only while nobody adds a
-      // sixth argument there, which is why it is pinned rather than left to a comment.
+      // composed, not documents the user pinned. Board Ask deliberately keeps
+      // persistence disabled; pin the absence of `set_dashboard_answer` calls so
+      // a future refactor cannot silently turn an ephemeral answer into a cache.
       set_dashboard_answer: () => {
         (globalThis as any).__setDashboardAnswerCalls =
           ((globalThis as any).__setDashboardAnswerCalls ?? 0) + 1;
@@ -549,16 +631,22 @@ test("Dashboards: sealed material-only board still asks with its board id", asyn
   );
 
   await page.goto("/dashboards/b-dense");
+  await enterCompose(page);
   await expect(page.locator("app-dashboard-tile")).toHaveCount(3);
+  await page.getByRole("button", { name: "Done", exact: true }).click();
 
-  // The Ask column starts collapsed to its rail, so expand it the way a user does.
+  // Ask is not mounted until explicitly opened.
   await openAsk(page);
-  await page.getByRole("textbox", { name: /Ask a question/i }).fill("who owes me?");
-  await page.getByRole("button", { name: "Ask", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: /Ask a question/i })
+    .fill("who owes me?");
+  await submitAsk(page);
 
   // It ASKED — no dead end, and the answer names the real situation (locked tiles)
   // rather than telling the user to go record a meeting.
-  await expect(page.getByText(/Nothing on this board is readable/)).toBeVisible();
+  await expect(
+    page.getByText(/Nothing on this board is readable/),
+  ).toBeVisible();
   // …and it sent the board id, which is what makes the backend scope the request
   // instead of falling through to a vault-wide search.
   const sent = await page.evaluate(() => (globalThis as any).__askArgs);

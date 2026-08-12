@@ -32,6 +32,26 @@
 
   @if (editing()) {
     <div class="tile-tools">
+      <button
+        type="button"
+        class="tool"
+        [disabled]="!canMoveEarlier()"
+        (click)="moveEarlier.emit()"
+        aria-label="Move tile earlier"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>
+      </button>
+      <button
+        type="button"
+        class="tool"
+        [disabled]="!canMoveLater()"
+        (click)="moveLater.emit()"
+        aria-label="Move tile later"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><path d="M12 5v14m6-6-6 6-6-6" /></svg>
+      </button>
       <button type="button" class="tool" (click)="narrow.emit()" aria-label="Make tile narrower">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
              stroke-linecap="round"><path d="M15 6l-6 6 6 6" /></svg>
@@ -257,21 +277,25 @@
     @if (la.withheld) {
       <p class="muted">
         🔒 The saved answer is hidden — one of the sources it was built from is sealed.
-        Unlock it and re-answer.
+        Unlock its sources to reveal it.
       </p>
     } @else if (la.answer) {
       <p class="answer">{{ la.answer }}</p>
     } @else {
-      <p class="muted">Not answered yet — ask it once and the answer lives here.</p>
+      <p class="muted">No saved answer yet.</p>
     }
+    @if (la.answeredAt || allowRefreshAnswer()) {
     <div class="answer-foot">
       @if (la.answeredAt) {
         <span class="muted-small">answered {{ formatDate(la.answeredAt) }}</span>
       }
+      @if (allowRefreshAnswer()) {
       <button type="button" class="btn btn-ghost btn-sm" (click)="refreshAnswer.emit()">
         Re-answer
       </button>
+      }
     </div>
+    }
   }
 </div>
 }
