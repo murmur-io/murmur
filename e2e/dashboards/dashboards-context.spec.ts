@@ -41,6 +41,41 @@ const BOARDS = [
   },
 ];
 
+async function enterCompose(
+  page: import("@playwright/test").Page,
+): Promise<void> {
+  if (
+    !(await page.locator('section[aria-label="Compose board tiles"]').count())
+  ) {
+    await page.getByRole("button", { name: "Compose", exact: true }).click();
+  }
+  await page.locator('section[aria-label="Compose board tiles"]').waitFor();
+}
+
+async function openPalette(page: import("@playwright/test").Page) {
+  // Board resolution is asynchronous. Waiting for either stable entry action
+  // avoids racing the loading state and then committing to a Compose button
+  // that cannot exist on an empty board.
+  await page
+    .locator(
+      'button:has-text("Add a Note, Recording or Document"), button:has-text("Compose")',
+    )
+    .first()
+    .waitFor();
+  const emptyAction = page.getByRole("button", {
+    name: "Add a Note, Recording or Document",
+  });
+  if (await emptyAction.isVisible()) {
+    await emptyAction.click();
+  } else {
+    await enterCompose(page);
+    await page.getByRole("button", { name: "Add to board" }).click();
+  }
+  const palette = page.getByRole("dialog", { name: "Add to board" });
+  await palette.waitFor();
+  return palette;
+}
+
 test("Ask: a dashboard can be picked as scope and expands to its visible sources", async ({
   page,
 }) => {
@@ -58,7 +93,10 @@ test("Ask: a dashboard can be picked as scope and expands to its visible sources
   );
 
   await page.goto("/ask");
-  await page.getByRole("button", { name: /Source/ }).first().click();
+  await page
+    .getByRole("button", { name: /Source/ })
+    .first()
+    .click();
 
   // Boards are offered ABOVE notes/meetings — the user's own declaration of scope.
   const picker = page.locator(".sp-list");
@@ -70,22 +108,50 @@ test("Ask: a dashboard can be picked as scope and expands to its visible sources
   await picker.getByRole("option", { name: /Atlas GA/ }).click();
 
   // Picking the board added BOTH of its visible sources as chips.
-  await expect(page.locator(".sp-chip, .sp .pill")).toHaveCount(2, { timeout: 5000 });
+  await expect(page.locator(".sp-chip, .sp .pill")).toHaveCount(2, {
+    timeout: 5000,
+  });
 });
 
-test("Dashboards: Arrange mode makes tiles draggable and persists a reorder", async ({
+test("Dashboards: Compose makes tiles draggable and persists a reorder", async ({
   page,
 }) => {
   const tiles = [
     {
-      id: "t-a", dashboardId: "b-atlas", kind: "note", refId: "n-1", title: null,
-      span: 4, position: 0, config: null, createdAt: "2026-08-01T09:00:00Z",
-      data: { kind: "note", id: "n-1", title: "FIRST TILE", snippet: "a", updatedAt: 1 },
+      id: "t-a",
+      dashboardId: "b-atlas",
+      kind: "note",
+      refId: "n-1",
+      title: null,
+      span: 4,
+      position: 0,
+      config: null,
+      createdAt: "2026-08-01T09:00:00Z",
+      data: {
+        kind: "note",
+        id: "n-1",
+        title: "FIRST TILE",
+        snippet: "a",
+        updatedAt: 1,
+      },
     },
     {
-      id: "t-b", dashboardId: "b-atlas", kind: "note", refId: "n-2", title: null,
-      span: 4, position: 1, config: null, createdAt: "2026-08-01T09:00:00Z",
-      data: { kind: "note", id: "n-2", title: "SECOND TILE", snippet: "b", updatedAt: 1 },
+      id: "t-b",
+      dashboardId: "b-atlas",
+      kind: "note",
+      refId: "n-2",
+      title: null,
+      span: 4,
+      position: 1,
+      config: null,
+      createdAt: "2026-08-01T09:00:00Z",
+      data: {
+        kind: "note",
+        id: "n-2",
+        title: "SECOND TILE",
+        snippet: "b",
+        updatedAt: 1,
+      },
     },
   ];
 
@@ -93,7 +159,8 @@ test("Dashboards: Arrange mode makes tiles draggable and persists a reorder", as
     page,
     {
       reorder_dashboard_tiles: (args: { tileIds?: string[] }) => {
-        (window as unknown as { __reorder?: string[] }).__reorder = args?.tileIds;
+        (window as unknown as { __reorder?: string[] }).__reorder =
+          args?.tileIds;
         return null;
       },
     },
@@ -105,16 +172,12 @@ test("Dashboards: Arrange mode makes tiles draggable and persists a reorder", as
   );
 
   await page.goto("/dashboards/b-atlas");
-  await expect(page.getByText("FIRST TILE")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "FIRST TILE" })).toBeVisible();
 
-  // Not draggable until Arrange mode is on — a board is read-first.
-  await expect(page.locator("app-dashboard-tile").first()).not.toHaveAttribute(
-    "draggable",
-    "true",
-  );
-
-  await page.getByRole("button", { name: "Arrange" }).click();
-  await expect(page.getByText(/drag tiles to reorder/)).toBeVisible();
+  // The peer-card grid does not exist until the explicit Compose mode is entered.
+  await expect(page.locator("app-dashboard-tile")).toHaveCount(0);
+  await enterCompose(page);
+  await expect(page.getByText(/Drag or use Move earlier/)).toBeVisible();
   await expect(page.locator("app-dashboard-tile").first()).toHaveAttribute(
     "draggable",
     "true",
@@ -128,7 +191,9 @@ test("Dashboards: Arrange mode makes tiles draggable and persists a reorder", as
   // The backend was asked for the NEW order, second tile first.
   await expect
     .poll(() =>
-      page.evaluate(() => (window as unknown as { __reorder?: string[] }).__reorder),
+      page.evaluate(
+        () => (window as unknown as { __reorder?: string[] }).__reorder,
+      ),
     )
     .toEqual(["t-b", "t-a"]);
 });
@@ -156,15 +221,7 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   );
 
   await page.goto("/dashboards/b-atlas");
-  await page.getByRole("button", { name: "Add tile" }).click();
-
-  // The trigger reflects state, so "the click landed" and "the palette rendered"
-  // are separately observable — the two failures that looked identical in the
-  // original bug report.
-  await expect(page.getByRole("button", { name: "Close", exact: true })).toBeVisible();
-
-  const palette = page.getByRole("dialog", { name: "Add a tile" });
-  await expect(palette).toBeVisible();
+  const palette = await openPalette(page);
 
   // It must be rendered by `app-shell`, NOT inside the board. That is the whole
   // fix: an overlay whose only ancestors are <body>/<html> has no containing
@@ -173,7 +230,8 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
   // the packaged webview as in the engines this suite runs.
   const ancestry = await page.evaluate(() => {
     const el = document.querySelector(".tp-overlay");
-    if (!el) return { found: false, insideBoard: true, containingBlocks: ["missing"] };
+    if (!el)
+      return { found: false, insideBoard: true, containingBlocks: ["missing"] };
     const containingBlocks: string[] = [];
     for (let n = el.parentElement; n; n = n.parentElement) {
       const cs = getComputedStyle(n);
@@ -185,7 +243,9 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
         cs.contain,
         cs.willChange,
       ];
-      if (traps.some((v) => v && v !== "none" && v !== "auto" && v !== "normal")) {
+      if (
+        traps.some((v) => v && v !== "none" && v !== "auto" && v !== "normal")
+      ) {
         containingBlocks.push(n.tagName.toLowerCase());
       }
     }
@@ -229,17 +289,28 @@ test("Dashboards: the tile palette escapes every containing block and lands in t
     const el = document.querySelector(".palette");
     if (!el) return "no-palette";
     const r = el.getBoundingClientRect();
-    const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-    return el.contains(top) ? "palette" : (top?.className?.toString() ?? "unknown");
+    const top = document.elementFromPoint(
+      r.x + r.width / 2,
+      r.y + r.height / 2,
+    );
+    return el.contains(top)
+      ? "palette"
+      : (top?.className?.toString() ?? "unknown");
   });
-  expect(hit, "the palette centre must be hit-testable, not covered").toBe("palette");
+  expect(hit, "the palette centre must be hit-testable, not covered").toBe(
+    "palette",
+  );
 
   // And a catalogue entry must be clickable end to end (it advances to step 2).
   await palette.locator(".node").first().click();
-  await expect(palette.getByRole("button", { name: /All tiles/ })).toBeVisible();
+  await expect(
+    palette.getByRole("button", { name: /All tiles/ }),
+  ).toBeVisible();
 });
 
-test("Dashboards: the palette still shows on an engine without :modal or showModal", async ({ page }) => {
+test("Dashboards: the palette still shows on an engine without :modal or showModal", async ({
+  page,
+}) => {
   // THE REPORTED FAILURE, reproduced. The trigger flipped to "Close" — so the click
   // landed and the state was right — while nothing appeared on screen. That is what
   // a <dialog> looks like when showModal() throws: it never opens, so it stays
@@ -253,7 +324,10 @@ test("Dashboards: the palette still shows on an engine without :modal or showMod
     const realMatches = Element.prototype.matches;
     Element.prototype.matches = function (sel: string) {
       if (typeof sel === "string" && sel.includes(":modal")) {
-        throw new DOMException("':modal' is not a valid selector", "SyntaxError");
+        throw new DOMException(
+          "':modal' is not a valid selector",
+          "SyntaxError",
+        );
       }
       return realMatches.call(this, sel);
     };
@@ -276,10 +350,11 @@ test("Dashboards: the palette still shows on an engine without :modal or showMod
   );
 
   await page.goto("/dashboards/b-atlas");
-  await page.getByRole("button", { name: "Add tile" }).click();
-
-  const palette = page.getByRole("dialog", { name: "Add a tile" });
-  await expect(palette, "a refused showModal must not leave the palette hidden").toBeVisible();
+  const palette = await openPalette(page);
+  await expect(
+    palette,
+    "a refused showModal must not leave the palette hidden",
+  ).toBeVisible();
   expect(await palette.locator(".node").count()).toBeGreaterThanOrEqual(6);
 
   // On screen, and hit-testable — not merely present in the DOM.
@@ -290,7 +365,9 @@ test("Dashboards: the palette still shows on an engine without :modal or showMod
   const hit = await page.evaluate(() => {
     const el = document.querySelector(".palette")!;
     const r = el.getBoundingClientRect();
-    return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+    return el.contains(
+      document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2),
+    );
   });
   expect(hit, "the fallback palette must be clickable, not covered").toBe(true);
 });
@@ -337,9 +414,7 @@ test("Dashboards: the palette's position does not depend on the board's own subt
   await page.addStyleTag({
     content: "app-dashboard-view { transform: translateY(1200px); }",
   });
-  await page.getByRole("button", { name: "Add tile" }).click();
-
-  const palette = page.getByRole("dialog", { name: "Add a tile" });
+  const palette = await openPalette(page);
   await expect(palette).toBeVisible();
 
   const box = await palette.boundingBox();
@@ -356,7 +431,9 @@ test("Dashboards: the palette's position does not depend on the board's own subt
     const el = document.querySelector(".palette");
     if (!el) return false;
     const r = el.getBoundingClientRect();
-    return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+    return el.contains(
+      document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2),
+    );
   });
   expect(hit, "the palette centre must be hit-testable").toBe(true);
 });
@@ -381,15 +458,42 @@ test("Dashboards: a tile with a malformed payload cannot blank the rest of the U
 
   const brokenTiles = [
     {
-      id: "t-note", dashboardId: "b-atlas", kind: "note", refId: "n-1", title: null,
-      span: 4, position: 0, config: null, createdAt: "2026-08-01T09:00:00Z",
-      data: { kind: "note", id: "n-1", title: "A NOTE", snippet: "s", updatedAt: null },
+      id: "t-note",
+      dashboardId: "b-atlas",
+      kind: "note",
+      refId: "n-1",
+      title: null,
+      span: 4,
+      position: 0,
+      config: null,
+      createdAt: "2026-08-01T09:00:00Z",
+      data: {
+        kind: "note",
+        id: "n-1",
+        title: "A NOTE",
+        snippet: "s",
+        updatedAt: null,
+      },
     },
     {
       // Exactly what the backend used to send: no `startedAt`, no `durationS`, no `hasAudio`.
-      id: "t-rec", dashboardId: "b-atlas", kind: "meeting", refId: "m-1", title: null,
-      span: 4, position: 1, config: null, createdAt: "2026-08-01T09:00:00Z",
-      data: { kind: "meeting", id: "m-1", title: "A RECORDING", started_at: "2026-07-20T02:30:00Z", duration_s: 900, has_audio: true },
+      id: "t-rec",
+      dashboardId: "b-atlas",
+      kind: "meeting",
+      refId: "m-1",
+      title: null,
+      span: 4,
+      position: 1,
+      config: null,
+      createdAt: "2026-08-01T09:00:00Z",
+      data: {
+        kind: "meeting",
+        id: "m-1",
+        title: "A RECORDING",
+        started_at: "2026-07-20T02:30:00Z",
+        duration_s: 900,
+        has_audio: true,
+      },
     },
   ];
 
@@ -410,9 +514,11 @@ test("Dashboards: a tile with a malformed payload cannot blank the rest of the U
 
   // The palette is rendered LATER in the same change-detection pass than the tiles, so it is the
   // thing a throwing tile binding takes down. It must still open, and be populated.
-  await page.getByRole("button", { name: "Add tile" }).click();
-  const palette = page.getByRole("dialog", { name: "Add a tile" });
-  await expect(palette, "a malformed tile must not stop the palette rendering").toBeVisible();
+  const palette = await openPalette(page);
+  await expect(
+    palette,
+    "a malformed tile must not stop the palette rendering",
+  ).toBeVisible();
   expect(
     await palette.locator(".node").count(),
     "the palette's catalogue must render, not just its box",

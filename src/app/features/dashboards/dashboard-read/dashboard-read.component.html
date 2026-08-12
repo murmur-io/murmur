@@ -1,0 +1,171 @@
+<section class="read" [attr.aria-label]="lens() === 'brief' ? 'Board brief' : lens() + ' lens'">
+  @switch (lens()) {
+    @case ("brief") {
+      <div class="dominant">
+        <span class="eyebrow">{{ projection().dominant.label }}</span>
+        <h2>{{ projection().dominant.title }}</h2>
+        <p>{{ projection().dominant.detail }}</p>
+        @if (projection().dominant.answeredAt; as answeredAt) {
+          <p class="answer-age">Answered {{ formatDate(answeredAt) }}</p>
+        }
+        @if (projection().dominant.source; as source) {
+          <button type="button" class="source-action" (click)="open(source)">
+            Open source <span aria-hidden="true">→</span>
+          </button>
+        }
+      </div>
+
+      <div class="brief-grid">
+        <section class="read-card" aria-labelledby="attention-title">
+          <header class="section-head">
+            <h3 id="attention-title">Needs attention</h3>
+            <span>{{ projection().attention.length }}</span>
+          </header>
+          @if (projection().attention.length === 0) {
+            <p class="good"><span aria-hidden="true">✓</span> No due or overdue items</p>
+          } @else {
+            <ul class="read-list">
+              @for (row of projection().attention; track row.id) {
+                <li>
+                  <button type="button" class="read-row" [disabled]="!row.source" (click)="open(row.source)">
+                    <span class="row-title">{{ row.text }}</span>
+                    <span class="row-meta">{{ row.category }}@if (row.meta) { · {{ row.meta }}}</span>
+                  </button>
+                  <span class="status">{{ row.status }}</span>
+                </li>
+              }
+            </ul>
+          }
+        </section>
+
+        <section class="read-card" aria-labelledby="evidence-title">
+          <header class="section-head">
+            <h3 id="evidence-title">Recent evidence</h3>
+            <span>{{ projection().evidence.length }}</span>
+          </header>
+          @if (projection().evidence.length === 0) {
+            <p class="muted">No readable material sources on this board.</p>
+          } @else {
+            <ul class="read-list">
+              @for (source of projection().evidence; track source.id) {
+                <li>
+                  <button type="button" class="read-row" (click)="open(source.source)">
+                    <span class="row-title">{{ source.title }}</span>
+                    <span class="row-meta">{{ source.label }} · {{ source.detail }}</span>
+                  </button>
+                </li>
+              }
+            </ul>
+          }
+        </section>
+      </div>
+    }
+
+    @case ("overview") {
+      <div class="lens-head">
+        <span class="eyebrow">Overview</span>
+        <h2>The board at a glance</h2>
+        <p>Counts describe the readable board payload plus history the backend explicitly marks as superseded.</p>
+      </div>
+      <dl class="metrics">
+        <div><dt>Readable sources</dt><dd>{{ projection().readableMaterialCount }}</dd></div>
+        <div><dt>Derived views</dt><dd>{{ projection().derivedViewCount }}</dd></div>
+        <div><dt>People</dt><dd>{{ projection().people.length }}</dd></div>
+        <div><dt>Open items</dt><dd>{{ projection().commitments.length }}</dd></div>
+        <div><dt>Superseded values</dt><dd>{{ projection().supersededStates.length }}</dd></div>
+      </dl>
+      @if (projection().supersededStates.length > 0) {
+        <section class="read-card" aria-labelledby="superseded-title">
+          <header class="section-head">
+            <h3 id="superseded-title">Superseded past state</h3>
+            <span>{{ projection().supersededStates.length }}</span>
+          </header>
+          <ul class="read-list">
+            @for (state of projection().supersededStates; track state.id) {
+              <li>
+                <button type="button" class="read-row" [disabled]="!state.source" (click)="open(state.source)">
+                  <span class="row-title">{{ state.entity }} · {{ state.predicate || "history" }}: {{ state.value }}</span>
+                  <span class="row-meta">Superseded@if (state.meta) { · {{ state.meta }}}</span>
+                </button>
+                <span class="past-status">past state</span>
+              </li>
+            }
+          </ul>
+        </section>
+      }
+    }
+
+    @case ("commitments") {
+      <div class="lens-head">
+        <span class="eyebrow">Commitments</span>
+        <h2>Promises and reminders</h2>
+        <p>Only rows already resolved by this board are shown.</p>
+      </div>
+      @if (projection().commitments.length === 0) {
+        @if (projection().hasGoodZero) {
+          <div class="positive-zero"><span aria-hidden="true">✓</span><strong>Nothing open</strong><p>Configured commitment views currently have no rows.</p></div>
+        } @else {
+          <p class="muted">No commitment or reminder view is configured on this board.</p>
+        }
+      } @else {
+        <ul class="read-list lens-list">
+          @for (row of projection().commitments; track row.id) {
+            <li>
+              <button type="button" class="read-row" [disabled]="!row.source" (click)="open(row.source)">
+                <span class="row-title">{{ row.text }}</span>
+                <span class="row-meta">{{ row.category }}@if (row.meta) { · {{ row.meta }}}</span>
+              </button>
+              @if (row.status) { <span class="status">{{ row.status }}</span> }
+            </li>
+          }
+        </ul>
+      }
+    }
+
+    @case ("sources") {
+      <div class="lens-head">
+        <span class="eyebrow">Sources</span>
+        <h2>Material in this board</h2>
+        <p>Notes, recordings and documents are distinct from derived board views.</p>
+      </div>
+      <ul class="source-list">
+        @for (source of projection().sources; track source.id) {
+          <li>
+            <button type="button" (click)="open(source.source)">
+              <span class="source-mark" [attr.data-kind]="source.kind"><mur-icon [icon]="source.kind === 'meeting' ? 'meetings' : source.kind === 'note' ? 'notes' : 'document'" /></span>
+              <span><strong>{{ source.title }}</strong><small>{{ source.label }} · {{ source.detail }}</small></span>
+              <span aria-hidden="true">→</span>
+            </button>
+          </li>
+        }
+      </ul>
+      @if (projection().sources.length === 0) { <p class="muted">No readable material sources.</p> }
+    }
+
+    @case ("people") {
+      <div class="lens-head">
+        <span class="eyebrow">People</span>
+        <h2>Explicit people views</h2>
+        <p>People are not inferred from source titles or commitment text.</p>
+      </div>
+      @if (projection().people.length === 0) {
+        <p class="muted">No Person view is configured on this board.</p>
+      } @else {
+        <ul class="people-list">
+          @for (person of projection().people; track person.id) {
+            <li><strong>{{ person.name }}</strong><span>{{ person.mentionCount }} meetings</span><span>{{ person.openCommitments }} open promises</span></li>
+          }
+        </ul>
+      }
+    }
+  }
+
+  <footer class="boundary" aria-label="Board boundary">
+    <strong>Board boundary</strong>
+    <span>{{ projection().readableMaterialCount }} readable material sources</span>
+    <span>{{ projection().derivedViewCount }} derived views</span>
+    @if (projection().sealedCount > 0) { <span>{{ projection().sealedCount }} sealed and excluded</span> }
+    @if (projection().missingCount > 0) { <span>{{ projection().missingCount }} missing or not configured</span> }
+    @if (projection().supersededStates.length > 0) { <span>{{ projection().supersededStates.length }} superseded past-state {{ projection().supersededStates.length === 1 ? "value" : "values" }}</span> }
+  </footer>
+</section>
