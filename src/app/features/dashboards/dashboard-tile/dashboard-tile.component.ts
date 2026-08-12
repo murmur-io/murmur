@@ -167,6 +167,10 @@ export class DashboardTileComponent {
   readonly cited = input(0);
   /** True while the board is in layout mode (resize / remove affordances shown). */
   readonly editing = input(false);
+  readonly canMoveEarlier = input(false);
+  readonly canMoveLater = input(false);
+  /** Security-sensitive persistence is opt-in; dashboards keep this disabled. */
+  readonly allowRefreshAnswer = input(false);
   /** This tile is the one being dragged. */
   readonly dragging = input(false);
   /** This tile is the current drop target. */
@@ -185,6 +189,8 @@ export class DashboardTileComponent {
   readonly remove = output<void>();
   readonly widen = output<void>();
   readonly narrow = output<void>();
+  readonly moveEarlier = output<void>();
+  readonly moveLater = output<void>();
   readonly openSource = output<SourceRef>();
   readonly refreshAnswer = output<void>();
 

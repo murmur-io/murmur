@@ -18,6 +18,15 @@
 // Arrange mode: the tile becomes a grab target and says so.
 :host(.is-arranging) {
   cursor: grab;
+
+  .tile-head {
+    flex-wrap: wrap;
+  }
+
+  .tile-tools {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
 }
 
 :host(.is-dragging) {
@@ -231,6 +240,11 @@
   &:hover {
     background: var(--surface-hover);
     color: var(--text-primary);
+  }
+
+  &:disabled {
+    opacity: 0.35;
+    cursor: default;
   }
 
   &.danger:hover { color: var(--danger); }
