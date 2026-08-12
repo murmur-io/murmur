@@ -110,9 +110,6 @@
 }
 
 .catalogue {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: var(--space-2);
   padding: var(--space-4) var(--space-5) var(--space-5);
   // Takes the panel's remaining height and scrolls inside it; `min-height: 0` is
   // what lets a flex item shrink below its content instead of forcing the panel
@@ -120,6 +117,25 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+
+  h4 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 0.84rem;
+  }
+}
+
+.group-copy {
+  margin: var(--space-1) 0 var(--space-3);
+  color: var(--text-tertiary);
+  font-size: 0.72rem;
+}
+
+.catalogue-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
 }
 
 .node {

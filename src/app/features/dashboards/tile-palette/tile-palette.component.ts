@@ -29,6 +29,15 @@ interface NodeType {
   family: "note" | "rec" | "person" | "doc" | "insight" | "remind";
 }
 
+const FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "a[href]",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
 /**
  * The tile catalogue. Order is the palette's reading order: material first,
  * then the derived views that are the actual reason to build a board.
@@ -109,7 +118,7 @@ const NODE_TYPES: NodeType[] = [
   {
     kind: "living_answer",
     name: "Living answer",
-    description: "A pinned question whose answer you can re-run any time.",
+    description: "A saved question with its last gated answer, when available.",
     onlyMurmur: true,
     mode: "question",
     family: "insight",
@@ -166,6 +175,8 @@ export class TilePaletteComponent {
   readonly choose = output<TileChoice>();
 
   readonly types = NODE_TYPES;
+  readonly sourceTypes = NODE_TYPES.filter((type) => type.mode === "link");
+  readonly viewTypes = NODE_TYPES.filter((type) => type.mode !== "link");
 
   /** The kind being configured; `null` ⇒ the catalogue step. */
   readonly selected = signal<NodeType | null>(null);
@@ -184,9 +195,13 @@ export class TilePaletteComponent {
    * on its own when the `@switch` swaps the step in, with no call site to forget.
    */
   private readonly searchField = viewChild<ElementRef<HTMLInputElement>>("searchField");
+  private readonly panel = viewChild<ElementRef<HTMLElement>>("panel");
+  private readonly firstChoice = viewChild<ElementRef<HTMLButtonElement>>("firstChoice");
 
   private readonly _focusField = effect(() => {
-    this.searchField()?.nativeElement.focus();
+    const field = this.searchField()?.nativeElement;
+    if (field) field.focus();
+    else this.firstChoice()?.nativeElement.focus();
   });
 
   readonly filteredEntities = computed(() => {
@@ -296,10 +311,35 @@ export class TilePaletteComponent {
    * which KIND of tile you wanted is a needless step backwards.
    */
   onKeydown(event: KeyboardEvent): void {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    if (this.selected()) this.back();
-    else this.dismiss.emit();
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (this.selected()) this.back();
+      else this.dismiss.emit();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const panel = this.panel()?.nativeElement;
+    if (!panel) return;
+    const focusable = [...panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)]
+      .filter((element) => element.getClientRects().length > 0);
+    if (focusable.length === 0) {
+      event.preventDefault();
+      panel.focus();
+      return;
+    }
+    const active = document.activeElement;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!focusable.includes(active as HTMLElement)) {
+      event.preventDefault();
+      first.focus();
+    } else if (event.shiftKey && active === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 
 }

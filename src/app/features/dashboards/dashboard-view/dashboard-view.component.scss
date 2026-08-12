@@ -1,360 +1,54 @@
-// One board: the tile canvas + the board-scoped Ask column. Tokens only.
-:host {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  padding: 0 var(--space-2) var(--space-5);
-}
+:host { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 0 var(--space-2) var(--space-5); }
+.head { display: flex; align-items: flex-end; gap: var(--space-2); padding: var(--space-2) 0 var(--space-4); }
+.head-text { flex: 1; min-width: 0; }
+.head h1 { margin: var(--space-1) 0 0; font-size: 1.5rem; font-weight: 680; letter-spacing: -0.035em; }
+.crumb { padding: 0; border: 0; background: none; color: var(--text-muted); font: inherit; font-size: 0.76rem; cursor: pointer; }
+.crumb:hover { color: var(--text-primary); }
+.emoji { font-size: 1.35rem; line-height: 1; }
+.title-edit { display: inline-flex; align-items: center; gap: var(--space-2); margin-left: calc(var(--space-2) * -1); padding: var(--space-1) var(--space-2); border: 1px solid transparent; border-radius: var(--radius-sm); background: none; color: inherit; font: inherit; cursor: text; }
+.title-edit:hover, .title-edit:focus-visible { border-color: var(--border-subtle); background: var(--surface-input); }
+.rename { display: flex; align-items: center; gap: var(--space-2); }
+.rename-field { min-width: 260px; padding: var(--space-1) var(--space-2); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-input); color: var(--text-primary); font-size: 1.05rem; font-weight: 640; }
+.head mur-icon { width: var(--space-4); height: var(--space-4); }
+.compose-hint { color: var(--text-tertiary); font-size: 0.72rem; white-space: nowrap; }
+.banner-error { margin-bottom: var(--space-3); }
+.empty-copy { max-width: 48ch; margin: var(--space-2) auto var(--space-4); color: var(--text-muted); }
 
-.head {
-  display: flex;
-  align-items: flex-end;
-  gap: var(--space-2);
-  padding: var(--space-2) 0 var(--space-4);
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-4); min-width: 0; min-height: 0; flex: 1; }
+.workspace.has-ask { grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); }
+.reading { min-width: 0; overflow: auto; padding-bottom: var(--space-5); }
+.lenses { display: flex; gap: var(--space-1); margin-bottom: var(--space-4); padding: var(--space-1); overflow-x: auto; border: 1px solid var(--border-subtle); border-radius: var(--radius-pill); background: var(--surface-input); width: max-content; max-width: 100%; }
+.lenses button { flex: none; padding: var(--space-2) var(--space-3); border: 0; border-radius: var(--radius-pill); background: none; color: var(--text-secondary); font: inherit; font-size: 0.76rem; cursor: pointer; }
+.lenses button.active { background: var(--shell-active-bg); color: var(--shell-active-text); box-shadow: var(--shell-active-shadow); }
 
-  h1 {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    margin: 2px 0 0;
-    font-size: 1.5rem;
-    font-weight: 680;
-    letter-spacing: -0.035em;
-  }
-}
+.compose { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); grid-auto-rows: max-content; align-content: start; gap: var(--space-3); min-width: 0; overflow: auto; padding-bottom: var(--space-5); }
 
-.head-text {
-  flex: 1;
-  min-width: 0;
-}
+.ask { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-raised); backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate)); }
+.ask-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border-subtle); }
+.ask-head h2 { margin: var(--space-1) 0 0; font-size: 0.88rem; }
+.eyebrow { color: var(--text-tertiary); font-size: 0.64rem; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }
+.scope { margin: var(--space-3) var(--space-4) 0; padding: var(--space-3); border: 1px solid var(--accent-ring); border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--text-secondary); font-size: 0.7rem; line-height: 1.5; }
+.scope span { display: block; margin-top: var(--space-1); color: var(--text-tertiary); }
+.thread { display: flex; flex: 1; flex-direction: column; gap: var(--space-3); min-height: 0; overflow: auto; padding: var(--space-4); }
+.thread .banner { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); font-size: 0.8rem; }
+.bubble { padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-input); color: var(--text-secondary); font-size: 0.8rem; line-height: 1.6; }
+.bubble.me { align-self: flex-end; max-width: 88%; border-color: transparent; background: var(--accent); color: var(--text-on-accent); white-space: pre-wrap; }
+.bubble.thinking { display: flex; align-items: center; gap: var(--space-2); color: var(--text-muted); }
+.suggestions { display: flex; flex-direction: column; gap: var(--space-2); }
+.suggestion { padding: var(--space-2) var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--surface-input); color: var(--text-secondary); font: inherit; font-size: 0.76rem; text-align: left; cursor: pointer; }
+.suggestion:hover { background: var(--surface-hover); color: var(--text-primary); }
+.composer { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3); border-top: 1px solid var(--border-subtle); }
+.ask-field { flex: 1; min-width: 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-pill); background: var(--surface-input); color: var(--text-primary); font: inherit; font-size: 0.78rem; }
+.ask-field:focus-visible { outline: none; border-color: var(--accent-ring); box-shadow: 0 0 0 var(--space-1) var(--accent-soft); }
 
-.crumb {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: 0.76rem;
-  cursor: pointer;
-
-  &:hover { color: var(--text-primary); }
-}
-
-.emoji {
-  font-size: 1.35rem;
-  line-height: 1;
-}
-
-.arrange-hint {
-  color: var(--text-muted);
-  font-size: 0.72rem;
-  white-space: nowrap;
-}
-
-.board {
-  display: flex;
-  gap: var(--space-3);
-  min-height: 0;
-  flex: 1;
-}
-
-// The 12-column grid the tile spans map onto. `grid-auto-rows: max-content` is
-// load-bearing: with `auto` rows the browser distributes the container height
-// evenly and every tile clips its own content.
-.canvas {
-  display: grid;
-  grid-template-columns: repeat(12, 1fr);
-  grid-auto-rows: max-content;
-  align-content: start;
-  gap: var(--space-3);
-  flex: 1;
-  min-width: 0;
-  overflow: auto;
-  padding-bottom: var(--space-5);
-}
-
-.canvas mur-empty-state {
-  grid-column: span 12;
-}
-
-.empty-copy {
-  max-width: 46ch;
-  margin: var(--space-2) auto var(--space-4);
-  color: var(--text-muted);
-}
-
-// ── Ask column ───────────────────────────────────────────────────────────────
-// In-flow panel ⇒ the frosted card surface is correct here (T3 applies to
-// FLOATING overlays only).
-.ask {
-  display: flex;
-  flex-direction: column;
-  flex: 0 0 380px;
-  max-width: 380px;
-  transition: flex-basis var(--transition), max-width var(--transition);
-  min-height: 0;
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--surface-raised);
-  backdrop-filter: blur(18px) saturate(140%);
-}
-
-// Collapsed: a 44px rail that still carries the scope count.
-.ask.is-rail {
-  flex: 0 0 44px;
-  max-width: 44px;
-  background: var(--surface-input);
-  backdrop-filter: none;
-}
-
-.ask-rail {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-3);
-  width: 100%;
-  height: 100%;
-  padding: var(--space-3) 0;
-  border: 0;
-  background: none;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: color var(--transition-fast);
-
-  &:hover,
-  &:focus-visible {
-    color: var(--text-primary);
-  }
-
-  mur-icon {
-    flex: none;
-    width: 18px;
-    height: 18px;
-  }
-}
-
-// The label reads bottom-to-top up the rail, so the count stays legible in 44px.
-.rail-label {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-  font-size: 0.6875rem;
-  line-height: 1.35;
-  letter-spacing: 0.02em;
-  white-space: nowrap;
-}
-
-.rail-count {
-  color: var(--text-tertiary);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ask {
-    transition: none;
-  }
-}
-
-.ask-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-
-  h2 {
-    margin: 0;
-    font-size: 0.82rem;
-    font-weight: 640;
-    color: var(--text-primary);
-  }
-}
-
-.scope {
-  margin: var(--space-3) var(--space-4) 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--accent-ring);
-  border-radius: var(--radius-sm);
-  background: var(--accent-soft);
-  color: var(--text-secondary);
-  font-size: 0.72rem;
-  line-height: 1.5;
-
-  strong { color: var(--text-primary); }
-}
-
-.scope-sealed {
-  display: block;
-  margin-top: 2px;
-  color: var(--text-muted);
-}
-
-.thread {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: var(--space-4);
-}
-
-.thread .banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  font-size: 0.8rem;
-}
-
-.bubble {
-  padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  border-bottom-left-radius: var(--radius-sm);
-  background: var(--surface-input);
-  color: var(--text-secondary);
-  font-size: 0.8rem;
-  line-height: 1.6;
-
-  // `white-space: pre-wrap` belongs to text that is NOT parsed. An assistant turn
-  // now renders through `app-markdown`, where pre-wrap would preserve the source
-  // newlines around every block element and double the spacing.
-  &.me {
-    white-space: pre-wrap;
-  }
-
-  &.me {
-    align-self: flex-end;
-    max-width: 88%;
-    border-color: transparent;
-    border-radius: var(--radius-md);
-    border-bottom-right-radius: var(--radius-sm);
-    background: var(--accent);
-    color: var(--text-on-accent);
-  }
-
-  &.thinking {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    color: var(--text-muted);
-  }
-}
-
-.suggestions {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.suggestion {
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.028);
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.76rem;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background var(--transition-fast),
-    color var(--transition-fast);
-
-  &:hover {
-    background: var(--surface-hover);
-    color: var(--text-primary);
-  }
-}
-
-.composer {
-  display: flex;
-  gap: var(--space-2);
-  align-items: center;
-  padding: var(--space-3);
-  border-top: 1px solid var(--border-subtle);
-}
-
-.ask-field {
-  flex: 1;
-  min-width: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 0.78rem;
-
-  &::placeholder { color: var(--text-muted); }
-
-  &:focus-visible {
-    outline: none;
-    border-color: var(--accent-ring);
-    box-shadow: 0 0 0 3px var(--accent-soft);
-  }
-}
-
-.banner-error {
-  margin-bottom: var(--space-3);
-}
-
-// Narrow windows: the Ask column drops under the canvas rather than squeezing it.
 @media (max-width: 1080px) {
-  .board {
-    flex-direction: column;
-  }
-
-  .ask {
-    flex: 1 1 auto;
-    max-width: none;
-    max-height: 420px;
-  }
+  .workspace.has-ask { grid-template-columns: minmax(0, 1fr); }
+  .ask { max-height: 360px; }
+  .secondary-action { margin-left: auto; }
 }
-
-// ── rename ───────────────────────────────────────────────────────────────────
-// The title doubles as the rename control, so it must look like a heading until
-// hovered — a button that shouts is chrome the header does not need.
-.title-edit {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 2px var(--space-2);
-  margin-left: calc(var(--space-2) * -1);
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: none;
-  color: inherit;
-  font: inherit;
-  cursor: text;
-  transition:
-    background var(--transition-fast),
-    border-color var(--transition-fast);
-
-  &:hover,
-  &:focus-visible {
-    border-color: var(--border-subtle);
-    background: var(--surface-input);
-  }
+@media (max-width: 720px) {
+  .head { align-items: center; flex-wrap: wrap; }
+  .head-text { flex-basis: 100%; }
+  .compose-hint { display: none; }
 }
-
-.rename {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.rename-field {
-  min-width: 260px;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--surface-input);
-  color: var(--text-primary);
-  font-size: 1.05rem;
-  font-weight: 640;
-}
+@media (prefers-reduced-motion: reduce) { .lenses button { transition: none; } }
