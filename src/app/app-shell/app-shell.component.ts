@@ -202,6 +202,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     // `.app-main` comment in styles.css. Views that want a narrower reading
     // column own that cap in their own component scss.)
     "(document:keydown)": "onGlobalKeydown($event)",
+    "(window:keydown.escape)": "onWindowEscape($event)",
   },
   templateUrl: "./app-shell.component.html",
   styleUrl: "./app-shell.component.scss",
@@ -617,6 +618,18 @@ export class AppShellComponent {
         void this.tabs.closeTab(activeId);
       }
     }
+  }
+
+  /**
+   * Consume Escape at the main-window shell boundary after document-level
+   * overlay handlers have run. In native macOS fullscreen, an unconsumed Escape
+   * falls through to window chrome (which can hide/minimize Murmur); the app's
+   * own transient UI still receives the event first during normal bubbling.
+   * The separate `/bar` window is outside this shell and keeps its intentional
+   * Escape-to-hide behavior.
+   */
+  onWindowEscape(event: Event): void {
+    event.preventDefault();
   }
 
   /**
