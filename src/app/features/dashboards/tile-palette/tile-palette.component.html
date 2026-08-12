@@ -24,7 +24,7 @@
     (keydown.escape)="dismiss.emit()"
   ></div>
 
-  <div class="palette" role="dialog" aria-modal="true" aria-label="Add a tile">
+  <div #panel class="palette" role="dialog" aria-modal="true" aria-label="Add to board" tabindex="-1">
     @if (selected(); as type) {
       <header class="palette-head">
         <button type="button" class="btn btn-ghost btn-sm back" (click)="back()">← All tiles</button>
@@ -118,17 +118,20 @@
     } @else {
       <header class="palette-head">
         <div>
-          <h3>Add a tile</h3>
+          <h3>Add to board</h3>
           <p>
-            Every tile stays live — it re-reads itself when something new is said.
-            <strong>Only-Murmur</strong> tiles are the ones no vault or cloud notetaker can build.
+            Add material Sources, or a derived View over the board's readable scope.
+            Source picks persist only their reference id.
           </p>
         </div>
       </header>
 
       <div class="catalogue">
-        @for (type of types; track type.kind) {
-          <button type="button" class="node" (click)="pick(type)">
+        <h4>Sources</h4>
+        <p class="group-copy">Readable material you deliberately add to this board.</p>
+        <div class="catalogue-grid source-grid">
+        @for (type of sourceTypes; track type.kind; let first = $first) {
+          <button #firstChoice type="button" class="node" (click)="pick(type)">
             <span class="node-dot" [class]="'dot-' + type.family"></span>
             <span class="node-text">
               <span class="node-name">{{ type.name }}</span>
@@ -139,6 +142,21 @@
             </span>
           </button>
         }
+        </div>
+        <h4>Views</h4>
+        <p class="group-copy">Derived representations; they do not add material to Ask scope.</p>
+        <div class="catalogue-grid">
+        @for (type of viewTypes; track type.kind) {
+          <button type="button" class="node" (click)="pick(type)">
+            <span class="node-dot" [class]="'dot-' + type.family"></span>
+            <span class="node-text">
+              <span class="node-name">{{ type.name }}</span>
+              <span class="node-desc">{{ type.description }}</span>
+              @if (type.onlyMurmur) { <span class="only-badge">only Murmur</span> }
+            </span>
+          </button>
+        }
+        </div>
       </div>
     }
   </div>
