@@ -460,6 +460,21 @@ pub(crate) fn require_current_meeting_content_snapshot(
     require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)
 }
 
+/// Run a bounded meeting-content read only after revalidating its snapshot while holding the seal
+/// lifecycle guard. A relock that wins before this interval prevents `read` from running; a relock
+/// that starts afterwards waits until every plaintext source has been copied into the request.
+/// Callers MUST return from this helper before awaiting provider/network work.
+fn read_current_meeting_content_under_snapshot<T>(
+    state: &AppState,
+    meeting_id: &str,
+    snapshot: &MeetingContentSnapshot,
+    read: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)?;
+    read()
+}
+
 pub(crate) fn meeting_dispatch_admission(
     app: &AppHandle,
     meeting_id: String,
@@ -2606,6 +2621,460 @@ pub struct CompanionAppendResult {
     pub meeting_wikilink: String,
 }
 
+const CONVERTED_NOTE_START: &str = "<!-- murmur:converted-meeting-note -->";
+const CONVERTED_NOTE_END: &str = "<!-- /murmur:converted-meeting-note -->";
+
+/// Resolve one conversion-only template choice without mutating the user's global note style.
+/// `None`/`default` means the current Settings default; built-ins are accepted directly; every
+/// other value must be an existing saved-template id (unknown ids fail closed rather than silently
+/// producing a different shape than the picker showed).
+#[derive(Debug, Clone)]
+struct ConversionTemplateSelection {
+    style: String,
+    saved: Option<crate::storage::models::NoteTemplate>,
+}
+
+fn resolve_conversion_template(
+    requested: Option<&str>,
+    configured_default: &str,
+    saved_templates: Vec<crate::storage::models::NoteTemplate>,
+) -> Result<ConversionTemplateSelection, AppError> {
+    let requested = requested.map(str::trim).filter(|id| !id.is_empty());
+    let selected = match requested {
+        None | Some("default") => configured_default.trim(),
+        Some(id) => id,
+    };
+    if matches!(selected, "" | "standard" | "brief" | "detailed" | "action") {
+        return Ok(ConversionTemplateSelection {
+            style: selected.to_string(),
+            saved: None,
+        });
+    }
+    if let Some(saved) = saved_templates
+        .into_iter()
+        .find(|template| template.id == selected)
+    {
+        return Ok(ConversionTemplateSelection {
+            style: selected.to_string(),
+            saved: Some(saved),
+        });
+    }
+    Err(AppError::InvalidArg(
+        "the selected note template no longer exists".into(),
+    ))
+}
+
+/// Compose a generated conversion into the companion note without ever replacing user-authored
+/// prose. On first conversion the model's front-matter becomes the base (plus Murmur's managed
+/// `meeting:` wikilink). Later conversions replace only the fenced generated block; text before or
+/// after it survives byte-for-byte. The generated front-matter is not allowed to overwrite an
+/// existing note's user-managed front-matter.
+fn compose_converted_companion_markdown(
+    current: &str,
+    meeting_name: &str,
+    generated: &str,
+) -> Result<String, AppError> {
+    let (current_yaml, current_body) = crate::storage::db::split_front_matter(current);
+    let (generated_yaml, generated_body) = crate::storage::db::split_front_matter(generated);
+    let generated_body = generated_body.trim();
+    if generated_body.is_empty() {
+        return Err(AppError::Unavailable(
+            "the note provider returned an empty note".into(),
+        ));
+    }
+    if generated_body.contains(CONVERTED_NOTE_START)
+        || generated_body.contains(CONVERTED_NOTE_END)
+    {
+        return Err(AppError::InvalidArg(
+            "the note provider returned Murmur's reserved conversion markers".into(),
+        ));
+    }
+
+    let managed = format!("{CONVERTED_NOTE_START}\n{generated_body}\n{CONVERTED_NOTE_END}");
+    // Keep every byte outside the managed fence untouched. Emptiness is semantic only; never
+    // `trim_end` user prose because trailing blank lines may be deliberate Markdown formatting.
+    let current_body_is_empty = current_body.trim().is_empty();
+    let starts = current_body
+        .match_indices(CONVERTED_NOTE_START)
+        .collect::<Vec<_>>();
+    let ends = current_body
+        .match_indices(CONVERTED_NOTE_END)
+        .collect::<Vec<_>>();
+    let body = match (starts.as_slice(), ends.as_slice()) {
+        ([(start, _)], [(end, _)]) if start < end => {
+            let suffix_start = *end + CONVERTED_NOTE_END.len();
+            format!(
+                "{}{}{}",
+                &current_body[..*start],
+                managed,
+                &current_body[suffix_start..]
+            )
+        }
+        ([], []) if current_body_is_empty => managed,
+        ([], []) => {
+            let separator = if current_body.ends_with("\n\n") {
+                ""
+            } else if current_body.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            };
+            format!("{current_body}{separator}{managed}")
+        }
+        _ => {
+            return Err(AppError::InvalidArg(
+                "the companion note contains a malformed converted-note block; repair its Murmur markers before converting again".into(),
+            ));
+        }
+    };
+
+    // A newly-created companion has only Murmur's `meeting:` front-matter and no body. In that
+    // state preserve the provider's declarative metadata. Once user content exists, their current
+    // front-matter is authoritative and generated metadata cannot clobber it.
+    let base_yaml = if current_body_is_empty && !generated_yaml.trim().is_empty() {
+        generated_yaml
+    } else {
+        current_yaml
+    };
+    let base = if base_yaml.trim().is_empty() {
+        body
+    } else {
+        format!("---\n{}\n---\n\n{body}", base_yaml.trim())
+    };
+    Ok(stamp_companion_meeting_link_preserving_body(
+        &base,
+        meeting_name,
+    ))
+}
+
+fn conversion_transcript(segments: &[Segment], linked_context: &str) -> String {
+    let mut transcript = segments
+        .iter()
+        .map(|segment| {
+            let speaker = segment.speaker.as_deref().unwrap_or("unknown");
+            format!(
+                "[{:.0}-{:.0}s] ({speaker}) {}",
+                segment.start_s,
+                segment.end_s,
+                segment.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !linked_context.trim().is_empty() {
+        transcript.push_str(
+            "\n\nLINKED CONTEXT (secondary context selected in Related; the primary meeting \
+             transcript above remains the source of truth for this meeting's decisions and tasks)\n",
+        );
+        transcript.push_str(linked_context.trim());
+    }
+    transcript
+}
+
+/// Persist a completed conversion while holding the lock lifecycle across the source-snapshot
+/// recheck and the companion write. This closes the post-provider relock race: a stale generated
+/// result can neither create nor update a note. The companion remains the canonical authored-note
+/// row (`documents.meeting_id` + structured companion edge), and existing body text is preserved.
+fn persist_converted_companion_under_snapshot(
+    state: &AppState,
+    meeting_id: &str,
+    snapshot: &MeetingContentSnapshot,
+    meeting_name: &str,
+    generated: &str,
+) -> Result<CompanionAppendResult, AppError> {
+    let embedder = crate::embed::active_persistence_embedder_if_available();
+    persist_converted_companion_under_snapshot_with(
+        state,
+        meeting_id,
+        snapshot,
+        meeting_name,
+        generated,
+        embedder.as_deref(),
+    )
+}
+
+fn persist_converted_companion_under_snapshot_with(
+    state: &AppState,
+    meeting_id: &str,
+    snapshot: &MeetingContentSnapshot,
+    meeting_name: &str,
+    generated: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<CompanionAppendResult, AppError> {
+    let lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)?;
+    let meeting_wikilink = format!("[[{meeting_name}]]");
+
+    let (note_id, markdown, created) =
+        if let Some(id) = state.db.companion_note_for_meeting(meeting_id)? {
+            let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&id)? else {
+                return Err(AppError::Storage(
+                    "the companion note disappeared during conversion".into(),
+                ));
+            };
+            if !folder_is_unlocked(state, &folder_id)? {
+                return Err(AppError::Locked(
+                    "unlock the companion note's folder before converting this meeting".into(),
+                ));
+            }
+            let row = state
+                .db
+                .get_note_row(&id)?
+                .ok_or_else(|| AppError::Storage("the companion note is unavailable".into()))?;
+            let markdown =
+                compose_converted_companion_markdown(&row.text, meeting_name, generated)?;
+            (id, markdown, false)
+        } else {
+            // Compose/validate BEFORE birth. An empty or malformed provider response leaves no row.
+            let markdown = compose_converted_companion_markdown("", meeting_name, generated)?;
+            let id = create_generated_root_companion_under_lifecycle_authorized(
+                state,
+                meeting_id,
+                meeting_name,
+                &markdown,
+            )?;
+            (id, markdown, true)
+        };
+    if created {
+        // DB canonical state is already complete atomically. Vault export remains a derived,
+        // best-effort projection just like the ordinary note-update path.
+        if let Err(error) = export_note_to_vault_under_lifecycle_authorized(state, &note_id) {
+            tracing::warn!(
+                target: "notes",
+                error = %error,
+                "converted note vault export failed (canonical DB note retained)"
+            );
+        }
+    } else {
+        update_note_doc_under_lifecycle_authorized(state, &note_id, meeting_name, &markdown)?;
+    }
+    drop(lifecycle);
+
+    refresh_note_doc_derived_best_effort(state, &note_id, meeting_name, &markdown, embedder);
+
+    Ok(CompanionAppendResult {
+        note_id,
+        meeting_wikilink,
+    })
+}
+
+/// Birth the conversion companion in the reserved always-open Notes root. Unlike ordinary note
+/// creation this path starts non-empty, but it cannot target a locked folder; consequently it does
+/// not broaden sealed-note birth semantics. Document content, `meeting_id`, and the required
+/// companion edge commit in one DB transaction.
+fn create_generated_root_companion_under_lifecycle_authorized(
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<String, AppError> {
+    let folder_id = state.db.ensure_notes_root()?;
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "the Notes root is unexpectedly locked; the converted note was not created".into(),
+        ));
+    }
+    let title = title.trim();
+    let title = if title.is_empty() {
+        crate::storage::db::UNTITLED_TITLE
+    } else {
+        title
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    validate_attachment_references_before_save(
+        state,
+        &crate::storage::AttachmentOwner::Document {
+            document_id: id.clone(),
+        },
+        markdown,
+    )?;
+    state.db.insert_companion_note_atomic(
+        &id,
+        &folder_id,
+        &crate::export::sanitize_title(title),
+        title,
+        markdown,
+        meeting_id,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    tracing::info!(
+        target: "notes",
+        note_id = %id,
+        meeting_id = %meeting_id,
+        "converted companion note created atomically"
+    );
+    Ok(id)
+}
+
+/// Convert an unlocked meeting and its ACTIVE, visible Related items into the canonical companion
+/// note. This is one bounded Notes-role summarize call through the existing provider factory; cloud
+/// providers therefore retain the consent gate, RedactingProvider and content-free egress ledger.
+#[tauri::command]
+pub async fn convert_meeting_to_note(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+    template_id: Option<String>,
+) -> Result<CompanionAppendResult, AppError> {
+    convert_meeting_to_note_inner_with(
+        Some(&app),
+        state.inner(),
+        meeting_id,
+        template_id,
+        None,
+    )
+    .await
+}
+
+async fn convert_meeting_to_note_inner_with(
+    app: Option<&AppHandle>,
+    state: &AppState,
+    meeting_id: String,
+    template_id: Option<String>,
+    provider_override: Option<
+        std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>,
+    >,
+) -> Result<CompanionAppendResult, AppError> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let target =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config);
+    let snapshot = capture_meeting_content_snapshot(state, &meeting_id)?;
+    let (meeting, segments, manual_notes, linked_context, vault_titles) =
+        read_current_meeting_content_under_snapshot(
+            state,
+            &meeting_id,
+            &snapshot,
+            || {
+                let meeting = state
+                    .db
+                    .get_meeting(&meeting_id)?
+                    .ok_or_else(|| AppError::InvalidArg(format!("no meeting {meeting_id}")))?;
+                let segments = state.db.get_segments(&meeting_id)?;
+                let manual_notes = state.db.get_manual_notes(&meeting_id)?;
+                let unlocked = unlocked_snapshot(state)?;
+                let edges = state.db.links_for_visible(
+                    crate::links::LinkKind::Meeting,
+                    &meeting_id,
+                    &unlocked,
+                )?;
+                let mut sources = Vec::new();
+                let mut vault_titles = Vec::new();
+                for edge in edges.into_iter().filter(|edge| edge.status == "active") {
+                    let Some(kind) = crate::links::LinkKind::parse(&edge.other_kind) else {
+                        continue;
+                    };
+                    sources.push(crate::storage::models::SourceRef {
+                        kind,
+                        id: edge.other_id,
+                    });
+                    if !edge.other_title.trim().is_empty() {
+                        vault_titles.push(edge.other_title);
+                    }
+                }
+                let linked_context =
+                    crate::summarize::vault_context::build_vault_context_exact_visible_with_budget(
+                        &state.db,
+                        &sources,
+                        crate::summarize::vault_context::budget_for(&target.connection),
+                        &unlocked,
+                    )?;
+                Ok((
+                    meeting,
+                    segments,
+                    manual_notes,
+                    linked_context,
+                    vault_titles,
+                ))
+            },
+        )?;
+    if segments.is_empty() {
+        return Err(AppError::InvalidArg(
+            "this meeting has no transcript to convert".into(),
+        ));
+    }
+    let selection = resolve_conversion_template(
+        template_id.as_deref(),
+        &config.note_style,
+        state.db.list_note_templates()?,
+    )?;
+    let provider = match provider_override {
+        Some(provider) => provider,
+        None => crate::summarize::provider_for(
+            crate::summarize::roles::Role::Notes,
+            &config,
+            &state.heavy_inference,
+        )?,
+    };
+    let labeled = segments.iter().any(|segment| segment.speaker.is_some());
+    let diarized_others = segments.iter().any(|segment| {
+        segment
+            .speaker
+            .as_deref()
+            .map(|speaker| speaker.starts_with("others-"))
+            .unwrap_or(false)
+    });
+    let mut template = match selection.saved.as_ref() {
+        Some(saved) => crate::summarize::template::build_template_from_saved(
+            saved,
+            &config.note_language,
+            labeled,
+            diarized_others,
+            &config.user_display_name,
+        ),
+        None => crate::summarize::template::build_template(
+            &selection.style,
+            &config.note_language,
+            labeled,
+            diarized_others,
+            &config.user_display_name,
+        ),
+    };
+    template.push_str(
+        "\n\nCONVERSION CONTEXT: Treat the primary meeting transcript as authoritative. Linked \
+         context is secondary background selected by the user: use it to explain established \
+         context and add valid [[wikilinks]], but never copy another item's decisions or action \
+         items into this meeting unless the primary transcript explicitly supports them.",
+    );
+    // Typed in-meeting notes are part of the user's full meeting context. The source read is gated
+    // by the same meeting snapshot/admission as the transcript and rides `SummarizeRequest` so the
+    // existing RedactingProvider scrubs it before any cloud egress.
+    let request = crate::summarize::SummarizeRequest {
+        transcript: conversion_transcript(&segments, &linked_context),
+        meta: crate::summarize::MeetingMeta {
+            date_iso: meeting.started_at.chars().take(10).collect(),
+            title_hint: meeting.title.clone(),
+            duration_s: meeting.duration_s,
+            language: config.language.clone(),
+        },
+        template,
+        vault_titles,
+        related_context: None,
+        user_notes: (!manual_notes.trim().is_empty()).then_some(manual_notes),
+        live_bullets: None,
+        glossary: crate::summarize::template::render_glossary_for_prompt(&config.glossary),
+    };
+    let generated = match app {
+        Some(app) => {
+            let admission = meeting_dispatch_admission(app, meeting_id.clone(), snapshot.clone());
+            admission.run(|| provider.summarize(&request)).await?
+        }
+        None => provider.summarize(&request).await?,
+    };
+    require_current_meeting_content_snapshot(state, &meeting_id, &snapshot)?;
+    let meeting_name = meeting_display_name(meeting.title.as_deref());
+    persist_converted_companion_under_snapshot(
+        state,
+        &meeting_id,
+        &snapshot,
+        &meeting_name,
+        &generated,
+    )
+}
+
 /// IDEMPOTENTLY ensure the note markdown's YAML front-matter carries `meeting: "[[<name>]]"`, then
 /// APPEND `block` to the body with a blank-line separator. PURE (no DB / no state) so the composition
 /// is unit-testable in isolation. Never blanks existing content: the prior body + prior front-matter
@@ -2617,6 +3086,35 @@ pub struct CompanionAppendResult {
 /// - Front-matter present WITH a `meeting:` key → that line is rewritten to the current name
 ///   (keeps the link correct across a rename); no duplicate key is ever added.
 fn compose_companion_markdown(current: &str, meeting_name: &str, block: &str) -> String {
+    let (yaml, body) = crate::storage::db::split_front_matter(current);
+    let body_trimmed = body.trim_end();
+    let block_trimmed = block.trim();
+    let new_body = if body_trimmed.is_empty() {
+        block_trimmed.to_string()
+    } else if block_trimmed.is_empty() {
+        body_trimmed.to_string()
+    } else {
+        format!("{body_trimmed}\n\n{block_trimmed}")
+    };
+    let body_with_legacy_newline = if new_body.is_empty() {
+        String::new()
+    } else {
+        format!("{new_body}\n")
+    };
+    let with_existing_front_matter = if yaml.is_empty() {
+        body_with_legacy_newline
+    } else if body_with_legacy_newline.is_empty() {
+        format!("---\n{yaml}\n---\n")
+    } else {
+        format!("---\n{yaml}\n---\n\n{body_with_legacy_newline}")
+    };
+    stamp_companion_meeting_link_preserving_body(&with_existing_front_matter, meeting_name)
+}
+
+/// Stamp/refresh only Murmur's top-level `meeting:` YAML key while preserving every BODY byte.
+/// Conversion uses this after an exact managed-fence splice so user-authored trailing whitespace
+/// and Markdown line-break markers cannot be normalized as a side-effect of re-conversion.
+fn stamp_companion_meeting_link_preserving_body(current: &str, meeting_name: &str) -> String {
     let link_value = format!("\"[[{meeting_name}]]\"");
     let (yaml, body) = crate::storage::db::split_front_matter(current);
 
@@ -2644,21 +3142,10 @@ fn compose_companion_markdown(current: &str, meeting_name: &str, block: &str) ->
     }
     let front_matter = format!("---\n{}\n---", fm_lines.join("\n"));
 
-    // Append the block to the body with a blank-line separator (never overwrite prior body).
-    let body_trimmed = body.trim_end();
-    let block_trimmed = block.trim();
-    let new_body = if body_trimmed.is_empty() {
-        block_trimmed.to_string()
-    } else if block_trimmed.is_empty() {
-        body_trimmed.to_string()
-    } else {
-        format!("{body_trimmed}\n\n{block_trimmed}")
-    };
-
-    if new_body.is_empty() {
+    if body.is_empty() {
         format!("{front_matter}\n")
     } else {
-        format!("{front_matter}\n\n{new_body}\n")
+        format!("{front_matter}\n\n{body}")
     }
 }
 
@@ -9676,6 +10163,9 @@ pub(crate) fn assert_in_vault(
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
     pub logged_in: bool,
+    /// Content-free, durable latch set after the first successful account login. It lets the shell
+    /// distinguish an intentionally local-only user from an account whose session was lost.
+    pub account_expected: bool,
     /// Present when logged in: the account email (for display).
     pub email: Option<String>,
     /// True iff MK is in the session (a share can be created without re-auth).
@@ -9689,6 +10179,34 @@ pub struct AccountStatus {
     /// shows the "Unlock with Touch ID" button only when this is set (and `unlockedForSharing` is not).
     /// NO Touch ID prompt is presented to compute this (existence probe only).
     pub biometric_unlock_available: bool,
+}
+
+const ACCOUNT_EXPECTED_SETTING: &str = "sharing_account_expected";
+
+/// Read the content-free account latch and backfill pre-feature installations that still have a
+/// live or persisted session. Once observed it is one-way: a later definitive 401 may clear the
+/// Keychain tokens, but the shell can still explain that sign-in is required. A logged-in upgrade
+/// is not reported as durable until its metadata write succeeds.
+fn account_expected_with_upgrade(state: &AppState, logged_in: bool) -> Result<bool, AppError> {
+    account_expected_with_upgrade_with(state, logged_in, |state| {
+        state.db.set_setting(ACCOUNT_EXPECTED_SETTING, "true")
+    })
+}
+
+fn account_expected_with_upgrade_with(
+    state: &AppState,
+    logged_in: bool,
+    persist_latch: impl FnOnce(&AppState) -> Result<(), AppError>,
+) -> Result<bool, AppError> {
+    let persisted = state
+        .db
+        .get_setting(ACCOUNT_EXPECTED_SETTING)?
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    if logged_in && !persisted {
+        persist_latch(state)?;
+    }
+    Ok(persisted || logged_in)
 }
 
 /// Read the configured sharing-server base URL from the live config (empty ⇒ unset).
@@ -9911,12 +10429,24 @@ async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, 
 /// `account_status` — is there a logged-in sharing account this session, and can it share?
 #[tauri::command]
 pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppError> {
+    account_status_inner_with(
+        state.inner(),
+        crate::share::load_tokens,
+        crate::secrets::keychain::account_mk_cached,
+    )
+}
+
+fn account_status_inner_with(
+    state: &AppState,
+    load_tokens: impl FnOnce() -> Result<Option<crate::share::PersistedTokens>, AppError>,
+    account_mk_cached: impl FnOnce() -> Result<bool, AppError>,
+) -> Result<AccountStatus, AppError> {
     let session = state
         .account_session
         .lock()
         .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
     // Logged-in-but-locked survives a restart via the Keychain tokens even when MK isn't in RAM.
-    let persisted_email = crate::share::load_tokens()?.map(|t| t.email);
+    let persisted_email = load_tokens()?.map(|t| t.email);
     let (logged_in, email, unlocked) = match session.as_ref() {
         Some(s) => (true, Some(s.email.clone()), true),
         None => match persisted_email {
@@ -9924,6 +10454,7 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
             None => (false, None, false),
         },
     };
+    let account_expected = account_expected_with_upgrade(state, logged_in)?;
     // Existence-only probe (NO Touch ID prompt): can a locked session be restored biometrically?
     // The no-prompt existence probe LIES for ACL'd data-protection items on current macOS
     // (2026-07-05 field incident: it reported not-found for items that a prompting read returns),
@@ -9931,7 +10462,7 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
     // whenever a logged-in-but-locked session exists; a tap with no real cached MK fails closed
     // ("no cached account key") and the FE falls back to the password CTA. The probe result still
     // short-circuits `true` when it does find the item.
-    let probe_says_cached = crate::secrets::keychain::account_mk_cached().unwrap_or(false);
+    let probe_says_cached = account_mk_cached().unwrap_or(false);
     let biometric_unlock_available =
         logged_in && (probe_says_cached || cfg!(all(target_os = "macos", not(debug_assertions))));
     let cfg = state
@@ -9940,6 +10471,7 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     Ok(AccountStatus {
         logged_in,
+        account_expected,
         email,
         unlocked_for_sharing: unlocked,
         share_consented: cfg.share_egress_consented,
@@ -10139,8 +10671,7 @@ pub async fn account_login(
     let mk = crate::e2ee::keys::unwrap_mk_pw(&key_material.mk_wrap_pw, &kek_pw, &acct_id)?;
     let generation = key_material.current_generation.unwrap_or(1);
 
-    // Persist tokens + the non-secret generation to the Keychain (never SQLite, never logged).
-    crate::share::store_tokens(&crate::share::PersistedTokens {
+    let persisted_tokens = crate::share::PersistedTokens {
         access_token: access_token.clone(),
         refresh_token: refresh_token.clone(),
         device_id: device_id.clone(),
@@ -10149,26 +10680,24 @@ pub async fn account_login(
         server_user_id: server_user_id.clone(),
         generation,
         access_expires_at: access_expires_at.clone(),
-    })?;
-
-    // Cache the session (MK in RAM, zeroized on drop).
-    {
-        let mut session = state
-            .account_session
-            .lock()
-            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
-        *session = Some(crate::share::AccountSession {
-            account_id: acct_id.clone(),
-            email: acct_id.clone(),
-            server_user_id,
-            device_id,
-            mk: Zeroizing::new(*mk),
-            generation,
-            access_token,
-            access_expires_at,
-            refresh_token,
-        });
-    }
+    };
+    let session = crate::share::AccountSession {
+        account_id: acct_id.clone(),
+        email: acct_id.clone(),
+        server_user_id,
+        device_id,
+        mk: Zeroizing::new(*mk),
+        generation,
+        access_token,
+        access_expires_at,
+        refresh_token,
+    };
+    establish_account_login_local_with(
+        state.inner(),
+        &persisted_tokens,
+        session,
+        crate::share::store_tokens,
+    )?;
 
     // Cache the MK biometric-gated (WRITE — no Touch ID prompt) so a later restart restores the session
     // with one Touch ID tap (`unlock_sharing_with_biometric`) instead of a password re-login. Non-fatal:
@@ -10191,7 +10720,65 @@ pub async fn account_login(
         tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile at login failed (non-fatal)");
     }
 
-    account_status(state)
+    // Build every fallible field BEFORE stamping the one-way latch. Once the latch is set there are
+    // no remaining `?` paths: this invocation is committed to return `Ok(AccountStatus)`.
+    let cfg = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    let status = AccountStatus {
+        logged_in: true,
+        account_expected: true,
+        email: Some(acct_id),
+        unlocked_for_sharing: true,
+        share_consented: cfg.share_egress_consented,
+        server_configured: !cfg.share_base_url.trim().is_empty(),
+        biometric_unlock_available: crate::secrets::keychain::account_mk_cached()
+            .unwrap_or(false)
+            || cfg!(all(target_os = "macos", not(debug_assertions))),
+    };
+    drop(cfg);
+    finish_account_login_success(state.inner(), status)
+}
+
+/// Establish the usable LOCAL half of a login, without touching the account-expectation latch.
+/// Callers stamp that latch only at their final `Ok` boundary via [`finish_account_login_success`].
+fn establish_account_login_local_with(
+    state: &AppState,
+    tokens: &crate::share::PersistedTokens,
+    account_session: crate::share::AccountSession,
+    store_tokens: impl FnOnce(&crate::share::PersistedTokens) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    store_tokens(tokens)?;
+    {
+        let mut session = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        *session = Some(account_session);
+    }
+    Ok(())
+}
+
+/// Absolute successful-login commit boundary: durable content-free latch persistence is REQUIRED
+/// for `Ok(AccountStatus)`, and no fallible operation runs afterwards. A storage failure therefore
+/// cannot report an unqualified successful login with no lost-session marker.
+fn finish_account_login_success(
+    state: &AppState,
+    status: AccountStatus,
+) -> Result<AccountStatus, AppError> {
+    finish_account_login_success_with(state, status, |state| {
+        state.db.set_setting(ACCOUNT_EXPECTED_SETTING, "true")
+    })
+}
+
+fn finish_account_login_success_with(
+    state: &AppState,
+    status: AccountStatus,
+    persist_latch: impl FnOnce(&AppState) -> Result<(), AppError>,
+) -> Result<AccountStatus, AppError> {
+    persist_latch(state)?;
+    Ok(status)
 }
 
 /// `account_logout()` — best-effort server logout, clear the Keychain tokens + drop the session MK.

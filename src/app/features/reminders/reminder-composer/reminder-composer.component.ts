@@ -293,12 +293,14 @@ export class ReminderComposerComponent {
         // cannot be the authority because Angular schedules effects.
         this.purgeInvalidatedRequest();
         this.listenerState.set("ready");
+        this.service.markListenersReady();
       }
     } catch {
       if (!this.destroyed) {
         // A composer request must not retain or hydrate source-derived text
         // when this renderer cannot observe a later lock transition.
         this.listenerState.set("failed");
+        this.service.markListenersFailed();
         this.purgeInvalidatedRequest();
       }
     }
@@ -359,6 +361,7 @@ export class ReminderComposerComponent {
   private async installVisibilityInvalidatedListener(): Promise<void> {
     const unlisten = await this.ipc.onReminderVisibilityInvalidated(() => {
       if (!this.destroyed) {
+        this.service.markVisibilityInvalidated();
         this.purgeInvalidatedRequest();
       }
     });

@@ -320,6 +320,9 @@
   <mur-quick-search (closed)="searchOpen.set(false)" />
 }
 
+<!-- Account session notice: keeps optional sharing auth visible outside Settings. -->
+<app-account-session-banner />
+
 <!-- Toast viewport: renders the app-wide queue from ToastService. -->
 @if (toasts().length > 0) {
   <div class="toast-viewport" aria-live="polite" aria-atomic="false">

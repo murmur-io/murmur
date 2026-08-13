@@ -2324,6 +2324,8 @@ export interface EgressLedger {
 
 /** Mirrors Rust `commands::AccountStatus` — the sharing-account session state. */
 export interface AccountStatus {
+  /** True after this device has successfully signed in at least once. */
+  accountExpected: boolean;
   /** A session is present (logged in this session, or restorable from the Keychain). */
   loggedIn: boolean;
   /** The account email, when logged in. */

@@ -70,3 +70,162 @@ test.describe("Settings › Account — resolved-null status (mocked IPC)", () =
     expect(errors).toEqual([]);
   });
 });
+
+test("Settings sign-in and logout update the global session banner without focus or polling", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(message.text());
+  });
+  page.on("pageerror", (error) => errors.push(String(error)));
+  await mockTauri(page, {
+    account_status: () => {
+      const w = window as unknown as { __settingsAccount?: Record<string, unknown> };
+      return w.__settingsAccount ?? {
+        accountExpected: true,
+        loggedIn: false,
+        email: null,
+        unlockedForSharing: false,
+        shareConsented: true,
+        serverConfigured: true,
+        biometricUnlockAvailable: false,
+      };
+    },
+    account_login: () => {
+      const status = {
+        accountExpected: true,
+        loggedIn: true,
+        email: "ada@example.com",
+        unlockedForSharing: true,
+        shareConsented: true,
+        serverConfigured: true,
+        biometricUnlockAvailable: true,
+      };
+      (window as unknown as { __settingsAccount?: Record<string, unknown> })
+        .__settingsAccount = status;
+      return status;
+    },
+    account_logout: () => {
+      (window as unknown as { __settingsAccount?: Record<string, unknown> })
+        .__settingsAccount = {
+          accountExpected: true,
+          loggedIn: false,
+          email: null,
+          unlockedForSharing: false,
+          shareConsented: true,
+          serverConfigured: true,
+          biometricUnlockAvailable: false,
+        };
+      return null;
+    },
+  });
+  await openAccountSection(page);
+
+  const section = page.locator("app-settings-account-section");
+  const banner = page.getByLabel("Sharing account status");
+  await expect(banner).toContainText("Your sharing session ended");
+  await section
+    .getByRole("button", { name: "Create or sign in to a sharing account" })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "Sharing account" });
+  await dialog.getByRole("button", { name: "I already have one" }).click();
+  await page.evaluate(() => {
+    const host = document.querySelector("app-sharing-auth-flow");
+    const angular = (window as unknown as {
+      ng: { getComponent: (element: Element) => { completed: { subscribe: (callback: (payload: unknown) => void) => void } } };
+    }).ng;
+    const component = angular.getComponent(host!);
+    const capture = window as unknown as {
+      __authCompletionPayloads?: Array<{
+        type: string;
+        hasEmail: boolean;
+        keys: string[];
+      }>;
+    };
+    capture.__authCompletionPayloads = [];
+    component.completed.subscribe((payload: unknown) => {
+      capture.__authCompletionPayloads!.push({
+        type: typeof payload,
+        hasEmail:
+          typeof payload === "object" &&
+          payload !== null &&
+          "email" in payload,
+        keys:
+          typeof payload === "object" && payload !== null
+            ? Object.keys(payload)
+            : [],
+      });
+    });
+  });
+  await dialog.getByLabel("Email").fill("ada@example.com");
+  await dialog.getByLabel("Password").fill("correct horse battery staple");
+  await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
+
+  await expect(banner).toHaveCount(0);
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as {
+          __authCompletionPayloads?: Array<{
+            type: string;
+            hasEmail: boolean;
+            keys: string[];
+          }>;
+        }).__authCompletionPayloads ?? [],
+    ),
+  ).toEqual([{ type: "undefined", hasEmail: false, keys: [] }]);
+  await expect(section.getByText("ada@example.com")).toBeVisible();
+  await section.getByRole("button", { name: "Sign out" }).click();
+
+  await expect(banner).toContainText("Your sharing session ended");
+  await expect(
+    section.getByRole("button", { name: "Create or sign in to a sharing account" }),
+  ).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("Settings Touch ID unlock clears the global locked banner immediately", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      unlock_sharing_with_biometric: () => {
+        const status = {
+          accountExpected: true,
+          loggedIn: true,
+          email: "ada@example.com",
+          unlockedForSharing: true,
+          shareConsented: true,
+          serverConfigured: true,
+          biometricUnlockAvailable: true,
+        };
+        (window as unknown as { __settingsTouchId?: Record<string, unknown> })
+          .__settingsTouchId = status;
+        return status;
+      },
+      account_status: () =>
+        (window as unknown as { __settingsTouchId?: Record<string, unknown> })
+          .__settingsTouchId ?? {
+          accountExpected: true,
+          loggedIn: true,
+          email: "ada@example.com",
+          unlockedForSharing: false,
+          shareConsented: true,
+          serverConfigured: true,
+          biometricUnlockAvailable: true,
+        },
+    },
+  );
+  await openAccountSection(page);
+
+  const banner = page.getByLabel("Sharing account status");
+  await expect(banner).toContainText("Sharing is locked");
+  await page
+    .locator("app-settings-account-section")
+    .getByRole("button", { name: "Unlock with Touch ID" })
+    .click();
+  await expect(banner).toHaveCount(0);
+  await expect(page.getByText("Ready to share this session")).toBeVisible();
+});
