@@ -264,9 +264,10 @@ impl crate::reason::LocalReasoner for DurableDispatchReasoner<'_> {
     }
 }
 
-/// Cap the incoming Ask history to the last [`CHAT_CONTEXT_TURNS`] turns — the same discipline as
-/// the in-meeting chat panel, closing the unbounded-prompt-growth gap the pre-agentic `ask_vault`
-/// had (it rendered the whole history uncapped).
+/// First cap the incoming Ask history to the last [`CHAT_CONTEXT_TURNS`] turns. The shared
+/// `vault_chat::render_conversation` seam then applies the strict rendered-character budget to both
+/// the deterministic floor and agentic Ask. Keeping the count cap here still avoids cloning an
+/// unbounded number of durable rows before the render-time content bound is applied.
 pub(crate) fn capped_ask_history(history: &[ChatTurn]) -> &[ChatTurn] {
     let start = history.len().saturating_sub(CHAT_CONTEXT_TURNS);
     &history[start..]
