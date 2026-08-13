@@ -1,3 +1,4 @@
+@if (hasContent() || error() || showCreateAction()) {
 <section
   class="smart-card"
   [class.card]="hasContent()"
@@ -14,14 +15,16 @@
         <h3>Don’t let this slip</h3>
       </div>
     }
-    <button
-      type="button"
-      class="btn btn-ghost"
-      [disabled]="!listenerReady()"
-      (click)="newReminder()"
-    >
-      New reminder
-    </button>
+    @if (showCreateAction()) {
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="!listenerReady()"
+        (click)="newReminder()"
+      >
+        New reminder
+      </button>
+    }
   </header>
 
   @if (error(); as message) {
@@ -81,3 +84,4 @@
     </ul>
   }
 </section>
+}

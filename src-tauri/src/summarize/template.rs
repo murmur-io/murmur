@@ -428,11 +428,43 @@ pub fn build_template(
     diarized_others: bool,
     me_name: &str,
 ) -> String {
-    let mut t = format!(
-        "{}\n\n{}",
+    finish_template_prompt(
         template_for_style(style),
-        language_directive(note_language)
-    );
+        note_language,
+        labeled,
+        diarized_others,
+        me_name,
+    )
+}
+
+/// Render one explicitly resolved saved-template row without consulting or mutating the global
+/// saved-template registry. Per-request consumers such as convert-to-note use this after loading
+/// the selected row from SQLite, so tone/sections/front-matter can never drift from the DB merely
+/// because a process-global registry refresh was stale.
+pub fn build_template_from_saved(
+    template: &NoteTemplate,
+    note_language: &str,
+    labeled: bool,
+    diarized_others: bool,
+    me_name: &str,
+) -> String {
+    finish_template_prompt(
+        render_saved_template(template),
+        note_language,
+        labeled,
+        diarized_others,
+        me_name,
+    )
+}
+
+fn finish_template_prompt(
+    style_prompt: String,
+    note_language: &str,
+    labeled: bool,
+    diarized_others: bool,
+    me_name: &str,
+) -> String {
+    let mut t = format!("{}\n\n{}", style_prompt, language_directive(note_language));
     if labeled {
         t.push_str("\n\n");
         t.push_str(if diarized_others {

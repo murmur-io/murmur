@@ -480,8 +480,15 @@ pub fn get_meeting_detail(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<MeetingDetailDto>, AppError> {
-    let _lifecycle = lifecycle_guard(state.inner());
-    let Some(anchor) = state.db.get_meeting_gate_anchor(&meeting_id)? else {
+    get_meeting_detail_inner(state.inner(), &meeting_id)
+}
+
+pub(crate) fn get_meeting_detail_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<Option<MeetingDetailDto>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let Some(anchor) = state.db.get_meeting_gate_anchor(meeting_id)? else {
         return Ok(None);
     };
 
@@ -498,15 +505,15 @@ pub fn get_meeting_detail(
     // path here means the gate covers the asset protocol regardless of the on-disk seal state, so a
     // plaintext WAV that briefly survives in the scoped dir (e.g. recorded into an already-sealed
     // folder, or a crash window) can never be served to a locked meeting's view.
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+    if !meeting_is_unlocked(state, meeting_id)? {
         return Ok(Some(masked_detail(anchor)));
     }
 
-    let Some(meeting) = state.db.get_meeting(&meeting_id)? else {
+    let Some(meeting) = state.db.get_meeting(meeting_id)? else {
         return Ok(None);
     };
 
-    let note_row = state.db.get_latest_note_for_meeting(&meeting_id)?;
+    let note_row = state.db.get_latest_note_for_meeting(meeting_id)?;
     // Phase 5: capture provenance from the note row BEFORE converting to NoteDto (NoteDto is a
     // subset and doesn't carry model fields). All three are None when the note is absent or when
     // the provider did not record provenance (pre-Phase-5 notes).
@@ -533,7 +540,7 @@ pub fn get_meeting_detail(
         .unwrap_or_default();
     let assistant_interactions = state
         .db
-        .list_assistant_interactions_visible(&meeting_id, &unlocked)?;
+        .list_assistant_interactions_visible(meeting_id, &unlocked)?;
     Ok(Some(MeetingDetailDto {
         meeting,
         note,
