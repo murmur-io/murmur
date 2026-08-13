@@ -67,6 +67,7 @@ pub(crate) fn capture_durable_scope_under_lifecycle(
                 snapshot: MeetingContentSnapshot {
                     folder_id,
                     visibility,
+                    active_related: active_related_witness(state, ref_id)?,
                 },
             })
         }

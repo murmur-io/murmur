@@ -5,7 +5,7 @@ use crate::storage::models::{Folder, Meeting, MeetingStatus, NoteRecord};
 use crate::storage::Db;
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -517,6 +517,156 @@ fn loopback_ollama_ask_paths_revalidate_visibility_before_provider_dispatch() {
     );
 }
 
+// Keep this cloud-factory oracle beside the base branch's LOCAL_LOOPBACK dispatch oracle above:
+// together they bind both sides of Ask's provider classification after the history-budget merge.
+/// The public Ask command resolves BOTH of its model branches from the Ask role: the agentic
+/// attempt obtains `ReasonerCell::current_for(Role::Ask)`, while its deterministic floor obtains
+/// `provider_for(Role::Ask)`. Exercise those production factories side-by-side and prove that
+/// every remotely-capable target refuses before transport construction when consent is absent.
+#[test]
+fn ask_agentic_and_floor_factories_share_the_fail_closed_consent_gate() {
+    let cases = [
+        ("codex_cli", "http://localhost:11434"),
+        ("ollama", "https://ollama.remote.example/api"),
+        ("future_remote_provider", "http://localhost:11434"),
+    ];
+
+    for (connection, ollama_base_url) in cases {
+        let cfg = AppConfig {
+            brain_backend: crate::settings::config::BrainBackend::Cloud,
+            role_ask_connection: connection.to_string(),
+            ollama_base_url: ollama_base_url.to_string(),
+            cloud_egress_consented: false,
+            ..AppConfig::default()
+        };
+        let shared_cfg = std::sync::Arc::new(Mutex::new(cfg.clone()));
+        let heavy = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let agentic = crate::reason::ReasonerCell::new(
+            std::sync::Arc::clone(&shared_cfg),
+            std::sync::Arc::clone(&heavy),
+        )
+        .current_for(crate::summarize::roles::Role::Ask)
+        .reason("Ask system", "private vault question");
+        let agentic_message = match agentic {
+            Err(AppError::Unavailable(message)) => message,
+            other => panic!(
+                "Ask agentic factory must refuse unconsented {connection}: {other:?}"
+            ),
+        };
+
+        let floor = crate::summarize::provider_for(
+            crate::summarize::roles::Role::Ask,
+            &cfg,
+            &heavy,
+        );
+        let floor_message = match floor {
+            Err(AppError::Unavailable(message)) => message,
+            Err(other) => panic!(
+                "Ask floor factory must refuse unconsented {connection}, got {other:?}"
+            ),
+            Ok(_) => panic!("Ask floor factory built unconsented {connection}"),
+        };
+        assert_eq!(
+            agentic_message, floor_message,
+            "agentic and floor Ask branches must expose the same consent refusal"
+        );
+    }
+}
+
+#[derive(Default)]
+struct AskCaptureProvider {
+    prompts: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::summarize::provider::SummarizerProvider for AskCaptureProvider {
+    fn id(&self) -> &str {
+        crate::summarize::PROVIDER_CODEX_CLI
+    }
+
+    async fn availability(&self) -> crate::summarize::provider::Availability {
+        crate::summarize::provider::Availability::Available
+    }
+
+    async fn summarize(
+        &self,
+        request: &crate::summarize::provider::SummarizeRequest,
+    ) -> crate::error::Result<String> {
+        Ok(request.transcript.clone())
+    }
+
+    async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((system.to_string(), user.to_string()));
+        Ok(format!("{system}\n{user}"))
+    }
+}
+
+#[derive(Default)]
+struct AskCaptureEgressSink {
+    entries: Mutex<Vec<crate::summarize::egress_log::EgressEntry>>,
+}
+
+impl crate::summarize::egress_log::EgressSink for AskCaptureEgressSink {
+    fn record(&self, entry: crate::summarize::egress_log::EgressEntry) {
+        self.entries.lock().unwrap().push(entry);
+    }
+}
+
+/// Once Ask consent is granted, its floor still has no alternate transport seam: role resolution,
+/// redaction, dispatch, response restoration, and the content-free ledger are all exercised through
+/// `provider_for_with_test_egress_sink(Role::Ask)` without a CLI, AppHandle, or network socket.
+#[test]
+fn ask_role_factory_redacts_before_dispatch_and_records_content_free_ledger() {
+    let inner = std::sync::Arc::new(AskCaptureProvider::default());
+    let sink = std::sync::Arc::new(AskCaptureEgressSink::default());
+    let cfg = AppConfig {
+        role_ask_connection: crate::summarize::PROVIDER_CODEX_CLI.to_string(),
+        role_ask_model: "gpt-ask-test".to_string(),
+        cloud_egress_consented: true,
+        ..AppConfig::default()
+    };
+    let provider = crate::summarize::provider_for_with_test_egress_sink(
+        crate::summarize::roles::Role::Ask,
+        &cfg,
+        &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        sink.clone(),
+        inner.clone(),
+    )
+    .expect("the Ask role must use the canonical consent/redaction/ledger factory");
+
+    let output = block_on(provider.complete(
+        "Answer only from the provided vault context.",
+        "Contact alice@example.com about the launch.",
+    ))
+    .unwrap();
+    assert!(
+        output.contains("alice@example.com"),
+        "the local response restores the redacted value"
+    );
+
+    let prompts = inner.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    let dispatched = format!("{}\n{}", prompts[0].0, prompts[0].1);
+    assert!(!dispatched.contains("alice@example.com"));
+    assert!(dispatched.contains("⟪EMAIL_1⟫"));
+    drop(prompts);
+
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.provider_id, crate::summarize::PROVIDER_CODEX_CLI);
+    assert_eq!(entry.model_requested, "gpt-ask-test");
+    assert_eq!(entry.call_kind, "complete");
+    assert_eq!(entry.redactions.email, 1);
+    let debug = format!("{entry:?}");
+    assert!(!debug.contains("alice@example.com"));
+    assert!(!debug.contains("launch"));
+}
+
 /// The Cloud loop path: a scripted brain calls a GATED tool, answers, and the tool-derived
 /// `[[Title]]` citations flow into the DTO — verbatim in `citations` AND resolved (gated) into
 /// the structured `sources` chips.
@@ -569,6 +719,252 @@ fn ask_loop_tool_citations_flow_into_dto() {
     assert_eq!(out.sources[0].meeting_id, "m1");
     assert_eq!(out.sources[0].title, "Atlas Kickoff");
     assert_eq!(out.sources[0].started_at, "2026-06-26T09:00:00Z");
+}
+
+/// ORG_READ production-chain oracle for the stateless Ask surface used by Quick Search.
+///
+/// This drives the real `ask_vault_loop` and `GatedToolExecutor` with a model that requests
+/// `org_brain_search`, then echoes only that gated tool-result block into the answer DTO. The
+/// fixtures exercise every gate before the new Angular sink: local membership/admission,
+/// per-install context enablement, tombstone exclusion, and dispatch authorization. A failed gate
+/// must leave the secret absent from all three DTO plaintext lanes (answer, sources, citations).
+/// The admitted case also pins the production tool's hard 20-result bound.
+#[test]
+fn quick_search_org_ask_chain_is_conjunctively_gated_and_bounded() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ToolResultEchoReasoner {
+        calls: AtomicUsize,
+    }
+    impl LocalReasoner for ToolResultEchoReasoner {
+        fn id(&self) -> &str {
+            "org-tool-result-echo"
+        }
+
+        fn reason(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+
+        fn structured(
+            &self,
+            _system: &str,
+            user: &str,
+            _schema: &Value,
+        ) -> crate::error::Result<Value> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(serde_json::json!({
+                    "tool": "org_brain_search",
+                    "args": { "query": "project cipher" }
+                }));
+            }
+            let answer = user
+                .rsplit_once("[org_brain_search result]\n")
+                .map(|(_, result)| result.trim())
+                .unwrap_or("No authorized org context.");
+            Ok(serde_json::json!({ "answer": answer }))
+        }
+    }
+
+    fn seed_membership(db: &Db, enabled: bool) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-quick-search".into(),
+            name: "Quick Search Org".into(),
+            role: "member".into(),
+            joined_at: "2026-08-13T00:00:00Z".into(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: enabled,
+        })
+        .unwrap();
+    }
+
+    fn seed_org_secret(db: &Db, item_id: &str, secret: &str, seq: u64) {
+        db.upsert_org_item(
+            item_id,
+            "org-quick-search",
+            seq,
+            "colleague",
+            &format!("{secret} project cipher"),
+            &format!("{secret} project cipher decision"),
+            "2026-08-13T09:00:00Z",
+            1,
+            1,
+            &[seq as u8; 32],
+            None,
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+    }
+
+    /// Production feed-ingest admission: prepares the bounded index, then commits plaintext and
+    /// cursor together only while the org membership still exists. Positive disclosure evidence
+    /// must enter through this seam rather than the raw storage upsert used for hostile stale-row
+    /// fixtures below.
+    fn ingest_authorized_org_secret(db: &Db, item_id: &str, secret: &str, seq: u64) {
+        let title = format!("{secret} project cipher");
+        let markdown = format!("{secret} project cipher decision");
+        let prepared = Db::prepare_org_item_index(
+            &title,
+            "2026-08-13T09:00:00Z",
+            &markdown,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        assert!(
+            db.commit_org_feed_item(
+                item_id,
+                "org-quick-search",
+                seq,
+                "colleague",
+                &title,
+                &markdown,
+                "2026-08-13T09:00:00Z",
+                1,
+                1,
+                &[seq as u8; 32],
+                None,
+                Some("authorized-colleague"),
+                &prepared,
+            )
+            .unwrap(),
+            "member-gated feed admission must commit the positive fixture"
+        );
+    }
+
+    fn run_chain(db: &Db, executor: &dyn crate::agent::ToolExecutor) -> AskVaultResult {
+        let unlocked = Mutex::new(HashSet::new());
+        ask_vault_loop(
+            &ToolResultEchoReasoner {
+                calls: AtomicUsize::new(0),
+            },
+            executor,
+            db,
+            &unlocked,
+            "What did the team decide about project cipher?",
+            &[],
+            "",
+            "",
+            true,
+            None,
+            crate::reason::GenOptions::ask_answer(),
+        )
+        .unwrap()
+        .expect("the scripted Ask chain converges")
+    }
+
+    fn assert_secret_absent(result: &AskVaultResult, secret: &str, gate: &str) {
+        assert!(
+            !result.answer.contains(secret),
+            "{gate}: rejected org plaintext reached the Quick Search answer DTO: {}",
+            result.answer
+        );
+        assert!(
+            result
+                .sources
+                .iter()
+                .all(|source| !source.title.contains(secret)),
+            "{gate}: rejected org plaintext reached a source DTO: {:?}",
+            result.sources
+        );
+        assert!(
+            result
+                .citations
+                .iter()
+                .all(|citation| !citation.contains(secret)),
+            "{gate}: rejected org plaintext reached a citation DTO: {:?}",
+            result.citations
+        );
+    }
+
+    let cfg = AppConfig {
+        semantic_search_enabled: false,
+        ..AppConfig::default()
+    };
+
+    // Positive control + result bound: the exact executor used by stateless `ask_vault` exposes
+    // at most twenty fused org hits to the model and therefore to its answer DTO.
+    let live = tmp_db();
+    seed_membership(&live, true);
+    for n in 1..=25 {
+        ingest_authorized_org_secret(
+            &live,
+            &format!("live-{n}"),
+            &format!("ORG_LIVE_{n}"),
+            n,
+        );
+    }
+    let live_unlocked = Mutex::new(HashSet::new());
+    let live_executor = ask_executor(&live, &live_unlocked, &cfg);
+    let live_result = run_chain(&live, &live_executor);
+    let rendered_hits = live_result.answer.matches("[org · colleague]").count();
+    assert_eq!(
+        rendered_hits, 20,
+        "the production org Ask result stays hard-bounded"
+    );
+    assert!(live_result.answer.contains("ORG_LIVE_"));
+    assert!(
+        live_result.sources.is_empty() && live_result.citations.is_empty(),
+        "org provenance stays in the labelled answer; it must not be forged into local-meeting \
+         source chips or wikilink citations"
+    );
+
+    // No joined `org_state`: even a stale plaintext replica cannot be advertised or read.
+    let non_member = tmp_db();
+    let membership_secret = "ORG_SECRET_MEMBERSHIP";
+    seed_org_secret(&non_member, "membership", membership_secret, 1);
+    let non_member_unlocked = Mutex::new(HashSet::new());
+    let non_member_executor = ask_executor(&non_member, &non_member_unlocked, &cfg);
+    assert_secret_absent(
+        &run_chain(&non_member, &non_member_executor),
+        membership_secret,
+        "membership/admission",
+    );
+
+    let disabled = tmp_db();
+    seed_membership(&disabled, false);
+    let disabled_secret = "ORG_SECRET_CONTEXT_DISABLED";
+    seed_org_secret(&disabled, "disabled", disabled_secret, 1);
+    let disabled_unlocked = Mutex::new(HashSet::new());
+    let disabled_executor = ask_executor(&disabled, &disabled_unlocked, &cfg);
+    assert_secret_absent(
+        &run_chain(&disabled, &disabled_executor),
+        disabled_secret,
+        "context-enabled",
+    );
+
+    let tombstoned = tmp_db();
+    seed_membership(&tombstoned, true);
+    let tombstone_secret = "ORG_SECRET_TOMBSTONED";
+    seed_org_secret(&tombstoned, "tombstoned", tombstone_secret, 1);
+    tombstoned.tombstone_org_item("tombstoned").unwrap();
+    let tombstoned_unlocked = Mutex::new(HashSet::new());
+    let tombstoned_executor = ask_executor(&tombstoned, &tombstoned_unlocked, &cfg);
+    assert_secret_absent(
+        &run_chain(&tombstoned, &tombstoned_executor),
+        tombstone_secret,
+        "tombstone",
+    );
+
+    // The durable authorization wrapper is the command's post-snapshot dispatch barrier. A stale
+    // capability refuses the local tool before its plaintext enters the loop transcript.
+    let unauthorized = tmp_db();
+    seed_membership(&unauthorized, true);
+    let authorization_secret = "ORG_SECRET_AUTHORIZATION";
+    seed_org_secret(&unauthorized, "unauthorized", authorization_secret, 1);
+    let unauthorized_unlocked = Mutex::new(HashSet::new());
+    let inner = ask_executor(&unauthorized, &unauthorized_unlocked, &cfg);
+    let admission =
+        crate::state::ContentDispatchAdmission::for_test(Arc::new(Mutex::new(())), || {
+            Err(AppError::Locked("stale org authorization".into()))
+        });
+    let admitted = crate::agent::AdmittedToolExecutor::new(&inner, admission);
+    assert_secret_absent(
+        &run_chain(&unauthorized, &admitted),
+        authorization_secret,
+        "dispatch authorization",
+    );
 }
 
 /// The loop contract at this surface: non-convergence → `Ok(None)` (the command floors); a
@@ -990,6 +1386,11 @@ fn ask_loop_never_surfaces_sealed_content() {
     )
     .unwrap()
     .expect("converged");
+    assert!(
+        !out.answer.contains("Atlas Secret Terms") && !out.answer.contains("SEALED"),
+        "sealed source content/title must not reach the produced answer: {}",
+        out.answer
+    );
     assert!(
         out.citations.iter().all(|c| !c.contains("Secret")),
         "sealed title must never be cited: {:?}",
