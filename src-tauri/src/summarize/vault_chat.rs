@@ -3,6 +3,15 @@
 
 use crate::storage::models::ChatTurn;
 
+/// Strict budget for rendered PRIOR Ask history. The current question is appended separately and
+/// is deliberately outside this limit. Half of the agent loop's 32k immutable-head target leaves
+/// room for that question and the surrounding protocol while keeping the deterministic floor and
+/// agentic route byte-identical through one rendering seam.
+const ASK_PRIOR_HISTORY_CHAR_BUDGET: usize = 16_000;
+const ASK_HISTORY_OMISSION_MARKER: &str =
+    "[Earlier Ask history omitted to fit the context budget.]\n";
+const ASK_HISTORY_COMPACT_OMISSION_MARKER: &str = "[Earlier omitted]\n";
+
 /// Shared coordinate/polarity discipline for both the deterministic corpus floor and the agentic
 /// Ask persona. The Qwen bake-off exposed a clause-contamination failure: an OPEN budget was used
 /// to negate a separately approved launch. Single-sourcing keeps the two Ask routes aligned.
@@ -63,20 +72,133 @@ fn memory_block(memory_brief: &str) -> String {
 }
 
 /// Render the running conversation + latest question into the user message. Shared VERBATIM by the
-/// corpus floor ([`build`]) and the agentic Ask loop, so both brains see the exact same conversation
-/// (the floor stays byte-identical to the pre-agentic implementation).
+/// corpus floor ([`build`]) and the agentic Ask loop, so both brains see the exact same bounded
+/// conversation. Prior history keeps the newest complete suffix within
+/// [`ASK_PRIOR_HISTORY_CHAR_BUDGET`]. Only when the newest prior turn alone cannot fit do we retain
+/// an honestly marked, Unicode-safe suffix of that turn. The separately supplied current question
+/// retains its existing trim-only behavior and is never consumed by the prior-history budget.
 pub fn render_conversation(history: &[ChatTurn], question: &str) -> String {
     let mut user = String::new();
-    for turn in history {
-        let who = if turn.role == "assistant" {
-            "Assistant"
-        } else {
-            "User"
-        };
-        user.push_str(&format!("{who}: {}\n", turn.content.trim()));
+
+    let complete_history_fits = history
+        .iter()
+        .try_fold(0usize, |used, turn| {
+            let next = used.saturating_add(rendered_turn_cost(turn));
+            (next <= ASK_PRIOR_HISTORY_CHAR_BUDGET).then_some(next)
+        })
+        .is_some();
+
+    if complete_history_fits {
+        for turn in history {
+            push_complete_turn(&mut user, turn);
+        }
+    } else {
+        let mut used = 0usize;
+        let mut start = history.len();
+
+        for (index, turn) in history.iter().enumerate().rev() {
+            let cost = rendered_turn_cost(turn);
+            if cost > ASK_PRIOR_HISTORY_CHAR_BUDGET.saturating_sub(used) {
+                break;
+            }
+            used = used.saturating_add(cost);
+            start = index;
+        }
+
+        if start < history.len() {
+            push_complete_suffix_with_omission(&mut user, &history[start..], used);
+        } else if let Some(newest) = history.last() {
+            let available = ASK_PRIOR_HISTORY_CHAR_BUDGET
+                .saturating_sub(ASK_HISTORY_OMISSION_MARKER.chars().count());
+            user.push_str(ASK_HISTORY_OMISSION_MARKER);
+            let prefix = format!("{}: …", role_label(newest));
+            let suffix_capacity = available.saturating_sub(prefix.chars().count() + 1);
+            user.push_str(&prefix);
+            user.push_str(suffix_chars(newest.content.trim(), suffix_capacity));
+            user.push('\n');
+        }
     }
+
     user.push_str(&format!("User: {}\nAssistant:", question.trim()));
     user
+}
+
+fn role_label(turn: &ChatTurn) -> &'static str {
+    if turn.role == "assistant" {
+        "Assistant"
+    } else {
+        "User"
+    }
+}
+
+fn rendered_turn_cost(turn: &ChatTurn) -> usize {
+    role_label(turn).chars().count() + 2 + turn.content.trim().chars().count() + 1
+}
+
+fn push_complete_turn(output: &mut String, turn: &ChatTurn) {
+    output.push_str(role_label(turn));
+    output.push_str(": ");
+    output.push_str(turn.content.trim());
+    output.push('\n');
+}
+
+/// Disclose omitted older history without sacrificing any complete turn from the largest newest
+/// contiguous suffix that fits by itself. Prefer the readable long marker, then progressively
+/// shorter honest markers. At zero headroom, replace only the normal separator space on the oldest
+/// retained turn with a leading ellipsis, so every retained role and content remains complete at
+/// exactly the same scalar cost as ordinary rendering.
+fn push_complete_suffix_with_omission(
+    output: &mut String,
+    suffix: &[ChatTurn],
+    suffix_cost: usize,
+) {
+    let headroom = ASK_PRIOR_HISTORY_CHAR_BUDGET.saturating_sub(suffix_cost);
+    let long_cost = ASK_HISTORY_OMISSION_MARKER.chars().count();
+    let compact_cost = ASK_HISTORY_COMPACT_OMISSION_MARKER.chars().count();
+
+    if headroom >= long_cost {
+        output.push_str(ASK_HISTORY_OMISSION_MARKER);
+        for turn in suffix {
+            push_complete_turn(output, turn);
+        }
+    } else if headroom >= compact_cost {
+        output.push_str(ASK_HISTORY_COMPACT_OMISSION_MARKER);
+        for turn in suffix {
+            push_complete_turn(output, turn);
+        }
+    } else if headroom >= 2 {
+        output.push_str("…\n");
+        for turn in suffix {
+            push_complete_turn(output, turn);
+        }
+    } else if headroom == 1 {
+        output.push('…');
+        for turn in suffix {
+            push_complete_turn(output, turn);
+        }
+    } else if let Some((first, rest)) = suffix.split_first() {
+        output.push('…');
+        output.push_str(role_label(first));
+        output.push(':');
+        output.push_str(first.content.trim());
+        output.push('\n');
+        for turn in rest {
+            push_complete_turn(output, turn);
+        }
+    }
+}
+
+fn suffix_chars(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(max_chars - 1)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    &text[start..]
 }
 
 /// The vault-QA persona for the AGENTIC Ask surface (PR G, ask-unify): the same grounded / cited /
