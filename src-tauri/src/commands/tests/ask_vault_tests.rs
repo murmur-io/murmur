@@ -341,6 +341,182 @@ fn ask_floor_preserves_no_consent_error_semantics() {
     );
 }
 
+/// LOCAL_LOOPBACK authorization oracle for the exact two Ask paths that consume
+/// `vault_chat::render_conversation`: a loopback Ollama floor excludes sealed corpus rows and a
+/// stale visibility admission prevents the provider future from being constructed; the agentic
+/// loop carries the same admission through `DurableDispatchReasoner`, invokes the real
+/// provider-backed reasoner, and rejects before `provider.complete` can open a connection. This
+/// binds the history-budget change to the unchanged dispatch gate instead of treating loopback as
+/// implicitly authorized. It is the mandatory LOCAL_LOOPBACK evidence in acceptance item 6, not
+/// an assertion that production dispatch behavior changed.
+#[test]
+fn loopback_ollama_ask_paths_revalidate_visibility_before_provider_dispatch() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ollama_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let loopback_connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let loopback_connections_for_server = std::sync::Arc::clone(&loopback_connections);
+    let stop_server = std::sync::Arc::new(AtomicBool::new(false));
+    let stop_server_worker = std::sync::Arc::clone(&stop_server);
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !stop_server_worker.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    use std::io::{Read, Write};
+
+                    loopback_connections_for_server.fetch_add(1, Ordering::SeqCst);
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                        .unwrap();
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let body = br#"{"response":"unexpected dispatch","done":true}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(body);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("unexpected listener error: {error}"),
+            }
+        }
+    });
+    let db = tmp_db();
+    seed_note(&db, "open1", "Atlas Kickoff", "OPEN-ATLAS-CONTEXT", None);
+    db.insert_folder(&Folder {
+        id: "sealed-folder".into(),
+        name: "Sealed".into(),
+        path: "Sealed".into(),
+        parent_id: None,
+        locked: true,
+        created_at: "2026-06-26T00:00:00Z".into(),
+    })
+    .unwrap();
+    // Keep plaintext in this adversarial fixture so the assertion proves the read predicate, not
+    // merely the normal at-rest blanking invariant.
+    seed_note(
+        &db,
+        "sealed1",
+        "Atlas Secret",
+        "SEALED-PLAINTEXT-MUST-NOT-REACH-OLLAMA",
+        Some("sealed-folder"),
+    );
+
+    let cfg = AppConfig {
+        provider_id: crate::summarize::PROVIDER_OLLAMA.into(),
+        role_ask_connection: crate::summarize::PROVIDER_OLLAMA.into(),
+        ollama_base_url,
+        semantic_search_enabled: false,
+        ..AppConfig::default()
+    };
+    assert!(
+        !crate::summarize::egress_is_cloud(crate::summarize::PROVIDER_OLLAMA, &cfg),
+        "fixture must exercise the LOCAL_LOOPBACK row"
+    );
+
+    let unlocked = HashSet::new();
+    let history = [ChatTurn {
+        role: "user".into(),
+        content: "PRIOR-HISTORY-WOULD-REACH-THE-PROVIDER".into(),
+    }];
+    let prompt = build_ask_vault_floor_prompt(
+        &db, &cfg, &unlocked, "atlas", &history, "", None, None, None, None,
+    )
+    .unwrap();
+    let AskFloorPrompt::Ready { system, user, .. } = prompt else {
+        panic!("visible fixture must produce a provider-bound floor prompt");
+    };
+    assert!(system.contains("OPEN-ATLAS-CONTEXT"));
+    assert!(!system.contains("SEALED-PLAINTEXT-MUST-NOT-REACH-OLLAMA"));
+    assert!(user.contains("PRIOR-HISTORY-WOULD-REACH-THE-PROVIDER"));
+
+    let floor_validations = std::sync::Arc::new(AtomicUsize::new(0));
+    let floor_validation_spy = std::sync::Arc::clone(&floor_validations);
+    let floor_admission = crate::state::ContentDispatchAdmission::for_test(
+        std::sync::Arc::new(Mutex::new(())),
+        move || {
+            floor_validation_spy.fetch_add(1, Ordering::SeqCst);
+            Err(AppError::Locked(
+                "relocked before loopback floor dispatch".into(),
+            ))
+        },
+    );
+    let floor_result = block_on(ask_vault_floor_authorized(
+        &std::sync::Arc::new(db),
+        &cfg,
+        &unlocked,
+        "atlas",
+        &history,
+        "",
+        None,
+        &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        None,
+        None,
+        None,
+        floor_admission,
+    ));
+    assert!(matches!(floor_result, Err(AppError::Locked(_))));
+    assert_eq!(floor_validations.load(Ordering::SeqCst), 1);
+
+    let resolved = crate::summarize::roles::resolve(crate::summarize::roles::Role::Ask, &cfg);
+    assert_eq!(resolved.connection, crate::summarize::PROVIDER_OLLAMA);
+    assert!(
+        !resolved.is_reasoner_only(),
+        "loopback Ollama must exercise the real agentic provider route"
+    );
+    let agentic = crate::reason::CloudReasoner::for_role(
+        std::sync::Arc::new(Mutex::new(cfg.clone())),
+        crate::summarize::roles::Role::Ask,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+    assert_eq!(agentic.id(), "cloud:ollama");
+    let agentic_validations = std::sync::Arc::new(AtomicUsize::new(0));
+    let agentic_validation_spy = std::sync::Arc::clone(&agentic_validations);
+    let agentic_admission = crate::state::ContentDispatchAdmission::for_test(
+        std::sync::Arc::new(Mutex::new(())),
+        move || {
+            agentic_validation_spy.fetch_add(1, Ordering::SeqCst);
+            Err(AppError::Locked(
+                "relocked before loopback agentic dispatch".into(),
+            ))
+        },
+    );
+    let guarded_agentic = durable_dispatch_reasoner(&agentic, agentic_admission);
+    let db = tmp_db();
+    let unlocked = Mutex::new(HashSet::new());
+    let executor = ask_executor(&db, &unlocked, &cfg);
+    let agentic_result = ask_vault_loop(
+        &guarded_agentic,
+        &executor,
+        &db,
+        &unlocked,
+        "atlas",
+        &history,
+        "",
+        "",
+        false,
+        None,
+        crate::reason::GenOptions::ask_answer(),
+    );
+    assert!(matches!(agentic_result, Err(AppError::Locked(_))));
+    assert_eq!(agentic_validations.load(Ordering::SeqCst), 1);
+    stop_server.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    assert_eq!(
+        loopback_connections.load(Ordering::SeqCst),
+        0,
+        "visibility rejection must prevent every loopback Ollama connection"
+    );
+}
+
 /// The Cloud loop path: a scripted brain calls a GATED tool, answers, and the tool-derived
 /// `[[Title]]` citations flow into the DTO — verbatim in `citations` AND resolved (gated) into
 /// the structured `sources` chips.
@@ -493,6 +669,221 @@ fn ask_history_cap_enforced() {
 
     // A short history passes through untouched.
     assert_eq!(capped_ask_history(&msgs[..3]).len(), 3);
+}
+
+const ASK_HISTORY_TEST_BUDGET: usize = 16_000;
+const ASK_HISTORY_TEST_OMISSION_MARKER: &str =
+    "[Earlier Ask history omitted to fit the context budget.]\n";
+
+fn rendered_prior_history<'a>(rendered: &'a str, question: &str) -> &'a str {
+    let current_turn = format!("User: {}\nAssistant:", question.trim());
+    rendered
+        .strip_suffix(&current_turn)
+        .expect("the current question and completion cue must remain intact")
+}
+
+/// Focused resource/egress regression: a count cap alone does not bound twelve legal,
+/// pasted-document-sized turns. The shared renderer must keep a suffix of complete newest turns,
+/// disclose that older context was omitted, and leave the separately supplied question intact.
+#[test]
+fn ask_history_char_budget_bounds_many_large_turns_and_keeps_newest_context() {
+    let mut history: Vec<ChatTurn> = (0..11)
+        .map(|i| ChatTurn {
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: format!("OLDER-TURN-{i}-{}", "ż".repeat(3_000)),
+        })
+        .collect();
+    history.push(ChatTurn {
+        role: "assistant".into(),
+        content: "NEWEST-COMPLETE-TURN-Ω".into(),
+    });
+    let question = "CURRENT-QUESTION-zażółć-🙂";
+    let rendered =
+        crate::summarize::vault_chat::render_conversation(capped_ask_history(&history), question);
+    let prior = rendered_prior_history(&rendered, question);
+
+    assert!(
+        prior.chars().count() <= ASK_HISTORY_TEST_BUDGET,
+        "rendered prior Ask history exceeded the strict budget: {}",
+        prior.chars().count()
+    );
+    assert!(prior.starts_with(ASK_HISTORY_TEST_OMISSION_MARKER));
+    assert!(prior.contains("Assistant: NEWEST-COMPLETE-TURN-Ω\n"));
+    assert!(
+        !prior.contains("OLDER-TURN-0-"),
+        "the oldest complete turn must be dropped rather than partially packed"
+    );
+    assert!(rendered.ends_with("User: CURRENT-QUESTION-zażółć-🙂\nAssistant:"));
+}
+
+/// When even the newest prior turn cannot fit whole, preserve an honestly marked, Unicode-safe
+/// suffix. This keeps the immediate context without permitting one legal row to bypass the bound.
+#[test]
+fn ask_history_char_budget_marks_and_safely_suffixes_one_oversized_newest_turn() {
+    let history = [ChatTurn {
+        role: "assistant".into(),
+        content: format!("HEAD-SENTINEL-{}-TAIL-Ω", "ą🙂".repeat(12_000)),
+    }];
+    let question = "CURRENT-QUESTION-STAYS-WHOLE";
+    let rendered = crate::summarize::vault_chat::render_conversation(&history, question);
+    let prior = rendered_prior_history(&rendered, question);
+
+    assert!(prior.chars().count() <= ASK_HISTORY_TEST_BUDGET);
+    assert!(prior.starts_with(ASK_HISTORY_TEST_OMISSION_MARKER));
+    assert!(prior.contains("Assistant: …"));
+    assert!(!prior.contains("HEAD-SENTINEL"));
+    assert!(prior.contains("-TAIL-Ω"));
+    assert!(rendered.ends_with("User: CURRENT-QUESTION-STAYS-WHOLE\nAssistant:"));
+}
+
+/// Reserving the long omission marker must not partially truncate a newest turn that fits within
+/// the full history budget by itself. Use a shorter honest marker and retain the complete turn.
+#[test]
+fn ask_history_char_budget_keeps_a_complete_newest_turn_near_the_boundary() {
+    // "Assistant: " (11) + content (15,968) + newline (1) = 15,980 characters, leaving
+    // enough room for the compact 18-character omission marker but not the long marker.
+    let newest_content = "ż".repeat(15_968);
+    let history = [
+        ChatTurn {
+            role: "user".into(),
+            content: "older".repeat(30),
+        },
+        ChatTurn {
+            role: "assistant".into(),
+            content: newest_content.clone(),
+        },
+    ];
+    let rendered = crate::summarize::vault_chat::render_conversation(&history, "q");
+    let prior = rendered_prior_history(&rendered, "q");
+
+    assert_eq!(prior.chars().count(), 15_998);
+    assert!(prior.starts_with("[Earlier omitted]\n"));
+    assert!(prior.ends_with(&format!("Assistant: {newest_content}\n")));
+    assert!(!prior.contains("older"));
+}
+
+/// Even with zero scalar headroom, the complete newest content wins over an older turn; a leading
+/// ellipsis replaces only the normal separator space so omission remains disclosed within 16,000.
+#[test]
+fn ask_history_char_budget_keeps_exact_boundary_newest_content_with_older_omission() {
+    let newest_content = "🙂".repeat(15_988);
+    let history = [
+        ChatTurn {
+            role: "user".into(),
+            content: "older".repeat(30),
+        },
+        ChatTurn {
+            role: "assistant".into(),
+            content: newest_content.clone(),
+        },
+    ];
+    let rendered = crate::summarize::vault_chat::render_conversation(&history, "q");
+    let prior = rendered_prior_history(&rendered, "q");
+
+    assert_eq!(prior.chars().count(), ASK_HISTORY_TEST_BUDGET);
+    assert_eq!(prior, format!("…Assistant:{newest_content}\n"));
+}
+
+/// Every adaptive-marker boundary keeps the newest turn complete and never exceeds the budget.
+/// The cases exercise all marker choices: one-scalar prefix, two-scalar line marker, and compact
+/// or long labelled marker. Zero headroom is covered by the exact-boundary regression above.
+#[test]
+fn ask_history_char_budget_adapts_omission_marker_to_available_headroom() {
+    for headroom in [1usize, 2, 17, 18, 56, 57] {
+        let newest_content = "ż".repeat(15_988 - headroom);
+        let history = [
+            ChatTurn {
+                role: "user".into(),
+                content: "older".repeat(30),
+            },
+            ChatTurn {
+                role: "assistant".into(),
+                content: newest_content.clone(),
+            },
+        ];
+        let rendered = crate::summarize::vault_chat::render_conversation(&history, "q");
+        let prior = rendered_prior_history(&rendered, "q");
+
+        assert!(
+            prior.chars().count() <= ASK_HISTORY_TEST_BUDGET,
+            "headroom {headroom} exceeded the history budget"
+        );
+        assert!(
+            prior.ends_with(&format!("Assistant: {newest_content}\n")),
+            "headroom {headroom} did not preserve the complete newest turn"
+        );
+        assert!(!prior.contains("older"));
+        match headroom {
+            1 => assert!(prior.starts_with('…')),
+            2 | 17 => assert!(prior.starts_with("…\n")),
+            18 | 56 => assert!(prior.starts_with("[Earlier omitted]\n")),
+            57 => assert!(prior.starts_with(ASK_HISTORY_TEST_OMISSION_MARKER)),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Marker readability must not cost an adjacent complete turn. Choose the largest newest
+/// contiguous suffix first, then shorten the honest omission marker when the long label would make
+/// that suffix overflow.
+#[test]
+fn ask_history_char_budget_shortens_marker_to_keep_a_larger_complete_suffix() {
+    // Rendered costs: 100 + 30 + 15,920 = 16,050. The long 57-scalar marker can accompany only
+    // the newest turn, but the 18-scalar compact marker plus the newest two costs 15,968.
+    let dropped_content = format!("DROP-{}", "o".repeat(88));
+    let adjacent_content = format!("KEEP-{}", "a".repeat(18));
+    let newest_content = format!("NEWEST-{}", "ż".repeat(15_901));
+    let history = [
+        ChatTurn {
+            role: "user".into(),
+            content: dropped_content.clone(),
+        },
+        ChatTurn {
+            role: "user".into(),
+            content: adjacent_content.clone(),
+        },
+        ChatTurn {
+            role: "assistant".into(),
+            content: newest_content.clone(),
+        },
+    ];
+    let rendered = crate::summarize::vault_chat::render_conversation(&history, "q");
+    let prior = rendered_prior_history(&rendered, "q");
+
+    assert_eq!(prior.chars().count(), 15_968);
+    assert!(prior.starts_with("[Earlier omitted]\n"));
+    assert!(!prior.contains(&dropped_content));
+    assert!(prior.contains(&format!("User: {adjacent_content}\n")));
+    assert!(prior.ends_with(&format!("Assistant: {newest_content}\n")));
+}
+
+/// A history exactly on the scalar-value boundary remains byte-identical to the old short-history
+/// rendering. One extra scalar is what activates the explicit truncation path.
+#[test]
+fn ask_history_char_budget_preserves_the_exact_boundary() {
+    // "User: " (6) + content (15,993) + newline (1) = exactly 16,000 characters.
+    let content = "ż".repeat(15_993);
+    let history = [ChatTurn {
+        role: "user".into(),
+        content: content.clone(),
+    }];
+    let rendered = crate::summarize::vault_chat::render_conversation(&history, "q");
+    let prior = rendered_prior_history(&rendered, "q");
+    assert_eq!(prior.chars().count(), ASK_HISTORY_TEST_BUDGET);
+    assert_eq!(prior, format!("User: {content}\n"));
+    assert!(!prior.contains(ASK_HISTORY_TEST_OMISSION_MARKER));
+
+    // One additional scalar must activate the marked, bounded truncation path.
+    let over_content = "ż".repeat(15_994);
+    let over_history = [ChatTurn {
+        role: "user".into(),
+        content: over_content,
+    }];
+    let over_rendered = crate::summarize::vault_chat::render_conversation(&over_history, "q");
+    let over_prior = rendered_prior_history(&over_rendered, "q");
+    assert!(over_prior.chars().count() <= ASK_HISTORY_TEST_BUDGET);
+    assert!(over_prior.starts_with(ASK_HISTORY_TEST_OMISSION_MARKER));
+    assert!(over_prior.contains("User: …"));
 }
 
 /// SURFACE SPLIT: the vault executor must NOT advertise `propose_note` (the Ask page has no
