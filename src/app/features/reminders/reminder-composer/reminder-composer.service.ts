@@ -30,7 +30,25 @@ export type ReminderComposerRequest =
 export class ReminderComposerService {
   private readonly _request = signal<ReminderComposerRequest | null>(null);
   readonly request = this._request.asReadonly();
+  private readonly _listenerState = signal<"pending" | "ready" | "failed">(
+    "pending",
+  );
+  readonly listenerState = this._listenerState.asReadonly();
+  private readonly _privacyEpoch = signal(0);
+  readonly privacyEpoch = this._privacyEpoch.asReadonly();
   private nextKey = 0;
+
+  markListenersReady(): void {
+    this._listenerState.set("ready");
+  }
+
+  markListenersFailed(): void {
+    this._listenerState.set("failed");
+  }
+
+  markVisibilityInvalidated(): void {
+    this._privacyEpoch.update((epoch) => epoch + 1);
+  }
 
   openCreate(options?: {
     title?: string;

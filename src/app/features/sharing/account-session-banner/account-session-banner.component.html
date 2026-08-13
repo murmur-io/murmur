@@ -1,0 +1,68 @@
+@if (session.notice(); as notice) {
+  <aside class="session-banner" role="status" aria-label="Sharing account status">
+    <span class="session-icon" aria-hidden="true">
+      @if (notice === "signed-out") {
+        <svg viewBox="0 0 20 20" fill="none">
+          <circle cx="10" cy="7" r="3" stroke="currentColor" stroke-width="1.4" />
+          <path d="M4.8 16c.8-2.6 2.8-4 5.2-4s4.4 1.4 5.2 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+        </svg>
+      } @else {
+        <svg viewBox="0 0 20 20" fill="none">
+          <rect x="4" y="9" width="12" height="8" rx="2" stroke="currentColor" stroke-width="1.4" />
+          <path d="M6.5 9V7a3.5 3.5 0 0 1 7 0v2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+        </svg>
+      }
+    </span>
+    <div class="session-copy">
+      <strong>{{ notice === "signed-out" ? "Your sharing session ended" : "Sharing is locked" }}</strong>
+      <span>
+        {{ notice === "signed-out"
+          ? "Sign in here to restore encrypted sharing. Your local notes still work."
+          : "Unlock the sharing key for this app session. Your local notes stay available." }}
+      </span>
+      @if (session.error(); as error) {
+        <span class="session-error" role="alert">{{ error }}</span>
+      }
+    </div>
+    <div class="session-actions">
+      @if (notice === "sharing-locked" && session.status()?.biometricUnlockAvailable) {
+        <button type="button" class="btn btn-primary session-action" [disabled]="session.loading()" (click)="unlock()">
+          <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <path d="M6 7.5V6a3 3 0 0 1 6 0v1.5M4.5 7.5h9v7h-9v-7Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+          </svg>
+          {{ session.loading() ? "Unlocking…" : "Touch ID" }}
+        </button>
+      }
+      <button type="button" class="btn btn-ghost session-action" (click)="openAuth('signin')">
+        Sign in
+      </button>
+      @if (notice === "signed-out") {
+        <button type="button" class="btn btn-ghost session-action" (click)="openAuth('create')">
+          Create account
+        </button>
+      }
+    </div>
+    <button type="button" class="session-dismiss" aria-label="Dismiss for this session" (click)="session.dismissForSession()">
+      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+      </svg>
+    </button>
+  </aside>
+}
+
+@if (authDoor(); as door) {
+  <div class="auth-scrim" role="dialog" aria-modal="true" aria-label="Sharing account" (click)="onScrim($event)" (keydown.escape)="closeAuth()">
+    <section class="auth-modal">
+      <button type="button" class="auth-close" aria-label="Close account setup" (click)="closeAuth()">
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="m4 4 8 8m0-8-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
+      <app-sharing-auth-flow
+        [initialDoor]="door"
+        (completed)="onCompleted()"
+        (dismissed)="closeAuth()"
+      />
+    </section>
+  </div>
+}

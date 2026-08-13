@@ -18,7 +18,6 @@ import type {
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
-import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
 import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
@@ -133,7 +132,6 @@ export interface AssistantQa {
     MarkdownComponent,
     AssistantSourcesComponent,
     ConnectionsComponent,
-    MoveToMenuComponent,
     MeetingActionsComponent,
     RelatedMeetingsComponent,
     Stage2PanelComponent,
@@ -177,10 +175,6 @@ export class NotePanelComponent {
   readonly noteRaw = input<string | null>(null);
   /** Gated image DTOs for this meeting note. */
   readonly attachments = input<readonly NoteAttachmentDto[]>([]);
-  /** Image-bearing notes use the shared Markdown renderer to preserve exact order. */
-  readonly hasAttachmentRefs = computed(() =>
-    /murmur-attachment:\/\/[0-9a-f-]{36}/i.test(this.noteRaw() ?? ""),
-  );
   /** The vault export path from the note DTO (Saved-to-vault line). */
   readonly exportedPath = input<string | null>(null);
   /** Model provenance for the ghost badge (null → hidden). */
@@ -249,25 +243,13 @@ export class NotePanelComponent {
    */
   readonly seekReceipt = output<{ startS: number; segId: number; seq: number }>();
 
-  // --- ⋯ More overlay menu (local presentational open/close) --------------
-  private readonly moreAnchor =
-    viewChild<ElementRef<HTMLElement>>("moreAnchor");
   private readonly editorArea =
     viewChild<ElementRef<HTMLTextAreaElement>>("editorArea");
   private readonly imageFileInput =
     viewChild<ElementRef<HTMLInputElement>>("imageFileInput");
-  readonly menuOpen = signal(false);
   readonly importingImages = signal(0);
   private imageInsertion: { start: number; end: number } | null = null;
 
-  toggleMenu(): void {
-    this.menuOpen.update((v) => !v);
-  }
-
-  /** Close the menu after an item fires (the action itself is an output). */
-  pick(): void {
-    this.menuOpen.set(false);
-  }
 
   rememberImageInsertion(): void {
     const el = this.editorArea()?.nativeElement;
@@ -460,11 +442,6 @@ export class NotePanelComponent {
     }
   }
 
-  /** Whether the menu should offset the ⋯ trigger when no badge precedes it. */
-  readonly hasTrailingBadge = computed(
-    () => this.provenanceLabel() !== null,
-  );
-
   /** Monotonic click id so a repeat click on the SAME receipt re-fires downstream. */
   private receiptSeq = 0;
 
@@ -636,8 +613,4 @@ export class NotePanelComponent {
     }
   }
 
-  /** Suppress unused-viewChild lint while keeping the anchor ref available. */
-  protected anchorEl(): HTMLElement | null {
-    return this.moreAnchor()?.nativeElement ?? null;
-  }
 }

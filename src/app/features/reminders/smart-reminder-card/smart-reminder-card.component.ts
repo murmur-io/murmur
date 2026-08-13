@@ -52,6 +52,12 @@ export class SmartReminderCardComponent {
   readonly sourceTitle = input("");
   /** Keys re-audit to the currently rendered canonical revision. */
   readonly sourceRevision = input<string | number | null>(null);
+  /**
+   * Whether this card owns the generic "New reminder" affordance. Meeting
+   * detail promotes that action into its command bar and disables it here so
+   * the idle strip cannot duplicate the primary action.
+   */
+  readonly showCreateAction = input(true);
 
   private readonly _suggestions = signal<ReminderSuggestionView[]>([]);
   readonly suggestions = this._suggestions.asReadonly();

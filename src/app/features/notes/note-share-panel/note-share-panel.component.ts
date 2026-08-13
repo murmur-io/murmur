@@ -23,6 +23,7 @@ import {
 } from "../../detail/org-share-sheet/org-share-sheet.component";
 import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { AccountSessionService } from "../../../services/account-session.service";
 
 /** The link-share flow step (Manage always coexists as the list below). */
 type ShareStep = "configure" | "created";
@@ -77,6 +78,7 @@ export class NoteSharePanelComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly accountSession = inject(AccountSessionService);
 
   /** THIS note's document id — the shares filter key. */
   readonly noteId = input.required<string>();
@@ -389,7 +391,8 @@ export class NoteSharePanelComponent {
     this.unlocking.set(true);
     this.gateError.set(null);
     try {
-      await this.ipc.unlockSharingWithBiometric();
+      const status = await this.ipc.unlockSharingWithBiometric();
+      this.accountSession.accept(status);
       await this.refresh();
       if (!this.accountStatus()?.unlockedForSharing) {
         this._biometricFailed.set(true);
