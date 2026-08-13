@@ -85,7 +85,9 @@ test("All notes merges org shared items (with org-name badge) + the chip row lis
   // 2) "All notes" shows YOUR authored note AND the org shared item, merged,
   // as table rows.
   await expect(page.getByText("My First Note")).toBeVisible();
-  const orgRow = page.locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" });
+  const orgRow = page.locator(".mur-table tbody tr", {
+    hasText: "Team Roadmap Q3",
+  });
   await expect(orgRow).toHaveCount(1);
   // The org row carries the ORG-NAME badge + the author hint.
   await expect(orgRow.locator(".org-badge")).toContainText("Siema");
@@ -182,6 +184,70 @@ test("clicking an org shared item routes to the read-only /org-item viewer", asy
   expect(consoleErrors).toEqual([]);
 });
 
+test("org-item Ask never offers unsupported composite dashboard scope", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    ...ORG_MOCKS,
+    list_dashboards: () => [
+      {
+        id: "unsupported-org-dashboard",
+        title: "Must not be offered to org Ask",
+        emoji: "🚫",
+        tileCount: 1,
+        createdAt: "2026-08-06T01:00:00Z",
+        updatedAt: "2026-08-06T01:00:00Z",
+      },
+    ],
+  });
+  await page.goto("/org-item/oi1");
+  await page.evaluate(() => {
+    const target = window as unknown as {
+      __orgAskArgs?: unknown;
+      __TAURI_INTERNALS__: {
+        invoke: (
+          command: string,
+          args?: Record<string, unknown>,
+        ) => Promise<unknown>;
+      };
+    };
+    const original = target.__TAURI_INTERNALS__.invoke.bind(
+      target.__TAURI_INTERNALS__,
+    );
+    target.__TAURI_INTERNALS__.invoke = (command, args) => {
+      if (command === "ask_vault") target.__orgAskArgs = args;
+      return original(command, args);
+    };
+  });
+  await page.getByRole("button", { name: "Ask Brain" }).click();
+  const chat = page.locator("app-note-chat");
+  await chat.getByRole("button", { name: "Sources" }).click();
+  await expect(
+    page.getByRole("option", {
+      name: "Use dashboard Must not be offered to org Ask",
+    }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Must not be offered to org Ask", { exact: true }),
+  ).toHaveCount(0);
+  await page.evaluate(() => {
+    const scrim = document.querySelector<HTMLElement>(".sp-scrim");
+    scrim?.click();
+  });
+  await expect(page.locator(".sp-pop")).toHaveCount(0);
+  await chat.locator(".chat-input").fill("Ask only about this org item");
+  await chat.locator(".chat-input").press("Enter");
+  await expect(chat.locator(".chat-row.is-assistant")).toHaveCount(1);
+
+  const args = await page.evaluate(
+    () =>
+      (window as unknown as { __orgAskArgs?: Record<string, unknown> })
+        .__orgAskArgs,
+  );
+  expect(args?.["pinnedOrgItemId"]).toBe("oi1");
+  expect(args).not.toHaveProperty("dashboardId");
+});
+
 test("selecting the org chip shows ONLY that org's items", async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on("console", (msg) => {
@@ -243,7 +309,9 @@ test("a long org name truncates with an ellipsis, not a hard clip (matches .titl
   await page.goto("/notes");
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  const orgRow = page.locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" });
+  const orgRow = page.locator(".mur-table tbody tr", {
+    hasText: "Team Roadmap Q3",
+  });
   const badge = orgRow.locator(".org-badge");
   await expect(badge).toBeVisible();
 

@@ -16,6 +16,7 @@ import type {
   TileKind,
   LinkEdge,
   LinkKind,
+  LivingAnswerTileData,
   SourceRef,
   WikiTarget,
   CompanionAppendResult,
@@ -185,8 +186,7 @@ export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 // Recording hit the 4h hard TIME cap and self-stopped (distinct from the byte-based prune).
 export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
-export const EVENT_RECORDING_CAPTURE_FAULT =
-  "murmur://recording-capture-fault";
+export const EVENT_RECORDING_CAPTURE_FAULT = "murmur://recording-capture-fault";
 export const EVENT_MIC_AUTO_UNMUTED = "murmur://mic-auto-unmuted";
 // Brain v2 L5 — a scheduled brief was STAGED (propose-accept; run id + label + size only).
 export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
@@ -202,14 +202,12 @@ export const EVENT_CONTENT_DELETED = "murmur://content-deleted";
 /** Count-only invalidation for the first-class Murmur reminder inbox. */
 export const EVENT_REMINDERS_UPDATED = "murmur://reminders-updated";
 /** Kind + opaque source id only; Smart cards re-audit through the gated command. */
-export const EVENT_REMINDER_SOURCE_UPDATED =
-  "murmur://reminder-source-updated";
+export const EVENT_REMINDER_SOURCE_UPDATED = "murmur://reminder-source-updated";
 /** No-payload privacy barrier: every cached reminder source title must be discarded immediately. */
 export const EVENT_REMINDER_VISIBILITY_INVALIDATED =
   "murmur://reminder-visibility-invalidated";
 /** No-payload privacy barrier: every durable Ask history cache must be purged immediately. */
-export const EVENT_ASK_HISTORY_INVALIDATED =
-  "murmur://ask-history-invalidated";
+export const EVENT_ASK_HISTORY_INVALIDATED = "murmur://ask-history-invalidated";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -307,7 +305,10 @@ export class IpcService {
     meetingId: string,
     findings: VerifyFindingDto[],
   ): Promise<NoteDto> {
-    return invoke<NoteDto>("apply_note_verify_markers", { meetingId, findings });
+    return invoke<NoteDto>("apply_note_verify_markers", {
+      meetingId,
+      findings,
+    });
   }
 
   /**
@@ -465,7 +466,12 @@ export class IpcService {
     password: string,
     saveRecovery: boolean,
   ): Promise<string | null> {
-    return invoke<string | null>("account_signup", { email, code, password, saveRecovery });
+    return invoke<string | null>("account_signup", {
+      email,
+      code,
+      password,
+      saveRecovery,
+    });
   }
 
   /** Log in (OPAQUE); unwraps MK for the session and stores the tokens in the Keychain. */
@@ -699,9 +705,11 @@ export class IpcService {
    * whenever the scrub toggle flips (the markdown + counts change). Refuses
    * (`Locked`) a sealed source. Mirrors the spec `preview_org_share`.
    */
-  previewOrgShare(
-    args: { meetingId?: string; documentId?: string; scrub: boolean },
-  ): Promise<OrgSharePreview> {
+  previewOrgShare(args: {
+    meetingId?: string;
+    documentId?: string;
+    scrub: boolean;
+  }): Promise<OrgSharePreview> {
     return invoke<OrgSharePreview>("preview_org_share", {
       meetingId: args.meetingId ?? null,
       documentId: args.documentId ?? null,
@@ -1261,9 +1269,8 @@ export class IpcService {
   // Boards of tiles over EXISTING sources. `getDashboard` returns every tile
   // already resolved through the backend's gated readers — a sealed source
   // arrives as `{ kind: "locked" }` with no payload, so the FE cannot leak what
-  // it was never given. Board-scoped Ask reuses the shipped `askVault(…,
-  // explicitSources)` path with `getDashboardSources()`; there is no separate
-  // dashboard AI command and therefore no new egress surface.
+  // it was never given. Board-scoped Ask sends only `dashboardId`; the backend
+  // resolves the live composite under the same privacy/egress seams.
 
   /** Every board with its layout metadata (no gated payload read). */
   listDashboards(): Promise<DashboardSummary[]> {
@@ -1340,22 +1347,24 @@ export class IpcService {
     return invoke<void>("update_dashboard_tile", { id, ...patch });
   }
 
-  /**
-   * Persist a Living-answer result. The BACKEND writes it, because the gate that
-   * governs the cached answer is a snapshot of which folders were readable at
-   * answer time — something the FE cannot compute, and something no list of
-   * sources can substitute for (Ask expands into linked neighbours).
-   */
-  setDashboardAnswer(
-    id: string,
-    question: string,
-    answer: string,
-  ): Promise<void> {
-    return invoke<void>("set_dashboard_answer", { id, question, answer });
-  }
-
   deleteDashboardTile(id: string): Promise<boolean> {
     return invoke<boolean>("delete_dashboard_tile", { id });
+  }
+
+  /**
+   * Rebuild one Living Answer from the dashboard's current backend-gated scope.
+   * The caller supplies identity + question only; answer/provenance stay backend-owned.
+   */
+  refreshDashboardAnswer(
+    dashboardId: string,
+    tileId: string,
+    question: string,
+  ): Promise<LivingAnswerTileData> {
+    return invoke<LivingAnswerTileData>("refresh_dashboard_answer", {
+      dashboardId,
+      tileId,
+      question,
+    });
   }
 
   reorderDashboardTiles(dashboardId: string, tileIds: string[]): Promise<void> {
@@ -1975,6 +1984,7 @@ export class IpcService {
     conversationId?: string,
     explicitSources?: SourceRef[],
     askTraceId?: string,
+    dashboardId?: string,
   ): Promise<AskConversationSendResult> {
     return invoke<AskConversationSendResult>("ask_vault_persisted", {
       scope,
@@ -1982,6 +1992,7 @@ export class IpcService {
       conversationId,
       askTraceId,
       ...(explicitSources?.length ? { explicitSources } : {}),
+      ...(dashboardId ? { dashboardId } : {}),
     });
   }
 
@@ -1991,12 +2002,14 @@ export class IpcService {
     question: string,
     conversationId?: string,
     explicitSources?: SourceRef[],
+    dashboardId?: string,
   ): Promise<AskConversationSendResult> {
     return invoke<AskConversationSendResult>("chat_meeting_persisted", {
       meetingId,
       question,
       conversationId,
       ...(explicitSources?.length ? { explicitSources } : {}),
+      ...(dashboardId ? { dashboardId } : {}),
     });
   }
 
@@ -2878,7 +2891,9 @@ export class IpcService {
    * locked folder never exposes a typed view.
    */
   getNoteFolderSchema(folderId: string): Promise<PropertySchemaField[]> {
-    return invoke<PropertySchemaField[]>("get_note_folder_schema", { folderId });
+    return invoke<PropertySchemaField[]>("get_note_folder_schema", {
+      folderId,
+    });
   }
 
   /**
@@ -2935,7 +2950,9 @@ export class IpcService {
    * the FE must confirm first. Returns the reopened FolderNode.
    */
   discardUnrecoverableFolderLock(folderId: string): Promise<FolderNode> {
-    return invoke<FolderNode>("discard_unrecoverable_folder_lock", { folderId });
+    return invoke<FolderNode>("discard_unrecoverable_folder_lock", {
+      folderId,
+    });
   }
 
   /**
@@ -2943,7 +2960,9 @@ export class IpcService {
    * and discards its lock IF the key is unrecoverable. `null` when the meeting is at the vault root
    * or its folder is already open. Refuses (rejects) if the folder is actually recoverable.
    */
-  discardUnrecoverableMeetingLock(meetingId: string): Promise<FolderNode | null> {
+  discardUnrecoverableMeetingLock(
+    meetingId: string,
+  ): Promise<FolderNode | null> {
     return invoke<FolderNode | null>("discard_unrecoverable_meeting_lock", {
       meetingId,
     });
@@ -3094,9 +3113,7 @@ export class IpcService {
    * so the card can render the live tool-trace chips ("Searching notes… ✓").
    * NO PII — tool name + a coarse count only.
    */
-  onAssistantTool(
-    cb: (p: AssistantToolPayload) => void,
-  ): Promise<UnlistenFn> {
+  onAssistantTool(cb: (p: AssistantToolPayload) => void): Promise<UnlistenFn> {
     return listen<AssistantToolPayload>(EVENT_ASSISTANT_TOOL, (e) =>
       cb(e.payload),
     );
@@ -3117,9 +3134,7 @@ export class IpcService {
   }
 
   /** Fires with progress for the in-flight Whisper transcribe-model download. */
-  onModelDownload(
-    cb: (p: ModelDownloadProgress) => void,
-  ): Promise<UnlistenFn> {
+  onModelDownload(cb: (p: ModelDownloadProgress) => void): Promise<UnlistenFn> {
     return listen<ModelDownloadProgress>(EVENT_MODEL_DOWNLOAD, (e) =>
       cb(e.payload),
     );
@@ -3137,9 +3152,7 @@ export class IpcService {
   }
 
   /** Fires with progress for an in-flight local brain-model download. */
-  onBrainDownload(
-    cb: (p: BrainDownloadProgress) => void,
-  ): Promise<UnlistenFn> {
+  onBrainDownload(cb: (p: BrainDownloadProgress) => void): Promise<UnlistenFn> {
     return listen<BrainDownloadProgress>(EVENT_BRAIN_DOWNLOAD, (e) =>
       cb(e.payload),
     );
@@ -3157,9 +3170,7 @@ export class IpcService {
   }
 
   /** Fires with per-file progress for the in-flight embedding-model download. */
-  onEmbedDownload(
-    cb: (p: EmbedDownloadProgress) => void,
-  ): Promise<UnlistenFn> {
+  onEmbedDownload(cb: (p: EmbedDownloadProgress) => void): Promise<UnlistenFn> {
     return listen<EmbedDownloadProgress>(EVENT_EMBED_DOWNLOAD, (e) =>
       cb(e.payload),
     );
@@ -3176,9 +3187,7 @@ export class IpcService {
    * NO PII (the `documentId` is a random UUID; no filename/text). Subscribe once
    * per open Brain view and release the returned {@link UnlistenFn} on teardown.
    */
-  onDocImportProgress(
-    cb: (p: DocImportProgress) => void,
-  ): Promise<UnlistenFn> {
+  onDocImportProgress(cb: (p: DocImportProgress) => void): Promise<UnlistenFn> {
     return listen<DocImportProgress>(EVENT_DOC_IMPORT, (e) => cb(e.payload));
   }
 

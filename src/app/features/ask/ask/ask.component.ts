@@ -19,6 +19,7 @@ import type {
   AskConversation,
   AskConversationScope,
   AskConversationSummary,
+  DashboardScopeRef,
   SourceRef,
   VaultSource,
 } from "../../../core/models";
@@ -130,6 +131,8 @@ export class AskComponent implements OnInit {
    * their links; empty ⇒ pass `undefined` (whole-vault) to {@link askVault}.
    */
   readonly sources = signal<SourceRef[]>([]);
+  /** One composite board identity; never expanded into child SourceRefs in the WebView. */
+  readonly dashboard = signal<DashboardScopeRef | null>(null);
 
   /** Durable SQLite conversation id; distinct from the per-request trace id. */
   readonly conversationId = signal<string | null>(null);
@@ -400,6 +403,30 @@ export class AskComponent implements OnInit {
     void this.historyPrivacy.ensureReady();
   }
 
+  /**
+   * A durable thread cannot change composite identity in place. User selection
+   * therefore starts a fresh conversation while preserving manual sources.
+   * History restore writes `dashboard` directly and never enters this handler.
+   */
+  onDashboardChange(next: DashboardScopeRef | null): void {
+    if (this.dashboard()?.id === next?.id) return;
+    const sources = this.sources();
+    if (this.conversationId() !== null || this.conversation().length > 0) {
+      this.resetConversation(false);
+      this.sources.set(sources);
+    }
+    this.dashboard.set(next);
+  }
+
+  onSourcesChange(next: SourceRef[]): void {
+    const dashboard = this.dashboard();
+    if (this.conversationId() !== null || this.conversation().length > 0) {
+      this.resetConversation(false);
+      this.dashboard.set(dashboard);
+    }
+    this.sources.set(next);
+  }
+
   /** Load and resume one canonical conversation, including its saved sources. */
   async resumeConversation(id: string): Promise<void> {
     if (this.pending() || !this.historyPrivacyReady()) {
@@ -419,6 +446,7 @@ export class AskComponent implements OnInit {
       this.requestSeq++;
       this.conversationId.set(detail.id);
       this.sources.set(detail.selectedSources);
+      this.dashboard.set(detail.dashboard ?? null);
       this.conversation.set(this.renderTurns(detail));
       this.draft.set("");
       this.error.set(null);
@@ -487,6 +515,7 @@ export class AskComponent implements OnInit {
         conversationId,
         scope.length ? scope : undefined,
         askThreadId,
+        this.dashboard()?.id,
       );
       if (requestSeq !== this.requestSeq) {
         return;
@@ -558,6 +587,7 @@ export class AskComponent implements OnInit {
     this.draft.set("");
     this.error.set(null);
     this.sources.set([]);
+    this.dashboard.set(null);
     this.historyOpen.set(false);
     this.historyLoading.set(false);
     this.historyError.set(null);
@@ -614,7 +644,8 @@ export class AskComponent implements OnInit {
 
   /** The scrollable message log. */
   private readonly scroller = viewChild<ElementRef<HTMLDivElement>>("scroller");
-  private readonly composer = viewChild<ElementRef<HTMLTextAreaElement>>("input");
+  private readonly composer =
+    viewChild<ElementRef<HTMLTextAreaElement>>("input");
   private readonly sourcePicker = viewChild(SourcePickerComponent);
 
   private focusComposer(): void {

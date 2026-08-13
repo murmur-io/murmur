@@ -64,6 +64,7 @@ const VISIBILITY_RETRY_MESSAGE: &str = "content visibility changed; retry the re
 struct VisibilitySnapshot {
     seal_epoch: u64,
     unlocked_folders: HashSet<String>,
+    ask_dispatch_generation: Option<i64>,
 }
 
 /// The exact shared visibility authority used for one MCP request. Production constructs this only
@@ -98,6 +99,10 @@ impl<'a> RpcContext<'a> {
         Ok(VisibilitySnapshot {
             seal_epoch: self.seal_epoch.load(Ordering::SeqCst),
             unlocked_folders,
+            ask_dispatch_generation: match self.db {
+                Some(db) => Some(db.ask_dispatch_generation().map_err(|_| ())?),
+                None => None,
+            },
         })
     }
 }
@@ -816,6 +821,8 @@ fn send_rpc_reply(
                 state.unlocked_folders.as_ref(),
                 deadline,
             ) != Ok(true)
+                || pending.snapshot.ask_dispatch_generation
+                    != state.db.ask_dispatch_generation().ok()
             {
                 drop(lifecycle);
                 let refusal = rpc_err(pending.id, VISIBILITY_RETRY_CODE, VISIBILITY_RETRY_MESSAGE)
@@ -2543,6 +2550,7 @@ mod tests {
             snapshot: VisibilitySnapshot {
                 seal_epoch: state.seal_epoch.load(Ordering::SeqCst),
                 unlocked_folders: HashSet::new(),
+                ask_dispatch_generation: Some(state.db.ask_dispatch_generation().unwrap()),
             },
             outcome: Ok("SECRET_MUST_NOT_RENDER_OR_WRITE".into()),
         };
@@ -2767,6 +2775,7 @@ mod tests {
             snapshot: VisibilitySnapshot {
                 seal_epoch: 0,
                 unlocked_folders: HashSet::new(),
+                ask_dispatch_generation: None,
             },
             outcome: Ok("\u{0001}".repeat(MAX_TOOL_TEXT_BYTES)),
         };
@@ -3316,6 +3325,121 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    #[test]
+    fn content_response_revalidation_discards_materialized_living_answer_after_ask_generation_bump()
+    {
+        const MARKER: &str = "OLD_LIVING_ANSWER_MUST_NOT_REACH_MCP";
+
+        let db_path =
+            crate::storage::db::unique_temp_path("murmur-mcp-living-answer-generation", "sqlite");
+        let state = AppState::init_at(&db_path, TEST_DEK).unwrap();
+        state
+            .db
+            .insert_dashboard(
+                "board-ask-generation",
+                "Ask generation board",
+                None,
+                None,
+                "2026-08-13T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "tile-ask-generation",
+                "board-ask-generation",
+                4,
+                "What changed?",
+                "[]",
+                "2026-08-13T10:00:01Z",
+            )
+            .unwrap();
+        let budget = {
+            let config = state.config.lock().unwrap();
+            crate::commands::resolved_ask_corpus_budget(&config)
+        };
+        let composite = crate::commands::living_answer_composite_context(
+            &state.db,
+            "board-ask-generation",
+            &HashSet::new(),
+            budget,
+        )
+        .unwrap();
+        assert!(state
+            .db
+            .store_dashboard_living_answer_cas(
+                "tile-ask-generation",
+                "board-ask-generation",
+                "What changed?",
+                MARKER,
+                "2026-08-13T10:01:00Z",
+                "[]",
+                composite.witness.generation,
+                &composite.witness.input_digest,
+                budget,
+            )
+            .unwrap());
+
+        let context = RpcContext::from_state(&state);
+        let params = json!({
+            "name": "get_dashboard",
+            "arguments": { "dashboardId": "board-ask-generation" }
+        });
+        let pending = match handle_tool_call(
+            &context,
+            json!(81),
+            Some(&params),
+            Instant::now() + REQUEST_DEADLINE,
+        ) {
+            RpcReply::Content(pending) => pending,
+            RpcReply::Immediate(response) => {
+                panic!("get_dashboard unexpectedly finalized early: {response}")
+            }
+        };
+        assert!(
+            pending
+                .outcome
+                .as_ref()
+                .is_ok_and(|text| text.contains(MARKER)),
+            "the regression must materialize the valid old-generation cache before the race"
+        );
+
+        {
+            let _lifecycle = state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.db.advance_ask_dispatch_generation().unwrap();
+        }
+        let gate = Arc::new(McpResponseGate::new());
+        let (mut client, mut server) = tcp_pair();
+        send_rpc_reply(
+            &mut server,
+            RpcReply::Content(pending),
+            &state,
+            &gate,
+            Instant::now() + REQUEST_DEADLINE,
+        );
+        drop(server);
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+        let (_, body) = wire.split_once("\r\n\r\n").expect("complete HTTP reply");
+        let response: Value = serde_json::from_str(body).expect("JSON-RPC response");
+        assert_eq!(response["error"]["code"], VISIBILITY_RETRY_CODE);
+        assert_eq!(
+            response["error"]["message"],
+            Value::String(VISIBILITY_RETRY_MESSAGE.into())
+        );
+        assert!(
+            !response.to_string().contains(MARKER),
+            "the response gate leaked a Living Answer materialized under an old Ask generation"
+        );
+        assert_eq!(gate.active_count(), 0);
+
+        drop(state);
+        let _ = std::fs::remove_file(db_path);
+    }
+
     /// KnowledgeDiff note context is reachable only through the fixed loopback MCP catalog, and a
     /// relock after materialization but before response production discards content AND bounded
     /// source-count metadata. The model-facing/GatedToolExecutor boundary is asserted separately in
@@ -3689,6 +3813,7 @@ mod tests {
         let snapshot = VisibilitySnapshot {
             seal_epoch: 41,
             unlocked_folders: original.clone(),
+            ask_dispatch_generation: None,
         };
         let epoch = AtomicU64::new(41);
         let unlocked = Mutex::new(original);

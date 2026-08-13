@@ -655,6 +655,41 @@ impl Db {
             .transpose()
     }
 
+    /// Full meeting row through one SQL visibility predicate. Unlike a check-then-`get_meeting`
+    /// pair, a concurrent relock cannot land between authorization and reading title/audio_path.
+    ///
+    /// Canonical ownership invariant: a meeting's only folder edge is `notes.folder_id`, so a
+    /// meeting with no note rows is necessarily unfiled/root-visible. That state is intentional
+    /// for live recordings and crash-recovery ghosts. Do not infer a former seal from optional
+    /// artifacts: segment/timeline/manual-note blobs and encrypted audio can all legitimately be
+    /// absent. Once a note establishes folder ownership, the predicate below gates and hydrates
+    /// the row in the same SQL statement.
+    pub fn get_meeting_if_visible(
+        &self,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<Meeting>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
+                    (SELECT nf.folder_id FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
+               FROM meetings m
+              WHERE m.id = ?1 AND (
+                    NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                    OR EXISTS (
+                      SELECT 1 FROM notes n
+                       LEFT JOIN folders f ON f.id = n.folder_id
+                       WHERE n.meeting_id = m.id AND {visible}
+                    ))"
+        );
+        conn.query_row(&sql, rusqlite::params![id], row_to_meeting)
+            .optional()
+            .map_err(map_err)?
+            .transpose()
+    }
+
     /// CASE-FOLDED twin of [`Self::meeting_by_title_visible`] (brain-v3 audit Fix 6): the same
     /// gated resolver but comparing `LOWER(m.title) = LOWER(?1)` so `[[project x]]` resolves a
     /// meeting titled "Project X". Used ONLY as [`Self::resolve_wikilink`]'s meeting-leg fallback

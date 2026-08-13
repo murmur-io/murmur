@@ -29,8 +29,9 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
     },
     lock_folder: (args: { folderId: string }) => {
       if (args.folderId === "nf-history") {
-        (window as unknown as { __historyNoteLocked?: boolean })
-          .__historyNoteLocked = true;
+        (
+          window as unknown as { __historyNoteLocked?: boolean }
+        ).__historyNoteLocked = true;
       }
       return null;
     },
@@ -42,17 +43,23 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
   await page.locator(".sp-scrim").click();
   await page.locator(".ask-input").fill("Sensitive Ask message");
   await page.locator(".ask-input").press("Enter");
-  await expect(page.getByText("Sensitive Ask message", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Sensitive Ask message", { exact: true }),
+  ).toBeVisible();
 
   await page.getByRole("button", { name: "Conversation history" }).click();
-  await expect(page.getByText("Sensitive Ask message", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Sensitive Ask message", { exact: true }),
+  ).toBeVisible();
 
   const lock = page.getByRole("button", { name: "Lock folder" }).first();
   await expect(lock).toBeAttached();
   await lock.click({ force: true });
 
   await expect(page.locator("mur-chat-history")).toHaveCount(0);
-  await expect(page.getByText("Sensitive Ask message", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("Sensitive Ask message", { exact: true }),
+  ).toHaveCount(0);
   await expect(page.locator(".ask-row")).toHaveCount(0);
   await expect(page.locator("mur-source-picker .sp-chip")).toHaveCount(0);
 });
@@ -80,8 +87,9 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
     },
     lock_folder: (args: { folderId: string }) => {
       if (args.folderId === "f-history") {
-        (window as unknown as { __historyMeetingLocked?: boolean })
-          .__historyMeetingLocked = true;
+        (
+          window as unknown as { __historyMeetingLocked?: boolean }
+        ).__historyMeetingLocked = true;
       }
       return null;
     },
@@ -89,12 +97,16 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
   await page.goto("/ask");
   await page.locator(".ask-input").fill("Meeting-derived secret");
   await page.locator(".ask-input").press("Enter");
-  await expect(page.getByText("Meeting-derived secret", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Meeting-derived secret", { exact: true }),
+  ).toBeVisible();
 
   const lock = page.locator("app-folder-row .lock-toggle").first();
   await expect(lock).toBeAttached();
   await lock.click({ force: true });
-  await expect(page.getByText("Meeting-derived secret", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("Meeting-derived secret", { exact: true }),
+  ).toHaveCount(0);
   await expect(page.locator(".ask-row")).toHaveCount(0);
 });
 
@@ -105,7 +117,9 @@ test("a content deletion event evicts the durable Ask cache immediately", async 
   await page.goto("/ask");
   await page.locator(".ask-input").fill("Deleted-source secret");
   await page.locator(".ask-input").press("Enter");
-  await expect(page.getByText("Deleted-source secret", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Deleted-source secret", { exact: true }),
+  ).toBeVisible();
 
   await page.evaluate(() => {
     (
@@ -117,7 +131,9 @@ test("a content deletion event evicts the durable Ask cache immediately", async 
       id: "n-deleted",
     });
   });
-  await expect(page.getByText("Deleted-source secret", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("Deleted-source secret", { exact: true }),
+  ).toHaveCount(0);
   await expect(page.locator(".ask-row")).toHaveCount(0);
 });
 
@@ -136,7 +152,9 @@ test("the canonical Ask-history purge event evicts every mounted plaintext cache
   await page.locator(".sp-scrim").click();
   await page.locator(".ask-input").fill("Moved-source secret");
   await page.locator(".ask-input").press("Enter");
-  await expect(page.getByText("Moved-source secret", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Moved-source secret", { exact: true }),
+  ).toBeVisible();
   await expect(page.locator("mur-source-picker .sp-chip")).toHaveCount(1);
 
   await page.evaluate(() => {
@@ -147,7 +165,9 @@ test("the canonical Ask-history purge event evicts every mounted plaintext cache
     ).__demoEmit("murmur://ask-history-invalidated", null);
   });
 
-  await expect(page.getByText("Moved-source secret", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("Moved-source secret", { exact: true }),
+  ).toHaveCount(0);
   await expect(page.locator(".ask-row")).toHaveCount(0);
   await expect(page.locator("mur-source-picker .sp-chip")).toHaveCount(0);
   await expect(page.locator("mur-chat-history")).toHaveCount(0);
@@ -157,16 +177,38 @@ test("privacy invalidation closes the source picker, scrubs cached labels, and d
   page,
 }) => {
   await mockTauri(page, {
-    list_dashboards: () => [
-      {
-        id: "dashboard-secret",
-        title: "Sealed dashboard title",
-        emoji: "🔒",
-        tileCount: 2,
-        createdAt: "2026-08-06T01:00:00Z",
-        updatedAt: "2026-08-06T01:00:00Z",
-      },
-    ],
+    list_dashboards: () => {
+      const target = window as unknown as {
+        __dashboardListCall?: number;
+        __resolveLateDashboards?: () => void;
+      };
+      target.__dashboardListCall = (target.__dashboardListCall ?? 0) + 1;
+      if (target.__dashboardListCall === 1) {
+        return [
+          {
+            id: "dashboard-secret",
+            title: "Sealed dashboard title",
+            emoji: "🔒",
+            tileCount: 2,
+            createdAt: "2026-08-06T01:00:00Z",
+            updatedAt: "2026-08-06T01:00:00Z",
+          },
+        ];
+      }
+      return new Promise((resolve) => {
+        target.__resolveLateDashboards = () =>
+          resolve([
+            {
+              id: "late-dashboard-secret",
+              title: "Late sealed dashboard title",
+              emoji: "🤫",
+              tileCount: 1,
+              createdAt: "2026-08-06T01:00:00Z",
+              updatedAt: "2026-08-06T01:00:00Z",
+            },
+          ]);
+      });
+    },
     list_link_candidates: () =>
       new Promise((resolve) => {
         (
@@ -182,13 +224,35 @@ test("privacy invalidation closes the source picker, scrubs cached labels, and d
             },
           ]);
       }),
+    ask_vault_persisted: () =>
+      new Promise((resolve) => {
+        (
+          window as unknown as {
+            __resolveLatePrivateAsk?: () => void;
+          }
+        ).__resolveLatePrivateAsk = () =>
+          resolve({
+            conversationId: "stale-private-thread",
+            userMessageId: crypto.randomUUID(),
+            assistantMessageId: crypto.randomUUID(),
+            answer: "Late sealed answer",
+            sources: [],
+            citations: [],
+          });
+      }),
   });
   await page.goto("/ask");
 
   await page.locator("mur-source-picker .sp-trigger").click();
+  await page
+    .getByRole("option", { name: "Use dashboard Sealed dashboard title" })
+    .click();
   await expect(
-    page.getByRole("option", { name: /Sealed dashboard title/ }),
-  ).toBeVisible();
+    page.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toContainText("Sealed dashboard title");
+  await page.locator(".ask-input").fill("Private held question");
+  await page.locator(".ask-input").press("Enter");
+  await expect(page.locator(".ask-typing")).toBeVisible();
 
   await page.evaluate(() => {
     (
@@ -199,16 +263,56 @@ test("privacy invalidation closes the source picker, scrubs cached labels, and d
   });
 
   await expect(page.locator(".sp-pop")).toHaveCount(0);
-  await expect(page.getByText("Sealed dashboard title", { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByText("Sealed dashboard title", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Private held question", { exact: true }),
+  ).toHaveCount(0);
+
+  await page.locator("mur-source-picker .sp-trigger").click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(
+          (
+            window as unknown as {
+              __resolveLateDashboards?: () => void;
+            }
+          ).__resolveLateDashboards,
+        ),
+      ),
+    )
+    .toBe(true);
   await page.evaluate(() => {
     (
       window as unknown as {
-        __resolveLatePrivateCandidates?: () => void;
+        __demoEmit: (event: string, payload: unknown) => void;
       }
-    ).__resolveLatePrivateCandidates?.();
+    ).__demoEmit("murmur://ask-history-invalidated", null);
   });
-  await page.waitForTimeout(200);
-  await expect(page.getByText("Late sealed source title", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => {
+    const target = window as unknown as {
+      __resolveLatePrivateCandidates?: () => void;
+      __resolveLateDashboards?: () => void;
+      __resolveLatePrivateAsk?: () => void;
+    };
+    target.__resolveLatePrivateCandidates?.();
+    target.__resolveLateDashboards?.();
+    target.__resolveLatePrivateAsk?.();
+  });
+  await expect(
+    page.getByText("Late sealed source title", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Late sealed dashboard title", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Late sealed answer", { exact: true }),
+  ).toHaveCount(0);
   await expect(page.locator("mur-source-picker .sp-chip")).toHaveCount(0);
 });
 
@@ -251,7 +355,11 @@ test("meeting drawer purge clears saved titles and sources and defeats a late pr
       scope: { kind: "meeting", refId: "m-atlas-roadmap" },
       title: "Meeting history secret title",
       selectedSources: [
-        { kind: "note", id: "n-saved-secret", title: "Saved meeting secret source" },
+        {
+          kind: "note",
+          id: "n-saved-secret",
+          title: "Saved meeting secret source",
+        },
       ],
       messages: [
         {
@@ -282,12 +390,16 @@ test("meeting drawer purge clears saved titles and sources and defeats a late pr
   const chat = page.locator("app-meeting-chat");
   await chat.getByRole("button", { name: "Conversation history" }).click();
   await chat.locator(".history-row").click();
-  await expect(chat.getByText("Meeting drawer secret message", { exact: true })).toBeVisible();
+  await expect(
+    chat.getByText("Meeting drawer secret message", { exact: true }),
+  ).toBeVisible();
   await expect(chat.locator(".sp-chip-title")).toHaveText([
     "Saved meeting secret source",
   ]);
   await chat.getByRole("button", { name: "Conversation history" }).click();
-  await expect(chat.getByText("Meeting history secret title", { exact: true })).toBeVisible();
+  await expect(
+    chat.getByText("Meeting history secret title", { exact: true }),
+  ).toBeVisible();
 
   await page.evaluate(() => {
     (
@@ -297,8 +409,12 @@ test("meeting drawer purge clears saved titles and sources and defeats a late pr
     ).__demoEmit("murmur://ask-history-invalidated", null);
   });
 
-  await expect(chat.getByText("Meeting history secret title", { exact: true })).toHaveCount(0);
-  await expect(chat.getByText("Meeting drawer secret message", { exact: true })).toHaveCount(0);
+  await expect(
+    chat.getByText("Meeting history secret title", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    chat.getByText("Meeting drawer secret message", { exact: true }),
+  ).toHaveCount(0);
   await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
   await page.evaluate(() => {
     (
@@ -307,10 +423,14 @@ test("meeting drawer purge clears saved titles and sources and defeats a late pr
   });
   await page.waitForTimeout(100);
   await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
-  await expect(chat.getByText("Late meeting-linked secret", { exact: true })).toHaveCount(0);
+  await expect(
+    chat.getByText("Late meeting-linked secret", { exact: true }),
+  ).toHaveCount(0);
   await chat.getByRole("button", { name: "New conversation" }).click();
   await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
-  await expect(chat.getByText("Late meeting-linked secret", { exact: true })).toHaveCount(0);
+  await expect(
+    chat.getByText("Late meeting-linked secret", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("authored-note drawer purge clears saved titles and sources and defeats a late prefill", async ({
@@ -352,7 +472,11 @@ test("authored-note drawer purge clears saved titles and sources and defeats a l
       scope: { kind: "note", refId: "n1" },
       title: "Note history secret title",
       selectedSources: [
-        { kind: "meeting", id: "m-saved-secret", title: "Saved note secret source" },
+        {
+          kind: "meeting",
+          id: "m-saved-secret",
+          title: "Saved note secret source",
+        },
       ],
       messages: [
         {
@@ -383,12 +507,16 @@ test("authored-note drawer purge clears saved titles and sources and defeats a l
   const chat = page.locator(".note-chat-drawer app-note-chat");
   await chat.getByRole("button", { name: "Conversation history" }).click();
   await chat.locator(".history-row").click();
-  await expect(chat.getByText("Note drawer secret message", { exact: true })).toBeVisible();
+  await expect(
+    chat.getByText("Note drawer secret message", { exact: true }),
+  ).toBeVisible();
   await expect(chat.locator(".sp-chip-title")).toHaveText([
     "Saved note secret source",
   ]);
   await chat.getByRole("button", { name: "Conversation history" }).click();
-  await expect(chat.getByText("Note history secret title", { exact: true })).toBeVisible();
+  await expect(
+    chat.getByText("Note history secret title", { exact: true }),
+  ).toBeVisible();
 
   await page.evaluate(() => {
     (
@@ -398,8 +526,12 @@ test("authored-note drawer purge clears saved titles and sources and defeats a l
     ).__demoEmit("murmur://ask-history-invalidated", null);
   });
 
-  await expect(chat.getByText("Note history secret title", { exact: true })).toHaveCount(0);
-  await expect(chat.getByText("Note drawer secret message", { exact: true })).toHaveCount(0);
+  await expect(
+    chat.getByText("Note history secret title", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    chat.getByText("Note drawer secret message", { exact: true }),
+  ).toHaveCount(0);
   await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
   await page.evaluate(() => {
     (
@@ -408,10 +540,14 @@ test("authored-note drawer purge clears saved titles and sources and defeats a l
   });
   await page.waitForTimeout(100);
   await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
-  await expect(chat.getByText("Late note-linked secret", { exact: true })).toHaveCount(0);
+  await expect(
+    chat.getByText("Late note-linked secret", { exact: true }),
+  ).toHaveCount(0);
   await chat.getByRole("button", { name: "New conversation" }).click();
   await expect(chat.locator(".sp-chip-title")).toHaveCount(0);
-  await expect(chat.getByText("Late note-linked secret", { exact: true })).toHaveCount(0);
+  await expect(
+    chat.getByText("Late note-linked secret", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("durable Ask cannot read or send before every privacy listener is acknowledged", async ({
@@ -458,10 +594,12 @@ test("durable Ask cannot read or send before every privacy listener is acknowled
   await expect(page.locator(".ask-input")).toBeDisabled();
   expect(
     await page.evaluate(() => ({
-      list: (window as unknown as { __privacyListCalls?: number })
-        .__privacyListCalls ?? 0,
-      send: (window as unknown as { __privacySendCalls?: number })
-        .__privacySendCalls ?? 0,
+      list:
+        (window as unknown as { __privacyListCalls?: number })
+          .__privacyListCalls ?? 0,
+      send:
+        (window as unknown as { __privacySendCalls?: number })
+          .__privacySendCalls ?? 0,
     })),
   ).toEqual({ list: 0, send: 0 });
 
@@ -540,12 +678,15 @@ test("privacy-listener failure is fail-closed and double Retry coalesces one rec
   await expect(page.locator(".ask-input")).toBeDisabled();
   expect(
     await page.evaluate(() => ({
-      list: (window as unknown as { __privacyRetryLists?: number })
-        .__privacyRetryLists ?? 0,
-      send: (window as unknown as { __privacyRetrySends?: number })
-        .__privacyRetrySends ?? 0,
-      sources: (window as unknown as { __privacySourceReads?: number })
-        .__privacySourceReads ?? 0,
+      list:
+        (window as unknown as { __privacyRetryLists?: number })
+          .__privacyRetryLists ?? 0,
+      send:
+        (window as unknown as { __privacyRetrySends?: number })
+          .__privacyRetrySends ?? 0,
+      sources:
+        (window as unknown as { __privacySourceReads?: number })
+          .__privacySourceReads ?? 0,
     })),
   ).toEqual({ list: 0, send: 0, sources: 0 });
 
@@ -564,10 +705,12 @@ test("privacy-listener failure is fail-closed and double Retry coalesces one rec
     },
     [askEvent, contentEvent, visibilityEvent],
   );
-  await secureAlert.getByRole("button", { name: "Retry" }).evaluate((button) => {
-    button.click();
-    button.click();
-  });
+  await secureAlert
+    .getByRole("button", { name: "Retry" })
+    .evaluate((button) => {
+      button.click();
+      button.click();
+    });
   await expect
     .poll(() =>
       page.evaluate(
