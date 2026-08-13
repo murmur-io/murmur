@@ -43,6 +43,7 @@ import { FoldersService } from "../services/folders.service";
 import { NotesService } from "../services/notes.service";
 import { TilePaletteService } from "../services/tile-palette.service";
 import { ToastService, type Toast } from "../services/toast.service";
+import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
 
 /** localStorage key for the chrome mode: "1" = pill bar, "0" = sidebar. */
 const SIDEBAR_KEY = "murmur-sidebar-collapsed";
@@ -175,6 +176,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     DocumentPreviewComponent,
     ReminderComposerComponent,
     TilePaletteComponent,
+    AccountSessionBannerComponent,
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto

@@ -1078,6 +1078,20 @@ export class IpcService {
   }
 
   /**
+   * Generate or refresh this meeting's canonical companion note. Omitting the
+   * template id asks the backend to resolve the user's Settings default.
+   */
+  convertMeetingToNote(
+    meetingId: string,
+    templateId?: string,
+  ): Promise<CompanionAppendResult> {
+    return invoke<CompanionAppendResult>("convert_meeting_to_note", {
+      meetingId,
+      ...(templateId ? { templateId } : {}),
+    });
+  }
+
+  /**
    * Re-run the FULL pipeline (ASR + summarize + export) from a failed recording's on-disk archive
    * audio — the recovery for a pipeline that died mid-transcription (re-summarize alone cannot
    * re-run ASR). Backend gates: meeting must be in the Error state, its folder unlocked, its

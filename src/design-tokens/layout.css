@@ -85,4 +85,15 @@
      chrome (the highest in the app is 120) — one shared token keeps the four
      portaled overlays on the same top layer instead of drifting apart. */
   --z-overlay: 2000;
+
+  /* Meeting workspace overlays and global account-session surfaces. */
+  --meeting-command-provider-max: 14rem;
+  --meeting-template-menu-width: 19rem;
+  --meeting-template-menu-max-height: 24rem;
+  --meeting-move-menu-min-width: 20rem;
+  --account-session-banner-width: 30rem;
+  --account-session-modal-width: 40rem;
+  --brain-spinner-border-width: 2px;
+  --z-meeting-command-bar: 2;
+  --z-account-session-banner: 65;
 }

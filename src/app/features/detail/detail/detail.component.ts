@@ -59,6 +59,7 @@ import {
 import { SharePanelComponent } from "../share-panel/share-panel.component";
 import { VerifyPanelComponent } from "../verify-panel/verify-panel.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { MeetingCommandBarComponent } from "../meeting-command-bar/meeting-command-bar.component";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 interface ActionItem {
@@ -78,6 +79,7 @@ interface ActionItem {
     MeetingChatComponent,
     SharePanelComponent,
     VerifyPanelComponent,
+    MeetingCommandBarComponent,
   ],
   templateUrl: "./detail.component.html",
   styleUrl: "./detail.component.scss",
@@ -108,6 +110,14 @@ export class DetailComponent implements OnInit {
   );
   readonly loading = signal(true);
   readonly busy = signal(false);
+  private readonly conversionRequest = signal<{
+    meetingId: string;
+    sequence: number;
+  } | null>(null);
+  private conversionSequence = 0;
+  readonly converting = computed(
+    () => this.conversionRequest()?.meetingId === this.detail()?.meeting.id,
+  );
   readonly msg = signal("");
 
   /**
@@ -1476,6 +1486,51 @@ export class DetailComponent implements OnInit {
     } finally {
       this.busy.set(false);
     }
+  }
+
+  async convertToNote(id: string, templateId: string | null): Promise<void> {
+    if (this.converting()) {
+      return;
+    }
+    const title = this.detail()?.meeting.title || "Meeting";
+    const request = { meetingId: id, sequence: ++this.conversionSequence };
+    this.conversionRequest.set(request);
+    try {
+      const result = await this.ipc.convertMeetingToNote(
+        id,
+        templateId ?? undefined,
+      );
+      if (!this.isCurrentConversion(request) || !this.isActiveMeeting(id)) {
+        return;
+      }
+      this.toast.success("Meeting converted to a linked note");
+      await this.tabsService.openNote(result.noteId, `${title} — note`);
+    } catch (error) {
+      if (this.isCurrentConversion(request) && this.isActiveMeeting(id)) {
+        this.toast.danger(this.errorCopy.because("Couldn’t convert this meeting", error));
+      }
+    } finally {
+      if (this.conversionRequest()?.sequence === request.sequence) {
+        this.conversionRequest.set(null);
+      }
+    }
+  }
+
+  private isCurrentConversion(request: {
+    meetingId: string;
+    sequence: number;
+  }): boolean {
+    const current = this.conversionRequest();
+    return (
+      current?.sequence === request.sequence &&
+      current.meetingId === request.meetingId &&
+      this.detail()?.meeting.id === request.meetingId
+    );
+  }
+
+  private isActiveMeeting(id: string): boolean {
+    const primary = this.router.parseUrl(this.router.url).root.children["primary"];
+    return primary?.segments[0]?.path === "meeting" && primary.segments[1]?.path === id;
   }
 
   // --- Inline title rename -------------------------------------------------
