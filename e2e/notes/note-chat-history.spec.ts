@@ -88,6 +88,11 @@ test("a late default-source prefill cannot overwrite sources restored from histo
       selectedSources: [
         { kind: "note", id: "n-saved", title: "Saved source scope" },
       ],
+      dashboard: {
+        id: "dashboard-note-history",
+        title: "Live note dashboard title",
+        emoji: "📝",
+      },
       messages: [
         {
           id: "00000000-0000-4000-8000-000000000401",
@@ -111,15 +116,65 @@ test("a late default-source prefill cannot overwrite sources restored from histo
       createdAt: "2026-08-06T01:00:00Z",
       updatedAt: "2026-08-06T01:01:00Z",
     }),
+    ask_vault_persisted: (args: unknown) => {
+      (window as unknown as { __freshNoteArgs?: unknown }).__freshNoteArgs =
+        args;
+      return {
+        conversationId: "fresh-note-thread",
+        userMessageId: crypto.randomUUID(),
+        assistantMessageId: crypto.randomUUID(),
+        answer: "Fresh note answer",
+        sources: [],
+        citations: [],
+      };
+    },
   });
   await page.goto("/notes/n1");
   await page.locator(".head-chat-btn").click();
   const drawer = page.locator(".note-chat-drawer");
   await drawer.getByRole("button", { name: "Conversation history" }).click();
   await drawer.locator(".history-row").click();
-  await expect(drawer.locator(".sp-chip-title")).toHaveText([
-    "Saved source scope",
-  ]);
+  const manualChips = drawer.locator(
+    ".sp-chip:not(.sp-dashboard-chip) .sp-chip-title",
+  );
+  await expect(manualChips).toHaveText(["Saved source scope"]);
+  await expect(
+    drawer.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toContainText("Live note dashboard title");
+
+  await drawer
+    .getByRole("button", { name: "Remove dashboard Live note dashboard title" })
+    .click();
+  await expect(drawer.locator(".chat-row")).toHaveCount(0);
+  await expect(
+    drawer.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toHaveCount(0);
+  await expect(manualChips).toHaveText(["Saved source scope"]);
+
+  await drawer
+    .locator(".chat-input")
+    .fill("Fresh thread after dashboard removal");
+  await drawer.locator(".chat-input").press("Enter");
+  await expect(
+    drawer.getByText("Fresh note answer", { exact: true }),
+  ).toBeVisible();
+  const freshArgs = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __freshNoteArgs?: {
+            conversationId?: string;
+            dashboardId?: string;
+            explicitSources?: Array<{ kind: string; id: string }>;
+          };
+        }
+      ).__freshNoteArgs,
+  );
+  expect(freshArgs?.conversationId).toBeUndefined();
+  expect(freshArgs?.dashboardId).toBeUndefined();
+  expect(
+    (freshArgs?.explicitSources ?? []).map(({ kind, id }) => ({ kind, id })),
+  ).toEqual([{ kind: "note", id: "n-saved" }]);
 
   await page.evaluate(() => {
     (
@@ -166,7 +221,9 @@ test("a long authored-note history remains vertically reachable in the narrow dr
   await expect
     .poll(() => list.evaluate((element) => element.scrollTop))
     .toBeGreaterThan(0);
-  await expect(drawer.getByText("Conversation 60", { exact: true })).toBeVisible();
+  await expect(
+    drawer.getByText("Conversation 60", { exact: true }),
+  ).toBeVisible();
 });
 
 test("authored-note source titles wait for the privacy-listener barrier", async ({

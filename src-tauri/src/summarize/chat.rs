@@ -39,6 +39,24 @@ pub fn build_with_sources(
     question: &str,
     memory_brief: &str,
 ) -> (String, String) {
+    build_with_composite_sources(
+        transcript,
+        pinned_sources,
+        history,
+        question,
+        memory_brief,
+        false,
+    )
+}
+
+pub fn build_with_composite_sources(
+    transcript: &str,
+    pinned_sources: &str,
+    history: &[ChatTurn],
+    question: &str,
+    memory_brief: &str,
+    dashboard_scope: bool,
+) -> (String, String) {
     let t = if transcript.chars().count() > MAX_TRANSCRIPT_CHARS {
         let head: String = transcript.chars().take(MAX_TRANSCRIPT_CHARS).collect();
         format!("{head}\n[transcript truncated]")
@@ -65,7 +83,18 @@ pub fn build_with_sources(
         )
     };
 
-    let system = if pinned.trim().is_empty() {
+    let system = if dashboard_scope {
+        format!(
+            "You are a helpful assistant answering questions about ONE primary meeting within a \
+USER-COMPOSED DASHBOARD. Base answers strictly on the meeting transcript and readable dashboard \
+grounding below. The dashboard grounding can include notes, recordings, documents, capped active \
+linked context, and derived views. Preserve the meeting as the primary anchor while treating the \
+dashboard as a mixed-source corpus. If the answer is not in either section, say you \
+don't know. Never invent facts, decisions, or attributions. Do not claim there is no dashboard \
+context merely because privacy gating omitted some items. Be concise and concrete.\n\n\
+MEETING TRANSCRIPT:\n{t}\n\nDASHBOARD GROUNDING:\n{pinned}"
+        )
+    } else if pinned.trim().is_empty() {
         // Keep the original transcript-only prompt byte-for-byte when the picker is empty or every
         // selected source was gated away.
         format!(
@@ -158,6 +187,23 @@ mod tests {
         let legacy = build("transcript", &[], "question", "memory");
         let blank = build_with_sources("transcript", "   ", &[], "question", "memory");
         assert_eq!(blank, legacy);
+    }
+
+    #[test]
+    fn meeting_dashboard_prompt_keeps_anchor_and_names_composite_scope() {
+        let (system, _) = build_with_composite_sources(
+            "primary transcript",
+            "### [[Plan]]\ndocument body\n\n- promises\n    · ship it",
+            &[],
+            "q",
+            "must not appear",
+            true,
+        );
+        assert!(system.contains("ONE primary meeting"));
+        assert!(system.contains("USER-COMPOSED DASHBOARD"));
+        assert!(system.contains("DASHBOARD GROUNDING"));
+        assert!(!system.contains("meeting notes only"));
+        assert!(!system.contains("must not appear"));
     }
 
     /// EMPTY memory brief ⇒ byte-identical to the pre-memory prompt (no block); a present brief ⇒

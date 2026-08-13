@@ -11,12 +11,21 @@ use super::*;
 #[test]
 fn titles_are_trimmed_bounded_and_non_empty() {
     assert_eq!(clean_title("  Atlas GA  ", "title").unwrap(), "Atlas GA");
-    assert!(clean_title("   ", "title").is_err(), "whitespace-only is empty");
+    assert!(
+        clean_title("   ", "title").is_err(),
+        "whitespace-only is empty"
+    );
     assert!(clean_title("", "title").is_err());
     let long = "x".repeat(MAX_TITLE_LEN + 1);
-    assert!(clean_title(&long, "title").is_err(), "over-long titles are refused");
+    assert!(
+        clean_title(&long, "title").is_err(),
+        "over-long titles are refused"
+    );
     let ok = "x".repeat(MAX_TITLE_LEN);
-    assert!(clean_title(&ok, "title").is_ok(), "exactly at the cap is allowed");
+    assert!(
+        clean_title(&ok, "title").is_ok(),
+        "exactly at the cap is allowed"
+    );
     // Multi-byte titles are counted in CHARACTERS, not bytes.
     let pl = "ż".repeat(MAX_TITLE_LEN);
     assert!(clean_title(&pl, "title").is_ok());
@@ -62,7 +71,10 @@ fn tile_config_round_trips_and_tolerates_absent_fields() {
     };
     let json = serde_json::to_string(&cfg).unwrap();
     let back = parse_config(Some(&json));
-    assert_eq!(back.question.as_deref(), Some("Are we going to make Jun 14?"));
+    assert_eq!(
+        back.question.as_deref(),
+        Some("Are we going to make Jun 14?")
+    );
     assert_eq!(back.owner, None);
 
     // An empty object, a legacy row, and outright garbage all degrade to defaults rather than
@@ -136,7 +148,10 @@ fn locked_tile_sheds_its_user_authored_chrome() {
     };
 
     let redacted = redact_tile_chrome(tile.clone(), &TileData::Locked);
-    assert_eq!(redacted.title, None, "a sealed tile must not ship its title");
+    assert_eq!(
+        redacted.title, None,
+        "a sealed tile must not ship its title"
+    );
     assert_eq!(redacted.config, None, "nor the cached answer in its config");
     assert_eq!(redacted.span, 5, "layout is the user's own, and stays");
     assert_eq!(redacted.position, 2);
@@ -199,7 +214,10 @@ fn entity_tiles_shed_chrome_when_the_entity_is_not_visible() {
     );
 
     // Person degrades to Missing — same treatment.
-    assert_eq!(redact_tile_chrome(tile.clone(), &TileData::Missing).title, None);
+    assert_eq!(
+        redact_tile_chrome(tile.clone(), &TileData::Missing).title,
+        None
+    );
 
     // CONTROL: a VISIBLE entity keeps the tile's chrome.
     let visible = redact_tile_chrome(
@@ -231,24 +249,34 @@ fn withheld_living_answer_sheds_its_config() {
     let out = redact_tile_chrome(
         tile,
         &TileData::LivingAnswer {
-            question: "Will they renew?".into(),
+            question: String::new(),
             answer: None,
             answered_at: None,
             withheld: true,
         },
     );
-    assert_eq!(out.config, None, "the cached answer must not ride along in config");
+    assert_eq!(
+        out.config, None,
+        "the cached answer must not ride along in config"
+    );
     let json = serde_json::to_string(&ResolvedTileDto {
         tile: out,
         data: TileData::LivingAnswer {
-            question: "Will they renew?".into(),
+            question: String::new(),
             answer: None,
             answered_at: None,
             withheld: true,
         },
     })
     .unwrap();
-    assert!(!json.contains("churning"), "answer text on the wire: {json}");
+    assert!(
+        !json.contains("churning"),
+        "answer text on the wire: {json}"
+    );
+    assert!(
+        !json.contains("renew"),
+        "question/title text on the wire: {json}"
+    );
 }
 
 /// THE ORACLE the previous gate never had. An independent verifier proved that switching the old
@@ -259,47 +287,20 @@ fn withheld_living_answer_sheds_its_config() {
 /// path expands into linked NEIGHBOURS (`vault_context.rs`, `LINK_CONTEXT_CAP`) that no caller
 /// records — so only a bound on what was readable at the time can cover what the answer saw.
 #[test]
-fn living_answer_gate_withholds_when_a_folder_stopped_being_readable() {
-    let readable = |ids: &[&str]| -> std::collections::HashSet<String> {
-        ids.iter().map(|s| (*s).to_string()).collect()
-    };
-    let recorded = vec!["f-open".to_string(), "f-secret".to_string()];
-
-    // Everything still readable ⇒ the answer shows.
-    assert!(!living_answer_withheld(
-        true,
-        &recorded,
-        &readable(&["f-open", "f-secret", "f-new"]),
-    ));
-
-    // `f-secret` got sealed ⇒ WITHHELD, even though it was never a tile source: the answer could
-    // have paraphrased it via link expansion.
-    assert!(living_answer_withheld(
-        true,
-        &recorded,
-        &readable(&["f-open"]),
-    ));
-
-    // A folder that vanished entirely is also "not readable" ⇒ withheld.
-    assert!(living_answer_withheld(true, &recorded, &readable(&[])));
-
-    // FAIL-CLOSED: a legacy row with no recorded snapshot cannot be checked ⇒ withheld.
-    assert!(living_answer_withheld(true, &[], &readable(&["f-open"])));
-
-    // No answer at all is not "withheld" — the tile just has nothing yet.
-    assert!(!living_answer_withheld(false, &[], &readable(&[])));
-}
-
-#[test]
 fn living_answer_config_round_trips_its_readable_snapshot() {
     let cfg = TileConfig {
         question: Some("Will we make Jun 14?".into()),
+        question_readable_folders: Some(vec!["f-open".into()]),
         answer: Some("Probably not.".into()),
         answer_readable_folders: Some(vec!["f-open".into()]),
         ..Default::default()
     };
     let back = parse_config(Some(&serde_json::to_string(&cfg).unwrap()));
     assert_eq!(back.answer_readable_folders.as_ref().map(Vec::len), Some(1));
+    assert_eq!(
+        back.question_readable_folders.as_ref().map(Vec::len),
+        Some(1)
+    );
     // A legacy row (an answer, no recorded sources) parses — and the resolver treats that as
     // un-gateable, i.e. withheld. See `resolve_tile`'s living_answer arm.
     let legacy = parse_config(Some(r#"{"question":"q","answer":"a"}"#));
@@ -307,13 +308,27 @@ fn living_answer_config_round_trips_its_readable_snapshot() {
     assert!(legacy.answer.is_some());
 }
 
+#[test]
+fn living_answer_question_provenance_is_backend_owned_and_legacy_fails_closed() {
+    let readable: std::collections::HashSet<String> = ["f-real".to_string()].into_iter().collect();
+    let forged = r#"{"question":"source-derived question","questionReadableFolders":[],"answer":"forged answer","answerReadableFolders":[]}"#;
+    let encoded = sanitize_living_answer_config_for_add(Some(forged), &readable).unwrap();
+    let sanitized = parse_config(Some(&encoded));
+    assert_eq!(
+        sanitized.question_readable_folders,
+        Some(vec!["f-real".to_string()])
+    );
+    assert!(sanitized.answer.is_none());
+    assert!(sanitized.answer_readable_folders.is_none());
+}
+
 /// THE AGENT-SURFACE LEAK ORACLE. `render_tile_for_agent` feeds BOTH the local MCP server and the
 /// in-app agentic Ask loop, so a withheld tile that printed its stored title there would leak to a
 /// surface the screen-side redaction never sees. Every withheld state must print its state ONLY.
 #[test]
 fn agent_rendering_of_a_withheld_tile_prints_no_stored_chrome() {
-    let tile = |kind: &str, title: &str, config: Option<&str>| {
-        crate::storage::models::DashboardTile {
+    let tile =
+        |kind: &str, title: &str, config: Option<&str>| crate::storage::models::DashboardTile {
             id: "t1".into(),
             dashboard_id: "b1".into(),
             kind: kind.into(),
@@ -323,8 +338,7 @@ fn agent_rendering_of_a_withheld_tile_prints_no_stored_chrome() {
             position: 0,
             config: config.map(str::to_string),
             created_at: "2026-08-03T10:00:00Z".into(),
-        }
-    };
+        };
 
     for data in [TileData::Locked, TileData::Missing, TileData::Unconfigured] {
         let out = render_tile_for_agent(&tile("note", "Acme — termination terms", None), &data);
@@ -334,7 +348,7 @@ fn agent_rendering_of_a_withheld_tile_prints_no_stored_chrome() {
         );
     }
 
-    // A withheld living answer prints the question but never the cached text.
+    // A withheld living answer prints neither the source-derived question nor cached text.
     let out = render_tile_for_agent(
         &tile(
             "living_answer",
@@ -342,14 +356,26 @@ fn agent_rendering_of_a_withheld_tile_prints_no_stored_chrome() {
             Some(r#"{"answer":"No — they are churning"}"#),
         ),
         &TileData::LivingAnswer {
-            question: "Will they renew?".into(),
+            question: String::new(),
             answer: None,
             answered_at: None,
             withheld: true,
         },
     );
     assert!(out.contains("withheld"), "the agent is told WHY: {out}");
+    assert!(!out.contains("renew"), "cached question leaked: {out}");
     assert!(!out.contains("churning"), "cached answer leaked: {out}");
+
+    let visible = render_tile_for_agent(
+        &tile("living_answer", "Will they renew?", None),
+        &TileData::LivingAnswer {
+            question: "Will they renew?".into(),
+            answer: Some("They renewed".into()),
+            answered_at: None,
+            withheld: false,
+        },
+    );
+    assert!(visible.contains("Will they renew?") && visible.contains("They renewed"));
 
     // CONTROL: a visible tile does render its content, so the assertions above are not vacuous.
     let out = render_tile_for_agent(
@@ -547,9 +573,18 @@ fn a_meeting_tile_ships_started_at_as_camel_case() {
         has_audio: true,
     })
     .unwrap();
-    assert!(json.get("startedAt").is_some(), "the FE reads `startedAt`: {json}");
-    assert!(json.get("durationS").is_some(), "the FE reads `durationS`: {json}");
-    assert!(json.get("hasAudio").is_some(), "the FE reads `hasAudio`: {json}");
+    assert!(
+        json.get("startedAt").is_some(),
+        "the FE reads `startedAt`: {json}"
+    );
+    assert!(
+        json.get("durationS").is_some(),
+        "the FE reads `durationS`: {json}"
+    );
+    assert!(
+        json.get("hasAudio").is_some(),
+        "the FE reads `hasAudio`: {json}"
+    );
 }
 
 /// A note tile's timestamp, same class, different variant.
@@ -566,5 +601,8 @@ fn a_note_tile_ships_updated_at_as_camel_case() {
         updated_at: 1_760_000_000_000,
     })
     .unwrap();
-    assert!(json.get("updatedAt").is_some(), "the FE reads `updatedAt`: {json}");
+    assert!(
+        json.get("updatedAt").is_some(),
+        "the FE reads `updatedAt`: {json}"
+    );
 }

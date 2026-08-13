@@ -2,8 +2,9 @@
 //! already exist in the vault.
 //!
 //! ## The one rule that governs this file
-//! A dashboard is a set of POINTERS. It stores no meeting content, and **every tile payload is
-//! resolved through an existing gated reader at read time** — `Db::*_visible` /
+//! A dashboard is primarily a set of POINTERS. Its one content-bearing tile, Living Answer, stores
+//! only a backend-generated cache with exact readable-folder and composite-context provenance.
+//! **Every tile payload is resolved through a gated reader at read time** — `Db::*_visible` /
 //! `get_*_if_visible` / `list_open_commitments` — never by a fresh ungated query. A tile whose
 //! source is sealed-and-not-session-unlocked resolves to [`TileData::Locked`], which carries no
 //! title, no snippet, no counts, and no dates. That is what keeps a board from becoming a back
@@ -16,24 +17,43 @@
 //! * `ref_id` is never validated for existence at write time. A tile pointing at a deleted row
 //!   resolves to [`TileData::Missing`] rather than erroring the whole board.
 //!
-//! Board-scoped Ask reuses the SHIPPED `ask_vault(explicit_sources: …)` path verbatim
-//! ([`get_dashboard_sources`] just hands it the board's visible sources), so this feature adds
-//! **no new AI path, no new egress surface, and no new redaction seam**.
+//! Board-scoped Ask is assembled by [`dashboard_composite_context`], then dispatched through the
+//! existing prepacked authorized provider path. Consent, redaction, egress ledger, lifecycle
+//! admission, and exact post-await witness validation remain at that shared backend seam.
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{ipc::Response, AppHandle, State};
 
 use crate::error::AppError;
 use crate::links::LinkKind;
 use crate::state::AppState;
 use crate::storage::dashboards_store::{
-    MAX_DASHBOARDS, MAX_SPAN, MAX_TILES_PER_BOARD, MIN_SPAN, TILE_KINDS,
+    LivingAnswerCacheState, MAX_DASHBOARDS, MAX_SPAN, MAX_TILES_PER_BOARD, MIN_SPAN, TILE_KINDS,
 };
 use crate::storage::models::{Dashboard, DashboardTile, SourceRef};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardContextWitness {
+    pub(crate) dashboard_id: String,
+    pub(crate) generation: i64,
+    pub(crate) ask_dispatch_generation: i64,
+    pub(crate) input_digest: String,
+    corpus_budget: usize,
+    additional_sources: Vec<SourceRef>,
+    excluded_meeting_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DashboardCompositeContext {
+    pub(crate) witness: DashboardContextWitness,
+    pub(crate) packed_corpus: String,
+    pub(crate) packed_sources: Vec<crate::storage::models::VaultSource>,
+}
+
 /// Longest accepted board title / tile heading. Bounds the DTO and the `.canvas` export.
 const MAX_TITLE_LEN: usize = 120;
-/// Longest accepted `config` JSON blob (the Living-answer question + cached answer).
+/// Longest accepted legacy/general `config` JSON blob. Living-answer content is persisted only in
+/// its provenance-separated columns after the backend has sanitized the add request.
 const MAX_CONFIG_LEN: usize = 8 * 1024;
 /// Rows shown inside a list-shaped tile (reminders / promises / drift steps / numbers).
 const TILE_ROWS: usize = 6;
@@ -176,7 +196,7 @@ pub enum TileData {
         owner: Option<String>,
         rows: Vec<TileRow>,
     },
-    /// A pinned question plus the answer last computed for it (by the FE, through `ask_vault`).
+    /// A pinned question plus the answer last computed by the backend-owned refresh command.
     ///
     /// `withheld` is the lock-model half: a cached answer is a PARAPHRASE of the sources it was
     /// built from, so once any of those sources is sealed-and-not-unlocked the answer stops being
@@ -189,7 +209,8 @@ pub enum TileData {
     },
 }
 
-/// The persisted `config` bag. Every field optional — an older row deserializes fine.
+/// Compatibility/request shape for historical tile configs and Living-answer creation. Resolved
+/// Living-answer content never hydrates this bag; it comes from dedicated provenance-gated columns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TileConfig {
@@ -202,6 +223,10 @@ pub struct TileConfig {
     /// `living_answer` — the pinned question and its last answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
+    /// Backend-owned readable-folder snapshot for the question itself. `None` is legacy and
+    /// unprovable; `Some([])` is a valid question created while no folders were readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_readable_folders: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,41 +251,12 @@ pub struct TileConfig {
     pub answer_readable_folders: Option<Vec<String>>,
 }
 
-/// Decide whether a cached Living answer may still be shown.
-///
-/// Split out as a PURE function on purpose: `resolve_tile` needs a `State<AppState>`, so nothing
-/// could test the gate in place — and an independent verifier proved that disabling the previous
-/// gate left the entire suite green. This one has a direct oracle
-/// (`living_answer_gate_withholds_when_a_folder_stopped_being_readable`).
-///
-/// Fail-closed: an answer with no recorded readable set, or an empty one, is withheld.
-pub(crate) fn living_answer_withheld(
-    has_answer: bool,
-    recorded_readable: &[String],
-    currently_readable: &std::collections::HashSet<String>,
-) -> bool {
-    if !has_answer {
-        return false;
-    }
-    if recorded_readable.is_empty() {
-        return true; // un-gateable (legacy row) ⇒ withhold
-    }
-    !recorded_readable
-        .iter()
-        .all(|id| currently_readable.contains(id))
-}
-
 /// Every folder the session can currently read: unlocked outright, or sealed but session-unlocked.
 fn readable_folder_ids(
     db: &crate::storage::Db,
     unlocked: &std::collections::HashSet<String>,
 ) -> Result<std::collections::HashSet<String>, AppError> {
-    Ok(db
-        .list_folders()?
-        .into_iter()
-        .filter(|f| !f.locked || unlocked.contains(&f.id))
-        .map(|f| f.id)
-        .collect())
+    Ok(db.visible_folder_ids(unlocked)?.into_iter().collect())
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────────────────────
@@ -302,6 +298,28 @@ fn clean_tint(raw: Option<String>) -> Option<String> {
 fn parse_config(raw: Option<&str>) -> TileConfig {
     raw.and_then(|s| serde_json::from_str::<TileConfig>(s).ok())
         .unwrap_or_default()
+}
+
+fn sanitize_living_answer_config_for_add(
+    raw: Option<&str>,
+    readable: &std::collections::HashSet<String>,
+) -> Result<String, AppError> {
+    let mut cfg = raw
+        .map(serde_json::from_str::<TileConfig>)
+        .transpose()
+        .map_err(|e| AppError::InvalidArg(format!("invalid tile config: {e}")))?
+        .unwrap_or_default();
+    cfg.question = Some(clean_title(
+        cfg.question.as_deref().unwrap_or_default(),
+        "question",
+    )?);
+    cfg.question_readable_folders = Some(readable.iter().cloned().collect());
+    cfg.answer = None;
+    cfg.answered_at = None;
+    cfg.answer_sources = None;
+    cfg.answer_readable_folders = None;
+    serde_json::to_string(&cfg)
+        .map_err(|e| AppError::Storage(format!("encoding tile config failed: {e}")))
 }
 
 fn snippet_of(text: &str, max: usize) -> String {
@@ -373,6 +391,7 @@ pub fn create_dashboard(
     emoji: Option<String>,
     tint: Option<String>,
 ) -> Result<Dashboard, AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     if state.db.dashboard_count()? >= MAX_DASHBOARDS {
         return Err(AppError::InvalidArg(format!(
             "dashboard limit reached ({MAX_DASHBOARDS})"
@@ -403,6 +422,7 @@ pub fn update_dashboard(
     tint: Option<String>,
     pinned: Option<bool>,
 ) -> Result<Dashboard, AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let title = match title {
         Some(t) => Some(clean_title(&t, "title")?),
         None => None,
@@ -426,11 +446,13 @@ pub fn update_dashboard(
 
 #[tauri::command]
 pub fn delete_dashboard(state: State<'_, AppState>, id: String) -> Result<bool, AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     state.db.delete_dashboard(&id)
 }
 
 #[tauri::command]
 pub fn reorder_dashboards(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     state.db.reorder_dashboards(&ids)
 }
 
@@ -446,6 +468,7 @@ pub fn add_dashboard_tile(
     span: Option<i64>,
     config: Option<String>,
 ) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     if !TILE_KINDS.contains(&kind.as_str()) {
         return Err(AppError::InvalidArg(format!("unknown tile kind: {kind}")));
     }
@@ -463,6 +486,7 @@ pub fn add_dashboard_tile(
         Some(t) if !t.trim().is_empty() => Some(clean_title(&t, "tile title")?),
         _ => None,
     };
+    let title = (kind != "living_answer").then_some(title).flatten();
     if let Some(c) = config.as_deref() {
         if c.len() > MAX_CONFIG_LEN {
             return Err(AppError::InvalidArg("tile config too large".into()));
@@ -470,8 +494,35 @@ pub fn add_dashboard_tile(
         serde_json::from_str::<TileConfig>(c)
             .map_err(|e| AppError::InvalidArg(format!("invalid tile config: {e}")))?;
     }
+    let mut question_provenance = None;
+    let config = if kind == "living_answer" {
+        let unlocked = super::unlocked_snapshot(state.inner())?;
+        let readable = readable_folder_ids(&state.db, &unlocked)?;
+        let encoded = sanitize_living_answer_config_for_add(config.as_deref(), &readable)?;
+        let question = parse_config(Some(&encoded)).question.unwrap_or_default();
+        question_provenance = Some((
+            question,
+            serde_json::to_string(&readable)
+                .map_err(|e| AppError::Storage(format!("encoding provenance failed: {e}")))?,
+        ));
+        None
+    } else {
+        config
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
+    if let Some((question, provenance)) = question_provenance.as_ref() {
+        state.db.insert_dashboard_living_answer_tile(
+            &id,
+            &dashboard_id,
+            span.unwrap_or(4),
+            question,
+            provenance,
+            &now,
+        )?;
+        state.db.touch_dashboard(&dashboard_id, &now)?;
+        return Ok(());
+    }
     state.db.insert_dashboard_tile(
         &id,
         &dashboard_id,
@@ -497,9 +548,15 @@ pub fn update_dashboard_tile(
     span: Option<i64>,
     config: Option<String>,
 ) -> Result<(), AppError> {
-    let Some(existing) = state.db.get_dashboard_tile(&id)? else {
+    let _lifecycle = super::lifecycle_guard(state.inner());
+    let Some((dashboard_id, existing_kind)) = state.db.dashboard_tile_metadata(&id)? else {
         return Err(AppError::InvalidArg(format!("no tile with id {id}")));
     };
+    if existing_kind == "living_answer" && config.is_some() {
+        return Err(AppError::InvalidArg(
+            "living-answer config is backend-owned".into(),
+        ));
+    }
     let title = match title {
         Some(t) if !t.trim().is_empty() => Some(clean_title(&t, "tile title")?),
         _ => None,
@@ -514,70 +571,20 @@ pub fn update_dashboard_tile(
     state
         .db
         .update_dashboard_tile(&id, title.as_deref(), span, config.as_deref())?;
-    state
-        .db
-        .touch_dashboard(&existing.dashboard_id, &now_iso())?;
+    state.db.touch_dashboard(&dashboard_id, &now_iso())?;
     // Same reason as `add_dashboard_tile`: never return the raw row. Reachable proof this
     // mattered — the Arrange-mode resize control fires for a SEALED tile, so returning the row
     // would push that tile's stored title/config into the webview.
     Ok(())
 }
 
-/// Persist a Living-answer result, stamping the readable-folder snapshot that gates it.
-///
-/// The FE cannot compute that snapshot (it has no folder/lock view), and letting it write the
-/// answer through the generic `update_dashboard_tile` is what made the cache un-gateable. So the
-/// backend owns this write end-to-end.
-#[tauri::command]
-pub fn set_dashboard_answer(
-    state: State<'_, AppState>,
-    id: String,
-    question: String,
-    answer: String,
-) -> Result<(), AppError> {
-    let Some(existing) = state.db.get_dashboard_tile(&id)? else {
-        return Err(AppError::InvalidArg(format!("no tile with id {id}")));
-    };
-    if existing.kind != "living_answer" {
-        return Err(AppError::InvalidArg(
-            "only a living-answer tile stores an answer".into(),
-        ));
-    }
-    let question = clean_title(&question, "question")?;
-    if answer.len() > MAX_CONFIG_LEN {
-        return Err(AppError::InvalidArg("answer too large".into()));
-    }
-    // Snapshot under the lifecycle guard so a relock cannot land between computing the readable
-    // set and storing it — otherwise the answer would be stamped with a MORE permissive set than
-    // was actually in force, which is the one direction that would weaken the gate.
-    let _lifecycle = super::lifecycle_guard(state.inner());
-    let unlocked = super::unlocked_snapshot(state.inner())?;
-    let readable: Vec<String> = readable_folder_ids(&state.db, &unlocked)?
-        .into_iter()
-        .collect();
-
-    let mut cfg = parse_config(existing.config.as_deref());
-    cfg.question = Some(question);
-    cfg.answer = Some(answer);
-    cfg.answered_at = Some(now_iso());
-    cfg.answer_readable_folders = Some(readable);
-    let encoded = serde_json::to_string(&cfg)
-        .map_err(|e| AppError::Storage(format!("encoding tile config failed: {e}")))?;
-    if encoded.len() > MAX_CONFIG_LEN {
-        return Err(AppError::InvalidArg("answer too large".into()));
-    }
-    state
-        .db
-        .update_dashboard_tile(&id, None, None, Some(&encoded))?;
-    state
-        .db
-        .touch_dashboard(&existing.dashboard_id, &now_iso())?;
-    Ok(())
-}
-
 #[tauri::command]
 pub fn delete_dashboard_tile(state: State<'_, AppState>, id: String) -> Result<bool, AppError> {
-    let board = state.db.get_dashboard_tile(&id)?.map(|t| t.dashboard_id);
+    let _lifecycle = super::lifecycle_guard(state.inner());
+    let board = state
+        .db
+        .dashboard_tile_metadata(&id)?
+        .map(|(dashboard_id, _kind)| dashboard_id);
     let removed = state.db.delete_dashboard_tile(&id)?;
     if let Some(b) = board {
         state.db.touch_dashboard(&b, &now_iso())?;
@@ -591,6 +598,7 @@ pub fn reorder_dashboard_tiles(
     dashboard_id: String,
     tile_ids: Vec<String>,
 ) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     state.db.reorder_dashboard_tiles(&dashboard_id, &tile_ids)?;
     state.db.touch_dashboard(&dashboard_id, &now_iso())
 }
@@ -599,34 +607,38 @@ pub fn reorder_dashboard_tiles(
 
 /// One board with every tile resolved through the gated readers.
 #[tauri::command]
-pub fn get_dashboard(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<Option<DashboardDetailDto>, AppError> {
+pub fn get_dashboard(state: State<'_, AppState>, id: String) -> Result<Response, AppError> {
     // TOCTOU: hold the lock lifecycle guard across the gate AND every tile read, exactly like
     // `commands/meetings.rs::get_meeting_detail`. Without it a relock landing between the
     // `unlocked_snapshot` below and a later tile's read would resolve that tile against a stale
     // "unlocked" view and return content from a folder that is sealed by the time it ships.
     let _lifecycle = super::lifecycle_guard(state.inner());
     let Some(dashboard) = state.db.get_dashboard(&id)? else {
-        return Ok(None);
+        return serde_json::to_string(&Option::<DashboardDetailDto>::None)
+            .map(Response::new)
+            .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()));
     };
-    let tiles = state.db.list_dashboard_tiles(&id)?;
+    let tiles = state.db.list_dashboard_tile_structures(&id)?;
     let unlocked = super::unlocked_snapshot(state.inner())?;
     let resolved = tiles
         .into_iter()
         .map(|tile| {
             let data = resolve_tile(&state.db, &tile, &unlocked)?;
-            Ok(ResolvedTileDto {
-                tile: redact_tile_chrome(tile, &data),
-                data,
-            })
+            let mut tile = DashboardTile {
+                title: None,
+                ..tile
+            };
+            tile.config = None;
+            Ok(ResolvedTileDto { tile, data })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
-    Ok(Some(DashboardDetailDto {
+    let payload = Some(DashboardDetailDto {
         dashboard,
         tiles: resolved,
-    }))
+    });
+    serde_json::to_string(&payload)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
 }
 
 /// Could this tile's payload NOT be fully resolved for the current session?
@@ -673,24 +685,25 @@ pub(crate) fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> Da
     let withheld = tile_is_withheld(data);
     if withheld {
         tile.title = None;
-        tile.config = None;
     }
+    // Config is an internal persistence envelope (and can contain cached derived text). TileData
+    // is the only authorized wire projection; no caller needs the raw config.
+    tile.config = None;
     tile
 }
 
-/// The board's VISIBLE sources, ready to hand to `ask_vault(explicit_sources: …)`. A sealed source
-/// is absent — so a board-scoped Ask can never retrieve from a locked folder, and the answer is
-/// deterministic over exactly what the user composed.
+/// The board's currently visible material pointers. This IPC is retained for non-AI UI consumers;
+/// dashboard Ask resolves material and derived context together through `dashboard_composite_context`.
 #[tauri::command]
-pub fn get_dashboard_sources(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<Vec<SourceRef>, AppError> {
+pub fn get_dashboard_sources(state: State<'_, AppState>, id: String) -> Result<Response, AppError> {
     // Same TOCTOU discipline as `get_dashboard`: gate and read under one lifecycle guard.
     let _lifecycle = super::lifecycle_guard(state.inner());
-    let tiles = state.db.list_dashboard_tiles(&id)?;
+    let tiles = state.db.list_dashboard_tile_structures(&id)?;
     let unlocked = super::unlocked_snapshot(state.inner())?;
-    dashboard_sources_inner(&state.db, tiles, &unlocked)
+    let payload = dashboard_sources_inner(&state.db, tiles, &unlocked)?;
+    serde_json::to_string(&payload)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
 }
 
 /// The header the board brief is packed under. Instructional on purpose: without
@@ -705,29 +718,31 @@ const MAX_BRIEF_CHARS: usize = 4000;
 
 /// What a board's DERIVED tiles SAY, as prompt text.
 ///
-/// THE ASYMMETRY THIS CLOSES. `get_dashboard_sources` maps only note/meeting/
-/// document to a `SourceRef` — correct, and unchanged here, because `SourceRef.kind`
-/// is a `LinkKind` and a drift lane is not a retrievable document. But nothing else
-/// carried the other seven kinds into the prompt either, while `tools.rs::tool_specs`
-/// exposes `get_dashboard` to the agentic loop and the local MCP server. Board Ask
-/// pins its sources, and `ask_vault` routes any non-empty pinned list to the
-/// deterministic floor — so the agentic path, and with it that tool, is SKIPPED.
-///
-/// The result was that the in-app "Ask this board" saw strictly LESS of the board
-/// than Claude Code did over MCP: a user could look at a Promise ledger, click the
-/// board's own suggested question — "Who owes me something on this board?" — and
-/// the model could not see that tile.
+/// Material pointers pack as full gated sources; this renderer supplies the other derived views
+/// to `dashboard_composite_context`, so the provider sees the same composed board the user sees.
 ///
 /// This adds no new gated reader and no new egress class. It walks the SHIPPED
 /// path (`resolve_tile` → [`tile_is_withheld`] → `render_tile_for_agent`), which is
 /// the same one the MCP surface already reads, so the two cannot disagree about
 /// what a tile says.
+#[cfg(test)]
 pub(crate) fn dashboard_brief_inner(
     db: &crate::storage::Db,
     tiles: Vec<DashboardTile>,
     unlocked: &std::collections::HashSet<String>,
     max_chars: usize,
 ) -> Result<String, AppError> {
+    let lines = dashboard_brief_lines(db, tiles, unlocked)?;
+    Ok(render_dashboard_brief(&lines, max_chars))
+}
+
+/// Resolve every derived tile exactly once. The complete canonical render and its budget-capped
+/// provider projection must be two views of these same values, not two independent DB read passes.
+fn dashboard_brief_lines(
+    db: &crate::storage::Db,
+    tiles: Vec<DashboardTile>,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, AppError> {
     let mut lines: Vec<String> = Vec::new();
     for tile in tiles {
         // Material kinds are already packed as SOURCES, with their full text. Repeating
@@ -769,13 +784,17 @@ pub(crate) fn dashboard_brief_inner(
             lines.push(rendered);
         }
     }
+    Ok(lines)
+}
+
+fn render_dashboard_brief(lines: &[String], max_chars: usize) -> String {
     if lines.is_empty() {
-        return Ok(String::new());
+        return String::new();
     }
     // The cap must bound the OUTPUT, so a budget too small to hold the label yields
     // nothing rather than a header that already breaches it.
     if max_chars < BRIEF_HEADER.chars().count() {
-        return Ok(String::new());
+        return String::new();
     }
     let mut out = String::from(BRIEF_HEADER);
     let mut wrote = 0usize;
@@ -785,7 +804,7 @@ pub(crate) fn dashboard_brief_inner(
         // `+ 1` is the newline this push would add; clippy prefers the strict form.
         if tile_text.chars().count() < remaining {
             out.push('\n');
-            out.push_str(&tile_text);
+            out.push_str(tile_text);
             wrote += 1;
             continue;
         }
@@ -801,7 +820,7 @@ pub(crate) fn dashboard_brief_inner(
         // as written left a BARE HEADER — the exact "views that do not exist" lie the
         // empty-board path is careful to avoid, reintroduced by an unconditional
         // increment. Nothing written means nothing counted.
-        let partial = truncate_tile(&tile_text, remaining);
+        let partial = truncate_tile(tile_text, remaining);
         if !partial.is_empty() {
             out.push_str(&partial);
             wrote += 1;
@@ -811,9 +830,9 @@ pub(crate) fn dashboard_brief_inner(
     // A bare header is the same "views that do not exist" lie an empty board is
     // careful to avoid.
     if wrote == 0 {
-        return Ok(String::new());
+        return String::new();
     }
-    Ok(out)
+    out
 }
 
 /// Keep a rendered tile's heading plus whole rows within `budget`, and count the rest.
@@ -853,54 +872,513 @@ fn truncate_tile(tile_text: &str, budget: usize) -> String {
     out
 }
 
-/// The board's derived tiles as prompt text, for `ask_vault`. `""` when there are none.
-///
-/// DELIBERATELY NOT A `#[tauri::command]`. The frontend passes a board ID and the
-/// backend derives the text; letting the FE hand a finished string into the prompt
-/// would be a new injection surface AND would put content generation outside the
-/// gate. It also means this adds no IPC surface and no `generate_handler!` entry.
-///
-/// Takes the caller's `unlocked` snapshot rather than taking its own: `ask_vault`
-/// already holds one, and gating the brief against a SECOND, later snapshot is
-/// exactly the TOCTOU that `get_dashboard`'s `lifecycle_guard` exists to prevent.
-pub(crate) fn dashboard_brief_for_ask(
+/// Resolve one ID-only dashboard into its complete, current AI scope under the caller's lifecycle
+/// interval. Missing/deleted IDs fail closed; an existing but empty/all-sealed board remains a real
+/// empty scope and never means vault-wide.
+pub(crate) fn dashboard_composite_context(
     db: &crate::storage::Db,
     dashboard_id: &str,
     unlocked: &std::collections::HashSet<String>,
     corpus_budget: usize,
-) -> Result<String, AppError> {
-    let tiles = db.list_dashboard_tiles(dashboard_id)?;
-    dashboard_brief_inner(db, tiles, unlocked, brief_allowance(corpus_budget))
-}
-
-/// The board-scoped input `ask_vault` hands to the floor prompt builder.
-///
-/// `None` ⇒ not asked from a board; every other Ask surface is byte-identical.
-/// `Some(brief)` ⇒ asked from a board, and the brief MAY BE EMPTY — an all-sealed
-/// board has nothing to show but still scopes the question. Collapsing that to
-/// `None` is the routing defect review caught: the ask fell through to a
-/// vault-wide search and answered from content the user never composed.
-///
-/// This exists as one function so the composition can be TESTED rather than read.
-/// Its two halves — the blank-id normalization and the empty-brief preservation —
-/// previously lived inline in `ask_vault`, where no test could reach them without a
-/// Tauri `State`, so a recurrence of that exact routing bug would have gone
-/// unnoticed with every added test still green.
-pub(crate) fn board_scoped_brief(
-    db: &crate::storage::Db,
-    dashboard_id: Option<&str>,
-    unlocked: &std::collections::HashSet<String>,
-    corpus_budget: usize,
-) -> Result<Option<String>, AppError> {
-    let Some(id) = dashboard_id.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    Ok(Some(dashboard_brief_for_ask(
+    additional_sources: &[SourceRef],
+    excluded_meeting_id: Option<&str>,
+) -> Result<DashboardCompositeContext, AppError> {
+    dashboard_composite_context_inner(
         db,
-        id,
+        dashboard_id,
         unlocked,
         corpus_budget,
-    )?))
+        additional_sources,
+        excluded_meeting_id,
+        false,
+    )
+}
+
+/// Living Answers are cached syntheses, not evidence for regenerating themselves. Excluding every
+/// Living Answer (not only the target) keeps two answer tiles from recursively conditioning each
+/// other and makes the stored corpus digest stable after the cache write.
+pub(crate) fn living_answer_composite_context(
+    db: &crate::storage::Db,
+    dashboard_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+    corpus_budget: usize,
+) -> Result<DashboardCompositeContext, AppError> {
+    dashboard_composite_context_inner(db, dashboard_id, unlocked, corpus_budget, &[], None, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dashboard_composite_context_inner(
+    db: &crate::storage::Db,
+    dashboard_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+    corpus_budget: usize,
+    additional_sources: &[SourceRef],
+    excluded_meeting_id: Option<&str>,
+    exclude_living_answers: bool,
+) -> Result<DashboardCompositeContext, AppError> {
+    use sha2::{Digest, Sha256};
+
+    let (generation, exists_now) = if exclude_living_answers {
+        db.dashboard_structural_context_state(dashboard_id)?
+    } else {
+        db.dashboard_context_state(dashboard_id)?
+    };
+    if !exists_now {
+        return Err(AppError::Locked("dashboard is unavailable".into()));
+    }
+    let mut tiles = db.list_dashboard_tile_structures(dashboard_id)?;
+    if exclude_living_answers {
+        tiles.retain(|tile| tile.kind != "living_answer");
+    }
+    let mut source_refs = additional_sources.to_vec();
+    for source in dashboard_sources_inner(db, tiles.clone(), unlocked)? {
+        if !source_refs
+            .iter()
+            .any(|existing| existing.kind == source.kind && existing.id == source.id)
+        {
+            source_refs.push(source);
+        }
+    }
+    source_refs.retain(|source| {
+        excluded_meeting_id.map_or(true, |meeting_id| {
+            source.kind != crate::links::LinkKind::Meeting || source.id != meeting_id
+        })
+    });
+    let brief_lines = dashboard_brief_lines(db, tiles, unlocked)?;
+    let full_derived_render = render_dashboard_brief(&brief_lines, usize::MAX);
+    let brief = render_dashboard_brief(&brief_lines, brief_allowance(corpus_budget));
+    let resolved_inputs =
+        crate::summarize::vault_context::resolve_vault_context_pinned_visible_inputs(
+            db,
+            &source_refs,
+            unlocked,
+        )?;
+    const COMPOSITE_SEPARATOR: &str = "\n\n";
+    let has_resolved_sources =
+        !resolved_inputs.explicit_sources.is_empty() || !resolved_inputs.neighbours.is_empty();
+    let separator_budget = usize::from(!brief.is_empty() && has_resolved_sources)
+        * COMPOSITE_SEPARATOR.chars().count();
+    let source_budget = corpus_budget
+        .saturating_sub(brief.chars().count())
+        .saturating_sub(separator_budget);
+    let (source_corpus, packed_sources) =
+        crate::summarize::vault_context::build_vault_context_resolved_visible_with_budget(
+            db,
+            &resolved_inputs,
+            source_budget,
+            unlocked,
+        )?;
+    let packed_corpus = match (brief.is_empty(), source_corpus.is_empty()) {
+        (true, _) => source_corpus,
+        (_, true) => brief.clone(),
+        (false, false) => format!("{brief}{COMPOSITE_SEPARATOR}{source_corpus}"),
+    };
+    // The provider corpus is intentionally budget-capped; the lifecycle witness is not. Hash the
+    // complete canonical gated input graph so a source-tail edit or selected neighbour replacement
+    // that falls wholly beyond the packing cutoff still invalidates post-await admission.
+    let mut manifest = Sha256::new();
+    manifest_field(&mut manifest, "domain", b"murmur:dashboard-full-input:v1");
+    manifest_field(&mut manifest, "dashboard_id", dashboard_id.as_bytes());
+    manifest_field(
+        &mut manifest,
+        "corpus_budget",
+        corpus_budget.to_string().as_bytes(),
+    );
+    manifest_field(
+        &mut manifest,
+        "exclude_living_answers",
+        if exclude_living_answers { b"1" } else { b"0" },
+    );
+    manifest_field(
+        &mut manifest,
+        "excluded_meeting_id",
+        excluded_meeting_id.unwrap_or("").as_bytes(),
+    );
+    for source in additional_sources {
+        manifest_source_ref(&mut manifest, "additional_source", source);
+    }
+    manifest_field(
+        &mut manifest,
+        "full_derived_render",
+        full_derived_render.as_bytes(),
+    );
+    manifest_field(&mut manifest, "packed_corpus", packed_corpus.as_bytes());
+    for source in &resolved_inputs.explicit_sources {
+        manifest_source_ref(&mut manifest, "explicit_source", &source.source);
+        manifest_field(
+            &mut manifest,
+            "explicit_full_input",
+            &source.manifest_digest,
+        );
+    }
+    for neighbour in &resolved_inputs.neighbours {
+        manifest_source_ref(&mut manifest, "neighbour_source", &neighbour.source);
+        manifest_field(
+            &mut manifest,
+            "neighbour_full_input",
+            &neighbour.manifest_digest,
+        );
+    }
+    let input_digest = format!("{:x}", manifest.finalize());
+    let ask_dispatch_generation = db.ask_dispatch_generation()?;
+    Ok(DashboardCompositeContext {
+        witness: DashboardContextWitness {
+            dashboard_id: dashboard_id.to_string(),
+            generation,
+            ask_dispatch_generation,
+            input_digest,
+            corpus_budget,
+            additional_sources: additional_sources.to_vec(),
+            excluded_meeting_id: excluded_meeting_id.map(str::to_string),
+        },
+        packed_corpus,
+        packed_sources,
+    })
+}
+
+/// Canonical unambiguous manifest field: both the label and value are byte-length-prefixed. This
+/// avoids delimiter collisions even when authored content contains arbitrary punctuation/newlines.
+fn manifest_field(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+    use sha2::Digest;
+
+    let label_len = u64::try_from(label.len()).unwrap_or(u64::MAX);
+    let value_len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    hasher.update(label_len.to_be_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(value_len.to_be_bytes());
+    hasher.update(value);
+}
+
+fn manifest_source_ref(hasher: &mut sha2::Sha256, role: &str, source: &SourceRef) {
+    manifest_field(hasher, "source_role", role.as_bytes());
+    manifest_field(hasher, "source_kind", source.kind.as_str().as_bytes());
+    manifest_field(hasher, "source_id", source.id.as_bytes());
+}
+
+pub(crate) fn require_dashboard_context_witness(
+    db: &crate::storage::Db,
+    witness: &DashboardContextWitness,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    let current = dashboard_composite_context(
+        db,
+        &witness.dashboard_id,
+        unlocked,
+        witness.corpus_budget,
+        &witness.additional_sources,
+        witness.excluded_meeting_id.as_deref(),
+    )?;
+    let (_, exists_now) = db.dashboard_context_state(&witness.dashboard_id)?;
+    if !exists_now || current.witness != *witness {
+        return Err(AppError::Locked(
+            "dashboard changed while generating the answer".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_ask_corpus_budget_under_lifecycle(
+    state: &AppState,
+    witness: &DashboardContextWitness,
+) -> Result<usize, AppError> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    let budget = super::resolved_ask_corpus_budget(&config);
+    Ok(if witness.excluded_meeting_id.is_some() {
+        budget.min(crate::summarize::chat::MAX_PINNED_SOURCE_CHARS)
+    } else {
+        budget
+    })
+}
+
+/// Revalidate both the dashboard material and the live Ask-provider packing budget while the
+/// caller owns the lifecycle guard. A witness is authorization for one exact provider input, not
+/// permission to reconstruct that input later with its now-stale budget.
+pub(crate) fn require_current_dashboard_context_witness_under_lifecycle(
+    state: &AppState,
+    witness: &DashboardContextWitness,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    if witness.corpus_budget != current_ask_corpus_budget_under_lifecycle(state, witness)? {
+        return Err(AppError::Locked(
+            "Ask provider changed while generating the answer".into(),
+        ));
+    }
+    require_dashboard_context_witness(&state.db, witness, unlocked)
+}
+
+pub(crate) fn require_living_answer_context_witness(
+    db: &crate::storage::Db,
+    witness: &DashboardContextWitness,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    let current = living_answer_composite_context(
+        db,
+        &witness.dashboard_id,
+        unlocked,
+        witness.corpus_budget,
+    )?;
+    if current.witness != *witness {
+        return Err(AppError::Locked(
+            "dashboard changed while generating the answer".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_current_living_answer_context_witness_under_lifecycle(
+    state: &AppState,
+    witness: &DashboardContextWitness,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    if witness.corpus_budget != current_ask_corpus_budget_under_lifecycle(state, witness)? {
+        return Err(AppError::Locked(
+            "Ask provider changed while generating the answer".into(),
+        ));
+    }
+    require_living_answer_context_witness(&state.db, witness, unlocked)
+}
+
+fn decode_folder_provenance(raw: Option<&str>) -> Option<Vec<String>> {
+    let folders = serde_json::from_str::<Vec<String>>(raw?).ok()?;
+    folders
+        .iter()
+        .all(|folder| !folder.trim().is_empty())
+        .then_some(folders)
+}
+
+fn living_answer_withheld() -> TileData {
+    TileData::LivingAnswer {
+        question: String::new(),
+        answer: None,
+        answered_at: None,
+        withheld: true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_dashboard_living_answer_after_await_with_dispatch(
+    state: &AppState,
+    visibility: &super::DurableScopeSnapshot,
+    ask_dispatch: &super::AskDispatchSnapshot,
+    witness: &DashboardContextWitness,
+    readable_folders: &[String],
+    dashboard_id: &str,
+    tile_id: &str,
+    question: &str,
+    answer: &str,
+    answered_at: &str,
+) -> Result<Response, AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    super::require_durable_scope_under_lifecycle(state, visibility)?;
+    super::require_current_ask_dispatch_under_lifecycle(state, ask_dispatch)?;
+    let unlocked = super::unlocked_snapshot(state)?;
+    require_current_living_answer_context_witness_under_lifecycle(state, witness, &unlocked)?;
+    let currently_readable = readable_folder_ids(&state.db, &unlocked)?;
+    if readable_folders
+        .iter()
+        .any(|folder| !currently_readable.contains(folder))
+    {
+        return Err(AppError::Locked(
+            "content visibility changed while generating the answer".into(),
+        ));
+    }
+    let readable_json = serde_json::to_string(readable_folders)
+        .map_err(|e| AppError::Storage(format!("encoding provenance failed: {e}")))?;
+    if !state.db.store_dashboard_living_answer_cas_with_dispatch(
+        tile_id,
+        dashboard_id,
+        question,
+        answer,
+        answered_at,
+        &readable_json,
+        witness.generation,
+        &witness.input_digest,
+        witness.corpus_budget,
+        witness.ask_dispatch_generation,
+    )? {
+        return Err(AppError::Locked(
+            "dashboard changed while generating the answer".into(),
+        ));
+    }
+    let payload = serde_json::to_string(&TileData::LivingAnswer {
+        question: question.to_string(),
+        answer: Some(answer.to_string()),
+        answered_at: Some(answered_at.to_string()),
+        withheld: false,
+    })
+    .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))?;
+    Ok(Response::new(payload))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_dashboard_living_answer_after_await(
+    state: &AppState,
+    visibility: &super::DurableScopeSnapshot,
+    witness: &DashboardContextWitness,
+    readable_folders: &[String],
+    dashboard_id: &str,
+    tile_id: &str,
+    question: &str,
+    answer: &str,
+    answered_at: &str,
+) -> Result<Response, AppError> {
+    let ask_dispatch = {
+        let _lifecycle = super::lifecycle_guard(state);
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
+        super::capture_ask_dispatch_snapshot_under_lifecycle(state, &config)?
+    };
+    persist_dashboard_living_answer_after_await_with_dispatch(
+        state,
+        visibility,
+        &ask_dispatch,
+        witness,
+        readable_folders,
+        dashboard_id,
+        tile_id,
+        question,
+        answer,
+        answered_at,
+    )
+}
+
+pub(crate) type LivingAnswerRefreshPreflight = (
+    super::DurableScopeSnapshot,
+    DashboardCompositeContext,
+    Vec<String>,
+    crate::settings::config::AppConfig,
+    super::AskDispatchSnapshot,
+);
+
+/// Resolve the exact Living Answer dispatch inputs inside one lifecycle interval. Keeping the
+/// complete preflight in a headless helper makes the non-reentrant-lock contract executable: the
+/// command and its regression test run this same path, including the under-lifecycle visibility
+/// snapshot capture.
+pub(crate) fn refresh_dashboard_answer_preflight(
+    state: &AppState,
+    dashboard_id: &str,
+    tile_id: &str,
+    question: &str,
+) -> Result<LivingAnswerRefreshPreflight, AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let ask_dispatch = super::capture_ask_dispatch_snapshot_under_lifecycle(state, &config)?;
+    let unlocked = super::unlocked_snapshot(state)?;
+    let Some((owner, kind)) = state.db.dashboard_tile_metadata(tile_id)? else {
+        return Err(AppError::InvalidArg("living answer is unavailable".into()));
+    };
+    if owner != dashboard_id || kind != "living_answer" {
+        return Err(AppError::InvalidArg("living answer is unavailable".into()));
+    }
+    let Some(preflight) = state.db.dashboard_living_answer_preflight(tile_id)? else {
+        return Err(AppError::InvalidArg("living answer is unavailable".into()));
+    };
+    let readable = readable_folder_ids(&state.db, &unlocked)?;
+    let question_folders =
+        decode_folder_provenance(preflight.question_readable_folders_json.as_deref())
+            .ok_or_else(|| AppError::Locked("living answer is unavailable".into()))?;
+    if !question_folders
+        .iter()
+        .all(|folder| readable.contains(folder))
+    {
+        return Err(AppError::Locked("living answer is unavailable".into()));
+    }
+    let stored_question = state
+        .db
+        .dashboard_living_question_after_preflight(tile_id)?
+        .ok_or_else(|| AppError::Locked("living answer is unavailable".into()))?;
+    if stored_question != question {
+        return Err(AppError::InvalidArg(
+            "living-answer question is backend-owned".into(),
+        ));
+    }
+    let ask_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
+            .connection;
+    let context = living_answer_composite_context(
+        &state.db,
+        dashboard_id,
+        &unlocked,
+        crate::summarize::vault_context::budget_for(&ask_conn),
+    )?;
+    let mut readable_folders = readable.into_iter().collect::<Vec<_>>();
+    readable_folders.sort();
+    Ok((
+        super::DurableScopeSnapshot::Vault(
+            super::capture_content_visibility_snapshot_under_lifecycle(state),
+        ),
+        context,
+        readable_folders,
+        config,
+        ask_dispatch,
+    ))
+}
+
+/// Generate and persist one Living Answer without accepting model output or provenance from the
+/// WebView. The existing dashboard Ask core owns provider selection, consent, redaction and the
+/// content-free egress ledger. This command owns only the cache admission around that call.
+#[tauri::command]
+pub async fn refresh_dashboard_answer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dashboard_id: String,
+    tile_id: String,
+    question: String,
+) -> Result<Response, AppError> {
+    let question = clean_title(&question, "question")?;
+    let (visibility, context, readable_folders, config, ask_dispatch) =
+        refresh_dashboard_answer_preflight(state.inner(), &dashboard_id, &tile_id, &question)?;
+    let witness = context.witness.clone();
+    let dispatch_visibility = visibility.clone();
+    let dispatch_witness = witness.clone();
+    let dispatch_ask = ask_dispatch.clone();
+    let dispatch_admission = crate::state::ContentDispatchAdmission::new(&app, move |current| {
+        super::require_durable_scope_under_lifecycle(current, &dispatch_visibility)?;
+        super::require_current_ask_dispatch_under_lifecycle(current, &dispatch_ask)?;
+        let unlocked = super::unlocked_snapshot(current)?;
+        require_current_living_answer_context_witness_under_lifecycle(
+            current,
+            &dispatch_witness,
+            &unlocked,
+        )
+    });
+    let result = super::ask_vault_prepacked_dashboard_authorized(
+        &context,
+        &config,
+        &question,
+        &[],
+        &state.heavy_inference,
+        dispatch_admission,
+    )
+    .await?;
+    if result.answer.trim().is_empty() || result.answer.len() > MAX_CONFIG_LEN {
+        return Err(AppError::InvalidArg("answer too large or empty".into()));
+    }
+
+    let answered_at = now_iso();
+    persist_dashboard_living_answer_after_await_with_dispatch(
+        state.inner(),
+        &visibility,
+        &ask_dispatch,
+        &witness,
+        &readable_folders,
+        &dashboard_id,
+        &tile_id,
+        &question,
+        &result.answer,
+        &answered_at,
+    )
 }
 
 /// How much of the prompt the brief may take.
@@ -967,9 +1445,12 @@ fn source_is_visible(
     unlocked: &std::collections::HashSet<String>,
 ) -> Result<bool, AppError> {
     Ok(match source.kind {
-        LinkKind::Note => db.note_markdown_if_visible(&source.id, unlocked)?.is_some(),
-        LinkKind::Meeting => db.meeting_is_visible(&source.id, unlocked)?,
-        LinkKind::Document => db.get_document_if_visible(&source.id, unlocked)?.is_some(),
+        LinkKind::Note => db.note_is_visible(&source.id, unlocked)?,
+        LinkKind::Meeting => {
+            db.meeting_is_visible(&source.id, unlocked)?
+                && db.dashboard_ref_exists("meeting", &source.id)?
+        }
+        LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
     })
 }
 
@@ -979,8 +1460,6 @@ pub(crate) fn resolve_tile(
     tile: &DashboardTile,
     unlocked: &std::collections::HashSet<String>,
 ) -> Result<TileData, AppError> {
-    let cfg = parse_config(tile.config.as_deref());
-
     // Kinds that need an anchor.
     let needs_ref = matches!(
         tile.kind.as_str(),
@@ -993,13 +1472,7 @@ pub(crate) fn resolve_tile(
 
     match tile.kind.as_str() {
         "note" => {
-            // `list_notes_visible(None, …)` is the SAME gated reader the Notes list uses; a sealed
-            // note is simply absent from it, which is exactly the Locked signal we want.
-            let Some(note) = db
-                .list_notes_visible(None, unlocked)?
-                .into_iter()
-                .find(|n| n.id == ref_id)
-            else {
+            let Some(note) = db.get_document_if_visible_kind(&ref_id, "note", unlocked)? else {
                 // Absent can mean sealed OR deleted. Distinguish with an EXISTENCE-only probe —
                 // it returns a bool, never a title or folder.
                 return Ok(if db.dashboard_ref_exists("note", &ref_id)? {
@@ -1008,26 +1481,20 @@ pub(crate) fn resolve_tile(
                     TileData::Missing
                 });
             };
-            if note.locked {
-                return Ok(TileData::Locked);
-            }
             Ok(TileData::Note {
                 id: note.id,
-                title: note.title,
-                snippet: snippet_of(&note.snippet, 220),
-                updated_at: note.updated_at,
+                title: note.title.unwrap_or(note.name),
+                snippet: snippet_of(&note.markdown, 220),
+                updated_at: note.updated_at.unwrap_or(note.created_at),
             })
         }
         "meeting" => {
-            if !db.meeting_is_visible(&ref_id, unlocked)? {
-                return Ok(if db.get_meeting(&ref_id)?.is_some() {
+            let Some(m) = db.get_meeting_if_visible(&ref_id, unlocked)? else {
+                return Ok(if db.dashboard_ref_exists("meeting", &ref_id)? {
                     TileData::Locked
                 } else {
                     TileData::Missing
                 });
-            }
-            let Some(m) = db.get_meeting(&ref_id)? else {
-                return Ok(TileData::Missing);
             };
             Ok(TileData::Meeting {
                 id: m.id,
@@ -1038,7 +1505,7 @@ pub(crate) fn resolve_tile(
             })
         }
         "document" => {
-            let Some(doc) = db.get_document_if_visible(&ref_id, unlocked)? else {
+            let Some(doc) = db.get_document_if_visible_kind(&ref_id, "document", unlocked)? else {
                 return Ok(if db.dashboard_ref_exists("document", &ref_id)? {
                     TileData::Locked
                 } else {
@@ -1056,11 +1523,7 @@ pub(crate) fn resolve_tile(
             })
         }
         "person" => {
-            let Some(node) = db
-                .list_entities_visible(unlocked)?
-                .into_iter()
-                .find(|e| e.id == ref_id)
-            else {
+            let Some(node) = db.get_entity_node_visible(&ref_id, unlocked)? else {
                 // An entity visible ONLY through sealed meetings is indistinguishable from an
                 // unknown one — the same non-leak contract `get_entity_detail` keeps, and the
                 // reason this arm must NOT fall back to any stored name. `redact_tile_chrome`
@@ -1086,19 +1549,17 @@ pub(crate) fn resolve_tile(
             // "smart" reminder's TITLE is authored from meeting content, so a reminder whose
             // every anchor points at a source the session cannot read is withheld here.
             let mut rows: Vec<(i64, TileRow)> = db
-                .list_stored_reminders()?
+                .list_dashboard_reminders_visible(unlocked)?
                 .into_iter()
-                .filter(|r| matches!(r.state, crate::storage::models::ReminderState::Active))
-                .filter(|r| reminder_provenance_is_readable(db, r, unlocked))
-                .map(|r| {
+                .map(|(title, due_at)| {
                     // Due in the past ⇒ "due" (needs attention), else "open".
                     let now_ms = chrono::Utc::now().timestamp_millis();
-                    let status = if r.due_at <= now_ms { "due" } else { "open" };
+                    let status = if due_at <= now_ms { "due" } else { "open" };
                     (
-                        r.due_at,
+                        due_at,
                         TileRow {
-                            text: r.title,
-                            meta: Some(format_epoch_day(r.due_at)),
+                            text: title,
+                            meta: Some(format_epoch_day(due_at)),
                             status: Some(status.to_string()),
                             source: None,
                         },
@@ -1115,24 +1576,27 @@ pub(crate) fn resolve_tile(
         "drift" => {
             // The bitemporal fact history for the entity, already gated by `list_facts_visible`.
             let facts = db.list_facts_visible(&ref_id, unlocked)?;
+            let entity = entity_name(db, &ref_id, unlocked)?;
+            if entity == ENTITY_HIDDEN {
+                return Ok(TileData::Drift {
+                    entity,
+                    predicate: String::new(),
+                    rows: vec![],
+                });
+            }
             if facts.is_empty() {
-                let entity = entity_name(db, &ref_id, unlocked)?;
                 return Ok(TileData::Drift {
                     // A hidden entity emits NO stored predicate either. Nothing writes
                     // `config.predicate` today, but the day a UI lets a user pin one chosen from
                     // an entity's facts, echoing it back for a sealed entity would be a leak.
-                    predicate: if entity == ENTITY_HIDDEN {
-                        String::new()
-                    } else {
-                        cfg.predicate.unwrap_or_default()
-                    },
+                    predicate: String::new(),
                     entity,
                     rows: vec![],
                 });
             }
             // Pick the predicate with the most recorded values (the one that actually moved),
             // unless the tile pins one.
-            let predicate = cfg.predicate.clone().unwrap_or_else(|| {
+            let predicate = {
                 let mut counts: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
                 for f in &facts {
@@ -1143,7 +1607,7 @@ pub(crate) fn resolve_tile(
                     .max_by_key(|(_, n)| *n)
                     .map(|(p, _)| p.to_string())
                     .unwrap_or_default()
-            });
+            };
             let mut steps: Vec<_> = facts
                 .iter()
                 .filter(|f| f.predicate == predicate)
@@ -1169,7 +1633,7 @@ pub(crate) fn resolve_tile(
                 .rev()
                 .collect();
             Ok(TileData::Drift {
-                entity: entity_name(db, &ref_id, unlocked)?,
+                entity,
                 predicate,
                 rows,
             })
@@ -1230,7 +1694,7 @@ pub(crate) fn resolve_tile(
             })
         }
         "promises" => {
-            let owner = cfg.owner.clone();
+            let owner = None;
             let items = db.list_open_commitments(unlocked, owner.as_deref())?;
             let rows = items
                 .into_iter()
@@ -1259,15 +1723,130 @@ pub(crate) fn resolve_tile(
             //
             // Fail-closed on a legacy row: an answer with no recorded sources cannot be checked,
             // so it is withheld rather than trusted.
-            let has_answer = cfg.answer.as_ref().is_some_and(|a| !a.trim().is_empty());
-            let recorded = cfg.answer_readable_folders.unwrap_or_default();
-            let withheld =
-                living_answer_withheld(has_answer, &recorded, &readable_folder_ids(db, unlocked)?);
+            let readable = readable_folder_ids(db, unlocked)?;
+            let Some(preflight) = db.dashboard_living_answer_preflight(&tile.id)? else {
+                return Ok(living_answer_withheld());
+            };
+            let Some(question_provenance) =
+                decode_folder_provenance(preflight.question_readable_folders_json.as_deref())
+            else {
+                return Ok(living_answer_withheld());
+            };
+            if !question_provenance
+                .iter()
+                .all(|folder| readable.contains(folder))
+            {
+                return Ok(living_answer_withheld());
+            }
+            match &preflight.answer {
+                LivingAnswerCacheState::Empty => {
+                    let Some(question) = db.dashboard_living_question_after_preflight(&tile.id)?
+                    else {
+                        return Ok(living_answer_withheld());
+                    };
+                    return Ok(TileData::LivingAnswer {
+                        question,
+                        answer: None,
+                        answered_at: None,
+                        withheld: false,
+                    });
+                }
+                LivingAnswerCacheState::Malformed => return Ok(living_answer_withheld()),
+                LivingAnswerCacheState::Valid {
+                    readable_folders_json,
+                    context_generation,
+                    context_digest,
+                    context_budget,
+                    ask_dispatch_generation,
+                } => {
+                    let Some(answer_folders) =
+                        decode_folder_provenance(Some(readable_folders_json))
+                    else {
+                        return Ok(living_answer_withheld());
+                    };
+                    let Ok(context_budget) = usize::try_from(*context_budget) else {
+                        return Ok(living_answer_withheld());
+                    };
+                    if context_budget == 0 || context_budget > 200_000 {
+                        return Ok(living_answer_withheld());
+                    }
+                    let current = living_answer_composite_context(
+                        db,
+                        &tile.dashboard_id,
+                        unlocked,
+                        context_budget,
+                    )?;
+                    if *ask_dispatch_generation != current.witness.ask_dispatch_generation {
+                        let Some(question) =
+                            db.dashboard_living_question_after_preflight(&tile.id)?
+                        else {
+                            return Ok(living_answer_withheld());
+                        };
+                        return Ok(TileData::LivingAnswer {
+                            question,
+                            answer: None,
+                            answered_at: None,
+                            withheld: false,
+                        });
+                    }
+                    if *context_generation != current.witness.generation
+                        || *context_digest != current.witness.input_digest
+                        || !answer_folders
+                            .iter()
+                            .all(|folder| readable.contains(folder))
+                    {
+                        return Ok(living_answer_withheld());
+                    }
+                }
+            }
+            let ask_dispatch_generation = match preflight.answer {
+                LivingAnswerCacheState::Valid {
+                    ask_dispatch_generation,
+                    ..
+                } => ask_dispatch_generation,
+                LivingAnswerCacheState::Empty | LivingAnswerCacheState::Malformed => {
+                    return Ok(living_answer_withheld());
+                }
+            };
+            let Some(content) = db.dashboard_living_answer_content_after_preflight_with_dispatch(
+                &tile.id,
+                ask_dispatch_generation,
+                match &preflight.answer {
+                    LivingAnswerCacheState::Valid {
+                        context_generation,
+                        ..
+                    } => *context_generation,
+                    LivingAnswerCacheState::Empty | LivingAnswerCacheState::Malformed => -1,
+                },
+                match &preflight.answer {
+                    LivingAnswerCacheState::Valid { context_digest, .. } => context_digest,
+                    LivingAnswerCacheState::Empty | LivingAnswerCacheState::Malformed => "",
+                },
+                match &preflight.answer {
+                    LivingAnswerCacheState::Valid { context_budget, .. } => *context_budget,
+                    LivingAnswerCacheState::Empty | LivingAnswerCacheState::Malformed => -1,
+                },
+            )?
+            else {
+                return Ok(living_answer_withheld());
+            };
+            let question = content.question;
+            let answer = content.answer;
+            let answered_at = content.answered_at;
+            if question.trim().is_empty()
+                || answer.as_ref().is_some_and(|value| value.trim().is_empty())
+                || answered_at
+                    .as_ref()
+                    .is_some_and(|value| value.trim().is_empty())
+                || (answer.is_some() != answered_at.is_some())
+            {
+                return Ok(living_answer_withheld());
+            }
             Ok(TileData::LivingAnswer {
-                question: cfg.question.unwrap_or_default(),
-                answer: if withheld { None } else { cfg.answer },
-                answered_at: if withheld { None } else { cfg.answered_at },
-                withheld,
+                question,
+                answer,
+                answered_at,
+                withheld: false,
             })
         }
         other => Err(AppError::InvalidArg(format!("unknown tile kind: {other}"))),
@@ -1362,14 +1941,14 @@ pub(crate) fn render_tile_for_agent(tile: &DashboardTile, data: &TileData) -> St
             // NEVER fall back to the stored title when the answer is withheld: that title is
             // exactly the field a legacy row copied from the source. An unnamed withheld tile is
             // anonymous, which is the correct outcome.
-            let q = match (question.trim().is_empty(), *withheld) {
-                (true, true) => "(untitled)".to_string(),
-                (true, false) => heading("living answer"),
-                _ => question.clone(),
-            };
             if *withheld {
-                format!("- living answer: {q}\n    [saved answer withheld — a source is sealed]")
+                "- living answer\n    [saved answer withheld — a source is sealed]".to_string()
             } else {
+                let q = if question.trim().is_empty() {
+                    heading("living answer")
+                } else {
+                    question.clone()
+                };
                 format!(
                     "- living answer: {q}\n    {}",
                     answer.as_deref().unwrap_or("(not answered yet)")
@@ -1381,37 +1960,10 @@ pub(crate) fn render_tile_for_agent(tile: &DashboardTile, data: &TileData) -> St
 
 /// Is a reminder's PROVENANCE readable in this session?
 ///
-/// `true` when it has no anchors at all (a hand-written reminder is the user's own data), or when
-/// at least one anchor still resolves through its gated reader. Withholding a reminder whose every
-/// anchor is sealed is what stops an agent reading a title that was authored from sealed content.
-fn reminder_provenance_is_readable(
-    db: &crate::storage::Db,
-    reminder: &crate::storage::models::StoredReminder,
-    unlocked: &std::collections::HashSet<String>,
-) -> bool {
-    if reminder.sources.is_empty() {
-        return true;
-    }
-    reminder.sources.iter().any(|anchor| {
-        let kind = match anchor.kind.as_str() {
-            "meeting" => LinkKind::Meeting,
-            "note" => LinkKind::Note,
-            "document" => LinkKind::Document,
-            // An anchor kind we do not understand cannot be proven readable ⇒ it does not count.
-            _ => return false,
-        };
-        source_is_visible(
-            db,
-            &SourceRef {
-                kind,
-                id: anchor.id.clone(),
-            },
-            unlocked,
-        )
-        .unwrap_or(false)
-    })
-}
-
+/// `true` when a manual reminder has no anchors (the user's own data), or when every recorded
+/// anchor resolves through its gated reader. A smart reminder with no anchors is unprovable and
+/// fails closed. A title can be derived jointly from multiple anchors, so one readable anchor
+/// never declassifies text influenced by a sealed one.
 /// The placeholder an entity-anchored tile shows when its entity is not currently visible. Also
 /// the signal `redact_tile_chrome` reads to strip that tile's stored chrome.
 const ENTITY_HIDDEN: &str = "—";
@@ -1424,9 +1976,7 @@ fn entity_name(
     unlocked: &std::collections::HashSet<String>,
 ) -> Result<String, AppError> {
     Ok(db
-        .list_entities_visible(unlocked)?
-        .into_iter()
-        .find(|e| e.id == entity_id)
+        .get_entity_node_visible(entity_id, unlocked)?
         .map(|e| e.name)
         .unwrap_or_else(|| ENTITY_HIDDEN.to_string()))
 }

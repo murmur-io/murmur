@@ -63,6 +63,10 @@
   padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
   max-width: 220px;
 }
+.sp-dashboard-chip {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+}
 .sp-chip-badge {
   display: inline-flex;
   align-items: center;
@@ -89,7 +93,9 @@
   color: var(--text-muted);
   cursor: pointer;
   flex: none;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
 }
 .sp-chip-remove:hover {
   background: var(--surface-hover);

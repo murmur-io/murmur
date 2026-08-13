@@ -17,7 +17,7 @@ import { mockNotes } from "./mock-invoke";
  * scope is `[{note n1}, {meeting m9}]`; `ask_vault` records the `explicitSources`
  * it was called with on `window` so the test can assert the exact wire shape.
  */
-test("Ask-about-this-note opens in the drawer, pre-fills note + its links, and sends ask_vault with explicitSources", async ({
+test("note chat keeps its note anchor, adds one dashboard scope, and sends dashboardId without expanding it", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -63,9 +63,31 @@ test("Ask-about-this-note opens in the drawer, pre-fills note + its links, and s
       }
       return [];
     },
-    ask_vault_persisted: (args: { explicitSources?: unknown }) => {
-      (window as unknown as { __askVaultSources?: unknown }).__askVaultSources =
-        args.explicitSources ?? null;
+    list_dashboards: () => [
+      {
+        id: "dashboard-note",
+        title: "Note board live title",
+        emoji: "📝",
+        tileCount: 2,
+        createdAt: "2026-08-06T01:00:00Z",
+        updatedAt: "2026-08-06T01:00:00Z",
+      },
+    ],
+    get_dashboard_sources: () => {
+      (
+        window as unknown as { __noteDashboardExpanded?: boolean }
+      ).__noteDashboardExpanded = true;
+      return [{ kind: "note", id: "must-not-expand" }];
+    },
+    ask_vault_persisted: (args: {
+      explicitSources?: unknown;
+      dashboardId?: string;
+    }) => {
+      (
+        window as unknown as {
+          __askVaultArgs?: unknown;
+        }
+      ).__askVaultArgs = args;
       return {
         conversationId: "note-conversation-1",
         userMessageId: crypto.randomUUID(),
@@ -93,6 +115,17 @@ test("Ask-about-this-note opens in the drawer, pre-fills note + its links, and s
   const chips = chat.locator(".sp-chip-title");
   await expect(chips).toHaveText(["My First Note", "Planning sync"]);
 
+  await chat.locator("mur-source-picker .sp-trigger").click();
+  await page
+    .getByRole("option", { name: "Use dashboard Note board live title" })
+    .click();
+  await expect(
+    chat.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toHaveCount(1);
+  await expect(
+    chat.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toContainText("Note board live title");
+
   // Ask a question — Enter sends via the composer.
   const input = chat.locator(".chat-input");
   await input.fill("Summarize this note");
@@ -103,14 +136,26 @@ test("Ask-about-this-note opens in the drawer, pre-fills note + its links, and s
 
   // ask_vault carried the pinned scope: exactly the note + its active link,
   // each as `{kind, id}` (title is display-only; the backend ignores it).
-  const sent = await page.evaluate(
-    () =>
-      (window as unknown as { __askVaultSources?: { kind: string; id: string }[] })
-        .__askVaultSources,
+  const sent = await page.evaluate(() => {
+    const target = window as unknown as {
+      __askVaultArgs?: {
+        explicitSources?: { kind: string; id: string }[];
+        dashboardId?: string;
+      };
+      __noteDashboardExpanded?: boolean;
+    };
+    return {
+      args: target.__askVaultArgs,
+      expanded: target.__noteDashboardExpanded,
+    };
+  });
+  expect(sent.args).toBeTruthy();
+  const pairs = (sent.args?.explicitSources ?? []).map(
+    (s) => `${s.kind}:${s.id}`,
   );
-  expect(sent).toBeTruthy();
-  const pairs = (sent ?? []).map((s) => `${s.kind}:${s.id}`);
   expect(pairs).toEqual(["note:n1", "meeting:m9"]);
+  expect(sent.args?.dashboardId).toBe("dashboard-note");
+  expect(sent.expanded).not.toBe(true);
 
   expect(consoleErrors).toEqual([]);
 });

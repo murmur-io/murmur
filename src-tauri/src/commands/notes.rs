@@ -120,7 +120,13 @@ pub(crate) fn create_note_inner(
     // Brain v3 PR-3 — LINK ENGINE: index the (empty) body's wikilinks so a create with no body
     // establishes a clean empty edge set; the first `update_note_doc` re-indexes real `[[Title]]`s.
     // No semantic pass on birth (no vectors yet). Best-effort.
-    index_wikilinks_best_effort(state, crate::links::LinkKind::Note, &id, "");
+    index_wikilinks_best_effort_under_lifecycle(
+        state,
+        &_lifecycle,
+        crate::links::LinkKind::Note,
+        &id,
+        "",
+    );
     tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note created");
     Ok(id)
 }
