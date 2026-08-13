@@ -4,4 +4,10 @@
   --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, system-ui,
     sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace;
+
+  /* Compact command/picker hierarchy shared by dense workspace chrome. */
+  --type-command-label: 0.84rem;
+  --type-command-caption: 0.72rem;
+  --type-command-kicker: 0.66rem;
+  --tracking-command-kicker: 0.06em;
 }

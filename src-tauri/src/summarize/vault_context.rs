@@ -540,6 +540,58 @@ pub(crate) fn build_vault_context_pinned_visible_with_budget(
     Ok((corpus, vault_sources))
 }
 
+/// Pack exactly the caller-selected sources under one fair budget, without the neighbour expansion
+/// used by Ask. Convert-to-note uses this for a meeting's ACTIVE Related edges: the linked items are
+/// useful secondary context, but a link-of-a-link was never selected for this conversion and must
+/// not silently enter the provider prompt. Every content read stays behind the same visible packers
+/// as [`build_vault_context_pinned_visible_with_budget`].
+pub(crate) fn build_vault_context_exact_visible_with_budget(
+    db: &Db,
+    sources: &[SourceRef],
+    budget: usize,
+    unlocked: &HashSet<String>,
+) -> Result<String> {
+    if budget == 0 || sources.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Resolve meeting rows ONLY through the visibility query before touching title/audio metadata.
+    // `get_meeting` is intentionally ungated and therefore forbidden on this cross-meeting path.
+    let visible_meetings = db
+        .list_meetings_visible(i64::MAX, unlocked)?
+        .into_iter()
+        .map(|meeting| (meeting.id.clone(), meeting))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut sections: Vec<(String, Vec<VaultSource>)> = Vec::new();
+    for source in sources {
+        let key = (source.kind.as_str().to_string(), source.id.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        match source.kind {
+            LinkKind::Meeting => {
+                if let Some(meeting) = visible_meetings.get(&source.id).cloned() {
+                    let (section, section_sources) =
+                        pack_meetings(db, vec![meeting], budget, unlocked)?;
+                    if !section.trim().is_empty() {
+                        sections.push((section, section_sources));
+                    }
+                }
+            }
+            LinkKind::Note | LinkKind::Document => {
+                let mut section = String::new();
+                if pack_notes(db, &source.id, budget, &mut section, unlocked)?
+                    && !section.trim().is_empty()
+                {
+                    sections.push((section, Vec::new()));
+                }
+            }
+        }
+    }
+    Ok(fair_pack_explicit_sections(sections, budget).0)
+}
+
 /// note↔meeting-links PR-2 — build a PINNED corpus from an EXPLICIT source list plus its capped,
 /// gated link-expansion. This is the source-scoped Ask path: the corpus is EXACTLY the listed
 /// `sources` (packed FIRST, fairly under the provider budget) plus up to [`LINK_CONTEXT_CAP`] of
@@ -1170,6 +1222,46 @@ mod tests {
         assert!(
             !corpus.contains("SEALED-NEIGHBOUR-BODY"),
             "a SEALED linked neighbour must be dropped by the gate (E9): {corpus}"
+        );
+    }
+
+    #[test]
+    fn exact_conversion_context_is_visible_and_never_expands_links_of_links() {
+        let db = temp_db();
+        seed_note(&db, "open-linked", "Open linked", "OPEN-LINKED-BODY", None);
+        seed_folder(&db, "f-conversion-locked");
+        seed_note(
+            &db,
+            "sealed-linked",
+            "SEALED-TITLE-MUST-NOT-ENTER",
+            "SEALED-LINKED-BODY",
+            Some("f-conversion-locked"),
+        );
+        seed_note(
+            &db,
+            "second-hop",
+            "Second hop",
+            "SECOND-HOP-BODY",
+            None,
+        );
+        db.upsert_manual_link("meeting", "open-linked", "meeting", "second-hop")
+            .unwrap();
+        db.set_folder_locked("f-conversion-locked", true, None)
+            .unwrap();
+
+        let corpus = build_vault_context_exact_visible_with_budget(
+            &db,
+            &[m_src("open-linked"), m_src("sealed-linked")],
+            20_000,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(corpus.contains("OPEN-LINKED-BODY"));
+        assert!(!corpus.contains("SEALED-LINKED-BODY"));
+        assert!(!corpus.contains("SEALED-TITLE-MUST-NOT-ENTER"));
+        assert!(
+            !corpus.contains("SECOND-HOP-BODY"),
+            "conversion context is exactly Related, never a link-of-link expansion: {corpus}"
         );
     }
 

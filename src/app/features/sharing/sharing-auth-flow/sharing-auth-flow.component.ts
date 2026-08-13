@@ -3,10 +3,12 @@ import {
   Component,
   ElementRef,
   Injector,
+  OnInit,
   afterNextRender,
   computed,
   inject,
   output,
+  input,
   signal,
   viewChild,
 } from "@angular/core";
@@ -14,6 +16,7 @@ import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
 import type { AccountStatus } from "../../../core/models";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { AccountSessionService } from "../../../services/account-session.service";
 
 /**
  * The reusable multi-step sharing-account flow. One state machine, two entry
@@ -41,7 +44,9 @@ type Step =
  * State: non-secret step state lives in signals; passwords live ONLY in
  * transient `FormControl`s, read at submit and cleared immediately after — never
  * a persistent signal, never logged (mirrors the retired inline form's
- * discipline). IPC results (an `AccountStatus`) land in the `completed` output.
+ * discipline). Account status lands directly in the root session service;
+ * `completed` is deliberately payload-free so identity never crosses a
+ * component-output boundary.
  *
  * THE BUG THIS FIXES: the create path's first leg calls `accountSendCode(email)`
  * → `account_send_code` → `ShareClient::signup` → `POST /v1/auth/signup`, which
@@ -58,15 +63,18 @@ type Step =
   templateUrl: "./sharing-auth-flow.component.html",
   styleUrl: "./sharing-auth-flow.component.scss",
 })
-export class SharingAuthFlowComponent {
+export class SharingAuthFlowComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly accountSession = inject(AccountSessionService);
 
-  /** Fired once the session is logged in (after sign-in, or signup → auto-login). */
-  readonly completed = output<AccountStatus>();
+  /** Payload-free completion; session identity stays inside AccountSessionService. */
+  readonly completed = output<void>();
   /** Fired when the user backs all the way out of the 'choose' step. */
   readonly dismissed = output<void>();
+  /** Lets a global banner open the existing flow at the requested door. */
+  readonly initialDoor = input<"choose" | "signin" | "create">("choose");
 
   // ── Non-secret step state (signals) ──────────────────────────────────────
   readonly step = signal<Step>("choose");
@@ -92,6 +100,14 @@ export class SharingAuthFlowComponent {
 
   /** The AccountStatus captured at auto-login, emitted after the recovery step. */
   private capturedStatus: AccountStatus | null = null;
+
+  ngOnInit(): void {
+    if (this.initialDoor() === "signin") {
+      this.startSignin();
+    } else if (this.initialDoor() === "create") {
+      this.startCreate();
+    }
+  }
 
   // ── Per-step focus targets ───────────────────────────────────────────────
   private readonly emailField =
@@ -290,6 +306,7 @@ export class SharingAuthFlowComponent {
       // account_signup opens NO session — chain a login so the user ends up
       // signed in in one pass.
       const status = await this.ipc.accountLogin(this.email().trim(), password);
+      this.accountSession.accept(status);
       // Clear the secrets immediately after the successful round-trip.
       this.passwordControl.setValue("");
       this.confirmControl.setValue("");
@@ -299,7 +316,7 @@ export class SharingAuthFlowComponent {
         this.goto("create-recovery");
       } else {
         this.goto("done");
-        this.completed.emit(status);
+        this.completed.emit();
       }
     } catch (e) {
       // Bad/expired code, weak password, or email taken — surface it and let the
@@ -314,7 +331,7 @@ export class SharingAuthFlowComponent {
   recoveryDone(): void {
     this.goto("done");
     if (this.capturedStatus) {
-      this.completed.emit(this.capturedStatus);
+      this.completed.emit();
     }
   }
 
@@ -342,9 +359,10 @@ export class SharingAuthFlowComponent {
     this.busy.set(true);
     try {
       const status = await this.ipc.accountLogin(email, password);
+      this.accountSession.accept(status);
       this.signinPwControl.setValue("");
       this.goto("done");
-      this.completed.emit(status);
+      this.completed.emit();
     } catch (e) {
       this.error.set(this.friendly(e));
     } finally {

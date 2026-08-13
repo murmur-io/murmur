@@ -1113,9 +1113,15 @@ test("Smart Reminder: visibility-listener registration failure prevents audit an
   await expect(card.getByText("Must never be audited or rendered")).toHaveCount(
     0,
   );
+  const newReminder = page
+    .getByTestId("meeting-command-bar")
+    .getByRole("button", { name: "New reminder" });
+  await expect(newReminder).toBeDisabled();
+  const composer = page.locator("app-reminder-composer");
+  await expect(composer.getByRole("dialog")).toHaveCount(0);
   await expect(
-    card.getByRole("button", { name: "New reminder" }),
-  ).toBeDisabled();
+    composer.getByText("Must never hydrate context", { exact: true }),
+  ).toHaveCount(0);
   expect(
     await page.evaluate(
       () =>
@@ -1527,8 +1533,25 @@ test("Smart Reminder: a lock before listener readiness cannot rehydrate the pare
   );
 
   await page.goto("/meeting/m-atlas-roadmap");
+  await page.evaluate(() => {
+    const target = window as unknown as {
+      __listenerBarrierLocked?: boolean;
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args: unknown) => Promise<unknown>;
+      };
+    };
+    const invoke = target.__TAURI_INTERNALS__.invoke.bind(
+      target.__TAURI_INTERNALS__,
+    );
+    target.__TAURI_INTERNALS__.invoke = (command, args) =>
+      command === "get_meeting_detail" && target.__listenerBarrierLocked
+        ? Promise.resolve(null)
+        : invoke(command, args);
+  });
   const card = page.locator("app-smart-reminder-card");
-  const newReminder = card.getByRole("button", { name: "New reminder" });
+  const newReminder = page
+    .getByTestId("meeting-command-bar")
+    .getByRole("button", { name: "New reminder" });
   await expect(newReminder).toBeDisabled();
   expect(
     await page.evaluate(
@@ -1637,6 +1660,22 @@ test("Smart Reminder: a mounted meeting card drops stale rows after every canoni
   });
 
   await page.goto("/meeting/m-atlas-roadmap");
+  await page.evaluate(() => {
+    const target = window as unknown as {
+      __smartSourceState?: { phase: string };
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args: unknown) => Promise<unknown>;
+      };
+    };
+    const invoke = target.__TAURI_INTERNALS__.invoke.bind(
+      target.__TAURI_INTERNALS__,
+    );
+    target.__TAURI_INTERNALS__.invoke = (command, args) =>
+      command === "get_meeting_detail" &&
+        target.__smartSourceState?.phase === "locked"
+        ? Promise.resolve(null)
+        : invoke(command, args);
+  });
   const card = page.locator("app-smart-reminder-card");
   await expect(card.getByText("Before source edit")).toBeVisible();
   const initialAudits = await page.evaluate(
@@ -1650,9 +1689,9 @@ test("Smart Reminder: a mounted meeting card drops stale rows after every canoni
 
   // The real title-edit UI and the opaque backend event can race; both paths
   // synchronously clear and coalesce into one debounced re-audit.
-  const notePanel = page.locator("app-note-panel");
-  await notePanel.getByRole("button", { name: /More/ }).click();
-  await notePanel.getByRole("menuitem", { name: "Rename" }).click();
+  const commandBar = page.getByTestId("meeting-command-bar");
+  await commandBar.getByRole("button", { name: /More/ }).click();
+  await commandBar.getByRole("menuitem", { name: "Rename" }).click();
   await page.getByLabel("Meeting title").fill("Renamed roadmap");
   await page.locator(".rename").getByRole("button", { name: "Save" }).click();
   await expect(card.getByText("Before source edit")).toHaveCount(0, {
@@ -1751,7 +1790,7 @@ test("Smart Reminder: a mounted meeting card drops stale rows after every canoni
   await expect(
     card.getByText("After transcript or manual-note edit"),
   ).toHaveCount(0, { timeout: 700 });
-  await card.getByRole("button", { name: "New reminder" }).click();
+  await commandBar.getByRole("button", { name: "New reminder" }).click();
   const composer = page.locator("app-reminder-composer");
   await expect(composer.getByRole("dialog")).toBeVisible();
   await expect(
@@ -1784,7 +1823,7 @@ test("Smart Reminder: a mounted meeting card drops stale rows after every canoni
     };
     target.__demoEmit("murmur://reminders-updated", { dueInboxCount: 0 });
   });
-  await card.getByRole("button", { name: "New reminder" }).click();
+  await commandBar.getByRole("button", { name: "New reminder" }).click();
   await expect(composer.getByRole("dialog")).toBeVisible();
   await expect(
     composer.getByText("Q2 Roadmap Planning", { exact: true }),
@@ -2305,7 +2344,10 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
     .click();
   const meetingCard = page.locator("app-smart-reminder-card");
   await expect(meetingCard).toBeVisible();
-  await meetingCard.getByRole("button", { name: "New reminder" }).click();
+  await page
+    .getByTestId("meeting-command-bar")
+    .getByRole("button", { name: "New reminder" })
+    .click();
   await expect(composer.getByText("Q2 Roadmap Planning")).toBeVisible();
   await composer.getByLabel("Title").press("Escape");
   await expect(composer.getByRole("dialog")).toHaveCount(0);
