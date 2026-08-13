@@ -1,13 +1,10 @@
-//! Durable Ask Brain conversation commands for the three v1 scopes.
-//!
-//! Org/dashboard/record-time assistant callers keep using their existing stateless commands and
-//! `assistant_interactions`; this module is the only durable conversation seam.
+//! Durable Ask Brain conversation commands for vault, note, and meeting anchors. An optional
+//! dashboard ID composes current board material/derived views into any of those scopes while the
+//! backend remains the sole authority for history and immutable first-turn provenance.
 
 use super::*;
-use crate::storage::models::{
-    AskConversation, AskConversationScope, AskConversationSendResult, AskConversationSummary,
-    SourceRef,
-};
+use crate::storage::models::{AskConversationScope, AskConversationSendResult, SourceRef};
+use tauri::ipc::Response;
 
 #[derive(Debug, Clone)]
 pub(crate) enum DurableScopeSnapshot {
@@ -74,6 +71,53 @@ pub(crate) fn capture_durable_scope_under_lifecycle(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn serialize_durable_send_response_with_dispatch(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+    payload: &AskConversationSendResult,
+) -> Result<Response, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_durable_scope_under_lifecycle(state, snapshot)?;
+    require_current_ask_dispatch_under_lifecycle(state, ask_dispatch)?;
+    if let Some(witness) = dashboard {
+        let unlocked = unlocked_snapshot(state)?;
+        crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
+            state, witness, &unlocked,
+        )?;
+    }
+    serde_json::to_string(payload)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("conversation response encoding failed".into()))
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_durable_send_response(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+    payload: &AskConversationSendResult,
+) -> Result<Response, AppError> {
+    let ask_dispatch = {
+        let _lifecycle = lifecycle_guard(state);
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
+        capture_ask_dispatch_snapshot_under_lifecycle(state, &config)?
+    };
+    serialize_durable_send_response_with_dispatch(
+        state,
+        snapshot,
+        &ask_dispatch,
+        dashboard,
+        payload,
+    )
+}
+
 pub(crate) fn require_durable_scope_under_lifecycle(
     state: &AppState,
     snapshot: &DurableScopeSnapshot,
@@ -92,23 +136,97 @@ pub(crate) fn require_durable_scope_under_lifecycle(
     }
 }
 
+pub(crate) fn require_durable_scope_for_dispatch_with_ask(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_durable_scope_under_lifecycle(state, snapshot)?;
+    require_current_ask_dispatch_under_lifecycle(state, ask_dispatch)?;
+    if let Some(witness) = dashboard {
+        let unlocked = unlocked_snapshot(state)?;
+        crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
+            state, witness, &unlocked,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn require_durable_scope_for_dispatch(
     state: &AppState,
     snapshot: &DurableScopeSnapshot,
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
 ) -> Result<(), AppError> {
-    let _lifecycle = lifecycle_guard(state);
-    require_durable_scope_under_lifecycle(state, snapshot)
+    let ask_dispatch = {
+        let _lifecycle = lifecycle_guard(state);
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
+        capture_ask_dispatch_snapshot_under_lifecycle(state, &config)?
+    };
+    require_durable_scope_for_dispatch_with_ask(state, snapshot, &ask_dispatch, dashboard)
 }
 
 pub(crate) fn durable_dispatch_admission(
     app: &AppHandle,
     snapshot: DurableScopeSnapshot,
+    ask_dispatch: AskDispatchSnapshot,
+    dashboard: Option<crate::commands::dashboards::DashboardContextWitness>,
 ) -> crate::state::ContentDispatchAdmission {
     crate::state::ContentDispatchAdmission::new(app, move |state| {
-        require_durable_scope_under_lifecycle(state, &snapshot)
+        require_durable_scope_under_lifecycle(state, &snapshot)?;
+        require_current_ask_dispatch_under_lifecycle(state, &ask_dispatch)?;
+        if let Some(witness) = dashboard.as_ref() {
+            let unlocked = unlocked_snapshot(state)?;
+            crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
+                state, witness, &unlocked,
+            )?;
+        }
+        Ok(())
     })
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_ask_exchange_after_await_with_dispatch(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    scope: &AskConversationScope,
+    conversation_id: Option<&str>,
+    resume_cursor: Option<crate::storage::ask_conversation_store::AskConversationCursor>,
+    question: &str,
+    answer: &str,
+    selected_sources: &[SourceRef],
+    assistant_sources: &[crate::storage::models::VaultSource],
+    assistant_citations: &[String],
+    dependency_folders: &[String],
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+) -> Result<crate::storage::ask_conversation_store::PersistedAskExchange, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    persist_ask_exchange_under_lifecycle(
+        state,
+        snapshot,
+        ask_dispatch,
+        scope,
+        conversation_id,
+        resume_cursor,
+        question,
+        answer,
+        selected_sources,
+        assistant_sources,
+        assistant_citations,
+        dependency_folders,
+        dashboard,
+    )
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_ask_exchange_after_await(
     state: &AppState,
@@ -122,9 +240,58 @@ pub(crate) fn persist_ask_exchange_after_await(
     assistant_sources: &[crate::storage::models::VaultSource],
     assistant_citations: &[String],
     dependency_folders: &[String],
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
 ) -> Result<crate::storage::ask_conversation_store::PersistedAskExchange, AppError> {
-    let _lifecycle = lifecycle_guard(state);
+    let ask_dispatch = {
+        let _lifecycle = lifecycle_guard(state);
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
+        capture_ask_dispatch_snapshot_under_lifecycle(state, &config)?
+    };
+    persist_ask_exchange_after_await_with_dispatch(
+        state,
+        snapshot,
+        &ask_dispatch,
+        scope,
+        conversation_id,
+        resume_cursor,
+        question,
+        answer,
+        selected_sources,
+        assistant_sources,
+        assistant_citations,
+        dependency_folders,
+        dashboard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_ask_exchange_under_lifecycle(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    scope: &AskConversationScope,
+    conversation_id: Option<&str>,
+    resume_cursor: Option<crate::storage::ask_conversation_store::AskConversationCursor>,
+    question: &str,
+    answer: &str,
+    selected_sources: &[SourceRef],
+    assistant_sources: &[crate::storage::models::VaultSource],
+    assistant_citations: &[String],
+    dependency_folders: &[String],
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+) -> Result<crate::storage::ask_conversation_store::PersistedAskExchange, AppError> {
     require_durable_scope_under_lifecycle(state, snapshot)?;
+    require_current_ask_dispatch_under_lifecycle(state, ask_dispatch)?;
+    if let Some(witness) = dashboard {
+        let unlocked = unlocked_snapshot(state)?;
+        crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
+            state, witness, &unlocked,
+        )?;
+    }
     // The provider seam may assemble its final retrieval context after the caller's initial
     // dependency snapshot. Visibility reductions bump `seal_epoch` and fail the revalidation
     // above; a visibility increase does not. Union the NOW-visible folders while the same
@@ -150,7 +317,7 @@ pub(crate) fn persist_ask_exchange_after_await(
         .collect::<std::collections::BTreeSet<_>>();
     dependency_folders.extend(current_visible);
     let dependency_folders = dependency_folders.into_iter().collect::<Vec<_>>();
-    state.db.persist_ask_exchange_cas(
+    state.db.persist_ask_exchange_cas_with_dispatch(
         scope,
         conversation_id,
         resume_cursor,
@@ -160,7 +327,124 @@ pub(crate) fn persist_ask_exchange_after_await(
         assistant_sources,
         assistant_citations,
         &dependency_folders,
+        dashboard.map(|witness| witness.dashboard_id.as_str()),
+        dashboard.map(|witness| witness.generation),
+        dashboard.map(|witness| witness.input_digest.as_str()),
+        ask_dispatch.generation,
         &chrono::Utc::now().to_rfc3339(),
+    )
+}
+
+/// Commit the canonical exchange and encode the exact committed identities without releasing the
+/// lifecycle mutex between those two operations. Config/consent writers therefore cannot create a
+/// hidden committed turn whose stale result is refused only at IPC serialization.
+#[allow(clippy::too_many_arguments)]
+fn finish_persisted_ask_send_after_await(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    scope: &AskConversationScope,
+    conversation_id: Option<&str>,
+    resume_cursor: Option<crate::storage::ask_conversation_store::AskConversationCursor>,
+    question: &str,
+    answer: String,
+    selected_sources: &[SourceRef],
+    assistant_sources: Vec<crate::storage::models::VaultSource>,
+    assistant_citations: Vec<String>,
+    dependency_folders: &[String],
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+) -> Result<Response, AppError> {
+    finish_persisted_ask_send_after_await_core(
+        state,
+        snapshot,
+        ask_dispatch,
+        scope,
+        conversation_id,
+        resume_cursor,
+        question,
+        answer,
+        selected_sources,
+        assistant_sources,
+        assistant_citations,
+        dependency_folders,
+        dashboard,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_persisted_ask_send_after_await_core(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    scope: &AskConversationScope,
+    conversation_id: Option<&str>,
+    resume_cursor: Option<crate::storage::ask_conversation_store::AskConversationCursor>,
+    question: &str,
+    answer: String,
+    selected_sources: &[SourceRef],
+    assistant_sources: Vec<crate::storage::models::VaultSource>,
+    assistant_citations: Vec<String>,
+    dependency_folders: &[String],
+    dashboard: Option<&crate::commands::dashboards::DashboardContextWitness>,
+    after_commit: impl FnOnce(),
+) -> Result<Response, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let committed = persist_ask_exchange_under_lifecycle(
+        state,
+        snapshot,
+        ask_dispatch,
+        scope,
+        conversation_id,
+        resume_cursor,
+        question,
+        &answer,
+        selected_sources,
+        &assistant_sources,
+        &assistant_citations,
+        dependency_folders,
+        dashboard,
+    )?;
+    after_commit();
+    let payload = AskConversationSendResult {
+        conversation_id: committed.conversation_id,
+        user_message_id: committed.user_message_id,
+        assistant_message_id: committed.assistant_message_id,
+        answer: answer.trim().to_string(),
+        sources: assistant_sources,
+        citations: assistant_citations,
+    };
+    serde_json::to_string(&payload)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("conversation response encoding failed".into()))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_persisted_ask_send_after_await_with_hook(
+    state: &AppState,
+    snapshot: &DurableScopeSnapshot,
+    ask_dispatch: &AskDispatchSnapshot,
+    scope: &AskConversationScope,
+    question: &str,
+    answer: String,
+    after_commit: impl FnOnce(),
+) -> Result<Response, AppError> {
+    finish_persisted_ask_send_after_await_core(
+        state,
+        snapshot,
+        ask_dispatch,
+        scope,
+        None,
+        None,
+        question,
+        answer,
+        &[],
+        Vec::new(),
+        Vec::new(),
+        &[],
+        None,
+        after_commit,
     )
 }
 
@@ -192,19 +476,122 @@ fn normalized_sources_for_scope(
     }
 }
 
+fn resolve_conversation_dashboard_id(
+    continuing: bool,
+    requested: Option<&str>,
+    persisted: Option<String>,
+) -> Result<Option<String>, AppError> {
+    let requested = requested
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if !continuing {
+        return Ok(requested);
+    }
+    if requested.is_some() && requested != persisted {
+        return Err(AppError::InvalidArg(
+            "conversation dashboard scope cannot be changed".into(),
+        ));
+    }
+    Ok(persisted)
+}
+
+pub(crate) fn require_persisted_dashboard_provenance_under_lifecycle(
+    state: &AppState,
+    scope: &AskConversationScope,
+    provenance: &crate::storage::ask_conversation_store::AskDashboardProvenance,
+    config: &AppConfig,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    let ask_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
+            .connection;
+    let excluded_meeting = match scope {
+        AskConversationScope::Meeting { ref_id } => Some(ref_id.as_str()),
+        AskConversationScope::Vault | AskConversationScope::Note { .. } => None,
+    };
+    let budget = excluded_meeting.map_or_else(
+        || crate::summarize::vault_context::budget_for(&ask_conn),
+        |_| {
+            crate::summarize::vault_context::budget_for(&ask_conn)
+                .min(crate::summarize::chat::MAX_PINNED_SOURCE_CHARS)
+        },
+    );
+    let current = crate::commands::dashboards::dashboard_composite_context(
+        &state.db,
+        &provenance.dashboard_id,
+        unlocked,
+        budget,
+        &provenance.selected_sources,
+        excluded_meeting,
+    )?;
+    let (_, exists_now) = state.db.dashboard_context_state(&provenance.dashboard_id)?;
+    if !exists_now
+        || current.witness.generation != provenance.generation
+        || current.witness.input_digest != provenance.input_digest
+    {
+        return Err(AppError::Locked("conversation is unavailable".into()));
+    }
+    Ok(())
+}
+
 /// Bounded, exact-scope, newest-first list. Unknown and invisible scopes both return an empty list.
 #[tauri::command]
 pub fn list_ask_conversations(
     state: State<'_, AppState>,
     scope: AskConversationScope,
-) -> Result<Vec<AskConversationSummary>, AppError> {
-    let _lifecycle = lifecycle_guard(state.inner());
-    let unlocked = unlocked_snapshot(state.inner())?;
-    match capture_durable_scope_under_lifecycle(state.inner(), &scope) {
-        Ok(_) => state.db.list_ask_conversations(&scope, &unlocked),
-        Err(AppError::Locked(_) | AppError::InvalidArg(_)) => Ok(Vec::new()),
-        Err(error) => Err(error),
-    }
+) -> Result<Response, AppError> {
+    list_ask_conversations_inner(state.inner(), &scope)
+}
+
+pub(crate) fn list_ask_conversations_inner(
+    state: &AppState,
+    scope: &AskConversationScope,
+) -> Result<Response, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let unlocked = unlocked_snapshot(state)?;
+    let visible = match capture_durable_scope_under_lifecycle(state, scope) {
+        Ok(_) => {
+            let ids = state.db.list_ask_conversation_ids(scope, &unlocked)?;
+            let mut visible = Vec::new();
+            for id in ids {
+                let Some(preflight) = state
+                    .db
+                    .ask_conversation_preflight(scope, &id, &unlocked)?
+                else {
+                    continue;
+                };
+                if preflight.dashboard.as_ref().map_or(true, |provenance| {
+                    require_persisted_dashboard_provenance_under_lifecycle(
+                        state,
+                        scope,
+                        provenance,
+                        &config,
+                        &unlocked,
+                    )
+                    .is_ok()
+                }) {
+                    if let Some(summary) = state
+                        .db
+                        .ask_conversation_summary_after_preflight(scope, &id)?
+                    {
+                        visible.push(summary);
+                    }
+                }
+            }
+            visible
+        }
+        Err(AppError::Locked(_) | AppError::InvalidArg(_)) => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    serde_json::to_string(&visible)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("conversation response encoding failed".into()))
 }
 
 /// Bounded exact-scope load. Unknown, wrong-scope and invisible IDs deliberately share one error.
@@ -213,24 +600,53 @@ pub fn load_ask_conversation(
     state: State<'_, AppState>,
     scope: AskConversationScope,
     conversation_id: String,
-) -> Result<AskConversation, AppError> {
-    let _lifecycle = lifecycle_guard(state.inner());
-    let unlocked = unlocked_snapshot(state.inner())?;
-    match capture_durable_scope_under_lifecycle(state.inner(), &scope) {
+) -> Result<Response, AppError> {
+    load_ask_conversation_inner(state.inner(), &scope, &conversation_id)
+}
+
+pub(crate) fn load_ask_conversation_inner(
+    state: &AppState,
+    scope: &AskConversationScope,
+    conversation_id: &str,
+) -> Result<Response, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let unlocked = unlocked_snapshot(state)?;
+    match capture_durable_scope_under_lifecycle(state, scope) {
         Ok(_) => {}
         Err(AppError::Locked(_) | AppError::InvalidArg(_)) => {
             return Err(AppError::Locked("conversation is unavailable".into()));
         }
         Err(error) => return Err(error),
     }
-    state
+    let preflight = state
         .db
-        .load_ask_conversation(&scope, &conversation_id, &unlocked)?
-        .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))
+        .ask_conversation_preflight(scope, conversation_id, &unlocked)?
+        .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))?;
+    if let Some(provenance) = preflight.dashboard.as_ref() {
+        require_persisted_dashboard_provenance_under_lifecycle(
+            state,
+            scope,
+            provenance,
+            &config,
+            &unlocked,
+        )?;
+    }
+    let payload = state
+        .db
+        .load_ask_conversation(scope, conversation_id, &unlocked)?
+        .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))?;
+    serde_json::to_string(&payload)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("conversation response encoding failed".into()))
 }
 
-/// Durable top-level/note Ask. The scope is restricted to vault or authored note; org and dashboard
-/// stay on the legacy stateless command. Canonical history comes from SQLite, never the WebView.
+/// Durable top-level/note Ask. Canonical history and optional dashboard provenance come from
+/// SQLite, never the WebView.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn ask_vault_persisted(
@@ -241,7 +657,8 @@ pub async fn ask_vault_persisted(
     conversation_id: Option<String>,
     ask_trace_id: Option<String>,
     explicit_sources: Option<Vec<SourceRef>>,
-) -> Result<AskConversationSendResult, AppError> {
+    dashboard_id: Option<String>,
+) -> Result<Response, AppError> {
     if !matches!(
         scope,
         AskConversationScope::Vault | AskConversationScope::Note { .. }
@@ -253,27 +670,109 @@ pub async fn ask_vault_persisted(
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
-    let (snapshot, history, resume_cursor, dependency_folders) = {
-        let _lifecycle = lifecycle_guard(state.inner());
-        let unlocked = unlocked_snapshot(state.inner())?;
-        let snapshot = capture_durable_scope_under_lifecycle(state.inner(), &scope)?;
-        let (history, resume_cursor) = match conversation_id.as_deref() {
-            Some(id) => {
-                let context = state
-                    .db
-                    .ask_conversation_context(&scope, id, &unlocked)?
-                    .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))?;
-                (context.turns, Some(context.cursor))
-            }
-            None => (Vec::new(), None),
-        };
-        let dependencies = state.db.visible_folder_ids(&unlocked)?;
-        (snapshot, history, resume_cursor, dependencies)
-    };
     // An authored-note conversation must be grounded in that exact note. Do not trust the WebView
     // to remember the anchor: inject it backend-side when absent, while preserving any additional
     // user-selected sources.
-    let explicit_sources = normalized_sources_for_scope(&scope, explicit_sources)?;
+    let mut explicit_sources = normalized_sources_for_scope(&scope, explicit_sources)?;
+    let (
+        snapshot,
+        history,
+        resume_cursor,
+        dependency_folders,
+        dashboard_id,
+        canonical_sources,
+        dashboard_witness,
+        ask_dispatch,
+    ) = {
+        let _lifecycle = lifecycle_guard(state.inner());
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
+        let unlocked = unlocked_snapshot(state.inner())?;
+        let ask_dispatch =
+            capture_ask_dispatch_snapshot_under_lifecycle(state.inner(), &config)?;
+        let snapshot = capture_durable_scope_under_lifecycle(state.inner(), &scope)?;
+        let (history, resume_cursor, persisted_dashboard_id, canonical_sources) =
+            match conversation_id.as_deref() {
+                Some(id) => {
+                    let preflight = state
+                        .db
+                        .ask_conversation_preflight(&scope, id, &unlocked)?
+                        .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))?;
+                    if preflight.ask_dispatch_generation != ask_dispatch.generation {
+                        return Err(AppError::Locked("conversation is unavailable".into()));
+                    }
+                    let canonical_sources = preflight
+                        .dashboard
+                        .as_ref()
+                        .map(|provenance| provenance.selected_sources.clone());
+                    if let Some(provenance) = preflight.dashboard.as_ref() {
+                        require_persisted_dashboard_provenance_under_lifecycle(
+                            state.inner(),
+                            &scope,
+                            provenance,
+                            &config,
+                            &unlocked,
+                        )?;
+                    }
+                    let context = state
+                        .db
+                        .ask_conversation_context_after_preflight(id, preflight)?;
+                    (
+                        context.turns,
+                        Some(context.cursor),
+                        context.dashboard.map(|dashboard| dashboard.dashboard_id),
+                        canonical_sources,
+                    )
+                }
+                None => (Vec::new(), None, None, None),
+            };
+        let dashboard_id = resolve_conversation_dashboard_id(
+            conversation_id.is_some(),
+            dashboard_id.as_deref(),
+            persisted_dashboard_id,
+        )?;
+        let sources_for_witness = canonical_sources
+            .as_deref()
+            .or(explicit_sources.as_deref())
+            .unwrap_or_default();
+        let dashboard_witness = if let Some(id) = dashboard_id.as_deref() {
+            let ask_conn = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                &config,
+            )
+            .connection;
+            Some(
+                crate::commands::dashboards::dashboard_composite_context(
+                    &state.db,
+                    id,
+                    &unlocked,
+                    crate::summarize::vault_context::budget_for(&ask_conn),
+                    sources_for_witness,
+                    None,
+                )?
+                .witness,
+            )
+        } else {
+            None
+        };
+        let dependencies = state.db.visible_folder_ids(&unlocked)?;
+        (
+            snapshot,
+            history,
+            resume_cursor,
+            dependencies,
+            dashboard_id,
+            canonical_sources,
+            dashboard_witness,
+            ask_dispatch,
+        )
+    };
+    if let Some(canonical_sources) = canonical_sources {
+        explicit_sources = (!canonical_sources.is_empty()).then_some(canonical_sources);
+    }
     let selected_sources = explicit_sources.clone().unwrap_or_default();
     let result = ask_vault_inner(
         &app,
@@ -283,31 +782,27 @@ pub async fn ask_vault_persisted(
         ask_trace_id,
         explicit_sources,
         None,
-        None,
+        dashboard_id.clone(),
         Some(snapshot.clone()),
+        dashboard_witness.clone(),
+        Some(ask_dispatch.clone()),
     )
     .await?;
-    let committed = persist_ask_exchange_after_await(
+    finish_persisted_ask_send_after_await(
         state.inner(),
         &snapshot,
+        &ask_dispatch,
         &scope,
         conversation_id.as_deref(),
         resume_cursor,
         &question,
-        &result.answer,
+        result.answer,
         &selected_sources,
-        &result.sources,
-        &result.citations,
+        result.sources,
+        result.citations,
         &dependency_folders,
-    )?;
-    Ok(AskConversationSendResult {
-        conversation_id: committed.conversation_id,
-        user_message_id: committed.user_message_id,
-        assistant_message_id: committed.assistant_message_id,
-        answer: result.answer,
-        sources: result.sources,
-        citations: result.citations,
-    })
+        dashboard_witness.as_ref(),
+    )
 }
 
 /// Durable exact-meeting Ask. Canonical history is loaded from SQLite and the successful answer is
@@ -320,30 +815,116 @@ pub async fn chat_meeting_persisted(
     question: String,
     conversation_id: Option<String>,
     explicit_sources: Option<Vec<SourceRef>>,
-) -> Result<AskConversationSendResult, AppError> {
+    dashboard_id: Option<String>,
+) -> Result<Response, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
     let scope = AskConversationScope::Meeting {
         ref_id: meeting_id.clone(),
     };
-    let (snapshot, history, resume_cursor, dependency_folders) = {
+    let mut explicit_sources = explicit_sources;
+    let (
+        snapshot,
+        history,
+        resume_cursor,
+        dependency_folders,
+        dashboard_id,
+        canonical_sources,
+        dashboard_witness,
+        ask_dispatch,
+    ) = {
         let _lifecycle = lifecycle_guard(state.inner());
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone();
         let unlocked = unlocked_snapshot(state.inner())?;
+        let ask_dispatch =
+            capture_ask_dispatch_snapshot_under_lifecycle(state.inner(), &config)?;
         let snapshot = capture_durable_scope_under_lifecycle(state.inner(), &scope)?;
-        let (history, resume_cursor) = match conversation_id.as_deref() {
-            Some(id) => {
-                let context = state
-                    .db
-                    .ask_conversation_context(&scope, id, &unlocked)?
-                    .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))?;
-                (context.turns, Some(context.cursor))
-            }
-            None => (Vec::new(), None),
+        let (history, resume_cursor, persisted_dashboard_id, canonical_sources) =
+            match conversation_id.as_deref() {
+                Some(id) => {
+                    let preflight = state
+                        .db
+                        .ask_conversation_preflight(&scope, id, &unlocked)?
+                        .ok_or_else(|| AppError::Locked("conversation is unavailable".into()))?;
+                    if preflight.ask_dispatch_generation != ask_dispatch.generation {
+                        return Err(AppError::Locked("conversation is unavailable".into()));
+                    }
+                    let canonical_sources = preflight
+                        .dashboard
+                        .as_ref()
+                        .map(|provenance| provenance.selected_sources.clone());
+                    if let Some(provenance) = preflight.dashboard.as_ref() {
+                        require_persisted_dashboard_provenance_under_lifecycle(
+                            state.inner(),
+                            &scope,
+                            provenance,
+                            &config,
+                            &unlocked,
+                        )?;
+                    }
+                    let context = state
+                        .db
+                        .ask_conversation_context_after_preflight(id, preflight)?;
+                    (
+                        context.turns,
+                        Some(context.cursor),
+                        context.dashboard.map(|dashboard| dashboard.dashboard_id),
+                        canonical_sources,
+                    )
+                }
+                None => (Vec::new(), None, None, None),
+            };
+        let dashboard_id = resolve_conversation_dashboard_id(
+            conversation_id.is_some(),
+            dashboard_id.as_deref(),
+            persisted_dashboard_id,
+        )?;
+        let sources_for_witness = canonical_sources
+            .as_deref()
+            .or(explicit_sources.as_deref())
+            .unwrap_or_default();
+        let dashboard_witness = if let Some(id) = dashboard_id.as_deref() {
+            let ask_conn = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                &config,
+            )
+            .connection;
+            let budget = crate::summarize::vault_context::budget_for(&ask_conn)
+                .min(crate::summarize::chat::MAX_PINNED_SOURCE_CHARS);
+            Some(
+                crate::commands::dashboards::dashboard_composite_context(
+                    &state.db,
+                    id,
+                    &unlocked,
+                    budget,
+                    sources_for_witness,
+                    Some(&meeting_id),
+                )?
+                .witness,
+            )
+        } else {
+            None
         };
         let dependencies = state.db.visible_folder_ids(&unlocked)?;
-        (snapshot, history, resume_cursor, dependencies)
+        (
+            snapshot,
+            history,
+            resume_cursor,
+            dependencies,
+            dashboard_id,
+            canonical_sources,
+            dashboard_witness,
+            ask_dispatch,
+        )
     };
+    if let Some(canonical_sources) = canonical_sources {
+        explicit_sources = (!canonical_sources.is_empty()).then_some(canonical_sources);
+    }
     let selected_sources = explicit_sources.clone().unwrap_or_default();
     let meeting_snapshot = match &snapshot {
         DurableScopeSnapshot::Meeting { snapshot, .. } => snapshot.clone(),
@@ -360,30 +941,27 @@ pub async fn chat_meeting_persisted(
         question.clone(),
         history,
         explicit_sources,
+        dashboard_id,
         Some(meeting_snapshot),
+        dashboard_witness.clone(),
+        Some(ask_dispatch.clone()),
     )
     .await?;
-    let committed = persist_ask_exchange_after_await(
+    finish_persisted_ask_send_after_await(
         state.inner(),
         &snapshot,
+        &ask_dispatch,
         &scope,
         conversation_id.as_deref(),
         resume_cursor,
         &question,
-        &answer,
-        &selected_sources,
-        &[],
-        &[],
-        &dependency_folders,
-    )?;
-    Ok(AskConversationSendResult {
-        conversation_id: committed.conversation_id,
-        user_message_id: committed.user_message_id,
-        assistant_message_id: committed.assistant_message_id,
         answer,
-        sources: Vec::new(),
-        citations: Vec::new(),
-    })
+        &selected_sources,
+        Vec::new(),
+        Vec::new(),
+        &dependency_folders,
+        dashboard_witness.as_ref(),
+    )
 }
 
 #[cfg(test)]
@@ -404,6 +982,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(sources.len(), 1, "anchor must not duplicate on resume");
+    }
+
+    #[test]
+    fn continuation_keeps_dashboard_identity_and_rejects_scope_switch() {
+        assert_eq!(
+            resolve_conversation_dashboard_id(true, None, Some("board-a".into())).unwrap(),
+            Some("board-a".into())
+        );
+        assert_eq!(
+            resolve_conversation_dashboard_id(true, Some("board-a"), Some("board-a".into()),)
+                .unwrap(),
+            Some("board-a".into())
+        );
+        assert!(matches!(
+            resolve_conversation_dashboard_id(true, Some("board-b"), Some("board-a".into()),),
+            Err(AppError::InvalidArg(_))
+        ));
     }
 
     #[test]

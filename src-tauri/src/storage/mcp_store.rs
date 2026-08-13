@@ -97,6 +97,36 @@ impl Db {
         Ok(())
     }
 
+    /// Remove a server and rotate Ask authorization in the same transaction only when the server
+    /// was consented (and therefore part of the effective durable-Ask tool surface).
+    pub(crate) fn delete_mcp_server_for_ask(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let consented = tx
+            .query_row("SELECT consented FROM mcp_servers WHERE id=?1", [id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()
+            .map_err(map_err)?
+            == Some(1);
+        tx.execute("DELETE FROM mcp_servers WHERE id=?1", [id])
+            .map_err(map_err)?;
+        if consented {
+            let rotated = tx.execute(
+                "UPDATE ask_dispatch_state SET generation=generation+1 WHERE singleton=1
+                   AND typeof(generation)='integer' AND generation>=0 AND generation<9223372036854775807",
+                [],
+            )
+            .map_err(map_err)?;
+            if rotated != 1 {
+                return Err(AppError::Storage(
+                    "Ask dispatch generation is unavailable".into(),
+                ));
+            }
+        }
+        tx.commit().map_err(map_err)
+    }
+
     /// Flip one MCP server's per-server egress consent (the ONLY writer of `consented`).
     pub fn set_mcp_server_consented(&self, id: &str, consented: bool) -> Result<()> {
         let conn = self.lock();
@@ -106,6 +136,37 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Flip MCP consent and rotate Ask authorization atomically. Idempotent writes do neither.
+    pub(crate) fn set_mcp_server_consented_for_ask(
+        &self,
+        id: &str,
+        consented: bool,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx
+            .execute(
+                "UPDATE mcp_servers SET consented=?2 WHERE id=?1 AND consented<>?2",
+                rusqlite::params![id, consented as i64],
+            )
+            .map_err(map_err)?;
+        if changed == 1 {
+            let rotated = tx.execute(
+                "UPDATE ask_dispatch_state SET generation=generation+1 WHERE singleton=1
+                   AND typeof(generation)='integer' AND generation>=0 AND generation<9223372036854775807",
+                [],
+            )
+            .map_err(map_err)?;
+            if rotated != 1 {
+                return Err(AppError::Storage(
+                    "Ask dispatch generation is unavailable".into(),
+                ));
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(changed == 1)
     }
 }
 

@@ -2607,7 +2607,7 @@ async fn summarize_and_export(
     let Some(vault_path) = config.vault_path.as_deref().filter(|p| !p.is_empty()) else {
         // Title the meeting so the library/detail view shows it (same title we'd derive on export).
         let title =
-            finalize_note_without_vault(&state.db, meeting_id, classification.as_str(), date_iso)?;
+            finalize_note_without_vault(state, meeting_id, classification.as_str(), date_iso)?;
         emit_status(
             app,
             "saved",
@@ -2646,7 +2646,7 @@ async fn summarize_and_export(
     // `meeting_locked` decision was read under the SAME lifecycle guard as the persist (W4).
     if meeting_locked {
         let title =
-            finalize_note_without_vault(&state.db, meeting_id, classification.as_str(), date_iso)?;
+            finalize_note_without_vault(state, meeting_id, classification.as_str(), date_iso)?;
         emit_status(
             app,
             "saved",
@@ -2773,7 +2773,7 @@ async fn summarize_and_export(
         // is written (the note is already durably sealed in the DB by that lock). Finish exactly
         // like the meeting-locked path above.
         let title =
-            finalize_note_without_vault(&state.db, meeting_id, classification.as_str(), date_iso)?;
+            finalize_note_without_vault(state, meeting_id, classification.as_str(), date_iso)?;
         emit_status(
             app,
             "saved",
@@ -2892,15 +2892,21 @@ fn persist_note_exported_path(
 /// from the note so the library/detail view shows it. The Obsidian vault is EXPORT-ONLY, so the
 /// no-vault path is a SUCCESS — it NEVER builds an `Export` error. Returns the derived title (for
 /// the graph-entity step). DB-only (no `AppHandle`/provider) so the no-vault contract is
-/// unit-testable in isolation.
+/// unit-testable in isolation. The title is part of the exact dashboard corpus witness, so the
+/// short canonical write shares the lifecycle barrier with dashboard-history authorization and
+/// hydration. Title derivation stays outside the critical section; the guard covers only the DB
+/// mutation and is never held over provider, graph, embedding, or filesystem work.
 fn finalize_note_without_vault(
-    db: &crate::storage::Db,
+    state: &AppState,
     meeting_id: &str,
     markdown: &str,
     date_iso: &str,
 ) -> Result<String> {
     let title = derive_title(markdown, date_iso);
-    db.set_meeting_title(meeting_id, &title)?;
+    {
+        let _lifecycle = crate::commands::lifecycle_guard(state);
+        state.db.set_meeting_title(meeting_id, &title)?;
+    }
     Ok(title)
 }
 
@@ -4568,7 +4574,7 @@ mod tests {
 
     /// The no-vault branch of `summarize_and_export`: with no vault configured the note is saved
     /// to the canonical DB (markdown + `exported_path = None`) and the meeting finishes in the
-    /// terminal `Summarized` state — NOT `Error`. We exercise the real DB-only tail
+    /// terminal `Summarized` state — NOT `Error`. We exercise the real state-backed tail
     /// (`finalize_note_without_vault`) plus the pre-branch writes `summarize_and_export` performs
     /// before it (the provider call + `AppHandle` emit are not unit-testable, so they're excluded;
     /// everything that determines success-vs-error and what lands in the DB is covered here).
@@ -4576,7 +4582,8 @@ mod tests {
     fn finalize_note_without_vault_saves_note_summarized_not_error() {
         use crate::storage::models::Meeting;
 
-        let db = crate::storage::Db::open_with_key(&temp_db_path("no-vault"), TEST_DEK).unwrap();
+        let state = AppState::init_at(&temp_db_path("no-vault"), TEST_DEK).unwrap();
+        let db = &state.db;
         let mid = "m-no-vault";
 
         // A freshly recorded meeting, mid-pipeline (still Recording, untitled).
@@ -4610,7 +4617,7 @@ mod tests {
         .unwrap();
 
         // The no-vault tail: titles the meeting and returns Ok (never the Export error).
-        let title = finalize_note_without_vault(&db, mid, markdown, "2026-06-27").unwrap();
+        let title = finalize_note_without_vault(&state, mid, markdown, "2026-06-27").unwrap();
         assert_eq!(title, "Q3 Planning");
 
         // Note is saved to the canonical DB with NO export path.
@@ -4633,6 +4640,69 @@ mod tests {
             "no-vault recording must finish Summarized, never Error"
         );
         assert_ne!(meeting.status, MeetingStatus::Error);
+    }
+
+    /// Exact dashboard-history provenance includes the meeting title. A no-vault pipeline finish
+    /// must therefore wait for the same lifecycle interval that authorizes and hydrates a durable
+    /// dashboard conversation: while the interval is held, neither the title write nor its return
+    /// can complete; after release, the canonical title lands exactly once.
+    #[test]
+    fn finalize_note_without_vault_title_waits_for_lifecycle_authorization() {
+        use crate::storage::models::Meeting;
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let state = Arc::new(
+            AppState::init_at(&temp_db_path("no-vault-title-lifecycle"), TEST_DEK).unwrap(),
+        );
+        let mid = "m-no-vault-title-lifecycle";
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: mid.to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: Some("2026-06-27T09:10:00Z".to_string()),
+                title: None,
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let lifecycle = crate::commands::lifecycle_guard(state.as_ref());
+        let worker_state = Arc::clone(&state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = finalize_note_without_vault(
+                worker_state.as_ref(),
+                mid,
+                "---\ntitle: Authorized title\n---\nBody.",
+                "2026-06-27",
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the title mutation must remain blocked inside an active history lifecycle interval"
+        );
+        assert_eq!(
+            state.db.get_meeting(mid).unwrap().unwrap().title,
+            None,
+            "no title may land before the lifecycle interval is released"
+        );
+
+        drop(lifecycle);
+        assert_eq!(done_rx.recv().unwrap().unwrap(), "Authorized title");
+        worker.join().unwrap();
+        assert_eq!(
+            state.db.get_meeting(mid).unwrap().unwrap().title.as_deref(),
+            Some("Authorized title")
+        );
     }
 
     /// brain2 realtime notes: `fold_manual_notes` appends a `## My notes` section with the typed

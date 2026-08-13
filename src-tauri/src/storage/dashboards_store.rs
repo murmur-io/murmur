@@ -2,12 +2,14 @@
 //!
 //! A dashboard is a user-composed board of TILES over sources that already exist elsewhere in the
 //! vault (a meeting, a note, a document, an entity, or a derived view like the fact-drift lane).
-//! The tables here therefore store **pointers and layout, never content**: `dashboard_tiles` keeps a
-//! `kind` + an optional `ref_id` + cosmetic layout, and every tile READ resolves through the
-//! existing gated readers (`visibility_clause` / `meeting_is_unlocked`) at read time.
+//! Most rows therefore store pointers + layout. The one deliberate content cache is a
+//! `living_answer`: dedicated columns hold the backend-generated answer plus exact structural,
+//! corpus and readable-folder provenance; the command layer validates that provenance before it
+//! hydrates a single content column.
 //!
 //! ## Lock model (see `.claude/rules/lock-model.md`)
-//! * Nothing sealed is ever copied into these tables, so there is nothing here to seal or purge.
+//! * Living-answer text is a derived paraphrase, so it is withheld unless its backend-owned
+//!   folder stamp and exact excluded-Living corpus witness are still current.
 //! * A tile pointing at a sealed-and-not-session-unlocked source resolves to a MASKED tile at the
 //!   command layer — the board renders a redacted placeholder instead of leaking a title.
 //! * `ref_id` is intentionally NOT a foreign key: a deleted source must degrade the tile to
@@ -16,7 +18,7 @@
 //! The methods below are an inherent-impl split of [`crate::storage::db::Db`] across files, the
 //! same pattern the other `*_store.rs` modules use.
 
-use rusqlite::{OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, Transaction};
 
 use crate::error::{AppError, Result};
 use crate::storage::db::{map_err, Db};
@@ -46,6 +48,13 @@ pub const MAX_TILES_PER_BOARD: i64 = 60;
 /// Hard ceiling on boards, for the same reason.
 pub const MAX_DASHBOARDS: i64 = 200;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LivingAnswerContent {
+    pub(crate) question: String,
+    pub(crate) answer: Option<String>,
+    pub(crate) answered_at: Option<String>,
+}
+
 fn row_to_dashboard(row: &Row<'_>) -> rusqlite::Result<Dashboard> {
     Ok(Dashboard {
         id: row.get(0)?,
@@ -73,10 +82,46 @@ fn row_to_tile(row: &Row<'_>) -> rusqlite::Result<DashboardTile> {
     })
 }
 
-const DASHBOARD_COLS: &str =
-    "id, title, emoji, tint, pinned, position, created_at, updated_at";
-const TILE_COLS: &str =
-    "id, dashboard_id, kind, ref_id, title, span, position, config, created_at";
+const DASHBOARD_COLS: &str = "id, title, emoji, tint, pinned, position, created_at, updated_at";
+const TILE_COLS: &str = "id, dashboard_id, kind, ref_id, title, span, position, config, created_at";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LivingAnswerCacheState {
+    Empty,
+    Valid {
+        readable_folders_json: String,
+        context_generation: i64,
+        context_digest: String,
+        context_budget: i64,
+        ask_dispatch_generation: i64,
+    },
+    Malformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LivingAnswerPreflight {
+    pub(crate) question_readable_folders_json: Option<String>,
+    pub(crate) answer: LivingAnswerCacheState,
+}
+
+fn advance_context_generation(
+    tx: &Transaction<'_>,
+    dashboard_id: &str,
+    exists_now: bool,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO dashboard_context_state
+         (dashboard_id, generation, structural_generation, exists_now)
+         VALUES (?1, 1, 1, ?2)
+         ON CONFLICT(dashboard_id) DO UPDATE SET
+           generation = dashboard_context_state.generation + 1,
+           structural_generation = dashboard_context_state.structural_generation + 1,
+           exists_now = excluded.exists_now",
+        rusqlite::params![dashboard_id, i64::from(exists_now)],
+    )
+    .map_err(map_err)?;
+    Ok(())
+}
 
 impl Db {
     /// Every board, pinned first, then by explicit position, then newest-updated.
@@ -105,10 +150,39 @@ impl Db {
         Ok(out)
     }
 
+    /// Monotonic identity/lifecycle witness for one board. The state row survives deletion, so
+    /// delete→recreate and X→Y→X mutations cannot admit an answer built from stale board text.
+    pub(crate) fn dashboard_context_state(&self, id: &str) -> Result<(i64, bool)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT generation, exists_now FROM dashboard_context_state WHERE dashboard_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+        .map(|state| state.unwrap_or((0, false)))
+        .map_err(map_err)
+    }
+
+    pub(crate) fn dashboard_structural_context_state(&self, id: &str) -> Result<(i64, bool)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT structural_generation, exists_now
+               FROM dashboard_context_state WHERE dashboard_id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+        .map(|state| state.unwrap_or((0, false)))
+        .map_err(map_err)
+    }
+
     pub fn dashboard_count(&self) -> Result<i64> {
         let conn = self.lock();
         let n = conn
-            .query_row("SELECT COUNT(*) FROM dashboards", [], |r| r.get::<_, i64>(0))
+            .query_row("SELECT COUNT(*) FROM dashboards", [], |r| {
+                r.get::<_, i64>(0)
+            })
             .map_err(map_err)?;
         Ok(n)
     }
@@ -122,24 +196,29 @@ impl Db {
         tint: Option<&str>,
         now: &str,
     ) -> Result<()> {
-        let conn = self.lock();
-        let next: i64 = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let next: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM dashboards",
                 [],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?6)",
             rusqlite::params![id, title, emoji, tint, next, now],
         )
         .map_err(map_err)?;
+        advance_context_generation(&tx, id, true)?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
-    /// Patch a board's user-editable fields.
+    /// Patch board chrome only. Title/emoji/tint/pinned never enter the provider input, and durable
+    /// history intentionally resolves title/emoji live, so this does not advance context generation.
+    /// Tile/source/derived mutations below do advance it atomically with their content change.
     ///
     /// Three-state per nullable column, because plain `COALESCE(?, col)` can only ever SET a
     /// value — it makes "remove the emoji" unexpressible:
@@ -186,17 +265,19 @@ impl Db {
 
     /// Delete a board and (by cascade) its tiles. Returns false when the id was unknown.
     pub fn delete_dashboard(&self, id: &str) -> Result<bool> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
         // The FK cascade only fires with foreign_keys=ON; delete tiles explicitly so the row can
         // never be orphaned regardless of the connection pragma.
-        conn.execute(
-            "DELETE FROM dashboard_tiles WHERE dashboard_id = ?1",
-            [id],
-        )
-        .map_err(map_err)?;
-        let n = conn
+        tx.execute("DELETE FROM dashboard_tiles WHERE dashboard_id = ?1", [id])
+            .map_err(map_err)?;
+        let n = tx
             .execute("DELETE FROM dashboards WHERE id = ?1", [id])
             .map_err(map_err)?;
+        if n > 0 {
+            advance_context_generation(&tx, id, false)?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(n > 0)
     }
 
@@ -216,6 +297,358 @@ impl Db {
         Ok(rows)
     }
 
+    /// Structural board layout only. Source-derived `title`/`config` are deliberately NULL until
+    /// the command resolver authorizes the tile under the current lifecycle snapshot.
+    pub(crate) fn list_dashboard_tile_structures(
+        &self,
+        dashboard_id: &str,
+    ) -> Result<Vec<DashboardTile>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,dashboard_id,kind,ref_id,NULL,span,position,NULL,created_at
+                   FROM dashboard_tiles WHERE dashboard_id=?1
+                  ORDER BY position ASC,created_at ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([dashboard_id], row_to_tile)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Content-free Living-answer preflight. This reads only provenance and SQLite type tags;
+    /// question/answer text is hydrated by `dashboard_living_answer_content_after_preflight`
+    /// only after the command layer proves every stamped folder is readable.
+    pub(crate) fn dashboard_living_answer_preflight(
+        &self,
+        id: &str,
+    ) -> Result<Option<LivingAnswerPreflight>> {
+        self.lock()
+            .query_row(
+                "SELECT CASE WHEN typeof(question_readable_folders_json)='text'
+                             THEN question_readable_folders_json ELSE NULL END,
+                        typeof(living_answer),
+                        typeof(living_answered_at),
+                        CASE WHEN typeof(answer_readable_folders_json)='text'
+                             THEN answer_readable_folders_json ELSE NULL END,
+                        CASE WHEN typeof(living_answer_context_generation)='integer'
+                             THEN living_answer_context_generation ELSE NULL END,
+                        CASE WHEN typeof(living_answer_context_digest)='text'
+                             THEN living_answer_context_digest ELSE NULL END,
+                        CASE WHEN typeof(living_answer_context_budget)='integer'
+                             THEN living_answer_context_budget ELSE NULL END,
+                        CASE WHEN typeof(living_answer_ask_dispatch_generation)='integer'
+                             THEN living_answer_ask_dispatch_generation ELSE NULL END
+                   FROM dashboard_tiles WHERE id=?1 AND kind='living_answer'",
+                [id],
+                |row| {
+                    let question_readable_folders_json = row.get(0)?;
+                    let answer_type: String = row.get(1)?;
+                    let answered_at_type: String = row.get(2)?;
+                    let readable_folders_json: Option<String> = row.get(3)?;
+                    let context_generation: Option<i64> = row.get(4)?;
+                    let context_digest: Option<String> = row.get(5)?;
+                    let context_budget: Option<i64> = row.get(6)?;
+                    let ask_dispatch_generation: Option<i64> = row.get(7)?;
+                    let answer = if answer_type == "null"
+                        && answered_at_type == "null"
+                        && readable_folders_json.is_none()
+                        && context_generation.is_none()
+                        && context_digest.is_none()
+                        && context_budget.is_none()
+                        && ask_dispatch_generation.is_none()
+                    {
+                        LivingAnswerCacheState::Empty
+                    } else if answer_type == "text" && answered_at_type == "text" {
+                        match (
+                            readable_folders_json,
+                            context_generation,
+                            context_digest,
+                            context_budget,
+                            ask_dispatch_generation,
+                        ) {
+                            (
+                                Some(readable_folders_json),
+                                Some(context_generation),
+                                Some(context_digest),
+                                Some(context_budget),
+                                Some(ask_dispatch_generation),
+                            ) => {
+                                LivingAnswerCacheState::Valid {
+                                    readable_folders_json,
+                                    context_generation,
+                                    context_digest,
+                                    context_budget,
+                                    ask_dispatch_generation,
+                                }
+                            }
+                            _ => LivingAnswerCacheState::Malformed,
+                        }
+                    } else {
+                        LivingAnswerCacheState::Malformed
+                    };
+                    Ok(LivingAnswerPreflight {
+                        question_readable_folders_json,
+                        answer,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
+    pub(crate) fn dashboard_living_answer_content_after_preflight_with_dispatch(
+        &self,
+        id: &str,
+        expected_ask_dispatch_generation: i64,
+        expected_context_generation: i64,
+        expected_context_digest: &str,
+        expected_context_budget: i64,
+    ) -> Result<Option<LivingAnswerContent>> {
+        self.lock()
+            .query_row(
+                "SELECT tile.living_question,tile.living_answer,tile.living_answered_at
+                   FROM dashboard_tiles tile
+                   JOIN dashboard_context_state state ON state.dashboard_id=tile.dashboard_id
+                  WHERE tile.id=?1 AND tile.kind='living_answer'
+                    AND state.exists_now=1 AND state.structural_generation=?3
+                    AND tile.living_answer_context_generation=?3
+                    AND tile.living_answer_context_digest=?4
+                    AND tile.living_answer_context_budget=?5
+                    AND typeof(living_question)='text'
+                    AND living_answer_ask_dispatch_generation=?2
+                    AND typeof(living_answer_ask_dispatch_generation)='integer'
+                    AND living_answer_ask_dispatch_generation=
+                        (SELECT generation FROM ask_dispatch_state WHERE singleton=1
+                          AND typeof(generation)='integer' AND generation>=0)
+                    AND (living_answer IS NULL OR
+                         (typeof(living_answer)='text' AND
+                          typeof(living_answered_at)='text'))",
+                rusqlite::params![
+                    id,
+                    expected_ask_dispatch_generation,
+                    expected_context_generation,
+                    expected_context_digest,
+                    expected_context_budget,
+                ],
+                |row| {
+                    Ok(LivingAnswerContent {
+                        question: row.get(0)?,
+                        answer: row.get(1)?,
+                        answered_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_living_answer_content_after_preflight(
+        &self,
+        id: &str,
+    ) -> Result<Option<LivingAnswerContent>> {
+        let Some(preflight) = self.dashboard_living_answer_preflight(id)? else {
+            return Ok(None);
+        };
+        let LivingAnswerCacheState::Valid {
+            context_generation,
+            context_digest,
+            context_budget,
+            ask_dispatch_generation,
+            ..
+        } = preflight.answer
+        else {
+            return Ok(None);
+        };
+        self.dashboard_living_answer_content_after_preflight_with_dispatch(
+            id,
+            ask_dispatch_generation,
+            context_generation,
+            &context_digest,
+            context_budget,
+        )
+    }
+
+    pub(crate) fn dashboard_living_question_after_preflight(
+        &self,
+        id: &str,
+    ) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT living_question FROM dashboard_tiles
+                  WHERE id=?1 AND kind='living_answer' AND typeof(living_question)='text'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stamp_dashboard_question_provenance(
+        &self,
+        id: &str,
+        question: &str,
+        readable_folders_json: &str,
+    ) -> Result<()> {
+        self.lock()
+            .execute(
+                "UPDATE dashboard_tiles SET living_question=?2,question_readable_folders_json=?3
+                  WHERE id=?1",
+                rusqlite::params![id, question, readable_folders_json],
+            )
+            .map(|_| ())
+            .map_err(map_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_dashboard_living_answer_tile(
+        &self,
+        id: &str,
+        dashboard_id: &str,
+        span: i64,
+        question: &str,
+        readable_folders_json: &str,
+        now: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let next: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM dashboard_tiles WHERE dashboard_id=?1",
+                [dashboard_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO dashboard_tiles
+             (id,dashboard_id,kind,span,position,created_at,living_question,question_readable_folders_json)
+             VALUES (?1,?2,'living_answer',?3,?4,?5,?6,?7)",
+            rusqlite::params![id, dashboard_id, span.clamp(MIN_SPAN, MAX_SPAN), next, now, question, readable_folders_json],
+        )
+        .map_err(map_err)?;
+        advance_context_generation(&tx, dashboard_id, true)?;
+        tx.commit().map_err(map_err)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn store_dashboard_living_answer_cas_with_dispatch(
+        &self,
+        id: &str,
+        dashboard_id: &str,
+        expected_question: &str,
+        answer: &str,
+        answered_at: &str,
+        readable_folders_json: &str,
+        expected_generation: i64,
+        context_digest: &str,
+        context_budget: usize,
+        expected_ask_dispatch_generation: i64,
+    ) -> Result<bool> {
+        let context_budget = i64::try_from(context_budget)
+            .map_err(|_| AppError::InvalidArg("living-answer context budget is too large".into()))?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let current_ask_dispatch_generation = tx
+            .query_row(
+                "SELECT generation FROM ask_dispatch_state WHERE singleton=1
+                   AND typeof(generation)='integer' AND generation>=0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_err)?;
+        if current_ask_dispatch_generation != expected_ask_dispatch_generation {
+            return Ok(false);
+        }
+        let state = tx
+            .query_row(
+                "SELECT structural_generation,exists_now
+                   FROM dashboard_context_state WHERE dashboard_id=?1",
+                [dashboard_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if state != Some((expected_generation, true)) {
+            return Ok(false);
+        }
+        let committed_generation = expected_generation;
+        let changed = tx
+            .execute(
+                "UPDATE dashboard_tiles SET
+                   living_answer=?4,
+                   living_answered_at=?5,
+                   answer_readable_folders_json=?6,
+                   living_answer_context_generation=?7,
+                   living_answer_context_digest=?8,
+                   living_answer_context_budget=?9,
+                   living_answer_ask_dispatch_generation=?10
+                 WHERE id=?1 AND dashboard_id=?2 AND kind='living_answer'
+                   AND typeof(living_question)='text' AND living_question=?3",
+                rusqlite::params![
+                    id,
+                    dashboard_id,
+                    expected_question,
+                    answer,
+                    answered_at,
+                    readable_folders_json,
+                    committed_generation,
+                    context_digest,
+                    context_budget,
+                    expected_ask_dispatch_generation,
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE dashboard_context_state SET generation=generation+1
+              WHERE dashboard_id=?1 AND exists_now=1",
+            [dashboard_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE dashboards SET updated_at=?2 WHERE id=?1",
+            rusqlite::params![dashboard_id, answered_at],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn store_dashboard_living_answer_cas(
+        &self,
+        id: &str,
+        dashboard_id: &str,
+        expected_question: &str,
+        answer: &str,
+        answered_at: &str,
+        readable_folders_json: &str,
+        expected_generation: i64,
+        context_digest: &str,
+        context_budget: usize,
+    ) -> Result<bool> {
+        self.store_dashboard_living_answer_cas_with_dispatch(
+            id,
+            dashboard_id,
+            expected_question,
+            answer,
+            answered_at,
+            readable_folders_json,
+            expected_generation,
+            context_digest,
+            context_budget,
+            self.ask_dispatch_generation()?,
+        )
+    }
+
     /// The tile KINDS on every board, keyed by board id — the list view's miniature preview reads
     /// this instead of loading every tile's (gated) payload.
     pub fn dashboard_tile_kinds(&self) -> Result<Vec<(String, String, i64)>> {
@@ -228,7 +661,11 @@ impl Db {
             .map_err(map_err)?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -244,6 +681,19 @@ impl Db {
             .optional()
             .map_err(map_err)?;
         Ok(out)
+    }
+
+    /// Content-free mutation anchor. Callers that only need ownership/kind must never hydrate
+    /// `title` or `config`, which can retain source-derived text while the source is sealed.
+    pub fn dashboard_tile_metadata(&self, id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT dashboard_id, kind FROM dashboard_tiles WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(map_err)
     }
 
     pub fn dashboard_tile_count(&self, dashboard_id: &str) -> Result<i64> {
@@ -274,15 +724,16 @@ impl Db {
         if !TILE_KINDS.contains(&kind) {
             return Err(AppError::InvalidArg(format!("unknown tile kind: {kind}")));
         }
-        let conn = self.lock();
-        let next: i64 = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let next: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM dashboard_tiles WHERE dashboard_id = ?1",
                 [dashboard_id],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO dashboard_tiles
                (id, dashboard_id, kind, ref_id, title, span, position, config, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -299,6 +750,8 @@ impl Db {
             ],
         )
         .map_err(map_err)?;
+        advance_context_generation(&tx, dashboard_id, true)?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -311,8 +764,17 @@ impl Db {
         span: Option<i64>,
         config: Option<&str>,
     ) -> Result<bool> {
-        let conn = self.lock();
-        let n = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let dashboard_id = tx
+            .query_row(
+                "SELECT dashboard_id FROM dashboard_tiles WHERE id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let n = tx
             .execute(
                 "UPDATE dashboard_tiles
                     SET title  = CASE WHEN ?2 IS NULL THEN title
@@ -324,14 +786,35 @@ impl Db {
                 rusqlite::params![id, title, span.map(|s| s.clamp(MIN_SPAN, MAX_SPAN)), config],
             )
             .map_err(map_err)?;
+        if n > 0 {
+            if let Some(dashboard_id) = dashboard_id.as_deref() {
+                advance_context_generation(&tx, dashboard_id, true)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
         Ok(n > 0)
     }
 
     pub fn delete_dashboard_tile(&self, id: &str) -> Result<bool> {
-        let conn = self.lock();
-        let n = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let dashboard_id = tx
+            .query_row(
+                "SELECT dashboard_id FROM dashboard_tiles WHERE id=?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let n = tx
             .execute("DELETE FROM dashboard_tiles WHERE id = ?1", [id])
             .map_err(map_err)?;
+        if n > 0 {
+            if let Some(dashboard_id) = dashboard_id.as_deref() {
+                advance_context_generation(&tx, dashboard_id, true)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
         Ok(n > 0)
     }
 
@@ -344,14 +827,23 @@ impl Db {
     /// rows sharing a position — and the rendered order then depended on the secondary sort key
     /// rather than on what the user dragged.
     pub fn reorder_dashboard_tiles(&self, dashboard_id: &str, tile_ids: &[String]) -> Result<()> {
-        let existing: Vec<String> = self
-            .list_dashboard_tiles(dashboard_id)?
-            .into_iter()
-            .map(|t| t.id)
-            .collect();
-        let order = dense_order(tile_ids, &existing);
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let existing = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM dashboard_tiles WHERE dashboard_id=?1
+                     ORDER BY position ASC, created_at ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map([dashboard_id], |row| row.get::<_, String>(0))
+                .map_err(map_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?;
+            rows
+        };
+        let order = dense_order(tile_ids, &existing);
         for (i, tile_id) in order.iter().enumerate() {
             tx.execute(
                 "UPDATE dashboard_tiles SET position = ?3
@@ -359,6 +851,9 @@ impl Db {
                 rusqlite::params![tile_id, dashboard_id, i as i64],
             )
             .map_err(map_err)?;
+        }
+        if !order.is_empty() {
+            advance_context_generation(&tx, dashboard_id, true)?;
         }
         tx.commit().map_err(map_err)?;
         Ok(())
@@ -418,8 +913,7 @@ impl Db {
             _ => return Ok(false),
         };
         let conn = self.lock();
-        let sql =
-            format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1{kind_filter})");
+        let sql = format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?1{kind_filter})");
         let exists: i64 = conn.query_row(&sql, [id], |r| r.get(0)).map_err(map_err)?;
         Ok(exists != 0)
     }
@@ -427,11 +921,7 @@ impl Db {
     /// Reorder BOARDS themselves (drag in the list view). Same permutation discipline as
     /// [`Self::reorder_dashboard_tiles`].
     pub fn reorder_dashboards(&self, ids: &[String]) -> Result<()> {
-        let existing: Vec<String> = self
-            .list_dashboards()?
-            .into_iter()
-            .map(|d| d.id)
-            .collect();
+        let existing: Vec<String> = self.list_dashboards()?.into_iter().map(|d| d.id).collect();
         let order = dense_order(ids, &existing);
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;

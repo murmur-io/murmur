@@ -768,6 +768,31 @@ impl ReasonerCell {
         self.current_for_with_token(role, None)
     }
 
+    /// Resolve from an exact caller-captured config. Durable Ask uses this together with its
+    /// dispatch-generation admission so provider construction cannot silently switch to a newer
+    /// target between preflight and the first authorized poll.
+    pub(crate) fn current_for_config(
+        &self,
+        role: Role,
+        cfg: &AppConfig,
+    ) -> Arc<dyn LocalReasoner> {
+        #[cfg(test)]
+        if let Some(f) = &self.fixed {
+            return Arc::clone(f);
+        }
+        let target = roles::reasoner_target(role, cfg);
+        match target.connection.as_str() {
+            roles::CONN_OFF => Arc::new(StubReasoner),
+            roles::CONN_LOCAL => admit_reasoner(self.local_cached(cfg, &target), None),
+            roles::CONN_AFM => admit_reasoner(afm::afm_reasoner_arc(cfg), None),
+            _ => Arc::new(CloudReasoner::for_role(
+                Arc::new(Mutex::new(cfg.clone())),
+                role,
+                Arc::clone(&self.heavy),
+            )),
+        }
+    }
+
     /// Exact-session dispatch for an explicitly recording-owned inference segment. The token is
     /// retained by both the admitted local-model decorator and the redacted cloud provider; the
     /// stub remains model-free.
@@ -1629,7 +1654,7 @@ fn block_on_complete(
 }
 
 fn block_on_complete_admitted(
-    provider: &Arc<dyn SummarizerProvider>,
+    provider_factory: impl FnOnce() -> Result<Arc<dyn SummarizerProvider>> + Send,
     system: &str,
     user: &str,
     admission: &crate::state::ContentDispatchAdmission,
@@ -1643,7 +1668,10 @@ fn block_on_complete_admitted(
                     .map_err(|e| {
                         AppError::Summarize(format!("cloud reasoner: runtime build failed: {e}"))
                     })?;
-                rt.block_on(admission.run(|| provider.complete(system, user)))
+                rt.block_on(admission.run(|| async {
+                    let provider = provider_factory()?;
+                    provider.complete(system, user).await
+                }))
             })
             .join()
             .map_err(|_| AppError::Summarize("cloud reasoner: worker thread panicked".into()))?
@@ -1667,8 +1695,7 @@ impl LocalReasoner for CloudReasoner {
         user: &str,
         admission: &crate::state::ContentDispatchAdmission,
     ) -> Result<String> {
-        let provider = self.build_provider()?;
-        block_on_complete_admitted(&provider, system, user, admission)
+        block_on_complete_admitted(|| self.build_provider(), system, user, admission)
     }
 
     fn reason_with_admitted(

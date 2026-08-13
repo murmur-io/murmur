@@ -13,7 +13,7 @@ use std::borrow::Cow;
 
 use crate::error::{AppError, Result};
 use crate::reminder_audit::ReminderAuditCandidate;
-use crate::storage::db::{map_err, Db};
+use crate::storage::db::{map_err, visibility_clause, Db};
 use crate::storage::models::{
     ReminderDraft, ReminderOrigin, ReminderRepeatUnit, ReminderSourceAnchor, ReminderState,
     ReminderSuggestionGateAnchor, StoredReminder, StoredReminderOccurrence,
@@ -1168,6 +1168,58 @@ impl Db {
             reminder.sources = list_sources(&conn, &reminder.id)?;
         }
         Ok(reminders)
+    }
+
+    /// Dashboard/agent projection that authorizes every Smart-reminder anchor in SQL BEFORE
+    /// hydrating its title. Manual reminders with no anchors are user-authored and remain valid;
+    /// Smart reminders with no anchors, unknown kinds, deleted sources, or any sealed source fail
+    /// closed. The normal reminder writer still accepts only note/meeting anchors; the document
+    /// arm keeps imported/future rows on the same typed visibility gate instead of silently
+    /// dropping a readable source. Returns only the two fields the dashboard renders.
+    pub(crate) fn list_dashboard_reminders_visible(
+        &self,
+        unlocked: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock();
+        // `visibility_clause` deliberately uses the canonical `f` folder alias. Keep each
+        // correlated source subquery scoped to that alias instead of assuming its parameter
+        // rewrites the SQL identifier (it does not).
+        let folder_visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT r.title, r.due_at
+               FROM reminders r
+              WHERE r.state='active'
+                AND (r.origin='manual' OR EXISTS (
+                      SELECT 1 FROM reminder_sources present WHERE present.reminder_id=r.id))
+                AND NOT EXISTS (
+                  SELECT 1 FROM reminder_sources rs
+                   WHERE rs.reminder_id=r.id AND (
+                     (rs.source_kind='meeting' AND NOT EXISTS (
+                       SELECT 1 FROM meetings m WHERE m.id=rs.source_id AND (
+                         NOT EXISTS (SELECT 1 FROM notes any_n WHERE any_n.meeting_id=m.id)
+                         OR EXISTS (SELECT 1 FROM notes mn
+                           LEFT JOIN folders f ON f.id=mn.folder_id
+                          WHERE mn.meeting_id=m.id AND {folder_visible})
+                       )))
+                     OR (rs.source_kind='note' AND NOT EXISTS (
+                       SELECT 1 FROM documents d
+                       JOIN folders f ON f.id=d.folder_id
+                       WHERE d.id=rs.source_id AND d.kind='note' AND {folder_visible}))
+                     OR (rs.source_kind='document' AND NOT EXISTS (
+                       SELECT 1 FROM documents d
+                       JOIN folders f ON f.id=d.folder_id
+                       WHERE d.id=rs.source_id AND d.kind='document' AND {folder_visible}))
+                     OR rs.source_kind NOT IN ('meeting','note','document')
+                   ))
+              ORDER BY r.due_at ASC, r.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
     }
 
     pub fn get_stored_reminder(&self, id: &str) -> Result<Option<StoredReminder>> {

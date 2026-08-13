@@ -50,6 +50,93 @@ impl Db {
         Ok(())
     }
 
+    /// Current global Ask-dispatch authorization generation. Captured with the effective Ask
+    /// config under the process lifecycle mutex and compared again at every dispatch/read CAS.
+    pub(crate) fn ask_dispatch_generation(&self) -> Result<i64> {
+        self.lock()
+            .query_row(
+                "SELECT generation FROM ask_dispatch_state WHERE singleton=1
+                   AND typeof(generation)='integer' AND generation>=0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_err)
+    }
+
+    /// Advance the durable Ask-dispatch generation before a multi-row AppConfig save. A later
+    /// config-save failure may conservatively over-invalidate, but can never leave an old provider
+    /// authorization usable after a partially persisted change.
+    pub(crate) fn advance_ask_dispatch_generation(&self) -> Result<i64> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "UPDATE ask_dispatch_state SET generation=generation+1 WHERE singleton=1
+               AND typeof(generation)='integer' AND generation>=0 AND generation<9223372036854775807",
+            [],
+        )
+        .map_err(map_err)
+        .and_then(|changed| {
+            if changed == 1 {
+                Ok(changed)
+            } else {
+                Err(crate::error::AppError::Storage(
+                    "Ask dispatch generation is unavailable".into(),
+                ))
+            }
+        })?;
+        let generation = tx
+            .query_row(
+                "SELECT generation FROM ask_dispatch_state WHERE singleton=1
+                   AND typeof(generation)='integer' AND generation>=0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(generation)
+    }
+
+    /// Persist cloud consent and rotate Ask authorization atomically. Callers compare the cached
+    /// value first, so idempotent grant/revoke operations do not rotate the generation.
+    pub(crate) fn set_cloud_egress_consent_and_advance_ask_dispatch(
+        &self,
+        consented: bool,
+    ) -> Result<i64> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO settings(key,value) VALUES ('cloud_egress_consented',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if consented { "true" } else { "false" }],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE ask_dispatch_state SET generation=generation+1 WHERE singleton=1
+               AND typeof(generation)='integer' AND generation>=0 AND generation<9223372036854775807",
+            [],
+        )
+        .map_err(map_err)
+        .and_then(|changed| {
+            if changed == 1 {
+                Ok(changed)
+            } else {
+                Err(crate::error::AppError::Storage(
+                    "Ask dispatch generation is unavailable".into(),
+                ))
+            }
+        })?;
+        let generation = tx
+            .query_row(
+                "SELECT generation FROM ask_dispatch_state WHERE singleton=1
+                   AND typeof(generation)='integer' AND generation>=0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(generation)
+    }
+
     /// Persist the selected embedding-model id and, when its resolved model changed, invalidate
     /// every vector partition in the SAME transaction. Chunks + FTS stay intact, so retrieval
     /// degrades to keyword-only until the explicit/background reindex repopulates vectors.
@@ -76,6 +163,38 @@ impl Db {
         }
         tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// Ask-aware embedding-model switch: setting, vector invalidation and dispatch-generation
+    /// rotation commit atomically so retrieval can never resume with an old authorization.
+    pub(crate) fn set_embed_model_selection_for_ask(
+        &self,
+        model_id: &str,
+        invalidate_vectors: bool,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES ('embed_model_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![model_id],
+        )
+        .map_err(map_err)?;
+        if invalidate_vectors {
+            delete_all_vector_partitions(&tx)?;
+        }
+        let rotated = tx.execute(
+            "UPDATE ask_dispatch_state SET generation=generation+1 WHERE singleton=1
+               AND typeof(generation)='integer' AND generation>=0 AND generation<9223372036854775807",
+            [],
+        )
+        .map_err(map_err)?;
+        if rotated != 1 {
+            return Err(crate::error::AppError::Storage(
+                "Ask dispatch generation is unavailable".into(),
+            ));
+        }
+        tx.commit().map_err(map_err)
     }
 
     /// Clear every model-dependent vector partition in one transaction while preserving all
