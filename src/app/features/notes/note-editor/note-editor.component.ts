@@ -175,6 +175,9 @@ const NOTE_CHAT_OPEN_KEY = "murmur-note-chat-open";
 @Component({
   selector: "app-note-editor",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  host: {
+    "(document:pointerdown)": "onDocumentPointerDown($event)",
+  },
   imports: [
     ConnectionsComponent,
     LinkPickerComponent,
@@ -426,6 +429,9 @@ export class NoteEditorComponent {
   private linkPickerRepositionQueued = false;
   private readonly tagInput =
     viewChild<ElementRef<HTMLInputElement>>("tagInput");
+  private readonly selectionToolbar = viewChild(NoteSelectionToolbarComponent);
+  private readonly brainPopover = viewChild(NoteBrainPopoverComponent);
+  private readonly linkPicker = viewChild(LinkPickerComponent);
 
   /**
    * Monotonic request token — a late `getNote` reply for a superseded id is
@@ -752,6 +758,7 @@ export class NoteEditorComponent {
       if (!doc || key !== tabKeyFor("note", doc.id)) {
         return;
       }
+      this.onTabBackgrounded();
       void this.runNoteBoundaryWork();
     });
     this.destroyRef.onDestroy(unsubDetach);
@@ -2739,6 +2746,63 @@ export class NoteEditorComponent {
   /** Dismiss the Brain popover + the bubble (Close / Discard / after Accept). */
   closePopover(): void {
     this.clearSelection();
+  }
+
+  /**
+   * Dismiss editor-owned transient UI when a pointer interaction leaves the
+   * body textarea and its teleported overlays. Other note chrome (title,
+   * properties, header) is outside the selection's owning surface and must
+   * dismiss it too. The overlay boxes live under `<body>`, so they carry an
+   * explicit marker rather than relying on component-host containment.
+   */
+  onDocumentPointerDown(event: PointerEvent): void {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (
+      this.bodyArea()?.nativeElement === target ||
+      target.closest("[data-note-editor-overlay]")
+    ) {
+      return;
+    }
+
+    // A pointerdown runs before the target's click. Clear selection-owned UI
+    // immediately, but do not tear down the specific inline menu whose click
+    // still needs to run (otherwise Share / slash-menu actions disappear before
+    // Angular receives their click). Other open menus still close as click-away.
+    const insideHeaderMenu = target.closest(".head-crumb, .head-more") !== null;
+    const insideSlashMenu = target.closest(".slash-menu") !== null;
+    this.clearSelection();
+    this.closeLinkPicker();
+    if (!insideSlashMenu) {
+      this.slashOpen.set(false);
+    }
+    if (!insideHeaderMenu) {
+      this.closeMenus();
+    }
+  }
+
+  /**
+   * A cached note route is detached rather than destroyed on tab/navigation
+   * switches. Drop transient editor state explicitly so teleported boxes cannot
+   * remain visible over the newly-active route.
+   */
+  onTabBackgrounded(): void {
+    this.dismissTransientUi();
+  }
+
+  private dismissTransientUi(): void {
+    // A tab route is detached before its signal-driven template can reconcile.
+    // Remove any boxes already teleported to <body> synchronously; clearing the
+    // owning signals below keeps the cached view correct when it reattaches.
+    this.selectionToolbar()?.detachFromDocument();
+    this.brainPopover()?.detachFromDocument();
+    this.linkPicker()?.detachFromDocument();
+    this.clearSelection();
+    this.closeLinkPicker();
+    this.slashOpen.set(false);
+    this.closeMenus();
   }
 
   /** Drop the selection state (hides both the bubble and the Brain popover). */
