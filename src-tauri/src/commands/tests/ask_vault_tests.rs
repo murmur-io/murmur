@@ -63,6 +63,133 @@ fn seed_sealed(db: &Db, meeting_id: &str, folder_id: &str, title: &str) {
     seed_note(db, meeting_id, title, "", Some(folder_id));
 }
 
+struct PromptSpyProvider {
+    calls: std::sync::atomic::AtomicUsize,
+    systems: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::summarize::provider::SummarizerProvider for PromptSpyProvider {
+    fn id(&self) -> &str {
+        "prompt-spy"
+    }
+    async fn availability(&self) -> crate::summarize::provider::Availability {
+        crate::summarize::provider::Availability::Available
+    }
+    async fn summarize(
+        &self,
+        _request: &crate::summarize::provider::SummarizeRequest,
+    ) -> crate::error::Result<String> {
+        Ok(String::new())
+    }
+    async fn complete(&self, system: &str, _user: &str) -> crate::error::Result<String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.systems.lock().unwrap().push(system.to_string());
+        Ok("answer".into())
+    }
+}
+
+#[test]
+fn shipped_dashboard_provider_sink_omits_global_memory_and_mutation_refuses_before_call() {
+    let db = tmp_db();
+    seed_note(&db, "m1", "Board note", "BOARD MATERIAL", None);
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "t1",
+        "b1",
+        "meeting",
+        Some("m1"),
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:01Z",
+    )
+    .unwrap();
+    let context = crate::commands::dashboards::dashboard_composite_context(
+        &db,
+        "b1",
+        &HashSet::new(),
+        200_000,
+        &[],
+        None,
+    )
+    .unwrap();
+    // The global memory block must not exist at all on the shipped prepacked board provider seam.
+    let spy = std::sync::Arc::new(PromptSpyProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        systems: Mutex::new(Vec::new()),
+    });
+    let admission = crate::state::ContentDispatchAdmission::for_test(
+        std::sync::Arc::new(Mutex::new(())),
+        || Ok(()),
+    );
+    let out = block_on(ask_vault_prepacked_dashboard_dispatch(
+        &context,
+        "question",
+        &[],
+        admission,
+        {
+            let spy = spy.clone();
+            move || {
+                Ok(spy
+                    as std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>)
+            }
+        },
+    ))
+    .unwrap();
+    assert_eq!(out.answer, "answer");
+    let system = spy.systems.lock().unwrap().join("\n");
+    assert!(!system.contains("WHAT YOU KNOW ABOUT THE USER"));
+
+    let stale = context.witness.clone();
+    db.delete_dashboard_tile("t1").unwrap();
+    let db = std::sync::Arc::new(db);
+    let admission =
+        crate::state::ContentDispatchAdmission::for_test(std::sync::Arc::new(Mutex::new(())), {
+            let db = db.clone();
+            move || {
+                crate::commands::dashboards::require_dashboard_context_witness(
+                    &db,
+                    &stale,
+                    &HashSet::new(),
+                )
+            }
+        });
+    let before = spy.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let err = block_on(ask_vault_prepacked_dashboard_dispatch(
+        &context,
+        "question",
+        &[],
+        admission,
+        {
+            let spy = spy.clone();
+            move || {
+                Ok(spy
+                    as std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>)
+            }
+        },
+    ))
+    .unwrap_err();
+    assert!(matches!(err, AppError::Locked(_)));
+    assert_eq!(spy.calls.load(std::sync::atomic::Ordering::SeqCst), before);
+}
+
+#[test]
+fn stateless_dashboard_history_is_refused_before_any_provider_path() {
+    let history = vec![ChatTurn {
+        role: "assistant".into(),
+        content: "old secret".into(),
+    }];
+    assert!(require_backend_owned_dashboard_history(false, None, &history).is_ok());
+    assert!(matches!(
+        require_backend_owned_dashboard_history(false, Some("b1"), &history),
+        Err(AppError::Locked(_))
+    ));
+    assert!(require_backend_owned_dashboard_history(true, Some("b1"), &history).is_ok());
+    assert!(require_backend_owned_dashboard_history(false, Some("b1"), &[]).is_ok());
+}
+
 /// A reasoner whose `structured()` returns canned JSON in sequence (a test double — the
 /// production loop drives the real ReasonerCell dispatch). Exhaustion yields an empty answer,
 /// which the loop treats as non-convergence.
@@ -251,10 +378,8 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
     // Empty memory brief ⇒ the floor prompt must stay BYTE-IDENTICAL to the pre-memory build.
     let (want_system, want_user) = crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-    match build_ask_vault_floor_prompt(
-        &db, &cfg, &unlocked, q, &history, "", None, None, None, None,
-    )
-    .unwrap()
+    match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None, None)
+        .unwrap()
     {
         AskFloorPrompt::Ready {
             system,
@@ -286,7 +411,7 @@ fn ask_floor_prompt_matches_pre_change_implementation() {
 
     // The empty-vault early return keeps the EXACT pre-change canned answer.
     let empty = tmp_db();
-    match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None, None)
+    match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None)
         .unwrap()
     {
         AskFloorPrompt::Empty(r) => {
@@ -331,7 +456,6 @@ fn ask_floor_preserves_no_consent_error_semantics() {
         "",
         None,
         &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        None,
         None,
         None,
     ));
@@ -428,7 +552,7 @@ fn loopback_ollama_ask_paths_revalidate_visibility_before_provider_dispatch() {
         content: "PRIOR-HISTORY-WOULD-REACH-THE-PROVIDER".into(),
     }];
     let prompt = build_ask_vault_floor_prompt(
-        &db, &cfg, &unlocked, "atlas", &history, "", None, None, None, None,
+        &db, &cfg, &unlocked, "atlas", &history, "", None, None, None,
     )
     .unwrap();
     let AskFloorPrompt::Ready { system, user, .. } = prompt else {
@@ -458,7 +582,6 @@ fn loopback_ollama_ask_paths_revalidate_visibility_before_provider_dispatch() {
         "",
         None,
         &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        None,
         None,
         None,
         floor_admission,
@@ -1280,6 +1403,26 @@ fn ask_history_char_budget_preserves_the_exact_boundary() {
     assert!(over_prior.chars().count() <= ASK_HISTORY_TEST_BUDGET);
     assert!(over_prior.starts_with(ASK_HISTORY_TEST_OMISSION_MARKER));
     assert!(over_prior.contains("User: …"));
+}
+
+#[test]
+fn dashboard_history_drops_only_a_duplicate_current_question() {
+    let mut history = vec![
+        ChatTurn {
+            role: "assistant".into(),
+            content: "earlier answer".into(),
+        },
+        ChatTurn {
+            role: "user".into(),
+            content: "  current question  ".into(),
+        },
+    ];
+    remove_duplicate_dashboard_question(&mut history, "current question");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].content, "earlier answer");
+
+    remove_duplicate_dashboard_question(&mut history, "different question");
+    assert_eq!(history.len(), 1, "unrelated history remains stable");
 }
 
 /// SURFACE SPLIT: the vault executor must NOT advertise `propose_note` (the Ask page has no

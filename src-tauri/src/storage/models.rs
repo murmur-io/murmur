@@ -722,6 +722,7 @@ pub struct DocumentSummary {
     pub name: String,
     pub title: Option<String>,
     pub markdown: String,
+    pub created_at: i64,
     pub updated_at: Option<i64>,
 }
 
@@ -1160,6 +1161,16 @@ pub struct AskConversationSourceRef {
     pub title: String,
 }
 
+/// Live dashboard chrome for a durable composite scope. Only `dashboard_id` is persisted on the
+/// conversation; title/emoji are resolved from the current board row on every load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardScopeRef {
+    pub id: String,
+    pub title: String,
+    pub emoji: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskConversation {
@@ -1167,6 +1178,7 @@ pub struct AskConversation {
     pub scope: AskConversationScope,
     pub title: String,
     pub selected_sources: Vec<AskConversationSourceRef>,
+    pub dashboard: Option<DashboardScopeRef>,
     pub messages: Vec<AskConversationMessage>,
     pub created_at: String,
     pub updated_at: String,

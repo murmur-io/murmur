@@ -19,6 +19,7 @@ import type {
   AskConversationScope,
   AskConversationSummary,
   ChatTurn,
+  DashboardScopeRef,
   SourceRef,
 } from "../../../core/models";
 import { SourceScopeService } from "../../../services/source-scope.service";
@@ -114,6 +115,8 @@ export class MeetingChatComponent {
    * grounding. `send()` passes `undefined` when empty (see below).
    */
   readonly sources = signal<SourceRef[]>([]);
+  /** Optional ID-only composite board beside the meeting's canonical anchor. */
+  readonly dashboard = signal<DashboardScopeRef | null>(null);
   private readonly defaultSources = signal<SourceRef[]>([]);
 
   /**
@@ -290,6 +293,26 @@ export class MeetingChatComponent {
     void this.historyPrivacy.ensureReady();
   }
 
+  /** A board switch cannot mutate an existing durable thread's identity. */
+  onDashboardChange(next: DashboardScopeRef | null): void {
+    if (this.dashboard()?.id === next?.id) return;
+    const sources = this.sources();
+    if (this.conversationId() !== null || this.conversation().length > 0) {
+      this.resetConversation(false);
+      this.sources.set(sources);
+    }
+    this.dashboard.set(next);
+  }
+
+  onSourcesChange(next: SourceRef[]): void {
+    const dashboard = this.dashboard();
+    if (this.conversationId() !== null || this.conversation().length > 0) {
+      this.resetConversation(false);
+      this.dashboard.set(dashboard);
+    }
+    this.sources.set(next);
+  }
+
   async resumeConversation(id: string): Promise<void> {
     if (this.pending() || !this.historyPrivacyReady()) {
       return;
@@ -307,6 +330,7 @@ export class MeetingChatComponent {
       this.prefillSeq++;
       this.conversationId.set(detail.id);
       this.sources.set(detail.selectedSources);
+      this.dashboard.set(detail.dashboard ?? null);
       this.conversation.set(this.renderTurns(detail));
       this.draft.set("");
       this.error.set(null);
@@ -361,6 +385,7 @@ export class MeetingChatComponent {
         question,
         conversationId,
         selectedSources.length ? selectedSources : undefined,
+        this.dashboard()?.id,
       );
       if (
         requestSeq !== this.requestSeq ||
@@ -437,8 +462,10 @@ export class MeetingChatComponent {
       this.prefillSeq++;
       this.defaultSources.set([]);
       this.sources.set([]);
+      this.dashboard.set(null);
     } else {
       this.sources.set(this.defaultSources());
+      this.dashboard.set(null);
     }
     this.historyOpen.set(false);
     this.historyLoading.set(false);
@@ -500,7 +527,8 @@ export class MeetingChatComponent {
 
   /** The scrollable message log. */
   private readonly scroller = viewChild<ElementRef<HTMLDivElement>>("scroller");
-  private readonly composer = viewChild<ElementRef<HTMLTextAreaElement>>("input");
+  private readonly composer =
+    viewChild<ElementRef<HTMLTextAreaElement>>("input");
   private readonly sourcePicker = viewChild(SourcePickerComponent);
 
   private focusComposer(): void {

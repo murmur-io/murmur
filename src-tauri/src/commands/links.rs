@@ -247,7 +247,7 @@ fn link_endpoint_is_unlocked(
             // `Some` ⇒ visible/unlocked, `None` ⇒ sealed-or-unknown ⇒ refuse. Documents stay
             // linkable (the chooser AND the Ask source-picker both offer them) and still fail-closed.
             let unlocked = unlocked_snapshot(state)?;
-            Ok(state.db.get_document_if_visible(id, &unlocked)?.is_some())
+            Ok(state.db.document_is_visible(id, &unlocked)?)
         }
     }
 }

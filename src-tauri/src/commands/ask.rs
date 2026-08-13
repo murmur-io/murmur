@@ -273,6 +273,16 @@ pub(crate) fn capped_ask_history(history: &[ChatTurn]) -> &[ChatTurn] {
     &history[start..]
 }
 
+pub(crate) fn remove_duplicate_dashboard_question(history: &mut Vec<ChatTurn>, question: &str) {
+    if history
+        .last()
+        .map(|turn| turn.role == "user" && turn.content.trim() == question.trim())
+        == Some(true)
+    {
+        history.pop();
+    }
+}
+
 /// Run the vault-scoped agentic attempt for [`ask_vault`]. Returns `Some(result)` ONLY when the
 /// loop CONVERGED; `None` on non-convergence or ordinary loop errors — incl. `Unavailable` (no cloud
 /// consent) — so the caller floors to the pre-agentic path with its original semantics. A
@@ -282,19 +292,16 @@ pub(crate) fn ask_vault_agentic_attempt(
     question: &str,
     history: &[ChatTurn],
     thread_id: &str,
+    config: AppConfig,
     dispatch_admission: crate::state::ContentDispatchAdmission,
     durable_history: bool,
 ) -> Result<Option<AskVaultResult>, AppError> {
     let state = app.state::<AppState>();
-    let config = match state.config.lock() {
-        Ok(c) => c.clone(),
-        Err(_) => return Ok(None), // poisoned config ⇒ floor (which will surface its own error)
-    };
     // Re-resolved per turn (never a startup snapshot): consent/provider/backend changes apply.
     // ASK role — under the legacy fallback this dispatches exactly like the pre-role `current()`.
     let reasoner = state
         .reasoner
-        .current_for(crate::summarize::roles::Role::Ask);
+        .current_for_config(crate::summarize::roles::Role::Ask, &config);
     // VAULT-SCOPED executor: no live meeting, READ-ONLY, and NO note drafts (the Ask page has no
     // notes flow / Accept affordance, so `propose_note` is not advertised on this surface). The
     // AppHandle is present so web_search / calendar_lookup participate under their existing
@@ -510,15 +517,6 @@ pub(crate) fn build_ask_vault_floor_prompt(
     reranker: Option<&dyn crate::rerank::Reranker>,
     explicit_sources: Option<&[crate::storage::models::SourceRef]>,
     pinned_org_item_id: Option<&str>,
-    // The asking board's DERIVED tiles, already gated and rendered by
-    // `commands::dashboards::dashboard_brief_for_ask`.
-    //
-    // `None` for every non-board caller, which keeps their packed prompt
-    // byte-identical. `Some("")` is a REAL state and is NOT the same thing: a board
-    // whose tiles are all sealed or hidden has nothing to say, but it still SCOPES
-    // the ask. Inferring scope from emptiness let such a board fall through to the
-    // vault-wide search below and answer from content the user never composed.
-    board_brief: Option<&str>,
 ) -> Result<AskFloorPrompt, AppError> {
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
@@ -532,35 +530,13 @@ pub(crate) fn build_ask_vault_floor_prompt(
     // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
     // whole-vault search below, byte-for-byte.
     let has_pinned_sources = explicit_sources.map(|s| !s.is_empty()).unwrap_or(false);
-    // A BOARD scopes the ask on its own — presence of the board, not presence of text.
-    // A derived-only board yields no `SourceRef`s, and an all-sealed board yields no
-    // brief either; both must still skip the vault-wide search, because the user
-    // composed the universe the question may be answered from.
-    let has_board_scope = board_brief.is_some();
-    // ONE value keys BOTH the budget reservation below and the join further down.
-    // Keeping them on different values (raw for the subtraction, trimmed for the join)
-    // let a whitespace-only brief shrink the corpus budget while contributing no text.
-    // `dashboard_brief_inner` never returns whitespace-only today, so this is defensive,
-    // not a live defect — collapsing it here is what keeps it that way.
-    let board_brief = board_brief.unwrap_or("");
-    let board_brief = if board_brief.trim().is_empty() {
-        ""
-    } else {
-        board_brief
-    };
-    let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() || has_board_scope
-    {
+    let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() {
         // PINNED corpus (deterministic; vault-wide search SKIPPED). Pack the pinned ORG item FIRST
         // (the shared note being viewed — pinned so it's ALWAYS in context; the local Brain's search
         // never surfaces org-feed content), then the explicit sources (+ their gated link-expansion).
         // In current callers the two are mutually exclusive — the org viewer sends only the org id,
         // the note editor sends only explicit sources — so no double-budget concern arises.
-        // Reserve the brief's room BEFORE packing the sources, not after. Prepending it
-        // to an already-full corpus let the packed prompt exceed the resolved ASK-role
-        // budget by the brief's length — up to 25% on a small provider budget. One
-        // budget, shared, with the board's own views taking their documented slice.
-        let budget = crate::summarize::vault_context::budget_for(&ask_conn)
-            .saturating_sub(board_brief.chars().count());
+        let budget = crate::summarize::vault_context::budget_for(&ask_conn);
         let mut corpus = String::new();
         if let Some(org_id) = pinned_org_item_id {
             corpus.push_str(&crate::summarize::vault_context::pack_pinned_org_item(
@@ -569,8 +545,8 @@ pub(crate) fn build_ask_vault_floor_prompt(
         }
         let sources = if let Some(srcs) = explicit_sources.filter(|s| !s.is_empty()) {
             let (src_corpus, src_sources) =
-                crate::summarize::vault_context::build_vault_context_pinned_visible(
-                    db, srcs, &ask_conn, unlocked,
+                crate::summarize::vault_context::build_vault_context_pinned_visible_with_budget(
+                    db, srcs, budget, unlocked,
                 )?;
             if !corpus.is_empty() && !src_corpus.is_empty() {
                 corpus.push_str("\n\n");
@@ -604,39 +580,10 @@ pub(crate) fn build_ask_vault_floor_prompt(
             db, question, &ask_conn, unlocked,
         )?
     };
-    // The board's own views go FIRST — they are what the user is looking at while
-    // typing, and the header tells the model not to re-derive them.
-    //
-    // NO truncation here. The brief arrives already bounded by
-    // `dashboards::brief_allowance`, which cuts between WHOLE rendered tiles. A second
-    // cut at this layer was a real defect: each rendered tile is one possibly-multiline
-    // string, so re-truncating by `.lines()` split inside a tile and could keep a
-    // heading while dropping the rows under it.
-    // `is_empty`, not `trim().is_empty()` — whitespace-only was already collapsed to ""
-    // above, so this reads the SAME value the budget reservation was keyed on.
-    let corpus = if board_brief.is_empty() {
-        corpus
-    } else if corpus.is_empty() {
-        board_brief.to_string()
-    } else {
-        format!("{board_brief}\n\n{corpus}")
-    };
     if corpus.trim().is_empty() {
-        // A BOARD-scoped ask that packs nothing is not an empty vault — it is a board
-        // whose tiles the session cannot read. Telling that user to "record and
-        // summarize a meeting first" sends them to fix the wrong thing entirely, and
-        // this change is what makes the state reachable, so it is this change's to get
-        // right. The message names the situation WITHOUT naming what is in the board:
-        // an all-sealed and a genuinely-empty board produce the same words, so the
-        // text discloses nothing the gate withholds.
-        let answer = if has_board_scope {
-            "Nothing on this board is readable right now — unlock its folders, or add \
-             tiles with content you can see."
-        } else {
-            "No meeting notes to search yet — record and summarize a meeting first."
-        };
         return Ok(AskFloorPrompt::Empty(AskVaultResult {
-            answer: answer.to_string(),
+            answer: "No meeting notes to search yet — record and summarize a meeting first."
+                .to_string(),
             sources: Vec::new(),
             citations: Vec::new(),
         }));

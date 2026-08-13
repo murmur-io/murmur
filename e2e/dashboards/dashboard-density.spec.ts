@@ -20,12 +20,10 @@ async function submitAsk(page: import("@playwright/test").Page): Promise<void> {
 async function enterCompose(
   page: import("@playwright/test").Page,
 ): Promise<void> {
-  if (
-    !(await page.locator('section[aria-label="Compose board tiles"]').count())
-  ) {
+  if (!(await page.locator('[data-testid="dashboard-compose"]').count())) {
     await page.getByRole("button", { name: "Compose", exact: true }).click();
   }
-  await page.locator('section[aria-label="Compose board tiles"]').waitFor();
+  await page.locator('[data-testid="dashboard-compose"]').waitFor();
 }
 
 /**
@@ -149,94 +147,62 @@ async function openBoard(page: import("@playwright/test").Page) {
   );
   await page.goto("/dashboards/b-dense");
   await enterCompose(page);
-  await expect(page.locator("app-dashboard-tile")).toHaveCount(4);
+  await expect(page.locator(".compose-row")).toHaveCount(4);
 }
 
-/** The rendered column span, read off the resolved grid placement. */
-async function spanOf(
-  page: import("@playwright/test").Page,
-  id: string,
-): Promise<number> {
-  return page.evaluate((tileId) => {
-    const el = document.querySelector(
-      `app-dashboard-tile[data-tile-id="${tileId}"]`,
-    );
-    if (!el) return -1;
-    const raw = getComputedStyle(el).gridColumn; // e.g. "span 3 / auto"
-    const m = /span\s+(\d+)/.exec(raw);
-    return m ? Number(m[1]) : -1;
-  }, id);
-}
-
-test("Dashboards: a tile that never had data collapses instead of reserving a full card", async ({
+test("Dashboards: Compose renders one compact canonical row per tile with no body previews", async ({
   page,
 }) => {
   await openBoard(page);
-
-  const numbers = page.locator('app-dashboard-tile[data-tile-id="t-numbers"]');
-  await expect(numbers).toHaveClass(/is-empty/);
-
-  // The apology is gone: no body region at all, and the strip is narrow.
-  await expect(numbers.locator(".tile-body")).toHaveCount(0);
-  expect(await spanOf(page, "t-numbers")).toBe(3);
-
-  // And it is SHORT — the whole point. The invariant that matters is RELATIVE:
-  // a collapsed strip must not read as a peer of a populated card. (An absolute
-  // pixel ceiling would just encode today's font stack; the ratio is the design.)
-  const heights = await page.evaluate(() => {
-    const h = (id: string) =>
-      document
-        .querySelector(`app-dashboard-tile[data-tile-id="${id}"]`)!
-        .getBoundingClientRect().height;
-    return { empty: h("t-numbers"), full: h("t-note") };
-  });
-  expect(heights.empty).toBeLessThan(heights.full * 0.75);
-  // Compose's explicit move controls add one compact toolbar row, but an empty
-  // strip must remain materially shorter than a populated card.
-  expect(heights.empty).toBeLessThanOrEqual(88);
-});
-
-test("Dashboards: an empty PROMISES tile reads as a result, not as an absence", async ({
-  page,
-}) => {
-  await openBoard(page);
-
-  const promises = page.locator(
-    'app-dashboard-tile[data-tile-id="t-promises"]',
-  );
-  // Zero open commitments is good news — it keeps its card and its body.
-  await expect(promises).not.toHaveClass(/is-empty/);
-  await expect(promises.locator(".tile-body")).toHaveCount(1);
-  await expect(promises.locator(".state-good")).toBeVisible();
-});
-
-test("Dashboards: kinds get different widths even though every stored row says span 4", async ({
-  page,
-}) => {
-  await openBoard(page);
-
-  const person = await spanOf(page, "t-person");
-  const note = await spanOf(page, "t-note");
-  const promises = await spanOf(page, "t-promises");
-
-  // A stat cluster is narrower than prose, which is narrower than a ledger.
-  expect(person).toBe(3);
-  expect(note).toBe(4);
-  expect(promises).toBe(6);
-  expect(new Set([person, note, promises]).size).toBeGreaterThan(1);
-});
-
-test("Dashboards: every tile header carries a per-kind mark", async ({
-  page,
-}) => {
-  await openBoard(page);
-
-  // The single biggest visual omission versus the prototype: the shipped header
-  // was an <h3> and a grey uppercase word, with zero colour anywhere on the board.
-  await expect(page.locator("app-dashboard-tile .tile-mark")).toHaveCount(4);
+  expect(
+    await page
+      .locator(".compose-row")
+      .evaluateAll((rows) =>
+        rows.map((row) => row.getAttribute("data-tile-id")),
+      ),
+  ).toEqual(["t-numbers", "t-promises", "t-person", "t-note"]);
+  await expect(page.locator(".tile-body")).toHaveCount(0);
   await expect(
-    page.locator('app-dashboard-tile[data-tile-id="t-note"] .tile-mark'),
-  ).toHaveAttribute("data-kind", "note");
+    page.locator(".compose-row.is-empty, .compose-row.is-duplicate"),
+  ).toHaveCount(0);
+});
+
+test("Dashboards: empty and populated derived views remain distinct labelled rows", async ({
+  page,
+}) => {
+  await openBoard(page);
+  await expect(page.locator('[data-tile-id="t-promises"]')).toContainText(
+    "0 open promises",
+  );
+  await expect(page.locator('[data-tile-id="t-person"]')).toContainText(
+    "Live derived board view",
+  );
+});
+
+test("Dashboards: Compose has no width controls and every row uses the same list column", async ({
+  page,
+}) => {
+  await openBoard(page);
+  await expect(
+    page.getByRole("button", { name: /Make tile (wider|narrower)/i }),
+  ).toHaveCount(0);
+  const lefts = await page
+    .locator(".compose-row")
+    .evaluateAll((rows) =>
+      rows.map((row) => Math.round(row.getBoundingClientRect().left)),
+    );
+  expect(new Set(lefts).size).toBe(1);
+});
+
+test("Dashboards: every Compose row carries a per-kind label and handle", async ({
+  page,
+}) => {
+  await openBoard(page);
+  await expect(page.locator(".compose-row .kind-mark")).toHaveCount(4);
+  await expect(page.locator('.compose-row[data-kind="note"]')).toContainText(
+    "Note",
+  );
+  await expect(page.locator('.drag-handle[draggable="true"]')).toHaveCount(4);
 });
 
 test("Dashboards: a failed Ask is a banner with a retry, not a grey bubble that looks like an answer", async ({
@@ -249,7 +215,7 @@ test("Dashboards: a failed Ask is a banner with a retry, not a grey bubble that 
   await mockTauri(
     page,
     {
-      ask_vault: () => {
+      ask_vault_persisted: () => {
         throw new Error(
           "summarizer error: cloud provider response failed after protected dispatch; details omitted",
         );
@@ -286,7 +252,7 @@ test("Dashboards: an answer renders as markdown, not as literal asterisks", asyn
   await mockTauri(
     page,
     {
-      ask_vault: () => ({
+      ask_vault_persisted: () => ({
         answer: "The **auth migration** is the risk.",
         sources: [],
         citations: [],
@@ -368,14 +334,16 @@ test("Dashboards: a duplicate tile renders as a back-reference, not a second cop
 
   await page.goto("/dashboards/b-dense");
   await enterCompose(page);
-  await expect(page.locator("app-dashboard-tile")).toHaveCount(2);
-
-  const second = page.locator('app-dashboard-tile[data-tile-id="t-p2"]');
-  await expect(second).toHaveClass(/is-duplicate/);
-  await expect(second.getByText(/same as the tile above/i)).toBeVisible();
-
-  // The row is rendered ONCE on the board, not twice.
-  await expect(page.getByText("Send the Acme paperwork")).toHaveCount(1);
+  await expect(page.locator(".compose-row")).toHaveCount(2);
+  expect(
+    await page
+      .locator(".compose-row")
+      .evaluateAll((rows) =>
+        rows.map((row) => row.getAttribute("data-tile-id")),
+      ),
+  ).toEqual(["t-p1", "t-p2"]);
+  await expect(page.locator(".compose-row.is-duplicate")).toHaveCount(0);
+  await expect(page.getByText("Send the Acme paperwork")).toHaveCount(0);
 });
 
 test("Dashboards: Ask is on demand and closing it preserves the in-memory thread", async ({
@@ -384,7 +352,7 @@ test("Dashboards: Ask is on demand and closing it preserves the in-memory thread
   await mockTauri(
     page,
     {
-      ask_vault: () => ({
+      ask_vault_persisted: () => ({
         answer: "Two are late.",
         sources: [],
         citations: [],
@@ -540,7 +508,7 @@ test("Dashboards: navigating away mid-ask does not leave the next board stuck bu
   await mockTauri(
     page,
     {
-      ask_vault: async () => {
+      ask_vault_persisted: async () => {
         await new Promise((r) => setTimeout(r, 1500));
         return {
           answer: "answer for the first board",
@@ -592,7 +560,7 @@ test("Dashboards: sealed material-only board still asks with its board id", asyn
   await mockTauri(
     page,
     {
-      ask_vault: (args: any) => {
+      ask_vault_persisted: (args: any) => {
         (globalThis as any).__askArgs = args;
         // The REAL string the board-scoped empty path returns (`commands/ask.rs`,
         // pinned by `a_board_scoped_empty_ask_does_not_tell_the_user_to_record`).
@@ -632,7 +600,8 @@ test("Dashboards: sealed material-only board still asks with its board id", asyn
 
   await page.goto("/dashboards/b-dense");
   await enterCompose(page);
-  await expect(page.locator("app-dashboard-tile")).toHaveCount(3);
+  await expect(page.locator(".compose-row")).toHaveCount(3);
+  await expect(page.locator('.compose-row[data-kind="locked"]')).toHaveCount(3);
   await page.getByRole("button", { name: "Done", exact: true }).click();
 
   // Ask is not mounted until explicitly opened.

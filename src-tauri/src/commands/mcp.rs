@@ -86,7 +86,8 @@ pub fn add_mcp_server(
 /// Remove one MCP server (its tool disappears from the brain on the next spec build).
 #[tauri::command]
 pub fn remove_mcp_server(state: State<'_, AppState>, server_id: String) -> Result<(), AppError> {
-    state.db.delete_mcp_server(&server_id)
+    let _lifecycle = super::lifecycle_guard(state.inner());
+    state.db.delete_mcp_server_for_ask(&server_id)
 }
 
 /// Grant the ONE-TIME per-server egress consent for an MCP server. Mirrors
@@ -96,15 +97,23 @@ pub fn consent_to_mcp_server(
     state: State<'_, AppState>,
     server_id: String,
 ) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     if state.db.get_mcp_server(&server_id)?.is_none() {
         return Err(AppError::InvalidArg(format!("no MCP server {server_id}")));
     }
-    state.db.set_mcp_server_consented(&server_id, true)
+    state
+        .db
+        .set_mcp_server_consented_for_ask(&server_id, true)
+        .map(|_| ())
 }
 
 /// Revoke an MCP server's egress consent — it drops out of the connector registry and the brain's
 /// tool list on the next build (fail-closed).
 #[tauri::command]
 pub fn revoke_mcp_consent(state: State<'_, AppState>, server_id: String) -> Result<(), AppError> {
-    state.db.set_mcp_server_consented(&server_id, false)
+    let _lifecycle = super::lifecycle_guard(state.inner());
+    state
+        .db
+        .set_mcp_server_consented_for_ask(&server_id, false)
+        .map(|_| ())
 }

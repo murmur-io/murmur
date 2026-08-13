@@ -2,8 +2,41 @@
      render as removable chips above the trigger; the trigger opens the OPAQUE
      candidate popover (T3). -->
 <div class="sp" [class.is-open]="open()">
-  @if (selected().length > 0) {
+  @if (dashboard() || selected().length > 0) {
     <ul class="sp-chips" aria-label="Selected sources">
+      @if (dashboard(); as board) {
+        <li
+          class="sp-chip sp-dashboard-chip pill"
+          data-testid="selected-dashboard-chip"
+        >
+          <span class="sp-chip-badge" aria-hidden="true">{{
+            board.emoji || "▦"
+          }}</span>
+          <span class="sp-chip-title">{{ board.title }}</span>
+          <button
+            type="button"
+            class="sp-chip-remove"
+            [attr.aria-label]="'Remove dashboard ' + board.title"
+            [disabled]="disabled()"
+            (click)="removeDashboard()"
+          >
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 16 16"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M4 4l8 8M12 4l-8 8"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        </li>
+      }
       @for (c of visibleChips(); track c.kind + c.id) {
         <li class="sp-chip pill">
           <span class="sp-chip-badge" aria-hidden="true">
@@ -157,9 +190,8 @@
         (scroll)="onScroll()"
       >
         <!--
-          Boards first: a dashboard is the user's OWN declaration of what belongs
-          together, so it is the strongest scope on offer. Picking one expands it
-          into its visible sources (sealed ones are dropped backend-side).
+          Boards first: in composite mode a click selects ONE board identity;
+          expand mode preserves the Reminders flat-source contract.
         -->
         @if (dashboardRows().length > 0) {
           <p class="sp-group">Dashboards</p>
@@ -168,8 +200,13 @@
               type="button"
               class="sp-row menu-item sp-board"
               role="option"
-              [attr.aria-selected]="false"
-              [disabled]="disabled() || selectionLimitReached() || expandingBoard() === board.id"
+              [attr.aria-selected]="dashboard()?.id === board.id"
+              [attr.aria-label]="'Use dashboard ' + board.title"
+              [disabled]="
+                disabled() ||
+                selectionLimitReached() ||
+                expandingBoard() === board.id
+              "
               (click)="pickDashboard(board)"
             >
               <span class="sp-title">
@@ -179,7 +216,13 @@
                 {{ board.title }}
               </span>
               <span class="sp-kind">
-                {{ expandingBoard() === board.id ? "adding…" : board.tileCount + " tiles" }}
+                {{
+                  dashboard()?.id === board.id
+                    ? "selected"
+                    : expandingBoard() === board.id
+                      ? "adding…"
+                      : board.tileCount + " tiles"
+                }}
               </span>
             </button>
           }

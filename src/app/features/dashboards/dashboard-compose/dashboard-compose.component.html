@@ -1,0 +1,92 @@
+<section
+  class="compose-workspace"
+  aria-labelledby="compose-title"
+  data-testid="dashboard-compose"
+>
+  <header class="compose-intro">
+    <div>
+      <span class="eyebrow">Board structure</span>
+      <h2 id="compose-title">Arrange what belongs here</h2>
+      <p>
+        Drag a handle or use Move earlier and Move later. Changes save as you
+        go.
+      </p>
+    </div>
+    <span class="count"
+      >{{ rows().length }} {{ rows().length === 1 ? "item" : "items" }}</span
+    >
+  </header>
+
+  <ol class="compose-list panel-card" aria-label="Board items in order">
+    @for (row of rows(); track row.tile.id) {
+      <li
+        class="compose-row"
+        [class.is-dragging]="draggingId() === row.tile.id"
+        [class.is-drop-target]="dropTargetId() === row.tile.id"
+        [attr.data-tile-id]="row.tile.id"
+        [attr.data-kind]="row.tile.data.kind"
+        (dragover)="onDragOver(row.tile, $event)"
+        (drop)="onDrop(row.tile, $event)"
+      >
+        <button
+          type="button"
+          class="drag-handle"
+          draggable="true"
+          [attr.aria-disabled]="busy()"
+          [attr.aria-label]="
+            'Drag to reorder ' +
+            row.title +
+            '. Alt+Arrow Up or Alt+Arrow Down also moves it.'
+          "
+          (dragstart)="onDragStart(row.tile, $event)"
+          (dragend)="onDragEnd()"
+          (keydown)="onHandleKeydown(row.tile, $event)"
+        >
+          <span aria-hidden="true">⠿</span>
+        </button>
+        <span
+          class="kind-mark"
+          [class.is-sealed]="row.tile.data.kind === 'locked'"
+          aria-hidden="true"
+        >
+          <mur-icon [icon]="row.icon" />
+        </span>
+        <div class="row-copy">
+          <span class="row-kind">{{ row.label }}</span>
+          <strong>{{ row.title }}</strong>
+          <span class="row-state">{{ row.state }}</span>
+        </div>
+        <div class="row-actions" [attr.aria-label]="'Actions for ' + row.title">
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            [attr.aria-disabled]="row.first || busy()"
+            [attr.aria-label]="'Move earlier ' + row.title"
+            (click)="moveBy(row.tile, -1)"
+          >
+            Move earlier
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            [attr.aria-disabled]="row.last || busy()"
+            [attr.aria-label]="'Move later ' + row.title"
+            (click)="moveBy(row.tile, 1)"
+          >
+            Move later
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm remove"
+            [attr.aria-disabled]="busy()"
+            [attr.aria-label]="'Remove ' + row.title + ' from board'"
+            (click)="!busy() && remove.emit(row.tile)"
+          >
+            Remove
+          </button>
+        </div>
+      </li>
+    }
+  </ol>
+  <p class="sr-only" aria-live="polite">{{ announcement() }}</p>
+</section>
