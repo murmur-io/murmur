@@ -267,6 +267,75 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def stable_single_link_bytes(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: Optional[int] = None,
+) -> bytes:
+    """Read one evidence inode once and prove it stayed path-bound and stable."""
+
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise HarnessError(f"{label} is missing") from exc
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_nlink != 1:
+        raise HarnessError(f"{label} is not a single-link regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise HarnessError(f"{label} cannot be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_mode != before.st_mode
+        ):
+            raise HarnessError(f"{label} changed before it was read")
+        chunks: List[bytes] = []
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            byte_count += len(chunk)
+            if max_bytes is not None and byte_count > max_bytes:
+                raise HarnessError(f"{label} exceeds its byte bound")
+            chunks.append(chunk)
+        finished = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            any(getattr(finished, field) != getattr(opened, field) for field in stable_fields)
+            or byte_count != opened.st_size
+        ):
+            raise HarnessError(f"{label} changed while it was read")
+        try:
+            rebound = path.lstat()
+        except OSError as exc:
+            raise HarnessError(f"{label} changed after it was read") from exc
+        if any(getattr(rebound, field) != getattr(finished, field) for field in stable_fields):
+            raise HarnessError(f"{label} changed after it was read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def _new_execution_id() -> str:
     return str(uuid.uuid4())
 
@@ -1337,6 +1406,113 @@ def _seatbelt_literal(path: Path) -> str:
     return json.dumps(str(path.resolve()))
 
 
+def _server_shared_object_read_root(
+    worktree: Path,
+    task_dir: Path,
+) -> Optional[Path]:
+    """Return the one runner-bound Git object store a shared server clone uses.
+
+    The task-local server checkout keeps all mutable Git metadata inside the
+    task root, but ``git clone --shared`` records the canonical sibling's
+    object directory in ``objects/info/alternates``.  Seatbelt must permit
+    that immutable dependency explicitly; deriving a broader source-repository
+    grant from mutable checkout data would defeat the isolation claim.
+    """
+
+    runtime_path = task_dir / "runtime.json"
+    try:
+        runtime_path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise HarnessError("shared server runtime binding cannot be inspected") from exc
+    try:
+        runtime_doc = json.loads(
+            stable_single_link_bytes(
+                runtime_path,
+                label="shared server runtime binding",
+                max_bytes=1024 * 1024,
+            ).decode("utf-8", "strict")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HarnessError("shared server runtime binding is malformed") from exc
+    if not isinstance(runtime_doc, dict):
+        raise HarnessError("shared server runtime binding is malformed")
+    if runtime_doc.get("server_checkout_mode") != "local-shared-clone":
+        return None
+    raw_worktree = runtime_doc.get("server_worktree")
+    raw_source = runtime_doc.get("server_source")
+    if not isinstance(raw_worktree, str) or not raw_worktree:
+        raise HarnessError("shared server clone has no runner-bound worktree")
+    if not isinstance(raw_source, str) or not raw_source:
+        raise HarnessError("shared server clone has no runner-bound source")
+
+    server_worktree = Path(raw_worktree)
+    expected_worktree = worktree.resolve().parent / "murmur-server"
+    if not server_worktree.is_absolute() or server_worktree != expected_worktree:
+        raise HarnessError("shared server clone path differs from the task binding")
+    try:
+        server_info = server_worktree.lstat()
+    except OSError as exc:
+        raise HarnessError("shared server clone is missing") from exc
+    if stat.S_ISLNK(server_info.st_mode) or not stat.S_ISDIR(server_info.st_mode):
+        raise HarnessError("shared server clone is not a real directory")
+
+    try:
+        task_doc = json.loads(
+            stable_single_link_bytes(
+                task_dir / "task.json",
+                label="shared server task binding",
+                max_bytes=1024 * 1024,
+            ).decode("utf-8", "strict")
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise HarnessError("shared server task binding is malformed") from exc
+    if not isinstance(task_doc, dict):
+        raise HarnessError("shared server task binding is malformed")
+    raw_primary = task_doc.get("repo_realpath")
+    if not isinstance(raw_primary, str) or not raw_primary:
+        raise HarnessError("task has no canonical repository binding")
+    primary = Path(raw_primary)
+    if not primary.is_absolute():
+        raise HarnessError("task canonical repository binding is not absolute")
+    expected_source = primary.parent / "murmur-server"
+    server_source = Path(raw_source)
+    if not server_source.is_absolute() or server_source != expected_source:
+        raise HarnessError("shared server source differs from the canonical sibling")
+
+    source_parts = (
+        server_source,
+        server_source / ".git",
+        server_source / ".git" / "objects",
+    )
+    for path in source_parts:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise HarnessError("shared server object source is missing") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise HarnessError("shared server object source is not a real directory")
+    object_root = source_parts[-1].resolve(strict=True)
+
+    alternates = server_worktree / ".git" / "objects" / "info" / "alternates"
+    raw_alternates = stable_single_link_bytes(
+        alternates,
+        label="shared server object alternate",
+        max_bytes=4096,
+    )
+    try:
+        alternate_lines = raw_alternates.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise HarnessError("shared server object alternate is malformed") from exc
+    if len(alternate_lines) != 1 or not alternate_lines[0]:
+        raise HarnessError("shared server clone must have exactly one object alternate")
+    alternate = Path(alternate_lines[0])
+    if not alternate.is_absolute() or alternate.resolve(strict=True) != object_root:
+        raise HarnessError("shared server clone object alternate differs from its source")
+    return object_root
+
+
 def build_check_seatbelt_profile(
     worktree: Path,
     task_dir: Path,
@@ -1392,6 +1568,9 @@ def build_check_seatbelt_profile(
         worktree.parent / "murmur-server",
     ):
         read_paths.add(optional.resolve())
+    server_object_root = _server_shared_object_read_root(worktree, task_dir)
+    if server_object_root is not None:
+        read_paths.add(server_object_root)
     # The hook selftest's Rust-backed mini-repository intentionally lives
     # below the sealed harness source tree. Cargo walks cwd ancestors and will
     # therefore load that tree's committed workspace config. Permit only the

@@ -6544,6 +6544,979 @@ def protocol_and_runtime_cases(test: Tests) -> None:
         test.equal("RUNTIME explicit budget wins", (mode, timeout), ("warm", 17))
 
 
+def protocol_server_proof_cases(test: Tests) -> None:
+    """The server half of a protocol verdict must be pinned and review-visible."""
+
+    canonical = runtime.load_config()["canonical_checks"]["protocol-server"]
+    expected_database = (
+        "postgresql://postgres:postgres@localhost:5433/urc_dev"
+    )
+    test.equal(
+        "PROTOCOL SERVER canonical check pins preflight, database, and full workspace",
+        canonical,
+        "DATABASE_URL="
+        + expected_database
+        + " CARGO_BUILD_JOBS=2 python3 -I -B "
+        ".agents/harness/protocol_server_check.py -- "
+        "cargo test --workspace -- --test-threads=1",
+    )
+
+    checker_path = ROOT / ".agents" / "harness" / "protocol_server_check.py"
+    test.true(
+        "PROTOCOL SERVER protected preflight implementation exists",
+        checker_path.is_file() and not checker_path.is_symlink(),
+    )
+    if not checker_path.is_file():
+        return
+    specification = importlib.util.spec_from_file_location(
+        "protocol_server_check_selftest", checker_path
+    )
+    if specification is None or specification.loader is None:
+        test.true("PROTOCOL SERVER preflight module can be loaded", False)
+        return
+    checker = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(checker)
+    test.equal(
+        "PROTOCOL SERVER wrapper pins the exact complete command",
+        (checker.DATABASE_URL, checker.TEST_ARGV),
+        (
+            expected_database,
+            ("cargo", "test", "--workspace", "--", "--test-threads=1"),
+        ),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-server-proof-") as raw:
+        root = Path(raw)
+        source = root / "murmur-server"
+        _init_repo(source)
+        nested = source / "nested"
+        nested.mkdir()
+        (nested / "original.txt").write_text("nested\n", encoding="utf-8")
+        _git(source, "add", "nested/original.txt")
+        _git(source, "commit", "-q", "-m", "nested tree")
+        revision = _git(source, "rev-parse", "HEAD")
+        primary_client = root / "meetnotes"
+        _init_repo(primary_client)
+        task_root = root / "task"
+        client = task_root / "meetnotes"
+        _init_repo(client)
+        (client / ".murmur-server-revision").write_text(
+            revision + "\n", encoding="utf-8"
+        )
+        server = task_root / "murmur-server"
+        _git(
+            root,
+            "clone",
+            "-q",
+            "--shared",
+            "--no-checkout",
+            str(source),
+            str(server),
+        )
+        _git(server, "checkout", "-q", "--detach", revision)
+
+        facts = checker.checkout_facts(client)
+        expected_fact_keys = {
+            "schema_version",
+            "revision",
+            "head",
+            "head_tree",
+            "detached",
+            "clean",
+            "checkout_mode",
+            "git_metadata_mode",
+            "git_dir",
+            "git_common_dir",
+            "git_metadata_sha256",
+            "head_manifest_sha256",
+            "index_manifest_sha256",
+            "worktree_manifest_sha256",
+            "checkout_snapshot_sha256",
+            "tracked_entry_count",
+            "metadata_entry_count",
+            "pre_exec_rechecks",
+            "facts_sha256",
+        }
+        test.equal(
+            "PROTOCOL SERVER clean detached exact pin yields canonical isolated facts",
+            (
+                set(facts),
+                facts["revision"],
+                facts["head"],
+                facts["detached"],
+                facts["clean"],
+                facts["checkout_mode"],
+                facts["git_metadata_mode"],
+                facts["git_dir"],
+                facts["git_common_dir"],
+                bool(runtime.SHA256_RE.fullmatch(facts["git_metadata_sha256"])),
+                facts["head_manifest_sha256"] == facts["index_manifest_sha256"],
+                facts["tracked_entry_count"],
+                facts["pre_exec_rechecks"],
+                verifier.server_checkout_facts_hash(facts),
+            ),
+            (
+                expected_fact_keys,
+                revision,
+                revision,
+                True,
+                True,
+                "local-shared-clone",
+                "isolated",
+                ".git",
+                ".git",
+                True,
+                True,
+                2,
+                1,
+                facts["facts_sha256"],
+            ),
+        )
+        pin_path = client / ".murmur-server-revision"
+        original_pin = pin_path.read_bytes()
+        original_checker_read = checker.os.read
+        pin_mutated = False
+
+        def mutate_pin_after_first_read(descriptor: int, count: int) -> bytes:
+            nonlocal pin_mutated
+            chunk = original_checker_read(descriptor, count)
+            if chunk and not pin_mutated:
+                pin_mutated = True
+                with pin_path.open("r+b") as handle:
+                    handle.seek(0)
+                    handle.write(b"f")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            return chunk
+
+        checker.os.read = mutate_pin_after_first_read
+        try:
+            test.raises(
+                "PROTOCOL SERVER same-inode pin mutation fails closed",
+                lambda: checker.checkout_facts(client),
+                "unsafe",
+            )
+        finally:
+            checker.os.read = original_checker_read
+            pin_path.write_bytes(original_pin)
+
+        fake_bin = root / "fake-bin"
+        fake_bin.mkdir()
+        fake_cargo = fake_bin / "cargo"
+        fake_cargo.write_text(
+            "#!/bin/sh\n"
+            "printf 'FAKE_CARGO_CWD=%s\\n' \"$PWD\"\n"
+            "printf 'FAKE_CARGO_ARGS=%s\\n' \"$*\"\n",
+            encoding="utf-8",
+        )
+        fake_cargo.chmod(0o755)
+        executed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(checker_path),
+                "--",
+                *checker.TEST_ARGV,
+            ],
+            cwd=str(client),
+            env={
+                **os.environ,
+                "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+                "DATABASE_URL": expected_database,
+                "CARGO_BUILD_JOBS": "2",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        executed_lines = executed.stdout.splitlines()
+        test.equal(
+            "PROTOCOL SERVER preflight enters sibling and executes exact workspace argv",
+            (
+                executed.returncode,
+                executed_lines[0] if executed_lines else None,
+                f"FAKE_CARGO_CWD={server.resolve()}" in executed.stdout,
+                "FAKE_CARGO_ARGS=test --workspace -- --test-threads=1"
+                in executed.stdout,
+            ),
+            (0, checker.facts_line(facts), True, True),
+        )
+
+        runtime.atomic_write_json(
+            task_root / "task.json",
+            {
+                "schema_version": 2,
+                "task_id": "protocol-server-seatbelt",
+                "repo_realpath": str(primary_client.resolve()),
+                "worktree_path": str(client.resolve()),
+            },
+        )
+        runtime.atomic_write_json(
+            task_root / "runtime.json",
+            {
+                "schema_version": 2,
+                "server_worktree": str(server.resolve()),
+                "server_source": str(source.resolve()),
+                "server_revision": revision,
+                "server_checkout_mode": "local-shared-clone",
+            },
+        )
+        sandboxed_git = runtime.run_check(
+            client,
+            task_root,
+            {
+                "id": "shared-server-object-read",
+                "command": (
+                    "git -C "
+                    + shlex.quote(str(server.resolve()))
+                    + " cat-file -e "
+                    + shlex.quote(revision + "^{commit}")
+                ),
+                "timeout_seconds": 10,
+            },
+            "protocol-server-seatbelt",
+        )
+        expected_sandbox_mode = (
+            "inherited"
+            if runtime.inherited_outer_sandbox_is_active()
+            else "direct"
+        )
+        test.equal(
+            "PROTOCOL SERVER Seatbelt resolves the one canonical shared object store",
+            (sandboxed_git["sandbox_mode"], sandboxed_git["passed"]),
+            (expected_sandbox_mode, True),
+        )
+        profile_text = Path(
+            str(sandboxed_git["sandbox_profile_path"])
+        ).read_text(encoding="utf-8")
+        source_literal = json.dumps(str(source.resolve()))
+        object_literal = json.dumps(
+            str((source / ".git" / "objects").resolve())
+        )
+        test.true(
+            "PROTOCOL SERVER Seatbelt grants only the source object subtree",
+            f"(subpath {object_literal})" in profile_text
+            and f"(subpath {source_literal})" not in profile_text,
+        )
+
+        original_nested_oid = _git(
+            source, "rev-parse", f"{revision}:nested"
+        )
+        (nested / "rogue.txt").write_text("rogue\n", encoding="utf-8")
+        _git(source, "add", "nested/rogue.txt")
+        rogue_root_oid = _git(source, "write-tree")
+        rogue_nested_oid = _git(
+            source, "rev-parse", f"{rogue_root_oid}:nested"
+        )
+        _git(source, "reset", "-q", "--hard", revision)
+        object_dir = source / ".git" / "objects"
+        original_nested_path = (
+            object_dir
+            / original_nested_oid[:2]
+            / original_nested_oid[2:]
+        )
+        rogue_nested_path = (
+            object_dir / rogue_nested_oid[:2] / rogue_nested_oid[2:]
+        )
+        original_nested_bytes = original_nested_path.read_bytes()
+        original_nested_mode = original_nested_path.stat().st_mode
+        original_nested_path.chmod(original_nested_mode | stat.S_IWUSR)
+        original_nested_path.write_bytes(rogue_nested_path.read_bytes())
+        try:
+            test.raises(
+                "PROTOCOL SERVER nested tree bytes must match their object identity",
+                lambda: checker.checkout_facts(client),
+                "SHA-1 identity",
+            )
+        finally:
+            original_nested_path.write_bytes(original_nested_bytes)
+            original_nested_path.chmod(original_nested_mode)
+
+        alternate_path = server / ".git" / "objects" / "info" / "alternates"
+        alternate_bytes = alternate_path.read_bytes()
+        wrong_objects = root / "wrong-objects"
+        wrong_objects.mkdir()
+        alternate_path.write_text(str(wrong_objects) + "\n", encoding="utf-8")
+        try:
+            test.raises(
+                "PROTOCOL SERVER Seatbelt rejects alternate-source drift",
+                lambda: runtime.build_check_seatbelt_profile(
+                    client,
+                    task_root,
+                    runtime=runtime._check_runtime_paths(task_root),
+                    network_mode="none",
+                ),
+                "differs from its source",
+            )
+        finally:
+            alternate_path.write_bytes(alternate_bytes)
+
+        for metadata_name in ("index", "config", "packed-refs"):
+            metadata_path = server / ".git" / metadata_name
+            outside_path = root / ("outside-" + metadata_name)
+            metadata_path.rename(outside_path)
+            metadata_path.symlink_to(outside_path)
+            try:
+                test.raises(
+                    "PROTOCOL SERVER nested Git metadata symlink fails closed: "
+                    + metadata_name,
+                    lambda: checker.checkout_facts(client),
+                    "must not contain symlinks",
+                )
+            finally:
+                metadata_path.unlink()
+                outside_path.rename(metadata_path)
+
+        config_path = server / ".git" / "config"
+        config_bytes = config_path.read_bytes()
+        external_config = root / "external-git-config"
+        external_config.write_text("[core]\n\tfilemode = false\n", encoding="utf-8")
+        config_path.write_bytes(
+            config_bytes
+            + b"\n[include]\n\tpath = "
+            + os.fsencode(external_config)
+            + b"\n"
+        )
+        try:
+            test.raises(
+                "PROTOCOL SERVER external config include fails closed",
+                lambda: checker.checkout_facts(client),
+                "must not include external config",
+            )
+        finally:
+            config_path.write_bytes(config_bytes)
+
+        config_path.write_bytes(
+            config_bytes
+            + b"\n[includeIf \"gitdir:**\"]\n\tpath = "
+            + os.fsencode(external_config)
+            + b"\n"
+        )
+        try:
+            test.raises(
+                "PROTOCOL SERVER conditional external config include fails closed",
+                lambda: checker.checkout_facts(client),
+                "must not include external config",
+            )
+        finally:
+            config_path.write_bytes(config_bytes)
+            external_config.unlink()
+
+        index_path = server / ".git" / "index"
+        outside_index = root / "outside-hardlinked-index"
+        index_path.rename(outside_index)
+        os.link(outside_index, index_path)
+        try:
+            test.raises(
+                "PROTOCOL SERVER hardlinked Git metadata fails closed",
+                lambda: checker.checkout_facts(client),
+                "must be single-link",
+            )
+        finally:
+            index_path.unlink()
+            outside_index.rename(index_path)
+
+        owned_path = server / "owned.txt"
+        _git(server, "update-index", "--assume-unchanged", "owned.txt")
+        test.true(
+            "PROTOCOL SERVER clean assume-unchanged flag cannot weaken proof",
+            checker.checkout_facts(client)["clean"],
+        )
+        owned_path.write_text("hidden assume-unchanged edit\n", encoding="utf-8")
+        try:
+            test.raises(
+                "PROTOCOL SERVER assume-unchanged cannot hide tracked changes",
+                lambda: checker.checkout_facts(client),
+                "tracked bytes",
+            )
+        finally:
+            owned_path.write_text("base\n", encoding="utf-8")
+            _git(server, "update-index", "--no-assume-unchanged", "owned.txt")
+
+        _git(server, "update-index", "--skip-worktree", "owned.txt")
+        test.true(
+            "PROTOCOL SERVER clean skip-worktree flag cannot weaken proof",
+            checker.checkout_facts(client)["clean"],
+        )
+        owned_path.write_text("hidden skip-worktree edit\n", encoding="utf-8")
+        try:
+            test.raises(
+                "PROTOCOL SERVER skip-worktree cannot hide tracked changes",
+                lambda: checker.checkout_facts(client),
+                "tracked bytes",
+            )
+        finally:
+            owned_path.write_text("base\n", encoding="utf-8")
+            _git(server, "update-index", "--no-skip-worktree", "owned.txt")
+
+        owned_path.write_text("ordinary tracked edit\n", encoding="utf-8")
+        try:
+            test.raises(
+                "PROTOCOL SERVER temporary index proves tracked bytes",
+                lambda: checker.checkout_facts(client),
+                "tracked bytes",
+            )
+        finally:
+            owned_path.write_text("base\n", encoding="utf-8")
+
+        _git(server, "update-index", "--chmod=+x", "owned.txt")
+        try:
+            test.raises(
+                "PROTOCOL SERVER index mode drift fails closed",
+                lambda: checker.checkout_facts(client),
+                "index differs",
+            )
+        finally:
+            _git(server, "update-index", "--chmod=-x", "owned.txt")
+
+        original_mode = owned_path.stat().st_mode
+        owned_path.chmod(original_mode | stat.S_IXUSR)
+        try:
+            test.raises(
+                "PROTOCOL SERVER executable-bit drift fails closed",
+                lambda: checker.checkout_facts(client),
+                "tracked bytes",
+            )
+        finally:
+            owned_path.chmod(original_mode)
+
+        outside_owned = root / "outside-hardlinked-owned"
+        owned_path.rename(outside_owned)
+        os.link(outside_owned, owned_path)
+        try:
+            test.raises(
+                "PROTOCOL SERVER hardlinked tracked file fails closed",
+                lambda: checker.checkout_facts(client),
+                "single-link",
+            )
+        finally:
+            owned_path.unlink()
+            outside_owned.rename(owned_path)
+
+        outside_symlink = root / "outside-symlink-owned"
+        outside_symlink.write_text("base\n", encoding="utf-8")
+        owned_path.unlink()
+        owned_path.symlink_to(outside_symlink)
+        try:
+            test.raises(
+                "PROTOCOL SERVER tracked symlink fails closed",
+                lambda: checker.checkout_facts(client),
+                "regular files",
+            )
+        finally:
+            owned_path.unlink()
+            owned_path.write_text("base\n", encoding="utf-8")
+            outside_symlink.unlink()
+
+        extra_directory = server / "ignored-empty-directory"
+        extra_directory.mkdir()
+        try:
+            test.raises(
+                "PROTOCOL SERVER ignored or empty directory fails closed",
+                lambda: checker.checkout_facts(client),
+                "extra directory",
+            )
+        finally:
+            extra_directory.rmdir()
+
+        exclude_path = server / ".git" / "info" / "exclude"
+        exclude_bytes = exclude_path.read_bytes()
+        exclude_path.write_bytes(exclude_bytes + b"\nignored-physical-entry\n")
+        ignored_entry = server / "ignored-physical-entry"
+        ignored_entry.write_text("ignored but present\n", encoding="utf-8")
+        try:
+            test.raises(
+                "PROTOCOL SERVER ignored untracked file fails closed",
+                lambda: checker.checkout_facts(client),
+                "untracked entry",
+            )
+        finally:
+            ignored_entry.unlink()
+            exclude_path.write_bytes(exclude_bytes)
+
+        metadata_fifo = server / ".git" / "adversarial-fifo"
+        os.mkfifo(metadata_fifo)
+        try:
+            test.raises(
+                "PROTOCOL SERVER special Git metadata node fails closed",
+                lambda: checker.checkout_facts(client),
+                "only directories and regular files",
+            )
+        finally:
+            metadata_fifo.unlink()
+
+        test.true(
+            "PROTOCOL SERVER facts expose no absolute temporary path",
+            str(root) not in checker.facts_line(checker.checkout_facts(client)),
+        )
+
+        (server / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        test.raises(
+            "PROTOCOL SERVER dirty checkout fails closed",
+            lambda: checker.checkout_facts(client),
+            "untracked entry",
+        )
+        (server / "dirty.txt").unlink()
+
+        _git(server, "switch", "-q", "-c", "attached")
+        test.raises(
+            "PROTOCOL SERVER attached checkout fails closed",
+            lambda: checker.checkout_facts(client),
+            "detached",
+        )
+        _git(server, "checkout", "-q", "--detach", revision)
+
+        (source / "owned.txt").write_text("base\nnext\n", encoding="utf-8")
+        _git(source, "add", "owned.txt")
+        _git(source, "commit", "-q", "-m", "next")
+        next_revision = _git(source, "rev-parse", "HEAD")
+        _git(server, "fetch", "-q", str(source), next_revision)
+        _git(server, "checkout", "-q", "--detach", next_revision)
+        test.raises(
+            "PROTOCOL SERVER wrong HEAD fails closed",
+            lambda: checker.checkout_facts(client),
+            "pinned revision",
+        )
+        shutil.rmtree(server)
+        _git(source, "worktree", "add", "-q", "--detach", str(server), revision)
+        test.raises(
+            "PROTOCOL SERVER linked checkout with shared Git metadata fails closed",
+            lambda: checker.checkout_facts(client),
+            "real directory",
+        )
+
+        stdout = task_root / "logs" / "protocol.stdout.log"
+        stderr = task_root / "logs" / "protocol.stderr.log"
+        log = task_root / "logs" / "protocol.log"
+        sandbox = task_root / "runtime" / "protocol.sb"
+        guardian = task_root / "runtime" / "protocol-guardian.json"
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text(checker.facts_line(facts) + "\ntest result: ok\n", encoding="utf-8")
+        stderr.write_text("", encoding="utf-8")
+        log.write_bytes(
+            b"=== stdout ===\n"
+            + stdout.read_bytes()
+            + b"\n=== stderr ===\n"
+            + stderr.read_bytes()
+        )
+        sandbox.write_text("(version 1)\n", encoding="utf-8")
+        guardian.write_text("{}\n", encoding="utf-8")
+        declared = {
+            "id": "protocol-server",
+            "command": canonical,
+            "timeout_seconds": 1800,
+        }
+        plan = {
+            "base_sha": "a" * 40,
+            "changed_paths": ["src-tauri/src/share/envelope.rs"],
+            "claims": [],
+            "actual_risk_flags": ["protocol"],
+            "checks": [declared],
+            "diff_sha256": "1" * 64,
+            "plan_sha256": "2" * 64,
+            "protocol_sha256": "3" * 64,
+            "server_required": True,
+        }
+        evidence = {
+            "id": "protocol-server",
+            "command": canonical,
+            "passed": True,
+            "outcome": "PASS",
+            "exit_code": 0,
+            "duration_ms": 1,
+            "resource_wait_ms": 0,
+            "bound_environment": {},
+            "log_path": str(log),
+            "log_sha256": runtime.sha256_file(log),
+            "stdout_path": str(stdout),
+            "stdout_sha256": runtime.sha256_file(stdout),
+            "stderr_path": str(stderr),
+            "stderr_sha256": runtime.sha256_file(stderr),
+            "sandbox_profile_path": str(sandbox),
+            "sandbox_profile_sha256": runtime.sha256_file(sandbox),
+            "guardian_path": str(guardian),
+            "guardian_sha256": runtime.sha256_file(guardian),
+            "leader_exited_with_live_group": False,
+        }
+        record = verifier.check_record(declared, plan, evidence)
+        original_stdout = stdout.read_bytes()
+        original_read = runtime.os.read
+        mutation_done = False
+
+        def mutate_stdout_after_first_read(descriptor: int, count: int) -> bytes:
+            nonlocal mutation_done
+            chunk = original_read(descriptor, count)
+            if chunk and not mutation_done:
+                mutation_done = True
+                with stdout.open("r+b") as handle:
+                    handle.seek(-1, os.SEEK_END)
+                    handle.write(b"X")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            return chunk
+
+        runtime.os.read = mutate_stdout_after_first_read
+        try:
+            test.raises(
+                "PROTOCOL SERVER same-inode stdout mutation fails closed",
+                lambda: verifier._server_checkout_facts_from_evidence(evidence),
+                "not immutable",
+            )
+        finally:
+            runtime.os.read = original_read
+            stdout.write_bytes(original_stdout)
+
+        outside_stdout = root / "outside-protocol.stdout.log"
+        stdout.rename(outside_stdout)
+        stdout.symlink_to(outside_stdout)
+        try:
+            test.raises(
+                "PROTOCOL SERVER symlinked stdout evidence fails closed",
+                lambda: verifier._server_checkout_facts_from_evidence(evidence),
+                "not immutable",
+            )
+        finally:
+            stdout.unlink()
+            outside_stdout.rename(stdout)
+        stdout.rename(outside_stdout)
+        os.link(outside_stdout, stdout)
+        try:
+            test.raises(
+                "PROTOCOL SERVER hardlinked stdout evidence fails closed",
+                lambda: verifier._server_checkout_facts_from_evidence(evidence),
+                "not immutable",
+            )
+        finally:
+            stdout.unlink()
+            outside_stdout.rename(stdout)
+
+        runtime.atomic_write_json(
+            task_root / "runtime.json",
+            {
+                "schema_version": 2,
+                "server_worktree": str(server.resolve()),
+                "server_source": str(source.resolve()),
+                "server_revision": revision,
+                "server_checkout_mode": "local-shared-clone",
+            },
+        )
+        test.equal(
+            "PROTOCOL SERVER check evidence stores hash-bound checkout facts",
+            record.get("server_checkout"),
+            facts,
+        )
+        verifier.validate_check_checkpoint(
+            record, declared, plan, task_root
+        )
+        runtime_path = task_root / "runtime.json"
+        outside_runtime = root / "outside-runtime.json"
+        runtime_path.rename(outside_runtime)
+        os.link(outside_runtime, runtime_path)
+        try:
+            test.raises(
+                "PROTOCOL SERVER hardlinked runtime binding fails closed",
+                lambda: verifier._review_server_checkout_attestation(
+                    client,
+                    task_root,
+                    [{"id": "protocol-server", "server_checkout": facts}],
+                ),
+                "runtime record is unsafe",
+            )
+        finally:
+            runtime_path.unlink()
+            outside_runtime.rename(runtime_path)
+
+        def evidence_for_stdout_line(line: str) -> Dict[str, Any]:
+            stdout.write_text(line + "\ntest result: ok\n", encoding="utf-8")
+            return {**evidence, "stdout_sha256": runtime.sha256_file(stdout)}
+
+        malformed_evidence = evidence_for_stdout_line(
+            checker.FACTS_PREFIX + "{not-json}"
+        )
+        test.raises(
+            "PROTOCOL SERVER malformed stdout facts fail closed",
+            lambda: verifier.check_record(declared, plan, malformed_evidence),
+            "not canonical JSON",
+        )
+        extra_shape = {**facts, "unexpected": "injected"}
+        extra_shape["facts_sha256"] = verifier.server_checkout_facts_hash(
+            extra_shape
+        )
+        shaped_evidence = evidence_for_stdout_line(
+            checker.FACTS_PREFIX
+            + runtime.canonical_json(extra_shape).decode("utf-8")
+        )
+        test.raises(
+            "PROTOCOL SERVER non-canonical fact shape fails closed",
+            lambda: verifier.check_record(declared, plan, shaped_evidence),
+            "non-canonical shape",
+        )
+        boolean_schema = {**facts, "schema_version": True}
+        boolean_schema["facts_sha256"] = verifier.server_checkout_facts_hash(
+            boolean_schema
+        )
+        boolean_schema_evidence = evidence_for_stdout_line(
+            checker.FACTS_PREFIX
+            + runtime.canonical_json(boolean_schema).decode("utf-8")
+        )
+        test.raises(
+            "PROTOCOL SERVER boolean schema version fails closed",
+            lambda: verifier.check_record(
+                declared, plan, boolean_schema_evidence
+            ),
+            "schema changed",
+        )
+        float_schema = {**facts, "schema_version": 2.0}
+        float_schema["facts_sha256"] = verifier.server_checkout_facts_hash(
+            float_schema
+        )
+        float_schema_evidence = evidence_for_stdout_line(
+            checker.FACTS_PREFIX
+            + runtime.canonical_json(float_schema).decode("utf-8")
+        )
+        test.raises(
+            "PROTOCOL SERVER float schema version fails closed",
+            lambda: verifier.check_record(
+                declared, plan, float_schema_evidence
+            ),
+            "schema changed",
+        )
+        for count_key in (
+            "tracked_entry_count",
+            "metadata_entry_count",
+            "pre_exec_rechecks",
+        ):
+            for malformed_count in (True, 1.0):
+                malformed_counts = {
+                    **facts,
+                    count_key: malformed_count,
+                }
+                malformed_counts["facts_sha256"] = (
+                    verifier.server_checkout_facts_hash(malformed_counts)
+                )
+                count_evidence = evidence_for_stdout_line(
+                    checker.FACTS_PREFIX
+                    + runtime.canonical_json(malformed_counts).decode("utf-8")
+                )
+                test.raises(
+                    "PROTOCOL SERVER count type fails closed: "
+                    + count_key
+                    + "/"
+                    + type(malformed_count).__name__,
+                    lambda current=count_evidence: verifier.check_record(
+                        declared,
+                        plan,
+                        current,
+                    ),
+                    "snapshot counts are malformed",
+                )
+        stale_hash = {**facts, "facts_sha256": "f" * 64}
+        stale_hash_evidence = evidence_for_stdout_line(
+            checker.FACTS_PREFIX
+            + runtime.canonical_json(stale_hash).decode("utf-8")
+        )
+        test.raises(
+            "PROTOCOL SERVER stale fact hash fails closed",
+            lambda: verifier.check_record(declared, plan, stale_hash_evidence),
+            "facts hash changed",
+        )
+        stdout.write_text(
+            checker.facts_line(facts) + "\ntampered after hash\n",
+            encoding="utf-8",
+        )
+        test.raises(
+            "PROTOCOL SERVER stdout byte tamper fails closed",
+            lambda: verifier.check_record(declared, plan, evidence),
+            "stdout artifact is not immutable",
+        )
+        stdout.write_text(
+            checker.facts_line(facts) + "\ntest result: ok\n",
+            encoding="utf-8",
+        )
+        escaped_stdout = root / "escaped-protocol.stdout.log"
+        escaped_stdout.write_text(
+            stdout.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        escaped_record = copy.deepcopy(record)
+        escaped_record["evidence"]["stdout_path"] = str(escaped_stdout)
+        escaped_record["evidence"]["stdout_sha256"] = runtime.sha256_file(
+            escaped_stdout
+        )
+        test.raises(
+            "PROTOCOL SERVER stdout path escape fails closed",
+            lambda: verifier.validate_check_checkpoint(
+                escaped_record, declared, plan, task_root
+            ),
+            "outside the v2 task store",
+        )
+        injected = copy.deepcopy(record)
+        injected["server_checkout"]["head"] = "f" * 40
+        test.raises(
+            "PROTOCOL SERVER arbitrary record fact injection is rejected",
+            lambda: verifier.validate_check_checkpoint(
+                injected, declared, plan, task_root
+            ),
+            "checkout facts differ",
+        )
+
+        contract = {
+            "task_id": "protocol-server-proof",
+            "description": "review both pinned protocol implementations",
+        }
+        prompt = verifier.combined_review_prompt(
+            contract,
+            plan,
+            b"protocol diff",
+            [record],
+            "protocol-security",
+            client,
+            task_root,
+            policy_text="policy",
+            proof_gap_policy_text="policy",
+        )
+        test.true(
+            "PROTOCOL SERVER reviewer prompt names every runner-owned checkout fact",
+            all(
+                marker in prompt
+                for marker in (
+                    '"revision": "' + revision + '"',
+                    '"head": "' + revision + '"',
+                    '"detached": true',
+                    '"clean": true',
+                    '"checkout_mode": "local-shared-clone"',
+                    '"git_metadata_mode": "isolated"',
+                    '"runtime_binding_sha256":',
+                )
+            ),
+        )
+        poisoned_runtime = runtime.load_json(task_root / "runtime.json")
+        poisoned_runtime["server_revision"] = "f" * 40
+        runtime.atomic_write_json(task_root / "runtime.json", poisoned_runtime)
+        test.raises(
+            "PROTOCOL SERVER runtime metadata cannot inject reviewer checkout facts",
+            lambda: verifier.combined_review_prompt(
+                contract,
+                plan,
+                b"protocol diff",
+                [record],
+                "protocol-security",
+                client,
+                task_root,
+                policy_text="policy",
+                proof_gap_policy_text="policy",
+            ),
+            "runner revision differs",
+        )
+        poisoned_runtime["server_revision"] = revision
+        runtime.atomic_write_json(task_root / "runtime.json", poisoned_runtime)
+        poisoned_runtime["server_worktree"] = str(root / "wrong-server")
+        runtime.atomic_write_json(task_root / "runtime.json", poisoned_runtime)
+        test.raises(
+            "PROTOCOL SERVER runtime sibling path drift fails closed",
+            lambda: verifier.combined_review_prompt(
+                contract,
+                plan,
+                b"protocol diff",
+                [record],
+                "protocol-security",
+                client,
+                task_root,
+                policy_text="policy",
+                proof_gap_policy_text="policy",
+            ),
+            "runtime path differs",
+        )
+        poisoned_runtime["server_worktree"] = str(server.resolve())
+        poisoned_runtime["server_checkout_mode"] = "local-isolated-clone"
+        runtime.atomic_write_json(task_root / "runtime.json", poisoned_runtime)
+        test.raises(
+            "PROTOCOL SERVER runtime checkout mode drift fails closed",
+            lambda: verifier.combined_review_prompt(
+                contract,
+                plan,
+                b"protocol diff",
+                [record],
+                "protocol-security",
+                client,
+                task_root,
+                policy_text="policy",
+                proof_gap_policy_text="policy",
+            ),
+            "checkout mode differs",
+        )
+        poisoned_runtime["server_checkout_mode"] = "local-shared-clone"
+        runtime.atomic_write_json(task_root / "runtime.json", poisoned_runtime)
+        pin_path = client / ".murmur-server-revision"
+        pin_path.write_text(next_revision + "\n", encoding="utf-8")
+        test.raises(
+            "PROTOCOL SERVER snapshot pin drift fails closed",
+            lambda: verifier.combined_review_prompt(
+                contract,
+                plan,
+                b"protocol diff",
+                [record],
+                "protocol-security",
+                client,
+                task_root,
+                policy_text="policy",
+                proof_gap_policy_text="policy",
+            ),
+            "differs from the snapshot pin",
+        )
+        pin_path.write_text(revision + "\n", encoding="utf-8")
+        original_prompt_sha = runtime.sha256_bytes(prompt.encode("utf-8"))
+        mutated_facts = copy.deepcopy(facts)
+        mutated_facts["checkout_mode"] = "local-isolated-clone"
+        mutated_facts["checkout_snapshot_sha256"] = verifier.canonical_hash(
+            {
+                key: mutated_facts[key]
+                for key in (
+                    "revision",
+                    "head_tree",
+                    "checkout_mode",
+                    "git_metadata_sha256",
+                    "head_manifest_sha256",
+                    "index_manifest_sha256",
+                    "worktree_manifest_sha256",
+                    "tracked_entry_count",
+                    "metadata_entry_count",
+                )
+            }
+        )
+        mutated_facts["facts_sha256"] = verifier.server_checkout_facts_hash(
+            mutated_facts
+        )
+        stdout.write_text(
+            checker.facts_line(mutated_facts) + "\ntest result: ok\n",
+            encoding="utf-8",
+        )
+        mutated_evidence = {**evidence, "stdout_sha256": runtime.sha256_file(stdout)}
+        mutated_record = verifier.check_record(
+            declared, plan, mutated_evidence
+        )
+        runtime_doc = runtime.load_json(task_root / "runtime.json")
+        runtime_doc["server_checkout_mode"] = "local-isolated-clone"
+        runtime.atomic_write_json(task_root / "runtime.json", runtime_doc)
+        mutated_prompt = verifier.combined_review_prompt(
+            contract,
+            plan,
+            b"protocol diff",
+            [mutated_record],
+            "protocol-security",
+            client,
+            task_root,
+            policy_text="policy",
+            proof_gap_policy_text="policy",
+        )
+        test.true(
+            "PROTOCOL SERVER checkout-fact change invalidates prompt attestation hash",
+            runtime.sha256_bytes(mutated_prompt.encode("utf-8"))
+            != original_prompt_sha,
+        )
+
+
 def commit_recovery_cases(test: Tests) -> None:
     with tempfile.TemporaryDirectory(prefix="murmur-v2-commit-") as raw:
         root = Path(raw)
@@ -9039,6 +10012,7 @@ def main() -> int:
     snapshot_node_modules_manifest_cases(test)
     checkpoint_cases(test)
     protocol_and_runtime_cases(test)
+    protocol_server_proof_cases(test)
     commit_recovery_cases(test)
     legacy_prompt_catchup_cases(test)
     build_root_isolation_cases(test)
