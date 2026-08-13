@@ -168,6 +168,11 @@ export class NoteBrainPopoverComponent {
   /** The popover element, positioned after render. */
   private readonly popoverEl =
     viewChild<ElementRef<HTMLDivElement>>("popover");
+
+  /** Remove the teleported box immediately when its cached owner is detached. */
+  detachFromDocument(): void {
+    this.popoverEl()?.nativeElement.remove();
+  }
   /** The command input, focused after the menu renders. */
   private readonly cmdInput =
     viewChild<ElementRef<HTMLInputElement>>("cmdInput");
