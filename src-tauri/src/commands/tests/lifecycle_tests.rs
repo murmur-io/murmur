@@ -2224,11 +2224,927 @@
         assert_eq!(m3.matches("meeting:").count(), 1);
 
         // A note that ALREADY has OTHER front-matter keys keeps them + gains the meeting key.
-        let with_tags = "---\ntags: [a, b]\n---\n\nBody here.";
+        let with_tags = "---\ntags: [a, b]\naliases: [Sync memo]\n---\n\nBody here.";
         let m4 = compose_companion_markdown(with_tags, "Sync", "New line.");
         assert!(m4.contains("tags: [a, b]"), "existing keys preserved");
+        assert!(
+            m4.contains("aliases: [Sync memo]"),
+            "every unrelated front-matter key is preserved"
+        );
+        assert_eq!(m4.matches("tags:").count(), 1, "tags are not duplicated");
+        assert_eq!(
+            m4.matches("aliases:").count(),
+            1,
+            "aliases are not duplicated"
+        );
         assert!(m4.contains("meeting: \"[[Sync]]\""));
         assert!(m4.contains("Body here.") && m4.contains("New line."));
+    }
+
+    #[test]
+    fn conversion_template_resolution_is_per_request_and_strict() {
+        let state = build_state("conversion-saved-template-db");
+        let saved = crate::storage::models::NoteTemplate {
+            id: "tpl-client".into(),
+            name: "Client memo".into(),
+            tone: "Use the UNIQUE CLIENT TONE.".into(),
+            sections: vec![crate::storage::models::NoteTemplateSection {
+                heading: "Unique client outcome".into(),
+                instruction: "State the one client-visible result.".into(),
+            }],
+            extra_frontmatter_keys: vec!["client_account".into()],
+            created_at: "2026-08-13T00:00:00Z".into(),
+        };
+        state.db.insert_note_template(&saved).unwrap();
+        let db_templates = state.db.list_note_templates().unwrap();
+        let selected = resolve_conversion_template(None, "detailed", db_templates.clone()).unwrap();
+        assert_eq!(selected.style, "detailed");
+        assert!(selected.saved.is_none());
+        assert_eq!(
+            resolve_conversion_template(Some("default"), "brief", vec![saved.clone()])
+                .unwrap()
+                .style,
+            "brief",
+        );
+        assert_eq!(
+            resolve_conversion_template(Some("action"), "brief", db_templates.clone())
+                .unwrap()
+                .style,
+            "action",
+        );
+        let selected = resolve_conversion_template(Some("tpl-client"), "brief", db_templates)
+            .unwrap();
+        let rendered = crate::summarize::template::build_template_from_saved(
+            selected.saved.as_ref().unwrap(),
+            "auto",
+            false,
+            false,
+            "",
+        );
+        assert!(rendered.contains("UNIQUE CLIENT TONE"));
+        assert!(rendered.contains("## Unique client outcome"));
+        assert!(rendered.contains("State the one client-visible result."));
+        assert!(rendered.contains("- client_account:"));
+        seed_meeting(&state.db, "m-template", "# Template source", None);
+        let provider = ConversionProvider::fixed(
+            "---\ntitle: Rendered template note\n---\n\n# Rendered template note",
+        );
+        block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            "m-template".into(),
+            Some("tpl-client".into()),
+            Some(provider.clone()),
+        ))
+        .unwrap();
+        let command_template = provider.template();
+        assert!(command_template.contains("UNIQUE CLIENT TONE"));
+        assert!(command_template.contains("## Unique client outcome"));
+        assert!(command_template.contains("State the one client-visible result."));
+        assert!(command_template.contains("- client_account:"));
+        assert!(matches!(
+            resolve_conversion_template(Some("deleted-template"), "brief", Vec::new()),
+            Err(AppError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn conversion_source_read_interval_revalidates_before_touching_content() {
+        let state = std::sync::Arc::new(build_state("conversion-read-interval"));
+        seed_meeting(&state.db, "m-read", "# Secret transcript", None);
+        let snapshot = capture_meeting_content_snapshot(state.as_ref(), "m-read").unwrap();
+        let read_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        // Model a relock that owns the lifecycle interval before the conversion reader can enter.
+        let lifecycle = lifecycle_guard(state.as_ref());
+        let reader_state = std::sync::Arc::clone(&state);
+        let reader_flag = std::sync::Arc::clone(&read_ran);
+        let reader_ready = std::sync::Arc::clone(&ready);
+        let reader = std::thread::spawn(move || {
+            reader_ready.wait();
+            read_current_meeting_content_under_snapshot(
+                reader_state.as_ref(),
+                "m-read",
+                &snapshot,
+                || {
+                    reader_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    reader_state.db.get_segments("m-read").map(|_| ())
+                },
+            )
+        });
+        ready.wait();
+        bump_seal_epoch(state.as_ref());
+        drop(lifecycle);
+
+        assert!(matches!(reader.join().unwrap(), Err(AppError::Locked(_))));
+        assert!(
+            !read_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale snapshot must fail before the plaintext read closure runs"
+        );
+
+        let fresh = capture_meeting_content_snapshot(state.as_ref(), "m-read").unwrap();
+        read_current_meeting_content_under_snapshot(state.as_ref(), "m-read", &fresh, || {
+            assert!(matches!(
+                state.lifecycle.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    struct ConversionProvider {
+        reply: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+        relock: Option<std::sync::Arc<AppState>>,
+        templates: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ConversionProvider {
+        fn fixed(markdown: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: Some(markdown.to_string()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                relock: None,
+                templates: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: None,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                relock: None,
+                templates: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn relocking(state: std::sync::Arc<AppState>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: Some("---\ntitle: Must not persist\n---\n\n# Must not persist".into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                relock: Some(state),
+                templates: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn template(&self) -> String {
+            self.templates
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::summarize::provider::SummarizerProvider for ConversionProvider {
+        fn id(&self) -> &str {
+            "conversion-test"
+        }
+
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+
+        async fn summarize(
+            &self,
+            request: &crate::summarize::provider::SummarizeRequest,
+        ) -> crate::error::Result<String> {
+            self.templates.lock().unwrap().push(request.template.clone());
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(state) = &self.relock {
+                // The production relock-all state machine runs from inside the provider await.
+                relock_all_inner(state.as_ref())?;
+            }
+            self.reply
+                .clone()
+                .ok_or_else(|| AppError::Unavailable("scripted provider failure".into()))
+        }
+
+        async fn complete(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
+            Err(AppError::Unavailable("unused conversion test completion".into()))
+        }
+    }
+
+    #[test]
+    fn conversion_command_refuses_initially_sealed_before_provider_and_writes() {
+        let state = build_state("conversion-command-initial-sealed");
+        make_open_folder(&state.db, "f-secret", "Secret");
+        seed_meeting(&state.db, "m-secret", "# Secret body", Some("f-secret"));
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let provider = ConversionProvider::fixed("---\ntitle: Leaked\n---\n\n# Leaked");
+
+        let result = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            "m-secret".into(),
+            None,
+            Some(provider.clone()),
+        ));
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(provider.count(), 0, "provider must not see sealed content");
+        assert_eq!(state.db.companion_note_for_meeting("m-secret").unwrap(), None);
+    }
+
+    #[test]
+    fn meeting_detail_command_chain_masks_every_sealed_content_channel() {
+        let state = build_state("meeting-detail-command-mask");
+        make_open_folder(&state.db, "f-detail-secret", "Secret");
+        let secret_note = "# PRIVATE DETAIL NOTE\n\n[[PRIVATE WIKILINK TARGET]]\n\n\
+                           ![[murmur-attachment:private-image]]";
+        seed_meeting(
+            &state.db,
+            "m-detail-secret",
+            secret_note,
+            Some("f-detail-secret"),
+        );
+        let owner = crate::storage::AttachmentOwner::Meeting {
+            meeting_id: "m-detail-secret".into(),
+            provider_id: "claude_code".into(),
+        };
+        // A real 1x1 PNG keeps this production-chain oracle focused on the
+        // sealed-detail mask instead of failing earlier in attachment validation.
+        let data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+                     \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+                     \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+                     \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+                     \xae\x42\x60\x82";
+        let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(data).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: "private-image",
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: data.len(),
+                data,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        lock_folder_inner(&state, "f-detail-secret".into()).unwrap();
+
+        let detail = get_meeting_detail_inner(&state, "m-detail-secret")
+            .unwrap()
+            .unwrap();
+        assert!(detail.locked);
+        assert_eq!(detail.meeting.title.as_deref(), Some("🔒 Locked"));
+        assert!(detail.meeting.audio_path.is_none());
+        assert!(detail.note.is_none());
+        assert!(detail.segments.is_empty());
+        assert!(detail.assistant_interactions.is_empty());
+        let wire = serde_json::to_string(&detail).unwrap();
+        for secret in [
+            "Quarterly strategy",
+            "PRIVATE DETAIL NOTE",
+            "PRIVATE WIKILINK TARGET",
+            "private-image",
+            "PII!",
+            "alpha bravo",
+        ] {
+            assert!(
+                !wire.contains(secret),
+                "sealed content channel leaked through get_meeting_detail: {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_command_relock_during_provider_await_writes_nothing() {
+        let state = std::sync::Arc::new(build_state("conversion-command-await-relock"));
+        make_open_folder(&state.db, "f-relock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m-relock",
+            "# Existing source",
+            Some("f-relock"),
+        );
+        lock_folder_inner(state.as_ref(), "f-relock".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-relock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-relock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        unseal_folder_extras(state.as_ref(), "f-relock", &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-relock".into());
+        let provider = ConversionProvider::relocking(std::sync::Arc::clone(&state));
+
+        let result = block_on(convert_meeting_to_note_inner_with(
+            None,
+            state.as_ref(),
+            "m-relock".into(),
+            None,
+            Some(provider.clone()),
+        ));
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(provider.count(), 1, "provider await actually ran");
+        assert!(
+            !state.unlocked_folders.lock().unwrap().contains("f-relock"),
+            "production relock-all revoked the source folder during provider await"
+        );
+        let reblanked = state.db.get_segments("m-relock").unwrap();
+        assert_eq!(reblanked.len(), 2, "sealed transcript rows remain canonical");
+        assert!(
+            reblanked.iter().all(|segment| segment.text.is_empty()),
+            "production relock-all reblanked every transcript row"
+        );
+        assert_eq!(state.db.companion_note_for_meeting("m-relock").unwrap(), None);
+    }
+
+    #[test]
+    fn conversion_related_change_during_provider_await_writes_nothing() {
+        #[derive(Clone, Copy)]
+        enum RelatedMutation {
+            Remove,
+            Deactivate,
+            DeleteSource,
+        }
+
+        struct MutatingRelatedProvider {
+            state: std::sync::Arc<AppState>,
+            mutation: RelatedMutation,
+            link_id: i64,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::summarize::provider::SummarizerProvider for MutatingRelatedProvider {
+            fn id(&self) -> &str {
+                "conversion-related-race"
+            }
+
+            async fn availability(&self) -> crate::summarize::provider::Availability {
+                crate::summarize::provider::Availability::Available
+            }
+
+            async fn summarize(
+                &self,
+                request: &crate::summarize::provider::SummarizeRequest,
+            ) -> crate::error::Result<String> {
+                assert!(
+                    request.transcript.contains("RELATED_SECRET_CONTEXT"),
+                    "precondition: active visible Related plaintext reached the provider request"
+                );
+                match self.mutation {
+                    RelatedMutation::Remove => self.state.db.delete_manual_link(
+                        "meeting",
+                        "m-related-race",
+                        "note",
+                        "n-related-race",
+                    )?,
+                    RelatedMutation::Deactivate => self.state.db.dismiss_link(self.link_id)?,
+                    RelatedMutation::DeleteSource => {
+                        self.state.db.delete_document("n-related-race")?
+                    }
+                }
+                Ok("---\ntitle: Stale\n---\n\n# Must not persist".into())
+            }
+
+            async fn complete(
+                &self,
+                _system: &str,
+                _user: &str,
+            ) -> crate::error::Result<String> {
+                Err(AppError::Unavailable("unused conversion completion".into()))
+            }
+        }
+
+        for (case, mutation) in [
+            ("remove", RelatedMutation::Remove),
+            ("deactivate", RelatedMutation::Deactivate),
+            ("delete-source", RelatedMutation::DeleteSource),
+        ] {
+            let state = std::sync::Arc::new(build_state(&format!(
+                "conversion-related-race-{case}"
+            )));
+            seed_meeting(
+                &state.db,
+                "m-related-race",
+                "# Primary transcript",
+                None,
+            );
+            make_open_folder(&state.db, "f-related-race", "Related");
+            seed_note_doc_cmd(
+                &state.db,
+                "n-related-race",
+                "f-related-race",
+                "Related source",
+                "RELATED_SECRET_CONTEXT",
+            );
+            let link_id = state.db.insert_link_for_test(
+                "meeting",
+                "m-related-race",
+                "note",
+                "n-related-race",
+                "manual",
+                1.0,
+                "user",
+                "active",
+            );
+            let provider = std::sync::Arc::new(MutatingRelatedProvider {
+                state: std::sync::Arc::clone(&state),
+                mutation,
+                link_id,
+            });
+
+            let result = block_on(convert_meeting_to_note_inner_with(
+                None,
+                state.as_ref(),
+                "m-related-race".into(),
+                None,
+                Some(provider),
+            ));
+
+            assert!(
+                matches!(result, Err(AppError::Locked(_))),
+                "{case}: stale Related context must invalidate conversion admission: {result:?}"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .companion_note_for_meeting("m-related-race")
+                    .unwrap(),
+                None,
+                "{case}: provider output based on stale Related context writes no companion"
+            );
+            let stale_rows: i64 = state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM documents WHERE text LIKE '%Must not persist%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stale_rows, 0,
+                "{case}: rejected provider output leaves no orphan document row"
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_command_provider_and_canonical_write_failures_preserve_existing_bytes() {
+        let state = build_state("conversion-command-preserve-failures");
+        seed_meeting(&state.db, "m-existing", "# Existing source", None);
+        let snapshot = capture_meeting_content_snapshot(&state, "m-existing").unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-existing",
+            &snapshot,
+            "Quarterly strategy",
+            "---\ntitle: Stable\n---\n\n# Stable\n\nOriginal generated bytes.",
+            None,
+        )
+        .unwrap();
+        let before = state.db.get_note_row(&companion.note_id).unwrap().unwrap().text;
+
+        let provider_failure = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            "m-existing".into(),
+            None,
+            Some(ConversionProvider::failing()),
+        ));
+        assert!(matches!(provider_failure, Err(AppError::Unavailable(_))));
+        assert_eq!(state.db.get_note_row(&companion.note_id).unwrap().unwrap().text, before);
+
+        state
+            .db
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER conversion_write_fault BEFORE UPDATE ON documents \
+                 WHEN OLD.id = '{}' BEGIN SELECT RAISE(ABORT, 'conversion write fault'); END;",
+                companion.note_id
+            ))
+            .unwrap();
+        let write_failure = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            "m-existing".into(),
+            None,
+            Some(ConversionProvider::fixed(
+                "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            )),
+        ));
+        assert!(write_failure.is_err());
+        assert_eq!(
+            state.db.get_note_row(&companion.note_id).unwrap().unwrap().text,
+            before,
+            "canonical update failure preserves the companion byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn converted_block_replaces_only_managed_content_and_rejects_broken_markers() {
+        let first = compose_converted_companion_markdown(
+            "",
+            "Project sync",
+            "---\ntitle: First\ntags: [meeting]\n---\n\n# First\n\nOld generated body.",
+        )
+        .unwrap();
+        assert!(first.contains("title: First"));
+        assert!(first.contains("meeting: \"[[Project sync]]\""));
+        assert_eq!(first.matches(CONVERTED_NOTE_START).count(), 1);
+        assert_eq!(first.matches(CONVERTED_NOTE_END).count(), 1);
+
+        let with_user_text = format!("{first}\nUser-authored appendix.\n");
+        let second = compose_converted_companion_markdown(
+            &with_user_text,
+            "Project sync",
+            "---\ntitle: Replacement\n---\n\n# Replacement\n\nFresh generated body.",
+        )
+        .unwrap();
+        assert!(second.contains("User-authored appendix."));
+        assert!(second.contains("Fresh generated body."));
+        assert!(!second.contains("Old generated body."));
+        assert!(second.contains("title: First"), "existing front-matter wins");
+        assert!(!second.contains("title: Replacement"));
+        assert_eq!(second.matches(CONVERTED_NOTE_START).count(), 1);
+
+        let trailing = format!("{first}\nUser-authored appendix.  \n\n\n");
+        let replaced = compose_converted_companion_markdown(
+            &trailing,
+            "Project sync",
+            "---\ntitle: Ignored\n---\n\n# Third\n\nThird generated body.",
+        )
+        .unwrap();
+        let (_, trailing_body) = crate::storage::db::split_front_matter(&trailing);
+        let (_, replaced_body) = crate::storage::db::split_front_matter(&replaced);
+        let trailing_suffix = trailing_body
+            .split_once(CONVERTED_NOTE_END)
+            .map(|(_, suffix)| suffix)
+            .unwrap();
+        let replaced_suffix = replaced_body
+            .split_once(CONVERTED_NOTE_END)
+            .map(|(_, suffix)| suffix)
+            .unwrap();
+        assert_eq!(
+            replaced_suffix, trailing_suffix,
+            "bytes outside the managed fence, including trailing whitespace, survive exactly"
+        );
+
+        let broken = format!("User text\n\n{CONVERTED_NOTE_START}\npartial");
+        assert!(matches!(
+            compose_converted_companion_markdown(&broken, "Project sync", "# New"),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            compose_converted_companion_markdown("", "Project sync", "---\n---\n"),
+            Err(AppError::Unavailable(_))
+        ));
+        assert!(matches!(
+            compose_converted_companion_markdown(
+                "",
+                "Project sync",
+                &format!("# Generated\n\n{CONVERTED_NOTE_START}\nforged block"),
+            ),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert!(matches!(
+            compose_converted_companion_markdown(
+                "",
+                "Project sync",
+                &format!("# Generated\n\nforged close {CONVERTED_NOTE_END}"),
+            ),
+            Err(AppError::InvalidArg(_))
+        ));
+    }
+
+    #[test]
+    fn converted_companion_creates_reuses_and_survives_relock_refusal() {
+        let state = build_state("converted-companion");
+        seed_meeting(&state.db, "m-convert", "# Existing meeting note", None);
+        let snapshot = capture_meeting_content_snapshot(&state, "m-convert").unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-convert",
+            &snapshot,
+            "Quarterly strategy",
+            "---\ntitle: Quarterly strategy\n---\n\n# Quarterly strategy\n\nFirst generated.",
+            None,
+        )
+        .unwrap();
+        let row = state.db.get_note_row(&first.note_id).unwrap().unwrap();
+        assert!(row.text.contains("First generated."));
+        assert_eq!(
+            state.db.companion_note_for_meeting("m-convert").unwrap(),
+            Some(first.note_id.clone())
+        );
+        // The public link reader deliberately collapses a companion edge with the generated
+        // `[[Meeting]]` wikilink for the same pair, preferring the wikilink row for display. Check
+        // the canonical row directly so this oracle proves atomic persistence rather than a UI
+        // dedupe representation.
+        let companion_edge_rows: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links
+                  WHERE src_kind = 'note' AND src_id = ?1
+                    AND dst_kind = 'meeting' AND dst_id = 'm-convert'
+                    AND edge_type = 'companion' AND status = 'active'",
+                [&first.note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            companion_edge_rows, 1,
+            "successful conversion must persist its required structured companion edge"
+        );
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        assert!(
+            active_conversion_related_edges(&state, "m-convert", &unlocked)
+                .unwrap()
+                .iter()
+                .all(|edge| edge.other_id != first.note_id),
+            "the structural companion output must never feed the next conversion as Related input"
+        );
+        let post_birth_snapshot = capture_meeting_content_snapshot(&state, "m-convert").unwrap();
+        assert_eq!(
+            post_birth_snapshot.active_related, snapshot.active_related,
+            "companion birth must not change the exact conversion-input witness"
+        );
+
+        let user_body = format!("{}\nUser-authored follow-up.\n", row.text);
+        update_note_doc_inner_with(
+            &state,
+            &first.note_id,
+            "Quarterly strategy",
+            &user_body,
+            None,
+        )
+        .unwrap();
+        let second_snapshot = capture_meeting_content_snapshot(&state, "m-convert").unwrap();
+        let second = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-convert",
+            &second_snapshot,
+            "Quarterly strategy",
+            "---\ntitle: Quarterly strategy\n---\n\n# Quarterly strategy\n\nSecond generated.",
+            None,
+        )
+        .unwrap();
+        assert_eq!(second.note_id, first.note_id, "one companion is reused");
+        let row = state.db.get_note_row(&second.note_id).unwrap().unwrap();
+        assert!(row.text.contains("User-authored follow-up."));
+        assert!(row.text.contains("Second generated."));
+        assert!(!row.text.contains("First generated."));
+
+        let stale_snapshot = capture_meeting_content_snapshot(&state, "m-convert").unwrap();
+        bump_seal_epoch(&state);
+        let before = row.text;
+        assert!(matches!(
+            persist_converted_companion_under_snapshot_with(
+                &state,
+                "m-convert",
+                &stale_snapshot,
+                "Quarterly strategy",
+                "---\ntitle: Bad\n---\n\n# Must not persist",
+                None,
+            ),
+            Err(AppError::Locked(_))
+        ));
+        assert_eq!(
+            state.db.get_note_row(&second.note_id).unwrap().unwrap().text,
+            before,
+            "stale provider output writes nothing"
+        );
+    }
+
+    #[test]
+    fn empty_conversion_creates_no_companion_artifact() {
+        let state = build_state("converted-empty-no-artifact");
+        seed_meeting(&state.db, "m-empty", "# Existing meeting note", None);
+        let snapshot = capture_meeting_content_snapshot(&state, "m-empty").unwrap();
+        assert!(persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-empty",
+            &snapshot,
+            "Quarterly strategy",
+            "---\n---\n",
+            None,
+        )
+        .is_err());
+        assert_eq!(state.db.companion_note_for_meeting("m-empty").unwrap(), None);
+    }
+
+    #[test]
+    fn account_expected_backfills_once_and_local_only_stays_silent() {
+        let state = build_state("account-expected-upgrade");
+        assert!(!account_expected_with_upgrade(&state, false).unwrap());
+        assert_eq!(state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(), None);
+
+        assert!(account_expected_with_upgrade(&state, true).unwrap());
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap().as_deref(),
+            Some("true")
+        );
+        assert!(
+            account_expected_with_upgrade(&state, false).unwrap(),
+            "later token/session loss retains the one-way latch"
+        );
+    }
+
+    #[test]
+    fn account_expected_upgrade_write_failure_is_not_reported_as_durable() {
+        let state = build_state("account-expected-upgrade-write-failure");
+        let result = account_expected_with_upgrade_with(&state, true, |_| {
+            Err(AppError::Storage("injected upgrade latch failure".into()))
+        });
+
+        assert!(matches!(result, Err(AppError::Storage(_))));
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(),
+            None,
+            "failed legacy-session backfill must not claim a durable account marker"
+        );
+    }
+
+    fn test_persisted_tokens() -> crate::share::PersistedTokens {
+        crate::share::PersistedTokens {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            device_id: "device".into(),
+            email: "user@example.test".into(),
+            account_id: "user@example.test".into(),
+            server_user_id: Some("server-user".into()),
+            generation: 1,
+            access_expires_at: Some("2026-08-13T12:00:00Z".into()),
+        }
+    }
+
+    fn test_account_session() -> crate::share::AccountSession {
+        crate::share::AccountSession {
+            account_id: "user@example.test".into(),
+            email: "user@example.test".into(),
+            server_user_id: Some("server-user".into()),
+            device_id: "device".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "access".into(),
+            access_expires_at: Some("2026-08-13T12:00:00Z".into()),
+            refresh_token: "refresh".into(),
+        }
+    }
+
+    fn test_account_status() -> AccountStatus {
+        AccountStatus {
+            logged_in: true,
+            account_expected: true,
+            email: Some("user@example.test".into()),
+            unlocked_for_sharing: true,
+            share_consented: false,
+            server_configured: true,
+            biometric_unlock_available: false,
+        }
+    }
+
+    #[test]
+    fn first_login_token_storage_failure_leaves_no_session_or_account_latch() {
+        let state = build_state("account-login-token-failure-no-latch");
+        let result = establish_account_login_local_with(
+            &state,
+            &test_persisted_tokens(),
+            test_account_session(),
+            |_| Err(AppError::Storage("injected Keychain failure".into())),
+        );
+
+        assert!(matches!(result, Err(AppError::Storage(_))));
+        assert!(state.account_session.lock().unwrap().is_none());
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(),
+            None,
+            "a failed first login must not create the lost-session nag latch"
+        );
+        assert!(!account_expected_with_upgrade(&state, false).unwrap());
+    }
+
+    #[test]
+    fn successful_local_login_commit_sets_latch_only_at_final_ok_boundary() {
+        let state = build_state("account-login-success-latch");
+        let store_calls = std::sync::atomic::AtomicUsize::new(0);
+        establish_account_login_local_with(
+            &state,
+            &test_persisted_tokens(),
+            test_account_session(),
+            |_| {
+                store_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(store_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(state.account_session.lock().unwrap().is_some());
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(),
+            None,
+            "usable token/session state alone is not yet the successful-return boundary"
+        );
+        let status = finish_account_login_success(&state, test_account_status()).unwrap();
+        assert!(status.logged_in && status.account_expected);
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn latch_storage_failure_cannot_return_success_without_marker() {
+        let state = build_state("account-login-latch-write-failure");
+        establish_account_login_local_with(
+            &state,
+            &test_persisted_tokens(),
+            test_account_session(),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let result = finish_account_login_success_with(
+            &state,
+            test_account_status(),
+            |_| Err(AppError::Storage("injected latch write failure".into())),
+        );
+
+        assert!(matches!(result, Err(AppError::Storage(_))));
+        assert!(
+            state.account_session.lock().unwrap().is_some(),
+            "the already-established usable session is not silently discarded"
+        );
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(),
+            None,
+            "the injected failure did not write a durable marker, so success must be refused"
+        );
+    }
+
+    #[test]
+    fn account_status_chain_is_local_even_with_an_invalid_server_url() {
+        let state = build_state("account-status-local-only");
+        state.config.lock().unwrap().share_base_url =
+            "https://this-host-must-never-be-contacted.invalid".into();
+        let token_reads = std::sync::atomic::AtomicUsize::new(0);
+        let biometric_reads = std::sync::atomic::AtomicUsize::new(0);
+
+        let status = account_status_inner_with(
+            &state,
+            || {
+                token_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            },
+            || {
+                biometric_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(false)
+            },
+        )
+        .unwrap();
+
+        assert!(!status.logged_in && !status.account_expected);
+        assert!(status.server_configured);
+        assert_eq!(token_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(biometric_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(), None);
+    }
+
+    #[test]
+    fn conversion_and_account_dtos_serialize_camel_case_keys() {
+        let converted = serde_json::to_value(CompanionAppendResult {
+            note_id: "n-1".into(),
+            meeting_wikilink: "[[Sync]]".into(),
+        })
+        .unwrap();
+        assert_eq!(converted["noteId"], "n-1");
+        assert_eq!(converted["meetingWikilink"], "[[Sync]]");
+        assert!(converted.get("note_id").is_none());
+
+        let status = serde_json::to_value(AccountStatus {
+            logged_in: false,
+            account_expected: true,
+            email: None,
+            unlocked_for_sharing: false,
+            share_consented: false,
+            server_configured: true,
+            biometric_unlock_available: false,
+        })
+        .unwrap();
+        assert_eq!(status["accountExpected"], true);
+        assert_eq!(status["unlockedForSharing"], false);
+        assert!(status.get("account_expected").is_none());
     }
 
     /// LAZY-CREATE + APPEND (RED→GREEN for the append/lazy-create path): the FIRST append creates ONE

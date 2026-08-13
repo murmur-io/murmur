@@ -17,6 +17,7 @@ import type {
 } from "../../../../core/models";
 import { SharingAuthFlowComponent } from "../../../sharing/sharing-auth-flow/sharing-auth-flow.component";
 import { ErrorCopyService } from "../../../../core/copy/error-copy.service";
+import { AccountSessionService } from "../../../../services/account-session.service";
 
 /** A flattened, depth-indented folder option for the accept-into picker. */
 interface FolderOption {
@@ -53,6 +54,7 @@ export class SettingsAccountSectionComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly accountSession = inject(AccountSessionService);
 
   /** The current sharing-account session; `null` until the first load resolves. */
   private readonly _status = signal<AccountStatus | null>(null);
@@ -177,6 +179,9 @@ export class SettingsAccountSectionComponent {
     try {
       st = await this.ipc.accountStatus();
       this._status.set(st);
+      if (st) {
+        this.accountSession.accept(st);
+      }
     } catch (e) {
       this._accountError.set(this.errorCopy.humanize(e));
     } finally {
@@ -250,6 +255,7 @@ export class SettingsAccountSectionComponent {
     try {
       const st = await this.ipc.unlockSharingWithBiometric();
       this._status.set(st);
+      this.accountSession.accept(st);
       if (!st.unlockedForSharing) {
         // Resolved but still locked — fall back to the password path.
         this._biometricFailed.set(true);
@@ -273,6 +279,7 @@ export class SettingsAccountSectionComponent {
     this._busy.set(true);
     try {
       await this.ipc.accountLogout();
+      this.accountSession.acceptLoggedOut();
       await this.reload();
     } catch (e) {
       this._accountError.set(this.errorCopy.humanize(e));

@@ -455,6 +455,27 @@ pub(crate) fn update_note_doc_inner_with(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let lifecycle = lifecycle_guard(state);
+    let doc = update_note_doc_under_lifecycle_authorized(state, id, title, markdown)?;
+
+    // PERF (brain-v3 audit H3, the `update_note_inner_with` twin): release the GLOBAL lifecycle
+    // guard BEFORE the heavy leg — the note-body re-embed + semantic-link pass is multi-second.
+    drop(lifecycle);
+    refresh_note_doc_derived_best_effort(state, id, title, markdown, embedder);
+
+    tracing::info!(target: "notes", note_id = %id, "note updated + re-indexed");
+    Ok(doc)
+}
+
+/// Canonical authored-note write while the caller already holds `lifecycle_guard`. This is the
+/// single gate + seal-on-write + attachment + vault-export + fresh-DTO seam shared by the ordinary
+/// editor update and convert-to-note. It deliberately performs no embedding/link inference: callers
+/// drop the global lifecycle mutex before [`refresh_note_doc_derived_best_effort`].
+pub(crate) fn update_note_doc_under_lifecycle_authorized(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<NoteDoc, AppError> {
     let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
             crate::errcode::NOTE_MISSING,
@@ -487,19 +508,20 @@ pub(crate) fn update_note_doc_inner_with(
     if let Err(e) = export_note_to_vault_under_lifecycle_authorized(state, id) {
         tracing::warn!(target: "notes", error = %e, "note vault re-export failed (text saved)");
     }
-    // Read the fresh DTO while still guarded (the row cannot be resealed under us); the heavy leg
-    // below never mutates the note row, so the DTO stays accurate.
-    let doc = get_note_under_lifecycle_authorized(state, id)?;
+    get_note_under_lifecycle_authorized(state, id)
+}
 
-    // PERF (brain-v3 audit H3, the `update_note_inner_with` twin): release the GLOBAL lifecycle
-    // guard BEFORE the heavy leg — the note-body re-embed + semantic-link pass is multi-second
-    // Candle/Metal work on a long note, and holding the guard across it delays screen-share
-    // auto-relock and every lock/unlock op. Race-safe without it: `index_note_chunks` re-checks
-    // the sealed-at-rest invariant (`doc_sealed_at_rest_tx`) INSIDE its write tx, so a mid-flight
-    // seal makes the write a refused no-op. The fast leg above (gate + seal-on-write + vault
-    // export + DTO read) stays under the guard.
-    drop(lifecycle);
-
+/// Refresh the derived retrieval/link projections after a canonical authored-note write. The
+/// caller must NOT hold `lifecycle_guard`; every indexer has its own sealed-at-rest admission.
+pub(crate) fn refresh_note_doc_derived_best_effort(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    markdown: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) {
+    let title = title.trim();
+    let title = if title.is_empty() { "Untitled" } else { title };
     // WP3 — the note is a first-class brain source: purge the old chunks and re-index the new BODY
     // (front-matter stripped inside `index_note_body_chunks`). Chunks + FTS come back
     // unconditionally (keyword works model-less); vectors ONLY when the REAL e5 model is present
@@ -514,9 +536,6 @@ pub(crate) fn update_note_doc_inner_with(
     // (model-gated). Both best-effort — a link failure never fails the note save.
     index_wikilinks_best_effort(state, crate::links::LinkKind::Note, id, markdown);
     auto_link_semantic_best_effort(state, crate::links::LinkKind::Note, id);
-
-    tracing::info!(target: "notes", note_id = %id, "note updated + re-indexed");
-    Ok(doc)
 }
 
 /// FAST autosave path — persist the note's title + markdown + `updated_at` ONLY. NO re-chunk, NO

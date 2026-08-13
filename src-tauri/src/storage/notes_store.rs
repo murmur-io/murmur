@@ -52,6 +52,128 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically birth a generated companion note in the always-open Notes root. The authored
+    /// document body, structured `meeting_id`, and required companion edge either commit together
+    /// or leave no rows. The command layer owns the lifecycle/root gate and attachment validation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_companion_note_atomic(
+        &self,
+        id: &str,
+        folder_id: &str,
+        name: &str,
+        title: &str,
+        text: &str,
+        meeting_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        self.insert_companion_note_atomic_core(
+            id,
+            folder_id,
+            name,
+            title,
+            text,
+            meeting_id,
+            created_at,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_companion_note_atomic_core(
+        &self,
+        id: &str,
+        folder_id: &str,
+        name: &str,
+        title: &str,
+        text: &str,
+        meeting_id: &str,
+        created_at: i64,
+        mut checkpoint: impl FnMut(bool) -> Result<()>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let root_is_open = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM folders
+                     WHERE id = ?1 AND is_root = 1 AND locked = 0
+                       AND COALESCE(kind, 'meeting') = 'note'
+                 )",
+                [folder_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !root_is_open {
+            return Err(AppError::Locked(
+                "companion notes can only be created in the open Notes root".into(),
+            ));
+        }
+        let meeting_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+                [meeting_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !meeting_exists {
+            return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
+        }
+        tx.execute(
+            "INSERT INTO documents
+               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at,
+                exported_path, meeting_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'note', NULL, ?6, ?6, NULL, ?7)",
+            rusqlite::params![id, folder_id, name, title, text, created_at, meeting_id],
+        )
+        .map_err(map_err)?;
+        checkpoint(false)?;
+        Self::upsert_link_tx(
+            &tx,
+            "note",
+            id,
+            "meeting",
+            meeting_id,
+            "companion",
+            1.0,
+            "user",
+            "active",
+            created_at,
+        )?;
+        checkpoint(true)?;
+        tx.commit().map_err(map_err)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_companion_note_atomic_failing_at(
+        &self,
+        id: &str,
+        folder_id: &str,
+        name: &str,
+        title: &str,
+        text: &str,
+        meeting_id: &str,
+        created_at: i64,
+        fail_after_link: bool,
+    ) -> Result<()> {
+        self.insert_companion_note_atomic_core(
+            id,
+            folder_id,
+            name,
+            title,
+            text,
+            meeting_id,
+            created_at,
+            |after_link| {
+                if after_link == fail_after_link {
+                    Err(AppError::Storage("injected companion birth failure".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
     /// BIRTH-SEAL twin of [`Db::insert_note`] for a session-unlocked LOCKED folder (2026-07-10
     /// residual W3): insert the row WITH its freshly-encrypted `text_blob` in ONE atomic INSERT, so
     /// there is never a blob-less plaintext row in a locked folder — not even transiently between an
@@ -858,7 +980,8 @@ fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
 mod tests {
     use super::*;
     use crate::storage::models::{
-        Folder, Meeting, MeetingStatus, RecordingGenerationKey, RecordingMicAssertion,
+        Folder, Meeting, MeetingStatus, NoteFolder, RecordingGenerationKey,
+        RecordingMicAssertion,
     };
 
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -928,6 +1051,128 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn companion_birth_rolls_back_document_and_link_at_each_checkpoint() {
+        for fail_after_link in [false, true] {
+            let db = db();
+            let meeting_id = seed_meeting(&db);
+            let folder_id = db.ensure_notes_root().unwrap();
+            let note_id = if fail_after_link {
+                "fail-after-link"
+            } else {
+                "fail-after-document"
+            };
+
+            let result = db.insert_companion_note_atomic_failing_at(
+                note_id,
+                &folder_id,
+                "generated-note",
+                "Generated note",
+                "---\nmeeting: \"[[Meeting]]\"\n---\n\nGenerated body",
+                &meeting_id,
+                42,
+                fail_after_link,
+            );
+
+            assert!(matches!(result, Err(AppError::Storage(_))));
+            assert!(db.get_note_row(note_id).unwrap().is_none());
+            assert_eq!(db.companion_note_for_meeting(&meeting_id).unwrap(), None);
+            let conn = db.lock();
+            let document_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM documents WHERE id = ?1",
+                    [note_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let link_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM links
+                      WHERE src_kind = 'note' AND src_id = ?1
+                        AND dst_kind = 'meeting' AND dst_id = ?2
+                        AND edge_type = 'companion'",
+                    rusqlite::params![note_id, meeting_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(document_rows, 0, "failure must leave no orphan note row");
+            assert_eq!(link_rows, 0, "failure must leave no partial companion edge");
+        }
+    }
+
+    #[test]
+    fn companion_birth_commits_body_meeting_id_and_required_link_together() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = db.ensure_notes_root().unwrap();
+        let markdown = "---\nmeeting: \"[[Meeting]]\"\n---\n\nGenerated body";
+
+        db.insert_companion_note_atomic(
+            "companion-ok",
+            &folder_id,
+            "generated-note",
+            "Generated note",
+            markdown,
+            &meeting_id,
+            42,
+        )
+        .unwrap();
+
+        let row = db.get_note_row("companion-ok").unwrap().unwrap();
+        assert_eq!(row.text, markdown);
+        assert_eq!(
+            db.companion_note_for_meeting(&meeting_id).unwrap().as_deref(),
+            Some("companion-ok")
+        );
+        let link_rows: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links
+                  WHERE src_kind = 'note' AND src_id = 'companion-ok'
+                    AND dst_kind = 'meeting' AND dst_id = ?1
+                    AND edge_type = 'companion'",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(link_rows, 1);
+    }
+
+    #[test]
+    fn companion_birth_cannot_broaden_nonempty_locked_folder_birth() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        db.insert_note_folder(
+            &NoteFolder {
+                id: "ordinary-folder".into(),
+                name: "Ordinary".into(),
+                path: "Ordinary".into(),
+                parent_id: None,
+                locked: false,
+                unlocked: false,
+                is_root: false,
+                kind: "note".into(),
+            },
+            "2026-07-22T12:00:00Z",
+        )
+        .unwrap();
+        db.set_folder_locked("ordinary-folder", true, Some(b"wrapped-key"))
+            .unwrap();
+
+        let result = db.insert_companion_note_atomic(
+            "must-not-exist",
+            "ordinary-folder",
+            "generated-note",
+            "Generated note",
+            "non-empty generated body",
+            &meeting_id,
+            42,
+        );
+
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert!(db.get_note_row("must-not-exist").unwrap().is_none());
     }
 
     #[test]

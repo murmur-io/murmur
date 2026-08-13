@@ -214,6 +214,7 @@ pub fn run() {
             commands::get_fact_receipt,
             commands::append_to_companion_note,
             commands::get_or_create_companion_note,
+            commands::convert_meeting_to_note,
             commands::delete_companion_note_if_empty,
             commands::import_document,
             commands::import_text,

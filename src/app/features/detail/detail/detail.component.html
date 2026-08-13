@@ -274,6 +274,39 @@
         }
       </div>
     } @else {
+      <app-meeting-command-bar
+        [meetingId]="d.meeting.id"
+        [folderId]="d.meeting.folderId ?? null"
+        [notePresent]="!!note()"
+        [provenance]="provenanceLabel()"
+        [busy]="busy()"
+        [converting]="converting()"
+        [renaming]="renaming()"
+        [editing]="editing()"
+        [exporting]="exporting()"
+        [exportingCanvas]="exportingCanvas()"
+        [linking]="linking()"
+        [keepsMasters]="keepsMasters()"
+        [hasAudio]="!!audioSrc()"
+        [moveOpen]="moveOpen()"
+        [exportMsg]="exportMsg()"
+        (convert)="convertToNote(d.meeting.id, $event)"
+        (resummarize)="resummarize(d.meeting.id)"
+        (rename)="startRename()"
+        (move)="toggleMove()"
+        (moved)="onMoved($event)"
+        (closeMove)="closeMove()"
+        (delete)="askDelete()"
+        (copyMd)="copyMarkdown()"
+        (saveMd)="saveMarkdown(d.meeting.id, d.meeting.title)"
+        (savePdf)="saveAsPdf()"
+        (exportCanvas)="exportCanvas(d.meeting.id)"
+        (saveAudio)="saveAudio(d.meeting.id, d.meeting.title)"
+        (exportMaster)="exportMaster($event, d.meeting.id, d.meeting.title)"
+        (linkGraph)="linkGraph()"
+        (edit)="startEdit()"
+      />
+
       <!-- TAB BAR (Note · Audio · Share) — page-scale segmented control. -->
       <app-detail-tabs
         [tabs]="detailTabs"
