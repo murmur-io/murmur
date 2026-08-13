@@ -29,6 +29,7 @@ import {
 } from "../org-share-sheet/org-share-sheet.component";
 import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { AccountSessionService } from "../../../services/account-session.service";
 
 /** The step the in-flow "Share with a person" panel is showing. */
 export type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
@@ -90,6 +91,7 @@ export class SharePanelComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly accountSession = inject(AccountSessionService);
 
   // --- Inputs from the shell ------------------------------------------------
   /** THIS meeting's id (null while the detail is loading), the shares filter key. */
@@ -491,7 +493,8 @@ export class SharePanelComponent {
     this.unlocking.set(true);
     this.gateError.set(null);
     try {
-      await this.ipc.unlockSharingWithBiometric();
+      const status = await this.ipc.unlockSharingWithBiometric();
+      this.accountSession.accept(status);
       // Re-read the (now unlocked) status + load the shares for this note.
       await this.refresh();
       if (!this.accountStatus()?.unlockedForSharing) {
