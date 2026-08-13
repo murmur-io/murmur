@@ -66,6 +66,43 @@
         }
     }
 
+    fn switch_ask_to_local_under_lifecycle(state: &AppState) {
+        let mut dto = {
+            let config = state.config.lock().unwrap();
+            config_to_dto(&config)
+        };
+        dto.role_ask_connection = crate::summarize::roles::CONN_LOCAL.to_string();
+        save_config_inner(state, dto).unwrap();
+    }
+
+    struct BudgetMutationProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::summarize::provider::SummarizerProvider for BudgetMutationProvider {
+        fn id(&self) -> &str {
+            "budget-mutation-spy"
+        }
+
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+
+        async fn summarize(
+            &self,
+            _request: &crate::summarize::provider::SummarizeRequest,
+        ) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn complete(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("stale answer".into())
+        }
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -151,8 +188,8 @@
             detail: "PROJ-1 not found in Jira".into(),
             url: String::new(),
         };
-        let e2 =
-            apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding]).unwrap_err();
+        let e2 = apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding])
+            .unwrap_err();
         assert!(
             matches!(e2, AppError::Locked(_)),
             "apply must fail Locked, got: {e2:?}"
@@ -346,7 +383,8 @@
             url: "https://x/browse/PROJ-1".into(),
         };
         let once =
-            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding.clone()]).unwrap();
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding.clone()])
+                .unwrap();
         assert!(
             once.markdown.contains("> ⧗ note says"),
             "inline marker present"
@@ -366,7 +404,8 @@
         assert_eq!(db_md, once.markdown);
 
         // Re-apply: neither region stacks (one inline marker, one fenced callout).
-        let twice = apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
+        let twice =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
         assert_eq!(
             twice.markdown.matches("(via Jira)").count(),
             2,
@@ -376,7 +415,8 @@
         assert_eq!(twice.markdown.matches("<!-- murmur:verify -->").count(), 1);
 
         // Empty findings: markers + callout stripped, the ORIGINAL note restored byte-exact.
-        let undone = apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
+        let undone =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
         assert_eq!(
             undone.markdown, original,
             "byte-exact undo through the command"
@@ -781,6 +821,60 @@
         let to_dst: Vec<_> = edges.iter().filter(|e| e.other_id == "dst").collect();
         assert_eq!(to_dst.len(), 1, "exactly one chip for the pair");
         assert!(to_dst[0].manual, "the chip is flagged removable-manual");
+    }
+
+    /// Exact dashboard history expands visible linked neighbours. The derived-wikilink replacement
+    /// must therefore share the lifecycle interval used by dashboard-history authorization and
+    /// hydration: it cannot replace the live edge set while that exact witness is being consumed.
+    #[test]
+    fn derived_wikilink_replacement_waits_for_history_lifecycle_interval() {
+        let state = Arc::new(build_state("wikilink-history-lifecycle"));
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(
+            &state.db,
+            "src",
+            "f-open",
+            "Source Note",
+            "See [[Target Note]].",
+        );
+        seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
+
+        let lifecycle = lifecycle_guard(state.as_ref());
+        let worker_state = Arc::clone(&state);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            index_wikilinks_best_effort(
+                worker_state.as_ref(),
+                crate::links::LinkKind::Note,
+                "src",
+                "See [[Target Note]].",
+            );
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "derived link replacement must wait for an active history lifecycle interval"
+        );
+        assert_eq!(
+            link_count_in(&state, "note", "src", "wikilink"),
+            0,
+            "no linked-neighbour membership may change before history hydration releases the interval"
+        );
+
+        drop(lifecycle);
+        done_rx.recv().unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            link_count_in(&state, "note", "src", "wikilink"),
+            1,
+            "the replacement lands after the history lifecycle interval"
+        );
     }
 
     /// Helper mirroring db.rs `link_count` for the command-test module.
@@ -1314,14 +1408,18 @@
 
         // No matching candidate → None (the caller surfaces the primary error).
         assert!(
-            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new)).is_none()
+            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new))
+                .is_none()
         );
         // AAD binding holds: the right KEK under the WRONG folder id must not unwrap.
         assert!(
-            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new)).is_none()
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new))
+                .is_none()
         );
         // The already-tried primary is skipped even if listed as a candidate.
-        assert!(try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none());
+        assert!(
+            try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none()
+        );
         // With NO already-tried key (the primary release itself failed), all candidates are tried.
         let (_, winner2, _) = try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", None)
             .expect("recovery with no primary must still find the sealing KEK");
@@ -1540,7 +1638,8 @@
     fn refresh_failure_fallback_policy() {
         let auth = refresh_failure_fallback(AppError::Auth("refused".into()), "cached".into());
         assert!(matches!(auth, Err(AppError::Auth(_))));
-        let net = refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
+        let net =
+            refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
         assert_eq!(net.unwrap(), "cached");
         let storage = refresh_failure_fallback(AppError::Storage("disk".into()), "cached".into());
         assert_eq!(storage.unwrap(), "cached");
@@ -1756,8 +1855,12 @@
             .set_folder_locked(&target.id, true, Some(&b"wrapped"[..]))
             .unwrap();
 
-        let again =
-            block_on(accept_share_inner(&state, "share-locked-idem".to_string(), None)).unwrap();
+        let again = block_on(accept_share_inner(
+            &state,
+            "share-locked-idem".to_string(),
+            None,
+        ))
+        .unwrap();
         assert_eq!(again.meeting_id, first.meeting_id);
         assert_eq!(again.title, "🔒 Locked");
     }
@@ -1802,7 +1905,8 @@
         );
 
         // (c) Replay to the WRONG recipient (grant addressed to `recipient`, opened by `attacker`).
-        let attacker = derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
+        let attacker =
+            derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
         let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-c", 1);
         let e = accept_ingest_verified(
             &state, &target, &attacker, &sender_fp, "s", &up, &content, "s-c", 1, 1,
@@ -3893,8 +3997,8 @@
         ));
 
         // STUB (default install): 0 imported, NO synthetic meeting left behind.
-        let n =
-            import_memories_inner(&state.db, &crate::reason::StubReasoner, true, "I like tea").unwrap();
+        let n = import_memories_inner(&state.db, &crate::reason::StubReasoner, true, "I like tea")
+            .unwrap();
         assert_eq!(n, 0);
         assert_eq!(
             count_import_meetings(&state.db),
@@ -3904,8 +4008,8 @@
         assert!(state.db.user_facts_all().unwrap().is_empty());
 
         // REAL extraction: 2 added, anchored to ONE synthetic meeting, visible via the gated read.
-        let n =
-            import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text").unwrap();
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
+            .unwrap();
         assert_eq!(n, 2);
         assert_eq!(count_import_meetings(&state.db), 1);
         let visible = state.db.list_user_facts_visible(&none).unwrap();
@@ -3919,8 +4023,8 @@
             .all(|f| f.meeting_id.as_deref().unwrap().starts_with("import-")));
 
         // RE-IMPORT of the same text: pure dedup — 0 new, and NO second synthetic meeting.
-        let n =
-            import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text").unwrap();
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
+            .unwrap();
         assert_eq!(n, 0, "re-import must reconcile to NoOps");
         assert_eq!(
             count_import_meetings(&state.db),
@@ -4605,7 +4709,8 @@
         let state = build_state("lock-clears-live");
         make_open_folder(&state.db, "f-lock", "Secret");
         seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
-        *state.live_transcript.lock().unwrap() = "stale tail of the just-recorded meeting".to_string();
+        *state.live_transcript.lock().unwrap() =
+            "stale tail of the just-recorded meeting".to_string();
         assert!(
             state.recorder.lock().unwrap().is_none(),
             "precondition: not recording"
@@ -5089,10 +5194,16 @@
     fn discard_with_dev_kek_refuses_unproven_keychain_absence() {
         let state = build_state("discard-dev-kek-fail-closed");
         make_open_folder(&state.db, "f-lock", "Secret");
-        seed_meeting(&state.db, "m1", "# still recoverable elsewhere", Some("f-lock"));
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# still recoverable elsewhere",
+            Some("f-lock"),
+        );
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
         let foreign_wrapped =
-            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
+                .unwrap();
         state
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
@@ -5180,7 +5291,8 @@
 
         // Make the folder unrecoverable (foreign wrapped key no candidate holds).
         let foreign_wrapped =
-            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
+                .unwrap();
         state
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
@@ -5660,8 +5772,8 @@
         let state = build_state("text-import");
         make_open_folder(&state.db, "f-open", "Project");
 
-        let id =
-            import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open").unwrap();
+        let id = import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open")
+            .unwrap();
         assert_eq!(
             get_document_inner(&state, &id).unwrap(),
             "We ship the beta on Friday.",
@@ -6535,7 +6647,8 @@
             detail: "secret link".to_string(),
             url: Some("[[Secret]]".to_string()),
         };
-        let stored = crate::enrich::apply_link_markers("# secret prose\n", std::slice::from_ref(&hit));
+        let stored =
+            crate::enrich::apply_link_markers("# secret prose\n", std::slice::from_ref(&hit));
         let id = create_note_inner(&state, Some(&fid), "Sealed note").unwrap();
         update_note_doc_inner(&state, &id, "Sealed note", &stored).unwrap();
         lock_folder_inner(&state, fid.clone()).unwrap();
@@ -6631,7 +6744,8 @@
     fn note_markdown_survives_lock_unlock_byte_identical() {
         let state = build_state("note-seal-cycle");
         let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
-        let original = "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
+        let original =
+            "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
         let id = create_note_inner(&state, Some(&fid), "Decyzja").unwrap();
         update_note_doc_inner(&state, &id, "Decyzja", original).unwrap();
 
@@ -6740,7 +6854,8 @@
         let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
 
         // Cheap save: body persisted + retrievable via get_note, updated_at set…
-        let now = save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        let now =
+            save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
         let doc = get_note_inner(&state, &id).unwrap();
         assert_eq!(doc.markdown, "Alpha bravo cheap-save body.");
         assert_eq!(doc.updated_at, now);
@@ -8523,7 +8638,8 @@
         for n in state.db.notes_in_folder(folder_id).unwrap() {
             if let Some(blob) = &n.content_blob {
                 let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
-                let md = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                let md =
+                    String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
                 state
                     .db
                     .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
@@ -8934,7 +9050,8 @@
             calls: std::sync::atomic::AtomicUsize::new(0),
             saw_guard_held: std::sync::atomic::AtomicBool::new(false),
         };
-        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe)).unwrap();
+        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe))
+            .unwrap();
         assert!(
             probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the note re-index must actually run (the probe is exercised)"
@@ -9193,7 +9310,8 @@
 
         // PASS 2 — MODEL PRESENT (the model-arrived-later recovery the audit gap describes).
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
         assert_eq!(meetings, 1, "the note-carrying meeting is indexed");
         assert_eq!(
             docs, 2,
@@ -9209,7 +9327,8 @@
 
         // PASS 3 — IDEMPOTENT: full coverage ⇒ a re-run touches nothing.
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
         assert_eq!((meetings, docs), (0, 0), "re-run is a no-op");
     }
 
@@ -9270,7 +9389,8 @@
         }
 
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
         assert_eq!(
             (meetings, docs),
             (0, 0),
@@ -9897,12 +10017,7 @@
         }
         std::fs::write(&legacy, raw).unwrap();
         let recording = crate::audio::source::adopt_legacy_raw_recording(
-            &state.db,
-            meeting_id,
-            &legacy,
-            48_000,
-            None,
-            &inflight,
+            &state.db, meeting_id, &legacy, 48_000, None, &inflight,
         )
         .unwrap();
         std::fs::remove_file(legacy).unwrap();
@@ -10033,8 +10148,7 @@
             let folder_id = format!("f-{}", uuid::Uuid::new_v4());
             make_open_folder(&state.db, &folder_id, "CleanupLock");
             let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
-            let fixture =
-                stage_released_archived_generation(&state, &meeting_id, Some(&folder_id));
+            let fixture = stage_released_archived_generation(&state, &meeting_id, Some(&folder_id));
 
             corrupt_archived_generation(&fixture);
             assert!(lock_folder_inner(&state, folder_id.clone()).is_err());
@@ -10193,7 +10307,10 @@
             let raw_path = active.mic_path.clone();
             assert!(move_into_locked_folder(&state, &active_id, &folder_id).is_err());
             assert_eq!(state.db.folder_for_meeting(&active_id).unwrap(), None);
-            assert!(raw_path.exists(), "refused Move preserves the exact raw source");
+            assert!(
+                raw_path.exists(),
+                "refused Move preserves the exact raw source"
+            );
             active.release_for_recovery(&state.db).unwrap();
         });
         std::fs::remove_dir_all(app_dir).unwrap();
@@ -10290,7 +10407,8 @@
         ));
 
         // Happy path: Error + a real on-disk WAV → claimed (Error → Recording), path resolved.
-        let wav = std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
+        let wav =
+            std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
         std::fs::write(&wav, b"RIFF-fake").unwrap();
         seed_meeting(&state.db, "m-retry", "# err", None);
         state
@@ -10336,7 +10454,8 @@
 
         // Establish a real locked folder and verified encrypted audio, then session-unlock just
         // long enough to capture the one-shot salvage CK.
-        let dir = std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-raced.wav");
@@ -10487,12 +10606,8 @@
             .content_blob;
 
         let replacement_ck = crate::crypto::random_key().unwrap();
-        let replacement_wrapped = crate::crypto::encrypt(
-            &kek,
-            &replacement_ck,
-            &aad_wrapped_ck("f-generation"),
-        )
-        .unwrap();
+        let replacement_wrapped =
+            crate::crypto::encrypt(&kek, &replacement_ck, &aad_wrapped_ck("f-generation")).unwrap();
         state
             .db
             .set_folder_locked("f-generation", true, Some(&replacement_wrapped))
@@ -10539,7 +10654,12 @@
     fn post_await_result_gate_refuses_cached_plaintext_after_relock() {
         let state = build_state("post-await-result-gate");
         make_open_folder(&state.db, "f-result", "Result");
-        seed_meeting(&state.db, "m-result", "# cached plaintext", Some("f-result"));
+        seed_meeting(
+            &state.db,
+            "m-result",
+            "# cached plaintext",
+            Some("f-result"),
+        );
         lock_folder_inner(&state, "f-result".into()).unwrap();
 
         let cached_markdown = "# cached plaintext".to_string();
@@ -10563,6 +10683,622 @@
         ));
     }
 
+    /// Regression for a shipped deadlock: Living Answer preflight already owns the non-reentrant
+    /// lifecycle mutex, so its visibility witness must use the under-lifecycle snapshot seam. This
+    /// drives the exact headless preflight called by the Tauri command and fails deterministically
+    /// if that path ever tries to acquire the same mutex twice.
+    #[test]
+    fn living_answer_refresh_preflight_does_not_relock_the_lifecycle_mutex() {
+        let state = Arc::new(build_state("living-answer-preflight-no-relock"));
+        state
+            .db
+            .insert_dashboard(
+                "board-preflight",
+                "Board",
+                None,
+                None,
+                "2026-08-13T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "tile-preflight",
+                "board-preflight",
+                4,
+                "What changed?",
+                "[]",
+                "2026-08-13T10:00:01Z",
+            )
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = crate::commands::dashboards::refresh_dashboard_answer_preflight(
+                &state,
+                "board-preflight",
+                "tile-preflight",
+                "What changed?",
+            );
+            tx.send(result.map(|(_, context, _, _, _)| context.packed_corpus))
+                .unwrap();
+        });
+
+        let corpus = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Living Answer preflight deadlocked on the lifecycle mutex")
+            .unwrap();
+        assert!(corpus.is_empty(), "the board contains only the excluded cache");
+    }
+
+    #[test]
+    fn save_config_waits_for_the_content_lifecycle_before_changing_ask_dispatch() {
+        let state = Arc::new(build_state("save-config-lifecycle"));
+        let mut dto = {
+            let config = state.config.lock().unwrap();
+            config_to_dto(&config)
+        };
+        dto.role_ask_connection = crate::summarize::roles::CONN_LOCAL.to_string();
+
+        let lifecycle = lifecycle_guard(&state);
+        let writer_state = state.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            tx.send(save_config_inner(&writer_state, dto)).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("config writer did not reach save_config_inner");
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_ne!(
+            state.config.lock().unwrap().role_ask_connection,
+            crate::summarize::roles::CONN_LOCAL,
+            "config must remain the old complete snapshot while lifecycle is held"
+        );
+        drop(lifecycle);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("config writer stayed blocked after lifecycle release")
+            .unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().role_ask_connection,
+            crate::summarize::roles::CONN_LOCAL
+        );
+    }
+
+    #[test]
+    fn ask_dispatch_generation_defeats_provider_aba_and_noop_saves() {
+        let state = build_state("ask-dispatch-aba");
+        let start = state.db.ask_dispatch_generation().unwrap();
+        let original = {
+            let config = state.config.lock().unwrap();
+            config_to_dto(&config)
+        };
+        save_config_inner(&state, original.clone()).unwrap();
+        assert_eq!(state.db.ask_dispatch_generation().unwrap(), start);
+
+        let mut changed = original.clone();
+        changed.role_ask_connection = crate::summarize::PROVIDER_GATEWAY.to_string();
+        changed.role_ask_model = "same-budget-model".to_string();
+        save_config_inner(&state, changed).unwrap();
+        assert_eq!(state.db.ask_dispatch_generation().unwrap(), start + 1);
+
+        save_config_inner(&state, original.clone()).unwrap();
+        assert_eq!(
+            state.db.ask_dispatch_generation().unwrap(),
+            start + 2,
+            "returning to byte-identical config must not revive generation N"
+        );
+
+        let mut memory_disabled = original;
+        memory_disabled.user_memory_enabled = false;
+        save_config_inner(&state, memory_disabled).unwrap();
+        assert_eq!(
+            state.db.ask_dispatch_generation().unwrap(),
+            start + 3,
+            "turning user memory off must revoke prompts captured while it was enabled"
+        );
+    }
+
+    #[test]
+    fn malformed_ask_dispatch_generation_fails_closed_and_cannot_be_coerced() {
+        let state = build_state("ask-dispatch-malformed");
+        {
+            let conn = state.db.lock();
+            conn.execute_batch(
+                "PRAGMA ignore_check_constraints=ON;
+                 UPDATE ask_dispatch_state SET generation='malformed' WHERE singleton=1;
+                 PRAGMA ignore_check_constraints=OFF;",
+            )
+            .unwrap();
+        }
+        assert!(state.db.ask_dispatch_generation().is_err());
+        assert!(state.db.advance_ask_dispatch_generation().is_err());
+        let raw: (String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT typeof(generation),CAST(generation AS TEXT)
+                   FROM ask_dispatch_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw, ("text".into(), "malformed".into()));
+    }
+
+    #[test]
+    fn history_commit_and_ipc_response_share_one_lifecycle_interval() {
+        let state = Arc::new(build_state("ask-history-atomic-response"));
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        let ask_dispatch = {
+            let _lifecycle = lifecycle_guard(&state);
+            let config = state.config.lock().unwrap().clone();
+            capture_ask_dispatch_snapshot_under_lifecycle(&state, &config).unwrap()
+        };
+        let (committed_tx, committed_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_state = state.clone();
+        let worker_snapshot = snapshot.clone();
+        let worker_dispatch = ask_dispatch.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = finish_persisted_ask_send_after_await_with_hook(
+                &worker_state,
+                &worker_snapshot,
+                &worker_dispatch,
+                &crate::storage::models::AskConversationScope::Vault,
+                "question",
+                "answer".into(),
+                || {
+                    committed_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+            done_tx.send(result.map(|_| ())).unwrap();
+        });
+        committed_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("finalizer did not commit");
+
+        let writer_state = state.clone();
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            writer_started_tx.send(()).unwrap();
+            let mut dto = {
+                let config = writer_state.config.lock().unwrap();
+                config_to_dto(&config)
+            };
+            dto.role_ask_connection = crate::summarize::roles::CONN_LOCAL.to_string();
+            writer_tx
+                .send(save_config_inner(&writer_state, dto))
+                .unwrap();
+        });
+        writer_started_rx.recv().unwrap();
+        assert!(matches!(
+            writer_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        writer_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversation_messages", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    /// A dashboard witness authorizes one exact provider/config projection. Changing the Ask role
+    /// after preflight must stop every continuation before plaintext is hydrated/dispatched,
+    /// persisted, cached, or serialized back across IPC.
+    #[test]
+    fn ask_dispatch_mutation_invalidates_history_dispatch_cache_and_response() {
+        let state = Arc::new(build_state("ask-budget-mutation"));
+        state
+            .db
+            .insert_dashboard(
+                "board-budget",
+                "Budget",
+                None,
+                None,
+                "2026-08-13T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "tile-budget",
+                "board-budget",
+                4,
+                "What changed?",
+                "[]",
+                "2026-08-13T10:00:01Z",
+            )
+            .unwrap();
+        let old_budget = {
+            let config = state.config.lock().unwrap();
+            let connection = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                &config,
+            )
+            .connection;
+            crate::summarize::vault_context::budget_for(&connection)
+        };
+        let context = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-budget",
+            &HashSet::new(),
+            old_budget,
+            &[],
+            None,
+        )
+        .unwrap();
+        let meeting_context = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-budget",
+            &HashSet::new(),
+            old_budget.min(crate::summarize::chat::MAX_PINNED_SOURCE_CHARS),
+            &[],
+            Some("meeting-anchor"),
+        )
+        .unwrap();
+        let living_context = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-budget",
+            &HashSet::new(),
+            old_budget,
+        )
+        .unwrap();
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        let committed = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "first question",
+            "first answer",
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&context.witness),
+        )
+        .unwrap();
+
+        switch_ask_to_local_under_lifecycle(&state);
+        let new_budget = {
+            let config = state.config.lock().unwrap();
+            let connection = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                &config,
+            )
+            .connection;
+            crate::summarize::vault_context::budget_for(&connection)
+        };
+        assert_ne!(old_budget, new_budget, "the fixture must change Ask budget");
+
+        let preflight = state
+            .db
+            .ask_conversation_preflight(
+                &crate::storage::models::AskConversationScope::Vault,
+                &committed.conversation_id,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(
+            preflight.is_none(),
+            "old dispatch generation must be rejected before history hydration"
+        );
+        state
+            .db
+            .lock()
+            .execute_batch(&format!(
+                "UPDATE ask_conversations SET title=x'80' WHERE id='{id}';
+                 UPDATE ask_conversation_messages SET content=x'80' WHERE conversation_id='{id}';",
+                id = committed.conversation_id
+            ))
+            .unwrap();
+        list_ask_conversations_inner(
+            &state,
+            &crate::storage::models::AskConversationScope::Vault,
+        )
+        .expect("stale-budget list must reject metadata before hydrating the poisoned title");
+        assert!(matches!(
+            load_ask_conversation_inner(
+                &state,
+                &crate::storage::models::AskConversationScope::Vault,
+                &committed.conversation_id,
+            ),
+            Err(AppError::Locked(_))
+        ));
+
+        let provider = Arc::new(BudgetMutationProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let gate_state = state.clone();
+        let stale_witness = context.witness.clone();
+        let admission = crate::state::ContentDispatchAdmission::for_test(
+            Arc::new(Mutex::new(())),
+            move || {
+                let _lifecycle = lifecycle_guard(&gate_state);
+                crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
+                    &gate_state,
+                    &stale_witness,
+                    &HashSet::new(),
+                )
+            },
+        );
+        let dispatch_error = block_on(ask_vault_prepacked_dashboard_dispatch(
+            &context,
+            "second question",
+            &[],
+            admission,
+            {
+                let provider = provider.clone();
+                move || {
+                    Ok(provider
+                        as Arc<dyn crate::summarize::provider::SummarizerProvider>)
+                }
+            },
+        ))
+        .unwrap_err();
+        assert!(matches!(dispatch_error, AppError::Locked(_)));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            persist_ask_exchange_after_await(
+                &state,
+                &snapshot,
+                &crate::storage::models::AskConversationScope::Vault,
+                Some(&committed.conversation_id),
+                None,
+                "second question",
+                "stale answer",
+                &[],
+                &[],
+                &[],
+                &[],
+                Some(&context.witness),
+            ),
+            Err(AppError::Locked(_))
+        ));
+        let message_count: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM ask_conversation_messages WHERE conversation_id=?1",
+                [&committed.conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_count, 2, "stale exchange must add no history turns");
+
+        let payload = crate::storage::models::AskConversationSendResult {
+            conversation_id: committed.conversation_id.clone(),
+            user_message_id: committed.user_message_id.clone(),
+            assistant_message_id: committed.assistant_message_id.clone(),
+            answer: "stale answer".into(),
+            sources: Vec::new(),
+            citations: Vec::new(),
+        };
+        assert!(matches!(
+            serialize_durable_send_response(
+                &state,
+                &snapshot,
+                Some(&context.witness),
+                &payload,
+            ),
+            Err(AppError::Locked(_))
+        ));
+        {
+            let _lifecycle = lifecycle_guard(&state);
+            assert!(matches!(
+                crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
+                    &state,
+                    &meeting_context.witness,
+                    &HashSet::new(),
+                ),
+                Err(AppError::Locked(_))
+            ));
+        }
+
+        assert!(matches!(
+            crate::commands::dashboards::persist_dashboard_living_answer_after_await(
+                &state,
+                &snapshot,
+                &living_context.witness,
+                &[],
+                "board-budget",
+                "tile-budget",
+                "What changed?",
+                "stale answer",
+                "2026-08-13T10:01:00Z",
+            ),
+            Err(AppError::Locked(_))
+        ));
+        let answer_type: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT typeof(living_answer) FROM dashboard_tiles WHERE id='tile-budget'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(answer_type, "null", "stale answer must add no cache content");
+    }
+
+    #[test]
+    fn ask_writer_withholds_old_living_answer_without_hydrating_or_clearing_it() {
+        let state = build_state("ask-budget-existing-cache");
+        state
+            .db
+            .insert_dashboard(
+                "board-cache",
+                "Cache",
+                None,
+                None,
+                "2026-08-13T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "tile-cache",
+                "board-cache",
+                4,
+                "What changed?",
+                "[]",
+                "2026-08-13T10:00:01Z",
+            )
+            .unwrap();
+        let old_budget = {
+            let config = state.config.lock().unwrap();
+            resolved_ask_corpus_budget(&config)
+        };
+        let old_context = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-cache",
+            &HashSet::new(),
+            old_budget,
+        )
+        .unwrap();
+        assert!(state
+            .db
+            .store_dashboard_living_answer_cas(
+                "tile-cache",
+                "board-cache",
+                "What changed?",
+                "Old-budget answer",
+                "2026-08-13T10:01:00Z",
+                "[]",
+                old_context.witness.generation,
+                &old_context.witness.input_digest,
+                old_budget,
+            )
+            .unwrap());
+        let tile = state.db.get_dashboard_tile("tile-cache").unwrap().unwrap();
+        assert!(matches!(
+            crate::commands::dashboards::resolve_tile(&state.db, &tile, &HashSet::new()).unwrap(),
+            crate::commands::dashboards::TileData::LivingAnswer {
+                answer: Some(ref answer),
+                withheld: false,
+                ..
+            } if answer == "Old-budget answer"
+        ));
+        let general_before = state.db.dashboard_context_state("board-cache").unwrap().0;
+        let structural_before = state
+            .db
+            .dashboard_structural_context_state("board-cache")
+            .unwrap()
+            .0;
+
+        switch_ask_to_local_under_lifecycle(&state);
+
+        assert_eq!(state.db.dashboard_context_state("board-cache").unwrap().0, general_before);
+        assert_eq!(
+            state
+                .db
+                .dashboard_structural_context_state("board-cache")
+                .unwrap()
+                .0,
+            structural_before,
+            "a provider-budget change does not change board structure"
+        );
+        assert!(matches!(
+            state
+                .db
+                .dashboard_living_answer_preflight("tile-cache")
+                .unwrap()
+                .unwrap()
+                .answer,
+            crate::storage::dashboards_store::LivingAnswerCacheState::Valid { .. }
+        ));
+        assert!(matches!(
+            crate::commands::dashboards::resolve_tile(&state.db, &tile, &HashSet::new()).unwrap(),
+            crate::commands::dashboards::TileData::LivingAnswer {
+                ref question,
+                answer: None,
+                answered_at: None,
+                withheld: false,
+            } if question == "What changed?"
+        ));
+
+        let new_budget = {
+            let config = state.config.lock().unwrap();
+            resolved_ask_corpus_budget(&config)
+        };
+        let new_context = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-cache",
+            &HashSet::new(),
+            new_budget,
+        )
+        .unwrap();
+        assert!(state
+            .db
+            .store_dashboard_living_answer_cas(
+                "tile-cache",
+                "board-cache",
+                "What changed?",
+                "Fresh local answer",
+                "2026-08-13T10:02:00Z",
+                "[]",
+                new_context.witness.generation,
+                &new_context.witness.input_digest,
+                new_budget,
+            )
+            .unwrap());
+        let general_after_refresh = state.db.dashboard_context_state("board-cache").unwrap().0;
+        let structural_after_refresh = state
+            .db
+            .dashboard_structural_context_state("board-cache")
+            .unwrap()
+            .0;
+        let mut same_budget_dto = {
+            let config = state.config.lock().unwrap();
+            config_to_dto(&config)
+        };
+        same_budget_dto.note_language = "pl".to_string();
+        save_config_inner(&state, same_budget_dto).unwrap();
+        assert_eq!(
+            state.db.dashboard_context_state("board-cache").unwrap().0,
+            general_after_refresh,
+            "an unrelated same-budget save must not invalidate the answer"
+        );
+        assert_eq!(
+            state
+                .db
+                .dashboard_structural_context_state("board-cache")
+                .unwrap()
+                .0,
+            structural_after_refresh
+        );
+        assert!(matches!(
+            crate::commands::dashboards::resolve_tile(&state.db, &tile, &HashSet::new()).unwrap(),
+            crate::commands::dashboards::TileData::LivingAnswer {
+                answer: Some(ref answer),
+                withheld: false,
+                ..
+            } if answer == "Fresh local answer"
+        ));
+    }
+
     /// RED-before-GREEN Ask-history oracle: a relock/delete generation change after inference must
     /// prevent BOTH the IPC result and the atomic user+assistant write. No orphan thread survives.
     #[test]
@@ -10583,15 +11319,480 @@
             &[],
             &[],
             &[],
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, AppError::Locked(_)));
         let count: i64 = state
             .db
             .lock()
-            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0, "stale post-await result must persist no rows");
+    }
+
+    #[test]
+    fn dashboard_mutation_after_inference_writes_zero_history_rows() {
+        let state = build_state("ask-history-dashboard-race");
+        state
+            .db
+            .insert_dashboard("board-race", "X", None, None, "2026-08-06T10:00:00Z")
+            .unwrap();
+        let witness = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-race",
+            &HashSet::new(),
+            200_000,
+            &[],
+            None,
+        )
+        .unwrap()
+        .witness;
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+
+        state
+            .db
+            .insert_dashboard_tile(
+                "transient-tile",
+                "board-race",
+                "note",
+                Some("missing-note"),
+                None,
+                4,
+                None,
+                "2026-08-06T10:01:00Z",
+            )
+            .unwrap();
+        state.db.delete_dashboard_tile("transient-tile").unwrap();
+
+        let error = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "question",
+            "stale answer",
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&witness),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn dashboard_source_tail_mutation_beyond_packing_cutoff_writes_zero_history_rows() {
+        let state = build_state("ask-history-dashboard-source-tail");
+        make_open_folder(&state.db, "f-open", "Open");
+        let original = format!("{}TAIL-A", "prefix ".repeat(200));
+        seed_note_doc_cmd(&state.db, "source-note", "f-open", "Source", &original);
+        state
+            .db
+            .insert_dashboard("board-tail", "X", None, None, "2026-08-06T10:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_tile(
+                "source-tile",
+                "board-tail",
+                "note",
+                Some("source-note"),
+                None,
+                4,
+                None,
+                "2026-08-06T10:00:00Z",
+            )
+            .unwrap();
+        let before = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-tail",
+            &HashSet::new(),
+            300,
+            &[],
+            None,
+        )
+        .unwrap();
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+
+        let replacement = format!("{}TAIL-B", "prefix ".repeat(200));
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE documents SET text=?2 WHERE id=?1",
+                rusqlite::params!["source-note", replacement],
+            )
+            .unwrap();
+        let after = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-tail",
+            &HashSet::new(),
+            300,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            before.packed_corpus, after.packed_corpus,
+            "the changed tail must be wholly beyond the provider cutoff"
+        );
+        assert_ne!(before.witness.input_digest, after.witness.input_digest);
+
+        let error = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "question",
+            "stale answer",
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&before.witness),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a stale tail mutation must persist no history");
+    }
+
+    #[test]
+    fn empty_selected_source_title_mutation_writes_zero_history_rows() {
+        let state = build_state("ask-history-empty-source-title");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "empty-note", "f-open", "TITLE-A", "");
+        state
+            .db
+            .insert_dashboard("board-empty", "X", None, None, "now")
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_tile(
+                "empty-tile",
+                "board-empty",
+                "note",
+                Some("empty-note"),
+                None,
+                4,
+                None,
+                "now",
+            )
+            .unwrap();
+        let before = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-empty",
+            &HashSet::new(),
+            300,
+            &[],
+            None,
+        )
+        .unwrap();
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        assert!(before.packed_corpus.is_empty());
+
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE documents SET title='TITLE-B', name='TITLE-B' WHERE id='empty-note'",
+                [],
+            )
+            .unwrap();
+        let after = crate::commands::dashboards::dashboard_composite_context(
+            &state.db,
+            "board-empty",
+            &HashSet::new(),
+            300,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(before.packed_corpus, after.packed_corpus);
+        assert_ne!(before.witness.input_digest, after.witness.input_digest);
+
+        let error = persist_ask_exchange_after_await(
+            &state,
+            &snapshot,
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            None,
+            "question",
+            "stale answer",
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&before.witness),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn living_answer_relock_after_provider_writes_zero_cache_content() {
+        let state = build_state("living-answer-post-await-relock");
+        make_open_folder(&state.db, "f-living", "Living");
+        state
+            .db
+            .insert_dashboard("board-living", "X", None, None, "2026-08-06T10:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "tile-living",
+                "board-living",
+                4,
+                "Will it ship?",
+                r#"["f-living"]"#,
+                "2026-08-06T10:00:00Z",
+            )
+            .unwrap();
+        let witness = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-living",
+            &HashSet::new(),
+            200_000,
+        )
+        .unwrap()
+        .witness;
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+
+        state
+            .db
+            .set_folder_locked("f-living", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        bump_seal_epoch(&state);
+        let error = match crate::commands::dashboards::persist_dashboard_living_answer_after_await(
+            &state,
+            &snapshot,
+            &witness,
+            &["f-living".to_string()],
+            "board-living",
+            "tile-living",
+            "Will it ship?",
+            "STALE PROVIDER ANSWER",
+            "2026-08-06T10:01:00Z",
+        ) {
+            Ok(_) => panic!("stale answer was admitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AppError::Locked(_)));
+        let answer_type: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT typeof(living_answer) FROM dashboard_tiles WHERE id='tile-living'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(answer_type, "null", "a relock must admit no cached answer");
+    }
+
+    #[test]
+    fn living_answer_dashboard_mutation_after_provider_writes_zero_cache_content() {
+        let state = build_state("living-answer-post-await-mutation");
+        state
+            .db
+            .insert_dashboard("board-living", "X", None, None, "2026-08-06T10:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "tile-living",
+                "board-living",
+                4,
+                "Will it ship?",
+                "[]",
+                "2026-08-06T10:00:00Z",
+            )
+            .unwrap();
+        let witness = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-living",
+            &HashSet::new(),
+            200_000,
+        )
+        .unwrap()
+        .witness;
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        state
+            .db
+            .insert_dashboard_tile(
+                "mutation",
+                "board-living",
+                "promises",
+                None,
+                None,
+                4,
+                None,
+                "2026-08-06T10:00:30Z",
+            )
+            .unwrap();
+
+        let error = match crate::commands::dashboards::persist_dashboard_living_answer_after_await(
+            &state,
+            &snapshot,
+            &witness,
+            &[],
+            "board-living",
+            "tile-living",
+            "Will it ship?",
+            "STALE PROVIDER ANSWER",
+            "2026-08-06T10:01:00Z",
+        ) {
+            Ok(_) => panic!("stale answer was admitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AppError::Locked(_)));
+        let answer_type: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT typeof(living_answer) FROM dashboard_tiles WHERE id='tile-living'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(answer_type, "null");
+    }
+
+    #[test]
+    fn out_of_budget_linked_neighbour_replacement_writes_zero_cache_content() {
+        let state = build_state("living-answer-neighbour-replacement");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(
+            &state.db,
+            "source-note",
+            "f-open",
+            "Source",
+            &"source body ".repeat(300),
+        );
+        seed_note_doc_cmd(&state.db, "neighbour-a", "f-open", "A", "NEIGHBOUR-A");
+        seed_note_doc_cmd(&state.db, "neighbour-b", "f-open", "B", "NEIGHBOUR-B");
+        state.db.insert_link_for_test(
+            "note",
+            "source-note",
+            "note",
+            "neighbour-a",
+            "manual",
+            1.0,
+            "user",
+            "active",
+        );
+        state
+            .db
+            .insert_dashboard("board-link", "X", None, None, "2026-08-06T10:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_tile(
+                "source-tile",
+                "board-link",
+                "note",
+                Some("source-note"),
+                None,
+                4,
+                None,
+                "2026-08-06T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_dashboard_living_answer_tile(
+                "answer-tile",
+                "board-link",
+                4,
+                "What changed?",
+                "[]",
+                "2026-08-06T10:00:01Z",
+            )
+            .unwrap();
+        let before = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-link",
+            &HashSet::new(),
+            300,
+        )
+        .unwrap();
+        assert!(!before.packed_corpus.contains("NEIGHBOUR-A"));
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE links SET dst_id='neighbour-b' WHERE src_kind='note' AND src_id='source-note' AND edge_type='manual'",
+                [],
+            )
+            .unwrap();
+        let after = crate::commands::dashboards::living_answer_composite_context(
+            &state.db,
+            "board-link",
+            &HashSet::new(),
+            300,
+        )
+        .unwrap();
+        assert_eq!(
+            before.packed_corpus, after.packed_corpus,
+            "the selected neighbour must remain wholly outside the provider budget"
+        );
+        assert_ne!(before.witness.input_digest, after.witness.input_digest);
+
+        let error = match crate::commands::dashboards::persist_dashboard_living_answer_after_await(
+            &state,
+            &snapshot,
+            &before.witness,
+            &[],
+            "board-link",
+            "answer-tile",
+            "What changed?",
+            "STALE PROVIDER ANSWER",
+            "2026-08-06T10:01:00Z",
+        ) {
+            Ok(_) => panic!("stale neighbour answer was admitted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AppError::Locked(_)));
+        let answer_type: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT typeof(living_answer) FROM dashboard_tiles WHERE id='answer-tile'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(answer_type, "null", "a stale neighbour must persist no cache");
     }
 
     #[test]
@@ -10638,7 +11839,8 @@
             state
                 .db
                 .lock()
-                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
@@ -10661,14 +11863,15 @@
         bump_seal_epoch(&state);
 
         for snapshot in [&vault, &note] {
-            let result = require_durable_scope_for_dispatch(&state, snapshot);
+            let result = require_durable_scope_for_dispatch(&state, snapshot, None);
             assert!(matches!(result, Err(AppError::Locked(_))));
         }
         assert_eq!(
             state
                 .db
                 .lock()
-                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
@@ -10682,14 +11885,14 @@
         let snapshot = capture_meeting_content_snapshot(&state, "m-admission").unwrap();
         bump_seal_epoch(&state);
 
-        let result =
-            require_current_meeting_content_snapshot(&state, "m-admission", &snapshot);
+        let result = require_current_meeting_content_snapshot(&state, "m-admission", &snapshot);
         assert!(matches!(result, Err(AppError::Locked(_))));
         assert_eq!(
             state
                 .db
                 .lock()
-                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
@@ -10721,13 +11924,16 @@
             &[],
             &[],
             &dependencies,
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, AppError::Locked(_)));
         let count: i64 = state
             .db
             .lock()
-            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -10746,7 +11952,11 @@
         let initial_dependencies = state.db.visible_folder_ids(&HashSet::new()).unwrap();
         assert_eq!(initial_dependencies, vec!["f-visible".to_string()]);
 
-        state.unlocked_folders.lock().unwrap().insert("f-late".into());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-late".into());
         let committed = persist_ask_exchange_after_await(
             &state,
             &snapshot,
@@ -10759,6 +11969,7 @@
             &[],
             &[],
             &initial_dependencies,
+            None,
         )
         .unwrap();
 
@@ -10775,7 +11986,10 @@
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap()
         };
-        assert_eq!(dependencies, vec!["f-late".to_string(), "f-visible".to_string()]);
+        assert_eq!(
+            dependencies,
+            vec!["f-late".to_string(), "f-visible".to_string()]
+        );
     }
 
     /// An idempotent retry of an already-locked empty folder has no meeting/document ids for the
@@ -10805,7 +12019,9 @@
         let count: i64 = state
             .db
             .lock()
-            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -10930,12 +12146,7 @@
         std::fs::write(&wav, b"RIFF-archived-audio").unwrap();
 
         make_open_folder(&state.db, "f-crash", "Crash");
-        seed_meeting(
-            &state.db,
-            "m-crashed",
-            "# crashed salvage",
-            Some("f-crash"),
-        );
+        seed_meeting(&state.db, "m-crashed", "# crashed salvage", Some("f-crash"));
         state
             .db
             .finalize_meeting(
@@ -11041,7 +12252,8 @@
     #[test]
     fn relock_reblank_leaves_completed_meeting_even_with_audio_on_disk() {
         let state = build_state("relock-noloss-status-leg");
-        let dir = std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-sum.wav");
@@ -11080,7 +12292,10 @@
             !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
             "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
         );
-        assert!(wav.exists(), "the only plaintext audio copy must also survive");
+        assert!(
+            wav.exists(),
+            "the only plaintext audio copy must also survive"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11308,11 +12523,9 @@
             "get_config must carry the stored glossary to Settings"
         );
 
-        let mut old_client_json = serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
-        old_client_json
-            .as_object_mut()
-            .unwrap()
-            .remove("glossary");
+        let mut old_client_json =
+            serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
+        old_client_json.as_object_mut().unwrap().remove("glossary");
         let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
         assert_eq!(
             dto_to_config(omitted, &current).glossary,
@@ -12959,7 +14172,10 @@
             .unwrap();
         state
             .db
-            .set_note_doc_exported_hash("n1", Some(&crate::export::note_content_hash("# My Note\n")))
+            .set_note_doc_exported_hash(
+                "n1",
+                Some(&crate::export::note_content_hash("# My Note\n")),
+            )
             .unwrap();
         // The user edits the exported file behind Murmur's back.
         std::fs::write(&md, "# My Note\nMY EXTERNAL NOTE\n").unwrap();
@@ -13665,10 +14881,7 @@
 
         let mut old_client_json =
             serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
-        old_client_json
-            .as_object_mut()
-            .unwrap()
-            .remove("glossary");
+        old_client_json.as_object_mut().unwrap().remove("glossary");
         let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
         save_config_inner(&state, omitted).unwrap();
         assert_eq!(state.config.lock().unwrap().glossary, "Konnect = Connect");
@@ -13864,11 +15077,14 @@
         // The load sweep judges `provider_model` by `provider_id`, like the save boundary. It was
         // briefly pinned to `"claude_code"` here, which meant a legitimate long Anthropic id was
         // cleared on EVERY LAUNCH — silently, since load performs no user-visible edit.
-        let db = Db::open_with_key(&tmp_db_path("long-anthropic-model-load"), DB_KEY).expect("open");
+        let db =
+            Db::open_with_key(&tmp_db_path("long-anthropic-model-load"), DB_KEY).expect("open");
         db.migrate().expect("migrate");
         let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
-        db.set_setting("provider_id", "anthropic").expect("seed provider_id");
-        db.set_setting("provider_model", &long).expect("seed provider_model");
+        db.set_setting("provider_id", "anthropic")
+            .expect("seed provider_id");
+        db.set_setting("provider_model", &long)
+            .expect("seed provider_model");
         assert_eq!(
             crate::settings::config::AppConfig::load(&db)
                 .expect("load")
@@ -13880,8 +15096,10 @@
         // ...and the same id under an ARGV engine is still cleared, so the rule stayed a rule.
         let db = Db::open_with_key(&tmp_db_path("long-argv-model-load"), DB_KEY).expect("open");
         db.migrate().expect("migrate");
-        db.set_setting("provider_id", "claude_code").expect("seed provider_id");
-        db.set_setting("provider_model", &long).expect("seed provider_model");
+        db.set_setting("provider_id", "claude_code")
+            .expect("seed provider_id");
+        db.set_setting("provider_model", &long)
+            .expect("seed provider_model");
         assert_eq!(
             crate::settings::config::AppConfig::load(&db)
                 .expect("load")
@@ -13904,7 +15122,10 @@
     #[test]
     fn a_role_model_is_validated_against_its_own_connection() {
         let long_but_valid = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
-        assert!(long_but_valid.len() > 64, "fixture must exceed the argv ceiling");
+        assert!(
+            long_but_valid.len() > 64,
+            "fixture must exceed the argv ceiling"
+        );
 
         // ARGV arm: too long for `--model`, so it must not be stored.
         let current = crate::settings::config::AppConfig {
@@ -14055,11 +15276,20 @@
         // ONLY input is the connection.
         for body_arm in ["anthropic", "ollama", "gateway"] {
             assert!(!connection_builds_argv(body_arm));
-            assert!(model_predicate_for(body_arm)(&long), "{body_arm} sends JSON");
+            assert!(
+                model_predicate_for(body_arm)(&long),
+                "{body_arm} sends JSON"
+            );
         }
         for argv_arm in ["claude_code", "codex_cli", "", "some_future_cli"] {
-            assert!(connection_builds_argv(argv_arm), "{argv_arm} must fail closed to argv");
-            assert!(!model_predicate_for(argv_arm)(&long), "{argv_arm} builds argv");
+            assert!(
+                connection_builds_argv(argv_arm),
+                "{argv_arm} must fail closed to argv"
+            );
+            assert!(
+                !model_predicate_for(argv_arm)(&long),
+                "{argv_arm} builds argv"
+            );
         }
 
         // `provider_model` is the ONE exception, and deliberately so: it is ALWAYS strict, whatever
@@ -14272,7 +15502,8 @@
                 crate::commands::model_predicate_for(&target.connection)(&target.model),
                 "provider_id={provider_id:?} role={role_connection:?} resolved to connection {:?} \
                  with model {:?}, which that arm cannot send",
-                target.connection, target.model
+                target.connection,
+                target.model
             );
             argv_legs_asserted += 1;
         }
@@ -14371,9 +15602,9 @@
             let target = resolve(Role::Notes, &saved);
             let ledger = crate::summarize::effective_model_requested(&target, &saved);
             let wire = match target.connection.as_str() {
-                "claude_code" => after_model_flag(crate::summarize::claude_code::model_args(
-                    &target.model,
-                )),
+                "claude_code" => {
+                    after_model_flag(crate::summarize::claude_code::model_args(&target.model))
+                }
                 "codex_cli" => {
                     after_model_flag(crate::summarize::codex_cli::model_args(&target.model))
                 }
@@ -14405,7 +15636,10 @@
                     target.model.is_empty(),
                     "this leg needs an EMPTY resolved model to exercise the fallback path"
                 );
-                assert_eq!(ledger, "", "an argv arm has no config fallback, and must not gain one");
+                assert_eq!(
+                    ledger, "",
+                    "an argv arm has no config fallback, and must not gain one"
+                );
             }
             checked += 1;
         }
@@ -14458,7 +15692,10 @@
         }
         // A 512-byte id — the ceiling the loose predicate now permits — behaves the same.
         let max_len = "a".repeat(512);
-        assert_eq!(resolve_brain_model(None, Some(&max_len)).expect("resolve"), None);
+        assert_eq!(
+            resolve_brain_model(None, Some(&max_len)).expect("resolve"),
+            None
+        );
     }
 
     /// The load sweep and the save boundary must agree for EVERY stored `provider_id`, including
@@ -14469,7 +15706,8 @@
         let db = Db::open_with_key(&tmp_db_path("empty-provider-id"), DB_KEY).expect("open");
         db.migrate().expect("migrate");
         db.set_setting("provider_id", "").expect("seed provider_id");
-        db.set_setting("provider_model", &long).expect("seed provider_model");
+        db.set_setting("provider_model", &long)
+            .expect("seed provider_model");
         let loaded = crate::settings::config::AppConfig::load(&db).expect("load");
         // Whether an empty engine is even REACHABLE decides how much this leg matters. Record the
         // answer instead of assuming it: if load normalises the blank away, the divergence this
@@ -14601,10 +15839,16 @@
         };
         let target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Notes, &cfg);
         let ledger = crate::summarize::effective_model_requested(&target, &cfg);
-        assert_eq!(ledger, "", "with nothing configured the ledger records 'provider chose'");
+        assert_eq!(
+            ledger, "",
+            "with nothing configured the ledger records 'provider chose'"
+        );
 
-        let provider =
-            crate::summarize::anthropic::AnthropicProvider::with_effort(None, ledger.clone(), String::new());
+        let provider = crate::summarize::anthropic::AnthropicProvider::with_effort(
+            None,
+            ledger.clone(),
+            String::new(),
+        );
         assert_ne!(
             provider.model_for_test(),
             ledger,
@@ -14778,8 +16022,7 @@
         );
         // INJECTIVE, tested as a SET. Asserting each spelling on its own line is what let
         // `plain-model` and `plain_model` both become "Plain Model" unnoticed.
-        let labels: std::collections::HashSet<&String> =
-            options.iter().map(|o| &o.label).collect();
+        let labels: std::collections::HashSet<&String> = options.iter().map(|o| &o.label).collect();
         assert_eq!(labels.len(), ids.len(), "labels must stay distinguishable");
     }
 
@@ -14802,8 +16045,16 @@
         }
         // The looser predicate is looser on LENGTH ONLY. Every argv-injection shape stays refused
         // on both, because none of them is a real model id on any arm.
-        for hostile in ["--sandbox danger-full-access", "../../etc/passwd", "a b", "./m"] {
-            assert!(!valid_model_id(hostile), "{hostile:?} must be refused (argv)");
+        for hostile in [
+            "--sandbox danger-full-access",
+            "../../etc/passwd",
+            "a b",
+            "./m",
+        ] {
+            assert!(
+                !valid_model_id(hostile),
+                "{hostile:?} must be refused (argv)"
+            );
             assert!(
                 !valid_catalog_model_id(hostile),
                 "{hostile:?} must be refused (json body) — looser length must not mean looser shape"
@@ -14811,7 +16062,10 @@
         }
         // ...and the argv ceiling still bites where it belongs.
         let long = "a".repeat(65);
-        assert!(!valid_model_id(&long), "an argv id stays short-slug bounded");
+        assert!(
+            !valid_model_id(&long),
+            "an argv id stays short-slug bounded"
+        );
         assert!(valid_catalog_model_id(&long), "a body id may be longer");
     }
 
@@ -14877,7 +16131,10 @@
         );
         // Every legal connection resolves without ever being shown a model id.
         for conn in ["claude_code", "anthropic", "codex_cli", "local", "off"] {
-            assert!(static_connection_models(conn).is_ok(), "{conn} must resolve");
+            assert!(
+                static_connection_models(conn).is_ok(),
+                "{conn} must resolve"
+            );
         }
     }
 
@@ -14972,14 +16229,18 @@
         // Serialized shape the FE reads: `source` is a sibling of `options`, never inside them.
         let json = serde_json::to_value(&empty).expect("catalog serializes");
         assert_eq!(json["source"], "live");
-        assert!(json["options"].as_array().expect("options array").is_empty());
+        assert!(json["options"]
+            .as_array()
+            .expect("options array")
+            .is_empty());
     }
 
     /// An unknown connection id refuses with `InvalidArg` — never a panic, never an empty Ok.
     #[test]
     fn list_models_unknown_connection_refuses() {
         for conn in ["", "openai", "GATEWAY", "claude"] {
-            let err = static_connection_models(conn).expect_err("unknown connection must be refused");
+            let err =
+                static_connection_models(conn).expect_err("unknown connection must be refused");
             assert!(
                 matches!(err, AppError::InvalidArg(_)),
                 "expected InvalidArg for '{conn}', got: {err:?}"
@@ -16184,7 +17445,8 @@
         seed_locked_meeting_with_note(&state, "f-prev", "m-prev");
 
         // Sealed → refuse (the preview is a read, so it is gated too).
-        let err = preview_org_share_inner(&state, Some("m-prev".to_string()), None, true).unwrap_err();
+        let err =
+            preview_org_share_inner(&state, Some("m-prev".to_string()), None, true).unwrap_err();
         assert!(
             matches!(err, AppError::Locked(_)),
             "sealed preview must refuse"
@@ -16466,7 +17728,8 @@
         // PUBLISHER seals under hex(content_sha) — NOT the local row id. (The server would assign a
         // different item_id; we simulate that by using a DISTINCT server id below.)
         let publisher_nonce = org_item_nonce(&content_sha);
-        let (ciphertext, feed_sha) = seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
+        let (ciphertext, feed_sha) =
+            seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
         assert_eq!(feed_sha, content_sha, "the feed carries the PLAINTEXT hash");
 
         // CONSUMER derives the nonce from ONLY the feed's content_sha256 (it never learns row_id, and
@@ -16635,7 +17898,6 @@
                 None,
                 None,
                 Some("it-p"),
-                None,
             )
             .unwrap()
         };
@@ -16671,8 +17933,7 @@
                 assert!(!corpus.contains("POISON_FALLBACK"));
                 assert_eq!(corpus.matches("### [[").count(), 1);
                 assert!(
-                    corpus.chars().count()
-                        <= crate::summarize::vault_context::budget_for("ollama"),
+                    corpus.chars().count() <= crate::summarize::vault_context::budget_for("ollama"),
                     "the pinned Org corpus must honor the resolved local-provider budget"
                 );
                 assert!(sources.is_empty(), "an Org item is not a local VaultSource");
@@ -17611,7 +18872,9 @@
         );
         drop(lifecycle);
         let exported = worker.join().unwrap().unwrap().expect("exported path");
-        assert!(std::fs::read_to_string(exported).unwrap().contains("private body"));
+        assert!(std::fs::read_to_string(exported)
+            .unwrap()
+            .contains("private body"));
 
         let _ = std::fs::remove_dir_all(vault);
     }
@@ -18192,7 +19455,8 @@
             state
                 .db
                 .lock()
-                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
@@ -19010,10 +20274,13 @@
         let snapshot = build_org_share_snapshot(&state, None, Some("n-move"), true).unwrap();
         state.db.set_note_doc_folder("n-move", "f-b").unwrap();
 
-        assert!(
-            !org_share_snapshot_is_current(&state, None, Some("n-move"), &snapshot.source_version,)
-                .unwrap()
-        );
+        assert!(!org_share_snapshot_is_current(
+            &state,
+            None,
+            Some("n-move"),
+            &snapshot.source_version,
+        )
+        .unwrap());
     }
 
     /// EGRESS TOCTOU: every seal/relock/remove-lock bumps the monotonic epoch. Even when the source
@@ -19030,10 +20297,13 @@
         let snapshot = build_org_share_snapshot(&state, None, Some("n-seal"), true).unwrap();
         bump_seal_epoch(&state);
 
-        assert!(
-            !org_share_snapshot_is_current(&state, None, Some("n-seal"), &snapshot.source_version,)
-                .unwrap()
-        );
+        assert!(!org_share_snapshot_is_current(
+            &state,
+            None,
+            Some("n-seal"),
+            &snapshot.source_version,
+        )
+        .unwrap());
     }
 
     /// INLINE REPUBLISH: there is one atomic `/items` request and no anonymous `/blobs` staging
@@ -19049,14 +20319,7 @@
         make_open_folder(&state.db, "f-after", "After");
         state
             .db
-            .insert_note(
-                "n-race",
-                "f-before",
-                "race",
-                "Race",
-                "# fresh body",
-                1,
-            )
+            .insert_note("n-race", "f-before", "race", "Race", "# fresh body", 1)
             .unwrap();
         state
             .db
@@ -19260,7 +20523,8 @@
             2,
             "every locally-joined org yields a status (RED on a single-org .next())"
         );
-        let ids: std::collections::HashSet<&str> = statuses.iter().map(|s| s.org_id.as_str()).collect();
+        let ids: std::collections::HashSet<&str> =
+            statuses.iter().map(|s| s.org_id.as_str()).collect();
         assert!(ids.contains("org-own"), "the owned org appears");
         assert!(ids.contains("org-inv"), "the invited org appears");
 
@@ -19816,7 +21080,10 @@
         fn to_json(&self) -> String {
             let sha = match &self.content_sha256 {
                 Some(bytes) => {
-                    format!(",\"contentSha256\":\"{}\"", murmur_protocol::b64::encode(bytes))
+                    format!(
+                        ",\"contentSha256\":\"{}\"",
+                        murmur_protocol::b64::encode(bytes)
+                    )
                 }
                 None => String::new(),
             };
@@ -20926,7 +22193,8 @@
     /// it didn't catch `active_link_user_shares_for_folder`'s `WHERE state = 'active'` excluding every
     /// real 1:1-person share (100%-reproducible, not an edge case).
     #[test]
-    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders() {
+    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders()
+    {
         let state = build_state("folder-1to1-shares");
         make_open_folder(&state.db, "f1", "Team");
         make_open_folder(&state.db, "f2", "Other");
@@ -21298,7 +22566,8 @@
             "2026-07-04T10:00:00Z",
         );
         let accepted =
-            ingest_shared_note(&state, &target, &env, "SENDERFP", "sender-uuid", "share-lk").unwrap();
+            ingest_shared_note(&state, &target, &env, "SENDERFP", "sender-uuid", "share-lk")
+                .unwrap();
         let mid = accepted.meeting_id;
 
         // The note row must be SEALED (blob present) — never a raw plaintext note behind the lock.
@@ -21521,7 +22790,10 @@
 
         // ── GREEN: the anti-entropy sweep restarts at 0 and applies the tombstone. ────────────────
         let changed = block_on(org_reconcile_now_inner(&state)).unwrap();
-        assert_eq!(changed, 1, "the sweep evicted exactly one stale replica row");
+        assert_eq!(
+            changed, 1,
+            "the sweep evicted exactly one stale replica row"
+        );
         assert!(
             state.db.get_org_item("it-orphan").unwrap().is_none(),
             "the withdrawn item is gone from the read path"
@@ -21947,7 +23219,13 @@
     #[test]
     fn list_org_shares_is_scoped_to_the_requested_org() {
         let state = build_state("org-shares-scoped");
-        seed_org_at(&state.db, "org-a", "Alpha", "member", "2026-07-01T00:00:00Z");
+        seed_org_at(
+            &state.db,
+            "org-a",
+            "Alpha",
+            "member",
+            "2026-07-01T00:00:00Z",
+        );
         seed_org_at(&state.db, "org-b", "Beta", "member", "2026-07-02T00:00:00Z");
         state
             .db

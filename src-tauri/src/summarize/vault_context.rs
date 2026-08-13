@@ -24,6 +24,79 @@ use crate::storage::Db;
 /// graph into one prompt.
 const LINK_CONTEXT_CAP: usize = 8;
 
+/// The exact, gated source graph selected for a pinned provider corpus. Keeping selection separate
+/// from packing lets lifecycle witnesses hash every selected input even when the provider budget
+/// later truncates all of its bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedVisibleInputs {
+    pub(crate) explicit_sources: Vec<ResolvedPinnedSource>,
+    pub(crate) neighbours: Vec<ResolvedPinnedSource>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedPinnedSource {
+    pub(crate) source: SourceRef,
+    header: String,
+    body: String,
+    body_required: bool,
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) vault_sources: Vec<VaultSource>,
+}
+
+fn hash_manifest_field(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
+    use sha2::Digest;
+
+    let label_len = u64::try_from(label.len()).unwrap_or(u64::MAX);
+    let value_len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    hasher.update(label_len.to_be_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(value_len.to_be_bytes());
+    hasher.update(value);
+}
+
+fn source_manifest_digest(
+    effective_title: &str,
+    started_at: Option<&str>,
+    body_present: bool,
+    body: &str,
+) -> [u8; 32] {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hash_manifest_field(&mut hasher, "domain", b"murmur:pinned-source-input:v1");
+    hash_manifest_field(&mut hasher, "effective_title", effective_title.as_bytes());
+    hash_manifest_field(
+        &mut hasher,
+        "started_at",
+        started_at.unwrap_or("").as_bytes(),
+    );
+    hash_manifest_field(
+        &mut hasher,
+        "body_present",
+        if body_present { b"1" } else { b"0" },
+    );
+    if body_present {
+        hash_manifest_field(&mut hasher, "full_body", body.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+impl ResolvedPinnedSource {
+    /// Preserve the established packer contract: a source needs room for its header plus at least
+    /// 200 body characters; otherwise it contributes no truncated header and no source chip.
+    fn section_for_budget(&self, budget: usize) -> Option<String> {
+        let remaining = budget.saturating_sub(self.header.len());
+        if remaining < 200 {
+            return None;
+        }
+        let body: String = self.body.chars().take(remaining).collect();
+        if self.body_required && body.trim().is_empty() {
+            return None;
+        }
+        Some(format!("{}{body}", self.header))
+    }
+}
+
 /// Char budget for the corpus, by provider. Weak on-device models (the explicit local Brain,
 /// Apple Foundation Models, and Ollama) have small context windows, so cap them much tighter;
 /// API/CLI models get headroom. Reuse `related_context`'s canonical classification so a new
@@ -325,45 +398,6 @@ fn pack_meetings(
     Ok((corpus, sources))
 }
 
-/// note↔meeting-links PR-2 — pack ONE standalone note/document (`documents` table row) into the
-/// budget-capped `corpus`, headed by a `### [[Title]] · id:` citation mirroring [`pack_meetings`].
-/// The read is GATED: `get_document_if_visible` returns `None` for a sealed-and-not-session-unlocked
-/// note/document, so its (possibly-stale-plaintext) body never enters the corpus (E9). Reads BOTH
-/// `kind='note'` and `kind='document'` rows (the gated reader is not kind-restricted). Returns
-/// `true` iff something was packed (so the caller can count what actually contributed).
-fn pack_notes(
-    db: &Db,
-    doc_id: &str,
-    budget: usize,
-    corpus: &mut String,
-    unlocked: &HashSet<String>,
-) -> Result<bool> {
-    if corpus.len() >= budget {
-        return Ok(false);
-    }
-    // GATE: sealed-and-not-unlocked note/document ⇒ `None` ⇒ contributes nothing.
-    let Some(doc) = db.get_document_if_visible(doc_id, unlocked)? else {
-        return Ok(false);
-    };
-    // Prefer the authored title; a `kind='document'` upload leaves title NULL → fall back to `name`.
-    let title = doc
-        .title
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or(doc.name);
-    let header = format!("\n\n### [[{title}]] · id:{}\n", doc.id);
-    let remaining = budget.saturating_sub(corpus.len() + header.len());
-    if remaining < 200 {
-        return Ok(false);
-    }
-    let chunk: String = doc.markdown.chars().take(remaining).collect();
-    if chunk.trim().is_empty() {
-        return Ok(false);
-    }
-    corpus.push_str(&header);
-    corpus.push_str(&chunk);
-    Ok(true)
-}
-
 /// Pack ONE PINNED org item (a read-only SHARED org-feed note being VIEWED in the org-item viewer)
 /// into a budget-capped corpus chunk, headed by a `### [[Title]] · shared · id:` citation mirroring
 /// [`pack_notes`]. Used by the Ask floor so "Ask about this shared note" is ALWAYS grounded in the
@@ -456,46 +490,46 @@ pub(crate) fn build_vault_context_pinned_visible_with_budget(
         return Ok((String::new(), Vec::new()));
     }
 
+    let inputs = resolve_vault_context_pinned_visible_inputs(db, sources, unlocked)?;
+    build_vault_context_resolved_visible_with_budget(db, &inputs, budget, unlocked)
+}
+
+/// Resolve the typed-visible explicit set and its ordered, deduped active-neighbour expansion once.
+/// Both the provider packer and the dashboard's exact lifecycle manifest consume this value, so
+/// neither can silently select a different ninth neighbour or a different typed endpoint.
+pub(crate) fn resolve_vault_context_pinned_visible_inputs(
+    db: &Db,
+    sources: &[SourceRef],
+    unlocked: &HashSet<String>,
+) -> Result<PinnedVisibleInputs> {
+    if sources.is_empty() {
+        return Ok(PinnedVisibleInputs {
+            explicit_sources: Vec::new(),
+            neighbours: Vec::new(),
+        });
+    }
+
     // Dedupe explicit identities while preserving picker order.
     let mut explicit_keys: HashSet<(String, String)> = HashSet::new();
-    let mut explicit_sources: Vec<&SourceRef> = Vec::new();
+    let mut explicit_refs: Vec<SourceRef> = Vec::new();
     for source in sources {
         let key = (source.kind.as_str().to_string(), source.id.clone());
-        if explicit_keys.insert(key) {
-            explicit_sources.push(source);
-        }
-    }
-
-    // Build each EXPLICIT source as a content-only section. Each read remains behind the same
-    // visible packer; link expansion deliberately does not happen here.
-    let mut sections: Vec<(String, Vec<VaultSource>)> = Vec::new();
-    for source in &explicit_sources {
-        match source.kind {
+        let typed_visible = match source.kind {
             LinkKind::Meeting => {
-                if let Some(meeting) = db.get_meeting(&source.id)? {
-                    let (section, section_sources) =
-                        pack_meetings(db, vec![meeting], budget, unlocked)?;
-                    if !section.trim().is_empty() {
-                        sections.push((section, section_sources));
-                    }
-                }
+                db.meeting_is_visible(&source.id, unlocked)?
+                    && db.dashboard_ref_exists("meeting", &source.id)?
             }
-            LinkKind::Note | LinkKind::Document => {
-                let mut section = String::new();
-                if pack_notes(db, &source.id, budget, &mut section, unlocked)?
-                    && !section.trim().is_empty()
-                {
-                    sections.push((section, Vec::new()));
-                }
-            }
+            LinkKind::Note => db.note_is_visible(&source.id, unlocked)?,
+            LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
+        };
+        if typed_visible && explicit_keys.insert(key) {
+            explicit_refs.push(source.clone());
         }
     }
-    let (mut corpus, mut vault_sources) = fair_pack_explicit_sections(sections, budget);
 
-    // ONE global link expansion: one explicit set, one neighbour dedupe, one cap across ALL sources.
     let mut seen_neighbours: HashSet<(String, String)> = HashSet::new();
-    let mut neighbours: Vec<(LinkKind, String)> = Vec::new();
-    'outer: for source in &explicit_sources {
+    let mut neighbours = Vec::new();
+    'outer: for source in &explicit_refs {
         let edges = db.links_for_visible(source.kind, &source.id, unlocked)?;
         for edge in edges {
             if edge.status != "active" {
@@ -508,33 +542,156 @@ pub(crate) fn build_vault_context_pinned_visible_with_budget(
             if explicit_keys.contains(&key) || !seen_neighbours.insert(key.clone()) {
                 continue;
             }
-            neighbours.push((other_kind, key.1));
+            neighbours.push(SourceRef {
+                kind: other_kind,
+                id: key.1,
+            });
             if neighbours.len() >= LINK_CONTEXT_CAP {
                 break 'outer;
             }
         }
     }
+    let explicit_sources = explicit_refs
+        .iter()
+        .map(|source| resolve_pinned_source(db, source, unlocked))
+        .collect::<Result<Vec<_>>>()?;
+    let neighbours = neighbours
+        .iter()
+        .map(|source| resolve_pinned_source(db, source, unlocked))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PinnedVisibleInputs {
+        explicit_sources,
+        neighbours,
+    })
+}
+
+fn resolve_pinned_source(
+    db: &Db,
+    source: &SourceRef,
+    unlocked: &HashSet<String>,
+) -> Result<ResolvedPinnedSource> {
+    let (header, body, effective_title, started_at, body_present, vault_sources) = match source.kind
+    {
+        LinkKind::Meeting => match db.get_meeting_if_visible(&source.id, unlocked)? {
+            Some(meeting) => {
+                let title = meeting
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "(untitled)".to_string());
+                let Some(note) = db.get_note_if_visible(&source.id, unlocked)? else {
+                    return Ok(ResolvedPinnedSource {
+                        source: source.clone(),
+                        header: String::new(),
+                        body: String::new(),
+                        body_required: false,
+                        manifest_digest: source_manifest_digest(
+                            &title,
+                            Some(&meeting.started_at),
+                            false,
+                            "",
+                        ),
+                        vault_sources: Vec::new(),
+                    });
+                };
+                let date = meeting
+                    .started_at
+                    .split(['T', ' '])
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let header = format!("\n\n### [[{title}]] · {date} · id:{}\n", meeting.id);
+                let source = VaultSource {
+                    meeting_id: meeting.id,
+                    title: title.clone(),
+                    started_at: meeting.started_at,
+                    origin: None,
+                };
+                (
+                    header,
+                    note.markdown,
+                    title,
+                    Some(source.started_at.clone()),
+                    true,
+                    vec![source],
+                )
+            }
+            None => (
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+                false,
+                Vec::new(),
+            ),
+        },
+        LinkKind::Note | LinkKind::Document => {
+            let Some(document) =
+                db.get_document_if_visible_kind(&source.id, source.kind.as_str(), unlocked)?
+            else {
+                return Ok(ResolvedPinnedSource {
+                    source: source.clone(),
+                    header: String::new(),
+                    body: String::new(),
+                    body_required: true,
+                    manifest_digest: source_manifest_digest("", None, false, ""),
+                    vault_sources: Vec::new(),
+                });
+            };
+            let title = document
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(document.name);
+            (
+                format!("\n\n### [[{title}]] · id:{}\n", document.id),
+                document.markdown,
+                title,
+                None,
+                true,
+                Vec::new(),
+            )
+        }
+    };
+    let manifest_digest =
+        source_manifest_digest(&effective_title, started_at.as_deref(), body_present, &body);
+    Ok(ResolvedPinnedSource {
+        source: source.clone(),
+        header,
+        body,
+        body_required: source.kind != LinkKind::Meeting,
+        manifest_digest,
+        vault_sources,
+    })
+}
+
+pub(crate) fn build_vault_context_resolved_visible_with_budget(
+    _db: &Db,
+    inputs: &PinnedVisibleInputs,
+    budget: usize,
+    _unlocked: &HashSet<String>,
+) -> Result<(String, Vec<VaultSource>)> {
+    if budget == 0 || inputs.explicit_sources.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+
+    // Pack each EXPLICIT source from the already gated snapshot. No database read or link
+    // expansion happens here; the lifecycle manifest consumes the same resolved source bytes.
+    let mut sections: Vec<(String, Vec<VaultSource>)> = Vec::new();
+    for source in &inputs.explicit_sources {
+        if let Some(section) = source.section_for_budget(budget) {
+            sections.push((section, source.vault_sources.clone()));
+        }
+    }
+    let (mut corpus, mut vault_sources) = fair_pack_explicit_sections(sections, budget);
 
     // Neighbours fill only budget left after every explicit source got its fair share.
-    for (kind, id) in neighbours {
+    for neighbour in &inputs.neighbours {
         let remaining = budget.saturating_sub(corpus.chars().count());
         if remaining == 0 {
             break;
         }
-        match kind {
-            LinkKind::Meeting => {
-                if let Some(meeting) = db.get_meeting(&id)? {
-                    let (chunk, chunk_sources) =
-                        pack_meetings(db, vec![meeting], remaining, unlocked)?;
-                    corpus.push_str(&chunk);
-                    vault_sources.extend(chunk_sources);
-                }
-            }
-            LinkKind::Note | LinkKind::Document => {
-                let mut chunk = String::new();
-                pack_notes(db, &id, remaining, &mut chunk, unlocked)?;
-                corpus.push_str(&chunk);
-            }
+        if let Some(chunk) = neighbour.section_for_budget(remaining) {
+            corpus.push_str(&chunk);
+            vault_sources.extend(neighbour.vault_sources.clone());
         }
     }
     Ok((corpus, vault_sources))
@@ -543,8 +700,8 @@ pub(crate) fn build_vault_context_pinned_visible_with_budget(
 /// Pack exactly the caller-selected sources under one fair budget, without the neighbour expansion
 /// used by Ask. Convert-to-note uses this for a meeting's ACTIVE Related edges: the linked items are
 /// useful secondary context, but a link-of-a-link was never selected for this conversion and must
-/// not silently enter the provider prompt. Every content read stays behind the same visible packers
-/// as [`build_vault_context_pinned_visible_with_budget`].
+/// not silently enter the provider prompt. Every content read is resolved once through the same
+/// typed, visibility-gated snapshot as [`build_vault_context_pinned_visible_with_budget`].
 pub(crate) fn build_vault_context_exact_visible_with_budget(
     db: &Db,
     sources: &[SourceRef],
@@ -555,37 +712,17 @@ pub(crate) fn build_vault_context_exact_visible_with_budget(
         return Ok(String::new());
     }
 
-    // Resolve meeting rows ONLY through the visibility query before touching title/audio metadata.
-    // `get_meeting` is intentionally ungated and therefore forbidden on this cross-meeting path.
-    let visible_meetings = db
-        .list_meetings_visible(i64::MAX, unlocked)?
-        .into_iter()
-        .map(|meeting| (meeting.id.clone(), meeting))
-        .collect::<std::collections::HashMap<_, _>>();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut sections: Vec<(String, Vec<VaultSource>)> = Vec::new();
+    let mut sections = Vec::new();
     for source in sources {
         let key = (source.kind.as_str().to_string(), source.id.clone());
         if !seen.insert(key) {
             continue;
         }
-        match source.kind {
-            LinkKind::Meeting => {
-                if let Some(meeting) = visible_meetings.get(&source.id).cloned() {
-                    let (section, section_sources) =
-                        pack_meetings(db, vec![meeting], budget, unlocked)?;
-                    if !section.trim().is_empty() {
-                        sections.push((section, section_sources));
-                    }
-                }
-            }
-            LinkKind::Note | LinkKind::Document => {
-                let mut section = String::new();
-                if pack_notes(db, &source.id, budget, &mut section, unlocked)?
-                    && !section.trim().is_empty()
-                {
-                    sections.push((section, Vec::new()));
-                }
+        let resolved = resolve_pinned_source(db, source, unlocked)?;
+        if let Some(section) = resolved.section_for_budget(budget) {
+            if !section.trim().is_empty() {
+                sections.push((section, resolved.vault_sources));
             }
         }
     }
@@ -598,12 +735,12 @@ pub(crate) fn build_vault_context_exact_visible_with_budget(
 /// their ACTIVE linked neighbours (packed AFTER, filling remaining budget only) — NEVER a
 /// vault-wide search.
 ///
-/// GATE (E9, load-bearing): every leg reads only through the `*_visible` readers against the live
-/// `unlocked` set. A meeting source packs through [`pack_meetings`] (its `get_note_if_visible`
-/// second gate drops a sealed meeting's note); a note/document source packs through [`pack_notes`]
-/// (`get_document_if_visible` gate). Link-expansion uses [`Db::links_for_visible`], which is ALREADY
-/// both-endpoint gated — so a sealed explicit source or a sealed neighbour contributes NOTHING and
-/// is never even enumerated. No content read bypasses these gates.
+/// GATE (E9, load-bearing): explicit sources and capped neighbours are first resolved into one
+/// typed, visibility-gated [`PinnedVisibleInputs`] snapshot against the live `unlocked` set. The
+/// provider packer and dashboard lifecycle manifest then consume those same bytes, so there is no
+/// second content read between authorization and dispatch. Link expansion uses
+/// [`Db::links_for_visible`], whose endpoints are already gated; a sealed explicit source or sealed
+/// neighbour contributes nothing and is never enumerated.
 ///
 /// Returns `(corpus, sources)` — `sources` carries the VaultSource chips for the MEETING sources
 /// that actually packed (notes/documents are not meetings, so they add no chip, matching
@@ -950,6 +1087,199 @@ mod tests {
         }
     }
 
+    fn d_src(id: &str) -> SourceRef {
+        SourceRef {
+            kind: LinkKind::Document,
+            id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolved_snapshot_preserves_the_legacy_200_character_pack_floor() {
+        let db = temp_db();
+        seed_folder(&db, "floor");
+        seed_note(&db, "empty-meeting", "Empty meeting", "", Some("floor"));
+        db.insert_note(
+            "hub",
+            "floor",
+            "Hub",
+            "Hub",
+            &"H".repeat(260),
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_note(
+            "near",
+            "floor",
+            "Near",
+            "Near",
+            "NEIGHBOUR MUST NOT FIT",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_link_for_test(
+            "note", "hub", "note", "near", "manual", 1.0, "user", "active",
+        );
+
+        let too_small = build_vault_context_pinned_visible_with_budget(
+            &db,
+            &[n_src("hub")],
+            100,
+            &HashSet::new(),
+        )
+        .unwrap()
+        .0;
+        assert!(
+            too_small.is_empty(),
+            "no partial header below the 200-char floor"
+        );
+
+        let tight = build_vault_context_pinned_visible_with_budget(
+            &db,
+            &[n_src("hub")],
+            300,
+            &HashSet::new(),
+        )
+        .unwrap()
+        .0;
+        assert!(tight.contains("Hub"));
+        assert!(!tight.contains("NEIGHBOUR MUST NOT FIT"));
+
+        let (empty_meeting, sources) = build_vault_context_pinned_visible_with_budget(
+            &db,
+            &[m_src("empty-meeting")],
+            300,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(empty_meeting.contains("Empty meeting"));
+        assert_eq!(
+            sources.len(),
+            1,
+            "an empty meeting note retains its source chip"
+        );
+    }
+
+    #[test]
+    fn pinned_provider_corpus_enforces_note_document_kind_before_body_read() {
+        let db = temp_db();
+        seed_folder(&db, "typed-open");
+        db.insert_document(
+            "real-note",
+            "typed-open",
+            "Note",
+            "note",
+            "note",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_document(
+            "real-doc",
+            "typed-open",
+            "Document",
+            "doc",
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_document(
+            "neighbour",
+            "typed-open",
+            "Neighbour",
+            "FORGED-NEIGHBOUR-SENTINEL",
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_link_for_test(
+            "document",
+            "real-note",
+            "document",
+            "neighbour",
+            "manual",
+            1.0,
+            "user",
+            "active",
+        );
+        db.insert_link_for_test(
+            "note",
+            "real-doc",
+            "document",
+            "neighbour",
+            "manual",
+            1.0,
+            "user",
+            "active",
+        );
+        db.lock()
+            .execute(
+                "UPDATE documents SET text=x'00' WHERE id IN ('real-note','real-doc')",
+                [],
+            )
+            .unwrap();
+
+        let (forged, _) = build_vault_context_pinned_visible(
+            &db,
+            &[d_src("real-note"), n_src("real-doc")],
+            "anthropic",
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(forged.is_empty());
+        assert!(!forged.contains("FORGED-NEIGHBOUR-SENTINEL"));
+
+        db.lock()
+            .execute(
+                "UPDATE documents SET text=CASE id WHEN 'real-note' THEN 'NOTE-KIND-SENTINEL' ELSE 'DOCUMENT-KIND-SENTINEL' END WHERE id IN ('real-note','real-doc')",
+                [],
+            )
+            .unwrap();
+
+        let (valid, _) = build_vault_context_pinned_visible(
+            &db,
+            &[n_src("real-note"), d_src("real-doc")],
+            "anthropic",
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(valid.contains("NOTE-KIND-SENTINEL"));
+        assert!(valid.contains("DOCUMENT-KIND-SENTINEL"));
+    }
+
+    #[test]
+    fn pinned_provider_corpus_typed_control_fixture() {
+        let db = temp_db();
+        seed_folder(&db, "typed-control");
+        db.insert_document(
+            "real-note",
+            "typed-control",
+            "Note",
+            "NOTE-KIND-SENTINEL",
+            "note",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_document(
+            "real-doc",
+            "typed-control",
+            "Document",
+            "DOCUMENT-KIND-SENTINEL",
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let (valid, _) = build_vault_context_pinned_visible(
+            &db,
+            &[n_src("real-note"), d_src("real-doc")],
+            "anthropic",
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(valid.contains("NOTE-KIND-SENTINEL"));
+        assert!(valid.contains("DOCUMENT-KIND-SENTINEL"));
+    }
+
     /// Meeting-chat regression: a note the user EXPLICITLY picked must still reach the provider
     /// prompt when the anchor meeting transcript is longer than the transcript budget. The old
     /// command appended the pinned corpus after the transcript and then truncated the combined
@@ -1175,6 +1505,64 @@ mod tests {
         assert!(chat_corpus2.contains("SEALED-NOTE-BODY"));
     }
 
+    #[test]
+    fn gated_meeting_row_hides_residual_title_audio_and_plaintext_until_unlocked() {
+        let db = temp_db();
+        seed_folder(&db, "f-locked-row");
+        db.insert_meeting(&Meeting {
+            id: "m-residual".into(),
+            started_at: "2026-06-26T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("RESIDUAL-TITLE-SENTINEL".into()),
+            duration_s: 60,
+            audio_path: Some("/tmp/RESIDUAL-AUDIO-SENTINEL.wav".into()),
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m-residual".into(),
+            provider_id: "test".into(),
+            markdown: "RESIDUAL-BODY-SENTINEL".into(),
+            created_at: "2026-06-26T09:05:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_note_folder("m-residual", Some("f-locked-row"))
+            .unwrap();
+        db.set_folder_locked("f-locked-row", true, None).unwrap();
+
+        let nothing = HashSet::new();
+        assert!(db
+            .get_meeting_if_visible("m-residual", &nothing)
+            .unwrap()
+            .is_none());
+        let (packed, sources) =
+            build_vault_context_pinned_visible(&db, &[m_src("m-residual")], "anthropic", &nothing)
+                .unwrap();
+        assert!(packed.is_empty());
+        assert!(sources.is_empty());
+        assert!(!packed.contains("RESIDUAL-TITLE-SENTINEL"));
+        assert!(!packed.contains("RESIDUAL-AUDIO-SENTINEL"));
+        assert!(!packed.contains("RESIDUAL-BODY-SENTINEL"));
+
+        let unlocked: HashSet<String> = ["f-locked-row".to_string()].into_iter().collect();
+        let visible = db
+            .get_meeting_if_visible("m-residual", &unlocked)
+            .unwrap()
+            .expect("session unlock restores the full meeting row");
+        assert_eq!(visible.title.as_deref(), Some("RESIDUAL-TITLE-SENTINEL"));
+        let (packed, sources) =
+            build_vault_context_pinned_visible(&db, &[m_src("m-residual")], "anthropic", &unlocked)
+                .unwrap();
+        assert!(packed.contains("RESIDUAL-TITLE-SENTINEL"));
+        assert!(packed.contains("RESIDUAL-BODY-SENTINEL"));
+        assert_eq!(sources.len(), 1);
+    }
+
     /// Link-aware expansion pulls in an explicit source's ACTIVE linked neighbour's content — and a
     /// SEALED neighbour is DROPPED (the both-endpoint gate holds through the expansion).
     #[test]
@@ -1229,6 +1617,23 @@ mod tests {
     fn exact_conversion_context_is_visible_and_never_expands_links_of_links() {
         let db = temp_db();
         seed_note(&db, "open-linked", "Open linked", "OPEN-LINKED-BODY", None);
+        seed_folder(&db, "f-conversion-open");
+        seed_doc_note(
+            &db,
+            "exact-note",
+            "f-conversion-open",
+            "Exact note",
+            "EXACT-NOTE-BODY",
+        );
+        db.insert_document(
+            "exact-document",
+            "f-conversion-open",
+            "Exact document",
+            "EXACT-DOCUMENT-BODY",
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
         seed_folder(&db, "f-conversion-locked");
         seed_note(
             &db,
@@ -1237,13 +1642,7 @@ mod tests {
             "SEALED-LINKED-BODY",
             Some("f-conversion-locked"),
         );
-        seed_note(
-            &db,
-            "second-hop",
-            "Second hop",
-            "SECOND-HOP-BODY",
-            None,
-        );
+        seed_note(&db, "second-hop", "Second hop", "SECOND-HOP-BODY", None);
         db.upsert_manual_link("meeting", "open-linked", "meeting", "second-hop")
             .unwrap();
         db.set_folder_locked("f-conversion-locked", true, None)
@@ -1251,12 +1650,25 @@ mod tests {
 
         let corpus = build_vault_context_exact_visible_with_budget(
             &db,
-            &[m_src("open-linked"), m_src("sealed-linked")],
+            &[
+                m_src("open-linked"),
+                n_src("exact-note"),
+                n_src("exact-note"),
+                d_src("exact-document"),
+                n_src("exact-document"),
+                m_src("sealed-linked"),
+            ],
             20_000,
             &HashSet::new(),
         )
         .unwrap();
         assert!(corpus.contains("OPEN-LINKED-BODY"));
+        assert_eq!(corpus.matches("EXACT-NOTE-BODY").count(), 1);
+        assert_eq!(corpus.matches("EXACT-DOCUMENT-BODY").count(), 1);
+        let meeting_pos = corpus.find("OPEN-LINKED-BODY").unwrap();
+        let note_pos = corpus.find("EXACT-NOTE-BODY").unwrap();
+        let document_pos = corpus.find("EXACT-DOCUMENT-BODY").unwrap();
+        assert!(meeting_pos < note_pos && note_pos < document_pos);
         assert!(!corpus.contains("SEALED-LINKED-BODY"));
         assert!(!corpus.contains("SEALED-TITLE-MUST-NOT-ENTER"));
         assert!(

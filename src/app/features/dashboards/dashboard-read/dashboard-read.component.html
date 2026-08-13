@@ -8,6 +8,22 @@
         @if (projection().dominant.answeredAt; as answeredAt) {
           <p class="answer-age">Answered {{ formatDate(answeredAt) }}</p>
         }
+        @if (projection().dominant.answerRefresh; as answerRefresh) {
+          <button
+            type="button"
+            class="source-action"
+            [disabled]="refreshingAnswerId() !== null"
+            (click)="refresh(answerRefresh)"
+          >
+            {{
+              refreshingAnswerId() === answerRefresh.tileId
+                ? "Refreshing…"
+                : projection().dominant.answeredAt
+                  ? "Re-answer"
+                  : "Answer now"
+            }}
+          </button>
+        }
         @if (projection().dominant.source; as source) {
           <button type="button" class="source-action" (click)="open(source)">
             Open source <span aria-hidden="true">→</span>

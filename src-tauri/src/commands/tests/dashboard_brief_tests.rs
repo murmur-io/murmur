@@ -1,23 +1,22 @@
 //! THE BOARD-BRIEF ORACLE — what a board's DERIVED tiles contribute to its own Ask.
 //!
-//! The asymmetry this closes: `tools.rs::tool_specs` exposes `get_dashboard` to the
-//! agentic loop and the local MCP server, so an external agent sees every tile. But
-//! board Ask pins its sources, and `ask_vault` routes any non-empty pinned list to
-//! the deterministic floor — skipping the agentic path and therefore that tool. The
-//! in-app "Ask this board" saw strictly LESS of the board than Claude Code did.
+//! Dashboard Ask now builds one exact composite corpus from its material pointers and gated
+//! derived views, then sends it through the dedicated dashboard prompt persona. This module pins
+//! that corpus and its lock behavior at both the resolver and prompt-builder seams.
 //!
 //! Every test here carries a CONTROL. A leak assertion that would also pass with the
 //! gate deleted proves nothing, and this feature has already shipped one such gate:
 //! the adversarial review of PR #562 found the answer-cache check was both incomplete
 //! AND unfalsifiable — disabling it left all 2732 tests green.
 //!
-//! ## EVIDENCE MAP — every derived kind, proven at the PACKED PROVIDER PROMPT
+//! ## EVIDENCE MAP — every derived kind, proven at the dashboard prompt-builder sink
 //!
 //! The negative that matters is not "the brief omits it" but "the prompt that LEAVES
 //! the process omits it". Each row below asserts absence (or indistinguishability) on
-//! `packed_scoped(..)` / `packed_user(..)` output — the sink itself, not
-//! `dashboard_brief_inner`'s return value one layer earlier — and each carries a
-//! control that flips it, so none can go vacuous.
+//! `packed_scoped(..)` / `packed_user(..)` are unit helpers over already-gated parts; they prove
+//! the active `vault_chat::build_for_dashboard` persona but are not called production resolvers.
+//! Separate production oracles below enter through `dashboard_composite_context` before driving
+//! that same prompt builder. Each negative carries a control that flips it.
 //!
 //! | kind | packed-sink negative | control that flips it |
 //! | --- | --- | --- |
@@ -36,9 +35,8 @@
 //!
 //! ## Honest RED limit
 //!
-//! The primary contract claim is not executable against the base commit: the board
-//! brief sink and its function argument did not exist there, so the new prompt test
-//! cannot compile on that tree. Its RED is structural. The lock-model claims remain
+//! The primary contract claim is not executable against the base commit: neither the composite
+//! resolver nor the dashboard prompt path existed there. Its RED is structural. The lock claims remain
 //! falsifiable through the paired sealed/unlocked controls above.
 //!
 use super::*;
@@ -56,6 +54,14 @@ fn file_db(label: &str) -> crate::storage::Db {
         TEST_DEK,
     )
     .unwrap()
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 fn seed_folder(db: &crate::storage::Db, id: &str, locked: bool) {
@@ -293,14 +299,12 @@ fn the_brief_is_bounded_and_never_cut_mid_row() {
 //
 // Both reviews landed the same MAJOR on the first cut of this change: every test
 // above asserts on `dashboard_brief_inner`'s return value, which is an INTERMEDIATE
-// string. None of them drove `build_ask_vault_floor_prompt`, so the whole wiring —
-// the scope trigger, the allowance, the tile-boundary truncation, the join with the
-// corpus, and the interaction with the empty-corpus early return — was unexercised.
+// string. The helpers below drive the active dashboard prompt builder, not the legacy
+// vault floor, so prompt-sink assertions exercise the same persona used in production.
 // An invariant proven one layer below the one the model actually reads is not proven.
 
-// `commands/mod.rs` mounts ask.rs as `ask_commands` and re-exports it, so the floor
-// builder is reachable from this nested test module the same way `ask_vault_tests`
-// reaches it.
+// The vault floor import is used only as a non-dashboard control. Dashboard cases below use
+// `vault_chat::build_for_dashboard` or the active prepacked authorized seam.
 use crate::commands::{build_ask_vault_floor_prompt, AskFloorPrompt};
 use crate::settings::AppConfig;
 
@@ -313,7 +317,8 @@ fn packed_user(
     packed_scoped(db, unlocked, Some(brief), sources)
 }
 
-/// `None` = not asked from a board at all; `Some("")` = a board with nothing readable.
+/// Unit-only prompt-builder seam over already-gated parts. Production scope is resolved by
+/// `dashboard_composite_context`; callers must not treat this helper as an authorization gate.
 fn packed_scoped(
     db: &crate::storage::Db,
     unlocked: &HashSet<String>,
@@ -336,29 +341,49 @@ fn packed_with_provider(
         cloud_egress_consented: true,
         ..AppConfig::default()
     };
-    match build_ask_vault_floor_prompt(
-        db,
-        &cfg,
-        unlocked,
-        "who owes me something on this board?",
-        &[],
-        "",
-        None,
-        sources,
-        None,
-        brief,
-    )
-    .unwrap()
-    {
-        // BOTH halves. `vault_chat::build` packs the corpus into the SYSTEM message and
-        // leaves the user turn as the bare question, so asserting on `user` alone would
-        // pass vacuously no matter what the brief did.
-        AskFloorPrompt::Ready { system, user, .. } => Some(format!(
-            "{system}
-{user}"
-        )),
-        AskFloorPrompt::Empty(_) => None,
+    let Some(brief) = brief else {
+        return match build_ask_vault_floor_prompt(
+            db,
+            &cfg,
+            unlocked,
+            "who owes me something on this board?",
+            &[],
+            "",
+            None,
+            sources,
+            None,
+        )
+        .unwrap()
+        {
+            AskFloorPrompt::Ready { system, user, .. } => Some(format!("{system}\n{user}")),
+            AskFloorPrompt::Empty(_) => None,
+        };
+    };
+    let brief = if brief.trim().is_empty() { "" } else { brief };
+    let budget = crate::summarize::vault_context::budget_for(&cfg.provider_id)
+        .saturating_sub(brief.chars().count());
+    let (source_corpus, _) =
+        crate::summarize::vault_context::build_vault_context_pinned_visible_with_budget(
+            db,
+            sources.unwrap_or_default(),
+            budget,
+            unlocked,
+        )
+        .unwrap();
+    let corpus = match (brief.trim().is_empty(), source_corpus.is_empty()) {
+        (true, _) => source_corpus,
+        (_, true) => brief.to_string(),
+        (false, false) => format!("{brief}\n\n{source_corpus}"),
+    };
+    if corpus.trim().is_empty() {
+        return None;
     }
+    let (system, user) = crate::summarize::vault_chat::build_for_dashboard(
+        &corpus,
+        &[],
+        "who owes me something on this board?",
+    );
+    Some(format!("{system}\n{user}"))
 }
 
 /// The ledger row reaches the PACKED PROMPT, on a board whose tiles are ALL derived —
@@ -367,9 +392,8 @@ fn packed_with_provider(
 ///
 /// ITS RED STATE IS STRUCTURAL, NOT AN EXECUTED FAILING RUN, and that distinction is
 /// worth stating rather than letting "RED-before-GREEN" be read as more than it is:
-/// this test cannot be compiled against the base commit, because neither
-/// `dashboard_brief_inner` nor `build_ask_vault_floor_prompt`'s tenth argument exists
-/// there. Pre-patch the sink was absent, so a derived tile could not reach the prompt
+/// this test cannot be compiled against the base commit because the composite dashboard prompt
+/// path did not exist there. Pre-patch the sink was absent, so a derived tile could not reach it
 /// by construction. The EXECUTED red-before-green in this change is the routing bug
 /// the reviews caught mid-flight — a derived-only board silently skipping the floor —
 /// which `an_all_withheld_board_never_falls_back_to_the_whole_vault` now pins.
@@ -430,104 +454,6 @@ fn a_sealed_row_never_reaches_the_packed_prompt() {
     assert!(
         user.contains("the sealed obligation"),
         "unlocking must restore it, or the leak test is vacuous: {user}"
-    );
-}
-
-/// A caller with no board is byte-identical to before — the equivalence that keeps
-/// every other Ask surface (note editor, org viewer, vault-wide) untouched.
-#[test]
-fn an_empty_brief_leaves_the_packed_prompt_unchanged() {
-    let db = file_db("packed-equivalence");
-    seed_folder(&db, "f-open", false);
-    seed_meeting_with_commitment(&db, "m1", "f-open", "ship it");
-
-    let sources = vec![SourceRef {
-        kind: crate::links::LinkKind::Meeting,
-        id: "m1".to_string(),
-    }];
-    let no_board = packed_scoped(&db, &HashSet::new(), None, Some(&sources));
-    let with_empty = packed_user(&db, &HashSet::new(), "", Some(&sources));
-    let with_blank = packed_user(&db, &HashSet::new(), "   \n  ", Some(&sources));
-    assert_eq!(
-        with_empty, with_blank,
-        "a blank brief must not perturb the packed prompt"
-    );
-    // …and neither perturbs it relative to NO BOARD AT ALL. This is the contract's
-    // byte-identity clause for the PINNED caller (the note editor), which the shipped
-    // floor-equivalence test does not reach — it only compares the whole-vault search
-    // path, where every scope pin is `None`.
-    assert_eq!(
-        no_board, with_empty,
-        "with no board, a pinned-sources ask must pack byte-identically to before"
-    );
-    assert!(
-        with_empty
-            .as_deref()
-            .map(|u| !u.contains(BRIEF_HEADER))
-            .unwrap_or(false),
-        "no board ⇒ no board header"
-    );
-
-    // The ORG-VIEWER caller too, not just the pinned-sources one. Both share the
-    // `saturating_sub` and the `trim().is_empty()` join, so this is belt-and-braces —
-    // but "shares the code path" is an argument, and the contract asks for equality.
-    let org_none = build_ask_vault_floor_prompt(
-        db_ref(&db),
-        &cfg_for_test(),
-        &HashSet::new(),
-        "who owes me something on this board?",
-        &[],
-        "",
-        None,
-        None,
-        Some("org-item-that-does-not-exist"),
-        None,
-    );
-    let org_blank = build_ask_vault_floor_prompt(
-        db_ref(&db),
-        &cfg_for_test(),
-        &HashSet::new(),
-        "who owes me something on this board?",
-        &[],
-        "",
-        None,
-        None,
-        Some("org-item-that-does-not-exist"),
-        Some("   \n  "),
-    );
-    let org_empty = build_ask_vault_floor_prompt(
-        db_ref(&db),
-        &cfg_for_test(),
-        &HashSet::new(),
-        "who owes me something on this board?",
-        &[],
-        "",
-        None,
-        None,
-        Some("org-item-that-does-not-exist"),
-        Some(""),
-    );
-    // Among BOARD-SCOPED calls, a blank brief adds nothing — the claim this sub-case
-    // is actually able to make.
-    assert_eq!(
-        org_blank.map(prompt_text).ok(),
-        org_empty.map(prompt_text).ok(),
-        "a blank brief must not perturb the org-pinned caller"
-    );
-    // A no-board call carries no board header. This REPLACED an assertion that
-    // `None` and `Some("")` pack IDENTICALLY, which was true only by accident: with no
-    // sources and a missing org item nothing packs, so both landed on the same canned
-    // empty answer. Scope is carried by the PRESENCE of the board, so those two are
-    // different callers — one has a board open and one does not — and they are now
-    // distinguishable exactly where that matters: the board-scoped one says the board
-    // is unreadable instead of telling the user to go record a meeting. Asserting them
-    // equal would pin the misdirecting message in place.
-    let org_none_text = org_none
-        .map(prompt_text)
-        .expect("org-pinned ask must resolve");
-    assert!(
-        !org_none_text.contains(BRIEF_HEADER),
-        "no board ⇒ no board header, for the org-pinned caller too: {org_none_text}"
     );
 }
 
@@ -692,9 +618,11 @@ fn truncation_never_keeps_a_tile_heading_without_its_rows() {
 /// only rendered on screen; the brief makes it an Ask-provider egress, so the
 /// negative belongs here too and not only in the on-screen tests.
 #[test]
-fn a_reminder_anchored_only_to_a_sealed_meeting_contributes_nothing() {
+fn a_multi_anchor_reminder_requires_every_source_to_be_readable() {
     let db = file_db("reminders-sealed");
+    seed_folder(&db, "f-open", false);
     seed_folder(&db, "f-sealed", true);
+    seed_meeting_with_commitment(&db, "m-open", "f-open", "irrelevant");
     seed_meeting_with_commitment(&db, "m-sealed", "f-sealed", "irrelevant");
 
     db.create_reminder(
@@ -705,22 +633,31 @@ fn a_reminder_anchored_only_to_a_sealed_meeting_contributes_nothing() {
             due_at: 1_780_000_000_000,
             repeat_every: None,
             repeat_unit: None,
-            sources: vec![ReminderSourceAnchor {
-                kind: "meeting".to_string(),
-                id: "m-sealed".to_string(),
-            }],
+            sources: vec![
+                ReminderSourceAnchor {
+                    kind: "meeting".to_string(),
+                    id: "m-open".to_string(),
+                },
+                ReminderSourceAnchor {
+                    kind: "meeting".to_string(),
+                    id: "m-sealed".to_string(),
+                },
+            ],
         },
-        ReminderOrigin::Manual,
+        ReminderOrigin::Smart,
         1_780_000_000_000,
     )
     .unwrap();
+    db.lock()
+        .execute("UPDATE reminders SET title=x'00' WHERE id='r1'", [])
+        .unwrap();
 
     let tiles = vec![tile("t1", "reminders", None, 0)];
     let brief =
         dashboard_brief_inner(&db, tiles.clone(), &HashSet::new(), MAX_BRIEF_CHARS).unwrap();
     assert!(
         !brief.contains("CHASE THE SEALED THING"),
-        "a reminder whose only anchor is sealed must not reach a prompt: {brief}"
+        "one readable anchor must not declassify a title derived from a sealed anchor: {brief}"
     );
     let packed = packed_scoped(&db, &HashSet::new(), Some(&brief), None).unwrap_or_default();
     assert!(
@@ -730,6 +667,12 @@ fn a_reminder_anchored_only_to_a_sealed_meeting_contributes_nothing() {
 
     // CONTROL — unlock the folder and the SAME assertion finds it, so the negative is
     // the provenance gate rather than a reminder that was never stored.
+    db.lock()
+        .execute(
+            "UPDATE reminders SET title='CHASE THE SEALED THING' WHERE id='r1'",
+            [],
+        )
+        .unwrap();
     let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
     let brief = dashboard_brief_inner(&db, tiles, &unlocked, MAX_BRIEF_CHARS).unwrap();
     assert!(
@@ -744,6 +687,204 @@ fn a_reminder_anchored_only_to_a_sealed_meeting_contributes_nothing() {
     );
 }
 
+/// A document anchor is read defensively even though the current reminder composer still writes
+/// only note/meeting anchors. This keeps a forward-compatible on-disk row honest: a readable
+/// document-derived reminder reaches both the resolved tile and provider corpus, while sealed or
+/// deleted documents contribute nothing.
+#[test]
+fn a_document_anchored_reminder_requires_a_readable_document() {
+    let db = file_db("reminders-document-anchor");
+    seed_folder(&db, "f-open", false);
+    seed_folder(&db, "f-sealed", true);
+    db.insert_document(
+        "d-open",
+        "f-open",
+        "open.txt",
+        "readable document body",
+        "document",
+        1_780_000_000_000,
+    )
+    .unwrap();
+    db.insert_document(
+        "d-sealed",
+        "f-sealed",
+        "sealed.txt",
+        "sealed document body",
+        "document",
+        1_780_000_000_001,
+    )
+    .unwrap();
+    db.insert_document(
+        "d-deleted",
+        "f-open",
+        "deleted.txt",
+        "deleted document body",
+        "document",
+        1_780_000_000_002,
+    )
+    .unwrap();
+
+    for (id, title) in [
+        ("r-open", "READABLE DOCUMENT REMINDER"),
+        ("r-sealed", "SEALED DOCUMENT REMINDER"),
+        ("r-deleted", "DELETED DOCUMENT REMINDER"),
+    ] {
+        db.create_reminder(
+            id,
+            &ReminderDraft {
+                title: title.to_string(),
+                details: None,
+                due_at: 1_780_000_000_000,
+                repeat_every: None,
+                repeat_unit: None,
+                sources: Vec::new(),
+            },
+            ReminderOrigin::Smart,
+            1_780_000_000_000,
+        )
+        .unwrap();
+    }
+
+    // The shipped writer deliberately retains its note/meeting-only storage contract. Seed the
+    // defensive forward-compatibility read seam without changing that public write surface as part
+    // of the dashboard feature.
+    db.lock()
+        .execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+             INSERT INTO reminder_sources(reminder_id,source_kind,source_id) VALUES
+               ('r-open','document','d-open'),
+               ('r-sealed','document','d-sealed'),
+               ('r-deleted','document','d-deleted');
+             PRAGMA ignore_check_constraints=OFF;",
+        )
+        .unwrap();
+    db.delete_document("d-deleted").unwrap();
+
+    let reminder_tile = tile("t-reminders", "reminders", None, 0);
+    let resolved = resolve_tile(&db, &reminder_tile, &HashSet::new()).unwrap();
+    let TileData::Reminders { rows, due_count } = resolved else {
+        panic!("the reminders tile must stay resolved");
+    };
+    assert_eq!(due_count, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text, "READABLE DOCUMENT REMINDER");
+
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "t-reminders",
+        "b1",
+        "reminders",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    let context =
+        dashboard_composite_context(&db, "b1", &HashSet::new(), 200_000, &[], None).unwrap();
+    let (system, user) = crate::summarize::vault_chat::build_for_dashboard(
+        &context.packed_corpus,
+        &[],
+        "Which reminders are on this board?",
+    );
+    let prompt = format!("{system}\n{user}");
+    assert!(prompt.contains("READABLE DOCUMENT REMINDER"));
+    assert!(!prompt.contains("SEALED DOCUMENT REMINDER"));
+    assert!(!prompt.contains("DELETED DOCUMENT REMINDER"));
+
+    // CONTROL — the same sealed row appears only after its folder is session-unlocked.
+    let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+    let context = dashboard_composite_context(&db, "b1", &unlocked, 200_000, &[], None).unwrap();
+    let (system, user) = crate::summarize::vault_chat::build_for_dashboard(
+        &context.packed_corpus,
+        &[],
+        "Which reminders are on this board?",
+    );
+    let prompt = format!("{system}\n{user}");
+    assert!(prompt.contains("SEALED DOCUMENT REMINDER"));
+    assert!(!prompt.contains("DELETED DOCUMENT REMINDER"));
+}
+
+#[test]
+fn smart_reminder_without_provenance_fails_closed_but_manual_reminder_is_visible() {
+    let db = file_db("reminders-empty-provenance");
+    db.create_reminder(
+        "r-smart",
+        &ReminderDraft {
+            title: "SMART SOURCE-LOST SECRET".to_string(),
+            details: None,
+            due_at: 1_780_000_000_000,
+            repeat_every: None,
+            repeat_unit: None,
+            sources: vec![],
+        },
+        ReminderOrigin::Smart,
+        1_780_000_000_000,
+    )
+    .unwrap();
+    db.create_reminder(
+        "r-manual",
+        &ReminderDraft {
+            title: "MANUAL OWNED REMINDER".to_string(),
+            details: None,
+            due_at: 1_780_000_000_001,
+            repeat_every: None,
+            repeat_unit: None,
+            sources: vec![],
+        },
+        ReminderOrigin::Manual,
+        1_780_000_000_001,
+    )
+    .unwrap();
+
+    let brief = dashboard_brief_inner(
+        &db,
+        vec![tile("t1", "reminders", None, 0)],
+        &HashSet::new(),
+        MAX_BRIEF_CHARS,
+    )
+    .unwrap();
+    let packed = packed_scoped(&db, &HashSet::new(), Some(&brief), None).unwrap();
+    assert!(!packed.contains("SMART SOURCE-LOST SECRET"));
+    assert!(
+        packed.contains("MANUAL OWNED REMINDER"),
+        "manual source-less reminders are user-authored and keep the negative non-vacuous: {packed}"
+    );
+}
+
+#[test]
+fn derived_board_brief_never_hydrates_residual_tile_chrome_or_config() {
+    let db = file_db("derived-poisoned-chrome");
+    db.insert_dashboard("b-derived", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "t-promises",
+        "b-derived",
+        "promises",
+        None,
+        Some("RESIDUAL DERIVED TITLE"),
+        4,
+        Some(r#"{"owner":"RESIDUAL OWNER"}"#),
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    db.lock()
+        .execute(
+            "UPDATE dashboard_tiles SET title=x'00',config=x'01' WHERE id='t-promises'",
+            [],
+        )
+        .unwrap();
+
+    let tiles = db.list_dashboard_tile_structures("b-derived").unwrap();
+    let brief = dashboard_brief_inner(&db, tiles, &HashSet::new(), MAX_BRIEF_CHARS).unwrap();
+    assert!(
+        brief.contains("promises"),
+        "gated derived payload still renders: {brief}"
+    );
+}
+
 /// GAP 1 — the SEVENTH derived kind. A `livingAnswer` whose cached answer was
 /// stamped against a folder that is no longer fully readable resolves with
 /// `withheld: true`, and a withheld cached answer is a PARAPHRASE of content the
@@ -752,44 +893,417 @@ fn a_reminder_anchored_only_to_a_sealed_meeting_contributes_nothing() {
 fn a_withheld_living_answer_contributes_nothing() {
     let db = file_db("living-answer-withheld");
     seed_folder(&db, "f-sealed", true);
-    seed_meeting_with_commitment(&db, "m-sealed", "f-sealed", "irrelevant");
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "t1",
+        "b1",
+        "living_answer",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    db.stamp_dashboard_question_provenance("t1", "will it land?", r#"["f-sealed"]"#)
+        .unwrap();
+    db.lock()
+        .execute("UPDATE dashboard_tiles SET config=x'00' WHERE id='t1'", [])
+        .unwrap();
+    let t = db.list_dashboard_tile_structures("b1").unwrap().remove(0);
 
-    // A cached answer stamped against a folder that is sealed and NOT session-unlocked.
-    let cfg = serde_json::json!({
-        "question": "will it land?",
-        "answer": "CACHED PARAPHRASE OF SEALED CONTENT",
-        "answeredAt": "2026-08-01T09:00:00Z",
-        "answerReadableFolders": ["f-sealed"],
-    })
-    .to_string();
-    let mut t = tile("t1", "living_answer", None, 0);
-    t.config = Some(cfg);
+    let locked_data = resolve_tile(&db, &t, &HashSet::new()).unwrap();
+    let TileData::LivingAnswer {
+        question,
+        answer,
+        withheld,
+        ..
+    } = &locked_data
+    else {
+        panic!("expected living-answer data")
+    };
+    assert!(*withheld);
+    assert!(
+        question.is_empty(),
+        "withheld question must be absent on the wire"
+    );
+    assert!(answer.is_none());
+    let redacted = redact_tile_chrome(t.clone(), &locked_data);
+    let rendered = render_tile_for_agent(&redacted, &locked_data);
+    assert!(!rendered.contains("will it land?"));
+    assert!(!rendered.contains("will it land?"));
 
     let brief =
         dashboard_brief_inner(&db, vec![t.clone()], &HashSet::new(), MAX_BRIEF_CHARS).unwrap();
-    assert!(
-        !brief.contains("CACHED PARAPHRASE OF SEALED CONTENT"),
-        "a withheld cached answer must not reach a prompt: {brief}"
-    );
+    assert!(!brief.contains("will it land?"));
+    assert!(!brief.contains("will it land?"));
     let packed = packed_user(&db, &HashSet::new(), &brief, None).unwrap_or_default();
-    assert!(!packed.contains("CACHED PARAPHRASE OF SEALED CONTENT"));
+    assert!(!packed.contains("will it land?"));
 
     // CONTROL — session-unlock the stamped folder and the SAME string reappears, so the
     // negative above is the withheld predicate rather than an unparsed config.
     let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+    let unlocked_data = resolve_tile(&db, &t, &unlocked).unwrap();
+    let TileData::LivingAnswer {
+        question,
+        answer,
+        withheld,
+        ..
+    } = &unlocked_data
+    else {
+        panic!("expected living-answer data")
+    };
+    assert!(!*withheld);
+    assert_eq!(question, "will it land?");
+    assert!(answer.is_none());
+    assert!(render_tile_for_agent(&t, &unlocked_data).contains("will it land?"));
     let brief = dashboard_brief_inner(&db, vec![t], &unlocked, MAX_BRIEF_CHARS).unwrap();
+    assert!(brief.contains("will it land?"));
+}
+
+#[test]
+fn a_readable_backend_stamped_living_answer_reaches_the_production_resolver() {
+    let db = file_db("living-answer-readable-cache");
+    seed_folder(&db, "f-open", false);
+    seed_meeting_with_commitment(&db, "m-source", "f-open", "ship on Friday");
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_living_answer_tile(
+        "t-readable",
+        "b1",
+        4,
+        "Will it ship?",
+        r#"["f-open"]"#,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    db.insert_dashboard_tile(
+        "t-promises",
+        "b1",
+        "promises",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:01Z",
+    )
+    .unwrap();
+    let context = living_answer_composite_context(&db, "b1", &HashSet::new(), 200_000).unwrap();
+    db.lock()
+        .execute(
+            "UPDATE dashboard_tiles SET
+               living_answer='YES — READABLE CACHE',
+               living_answered_at='2026-08-01T09:01:00Z',
+               answer_readable_folders_json='[\"f-open\"]',
+               living_answer_context_generation=?1,
+               living_answer_context_digest=?2,
+               living_answer_context_budget=200000,
+               living_answer_ask_dispatch_generation=?3
+             WHERE id='t-readable'",
+            rusqlite::params![
+                context.witness.generation,
+                context.witness.input_digest,
+                context.witness.ask_dispatch_generation,
+            ],
+        )
+        .unwrap();
+    let tile = db.list_dashboard_tile_structures("b1").unwrap().remove(0);
+
+    let data = resolve_tile(&db, &tile, &HashSet::new()).unwrap();
+    let TileData::LivingAnswer {
+        question,
+        answer,
+        answered_at,
+        withheld,
+    } = &data
+    else {
+        panic!("expected living answer")
+    };
+    assert_eq!(question, "Will it ship?");
+    assert_eq!(answer.as_deref(), Some("YES — READABLE CACHE"));
+    assert_eq!(answered_at.as_deref(), Some("2026-08-01T09:01:00Z"));
+    assert!(!withheld);
+    let wire = serde_json::to_string(&ResolvedTileDto {
+        tile: tile.clone(),
+        data: data.clone(),
+    })
+    .unwrap();
+    assert!(wire.contains("YES — READABLE CACHE"));
+    assert!(render_tile_for_agent(&tile, &data).contains("YES — READABLE CACHE"));
     assert!(
-        brief.contains("CACHED PARAPHRASE OF SEALED CONTENT"),
-        "unlocking must restore it, or the leak test is vacuous: {brief}"
+        dashboard_brief_inner(&db, vec![tile], &HashSet::new(), MAX_BRIEF_CHARS)
+            .unwrap()
+            .contains("YES — READABLE CACHE")
     );
+
+    db.lock()
+        .execute(
+            "UPDATE notes SET markdown='## Action items\n- [ ] Marcus — SOURCE MUTATED\n'
+              WHERE meeting_id='m-source'",
+            [],
+        )
+        .unwrap();
+    let tile = db
+        .list_dashboard_tile_structures("b1")
+        .unwrap()
+        .into_iter()
+        .find(|tile| tile.id == "t-readable")
+        .unwrap();
+    let stale = resolve_tile(&db, &tile, &HashSet::new()).unwrap();
+    assert!(matches!(
+        stale,
+        TileData::LivingAnswer {
+            answer: None,
+            withheld: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn malformed_or_unreadable_living_answer_content_is_never_hydrated() {
+    let db = file_db("living-answer-malformed-cache");
+    seed_folder(&db, "f-sealed", true);
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_living_answer_tile(
+        "t-malformed",
+        "b1",
+        4,
+        "QUESTION SENTINEL",
+        r#"["f-sealed"]"#,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    let generation = db.dashboard_context_state("b1").unwrap().0;
+    db.lock()
+        .execute(
+            "UPDATE dashboard_tiles SET
+               living_answer=?2,
+               living_answered_at='2026-08-01T09:01:00Z',
+               answer_readable_folders_json='[\"f-sealed\"]',
+               living_answer_context_generation=?1,
+               living_answer_context_digest='exact-packed-digest',
+               config='{\"answer\":\"LEGACY CONFIG SENTINEL\",\"answerReadableFolders\":[]}'
+             WHERE id='t-malformed'",
+            rusqlite::params![generation, b"SECRET BLOB-ANSWER".as_slice()],
+        )
+        .unwrap();
+    let tile = db.list_dashboard_tile_structures("b1").unwrap().remove(0);
+
+    for unlocked in [HashSet::new(), HashSet::from(["f-sealed".to_string()])] {
+        let data = resolve_tile(&db, &tile, &unlocked).unwrap();
+        assert!(matches!(
+            data,
+            TileData::LivingAnswer {
+                ref question,
+                answer: None,
+                answered_at: None,
+                withheld: true,
+            } if question.is_empty()
+        ));
+        let wire = serde_json::to_string(&ResolvedTileDto {
+            tile: redact_tile_chrome(tile.clone(), &data),
+            data: data.clone(),
+        })
+        .unwrap();
+        for secret in [
+            "QUESTION SENTINEL",
+            "SECRET BLOB-ANSWER",
+            "LEGACY CONFIG SENTINEL",
+        ] {
+            assert!(!wire.contains(secret), "secret reached wire: {wire}");
+            assert!(!render_tile_for_agent(&tile, &data).contains(secret));
+        }
+    }
+}
+
+#[test]
+fn living_answer_provider_context_excludes_every_cached_living_answer() {
+    let db = file_db("living-answer-no-self-conditioning");
+    seed_folder(&db, "f-open", false);
+    seed_meeting_with_commitment(&db, "m-source", "f-open", "GROUNDING MARKER");
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    for (id, question) in [("answer-a", "Question A?"), ("answer-b", "Question B?")] {
+        db.insert_dashboard_living_answer_tile(
+            id,
+            "b1",
+            4,
+            question,
+            r#"["f-open"]"#,
+            "2026-08-01T09:00:00Z",
+        )
+        .unwrap();
+    }
+    db.insert_dashboard_tile(
+        "promises",
+        "b1",
+        "promises",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:01Z",
+    )
+    .unwrap();
+    let excluded = living_answer_composite_context(&db, "b1", &HashSet::new(), 200_000).unwrap();
+    for (id, answer) in [
+        ("answer-a", "OLD CACHE A MUST NOT CONDITION"),
+        ("answer-b", "OLD CACHE B MUST NOT CONDITION"),
+    ] {
+        db.lock()
+            .execute(
+                "UPDATE dashboard_tiles SET
+                   living_answer=?2,
+                   living_answered_at='2026-08-01T09:01:00Z',
+                   answer_readable_folders_json='[\"f-open\"]',
+                   living_answer_context_generation=?3,
+                   living_answer_context_digest=?4,
+                   living_answer_context_budget=200000,
+                   living_answer_ask_dispatch_generation=?5
+                 WHERE id=?1",
+                rusqlite::params![
+                    id,
+                    answer,
+                    excluded.witness.generation,
+                    excluded.witness.input_digest,
+                    excluded.witness.ask_dispatch_generation,
+                ],
+            )
+            .unwrap();
+    }
+
+    let general =
+        dashboard_composite_context(&db, "b1", &HashSet::new(), 200_000, &[], None).unwrap();
+    assert!(general.packed_corpus.contains("OLD CACHE A MUST NOT CONDITION"));
+    assert!(general.packed_corpus.contains("OLD CACHE B MUST NOT CONDITION"));
+    let provider = living_answer_composite_context(&db, "b1", &HashSet::new(), 200_000).unwrap();
+    assert!(provider.packed_corpus.contains("GROUNDING MARKER"));
+    assert!(!provider.packed_corpus.contains("OLD CACHE A MUST NOT CONDITION"));
+    assert!(!provider.packed_corpus.contains("OLD CACHE B MUST NOT CONDITION"));
+}
+
+#[test]
+fn refreshing_a_second_living_answer_does_not_hide_the_first() {
+    let db = file_db("living-answer-two-caches");
+    seed_folder(&db, "f-open", false);
+    seed_meeting_with_commitment(&db, "m-source", "f-open", "GROUNDING MARKER");
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    for (id, question) in [("answer-a", "Question A?"), ("answer-b", "Question B?")] {
+        db.insert_dashboard_living_answer_tile(
+            id,
+            "b1",
+            4,
+            question,
+            r#"["f-open"]"#,
+            "2026-08-01T09:00:00Z",
+        )
+        .unwrap();
+    }
+    db.insert_dashboard_tile(
+        "promises",
+        "b1",
+        "promises",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:01Z",
+    )
+    .unwrap();
+    let context = living_answer_composite_context(&db, "b1", &HashSet::new(), 200_000).unwrap();
+    for (id, question, answer) in [
+        ("answer-a", "Question A?", "ANSWER A REMAINS"),
+        ("answer-b", "Question B?", "ANSWER B REMAINS"),
+    ] {
+        assert!(db
+            .store_dashboard_living_answer_cas(
+                id,
+                "b1",
+                question,
+                answer,
+                "2026-08-01T09:01:00Z",
+                r#"["f-open"]"#,
+                context.witness.generation,
+                &context.witness.input_digest,
+                200_000,
+            )
+            .unwrap());
+    }
+    assert_eq!(
+        db.dashboard_structural_context_state("b1").unwrap().0,
+        context.witness.generation,
+        "cache writes must not mutate the structural incarnation"
+    );
+    for (id, expected) in [
+        ("answer-a", "ANSWER A REMAINS"),
+        ("answer-b", "ANSWER B REMAINS"),
+    ] {
+        let tile = db
+            .list_dashboard_tile_structures("b1")
+            .unwrap()
+            .into_iter()
+            .find(|tile| tile.id == id)
+            .unwrap();
+        let resolved = resolve_tile(&db, &tile, &HashSet::new()).unwrap();
+        assert!(matches!(
+            resolved,
+            TileData::LivingAnswer {
+                answer: Some(ref answer),
+                withheld: false,
+                ..
+            } if answer == expected
+        ));
+    }
+}
+
+#[test]
+fn a_question_without_an_answer_is_withheld_after_its_creation_scope_relocks() {
+    let db = file_db("living-question-withheld");
+    seed_folder(&db, "f-sealed", true);
+    db.insert_dashboard("b1", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "t-question",
+        "b1",
+        "living_answer",
+        None,
+        None,
+        4,
+        None,
+        "now",
+    )
+    .unwrap();
+    db.stamp_dashboard_question_provenance(
+        "t-question",
+        "QUESTION DERIVED FROM SEALED SENTINEL",
+        r#"["f-sealed"]"#,
+    )
+    .unwrap();
+    let t = db.list_dashboard_tile_structures("b1").unwrap().remove(0);
+
+    let locked = resolve_tile(&db, &t, &HashSet::new()).unwrap();
+    let locked_json = serde_json::to_string(&ResolvedTileDto {
+        tile: redact_tile_chrome(t.clone(), &locked),
+        data: locked.clone(),
+    })
+    .unwrap();
+    assert!(!locked_json.contains("QUESTION DERIVED FROM SEALED SENTINEL"));
+    assert!(!render_tile_for_agent(&t, &locked).contains("QUESTION DERIVED"));
+
+    let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+    let visible = resolve_tile(&db, &t, &unlocked).unwrap();
+    assert!(render_tile_for_agent(&t, &visible).contains("QUESTION DERIVED FROM SEALED SENTINEL"));
 }
 
 /// GAP 2 — the PRODUCTION wiring, not one layer in.
 ///
 /// Every other test here enters at `dashboard_brief_inner` with a hand-built
-/// `HashSet`. That proves the rule but not the plumbing: `dashboard_brief_for_ask`
-/// reads the board's tiles from the DB and applies `brief_allowance`, and neither
-/// was executed. A gate established by READING a diff is not a gate that ran.
+/// `HashSet`. This drives the shipped composite resolver, including its DB tile read,
+/// derived brief allowance, material-source packing, and session visibility gate.
 #[test]
 fn the_production_brief_entry_point_gates_on_the_session_snapshot() {
     let db = file_db("production-wiring");
@@ -809,26 +1323,28 @@ fn the_production_brief_entry_point_gates_on_the_session_snapshot() {
     )
     .unwrap();
 
-    let brief = dashboard_brief_for_ask(&db, "b-live", &HashSet::new(), 200_000).unwrap();
+    let context =
+        dashboard_composite_context(&db, "b-live", &HashSet::new(), 200_000, &[], None).unwrap();
     assert!(
-        !brief.contains("the sealed obligation"),
-        "the production entry point must gate on the session snapshot: {brief}"
+        !context.packed_corpus.contains("the sealed obligation"),
+        "the production entry point must gate on the session snapshot: {}",
+        context.packed_corpus
     );
 
     // CONTROL — the same call with the folder session-unlocked finds it.
     let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
-    let brief = dashboard_brief_for_ask(&db, "b-live", &unlocked, 200_000).unwrap();
+    let context =
+        dashboard_composite_context(&db, "b-live", &unlocked, 200_000, &[], None).unwrap();
     assert!(
-        brief.contains("the sealed obligation"),
-        "unlocking must restore it, or the wiring test is vacuous: {brief}"
+        context.packed_corpus.contains("the sealed obligation"),
+        "unlocking must restore it, or the wiring test is vacuous: {}",
+        context.packed_corpus
     );
 
-    // An unknown board id is empty, never an error — a stale id must not fail an Ask.
-    assert!(
-        dashboard_brief_for_ask(&db, "no-such-board", &unlocked, 200_000)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(matches!(
+        dashboard_composite_context(&db, "no-such-board", &unlocked, 200_000, &[], None),
+        Err(AppError::Locked(_))
+    ));
 }
 
 /// The brief takes its slice OUT OF the corpus budget rather than on top of it.
@@ -837,7 +1353,7 @@ fn the_production_brief_entry_point_gates_on_the_session_snapshot() {
 /// 200k budget and a small vault there is slack: the corpus packs whole either way and
 /// the brief genuinely adds — correctly, since the prompt is still inside budget. An
 /// earlier version of this test ran exactly there, and therefore passed with or without
-/// `saturating_sub(board_brief.chars().count())` in `ask.rs`. A test that cannot fail is
+/// the composite resolver's shared source-budget subtraction. A test that cannot fail is
 /// not evidence — the same vacuity the adversarial review of PR #562 caught in this
 /// feature's answer-cache gate.
 ///
@@ -876,23 +1392,32 @@ fn the_brief_comes_out_of_the_corpus_budget_when_the_budget_binds() {
     let without = packed_with_provider(&db, &HashSet::new(), None, Some(&sources), "ollama")
         .unwrap_or_default();
 
+    let board_grounding = with_board
+        .split_once("DASHBOARD GROUNDING:\n")
+        .map(|(_, grounding)| grounding.split("\nUser:").next().unwrap_or(grounding))
+        .expect("board prompt must label its mixed grounding");
+    let legacy_grounding = without
+        .split_once("MEETING NOTES:\n")
+        .map(|(_, grounding)| grounding.split("\nUser:").next().unwrap_or(grounding))
+        .expect("non-board prompt must retain the legacy grounding label");
+
     assert!(
-        without.chars().count() > 3_000,
+        legacy_grounding.chars().count() > 3_000,
         "the no-board corpus must actually saturate the 4000-char budget, or this test proves nothing: {}",
-        without.chars().count()
+        legacy_grounding.chars().count()
     );
     // Equal to within the two-character `\n\n` that joins brief to corpus. Without
     // the subtraction the delta would be the brief's own length — hundreds of chars at
     // this allowance — so a 4-char tolerance still falsifies decisively.
-    let delta = with_board
+    let delta = board_grounding
         .chars()
         .count()
-        .saturating_sub(without.chars().count());
+        .saturating_sub(legacy_grounding.chars().count());
     assert!(
         delta <= 4,
         "the brief must displace corpus, not stack on it: board {} vs no-board {} (delta {delta}, brief {})",
-        with_board.chars().count(),
-        without.chars().count(),
+        board_grounding.chars().count(),
+        legacy_grounding.chars().count(),
         brief.chars().count()
     );
 }
@@ -959,12 +1484,8 @@ fn one_oversized_ledger_still_reaches_the_prompt_as_a_counted_prefix() {
 
 // ── THE PRODUCTION COMPOSITION ────────────────────────────────────────────────
 //
-// Everything above tests a PIECE: `dashboard_brief_inner` (the rule),
-// `dashboard_brief_for_ask` (the DB read), `build_ask_vault_floor_prompt` (the pack).
-// The glue in `ask_vault` — normalize the id, resolve the brief, PRESERVE `Some("")`,
-// forward it — was verified by reading, and that is where the routing defect actually
-// lived: a derived-only board skipping the floor entirely. `board_scoped_brief` is
-// that glue, extracted so these tests drive the shipped code rather than a copy of it.
+// Everything above tests a PIECE. These tests enter through the shipped composite resolver and
+// assert the exact packed corpus handed to the provider seam.
 
 /// End to end at the production seam: a board id in, a promises row out of the packed
 /// provider prompt — with no hand-assembled intermediate.
@@ -987,23 +1508,369 @@ fn the_production_composition_puts_a_ledger_row_in_the_packed_prompt() {
     )
     .unwrap();
 
-    let brief = board_scoped_brief(&db, Some("b-1"), &HashSet::new(), 200_000).unwrap();
-    let brief = brief.expect("a board id must yield board scope");
-    let packed = packed_scoped(&db, &HashSet::new(), Some(&brief), None)
-        .expect("a board-scoped ask must produce a prompt");
+    let context =
+        dashboard_composite_context(&db, "b-1", &HashSet::new(), 200_000, &[], None).unwrap();
+    let (system, user) = crate::summarize::vault_chat::build_for_dashboard(
+        &context.packed_corpus,
+        &[],
+        "who owes me something on this board?",
+    );
+    let packed = format!("{system}\n{user}");
     assert!(
         packed.contains("send the Acme paperwork"),
         "the production path must carry the ledger row to the provider prompt: {packed}"
     );
 }
 
+#[test]
+fn active_prepacked_dashboard_empty_and_withheld_return_the_same_safe_message() {
+    let db = file_db("prepacked-empty-withheld");
+    db.insert_dashboard("empty", "Empty", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard(
+        "withheld",
+        "Withheld",
+        None,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    seed_folder(&db, "f-sealed", true);
+    seed_meeting_with_commitment(
+        &db,
+        "m-sealed",
+        "f-sealed",
+        "SEALED WITHHELD PROMISE",
+    );
+    db.insert_dashboard_tile(
+        "withheld-meeting",
+        "withheld",
+        "meeting",
+        Some("m-sealed"),
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    let empty =
+        dashboard_composite_context(&db, "empty", &HashSet::new(), 200_000, &[], None).unwrap();
+    let withheld = dashboard_composite_context(
+        &db,
+        "withheld",
+        &HashSet::new(),
+        200_000,
+        &[],
+        None,
+    )
+    .unwrap();
+    assert!(empty.packed_corpus.is_empty());
+    assert!(withheld.packed_corpus.is_empty());
+    let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+    let visible =
+        dashboard_composite_context(&db, "withheld", &unlocked, 200_000, &[], None).unwrap();
+    assert!(
+        visible.packed_corpus.contains("SEALED WITHHELD PROMISE"),
+        "unlock control must prove the withheld board is not merely empty"
+    );
+
+    let admission = crate::state::ContentDispatchAdmission::for_test(
+        std::sync::Arc::new(std::sync::Mutex::new(())),
+        || Ok(()),
+    );
+    let heavy = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let config = AppConfig::default();
+    let empty_result = block_on(crate::commands::ask_vault_prepacked_dashboard_authorized(
+        &empty,
+        &config,
+        "question",
+        &[],
+        &heavy,
+        admission.clone(),
+    ))
+    .unwrap();
+    let withheld_result = block_on(crate::commands::ask_vault_prepacked_dashboard_authorized(
+        &withheld,
+        &config,
+        "question",
+        &[],
+        &heavy,
+        admission,
+    ))
+    .unwrap();
+
+    assert_eq!(empty_result.answer, withheld_result.answer);
+    assert_eq!(
+        empty_result.answer,
+        "Nothing on this board is readable right now — unlock its folders, or add tiles with content you can see."
+    );
+    assert!(empty_result.sources.is_empty() && empty_result.citations.is_empty());
+    assert!(withheld_result.sources.is_empty() && withheld_result.citations.is_empty());
+}
+
+#[test]
+fn id_only_composite_resolves_material_and_derived_with_dedupe() {
+    let db = file_db("composite-material-derived");
+    seed_folder(&db, "f-open", false);
+    seed_meeting_with_commitment(&db, "m1", "f-open", "send the board packet");
+    db.insert_dashboard("b-composite", "Board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    for tile_id in ["material-a", "material-duplicate"] {
+        db.insert_dashboard_tile(
+            tile_id,
+            "b-composite",
+            "meeting",
+            Some("m1"),
+            None,
+            4,
+            None,
+            "2026-08-01T09:00:00Z",
+        )
+        .unwrap();
+    }
+    db.insert_dashboard_tile(
+        "derived",
+        "b-composite",
+        "promises",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+
+    let context =
+        dashboard_composite_context(&db, "b-composite", &HashSet::new(), 200_000, &[], None)
+            .unwrap();
+    assert_eq!(
+        context.packed_sources.len(),
+        1,
+        "duplicate material pointers dedupe"
+    );
+    assert_eq!(context.packed_sources[0].meeting_id, "m1");
+    assert!(context.packed_corpus.contains("send the board packet"));
+    require_dashboard_context_witness(&db, &context.witness, &HashSet::new()).unwrap();
+
+    db.upsert_note(&NoteRecord {
+        meeting_id: "m1".to_string(),
+        provider_id: "test".to_string(),
+        markdown: "## Action items\n- [ ] Marcus — changed after capture\n".to_string(),
+        created_at: "2026-08-01T09:01:00Z".to_string(),
+        exported_path: None,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        require_dashboard_context_witness(&db, &context.witness, &HashSet::new()),
+        Err(AppError::Locked(_))
+    ));
+
+    db.delete_dashboard_tile("derived").unwrap();
+    assert!(matches!(
+        require_dashboard_context_witness(&db, &context.witness, &HashSet::new()),
+        Err(AppError::Locked(_))
+    ));
+}
+
+#[test]
+fn derived_tile_beyond_brief_cutoff_changes_exact_witness_not_provider_corpus() {
+    let db = file_db("derived-beyond-cutoff-witness");
+    seed_folder(&db, "f-open", false);
+    for i in 0..6 {
+        seed_meeting_with_commitment(
+            &db,
+            &format!("m-{i}"),
+            "f-open",
+            &format!("long obligation {i} with enough words to consume the brief allowance"),
+        );
+    }
+    db.create_reminder(
+        "late-reminder",
+        &ReminderDraft {
+            title: "REMINDER-A".to_string(),
+            details: None,
+            due_at: 1_780_000_000_000,
+            repeat_every: None,
+            repeat_unit: None,
+            sources: Vec::new(),
+        },
+        ReminderOrigin::Manual,
+        1_780_000_000_000,
+    )
+    .unwrap();
+    db.insert_dashboard("b-derived", "Board", None, None, "now")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "promises",
+        "b-derived",
+        "promises",
+        None,
+        None,
+        4,
+        None,
+        "now",
+    )
+    .unwrap();
+    db.insert_dashboard_tile(
+        "reminders",
+        "b-derived",
+        "reminders",
+        None,
+        None,
+        4,
+        None,
+        "later",
+    )
+    .unwrap();
+
+    let before =
+        dashboard_composite_context(&db, "b-derived", &HashSet::new(), 1_000, &[], None).unwrap();
+    assert!(!before.packed_corpus.contains("REMINDER-A"));
+    db.lock()
+        .execute(
+            "UPDATE reminders SET title='REMINDER-B' WHERE id='late-reminder'",
+            [],
+        )
+        .unwrap();
+    let after =
+        dashboard_composite_context(&db, "b-derived", &HashSet::new(), 1_000, &[], None).unwrap();
+    assert_eq!(before.packed_corpus, after.packed_corpus);
+    assert_ne!(before.witness.input_digest, after.witness.input_digest);
+}
+
+#[test]
+fn ninth_linked_neighbour_outside_cap_does_not_change_exact_witness() {
+    let db = file_db("ninth-neighbour-control");
+    seed_folder(&db, "f-open", false);
+    db.insert_note(
+        "hub",
+        "f-open",
+        "Hub",
+        "Hub",
+        &"hub body ".repeat(300),
+        1_700_000_000,
+    )
+    .unwrap();
+    for i in 0..9 {
+        let id = format!("n-{i}");
+        db.insert_note(
+            &id,
+            "f-open",
+            &id,
+            &id,
+            &format!("NEIGHBOUR-{i}-A"),
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_link_for_test(
+            "note", "hub", "note", &id, "manual", 1.0, "user", "active",
+        );
+    }
+    db.insert_dashboard("b-links", "Board", None, None, "now")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "hub-tile",
+        "b-links",
+        "note",
+        Some("hub"),
+        None,
+        4,
+        None,
+        "now",
+    )
+    .unwrap();
+    let before =
+        dashboard_composite_context(&db, "b-links", &HashSet::new(), 300, &[], None).unwrap();
+    db.lock()
+        .execute(
+            "UPDATE documents SET text='NEIGHBOUR-8-B' WHERE id='n-8'",
+            [],
+        )
+        .unwrap();
+    let after =
+        dashboard_composite_context(&db, "b-links", &HashSet::new(), 300, &[], None).unwrap();
+    assert_eq!(before.packed_corpus, after.packed_corpus);
+    assert_eq!(before.witness.input_digest, after.witness.input_digest);
+}
+
+#[test]
+fn identical_logical_edge_reinsert_does_not_change_exact_witness() {
+    let db = file_db("edge-row-id-control");
+    seed_folder(&db, "f-open", false);
+    db.insert_note("hub", "f-open", "Hub", "Hub", "hub body", 1_700_000_000)
+        .unwrap();
+    db.insert_note(
+        "near",
+        "f-open",
+        "Near",
+        "Near",
+        "neighbour body",
+        1_700_000_000,
+    )
+    .unwrap();
+    db.insert_link_for_test(
+        "note", "hub", "note", "near", "manual", 1.0, "user", "active",
+    );
+    db.insert_dashboard("b-edge", "Board", None, None, "now")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "hub-tile",
+        "b-edge",
+        "note",
+        Some("hub"),
+        None,
+        4,
+        None,
+        "now",
+    )
+    .unwrap();
+    let before =
+        dashboard_composite_context(&db, "b-edge", &HashSet::new(), 2_000, &[], None).unwrap();
+    let old_id: i64 = db
+        .lock()
+        .query_row("SELECT id FROM links WHERE edge_type='manual'", [], |row| row.get(0))
+        .unwrap();
+    db.lock()
+        .execute("UPDATE links SET id=100 WHERE edge_type='manual'", [])
+        .unwrap();
+    let new_id: i64 = db
+        .lock()
+        .query_row("SELECT id FROM links WHERE edge_type='manual'", [], |row| row.get(0))
+        .unwrap();
+    assert_ne!(old_id, new_id, "the control must really replace the SQL row");
+    let after =
+        dashboard_composite_context(&db, "b-edge", &HashSet::new(), 2_000, &[], None).unwrap();
+    assert_eq!(before.packed_corpus, after.packed_corpus);
+    assert_eq!(before.witness.input_digest, after.witness.input_digest);
+}
+
+#[test]
+fn composite_resolver_rejects_unknown_or_deleted_ids() {
+    let db = file_db("composite-missing");
+    assert!(matches!(
+        dashboard_composite_context(&db, "missing", &HashSet::new(), 200_000, &[], None),
+        Err(AppError::Locked(_))
+    ));
+    db.insert_dashboard("gone", "Gone", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.delete_dashboard("gone").unwrap();
+    assert!(matches!(
+        dashboard_composite_context(&db, "gone", &HashSet::new(), 200_000, &[], None),
+        Err(AppError::Locked(_))
+    ));
+}
+
 /// The `Some("")` case at the same seam — the one the first cut collapsed to `None`.
 #[test]
 fn the_production_composition_keeps_scope_for_an_all_withheld_board() {
-    let db = file_db("composition-withheld");
+    let state = brief_state("composition-withheld");
+    let db = &state.db;
     // Readable and entirely unrelated to the board.
-    seed_folder(&db, "f-open", false);
-    seed_meeting_with_commitment(&db, "m-unrelated", "f-open", "UNRELATED VAULT CONTENT");
+    seed_folder(db, "f-open", false);
+    seed_meeting_with_commitment(db, "m-unrelated", "f-open", "UNRELATED VAULT CONTENT");
     // The board: one tile anchored to an entity nobody can see.
     db.insert_dashboard("b-2", "Board", None, None, "2026-08-01T09:00:00Z")
         .unwrap();
@@ -1019,26 +1886,23 @@ fn the_production_composition_keeps_scope_for_an_all_withheld_board() {
     )
     .unwrap();
 
-    let brief = board_scoped_brief(&db, Some("b-2"), &HashSet::new(), 200_000).unwrap();
-    assert_eq!(
-        brief.as_deref(),
-        Some(""),
-        "a board with nothing readable must still be Some — scope is presence, not text"
-    );
-
-    let packed = packed_scoped(&db, &HashSet::new(), brief.as_deref(), None).unwrap_or_default();
+    let cfg = AppConfig::default();
+    let (_, context) =
+        crate::commands::dashboard_composite_floor_inputs(&state, &cfg, Some("b-2"), &[])
+            .unwrap();
+    let packed = context
+        .expect("an existing board must preserve board scope")
+        .packed_corpus;
     assert!(
         !packed.contains("UNRELATED VAULT CONTENT"),
         "an all-withheld board must not answer from the whole vault: {packed}"
     );
 
     // CONTROL — no board id at all, and the SAME fixture reaches the vault-wide corpus.
-    assert_eq!(
-        board_scoped_brief(&db, None, &HashSet::new(), 200_000).unwrap(),
-        None,
-        "no board ⇒ no scope"
-    );
-    let vault_wide = packed_scoped(&db, &HashSet::new(), None, None).unwrap_or_default();
+    let (_, context) =
+        crate::commands::dashboard_composite_floor_inputs(&state, &cfg, None, &[]).unwrap();
+    assert!(context.is_none(), "no board ⇒ no scope");
+    let vault_wide = packed_scoped(db, &HashSet::new(), None, None).unwrap_or_default();
     assert!(
         vault_wide.contains("UNRELATED VAULT CONTENT"),
         "the vault-wide path must still see the vault, or the guard test is vacuous"
@@ -1050,25 +1914,18 @@ fn the_production_composition_keeps_scope_for_an_all_withheld_board() {
 /// byte-identical path.
 #[test]
 fn a_blank_dashboard_id_is_not_a_board() {
-    let db = file_db("composition-blank");
+    let state = brief_state("composition-blank");
+    let cfg = AppConfig::default();
     for id in ["", "   ", "\t\n"] {
-        assert_eq!(
-            board_scoped_brief(&db, Some(id), &HashSet::new(), 200_000).unwrap(),
-            None,
-            "a blank id must not scope the ask: {id:?}"
-        );
+        let (_, context) =
+            crate::commands::dashboard_composite_floor_inputs(&state, &cfg, Some(id), &[])
+                .unwrap();
+        assert!(context.is_none(), "a blank id must not scope the ask: {id:?}");
     }
 }
 
-/// The LEGACY living-answer config — no `answerReadableFolders` stamp at all.
-///
-/// A row written before the stamp existed cannot be checked against anything, so
-/// `resolve_tile` fails CLOSED (`living_answer_withheld` treats an empty recorded set
-/// as unverifiable). That is the correct direction, and it is the one that had no test
-/// at this sink: the existing case only covers a config where the stamp IS present.
-/// An unstamped cached answer is still a paraphrase of whatever the vault held when it
-/// was written, so trusting it would quote possibly-sealed content back into a prompt
-/// forever.
+/// Legacy config is never hydrated by the dedicated-question format. Without the separate
+/// provenance columns and `living_question`, the whole tile fails closed.
 #[test]
 fn an_unstamped_legacy_living_answer_fails_closed() {
     let db = file_db("living-answer-legacy");
@@ -1078,6 +1935,7 @@ fn an_unstamped_legacy_living_answer_fails_closed() {
     // question/answer/answeredAt, and NO `answerReadableFolders` key.
     let legacy = serde_json::json!({
         "question": "will it land?",
+        "questionReadableFolders": ["f-open"],
         "answer": "LEGACY CACHED PARAPHRASE",
         "answeredAt": "2026-08-01T09:00:00Z",
     })
@@ -1094,23 +1952,8 @@ fn an_unstamped_legacy_living_answer_fails_closed() {
     let packed = packed_scoped(&db, &HashSet::new(), Some(&brief), None).unwrap_or_default();
     assert!(!packed.contains("LEGACY CACHED PARAPHRASE"));
 
-    // CONTROL — the SAME answer with a stamp naming a readable folder DOES render, so
-    // the withholding above is the fail-closed rule and not a config that failed to
-    // parse (which would make this test pass for the wrong reason).
-    let stamped = serde_json::json!({
-        "question": "will it land?",
-        "answer": "LEGACY CACHED PARAPHRASE",
-        "answeredAt": "2026-08-01T09:00:00Z",
-        "answerReadableFolders": ["f-open"],
-    })
-    .to_string();
-    let mut t2 = tile("t1", "living_answer", None, 0);
-    t2.config = Some(stamped);
-    let brief = dashboard_brief_inner(&db, vec![t2], &HashSet::new(), MAX_BRIEF_CHARS).unwrap();
-    assert!(
-        brief.contains("LEGACY CACHED PARAPHRASE"),
-        "a stamped, readable answer does render — the control that keeps the negative honest: {brief}"
-    );
+    // Even a legacy config with an answer stamp is never hydrated by the new dedicated-question
+    // format; future answers need their own backend-owned write path.
 }
 
 /// A single row LONGER than the whole allowance.
@@ -1166,12 +2009,9 @@ fn a_cap_smaller_than_the_label_yields_nothing() {
 
 // ── THE GUARDED BLOCK, EXECUTED ───────────────────────────────────────────────
 //
-// Everything above enters at `board_scoped_brief` or below with a caller-supplied
-// `HashSet`, so the ordering `ask_vault` actually performs — acquire the lifecycle
-// guard, THEN take the session snapshot, THEN resolve every tile under it — was
-// established by reading the diff. `board_scoped_floor_inputs` is that block; these
-// drive it with a real `AppState`, which also exercises the fail-closed default (a
-// fresh state unlocks nothing) and the Role::Ask budget derivation inside the guard.
+// Everything above enters below the lifecycle boundary with a caller-supplied `HashSet`.
+// These drive `dashboard_composite_floor_inputs` with a real `AppState`, exercising the
+// lifecycle ordering, fail-closed default, and Role::Ask budget derivation together.
 
 /// An `AppState` over a real temp SQLCipher DB — no Keychain, no Tauri. Same shape
 /// `commands::lifecycle_tests::build_state` uses; duplicated rather than shared
@@ -1217,6 +2057,70 @@ fn brief_state(tag: &str) -> crate::state::AppState {
     }
 }
 
+/// Integration oracle for the current trunk's provider matrix: dashboard composition must derive
+/// its one shared corpus budget from the resolved Ask connection, not from the legacy provider id.
+#[test]
+fn local_dashboard_composite_uses_the_on_device_corpus_budget() {
+    let state = brief_state("local-dashboard-budget");
+    let db = &state.db;
+    seed_folder(db, "f-open", false);
+    seed_meeting_with_commitment(db, "m-derived", "f-open", "ship the local build");
+    db.insert_note(
+        "n-long",
+        "f-open",
+        "long-source",
+        "long source",
+        &format!("LOCAL-DASHBOARD-BUDGET {}", "ż".repeat(12_000)),
+        1_775_553_600,
+    )
+    .unwrap();
+    db.insert_dashboard("b-local", "Local board", None, None, "2026-08-01T09:00:00Z")
+        .unwrap();
+    db.insert_dashboard_tile(
+        "t-material",
+        "b-local",
+        "note",
+        Some("n-long"),
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+    db.insert_dashboard_tile(
+        "t-derived",
+        "b-local",
+        "promises",
+        None,
+        None,
+        4,
+        None,
+        "2026-08-01T09:00:00Z",
+    )
+    .unwrap();
+
+    let cfg = AppConfig {
+        role_ask_connection: crate::summarize::roles::CONN_LOCAL.to_string(),
+        ..AppConfig::default()
+    };
+    let (_, context) =
+        crate::commands::dashboard_composite_floor_inputs(&state, &cfg, Some("b-local"), &[])
+            .unwrap();
+    let context = context.expect("the existing board must remain a first-class scope");
+
+    assert_eq!(context.witness.corpus_budget, 4_000);
+    assert!(
+        context.packed_corpus.contains(BRIEF_HEADER),
+        "the fixture must exercise the derived-plus-material join"
+    );
+    assert!(context.packed_corpus.contains("LOCAL-DASHBOARD-BUDGET"));
+    let packed_chars = context.packed_corpus.chars().count();
+    assert!(
+        (3_900..=4_000).contains(&packed_chars),
+        "the fixture must saturate, but never exceed, the resolved on-device budget: {packed_chars}"
+    );
+}
+
 /// The block `ask_vault` runs, driven end to end: a sealed row contributes nothing,
 /// and the control proves the same call finds it once the session unlocks the folder.
 #[test]
@@ -1240,8 +2144,9 @@ fn the_guarded_floor_inputs_gate_on_the_session_unlock_set() {
     .unwrap();
     let cfg = AppConfig::default();
 
-    let (unlocked, brief) =
-        crate::commands::board_scoped_floor_inputs(&state, &cfg, Some("b-1")).unwrap();
+    let (unlocked, context) =
+        crate::commands::dashboard_composite_floor_inputs(&state, &cfg, Some("b-1"), &[])
+            .unwrap();
     assert!(
         unlocked.is_empty(),
         "a fresh session unlocks nothing — fail closed"
@@ -1250,7 +2155,9 @@ fn the_guarded_floor_inputs_gate_on_the_session_unlock_set() {
     // with NO ROWS, because every one of them failed the gate. That distinction is the
     // whole point: the model learns a ledger exists and is empty from here, never what
     // is in it.
-    let text = brief.clone().expect("a board id must yield board scope");
+    let text = context
+        .expect("a board id must yield board scope")
+        .packed_corpus;
     assert!(
         !text.contains("the sealed obligation"),
         "a sealed row must not reach the prompt: {text}"
@@ -1268,17 +2175,22 @@ fn the_guarded_floor_inputs_gate_on_the_session_unlock_set() {
         .lock()
         .unwrap()
         .insert("f-sealed".to_string());
-    let (unlocked, brief) =
-        crate::commands::board_scoped_floor_inputs(&state, &cfg, Some("b-1")).unwrap();
+    let (unlocked, context) =
+        crate::commands::dashboard_composite_floor_inputs(&state, &cfg, Some("b-1"), &[])
+            .unwrap();
     assert_eq!(unlocked.len(), 1, "the returned snapshot is the session's");
     assert!(
-        brief.unwrap_or_default().contains("the sealed obligation"),
+        context
+            .map(|value| value.packed_corpus)
+            .unwrap_or_default()
+            .contains("the sealed obligation"),
         "unlocking must restore the row, or the negative above is vacuous"
     );
 
     // No board id ⇒ no scope, from the same production entry point.
-    let (_, brief) = crate::commands::board_scoped_floor_inputs(&state, &cfg, None).unwrap();
-    assert_eq!(brief, None);
+    let (_, context) =
+        crate::commands::dashboard_composite_floor_inputs(&state, &cfg, None, &[]).unwrap();
+    assert!(context.is_none());
 }
 
 /// The production helper must keep the lifecycle mutex for the entire interval from
@@ -1497,27 +2409,6 @@ fn a_visible_entity_carries_no_row_from_a_sealed_meeting() {
         packed_visible.contains("SEALED-FIGURE-42"),
         "the control must reach the provider sink, or the packed negative is vacuous: {packed_visible}"
     );
-}
-
-/// Helpers for the org-equivalence assertion above.
-fn db_ref(db: &crate::storage::Db) -> &crate::storage::Db {
-    db
-}
-
-fn cfg_for_test() -> AppConfig {
-    AppConfig {
-        semantic_search_enabled: false,
-        provider_id: "claude_code".to_string(),
-        cloud_egress_consented: true,
-        ..AppConfig::default()
-    }
-}
-
-fn prompt_text(p: AskFloorPrompt) -> String {
-    match p {
-        AskFloorPrompt::Ready { system, user, .. } => format!("{system}\n{user}"),
-        AskFloorPrompt::Empty(r) => r.answer,
-    }
 }
 
 /// PULSE AT THE MIXED CASE — the aggregate twin of
@@ -1793,7 +2684,7 @@ fn a_visible_person_counts_nothing_from_a_sealed_meeting() {
 
 /// A relock racing the brief build cannot produce a HALF-GATED brief.
 ///
-/// `board_scoped_floor_inputs` takes `lifecycle_guard` BEFORE `unlocked_snapshot` and
+/// `dashboard_composite_floor_inputs` takes `lifecycle_guard` BEFORE `unlocked_snapshot` and
 /// holds it across every `resolve_tile`. Sharing the caller's snapshot alone would not
 /// give this: it prevents a second, later snapshot, but only the guard serializes
 /// against a relock landing between the snapshot and the last tile. The later
@@ -1875,11 +2766,14 @@ fn a_relock_racing_the_brief_build_cannot_half_gate_it() {
         };
 
         let cfg = AppConfig::default();
-        let (_, brief) =
-            crate::commands::board_scoped_floor_inputs(&state, &cfg, Some("b-1")).unwrap();
+        let (_, context) =
+            crate::commands::dashboard_composite_floor_inputs(&state, &cfg, Some("b-1"), &[])
+                .unwrap();
         racer.join().unwrap();
 
-        let brief = brief.unwrap_or_default();
+        let brief = context
+            .map(|value| value.packed_corpus)
+            .unwrap_or_default();
         let has_promise = brief.contains("the raced obligation");
         let has_reminder = brief.contains("THE RACED REMINDER");
         assert_eq!(
@@ -1900,8 +2794,8 @@ fn a_relock_racing_the_brief_build_cannot_half_gate_it() {
 /// The lock-security review filed this as INFO and it was right to: `dashboard_brief_inner`
 /// returns either `String::new()` or a string starting with `BRIEF_HEADER`, so the state is
 /// unreachable in production. It is pinned here anyway because "unreachable" was an accident
-/// of the producer, not a property of this function — and `ask.rs` is in the owned set of the
-/// next phase. The fix collapses whitespace-only to `""` ONCE, so both sites read one value.
+/// of the producer, not a property of the active dashboard packer. The helper collapses
+/// whitespace-only to `""` once, so reservation and prompt assembly read one value.
 ///
 /// The 600-space control makes any reservation for invisible text observable.
 #[test]
@@ -1928,92 +2822,17 @@ fn a_whitespace_only_brief_costs_no_corpus_budget() {
     let with_blank =
         packed_with_provider(&db, &HashSet::new(), Some(&blank), Some(&sources), "ollama")
             .unwrap_or_default();
-    let without = packed_with_provider(&db, &HashSet::new(), None, Some(&sources), "ollama")
+    let with_empty = packed_with_provider(&db, &HashSet::new(), Some(""), Some(&sources), "ollama")
         .unwrap_or_default();
 
     // Without a binding budget the two would match trivially and this would prove nothing.
     assert!(
-        without.chars().count() > 3_000,
+        with_empty.chars().count() > 3_000,
         "the corpus must saturate the 4000-char budget or this test is vacuous: {}",
-        without.chars().count()
+        with_empty.chars().count()
     );
     assert_eq!(
-        with_blank, without,
+        with_blank, with_empty,
         "a whitespace-only brief must neither add text nor take budget"
-    );
-}
-
-/// The canned answer for an EMPTY board-scoped ask must not send the user to fix the
-/// wrong thing — and must still disclose nothing.
-///
-/// A board whose every tile is withheld packs no corpus, so the floor returns
-/// `AskFloorPrompt::Empty`. That branch used to say "No meeting notes to search yet —
-/// record and summarize a meeting first", which is true of an empty VAULT and false of
-/// a board full of locked tiles: it tells someone whose content exists and is sealed to
-/// go record a meeting. This change is what makes that state reachable, so the wrong
-/// message is this change's to fix.
-///
-/// THE SECOND ASSERTION IS THE LOCK-RELEVANT ONE. An all-sealed board and a board with
-/// no tiles at all must produce the SAME words. If the sealed board got a distinguishable
-/// message, the message itself would answer "does this board have content?" for a session
-/// that is not allowed to know — disclosure by phrasing rather than by payload.
-#[test]
-fn a_board_scoped_empty_ask_does_not_tell_the_user_to_record() {
-    fn empty_answer(db: &crate::storage::Db, brief: Option<&str>) -> String {
-        let cfg = AppConfig {
-            semantic_search_enabled: false,
-            provider_id: "ollama".to_string(),
-            cloud_egress_consented: true,
-            ..AppConfig::default()
-        };
-        match build_ask_vault_floor_prompt(
-            db,
-            &cfg,
-            &HashSet::new(),
-            "who owes me something on this board?",
-            &[],
-            "",
-            None,
-            None,
-            None,
-            brief,
-        )
-        .unwrap()
-        {
-            AskFloorPrompt::Empty(result) => result.answer,
-            AskFloorPrompt::Ready { .. } => panic!("fixture must pack nothing"),
-        }
-    }
-
-    // A board whose every tile is withheld: scoped (`Some`), but with nothing to say.
-    let sealed_db = file_db("empty-ask-sealed");
-    seed_folder(&sealed_db, "f-sealed", true);
-    seed_meeting_with_commitment(&sealed_db, "m-sealed", "f-sealed", "a sealed obligation");
-    let sealed = empty_answer(&sealed_db, Some(""));
-
-    assert!(
-        !sealed.contains("record and summarize"),
-        "a board-scoped ask must not tell the user to record a meeting: {sealed}"
-    );
-    assert!(
-        sealed.contains("board"),
-        "the board-scoped answer must name the board, not the vault: {sealed}"
-    );
-
-    // NON-DISCLOSURE: a board with no tiles at all must read identically.
-    let bare_db = file_db("empty-ask-bare");
-    let bare = empty_answer(&bare_db, Some(""));
-    assert_eq!(
-        sealed, bare,
-        "an all-sealed board and an empty board must be indistinguishable from their \
-         answer — otherwise the phrasing itself discloses that content exists"
-    );
-
-    // CONTROL — without a board, the vault-wide wording is still the right one, so the
-    // assertion above is about board scope and not about the string having been deleted.
-    let no_board = empty_answer(&bare_db, None);
-    assert!(
-        no_board.contains("record and summarize"),
-        "an unscoped empty ask must keep the vault-wide guidance: {no_board}"
     );
 }

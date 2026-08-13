@@ -16,10 +16,16 @@ import type {
 export class DashboardReadComponent {
   readonly lens = input.required<DashboardLens>();
   readonly projection = input.required<BoardProjection>();
+  readonly refreshingAnswerId = input<string | null>(null);
   readonly openSource = output<SourceRef>();
+  readonly refreshAnswer = output<{ tileId: string; question: string }>();
 
   open(source: SourceRef | null): void {
     if (source) this.openSource.emit(source);
+  }
+
+  refresh(answer: { tileId: string; question: string }): void {
+    this.refreshAnswer.emit(answer);
   }
 
   formatDate(iso: string): string {

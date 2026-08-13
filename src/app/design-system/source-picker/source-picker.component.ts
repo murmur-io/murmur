@@ -15,6 +15,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../core/ipc.service";
 import type {
+  DashboardScopeRef,
   DashboardSummary,
   LinkKind,
   NoteCitation,
@@ -83,6 +84,13 @@ export class SourcePickerComponent {
 
   /** Two-way: the picked sources rendered as removable chips. */
   readonly selected = model<SourceRef[]>([]);
+  /** Two-way composite dashboard identity, separate from material sources. */
+  readonly dashboard = model<DashboardScopeRef | null>(null);
+  /**
+   * `expand` preserves the historical Reminders contract. `composite` selects
+   * one ID-only board scope without fetching or retaining its child sources.
+   */
+  readonly dashboardMode = input<"expand" | "composite">("expand");
   /** Placeholder for the popover search input. */
   readonly placeholder = input("Add a note or meeting…");
   /** Label on the trigger button. */
@@ -92,12 +100,9 @@ export class SourcePickerComponent {
   /** Optional hard cap. Removal remains available at the cap unless disabled. */
   readonly selectionLimit = input<number | null>(null);
   /**
-   * Offer the user's DASHBOARDS as pickable scopes. Picking one expands it into
-   * the board's own VISIBLE sources (`get_dashboard_sources`, which drops sealed
-   * ones) and adds them, so a board becomes usable as context anywhere this
-   * picker is — Ask, note chat, reminders — without any command learning a new
-   * parameter. Default ON: a board is the user's own declaration of what belongs
-   * together, which is exactly what a source picker is for.
+   * Offer the user's dashboards as scopes. The default `expand` mode preserves
+   * Reminders' flat-source storage contract; Ask/chat hosts opt into `composite`
+   * and receive one metadata-only dashboard identity instead.
    */
   readonly allowDashboards = input(true);
   /**
@@ -122,7 +127,7 @@ export class SourcePickerComponent {
     if (!this.allowDashboards()) return [];
     const q = this.query().trim().toLowerCase();
     return this._dashboards()
-      .filter((d) => d.tileCount > 0)
+      .filter((d) => this.dashboardMode() === "composite" || d.tileCount > 0)
       .filter((d) => !q || d.title.toLowerCase().includes(q))
       .slice(0, 6);
   });
@@ -312,6 +317,7 @@ export class SourcePickerComponent {
     this.candidates.set([]);
     this._dashboards.set([]);
     this.selected.set([]);
+    this.dashboard.set(null);
     this.expandingBoard.set(null);
     this.activeIndex.set(0);
     this._loading.set(false);
@@ -494,17 +500,25 @@ export class SourcePickerComponent {
   }
 
   /**
-   * Expand a board into its own VISIBLE sources and add them all.
+   * Select a dashboard according to this picker's explicit mode.
    *
-   * The board is a SCOPE, not a source: `SourceRef.kind` is a `LinkKind`
-   * (meeting/note/document), so a dashboard cannot be one. Expanding here rather
-   * than teaching every consumer a `dashboardIds` parameter is what makes boards
-   * work as context EVERYWHERE this picker is used, with no protocol change and
-   * no new backend seam. The backend drops sealed sources from that list, so
-   * picking a board can never widen scope past what the session may read.
+   * Composite mode emits one metadata-only identity and performs no source read.
+   * Expand mode is the legacy Reminders path: it fetches the board's currently
+   * visible material refs and merges them into `selected`.
    */
   async pickDashboard(board: DashboardSummary): Promise<void> {
     if (this.disabled() || this.selectionLimitReached()) return;
+    if (this.dashboardMode() === "composite") {
+      // Metadata is display-only. The host sends exactly this ID and the backend
+      // resolves the authoritative live board under its privacy gate.
+      this.dashboard.set({
+        id: board.id,
+        title: board.title,
+        emoji: board.emoji,
+      });
+      this.close();
+      return;
+    }
     const epoch = this.privacyEpoch;
     this.expandingBoard.set(board.id);
     try {
@@ -518,7 +532,11 @@ export class SourcePickerComponent {
         for (const src of sources) {
           if (!allowed.has(src.kind)) continue;
           if (seen.has(src.kind + src.id)) continue;
-          if (limit !== null && Number.isInteger(limit) && out.length >= limit) {
+          if (
+            limit !== null &&
+            Number.isInteger(limit) &&
+            out.length >= limit
+          ) {
             break;
           }
           seen.add(src.kind + src.id);
@@ -556,6 +574,10 @@ export class SourcePickerComponent {
     this.selected.update((list) =>
       list.filter((s) => !(s.kind === ref.kind && s.id === ref.id)),
     );
+  }
+
+  removeDashboard(): void {
+    if (!this.disabled()) this.dashboard.set(null);
   }
 
   // --- Positioning (reused from the link picker) ---------------------------
