@@ -72,128 +72,132 @@
       (retryRequested)="retryHistory()"
     />
   } @else {
-  <!-- Message list (also the scroll region) -->
-  <div
-    #scroller
-    class="chat-log"
-    role="log"
-    aria-live="polite"
-    aria-label="Conversation"
-  >
-    @if (conversation().length === 0 && !pending()) {
-      <!-- Empty state: a friendly prompt + tappable starter chips. -->
-      <div class="chat-empty">
-        <span class="chat-empty-mark" aria-hidden="true"></span>
-        <p class="chat-empty-title">Chat with this meeting</p>
-        <p class="chat-empty-copy">
-          Ask anything about what was said — decisions, owners, follow-ups.
-        </p>
-        <div
-          class="chat-starters"
-          role="group"
-          aria-label="Suggested questions"
-        >
-          @for (s of starters; track s) {
-            <button
-              type="button"
-              class="chat-chip"
-              [style.--i]="$index"
-              [disabled]="!historyPrivacyReady()"
-              (click)="ask(s)"
-            >
-              {{ s }}
-            </button>
-          }
-        </div>
-      </div>
-    } @else {
-      @for (turn of conversation(); track turn.id) {
-        <div
-          class="chat-row"
-          [class.is-user]="turn.role === 'user'"
-          [class.is-assistant]="turn.role === 'assistant'"
-        >
+    <!-- Message list (also the scroll region) -->
+    <div
+      #scroller
+      class="chat-log"
+      role="log"
+      aria-live="polite"
+      aria-label="Conversation"
+    >
+      @if (conversation().length === 0 && !pending()) {
+        <!-- Empty state: a friendly prompt + tappable starter chips. -->
+        <div class="chat-empty">
+          <span class="chat-empty-mark" aria-hidden="true"></span>
+          <p class="chat-empty-title">Chat with this meeting</p>
+          <p class="chat-empty-copy">
+            Ask anything about what was said — decisions, owners, follow-ups.
+          </p>
           <div
-            class="chat-bubble"
-            [attr.aria-label]="
-              (turn.role === 'user' ? 'You' : 'Assistant') + ' said'
-            "
+            class="chat-starters"
+            role="group"
+            aria-label="Suggested questions"
           >
-            @if (turn.role === "assistant") {
-              <app-markdown [markdown]="turn.content" compact />
-            } @else {
-              {{ turn.content }}
+            @for (s of starters; track s) {
+              <button
+                type="button"
+                class="chat-chip"
+                [style.--i]="$index"
+                [disabled]="!historyPrivacyReady()"
+                (click)="ask(s)"
+              >
+                {{ s }}
+              </button>
             }
           </div>
         </div>
+      } @else {
+        @for (turn of conversation(); track turn.id) {
+          <div
+            class="chat-row"
+            [class.is-user]="turn.role === 'user'"
+            [class.is-assistant]="turn.role === 'assistant'"
+          >
+            <div
+              class="chat-bubble"
+              [attr.aria-label]="
+                (turn.role === 'user' ? 'You' : 'Assistant') + ' said'
+              "
+            >
+              @if (turn.role === "assistant") {
+                <app-markdown [markdown]="turn.content" compact />
+              } @else {
+                {{ turn.content }}
+              }
+            </div>
+          </div>
+        }
+
+        <!-- "Thinking…" typing indicator while a reply is in flight. -->
+        @if (pending()) {
+          <div class="chat-row is-assistant">
+            <div class="chat-bubble chat-typing" aria-label="Thinking">
+              <span class="chat-dot"></span>
+              <span class="chat-dot"></span>
+              <span class="chat-dot"></span>
+            </div>
+          </div>
+        }
       }
 
-      <!-- "Thinking…" typing indicator while a reply is in flight. -->
-      @if (pending()) {
-        <div class="chat-row is-assistant">
-          <div class="chat-bubble chat-typing" aria-label="Thinking">
-            <span class="chat-dot"></span>
-            <span class="chat-dot"></span>
-            <span class="chat-dot"></span>
-          </div>
+      <!-- Inline error with a retry affordance (keeps the question intact). -->
+      @if (error(); as err) {
+        <div class="chat-error" role="alert">
+          <span class="chat-error-text">{{ err }}</span>
+          <button
+            type="button"
+            class="btn btn-ghost chat-retry"
+            (click)="retry()"
+            [disabled]="pending() || !historyPrivacyReady()"
+          >
+            Retry
+          </button>
         </div>
       }
-    }
+    </div>
 
-    <!-- Inline error with a retry affordance (keeps the question intact). -->
-    @if (error(); as err) {
-      <div class="chat-error" role="alert">
-        <span class="chat-error-text">{{ err }}</span>
-        <button
-          type="button"
-          class="btn btn-ghost chat-retry"
-          (click)="retry()"
-          [disabled]="pending() || !historyPrivacyReady()"
-        >
-          Retry
-        </button>
-      </div>
-    }
-  </div>
-
-  <!-- Source-scoped Brain: pick which notes/meetings ground the answer (pre-filled
+    <!-- Source-scoped Brain: pick which notes/meetings ground the answer (pre-filled
        with this meeting + its active links). Empty ⇒ the whole-meeting default. -->
-  <mur-source-picker
-    class="chat-sources"
-    [(selected)]="sources"
-    [disabled]="pending() || !historyPrivacyReady()"
-    triggerLabel="Sources"
-    placeholder="Scope to a note or meeting…"
-  />
-
-  <!-- Composer: textarea (Enter sends · Shift+Enter newline) + Send. -->
-  <form class="chat-composer" (submit)="onSubmit($event)">
-    <textarea
-      #input
-      class="chat-input"
-      rows="1"
-      autocapitalize="sentences"
-      autocomplete="off"
-      spellcheck="true"
-      aria-label="Your question"
-      placeholder="Ask about this meeting…"
-      [value]="draft()"
+    <mur-source-picker
+      class="chat-sources"
+      [selected]="sources()"
+      (selectedChange)="onSourcesChange($event)"
+      [dashboard]="dashboard()"
+      (dashboardChange)="onDashboardChange($event)"
+      dashboardMode="composite"
       [disabled]="pending() || !historyPrivacyReady()"
-      (input)="onDraftInput($event)"
-      (keydown)="onKeydown($event)"
-    ></textarea>
-    <button
-      type="submit"
-      class="btn btn-primary chat-send"
-      [disabled]="!canSend()"
-      [attr.aria-label]="pending() ? 'Sending' : 'Send'"
-    >
-      @if (pending()) {
-        <span class="chat-send-spin" aria-hidden="true"></span>
-      } @else {
-        <span class="chat-send-arrow" aria-hidden="true"></span>
-      }
-    </button>
-  </form>
+      triggerLabel="Sources"
+      placeholder="Scope to a note or meeting…"
+    />
+
+    <!-- Composer: textarea (Enter sends · Shift+Enter newline) + Send. -->
+    <form class="chat-composer" (submit)="onSubmit($event)">
+      <textarea
+        #input
+        class="chat-input"
+        rows="1"
+        autocapitalize="sentences"
+        autocomplete="off"
+        spellcheck="true"
+        aria-label="Your question"
+        placeholder="Ask about this meeting…"
+        [value]="draft()"
+        [disabled]="pending() || !historyPrivacyReady()"
+        (input)="onDraftInput($event)"
+        (keydown)="onKeydown($event)"
+      ></textarea>
+      <button
+        type="submit"
+        class="btn btn-primary chat-send"
+        [disabled]="!canSend()"
+        [attr.aria-label]="pending() ? 'Sending' : 'Send'"
+      >
+        @if (pending()) {
+          <span class="chat-send-spin" aria-hidden="true"></span>
+        } @else {
+          <span class="chat-send-arrow" aria-hidden="true"></span>
+        }
+      </button>
+    </form>
   }
 </div>

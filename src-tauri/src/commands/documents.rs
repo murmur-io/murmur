@@ -789,7 +789,13 @@ pub(crate) fn persist_generated_note(
                 .db
                 .insert_note(&id, &prepared.folder_id, &name, &prepared.title, "", now)?;
         }
-        index_wikilinks_best_effort(state, crate::links::LinkKind::Note, &id, "");
+        index_wikilinks_best_effort_under_lifecycle(
+            state,
+            &_lifecycle,
+            crate::links::LinkKind::Note,
+            &id,
+            "",
+        );
     }
 
     // ATTACHMENTS (best-effort — a failure keeps the text note, never loses the untouched source).

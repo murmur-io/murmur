@@ -1,6 +1,96 @@
 import { expect, test } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
+test("vault history restores live dashboard metadata and a user scope change starts a new thread", async ({
+  page,
+}) => {
+  await mockTauri(page, {
+    list_ask_conversations: () => [
+      {
+        id: "saved-dashboard-thread",
+        scope: { kind: "vault" },
+        title: "Saved dashboard question",
+        createdAt: "2026-08-06T01:00:00Z",
+        updatedAt: "2026-08-06T01:01:00Z",
+        messageCount: 2,
+      },
+    ],
+    load_ask_conversation: () => ({
+      id: "saved-dashboard-thread",
+      scope: { kind: "vault" },
+      title: "Saved dashboard question",
+      selectedSources: [{ kind: "note", id: "manual", title: "Manual source" }],
+      dashboard: {
+        id: "dashboard-live",
+        title: "Live renamed dashboard",
+        emoji: "✨",
+      },
+      messages: [
+        {
+          id: "u1",
+          ordinal: 0,
+          role: "user",
+          content: "Saved dashboard question",
+          sources: [],
+          citations: [],
+          createdAt: "2026-08-06T01:00:00Z",
+        },
+        {
+          id: "a1",
+          ordinal: 1,
+          role: "assistant",
+          content: "Saved dashboard answer",
+          sources: [],
+          citations: [],
+          createdAt: "2026-08-06T01:01:00Z",
+        },
+      ],
+      createdAt: "2026-08-06T01:00:00Z",
+      updatedAt: "2026-08-06T01:01:00Z",
+    }),
+    ask_vault_persisted: (args: Record<string, unknown>) => {
+      (
+        window as unknown as { __historyDashboardSend?: unknown }
+      ).__historyDashboardSend = args;
+      return {
+        conversationId: "fresh-after-remove",
+        userMessageId: "u2",
+        assistantMessageId: "a2",
+        answer: "Fresh answer",
+        sources: [],
+        citations: [],
+      };
+    },
+  });
+  await page.goto("/ask");
+  await page.getByRole("button", { name: "Conversation history" }).click();
+  await page.getByRole("button", { name: /Saved dashboard question/ }).click();
+  const chip = page.locator('[data-testid="selected-dashboard-chip"]');
+  await expect(chip).toContainText("Live renamed dashboard");
+  await page
+    .getByRole("button", { name: "Remove dashboard Live renamed dashboard" })
+    .click();
+  await expect(page.locator(".ask-row")).toHaveCount(0);
+  await expect(page.locator("mur-source-picker .sp-chip-title")).toContainText([
+    "Manual source",
+  ]);
+  await page.locator(".ask-input").fill("Fresh scope question");
+  await page.locator(".ask-input").press("Enter");
+  const sent = await page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __historyDashboardSend?: Record<string, unknown>;
+        }
+      ).__historyDashboardSend,
+  );
+  expect(sent?.["conversationId"]).toBeUndefined();
+  expect(sent?.["dashboardId"]).toBeUndefined();
+  expect(sent?.["explicitSources"]).toEqual([
+    { kind: "note", id: "manual", title: "Manual source" },
+  ]);
+});
+
 test("vault Ask lists, resumes, continues, and starts durable conversations without duplicating rows", async ({
   page,
 }) => {
@@ -78,9 +168,9 @@ test("vault Ask lists, resumes, continues, and starts durable conversations with
   await expect(firstRow).toContainText("What was the Atlas decision?");
   await firstRow.click();
   await expect(page.locator(".ask-row")).toHaveCount(2);
-  await expect(page.locator("mur-source-picker .sp-chip-title").first()).toHaveText(
-    selectedTitle ?? "",
-  );
+  await expect(
+    page.locator("mur-source-picker .sp-chip-title").first(),
+  ).toHaveText(selectedTitle ?? "");
   await expect(
     page.locator("mur-source-picker .sp-chip-title").first(),
   ).not.toHaveText("FORGED FE TITLE");
@@ -98,7 +188,9 @@ test("vault Ask lists, resumes, continues, and starts durable conversations with
   await input.press("Enter");
   await history.click();
   await expect(page.locator("mur-chat-history .history-row")).toHaveCount(2);
-  await expect(page.getByText("Start a separate topic", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Start a separate topic", { exact: true }),
+  ).toBeVisible();
 
   expect(errors).toEqual([]);
 });
@@ -132,7 +224,9 @@ test("vault Ask history keeps the conversation during list failure and retries",
 
   // Closing history reveals the untouched conversation underneath.
   await page.getByRole("button", { name: "Conversation history" }).click();
-  await expect(page.getByText("Keep this visible conversation", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Keep this visible conversation", { exact: true }),
+  ).toBeVisible();
 });
 
 test("vault Ask exposes an explicit loading state while history is fetched", async ({
@@ -240,7 +334,9 @@ test("a failed row resume preserves the list and focus, then returns focus to th
   await expect(row).toBeFocused();
 
   await row.press("Enter");
-  await expect(page.getByText("Focusable answer", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Focusable answer", { exact: true }),
+  ).toBeVisible();
   await expect(page.locator(".ask-input")).toBeFocused();
 });
 

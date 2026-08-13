@@ -64,7 +64,8 @@ mod reminders;
 pub use reminders::*;
 
 // Dashboards — user-composed boards of tiles over EXISTING sources. Every tile payload resolves
-// through the gated readers at read time; the module adds no ungated query and no new AI path.
+// through gated readers at read time; composite Ask uses the shared authorized provider/egress
+// seam and revalidates its backend-owned witness after every await.
 mod dashboards;
 pub use dashboards::*;
 
@@ -376,13 +377,21 @@ pub(crate) struct ContentVisibilitySnapshot {
     seal_epoch: u64,
 }
 
+/// Capture the current authorization epoch while the caller already owns `lifecycle_guard`.
+/// Keeping this twin explicit prevents nested locking of the non-reentrant lifecycle mutex.
+pub(crate) fn capture_content_visibility_snapshot_under_lifecycle(
+    state: &AppState,
+) -> ContentVisibilitySnapshot {
+    ContentVisibilitySnapshot {
+        seal_epoch: state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
 /// Capture the current content-authorization generation under the same lifecycle mutex as every
 /// lock transition. Call this BEFORE assembling a visible multi-source corpus.
 pub(crate) fn capture_content_visibility_snapshot(state: &AppState) -> ContentVisibilitySnapshot {
     let _lifecycle = lifecycle_guard(state);
-    ContentVisibilitySnapshot {
-        seal_epoch: state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
-    }
+    capture_content_visibility_snapshot_under_lifecycle(state)
 }
 
 pub(crate) fn require_current_content_visibility_snapshot_under_lifecycle(
@@ -2299,12 +2308,7 @@ pub async fn update_note(
     .await?;
     // If the edit re-published ≥1 org copy, ping open org views (Notes list + Settings) so the fresh
     // title/body shows without a manual "Sync now". Best-effort — a republish failure never fails the save.
-    if republish_org_shares_for_source_notifying(
-        state.inner(),
-        Some(&meeting_id),
-        None,
-        &app,
-    )
+    if republish_org_shares_for_source_notifying(state.inner(), Some(&meeting_id), None, &app)
         .await
         .unwrap_or(0)
         > 0
@@ -4172,7 +4176,13 @@ pub(crate) fn rename_meeting_inner(
     if title.is_empty() {
         return Err(AppError::InvalidArg("title cannot be empty".into()));
     }
-    state.db.set_meeting_title(meeting_id, title)?;
+    // The title is part of dashboard material/composite digests. Serialize this short canonical
+    // write with history preflight+hydration so a durable dashboard conversation can never validate
+    // the old title and then hydrate its old turns after the new title has landed.
+    {
+        let _lifecycle = lifecycle_guard(state);
+        state.db.set_meeting_title(meeting_id, title)?;
+    }
     // Keep the companion note's managed title + front-matter `[[Meeting]]` link in sync with the new
     // title. Best-effort — a sync failure NEVER fails the rename (the title is already persisted).
     sync_companion_note_title_best_effort_with(state, meeting_id, embedder);
@@ -4215,6 +4225,100 @@ pub(crate) fn pack_chat_pinned_sources(
     Ok(corpus)
 }
 
+pub(crate) fn resolved_ask_corpus_budget(config: &AppConfig) -> usize {
+    let connection = crate::summarize::roles::provider_target(
+        crate::summarize::roles::Role::Ask,
+        config,
+    )
+    .connection;
+    crate::summarize::vault_context::budget_for(&connection)
+}
+
+/// Durable authorization captured for one Ask dispatch. The monotonic generation defeats
+/// A->B->A ABA changes; the exact projection additionally fails closed if a writer mutates the
+/// in-memory config without rotating the generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AskDispatchSnapshot {
+    pub(crate) generation: i64,
+    projection: String,
+}
+
+pub(crate) fn ask_dispatch_projection(config: &AppConfig) -> String {
+    let provider = crate::summarize::roles::provider_target(
+        crate::summarize::roles::Role::Ask,
+        config,
+    );
+    let reasoner = crate::summarize::roles::reasoner_target(
+        crate::summarize::roles::Role::Ask,
+        config,
+    );
+    serde_json::json!({
+        "provider": [provider.connection, provider.model, provider.effort],
+        "reasoner": [reasoner.connection, reasoner.model, reasoner.effort],
+        "effectiveModel": crate::summarize::effective_model_requested(&provider, config),
+        "cloudConsent": config.cloud_egress_consented,
+        "anthropicModel": config.anthropic_model,
+        "ollama": [config.ollama_base_url, config.ollama_model],
+        "gateway": [config.gateway_base_url, config.gateway_model],
+        "claude": [config.claude_binary, config.claude_code_inherit_env.to_string()],
+        "local": [
+            config.brain_model_path.clone().unwrap_or_default(),
+            config.brain_model_id.clone().unwrap_or_default(),
+            config.brain_light_model_id.clone().unwrap_or_default(),
+            config.brain_heavy_model_id.clone().unwrap_or_default(),
+            config.brain_idle_timeout_secs.to_string(),
+            config.brain_ready_timeout_secs.to_string(),
+            config.brain_hard_cap_secs.to_string(),
+        ],
+        "retrieval": [
+            config.embed_model_id.clone().unwrap_or_default(),
+            config.semantic_search_enabled,
+            config.user_memory_enabled,
+            config.ask_jit_retrieval,
+            config.brain_heavy_grammar_enabled,
+            config.loop_transcript_compaction,
+        ],
+        "connectors": {
+            "web": [config.web_search_enabled, config.web_search_consented],
+            "jira": [config.jira_enabled, config.jira_consented],
+            "jiraEndpoint": [config.jira_base_url, config.jira_email],
+            "slack": [config.slack_enabled, config.slack_consented],
+            "notion": [config.notion_enabled, config.notion_consented],
+            "clickup": [config.clickup_enabled, config.clickup_consented],
+            "clickupTeam": config.clickup_team_id,
+        },
+    })
+    .to_string()
+}
+
+pub(crate) fn capture_ask_dispatch_snapshot_under_lifecycle(
+    state: &AppState,
+    config: &AppConfig,
+) -> Result<AskDispatchSnapshot, AppError> {
+    Ok(AskDispatchSnapshot {
+        generation: state.db.ask_dispatch_generation()?,
+        projection: ask_dispatch_projection(config),
+    })
+}
+
+pub(crate) fn require_current_ask_dispatch_under_lifecycle(
+    state: &AppState,
+    expected: &AskDispatchSnapshot,
+) -> Result<(), AppError> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    if state.db.ask_dispatch_generation()? != expected.generation
+        || ask_dispatch_projection(&config) != expected.projection
+    {
+        return Err(AppError::Locked(
+            "Ask provider changed while generating the answer".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Grounded Q&A over a meeting's transcript ("chat with the meeting"). The configured
 /// provider answers strictly from the transcript, explicitly pinned sources, and running history.
 #[tauri::command]
@@ -4225,7 +4329,16 @@ pub async fn chat_meeting(
     question: String,
     history: Vec<ChatTurn>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    dashboard_id: Option<String>,
 ) -> Result<String, AppError> {
+    if dashboard_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return Err(AppError::InvalidArg(
+            "dashboard chat requires a persisted conversation".into(),
+        ));
+    }
     chat_meeting_inner(
         &app,
         state.inner(),
@@ -4233,11 +4346,18 @@ pub async fn chat_meeting(
         question,
         history,
         explicit_sources,
+        dashboard_id,
+        None,
+        None,
         None,
     )
     .await
 }
 
+// This is the single gated meeting-chat boundary. Its arguments deliberately keep the caller's
+// content snapshot and dashboard witness adjacent to the user inputs so neither authorization
+// token can be accidentally reconstructed after provider dispatch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_meeting_inner(
     app: &AppHandle,
     state: &AppState,
@@ -4245,19 +4365,168 @@ pub(crate) async fn chat_meeting_inner(
     question: String,
     history: Vec<ChatTurn>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    dashboard_id: Option<String>,
     authoritative_snapshot: Option<MeetingContentSnapshot>,
+    authoritative_dashboard: Option<dashboards::DashboardContextWitness>,
+    authoritative_ask_dispatch: Option<AskDispatchSnapshot>,
 ) -> Result<String, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
-    let visibility = match authoritative_snapshot {
+    require_backend_owned_dashboard_history(
+        authoritative_snapshot.is_some(),
+        dashboard_id.as_deref(),
+        &history,
+    )?;
+    let (inputs, config) = meeting_provider_inputs(
+        state,
+        &meeting_id,
+        authoritative_snapshot,
+        dashboard_id.as_deref(),
+        explicit_sources.as_deref().unwrap_or_default(),
+        &history,
+        &question,
+    )?;
+    let dashboard_witness = inputs.dashboard.clone();
+    if authoritative_ask_dispatch
+        .as_ref()
+        .is_some_and(|expected| expected != &inputs.ask_dispatch)
+    {
+        return Err(AppError::Locked(
+            "Ask provider changed while preparing the answer".into(),
+        ));
+    }
+    if let Some(expected) = authoritative_dashboard.as_ref() {
+        if dashboard_witness.as_ref() != Some(expected) {
+            return Err(AppError::Locked(
+                "dashboard changed while preparing the answer".into(),
+            ));
+        }
+    }
+    // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
+    // default provider as before (the legacy chat path always ignored `brain_backend`).
+    let config_for_dispatch = config.clone();
+    let heavy_for_dispatch = state.heavy_inference.clone();
+    let meeting_for_admission = meeting_id.clone();
+    let inputs_for_admission = inputs.clone();
+    let dashboard_id_for_admission = dashboard_id.clone();
+    let sources_for_admission = explicit_sources.clone().unwrap_or_default();
+    let history_for_admission = history.clone();
+    let question_for_admission = question.clone();
+    let dispatch_admission = crate::state::ContentDispatchAdmission::new(app, move |state| {
+        require_meeting_dashboard_scope_under_lifecycle(
+            state,
+            &meeting_for_admission,
+            &inputs_for_admission,
+            dashboard_id_for_admission.as_deref(),
+            &sources_for_admission,
+            &history_for_admission,
+            &question_for_admission,
+        )
+    });
+    let answer = dispatch_admission
+        .run(|| async {
+            let provider = crate::summarize::provider_for(
+                crate::summarize::roles::Role::Ask,
+                &config_for_dispatch,
+                &heavy_for_dispatch,
+            )?;
+            provider.complete(&inputs.system, &inputs.user).await
+        })
+        .await?;
+    require_meeting_dashboard_scope_for_return(
+        state,
+        &meeting_id,
+        &inputs,
+        dashboard_id.as_deref(),
+        explicit_sources.as_deref().unwrap_or_default(),
+        &history,
+        &question,
+    )?;
+    Ok(answer)
+}
+
+#[derive(Clone)]
+struct MeetingProviderInputs {
+    visibility: MeetingContentSnapshot,
+    dashboard: Option<dashboards::DashboardContextWitness>,
+    ask_dispatch: AskDispatchSnapshot,
+    system: String,
+    user: String,
+    input_digest: String,
+}
+
+fn composed_provider_input_digest(system: &str, user: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(system.as_bytes());
+    hasher.update([0]);
+    hasher.update(user.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn meeting_provider_inputs(
+    state: &AppState,
+    meeting_id: &str,
+    authoritative_snapshot: Option<MeetingContentSnapshot>,
+    dashboard_id: Option<&str>,
+    additional_sources: &[crate::storage::models::SourceRef],
+    history: &[ChatTurn],
+    question: &str,
+) -> Result<(MeetingProviderInputs, AppConfig), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let inputs = meeting_provider_inputs_under_lifecycle(
+        state,
+        meeting_id,
+        authoritative_snapshot,
+        &config,
+        dashboard_id,
+        additional_sources,
+        history,
+        question,
+    )?;
+    Ok((inputs, config))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn meeting_provider_inputs_under_lifecycle(
+    state: &AppState,
+    meeting_id: &str,
+    authoritative_snapshot: Option<MeetingContentSnapshot>,
+    config: &AppConfig,
+    dashboard_id: Option<&str>,
+    additional_sources: &[crate::storage::models::SourceRef],
+    history: &[ChatTurn],
+    question: &str,
+) -> Result<MeetingProviderInputs, AppError> {
+    let snapshot = match authoritative_snapshot {
         Some(snapshot) => {
-            require_current_meeting_content_snapshot(state, &meeting_id, &snapshot)?;
+            require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, &snapshot)?;
             snapshot
         }
-        None => capture_meeting_content_snapshot(state, &meeting_id)?,
+        None => {
+            if !meeting_is_unlocked(state, meeting_id)? {
+                return Err(AppError::Locked(
+                    "this meeting's folder is locked — unlock it and retry".into(),
+                ));
+            }
+            MeetingContentSnapshot {
+                folder_id: state.db.folder_for_meeting(meeting_id)?,
+                visibility: ContentVisibilitySnapshot {
+                    seal_epoch: state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+                },
+                active_related: active_related_witness(state, meeting_id)?,
+            }
+        }
     };
-    let segments = state.db.get_segments(&meeting_id)?;
+    let segments = state.db.get_segments(meeting_id)?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg(
             "this meeting has no transcript to chat about yet".into(),
@@ -4265,56 +4534,126 @@ pub(crate) async fn chat_meeting_inner(
     }
     let transcript = segments
         .iter()
-        .map(|s| format!("[{:.0}s] {}", s.start_s, s.text.trim()))
+        .map(|segment| format!("[{:.0}s] {}", segment.start_s, segment.text.trim()))
         .collect::<Vec<_>>()
         .join("\n");
-    let config = {
-        state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
-            .clone()
-    };
-    // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
-    // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
-    // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
     let unlocked = unlocked_snapshot(state)?;
-    // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation: when the FE pins explicit sources (the
-    // linked notes/meetings the user chose above the chat input), APPEND their gated PINNED corpus
-    // (+ capped, gated link-expansion) to this meeting's transcript grounding — the meeting stays the
-    // primary context, the pinned items add cross-item context. Every leg is `unlocked`-gated (a
-    // sealed pinned source/neighbour contributes NOTHING — never a leak). `None`/empty ⇒ byte-
-    // identical to the pre-change transcript-only grounding.
-    let mut pinned_sources = String::new();
-    if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
+    let composite = match dashboard_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let ask_conn = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                config,
+            )
+            .connection;
+            let budget = crate::summarize::vault_context::budget_for(&ask_conn)
+                .min(crate::summarize::chat::MAX_PINNED_SOURCE_CHARS);
+            Some(dashboards::dashboard_composite_context(
+                &state.db,
+                id,
+                &unlocked,
+                budget,
+                additional_sources,
+                Some(meeting_id),
+            )?)
+        }
+        None => None,
+    };
+    let pinned_sources = if let Some(context) = composite.as_ref() {
+        context.packed_corpus.clone()
+    } else if additional_sources.is_empty() {
+        String::new()
+    } else {
         let ask_conn =
-            crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
+            crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
                 .connection;
-        pinned_sources =
-            pack_chat_pinned_sources(&state.db, &meeting_id, &sources, &ask_conn, &unlocked)?;
-    }
-    // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
-    // default provider as before (the legacy chat path always ignored `brain_backend`).
-    let provider = crate::summarize::provider_for(
-        crate::summarize::roles::Role::Ask,
-        &config,
-        &state.heavy_inference,
-    )?;
-    let memory_brief = gated_memory_brief_for_injection(state, &unlocked, &question);
-    let (system, user) = crate::summarize::chat::build_with_sources(
+        pack_chat_pinned_sources(
+            &state.db,
+            meeting_id,
+            additional_sources,
+            &ask_conn,
+            &unlocked,
+        )?
+    };
+    let memory_brief = if composite.is_some() {
+        String::new()
+    } else {
+        gated_memory_brief_for_injection(state, &unlocked, question)
+    };
+    let (system, user) = crate::summarize::chat::build_with_composite_sources(
         &transcript,
         &pinned_sources,
-        &history,
-        &question,
+        history,
+        question,
         &memory_brief,
+        composite.is_some(),
     );
-    let dispatch_admission =
-        meeting_dispatch_admission(app, meeting_id.clone(), visibility.clone());
-    let answer = dispatch_admission
-        .run(|| provider.complete(&system, &user))
-        .await?;
-    require_current_meeting_content_snapshot(state, &meeting_id, &visibility)?;
-    Ok(answer)
+    let input_digest = composed_provider_input_digest(&system, &user);
+    Ok(MeetingProviderInputs {
+        visibility: snapshot,
+        dashboard: composite.map(|context| context.witness),
+        ask_dispatch: capture_ask_dispatch_snapshot_under_lifecycle(state, config)?,
+        system,
+        user,
+        input_digest,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_meeting_dashboard_scope_under_lifecycle(
+    state: &AppState,
+    meeting_id: &str,
+    expected: &MeetingProviderInputs,
+    dashboard_id: Option<&str>,
+    additional_sources: &[crate::storage::models::SourceRef],
+    history: &[ChatTurn],
+    question: &str,
+) -> Result<(), AppError> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let current = meeting_provider_inputs_under_lifecycle(
+        state,
+        meeting_id,
+        Some(expected.visibility.clone()),
+        &config,
+        dashboard_id,
+        additional_sources,
+        history,
+        question,
+    )?;
+    if current.dashboard != expected.dashboard
+        || current.ask_dispatch != expected.ask_dispatch
+        || current.input_digest != expected.input_digest
+    {
+        return Err(AppError::Locked(
+            "meeting or dashboard context changed while generating the answer".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_meeting_dashboard_scope_for_return(
+    state: &AppState,
+    meeting_id: &str,
+    expected: &MeetingProviderInputs,
+    dashboard_id: Option<&str>,
+    additional_sources: &[crate::storage::models::SourceRef],
+    history: &[ChatTurn],
+    question: &str,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_meeting_dashboard_scope_under_lifecycle(
+        state,
+        meeting_id,
+        expected,
+        dashboard_id,
+        additional_sources,
+        history,
+        question,
+    )
 }
 
 /// Per-meeting open/done action-item counts across the VISIBLE library, for the saved-views meetings
@@ -4666,8 +5005,19 @@ pub(crate) async fn build_and_persist_entities(
     // wikilink edges (resolved target ids) and suggest content-similar neighbours from the meeting's
     // chunks/vectors (indexed earlier in the pipeline; model-gated inside). Both best-effort — a link
     // failure never fails the graph/note (both already succeeded).
-    index_wikilinks_best_effort(state, crate::links::LinkKind::Meeting, meeting_id, markdown);
-    auto_link_semantic_best_effort(state, crate::links::LinkKind::Meeting, meeting_id);
+    index_wikilinks_best_effort_under_lifecycle(
+        state,
+        &_lifecycle,
+        crate::links::LinkKind::Meeting,
+        meeting_id,
+        markdown,
+    );
+    auto_link_semantic_best_effort_under_lifecycle(
+        state,
+        &_lifecycle,
+        crate::links::LinkKind::Meeting,
+        meeting_id,
+    );
 
     Ok(payload)
 }
@@ -4896,6 +5246,20 @@ fn index_wikilinks_best_effort(
     src_id: &str,
     body: &str,
 ) {
+    let lifecycle = lifecycle_guard(state);
+    index_wikilinks_best_effort_under_lifecycle(state, &lifecycle, src_kind, src_id, body);
+}
+
+/// Same hook for callers that already own the lifecycle barrier. Keeping the guard proof in the
+/// signature prevents the non-reentrant mutex from being acquired twice while still ensuring link
+/// membership cannot change across an exact dashboard-history admission.
+fn index_wikilinks_best_effort_under_lifecycle(
+    state: &AppState,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    src_kind: crate::links::LinkKind,
+    src_id: &str,
+    body: &str,
+) {
     let unlocked = match unlocked_snapshot(state) {
         Ok(u) => u,
         Err(e) => {
@@ -4903,10 +5267,12 @@ fn index_wikilinks_best_effort(
             return;
         }
     };
-    if let Err(e) = state
+    // Link membership contributes to the exact dashboard corpus. Resolution + replacement are
+    // short synchronous DB work and must share the lifecycle barrier with history admission.
+    let result = state
         .db
-        .index_wikilinks_for_source(src_kind, src_id, body, &unlocked)
-    {
+        .index_wikilinks_for_source(src_kind, src_id, body, &unlocked);
+    if let Err(e) = result {
         tracing::warn!(target: "links", error = %e, "wikilink index failed (text saved)");
     }
 }
@@ -4916,6 +5282,18 @@ fn index_wikilinks_best_effort(
 /// `SEMANTIC_LINK_CAP` content-similar neighbours (mutual-kNN / floor / cap; see `auto_link_semantic`).
 /// BEST-EFFORT: a failure logs (counts only) and never fails the caller. O(k·log n) — no corpus scan.
 fn auto_link_semantic_best_effort(state: &AppState, kind: crate::links::LinkKind, id: &str) {
+    let lifecycle = lifecycle_guard(state);
+    auto_link_semantic_best_effort_under_lifecycle(state, &lifecycle, kind, id);
+}
+
+/// Guard-owning twin of [`auto_link_semantic_best_effort`] for pipeline stages that already hold
+/// the lifecycle barrier.
+fn auto_link_semantic_best_effort_under_lifecycle(
+    state: &AppState,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    kind: crate::links::LinkKind,
+    id: &str,
+) {
     // GUARD: only run with the real embedder present — a stub vector carries no meaning, so a
     // stub-space "neighbour" would be noise. (The chunk index itself already refuses stub vectors.)
     if !crate::embed::embed_model_present() {
@@ -4928,7 +5306,10 @@ fn auto_link_semantic_best_effort(state: &AppState, kind: crate::links::LinkKind
             return;
         }
     };
-    if let Err(e) = state.db.auto_link_semantic(kind, id, &unlocked) {
+    // The embedder/index build happened before this hook. Serialize the bounded kNN-derived link
+    // replacement so an exact dashboard witness cannot be validated across a membership change.
+    let result = state.db.auto_link_semantic(kind, id, &unlocked);
+    if let Err(e) = result {
         tracing::warn!(target: "links", error = %e, "semantic auto-link failed (index intact)");
     }
 }
@@ -5097,6 +5478,14 @@ pub async fn ask_vault(
     // FE camelCase `dashboardId`. `None`/empty ⇒ byte-identical to before.
     dashboard_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
+    if dashboard_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return Err(AppError::InvalidArg(
+            "dashboard Ask requires a persisted conversation".into(),
+        ));
+    }
     ask_vault_inner(
         &app,
         state.inner(),
@@ -5106,6 +5495,8 @@ pub async fn ask_vault(
         explicit_sources,
         pinned_org_item_id,
         dashboard_id,
+        None,
+        None,
         None,
     )
     .await
@@ -5122,6 +5513,8 @@ pub(crate) async fn ask_vault_inner(
     pinned_org_item_id: Option<String>,
     dashboard_id: Option<String>,
     authoritative_snapshot: Option<DurableScopeSnapshot>,
+    authoritative_dashboard: Option<dashboards::DashboardContextWitness>,
+    authoritative_ask_dispatch: Option<AskDispatchSnapshot>,
 ) -> Result<AskVaultResult, AppError> {
     let durable_history = authoritative_snapshot.is_some();
     if question.trim().is_empty() {
@@ -5129,17 +5522,27 @@ pub(crate) async fn ask_vault_inner(
     }
     let visibility = authoritative_snapshot
         .unwrap_or_else(|| DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(state)));
-    let dispatch_admission = durable_dispatch_admission(app, visibility.clone());
-    let config = {
-        state
+    let (config, ask_dispatch) = {
+        let _lifecycle = lifecycle_guard(state);
+        let config = state
             .config
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
-            .clone()
+            .clone();
+        let dispatch = capture_ask_dispatch_snapshot_under_lifecycle(state, &config)?;
+        (config, dispatch)
     };
+    if authoritative_ask_dispatch
+        .as_ref()
+        .is_some_and(|expected| expected != &ask_dispatch)
+    {
+        return Err(AppError::Locked(
+            "Ask provider changed while preparing the answer".into(),
+        ));
+    }
     // The same 12-message discipline as the chat panel (CHAT_CONTEXT_TURNS): bounds prompt growth +
     // cloud egress on BOTH paths. The LATEST question still drives retrieval either way.
-    let history: Vec<ChatTurn> = capped_ask_history(&history).to_vec();
+    let mut history: Vec<ChatTurn> = capped_ask_history(&history).to_vec();
 
     // note↔meeting-links PR-2 — SOURCE-SCOPED (pinned) Ask. When the FE source picker sends a
     // non-empty explicit source list, retrieval is PINNED to exactly those items (+ their capped,
@@ -5155,6 +5558,10 @@ pub(crate) async fn ask_vault_inner(
     // floor entirely, and fell through to a vault-wide search with its board id silently
     // dropped. Review caught it; the motivating scenario was the one still broken.
     let board_id = dashboard_id.filter(|s| !s.trim().is_empty());
+    require_backend_owned_dashboard_history(durable_history, board_id.as_deref(), &history)?;
+    if board_id.is_some() {
+        remove_duplicate_dashboard_question(&mut history, &question);
+    }
     if pinned_sources.is_some() || pinned_org.is_some() || board_id.is_some() {
         // Snapshot AND resolve under ONE guard, exactly as `get_dashboard` does. Sharing
         // the caller's snapshot is not enough on its own: it prevents a second, later
@@ -5163,32 +5570,82 @@ pub(crate) async fn ask_vault_inner(
         // cannot cover that window either — it runs AFTER the provider call, so it
         // suppresses the RESULT, not the disclosure. The guard is dropped before the
         // await below; it is held only for the reads it has to bracket.
-        let (unlocked, board_brief) =
-            board_scoped_floor_inputs(state, &config, board_id.as_deref())?;
-        let memory_brief = gated_memory_brief_for_injection(state, &unlocked, &question);
-        let reranker = crate::rerank::active_reranker(
-            state
-                .reasoner
-                .current_for(crate::summarize::roles::Role::Ask),
+        let (unlocked, composite, scoped_config) = dashboard_composite_floor_inputs_current(
+            state,
+            board_id.as_deref(),
+            pinned_sources.as_deref().unwrap_or_default(),
+        )?;
+        let dashboard_witness = composite.as_ref().map(|context| context.witness.clone());
+        if let Some(expected) = authoritative_dashboard.as_ref() {
+            if dashboard_witness.as_ref() != Some(expected) {
+                return Err(AppError::Locked(
+                    "dashboard changed while preparing the answer".into(),
+                ));
+            }
+        }
+        // A dashboard is a closed composite scope. Cross-vault user-memory would silently widen it.
+        let memory_brief = if composite.is_some() {
+            String::new()
+        } else {
+            gated_memory_brief_for_injection(state, &unlocked, &question)
+        };
+        let dispatch_admission = durable_dispatch_admission(
+            app,
+            visibility.clone(),
+            ask_dispatch.clone(),
+            dashboard_witness.clone(),
         );
-        let result = ask_vault_floor_authorized(
-            &state.db,
-            &config,
-            &unlocked,
-            &question,
-            &history,
-            &memory_brief,
-            Some(reranker),
-            &state.heavy_inference,
-            pinned_sources,
-            pinned_org,
-            board_brief.as_deref(),
-            dispatch_admission.clone(),
-        )
-        .await?;
-        require_durable_scope_for_dispatch(state, &visibility)?;
+        let result = if let Some(context) = composite.as_ref() {
+            if pinned_org.is_some() {
+                return Err(AppError::InvalidArg(
+                    "dashboard and organization scopes cannot be combined".into(),
+                ));
+            }
+            ask_vault_prepacked_dashboard_authorized(
+                context,
+                &scoped_config,
+                &question,
+                &history,
+                &state.heavy_inference,
+                dispatch_admission.clone(),
+            )
+            .await?
+        } else {
+            let reranker = crate::rerank::active_reranker(
+                state
+                    .reasoner
+                    .current_for(crate::summarize::roles::Role::Ask),
+            );
+            ask_vault_floor_authorized(
+                &state.db,
+                &scoped_config,
+                &unlocked,
+                &question,
+                &history,
+                &memory_brief,
+                Some(reranker),
+                &state.heavy_inference,
+                pinned_sources,
+                pinned_org,
+                dispatch_admission.clone(),
+            )
+            .await?
+        };
+        require_durable_scope_for_dispatch_with_ask(
+            state,
+            &visibility,
+            &ask_dispatch,
+            dashboard_witness.as_ref(),
+        )?;
         return Ok(result);
     }
+
+    let dispatch_admission = durable_dispatch_admission(
+        app,
+        visibility.clone(),
+        ask_dispatch.clone(),
+        authoritative_dashboard.clone(),
+    );
 
     // Agentic path — CLOUD-connection roles only (the same rule as the in-meeting brain:
     // local-GGUF multi-step tool-call reliability is unproven). The eligibility gate keys on the
@@ -5204,12 +5661,14 @@ pub(crate) async fn ask_vault_inner(
         let q = question.clone();
         let h = history.clone();
         let attempt_admission = dispatch_admission.clone();
+        let attempt_config = config.clone();
         let attempt = tokio::task::spawn_blocking(move || {
             ask_vault_agentic_attempt(
                 &handle,
                 &q,
                 &h,
                 &thread_id,
+                attempt_config,
                 attempt_admission,
                 durable_history,
             )
@@ -5217,7 +5676,12 @@ pub(crate) async fn ask_vault_inner(
         .await
         .map_err(|e| AppError::Other(anyhow::anyhow!("ask task join failed: {e}")))??;
         if let Some(result) = attempt {
-            require_durable_scope_for_dispatch(state, &visibility)?;
+            require_durable_scope_for_dispatch_with_ask(
+                state,
+                &visibility,
+                &ask_dispatch,
+                authoritative_dashboard.as_ref(),
+            )?;
             return Ok(result);
         }
     }
@@ -5249,11 +5713,15 @@ pub(crate) async fn ask_vault_inner(
         &state.heavy_inference,
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
         None, // …and no pinned org item — this is the vault-wide fallthrough.
-        None, // …and no board: a board-scoped ask never reaches this branch.
         dispatch_admission,
     )
     .await?;
-    require_durable_scope_for_dispatch(state, &visibility)?;
+    require_durable_scope_for_dispatch_with_ask(
+        state,
+        &visibility,
+        &ask_dispatch,
+        authoritative_dashboard.as_ref(),
+    )?;
     Ok(result)
 }
 
@@ -5270,39 +5738,104 @@ pub(crate) enum AskFloorPrompt {
     },
 }
 
-/// THE FLOOR — the pre-agentic Ask-My-Vault implementation: gated corpus pack + ONE provider
-/// completion, with the original error/consent semantics (`make_provider`'s fail-closed consent
-/// gate errors exactly as before). Runs on the local/off brain backend and whenever the agentic
-/// attempt did not converge or errored.
-/// The session snapshot and the board brief, both taken under ONE `lifecycle_guard`.
-///
-/// Extracted so the ORDERING is executed by a test rather than read from a diff.
-/// Sharing the caller's snapshot is not sufficient on its own: it prevents a second,
-/// later snapshot, but only the guard serializes against a relock landing between the
-/// snapshot and the last `resolve_tile`. The later
-/// `require_current_content_visibility_snapshot` cannot cover that window either —
-/// it runs AFTER the provider call, so it suppresses the RESULT, not the disclosure.
-///
-/// The guard is released with the returned tuple, before any `.await`.
-pub(crate) fn board_scoped_floor_inputs(
+/// Reject caller-supplied history for dashboard chat unless it came from the durable backend seam.
+fn require_backend_owned_dashboard_history(
+    durable_history: bool,
+    dashboard_id: Option<&str>,
+    history: &[ChatTurn],
+) -> Result<(), AppError> {
+    if !durable_history
+        && dashboard_id.is_some_and(|id| !id.trim().is_empty())
+        && !history.is_empty()
+    {
+        return Err(AppError::Locked(
+            "dashboard conversations require backend-owned history".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the complete board corpus and its unlock snapshot under one lifecycle interval. The
+/// guard is released with the returned values before any provider `.await`.
+#[cfg(test)]
+pub(crate) fn dashboard_composite_floor_inputs(
     state: &AppState,
     config: &AppConfig,
     dashboard_id: Option<&str>,
-) -> Result<(std::collections::HashSet<String>, Option<String>), AppError> {
+    additional_sources: &[crate::storage::models::SourceRef],
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        Option<dashboards::DashboardCompositeContext>,
+    ),
+    AppError,
+> {
     with_board_scoped_floor_inputs(state, |unlocked| {
-        // The SAME budget the corpus is packed against, resolved from the ASK role's
-        // connection exactly as `build_ask_vault_floor_prompt` does — so the brief's share
-        // is a documented fraction of ONE budget, not a second, unrelated cap.
+        let Some(id) = dashboard_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return Ok(None);
+        };
         let ask_conn =
             crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
                 .connection;
         let budget = crate::summarize::vault_context::budget_for(&ask_conn);
-        crate::commands::dashboards::board_scoped_brief(&state.db, dashboard_id, unlocked, budget)
+        dashboards::dashboard_composite_context(
+            &state.db,
+            id,
+            unlocked,
+            budget,
+            additional_sources,
+            None,
+        )
+        .map(Some)
     })
+}
+
+/// Production resolver for provider inputs: capture the config which determines the Ask budget
+/// inside the same lifecycle interval as the dashboard witness. The returned config is the exact
+/// provider selection used for dispatch after the guard is released.
+fn dashboard_composite_floor_inputs_current(
+    state: &AppState,
+    dashboard_id: Option<&str>,
+    additional_sources: &[crate::storage::models::SourceRef],
+) -> Result<
+    (
+        std::collections::HashSet<String>,
+        Option<dashboards::DashboardCompositeContext>,
+        AppConfig,
+    ),
+    AppError,
+> {
+    let _lifecycle = lifecycle_guard(state);
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let unlocked = unlocked_snapshot(state)?;
+    let composite = match dashboard_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let ask_conn = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                &config,
+            )
+            .connection;
+            Some(dashboards::dashboard_composite_context(
+                &state.db,
+                id,
+                &unlocked,
+                crate::summarize::vault_context::budget_for(&ask_conn),
+                additional_sources,
+                None,
+            )?)
+        }
+        None => None,
+    };
+    Ok((unlocked, composite, config))
 }
 
 /// Execute a board-input resolver inside the same lifecycle interval as its unlock snapshot.
 /// Kept separate so the serialization property has a deterministic two-thread oracle.
+#[cfg(test)]
 pub(crate) fn with_board_scoped_floor_inputs<T>(
     state: &AppState,
     resolve: impl FnOnce(&std::collections::HashSet<String>) -> Result<T, AppError>,
@@ -5329,7 +5862,6 @@ async fn ask_vault_floor(
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
-    board_brief: Option<&str>,
 ) -> Result<AskVaultResult, AppError> {
     ask_vault_floor_core(
         db,
@@ -5342,7 +5874,6 @@ async fn ask_vault_floor(
         heavy,
         explicit_sources,
         pinned_org_item_id,
-        board_brief,
         None,
     )
     .await
@@ -5360,10 +5891,6 @@ async fn ask_vault_floor_authorized(
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
-    // The board's derived tiles, already gated and rendered. `None` for every
-    // non-board caller, which keeps the packed prompt byte-identical for them;
-    // `Some("")` is a board that scopes the ask but has nothing readable to show.
-    board_brief: Option<&str>,
     dispatch_admission: crate::state::ContentDispatchAdmission,
 ) -> Result<AskVaultResult, AppError> {
     ask_vault_floor_core(
@@ -5377,10 +5904,65 @@ async fn ask_vault_floor_authorized(
         heavy,
         explicit_sources,
         pinned_org_item_id,
-        board_brief,
         Some(dispatch_admission),
     )
     .await
+}
+
+pub(crate) async fn ask_vault_prepacked_dashboard_authorized(
+    context: &dashboards::DashboardCompositeContext,
+    config: &AppConfig,
+    question: &str,
+    history: &[ChatTurn],
+    heavy: &std::sync::Arc<tokio::sync::Semaphore>,
+    dispatch_admission: crate::state::ContentDispatchAdmission,
+) -> Result<AskVaultResult, AppError> {
+    if context.packed_corpus.trim().is_empty() {
+        return Ok(AskVaultResult {
+            answer: "Nothing on this board is readable right now — unlock its folders, or add \
+                     tiles with content you can see."
+                .to_string(),
+            sources: Vec::new(),
+            citations: Vec::new(),
+        });
+    }
+    let config = config.clone();
+    let heavy = heavy.clone();
+    ask_vault_prepacked_dashboard_dispatch(context, question, history, dispatch_admission, move || {
+        crate::summarize::provider_for(crate::summarize::roles::Role::Ask, &config, &heavy)
+    })
+    .await
+}
+
+async fn ask_vault_prepacked_dashboard_dispatch<F>(
+    context: &dashboards::DashboardCompositeContext,
+    question: &str,
+    history: &[ChatTurn],
+    dispatch_admission: crate::state::ContentDispatchAdmission,
+    provider_factory: F,
+) -> Result<AskVaultResult, AppError>
+where
+    F: FnOnce() -> Result<
+        std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>,
+        AppError,
+    >,
+{
+    let (system, user) = crate::summarize::vault_chat::build_for_dashboard(
+        &context.packed_corpus,
+        history,
+        question,
+    );
+    let answer = dispatch_admission
+        .run(|| async {
+            let provider = provider_factory()?;
+            provider.complete(&system, &user).await
+        })
+        .await?;
+    Ok(AskVaultResult {
+        answer,
+        sources: context.packed_sources.clone(),
+        citations: Vec::new(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5395,7 +5977,6 @@ async fn ask_vault_floor_core(
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
     pinned_org_item_id: Option<String>,
-    board_brief: Option<&str>,
     dispatch_admission: Option<crate::state::ContentDispatchAdmission>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
@@ -5413,7 +5994,6 @@ async fn ask_vault_floor_core(
     let question_owned = question.to_string();
     let history_owned = history.to_vec();
     let memory_brief_owned = memory_brief.to_string();
-    let board_brief_owned = board_brief.map(str::to_string);
     let prompt = tokio::task::spawn_blocking(move || {
         build_ask_vault_floor_prompt(
             &db_for_prompt,
@@ -5425,7 +6005,6 @@ async fn ask_vault_floor_core(
             reranker.as_deref(),
             explicit_sources.as_deref(),
             pinned_org_item_id.as_deref(),
-            board_brief_owned.as_deref(),
         )
     })
     .await
@@ -5439,11 +6018,29 @@ async fn ask_vault_floor_core(
         } => {
             // ASK role. With role keys absent this builds the legacy default provider for EVERY
             // brain_backend (the pre-role floor ignored it) — original error/consent semantics.
-            let provider =
-                crate::summarize::provider_for(crate::summarize::roles::Role::Ask, config, heavy)?;
             let answer = match dispatch_admission {
-                Some(admission) => admission.run(|| provider.complete(&system, &user)).await?,
-                None => provider.complete(&system, &user).await?,
+                Some(admission) => {
+                    let config = config.clone();
+                    let heavy = heavy.clone();
+                    admission
+                        .run(|| async {
+                            let provider = crate::summarize::provider_for(
+                                crate::summarize::roles::Role::Ask,
+                                &config,
+                                &heavy,
+                            )?;
+                            provider.complete(&system, &user).await
+                        })
+                        .await?
+                }
+                None => {
+                    let provider = crate::summarize::provider_for(
+                        crate::summarize::roles::Role::Ask,
+                        config,
+                        heavy,
+                    )?;
+                    provider.complete(&system, &user).await?
+                }
             };
             Ok(AskVaultResult {
                 answer,
@@ -5737,6 +6334,11 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
         crate::settings::validate_model_size_source(source)?;
     }
 
+    // Provider-role selection determines the exact Ask packing budget. Serialize the durable
+    // config write and cache replacement with dashboard/history preflight, dispatch polling, and
+    // post-await CAS. Lock order is lifecycle -> config -> DB throughout this interval.
+    let _lifecycle = lifecycle_guard(state);
+
     // Generic Settings cannot change `embed_model_id`: `dto_to_config` preserves it from this
     // mutex-protected cache, while the dedicated selector takes the model-selection write barrier
     // before taking the same mutex. Do not make an unrelated Settings save wait behind a minutes-
@@ -5746,6 +6348,11 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     let new_config = dto_to_config(config, &cache);
+    if ask_dispatch_projection(&cache) != ask_dispatch_projection(&new_config) {
+        // Rotate FIRST. AppConfig::save is row-wise; a later failure may over-invalidate, but no
+        // partial provider/config mutation can retain the old dispatch authorization.
+        state.db.advance_ask_dispatch_generation()?;
+    }
     new_config.save(&state.db)?;
     *cache = new_config;
 
@@ -6326,12 +6933,7 @@ pub async fn resummarize(
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
     // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
     // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
-    if republish_org_shares_for_source_notifying(
-        state.inner(),
-        Some(&meeting_id),
-        None,
-        &app,
-    )
+    if republish_org_shares_for_source_notifying(state.inner(), Some(&meeting_id), None, &app)
         .await
         .unwrap_or(0)
         > 0

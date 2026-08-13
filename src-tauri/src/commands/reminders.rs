@@ -1114,11 +1114,24 @@ mod runtime_probe {
         let original = runtime.original_config.take().ok_or_else(|| {
             AppError::Unavailable("runtime original configuration is unavailable".into())
         })?;
+        let _lifecycle = crate::commands::lifecycle_guard(state);
+        let current_projection = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Unavailable("runtime config is unavailable".into()))
+            .map(|config| crate::commands::ask_dispatch_projection(&config))?;
+        if current_projection != crate::commands::ask_dispatch_projection(&original) {
+            state.db.advance_ask_dispatch_generation()?;
+        }
         original.save(&state.db)?;
         *state
             .config
             .lock()
             .map_err(|_| AppError::Unavailable("runtime config is unavailable".into()))? = original;
+        // The debug runtime fixture also changes provider credentials after restoring config.
+        // Rotate before either fallible deletion; partial cleanup may over-invalidate but cannot
+        // leave an old authorization live against a changed Keychain.
+        state.db.advance_ask_dispatch_generation()?;
         crate::secrets::delete_secret(crate::summarize::ANTHROPIC_KEY_ACCOUNT)?;
         crate::secrets::delete_secret(crate::summarize::GATEWAY_KEY_ACCOUNT)?;
         drop(runtime);

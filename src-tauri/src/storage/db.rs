@@ -359,7 +359,65 @@ impl Db {
 
     /// Idempotent CREATE TABLE IF NOT EXISTS migrations.
     pub fn migrate(&self) -> Result<()> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let ask_dispatch_state_existed = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ask_dispatch_state'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_err)?
+            .is_some();
+        let dispatch_stamp_column_exists = |table: &str, column: &str| -> Result<bool> {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name=?2",
+                rusqlite::params![table, column],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count != 0)
+            .map_err(map_err)
+        };
+        if ask_dispatch_state_existed {
+            let (row_count, valid_count) = conn
+                .query_row(
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN singleton=1
+                                               AND typeof(generation)='integer'
+                                               AND generation>=0
+                                              THEN 1 ELSE 0 END),0)
+                       FROM ask_dispatch_state",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .map_err(map_err)?;
+            if (row_count, valid_count) != (1, 1) {
+                return Err(AppError::Storage(
+                    "Ask dispatch generation is unavailable".into(),
+                ));
+            }
+        } else {
+            if dispatch_stamp_column_exists("ask_conversations", "ask_dispatch_generation")?
+                || dispatch_stamp_column_exists(
+                    "dashboard_tiles",
+                    "living_answer_ask_dispatch_generation",
+                )?
+            {
+                return Err(AppError::Storage(
+                    "Ask dispatch generation is unavailable".into(),
+                ));
+            }
+            let tx = conn.transaction().map_err(map_err)?;
+            tx.execute_batch(
+                "CREATE TABLE ask_dispatch_state (
+                   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                   generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation >= 0)
+                 );
+                 INSERT INTO ask_dispatch_state(singleton,generation) VALUES (1,0);",
+            )
+            .map_err(map_err)?;
+            tx.commit().map_err(map_err)?;
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meetings (
                id TEXT PRIMARY KEY,
@@ -512,6 +570,13 @@ impl Db {
              );
              INSERT OR IGNORE INTO ask_history_state(singleton, visibility_generation)
                VALUES (1, 0);
+             -- Global authorization epoch for every Ask/provider dispatch. This is deliberately
+             -- separate from content visibility and dashboard generations: provider identity,
+             -- endpoint, model or consent may change while the source corpus stays byte-identical.
+             CREATE TABLE IF NOT EXISTS ask_dispatch_state (
+               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+               generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation >= 0)
+             );
              CREATE TABLE IF NOT EXISTS ask_conversations (
                id TEXT PRIMARY KEY,
                scope_kind TEXT NOT NULL CHECK(scope_kind IN ('vault', 'note', 'meeting')),
@@ -1105,10 +1170,11 @@ impl Db {
     ///   OPTIONAL anchor into an existing row (meeting / document / entity id) and is deliberately
     ///   NOT an FK: a tile whose target was deleted must degrade to a "missing source" tile rather
     ///   than cascade-delete a user's board layout. `config` is a small JSON bag for per-kind
-    ///   options (e.g. the Living-answer question). `position` is a dense integer order.
+    ///   options. Living answers use dedicated backend-owned content/provenance columns instead of
+    ///   caller-writable `config`. `position` is a dense integer order.
     ///
-    /// The tables carry no note text, no transcript, and no title copied from a gated row — the
-    /// board is a set of POINTERS, resolved through the gated readers on every read.
+    /// The tables carry no source note/transcript/title copy. The Living-answer cache is hydrated
+    /// only after its folder stamp + exact corpus witness pass the command-layer gate.
     fn migrate_dashboards(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS dashboards (
@@ -1135,9 +1201,81 @@ impl Db {
                FOREIGN KEY (dashboard_id) REFERENCES dashboards(id) ON DELETE CASCADE
              );
              CREATE INDEX IF NOT EXISTS idx_dashboard_tiles_board
-               ON dashboard_tiles(dashboard_id, position);",
+               ON dashboard_tiles(dashboard_id, position);
+             CREATE TABLE IF NOT EXISTS dashboard_context_state (
+               dashboard_id TEXT PRIMARY KEY,
+               generation INTEGER NOT NULL DEFAULT 0,
+               structural_generation INTEGER NOT NULL DEFAULT 0,
+               exists_now INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT OR IGNORE INTO dashboard_context_state (dashboard_id, generation, exists_now)
+               SELECT id, 0, 1 FROM dashboards;",
         )
         .map_err(map_err)?;
+        Self::add_column_if_missing(conn, "ask_conversations", "dashboard_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "ask_conversations",
+            "dashboard_context_generation",
+            "INTEGER",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "ask_conversations",
+            "dashboard_context_digest",
+            "TEXT",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "ask_conversations",
+            "ask_dispatch_generation",
+            "INTEGER",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_tiles",
+            "question_readable_folders_json",
+            "TEXT",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_tiles",
+            "answer_readable_folders_json",
+            "TEXT",
+        )?;
+        Self::add_column_if_missing(conn, "dashboard_tiles", "living_question", "TEXT")?;
+        Self::add_column_if_missing(conn, "dashboard_tiles", "living_answer", "TEXT")?;
+        Self::add_column_if_missing(conn, "dashboard_tiles", "living_answered_at", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_tiles",
+            "living_answer_context_generation",
+            "INTEGER",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_tiles",
+            "living_answer_context_digest",
+            "TEXT",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_tiles",
+            "living_answer_context_budget",
+            "INTEGER",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_tiles",
+            "living_answer_ask_dispatch_generation",
+            "INTEGER",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "dashboard_context_state",
+            "structural_generation",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -4178,7 +4316,7 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
         let sql = format!(
-            "SELECT d.id, d.folder_id, d.kind, d.name, d.title, COALESCE(d.text, ''), d.updated_at
+            "SELECT d.id, d.folder_id, d.kind, d.name, d.title, COALESCE(d.text, ''), d.created_at, d.updated_at
                FROM documents d
                JOIN folders f ON f.id = d.folder_id
               WHERE d.id = ?1 AND {visible}"
@@ -4194,11 +4332,56 @@ impl Db {
                 // Brain v3 PR-2: render clean display text (strip the block-structure markers a PR-2
                 // upload stores). A note / legacy row has no markers → unchanged.
                 markdown: crate::extract::render_display_text(&raw),
-                updated_at: r.get(6)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
             })
         })
         .optional()
         .map_err(map_err)
+    }
+
+    pub(crate) fn get_document_if_visible_kind(
+        &self,
+        id: &str,
+        kind: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<DocumentSummary>> {
+        if !matches!(kind, "note" | "document") {
+            return Err(AppError::InvalidArg(
+                "invalid dashboard document kind".into(),
+            ));
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT d.id,d.folder_id,d.kind,d.name,d.title,COALESCE(d.text,''),d.created_at,d.updated_at
+               FROM documents d JOIN folders f ON f.id=d.folder_id
+              WHERE d.id=?1 AND d.kind=?2 AND {visible}"
+        );
+        conn.query_row(&sql, rusqlite::params![id, kind], |row| {
+            let raw: String = row.get(5)?;
+            Ok(DocumentSummary {
+                id: row.get(0)?,
+                folder_id: row.get(1)?,
+                kind: row.get(2)?,
+                name: row.get(3)?,
+                title: row.get(4)?,
+                markdown: crate::extract::render_display_text(&raw),
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })
+        .optional()
+        .map_err(map_err)
+    }
+
+    pub(crate) fn document_is_visible(&self, id: &str, unlocked: &HashSet<String>) -> Result<bool> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM documents d JOIN folders f ON f.id=d.folder_id WHERE d.id=?1 AND d.kind='document' AND {visible})"),
+            [id], |row| row.get(0),
+        ).map_err(map_err)
     }
 
     // `folder_for_document` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
@@ -7146,7 +7329,8 @@ pub(crate) fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
     // Reclaim fixtures abandoned by EARLIER test processes before minting a new one. Callers own a
     // bare `PathBuf` at 73 sites across 36 files, so nothing here can drop-clean the CURRENT run —
     // sweeping on entry bounds the steady state at one run's worth instead of unbounded growth.
-    SWEEP.call_once(|| sweep_stale_temp_fixtures(std::env::temp_dir().as_path(), STALE_FIXTURE_AGE));
+    SWEEP
+        .call_once(|| sweep_stale_temp_fixtures(std::env::temp_dir().as_path(), STALE_FIXTURE_AGE));
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()

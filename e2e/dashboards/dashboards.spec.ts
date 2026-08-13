@@ -20,12 +20,10 @@ async function submitAsk(page: import("@playwright/test").Page): Promise<void> {
 async function enterCompose(
   page: import("@playwright/test").Page,
 ): Promise<void> {
-  if (
-    !(await page.locator('section[aria-label="Compose board tiles"]').count())
-  ) {
+  if (!(await page.locator('[data-testid="dashboard-compose"]').count())) {
     await page.getByRole("button", { name: "Compose", exact: true }).click();
   }
-  await page.locator('section[aria-label="Compose board tiles"]').waitFor();
+  await page.locator('[data-testid="dashboard-compose"]').waitFor();
 }
 
 /**
@@ -201,13 +199,14 @@ test("Dashboards: a SEALED tile leaks nothing — not even the title the user ty
     await assertSecretAbsent();
   }
 
-  // Compose may render the legacy tile row, but only from its resolved locked
-  // payload. Stored kind/title/config remain forbidden as fallback chrome.
+  // Compose renders a generic compact row from the gated payload only.
   await enterCompose(page);
-  const sealed = page.locator("app-dashboard-tile.is-locked");
+  const sealed = page.locator('.compose-row[data-kind="locked"]');
   await expect(sealed).toHaveCount(1);
-  await expect(sealed).toContainText("Sealed — not in scope");
-  await expect(sealed.locator(".tile-title")).toHaveText("🔒 Locked");
+  await expect(sealed).toContainText("Sealed item");
+  await expect(sealed).toContainText(
+    "Content hidden until its folder is unlocked",
+  );
   await assertSecretAbsent();
 
   // CONTROL: the same assertion catches a leak when one exists — an unsealed
@@ -253,60 +252,116 @@ test("Dashboards: an entity tile whose entity went invisible keeps no stored nam
 
   await page.goto("/dashboards/b-atlas");
   await enterCompose(page);
-  await expect(page.locator("app-dashboard-tile")).toHaveCount(1);
-  await expect(
-    page.locator("app-dashboard-tile .tile-title"),
-  ).not.toContainText("Dana");
+  await expect(page.locator(".compose-row")).toHaveCount(1);
+  await expect(page.locator(".compose-row strong")).not.toContainText("Dana");
   // A drift lane with no rows never had data, so it collapses to a strip rather
   // than reserving a full card for an apology (2026-08-04 density pass). The
   // leak assertion above is the point of this test and is unchanged.
-  await expect(page.locator("app-dashboard-tile")).toHaveClass(/is-empty/);
-  await expect(
-    page.getByText(/Values land here as they get revised/),
-  ).toBeVisible();
+  await expect(page.locator(".compose-row")).toHaveAttribute(
+    "data-kind",
+    "drift",
+  );
 });
 
-test("Dashboards: a withheld Living answer shows why, and not the cached text", async ({
+test("Dashboards: withheld legacy Living Answer chrome never reaches Read or Compose DOM", async ({
   page,
 }) => {
+  const secret = "NIGHTJAR LEGACY LIVING ANSWER SECRET";
   await mockTauri(
     page,
-    {},
+    {
+      get_dashboard: () => {
+        // Simulate a legacy persisted row whose every content-shaped field held
+        // plaintext. The production resolver is the authority that projects it
+        // to this scrubbed wire shape before the WebView sees it.
+        const legacyStored = {
+          title: "NIGHTJAR LEGACY LIVING ANSWER SECRET",
+          config: JSON.stringify({
+            question: "NIGHTJAR LEGACY LIVING ANSWER SECRET",
+            answer: "NIGHTJAR LEGACY LIVING ANSWER SECRET",
+          }),
+          question: "NIGHTJAR LEGACY LIVING ANSWER SECRET",
+        };
+        void legacyStored;
+        return {
+          id: "b-atlas",
+          title: "Atlas GA",
+          emoji: "🚀",
+          tint: "indigo",
+          pinned: true,
+          position: 0,
+          createdAt: "2026-08-01T09:00:00Z",
+          updatedAt: "2026-08-03T09:00:00Z",
+          tileCount: 2,
+          tileKinds: [],
+          tiles: [
+            {
+              id: "t-answer-withheld",
+              dashboardId: "b-atlas",
+              kind: "living_answer",
+              refId: null,
+              title: null,
+              span: 5,
+              position: 0,
+              config: null,
+              createdAt: "2026-08-01T09:00:00Z",
+              data: {
+                kind: "livingAnswer",
+                question: "",
+                answer: null,
+                answeredAt: null,
+                withheld: true,
+              },
+            },
+            {
+              id: "t-answer-readable",
+              dashboardId: "b-atlas",
+              kind: "living_answer",
+              refId: null,
+              title: null,
+              span: 5,
+              position: 1,
+              config: null,
+              createdAt: "2026-08-01T09:00:00Z",
+              data: {
+                kind: "livingAnswer",
+                question: "Authorized gated launch question",
+                answer: "Authorized gated answer",
+                answeredAt: "2026-08-03T09:00:00Z",
+                withheld: false,
+              },
+            },
+          ],
+        };
+      },
+    },
     {
       list_dashboards: BOARDS,
-      get_dashboard: {
-        ...BOARDS[0],
-        tiles: [
-          {
-            id: "t-answer",
-            dashboardId: "b-atlas",
-            kind: "living_answer",
-            refId: null,
-            title: null,
-            span: 5,
-            position: 0,
-            config: null,
-            createdAt: "2026-08-01T09:00:00Z",
-            data: {
-              kind: "livingAnswer",
-              question: "Will Acme renew?",
-              answer: null,
-              answeredAt: null,
-              withheld: true,
-            },
-          },
-        ],
-      },
       get_dashboard_sources: [],
     },
   );
 
   await page.goto("/dashboards/b-atlas");
-  await enterCompose(page);
-  await expect(page.getByText(/The saved answer is hidden/)).toBeVisible();
   await expect(
-    page.getByText(/one of the sources it was built from is sealed/),
+    page.getByText("Authorized gated launch question", { exact: true }),
   ).toBeVisible();
+  expect(
+    await page.locator("app-root").evaluate((root) => root.outerHTML),
+  ).not.toContain(secret);
+
+  await enterCompose(page);
+  const withheld = page.locator('[data-tile-id="t-answer-withheld"]');
+  await expect(withheld).toContainText("Living answer");
+  await expect(withheld).toContainText("Waiting for an answer");
+  await expect(withheld).not.toContainText(
+    /saved answer is hidden|sources it was built from/i,
+  );
+  await expect(
+    page.locator('[data-tile-id="t-answer-readable"]'),
+  ).toContainText("Authorized gated launch question");
+  expect(
+    await page.locator("app-root").evaluate((root) => root.outerHTML),
+  ).not.toContain(secret);
 });
 
 test("Dashboards: Read exposes Living Answer answered-at without inventing a stale verdict", async ({
@@ -359,11 +414,11 @@ test("Dashboards: Read exposes Living Answer answered-at without inventing a sta
   await expect(brief).not.toContainText(/stale|fresh/i);
 
   await page.getByRole("button", { name: "Compose", exact: true }).click();
-  const tile = page.locator(
-    'app-dashboard-tile[data-tile-id="t-cached-answer"]',
-  );
+  const tile = page.locator('.compose-row[data-tile-id="t-cached-answer"]');
   await expect(tile).toBeVisible();
   await expect(tile.getByRole("button", { name: "Re-answer" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Done", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Re-answer" })).toBeVisible();
   expect(
     await page.evaluate(
       () =>
@@ -372,16 +427,31 @@ test("Dashboards: Read exposes Living Answer answered-at without inventing a sta
   ).toBe(0);
 });
 
-test("Dashboards: board Ask sends readable sources and the board id", async ({
+test("Dashboards: board Ask sends only board id and backend conversation id, never FE history", async ({
   page,
 }) => {
   await mockTauri(
     page,
     {
-      ask_vault: (args: unknown) => {
-        (globalThis as { __dashboardAskArgs?: unknown }).__dashboardAskArgs =
-          args;
+      get_dashboard_sources: () => {
+        (
+          globalThis as { __dashboardAskSourceReads?: number }
+        ).__dashboardAskSourceReads =
+          ((globalThis as { __dashboardAskSourceReads?: number })
+            .__dashboardAskSourceReads ?? 0) + 1;
+        return [{ kind: "note", id: "must-not-expand" }];
+      },
+      ask_vault_persisted: (args: Record<string, unknown>) => {
+        const target = globalThis as { __dashboardAskCalls?: unknown[] };
+        target.__dashboardAskCalls = [
+          ...(target.__dashboardAskCalls ?? []),
+          args,
+        ];
         return {
+          conversationId:
+            (args["conversationId"] as string | undefined) ?? "board-thread-1",
+          userMessageId: crypto.randomUUID(),
+          assistantMessageId: crypto.randomUUID(),
           answer: "Jun 14 is at risk — the migration still has a sprint left.",
           sources: [
             {
@@ -421,10 +491,6 @@ test("Dashboards: board Ask sends readable sources and the board id", async ({
           },
         ],
       },
-      get_dashboard_sources: [
-        { kind: "meeting", id: "m-1" },
-        { kind: "note", id: "n-1" },
-      ],
     },
   );
 
@@ -445,14 +511,107 @@ test("Dashboards: board Ask sends readable sources and the board id", async ({
   await submitAsk(page);
 
   await expect(page.getByText(/Jun 14 is at risk/)).toBeVisible();
-  const sent = (await page.evaluate(
-    () => (globalThis as { __dashboardAskArgs?: unknown }).__dashboardAskArgs,
-  )) as { dashboardId?: string; explicitSources?: unknown[] };
-  expect(sent.dashboardId).toBe("b-atlas");
-  expect(sent.explicitSources).toEqual([
-    { kind: "meeting", id: "m-1" },
-    { kind: "note", id: "n-1" },
-  ]);
+  await page
+    .getByRole("textbox", { name: "Ask a question about this board" })
+    .fill("What changed?");
+  await submitAsk(page);
+  const calls = (await page.evaluate(
+    () =>
+      (globalThis as { __dashboardAskCalls?: unknown[] }).__dashboardAskCalls,
+  )) as Array<{
+    dashboardId?: string;
+    conversationId?: string;
+    explicitSources?: unknown[];
+    history?: unknown[];
+  }>;
+  expect(calls).toHaveLength(2);
+  expect(calls[0].dashboardId).toBe("b-atlas");
+  expect(calls[0].conversationId).toBeUndefined();
+  expect(calls[1].dashboardId).toBe("b-atlas");
+  expect(calls[1].conversationId).toBe("board-thread-1");
+  expect(calls[0].explicitSources).toBeUndefined();
+  expect(calls[0].history).toBeUndefined();
+  expect(calls[1].history).toBeUndefined();
+  expect(
+    await page.evaluate(
+      () =>
+        (globalThis as { __dashboardAskSourceReads?: number })
+          .__dashboardAskSourceReads ?? 0,
+    ),
+  ).toBe(0);
+});
+
+test("Dashboards: a board mutation synchronously drops turns and starts a provenance-fresh Ask thread", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      ask_vault_persisted: (args: Record<string, unknown>) => {
+        const target = globalThis as { __mutationAskCalls?: unknown[] };
+        target.__mutationAskCalls = [
+          ...(target.__mutationAskCalls ?? []),
+          args,
+        ];
+        const first = target.__mutationAskCalls.length === 1;
+        return {
+          conversationId: first ? "secret-old-thread" : "fresh-thread",
+          userMessageId: crypto.randomUUID(),
+          assistantMessageId: crypto.randomUUID(),
+          answer: first ? "OLD SECRET ANSWER" : "Fresh board answer",
+          sources: [],
+          citations: [],
+        };
+      },
+      reorder_dashboard_tiles: () => null,
+    },
+    {
+      list_dashboards: BOARDS,
+      get_dashboard: BOARD_DETAIL,
+      get_dashboard_sources: [],
+    },
+  );
+
+  await page.goto("/dashboards/b-atlas");
+  await openAsk(page);
+  await page
+    .getByRole("textbox", { name: "Ask a question about this board" })
+    .fill("OLD SECRET QUESTION");
+  await submitAsk(page);
+  await expect(
+    page.getByText("OLD SECRET ANSWER", { exact: true }),
+  ).toBeVisible();
+
+  await page.getByRole("button", { name: "Compose", exact: true }).click();
+  await page
+    .getByRole("button", { name: /Move later/ })
+    .first()
+    .click();
+  await expect(
+    page.getByText("OLD SECRET QUESTION", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("OLD SECRET ANSWER", { exact: true }),
+  ).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Done", exact: true }).click();
+  await openAsk(page);
+  await page
+    .getByRole("textbox", { name: "Ask a question about this board" })
+    .fill("Question after mutation");
+  await submitAsk(page);
+  await expect(
+    page.getByText("Fresh board answer", { exact: true }),
+  ).toBeVisible();
+
+  const calls = (await page.evaluate(
+    () => (globalThis as { __mutationAskCalls?: unknown[] }).__mutationAskCalls,
+  )) as Array<Record<string, unknown>>;
+  expect(calls).toHaveLength(2);
+  expect(calls[0]["conversationId"]).toBeUndefined();
+  expect(calls[1]["conversationId"]).toBeUndefined();
+  expect(calls[1]["history"]).toBeUndefined();
+  expect(JSON.stringify(calls[1])).not.toContain("OLD SECRET");
 });
 
 test("Dashboards: an empty board invites the first tile instead of showing a dead grid", async ({
@@ -460,7 +619,13 @@ test("Dashboards: an empty board invites the first tile instead of showing a dea
 }) => {
   await mockTauri(
     page,
-    {},
+    {
+      ask_vault_persisted: () => ({
+        answer: "This board has no readable sources yet.",
+        sources: [],
+        citations: [],
+      }),
+    },
     {
       list_dashboards: BOARDS,
       get_dashboard: { ...BOARDS[1], tiles: [] },

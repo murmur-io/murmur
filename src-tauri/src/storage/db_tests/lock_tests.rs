@@ -525,6 +525,92 @@ fn mcp_visibility_filter() {
     assert!(visible_after.contains("sealed1"));
 }
 
+/// A meeting has no independent folder column: its canonical ownership edge is created only when
+/// a note row receives `notes.folder_id`. Live/crash-recovery meetings therefore remain visible at
+/// the vault root before their first note, while the same meeting must disappear atomically from
+/// every meeting-row resolver once its note is owned by a sealed folder.
+#[test]
+fn no_note_live_meeting_is_root_visible_until_note_establishes_locked_ownership() {
+    let db = file_db("no-note-root-ownership");
+    let empty: HashSet<String> = HashSet::new();
+    let title = "live root visibility sentinel";
+
+    db.insert_meeting(&Meeting {
+        id: "live-root".to_string(),
+        started_at: "2026-08-13T10:00:00Z".to_string(),
+        ended_at: None,
+        title: Some(title.to_string()),
+        duration_s: 17,
+        audio_path: Some("/tmp/live-root.wav".to_string()),
+        status: MeetingStatus::Recording,
+        folder_id: None,
+    })
+    .unwrap();
+
+    let live = db
+        .get_meeting_if_visible("live-root", &empty)
+        .unwrap()
+        .expect("a no-note live recording is canonically unfiled and visible");
+    assert_eq!(live.title.as_deref(), Some(title));
+    assert_eq!(live.audio_path.as_deref(), Some("/tmp/live-root.wav"));
+    assert_eq!(live.folder_id, None);
+    assert_eq!(live.status, MeetingStatus::Recording);
+    assert!(db.meeting_is_visible("live-root", &empty).unwrap());
+    assert!(db
+        .meeting_by_title_visible(title, &empty)
+        .unwrap()
+        .is_some());
+    assert!(db
+        .list_meetings_visible(50, &empty)
+        .unwrap()
+        .iter()
+        .any(|meeting| meeting.id == "live-root"));
+
+    seed_folder(&db, "secret-live", "Secret live");
+    db.upsert_note(&NoteRecord {
+        meeting_id: "live-root".to_string(),
+        provider_id: "claude_code".to_string(),
+        markdown: "# finalized\n".to_string(),
+        created_at: "2026-08-13T10:01:00Z".to_string(),
+        exported_path: None,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })
+    .unwrap();
+    db.set_meeting_folder("live-root", Some("secret-live"))
+        .unwrap();
+    db.update_meeting_status("live-root", MeetingStatus::Summarized)
+        .unwrap();
+    let kek = crate::crypto::random_key().unwrap();
+    seal_folder(&db, "secret-live", &kek);
+
+    assert!(db
+        .get_meeting_if_visible("live-root", &empty)
+        .unwrap()
+        .is_none());
+    assert!(!db.meeting_is_visible("live-root", &empty).unwrap());
+    assert!(db
+        .meeting_by_title_visible(title, &empty)
+        .unwrap()
+        .is_none());
+    assert!(!db
+        .list_meetings_visible(50, &empty)
+        .unwrap()
+        .iter()
+        .any(|meeting| meeting.id == "live-root"));
+
+    session_unlock(&db, "secret-live", &kek);
+    let unlocked = HashSet::from(["secret-live".to_string()]);
+    let restored = db
+        .get_meeting_if_visible("live-root", &unlocked)
+        .unwrap()
+        .expect("session unlock restores the canonically owned meeting row");
+    assert_eq!(restored.title.as_deref(), Some(title));
+    assert_eq!(restored.audio_path.as_deref(), Some("/tmp/live-root.wav"));
+    assert_eq!(restored.folder_id.as_deref(), Some("secret-live"));
+}
+
 #[test]
 fn remove_lock_re_plaintexts() {
     let db = file_db("remove");
@@ -1723,7 +1809,7 @@ fn forget_entity_fact_closes_the_row_and_is_idempotent() {
         "re-forget is a no-op (idempotent)"
     );
     assert!(db
-        .list_ask_conversations(&AskConversationScope::Vault, &HashSet::new())
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
         .unwrap()
         .is_empty());
 
@@ -1789,7 +1875,7 @@ fn forget_and_clear_user_facts() {
         "re-forget is a no-op"
     );
     assert!(db
-        .list_ask_conversations(&AskConversationScope::Vault, &HashSet::new())
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
         .unwrap()
         .is_empty());
     let after = db.list_user_facts_visible(&HashSet::new()).unwrap();
@@ -1828,7 +1914,7 @@ fn forget_and_clear_user_facts() {
         "no user memory after clear"
     );
     assert!(db
-        .list_ask_conversations(&AskConversationScope::Vault, &HashSet::new())
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
         .unwrap()
         .is_empty());
 }

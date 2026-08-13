@@ -1173,21 +1173,20 @@ pub fn execute_tool(
                 return Ok(format!("No dashboard with id {dashboard_id}."));
             };
             let tiles = db
-                .list_dashboard_tiles(dashboard_id)
+                .list_dashboard_tile_structures(dashboard_id)
                 .map_err(|e| AppError::Storage(format!("dashboard tiles failed: {e}")))?;
             let mut out = format!("# {} (dashboard)\n", board.title);
             if tiles.is_empty() {
                 out.push_str("(no tiles yet)");
                 return Ok(out);
             }
-            for tile in &tiles {
+            for mut tile in tiles {
                 // The SAME gated resolver the UI uses. A sealed source renders redacted here too.
-                let data = crate::commands::resolve_tile(db, tile, unlocked)?;
-                // Redact BEFORE rendering, exactly as `get_dashboard` does for the UI. The agent
-                // path calls `resolve_tile` directly, so without this the renderer would still see
-                // a withheld tile's stored `title`/`config` — and a legacy row (written by a build
-                // that copied the source's title) would hand a sealed source's name to an agent.
-                let tile = crate::commands::redact_tile_chrome(tile.clone(), &data);
+                let data = crate::commands::resolve_tile(db, &tile, unlocked)?;
+                // Headings come entirely from gated TileData. Legacy stored chrome/config may
+                // paraphrase content that has since sealed, so this surface never hydrates it.
+                tile.title = None;
+                tile.config = None;
                 out.push_str(&crate::commands::render_tile_for_agent(&tile, &data));
                 out.push('\n');
             }

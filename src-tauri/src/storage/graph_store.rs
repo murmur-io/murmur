@@ -1000,6 +1000,49 @@ impl Db {
             neighbors,
         }))
     }
+
+    /// Exact-ID entity projection for dashboard tiles. It applies the same mention visibility gate
+    /// as the capped list without hydrating unrelated entity names or dropping a selected entity
+    /// merely because 500 others rank ahead of it.
+    pub(crate) fn get_entity_node_visible(
+        &self,
+        entity_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<GraphNode>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT e.id,e.name,e.kind,COUNT(em.meeting_id) AS cnt
+               FROM entities e
+               JOIN entity_mentions em ON em.entity_id=e.id
+               JOIN meetings m ON m.id=em.meeting_id
+              WHERE e.id=?1 AND (
+                NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id=m.id)
+                OR EXISTS (SELECT 1 FROM notes n LEFT JOIN folders f ON f.id=n.folder_id
+                            WHERE n.meeting_id=m.id AND {visible}))
+              GROUP BY e.id,e.name,e.kind HAVING cnt>0"
+        );
+        let row = conn
+            .query_row(&sql, [entity_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(map_err)?;
+        row.map(|(id, name, kind, mention_count)| {
+            Ok(GraphNode {
+                id,
+                name,
+                kind: EntityKind::from_str(&kind)?,
+                mention_count,
+            })
+        })
+        .transpose()
+    }
 }
 
 /// One VISIBLE note/document node row for the full-brain graph, pre-typed: `(kind, id, label, date)`
