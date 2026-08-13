@@ -126,6 +126,11 @@ export class LinkPickerComponent {
 
   private readonly popoverEl = viewChild<ElementRef<HTMLDivElement>>("popover");
 
+  /** Remove the teleported box immediately when its cached owner is detached. */
+  detachFromDocument(): void {
+    this.popoverEl()?.nativeElement.remove();
+  }
+
   /** Monotonic request token — a late reply for a superseded query is dropped (T1 stale-guard). */
   private requestSeq = 0;
   /**
