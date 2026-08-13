@@ -17,6 +17,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
   backdrop-filter: none;
   box-shadow: var(--shadow-lg);
 }
@@ -120,6 +121,7 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-xl);
   background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
   backdrop-filter: none;
   box-shadow: var(--shadow-lg);
 }
