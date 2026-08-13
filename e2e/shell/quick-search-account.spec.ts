@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 const consoleErrors = new WeakMap<Page, string[]>();
@@ -20,6 +20,50 @@ async function openPalette(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Search (⌘K)" }).click();
   await expect(page.getByRole("dialog", { name: "Quick search" })).toBeVisible();
 }
+
+async function sampleSurface(locator: Locator): Promise<{
+  background: string;
+  alpha: number;
+  backdrop: string;
+  webkitBackdrop: string;
+}> {
+  return locator.evaluate((element) => {
+    const sampleAlpha = (cssColor: string): number => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) return -1;
+
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = "rgba(0, 0, 0, 0)";
+      context.fillStyle = cssColor;
+      context.fillRect(0, 0, 1, 1);
+      return context.getImageData(0, 0, 1, 1).data[3] ?? -1;
+    };
+    const style = getComputedStyle(element);
+    return {
+      background: style.backgroundColor,
+      alpha: sampleAlpha(style.backgroundColor),
+      backdrop: style.getPropertyValue("backdrop-filter"),
+      webkitBackdrop: style.getPropertyValue("-webkit-backdrop-filter"),
+    };
+  });
+}
+
+test("the surface oracle rejects translucent modern CSS colors", async ({ page }) => {
+  await page.setContent('<div id="modern-color-probe"></div>');
+  const probe = page.locator("#modern-color-probe");
+  await probe.evaluate((element) => {
+    (element as HTMLElement).style.backgroundColor =
+      "color(srgb 1 1 1 / 0.5)";
+  });
+
+  const sample = await sampleSurface(probe);
+  expect(sample.background).toMatch(/^color\(/);
+  expect(sample.alpha).toBeGreaterThan(0);
+  expect(sample.alpha).toBeLessThan(255);
+});
 
 test("literal Search autofocuses and opens the result through the tab service", async ({
   page,
@@ -369,7 +413,10 @@ test("expected account loss shows direct sign-in without visiting Settings", asy
   const modal = page.getByRole("dialog", { name: "Sharing account" });
   await expect(modal.getByRole("heading", { name: "Sign in" })).toBeVisible();
   await expect(modal.getByLabel("Email")).toBeVisible();
-  await expect(modal.locator(".auth-modal")).toHaveCSS("backdrop-filter", "none");
+  const modalSurface = await sampleSurface(modal.locator(".auth-modal"));
+  expect(modalSurface.alpha).toBe(255);
+  expect(modalSurface.backdrop).not.toContain("blur");
+  expect(modalSurface.webkitBackdrop).not.toContain("blur");
 });
 
 test("a locked expected account offers Touch ID and clears the banner after unlock", async ({
