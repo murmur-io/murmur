@@ -24,14 +24,16 @@ use crate::storage::Db;
 /// graph into one prompt.
 const LINK_CONTEXT_CAP: usize = 8;
 
-/// Char budget for the corpus, by provider. Local quantized models (Ollama) have tiny
-/// default context windows, so cap much tighter; API/Claude models get headroom.
+/// Char budget for the corpus, by provider. Weak on-device models (the explicit local Brain,
+/// Apple Foundation Models, and Ollama) have small context windows, so cap them much tighter;
+/// API/CLI models get headroom. Reuse `related_context`'s canonical classification so a new
+/// on-device role cannot silently receive the cloud-sized Ask corpus.
 ///
 /// `pub` so a caller assembling a pinned corpus across MULTIPLE packers (e.g. the Ask floor packing
 /// a pinned org item AND explicit sources) can honor ONE shared budget instead of letting each
 /// packer spend the full budget independently.
 pub fn budget_for(provider_id: &str) -> usize {
-    if provider_id == "ollama" {
+    if crate::summarize::related_context::is_weak_provider(provider_id) {
         4_000
     } else {
         // Cited Ask: pack toward the model context window so more relevant notes (each kept under its
@@ -611,6 +613,80 @@ mod tests {
             created_at: "2026-06-26T00:00:00Z".to_string(),
         })
         .unwrap();
+    }
+
+    /// Regression: every existing on-device connection must share the small Ask corpus budget,
+    /// while every current cloud-capable connection and an unknown future identifier retain the
+    /// large-window budget. The explicit local Brain used to miss the Ollama-only check and
+    /// therefore received 200k chars despite its 4096-token plan. Binding both sides here also
+    /// makes the reused classification seam reviewable without duplicating its string literals.
+    #[test]
+    fn vault_budget_covers_the_complete_on_device_provider_matrix() {
+        for provider_id in [
+            crate::summarize::roles::CONN_LOCAL,
+            crate::summarize::roles::CONN_AFM,
+            crate::summarize::PROVIDER_OLLAMA,
+        ] {
+            assert_eq!(
+                budget_for(provider_id),
+                4_000,
+                "on-device provider {provider_id} must use the compact Ask corpus budget"
+            );
+        }
+        for provider_id in [
+            crate::summarize::PROVIDER_CLAUDE_CODE,
+            crate::summarize::PROVIDER_CODEX_CLI,
+            crate::summarize::PROVIDER_ANTHROPIC,
+            crate::summarize::PROVIDER_GATEWAY,
+            "future-remote-provider",
+        ] {
+            assert_eq!(
+                budget_for(provider_id),
+                200_000,
+                "non-weak provider {provider_id} must retain the large Ask corpus budget"
+            );
+        }
+    }
+
+    /// RED-before-GREEN resource-bound oracle: both the whole-vault and explicit-source paths must
+    /// apply the resolved local provider's compact budget to the corpus they actually construct.
+    #[test]
+    fn explicit_local_ask_corpora_are_capped_at_the_on_device_budget() {
+        let db = temp_db();
+        seed_note(
+            &db,
+            "local-long",
+            "Local budget",
+            &format!("LOCAL-BUDGET-EVIDENCE {}", "ż".repeat(12_000)),
+            None,
+        );
+
+        let nothing = HashSet::new();
+        let (whole, whole_sources) =
+            build_vault_context_visible(&db, "", crate::summarize::roles::CONN_LOCAL, &nothing)
+                .unwrap();
+        assert!(whole.contains("LOCAL-BUDGET-EVIDENCE"));
+        assert_eq!(whole_sources.len(), 1);
+        assert!(
+            whole.chars().count() <= 4_000,
+            "local whole-vault corpus exceeded 4k chars: {}",
+            whole.chars().count()
+        );
+
+        let (pinned, pinned_sources) = build_vault_context_pinned_visible(
+            &db,
+            &[m_src("local-long")],
+            crate::summarize::roles::CONN_LOCAL,
+            &nothing,
+        )
+        .unwrap();
+        assert!(pinned.contains("LOCAL-BUDGET-EVIDENCE"));
+        assert_eq!(pinned_sources.len(), 1);
+        assert!(
+            pinned.chars().count() <= 4_000,
+            "local pinned corpus exceeded 4k chars: {}",
+            pinned.chars().count()
+        );
     }
 
     /// E9: a sealed-and-not-session-unlocked folder's note must NEVER appear in the corpus that
