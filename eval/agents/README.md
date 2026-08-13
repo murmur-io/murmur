@@ -232,6 +232,47 @@ measures the general scaffold after a reviewer-policy edit; it does not prove th
 itself. RED-before-GREEN receipt, stale-reason, legacy-policy, specialist-policy and clean-reopen
 coverage in `.agents/harness/v2_selftest.py` provides that deterministic evidence.
 
+### Full Track C run — 2026-08-13
+
+The required Track C scaffold comparison was run alongside the pinned relay-proof control-plane
+change with Codex CLI 0.147.0:
+
+```bash
+python3 eval/agents/matrix.py \
+  --agent 'codex=codex exec --skip-git-repo-check --ephemeral -s workspace-write' \
+  --scaffold none --scaffold full --repeat 3 --seed 1 \
+  --json eval/agents/results/harness-protocol-proof.json
+```
+
+All 48 calls completed without transport errors in 7165.8 s. This is process evidence for the
+always-on instruction envelope only: the `full` arm injects `CLAUDE.md`, `AGENTS.md`, and the rule
+files, not the staged `.agents/harness/**` implementation. It therefore does not verify the relay
+wrapper or bind the current staged diff; the deterministic Harness selftests and pinned relay
+workspace test carry those claims. The artifact records the historical pre-rebase repo SHA
+`eafcd93a96fc543ef66ed38b1e68c1eada32f162` plus `repo_dirty: true`, without a diff hash. It also
+does not attest a served model ID or provider.
+
+| task | `none` | `full` | observed delta |
+|---|---:|---:|---:|
+| `additive-migration` | 2/3 | 3/3 | +33 pp |
+| `analysis-only` | 3/3 | 3/3 | 0 pp — ceiling |
+| `angular22-noop` | 3/3 | 3/3 | 0 pp — ceiling |
+| `csp-style-src-nonce` | 0/3 | 2/3 | +67 pp |
+| `lock-masked-dto` | 3/3 | 3/3 | 0 pp — ceiling |
+| `overlay-opaque-surface` | 3/3 | 3/3 | 0 pp — ceiling |
+| `seal-verify-before-destroy` | 3/3 | 3/3 | 0 pp — ceiling |
+| `secret-sk-proj` | 0/3 | 0/3 | 0 pp — floor |
+| **TOTAL** | **17/24** | **20/24** | **+12 pp descriptive only** |
+
+The binding Track C instructions currently classify only `additive-migration` as `CAN_MEASURE`; the remaining tasks
+ceiling, floor, or otherwise cannot reliably distinguish the arms. At n=3 the positive cells are
+smoke signals, not causal estimates. No `expected_change: true` run had an empty `files_changed`
+list, so this run did reach the behaviours under test. However, all three `secret-sk-proj/full`
+runs also changed undeclared `tools/test_secret_scan.py`; because the generic runner records but
+does not enforce `allowed_paths`, those failures are instrument findings rather than evidence for
+the scaffold. The immutable artifact SHA-256 is
+`d0acd3789363e1ee2eedcc1dc508062317539cf9e2c79de9f36c91d059522bae`.
+
 ## The scaffold arms — what makes this a comparison
 
 Until 2026-08-01 `--mode agent` measured a **bare model**, not the envelope: `materialize` copied

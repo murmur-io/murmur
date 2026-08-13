@@ -61,7 +61,7 @@
   "canonical_checks": {
     "rust-lib": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo test --lib -- --test-threads=1)",
     "rust-clippy": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo clippy --lib --tests -- -D warnings)",
-    "protocol-server": "(cd ../murmur-server && CARGO_BUILD_JOBS=2 cargo test -p murmur-protocol -- --test-threads=1)",
+    "protocol-server": "DATABASE_URL=postgresql://postgres:postgres@localhost:5433/urc_dev CARGO_BUILD_JOBS=2 python3 -I -B .agents/harness/protocol_server_check.py -- cargo test --workspace -- --test-threads=1",
     "npm-lock": "python3 -B .agents/harness/checks/npm-lock-evidence.py",
     "quality-archives": "python3 -B .agents/harness/checks/quality-artifacts.py --archive-stage --selftest",
     "quality-artifacts": "python3 -B .agents/harness/checks/quality-artifacts.py --final --selftest",
@@ -70,7 +70,7 @@
     "ng-build": "npx ng build",
     "playwright": "npm run test:e2e -- --workers=2",
     "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh",
-    "harness-python": "python3 -B -c 'import ast, importlib, pathlib, sys; names=(\"runtime\",\"cli\",\"verifier\",\"process_guardian\",\"config_audit\",\"hook_guard\",\"learning_extract\",\"resource_policy\",\"v2_selftest\",\"v2_fault_selftest\",\"metrics\",\"metrics_selftest\"); root=pathlib.Path(\".agents/harness\"); [ast.parse((root / (name + \".py\")).read_text(encoding=\"utf-8\"), filename=str(root / (name + \".py\"))) for name in names]; sys.path.insert(0, str(root)); [importlib.import_module(name) for name in names]'",
+    "harness-python": "python3 -B -c 'import ast, importlib, pathlib, sys; names=(\"runtime\",\"cli\",\"verifier\",\"process_guardian\",\"protocol_server_check\",\"config_audit\",\"hook_guard\",\"learning_extract\",\"resource_policy\",\"v2_selftest\",\"v2_fault_selftest\",\"metrics\",\"metrics_selftest\"); root=pathlib.Path(\".agents/harness\"); [ast.parse((root / (name + \".py\")).read_text(encoding=\"utf-8\"), filename=str(root / (name + \".py\"))) for name in names]; sys.path.insert(0, str(root)); [importlib.import_module(name) for name in names]'",
     "harness-v2-selftest": "python3 .agents/harness/v2_selftest.py",
     "receipt-selftest": "scripts/verify-harness-attestation --selftest",
     "hook-selftest": "bash .codex/hooks/selftest.sh",
