@@ -10,7 +10,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * default scope is `[{meeting m-atlas-roadmap "Q2 Roadmap Planning"}, {note nX}]`;
  * `chat_meeting` records the `explicitSources` it saw on `window`.
  */
-test("meeting chat pre-fills this meeting + its links and sends chat_meeting with explicitSources", async ({
+test("meeting chat keeps its meeting anchor, adds one dashboard scope, and sends dashboardId without expansion", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -41,9 +41,27 @@ test("meeting chat pre-fills this meeting + its links and sends chat_meeting wit
       }
       return [];
     },
-    chat_meeting_persisted: (args: { explicitSources?: unknown }) => {
-      (window as unknown as { __chatSources?: unknown }).__chatSources =
-        args.explicitSources ?? null;
+    list_dashboards: () => [
+      {
+        id: "dashboard-meeting",
+        title: "Meeting board live title",
+        emoji: "📅",
+        tileCount: 2,
+        createdAt: "2026-08-06T01:00:00Z",
+        updatedAt: "2026-08-06T01:00:00Z",
+      },
+    ],
+    get_dashboard_sources: () => {
+      (
+        window as unknown as { __meetingDashboardExpanded?: boolean }
+      ).__meetingDashboardExpanded = true;
+      return [{ kind: "meeting", id: "must-not-expand" }];
+    },
+    chat_meeting_persisted: (args: {
+      explicitSources?: unknown;
+      dashboardId?: string;
+    }) => {
+      (window as unknown as { __chatArgs?: unknown }).__chatArgs = args;
       return {
         conversationId: "meeting-conversation-1",
         userMessageId: crypto.randomUUID(),
@@ -86,6 +104,17 @@ test("meeting chat pre-fills this meeting + its links and sends chat_meeting wit
     "Companion note",
   ]);
 
+  await chat.locator("mur-source-picker .sp-trigger").click();
+  await page
+    .getByRole("option", { name: "Use dashboard Meeting board live title" })
+    .click();
+  await expect(
+    chat.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toHaveCount(1);
+  await expect(
+    chat.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toContainText("Meeting board live title");
+
   // Ask a question — Enter sends.
   const input = chat.locator(".chat-input");
   await input.fill("What did we decide?");
@@ -95,16 +124,25 @@ test("meeting chat pre-fills this meeting + its links and sends chat_meeting wit
   ).toContainText("Grounded meeting answer.");
 
   // chat_meeting carried the pinned scope: the meeting + its active link.
-  const sent = await page.evaluate(
-    () =>
-      (window as unknown as { __chatSources?: { kind: string; id: string }[] })
-        .__chatSources,
-  );
-  expect(sent).toBeTruthy();
-  expect((sent ?? []).map((s) => `${s.kind}:${s.id}`)).toEqual([
-    "meeting:m-atlas-roadmap",
-    "note:nX",
-  ]);
+  const sent = await page.evaluate(() => {
+    const target = window as unknown as {
+      __chatArgs?: {
+        explicitSources?: { kind: string; id: string }[];
+        dashboardId?: string;
+      };
+      __meetingDashboardExpanded?: boolean;
+    };
+    return {
+      args: target.__chatArgs,
+      expanded: target.__meetingDashboardExpanded,
+    };
+  });
+  expect(sent.args).toBeTruthy();
+  expect(
+    (sent.args?.explicitSources ?? []).map((s) => `${s.kind}:${s.id}`),
+  ).toEqual(["meeting:m-atlas-roadmap", "note:nX"]);
+  expect(sent.args?.dashboardId).toBe("dashboard-meeting");
+  expect(sent.expanded).not.toBe(true);
 
   expect(consoleErrors).toEqual([]);
 });

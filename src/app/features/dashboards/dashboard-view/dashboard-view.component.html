@@ -1,16 +1,43 @@
-<header class="head">
+<header class="head" [class.is-compose]="mode() === 'compose'">
   <div class="head-text">
     <button type="button" class="crumb" (click)="back()">← Dashboards</button>
     @if (renaming()) {
       <form class="rename" (submit)="commitRename(); $event.preventDefault()">
-        <input #renameField class="rename-field" type="text" [value]="renameDraft()" (input)="onRenameInput($event)" (keydown.escape)="cancelRename()" aria-label="Board name" />
-        <button type="submit" class="btn btn-primary btn-sm" [disabled]="!renameDraft().trim()">Save</button>
-        <button type="button" class="btn btn-ghost btn-sm" (click)="cancelRename()">Cancel</button>
+        <input
+          #renameField
+          class="rename-field"
+          type="text"
+          [value]="renameDraft()"
+          (input)="onRenameInput($event)"
+          (keydown.escape)="cancelRename()"
+          aria-label="Board name"
+        />
+        <button
+          type="submit"
+          class="btn btn-primary btn-sm"
+          [disabled]="!renameDraft().trim()"
+        >
+          Save
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          (click)="cancelRename()"
+        >
+          Cancel
+        </button>
       </form>
     } @else {
       <h1>
-        <button type="button" class="title-edit" (click)="startRename()" [attr.aria-label]="'Rename this board — ' + (board()?.title ?? '')">
-          @if (board()?.emoji; as emoji) { <span class="emoji">{{ emoji }}</span> }
+        <button
+          type="button"
+          class="title-edit"
+          (click)="startRename()"
+          [attr.aria-label]="'Rename this board — ' + (board()?.title ?? '')"
+        >
+          @if (board()?.emoji; as emoji) {
+            <span class="emoji">{{ emoji }}</span>
+          }
           {{ board()?.title ?? "Board" }}
         </button>
       </h1>
@@ -18,102 +45,183 @@
   </div>
 
   @if (mode() === "read") {
-    <button type="button" class="btn btn-ghost secondary-action" [disabled]="!privacyReady()" (click)="openAsk()"><mur-icon icon="ask" /> Ask</button>
-    @if (!isEmpty()) { <button type="button" class="btn btn-ghost" (click)="enterCompose()">Compose</button> }
+    <button
+      type="button"
+      class="btn btn-ghost secondary-action"
+      [disabled]="!privacyReady()"
+      (click)="openAsk()"
+    >
+      <mur-icon icon="ask" /> Ask
+    </button>
+    @if (!isEmpty()) {
+      <button type="button" class="btn btn-ghost" (click)="enterCompose()">
+        Compose
+      </button>
+    }
   } @else {
     <span class="compose-hint">Drag or use Move earlier / Move later</span>
-    <button type="button" class="btn btn-primary" [class.is-open]="paletteOpen()" (click)="togglePalette($event)">
+    <button
+      type="button"
+      class="btn btn-primary"
+      [class.is-open]="paletteOpen()"
+      (click)="togglePalette($event)"
+    >
       <mur-icon icon="plus" /> {{ paletteOpen() ? "Close" : "Add to board" }}
     </button>
-    <button type="button" class="btn btn-ghost" (click)="leaveCompose()">Done</button>
+    <button type="button" class="btn btn-ghost" (click)="leaveCompose()">
+      Done
+    </button>
   }
 </header>
 
-@if (error(); as err) { <div class="banner banner-error" role="alert">{{ err }}</div> }
+@if (error(); as err) {
+  <div class="banner banner-error" role="alert">{{ err }}</div>
+}
 
 @if (!privacyReady() && !privacyError()) {
-  <mur-empty-state><mur-spinner /> Establishing a secure board session…</mur-empty-state>
+  <mur-empty-state
+    ><mur-spinner /> Establishing a secure board session…</mur-empty-state
+  >
 } @else if (privacyRefreshing() || loading()) {
   <mur-empty-state><mur-spinner /> Re-checking this board…</mur-empty-state>
 } @else if (boardUnavailable()) {
   <mur-empty-state>
     <strong>Board unavailable.</strong>
-    <p class="empty-copy">{{ privacyError() ?? "Murmur could not safely resolve this board's current readable scope." }}</p>
-    <button type="button" class="btn btn-primary" (click)="retryLoad()">Try again</button>
+    <p class="empty-copy">
+      {{
+        privacyError() ??
+          "Murmur could not safely resolve this board's current readable scope."
+      }}
+    </p>
+    <button type="button" class="btn btn-primary" (click)="retryLoad()">
+      Try again
+    </button>
   </mur-empty-state>
 } @else if (isEmpty() && !askOpen()) {
   <mur-empty-state>
     <strong>Start with material for this board.</strong>
-    <p class="empty-copy">Add a Note, Recording or Document. Derived views can follow once the board has something readable to work from.</p>
-    <button type="button" class="btn btn-primary" (click)="openPalette($event)">Add a Note, Recording or Document</button>
+    <p class="empty-copy">
+      Add a Note, Recording or Document. Derived views can follow once the board
+      has something readable to work from.
+    </p>
+    <button type="button" class="btn btn-primary" (click)="openPalette($event)">
+      Add a Note, Recording or Document
+    </button>
   </mur-empty-state>
 } @else if (mode() === "compose") {
-  <section class="compose" aria-label="Compose board tiles">
-    @for (tile of tiles(); track tile.id; let first = $first; let last = $last) {
-      <app-dashboard-tile
-        [tile]="tile"
-        [editing]="true"
-        [allowRefreshAnswer]="false"
-        [duplicateOf]="duplicateOf(tile)"
-        [canMoveEarlier]="!first"
-        [canMoveLater]="!last"
-        [dragging]="draggingId() === tile.id"
-        [dropTarget]="dropTargetId() === tile.id"
-        draggable="true"
-        (dragstart)="onDragStart(tile, $event)"
-        (dragover)="onDragOver(tile, $event)"
-        (dragleave)="onDragLeave(tile)"
-        (drop)="onDrop(tile, $event)"
-        (dragend)="onDragEnd()"
-        (moveEarlier)="moveTile(tile, -1)"
-        (moveLater)="moveTile(tile, 1)"
-        (remove)="removeTile(tile)"
-        (widen)="widen(tile)"
-        (narrow)="narrow(tile)"
-        (openSource)="openSource($event)"
-      />
-    }
-  </section>
+  <app-dashboard-compose
+    [tiles]="tiles()"
+    [busy]="composeBusy()"
+    (move)="moveTile($event.tile, $event.delta)"
+    (reorder)="reorderTile($event)"
+    (remove)="removeTile($event)"
+  />
 } @else {
   <div class="workspace" [class.has-ask]="askOpen()">
     <main class="reading">
       <nav class="lenses" aria-label="Dashboard lenses">
         @for (item of lenses; track item.id) {
-          <button type="button" [class.active]="lens() === item.id" [attr.aria-current]="lens() === item.id ? 'page' : null" (click)="selectLens(item.id)">{{ item.label }}</button>
+          <button
+            type="button"
+            [class.active]="lens() === item.id"
+            [attr.aria-current]="lens() === item.id ? 'page' : null"
+            (click)="selectLens(item.id)"
+          >
+            {{ item.label }}
+          </button>
         }
       </nav>
-      <app-dashboard-read [lens]="lens()" [projection]="projection()" (openSource)="openSource($event)" />
+      <app-dashboard-read
+        [lens]="lens()"
+        [projection]="projection()"
+        [refreshingAnswerId]="answerRefreshingTileId()"
+        (openSource)="openSource($event)"
+        (refreshAnswer)="refreshLivingAnswer($event)"
+      />
     </main>
 
     @if (askOpen()) {
       <aside class="ask" aria-label="Ask this board">
         <header class="ask-head">
-          <div><span class="eyebrow">On demand</span><h2>Ask this board</h2></div>
-          <button type="button" class="btn btn-ghost btn-sm" (click)="closeAsk()" aria-label="Close Ask">Close</button>
+          <div>
+            <span class="eyebrow">On demand</span>
+            <h2>Ask this board</h2>
+          </div>
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            (click)="closeAsk()"
+            aria-label="Close Ask"
+          >
+            Close
+          </button>
         </header>
         <p class="scope">
-          Uses {{ sourceCount() }} currently readable material {{ sourceCount() === 1 ? "source" : "sources" }}, this board's derived views, and permitted gated linked context. This is the allowed scope, not a claim that every sentence is exact cited evidence.
-          @if (projection().sealedCount > 0) { <span>{{ projection().sealedCount }} sealed {{ projection().sealedCount === 1 ? "item is" : "items are" }} excluded.</span> }
+          Uses {{ sourceCount() }} currently readable material
+          {{ sourceCount() === 1 ? "source" : "sources" }}, this board's derived
+          views, and permitted gated linked context. This is the allowed scope,
+          not a claim that every sentence is exact cited evidence.
+          @if (projection().sealedCount > 0) {
+            <span
+              >{{ projection().sealedCount }} sealed
+              {{ projection().sealedCount === 1 ? "item is" : "items are" }}
+              excluded.</span
+            >
+          }
         </p>
         <div class="thread">
           @for (turn of turns(); track turn.id) {
             @if (turn.role === "error") {
-              <div class="banner is-danger" role="alert"><span>{{ turn.text }}</span><button type="button" class="btn btn-ghost btn-sm" (click)="retry(turn)">Try again</button></div>
+              <div class="banner is-danger" role="alert">
+                <span>{{ turn.text }}</span
+                ><button
+                  type="button"
+                  class="btn btn-ghost btn-sm"
+                  (click)="retry(turn)"
+                >
+                  Try again
+                </button>
+              </div>
             } @else if (turn.role === "user") {
               <div class="bubble me">{{ turn.text }}</div>
             } @else {
-              <div class="bubble"><app-markdown [markdown]="turn.text" compact /></div>
+              <div class="bubble">
+                <app-markdown [markdown]="turn.text" compact />
+              </div>
             }
           } @empty {
             <div class="suggestions">
-              @for (suggestion of suggestions; track suggestion) { <button type="button" class="suggestion" (click)="askSuggestion(suggestion)">{{ suggestion }}</button> }
+              @for (suggestion of suggestions; track suggestion) {
+                <button
+                  type="button"
+                  class="suggestion"
+                  (click)="askSuggestion(suggestion)"
+                >
+                  {{ suggestion }}
+                </button>
+              }
             </div>
           }
-          @if (asking()) { <div class="bubble thinking"><mur-spinner /> Thinking…</div> }
+          @if (asking()) {
+            <div class="bubble thinking"><mur-spinner /> Thinking…</div>
+          }
         </div>
         <form class="composer" (submit)="ask(); $event.preventDefault()">
-          <input class="ask-field" type="text" placeholder="Ask about this board…" [value]="draft()" (input)="onDraft($event)" aria-label="Ask a question about this board" />
-          <button type="submit" class="btn btn-primary btn-sm" [disabled]="!draft().trim() || asking()">Ask</button>
+          <input
+            class="ask-field"
+            type="text"
+            placeholder="Ask about this board…"
+            [value]="draft()"
+            (input)="onDraft($event)"
+            aria-label="Ask a question about this board"
+          />
+          <button
+            type="submit"
+            class="btn btn-primary btn-sm"
+            [disabled]="!draft().trim() || asking()"
+          >
+            Ask
+          </button>
         </form>
       </aside>
     }

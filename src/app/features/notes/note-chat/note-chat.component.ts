@@ -19,6 +19,7 @@ import type {
   AskConversationScope,
   AskConversationSummary,
   ChatTurn,
+  DashboardScopeRef,
   SourceRef,
 } from "../../../core/models";
 import { SourceScopeService } from "../../../services/source-scope.service";
@@ -131,6 +132,8 @@ export class NoteChatComponent {
    * itself is one of the sources, so the scope is never whole-vault by default).
    */
   readonly sources = signal<SourceRef[]>([]);
+  /** Optional ID-only composite board beside this note's canonical anchor. */
+  readonly dashboard = signal<DashboardScopeRef | null>(null);
   private readonly defaultSources = signal<SourceRef[]>([]);
 
   /** Durable history is local-authored-note only; Org stays intentionally stateless. */
@@ -187,9 +190,11 @@ export class NoteChatComponent {
     const seq = ++this.prefillSeq;
     if (kind !== "note") {
       // Org anchor: pinned server-side via `pinnedOrgItemId`; an org item is not a local SourceRef,
-      // so prefilling a note scope for its id would be wrong. Start the picker empty.
+      // so prefilling a note scope for its id would be wrong. Start the picker empty and make the
+      // unsupported pinned-org + dashboard combination impossible even across component reuse.
       this.defaultSources.set([]);
       this.sources.set([]);
+      this.dashboard.set(null);
       return;
     }
     if (!privacyReady) {
@@ -337,6 +342,30 @@ export class NoteChatComponent {
     void this.historyPrivacy.ensureReady();
   }
 
+  /** A board switch cannot mutate an existing durable thread's identity. */
+  onDashboardChange(next: DashboardScopeRef | null): void {
+    if (this.anchorKind() === "org") {
+      this.dashboard.set(null);
+      return;
+    }
+    if (this.dashboard()?.id === next?.id) return;
+    const sources = this.sources();
+    if (this.conversationId() !== null || this.conversation().length > 0) {
+      this.resetConversation(false);
+      this.sources.set(sources);
+    }
+    this.dashboard.set(next);
+  }
+
+  onSourcesChange(next: SourceRef[]): void {
+    const dashboard = this.dashboard();
+    if (this.conversationId() !== null || this.conversation().length > 0) {
+      this.resetConversation(false);
+      this.dashboard.set(dashboard);
+    }
+    this.sources.set(next);
+  }
+
   async resumeConversation(id: string): Promise<void> {
     if (
       !this.historyEnabled() ||
@@ -358,6 +387,7 @@ export class NoteChatComponent {
       this.prefillSeq++;
       this.conversationId.set(detail.id);
       this.sources.set(detail.selectedSources);
+      this.dashboard.set(detail.dashboard ?? null);
       this.conversation.set(this.renderTurns(detail));
       this.draft.set("");
       this.error.set(null);
@@ -427,6 +457,7 @@ export class NoteChatComponent {
           undefined,
           selectedSources.length ? selectedSources : undefined,
           this.noteId(),
+          undefined,
         );
         answer = result.answer;
       } else {
@@ -435,6 +466,8 @@ export class NoteChatComponent {
           question,
           conversationId,
           selectedSources.length ? selectedSources : undefined,
+          undefined,
+          this.dashboard()?.id,
         );
         answer = result.answer;
         persistedConversationId = result.conversationId;
@@ -517,8 +550,10 @@ export class NoteChatComponent {
       this.prefillSeq++;
       this.defaultSources.set([]);
       this.sources.set([]);
+      this.dashboard.set(null);
     } else {
       this.sources.set(this.defaultSources());
+      this.dashboard.set(null);
     }
     this.historyOpen.set(false);
     this.historyLoading.set(false);
@@ -580,7 +615,8 @@ export class NoteChatComponent {
 
   /** The scrollable message log. */
   private readonly scroller = viewChild<ElementRef<HTMLDivElement>>("scroller");
-  private readonly composer = viewChild<ElementRef<HTMLTextAreaElement>>("input");
+  private readonly composer =
+    viewChild<ElementRef<HTMLTextAreaElement>>("input");
   private readonly sourcePicker = viewChild(SourcePickerComponent);
 
   private focusComposer(): void {

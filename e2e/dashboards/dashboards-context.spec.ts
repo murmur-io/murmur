@@ -44,12 +44,10 @@ const BOARDS = [
 async function enterCompose(
   page: import("@playwright/test").Page,
 ): Promise<void> {
-  if (
-    !(await page.locator('section[aria-label="Compose board tiles"]').count())
-  ) {
+  if (!(await page.locator('[data-testid="dashboard-compose"]').count())) {
     await page.getByRole("button", { name: "Compose", exact: true }).click();
   }
-  await page.locator('section[aria-label="Compose board tiles"]').waitFor();
+  await page.locator('[data-testid="dashboard-compose"]').waitFor();
 }
 
 async function openPalette(page: import("@playwright/test").Page) {
@@ -76,19 +74,21 @@ async function openPalette(page: import("@playwright/test").Page) {
   return palette;
 }
 
-test("Ask: a dashboard can be picked as scope and expands to its visible sources", async ({
+test("Ask: a dashboard is one composite chip and never expands in the WebView", async ({
   page,
 }) => {
   await mockTauri(
     page,
-    {},
+    {
+      get_dashboard_sources: () => {
+        (
+          window as unknown as { __contextDashboardReads?: number }
+        ).__contextDashboardReads = 1;
+        return [{ kind: "note", id: "must-not-read" }];
+      },
+    },
     {
       list_dashboards: BOARDS,
-      // Two visible sources; a sealed third is already filtered out backend-side.
-      get_dashboard_sources: [
-        { kind: "meeting", id: "m-1" },
-        { kind: "note", id: "n-1" },
-      ],
     },
   );
 
@@ -102,15 +102,24 @@ test("Ask: a dashboard can be picked as scope and expands to its visible sources
   const picker = page.locator(".sp-list");
   await expect(picker.getByText("Dashboards")).toBeVisible();
   await expect(picker.getByText("Atlas GA")).toBeVisible();
-  // A board with no tiles is not a usable scope, so it is not offered.
-  await expect(picker.getByText("Nothing on it yet")).toHaveCount(0);
+  // Composite identity remains meaningful even when the live readable corpus is empty.
+  await expect(picker.getByText("Nothing on it yet")).toBeVisible();
 
   await picker.getByRole("option", { name: /Atlas GA/ }).click();
 
-  // Picking the board added BOTH of its visible sources as chips.
-  await expect(page.locator(".sp-chip, .sp .pill")).toHaveCount(2, {
-    timeout: 5000,
-  });
+  await expect(
+    page.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toHaveCount(1);
+  await expect(
+    page.locator('[data-testid="selected-dashboard-chip"]'),
+  ).toContainText("Atlas GA");
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { __contextDashboardReads?: number })
+          .__contextDashboardReads ?? 0,
+    ),
+  ).toBe(0);
 });
 
 test("Dashboards: Compose makes tiles draggable and persists a reorder", async ({
@@ -175,17 +184,24 @@ test("Dashboards: Compose makes tiles draggable and persists a reorder", async (
   await expect(page.getByRole("heading", { name: "FIRST TILE" })).toBeVisible();
 
   // The peer-card grid does not exist until the explicit Compose mode is entered.
-  await expect(page.locator("app-dashboard-tile")).toHaveCount(0);
+  await expect(page.locator('[data-testid="dashboard-compose"]')).toHaveCount(
+    0,
+  );
   await enterCompose(page);
   await expect(page.getByText(/Drag or use Move earlier/)).toBeVisible();
-  await expect(page.locator("app-dashboard-tile").first()).toHaveAttribute(
+  await expect(page.locator(".compose-row")).toHaveCount(2);
+  await expect(page.locator(".compose-row").first()).not.toHaveAttribute(
+    "draggable",
+    "true",
+  );
+  await expect(page.locator(".drag-handle").first()).toHaveAttribute(
     "draggable",
     "true",
   );
 
   // Drag the second tile onto the first.
-  const source = page.locator("app-dashboard-tile").nth(1);
-  const target = page.locator("app-dashboard-tile").nth(0);
+  const source = page.locator(".drag-handle").nth(1);
+  const target = page.locator(".compose-row").nth(0);
   await source.dragTo(target);
 
   // The backend was asked for the NEW order, second tile first.
