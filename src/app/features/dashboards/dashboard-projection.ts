@@ -49,6 +49,7 @@ export interface BoardProjection {
     detail: string;
     answeredAt: string | null;
     source: SourceRef | null;
+    answerRefresh: { tileId: string; question: string } | null;
   };
   attention: CommitmentView[];
   evidence: MaterialSourceView[];
@@ -146,7 +147,12 @@ export function projectDashboard(tiles: readonly ResolvedTile[]): BoardProjectio
   let missingCount = 0;
   let derivedViewCount = 0;
   let hasGoodZero = false;
-  let livingAnswer: { title: string; detail: string; answeredAt: string | null } | null = null;
+  let livingAnswer: {
+    tileId: string;
+    title: string;
+    detail: string;
+    answeredAt: string | null;
+  } | null = null;
 
   for (const tile of tiles) {
     const data = tile.data;
@@ -187,10 +193,13 @@ export function projectDashboard(tiles: readonly ResolvedTile[]): BoardProjectio
         });
         break;
       case "livingAnswer":
-        if (!livingAnswer && !data.withheld && data.answer) {
+        if (!livingAnswer && !data.withheld && data.question.trim()) {
           livingAnswer = {
+            tileId: tile.id,
             title: data.question,
-            detail: data.answer,
+            detail:
+              data.answer ??
+              "No saved answer yet. Refresh it from this board's current readable scope.",
             answeredAt: data.answeredAt,
           };
         }
@@ -236,6 +245,10 @@ export function projectDashboard(tiles: readonly ResolvedTile[]): BoardProjectio
         detail: livingAnswer.detail,
         answeredAt: livingAnswer.answeredAt,
         source: null,
+        answerRefresh: {
+          tileId: livingAnswer.tileId,
+          question: livingAnswer.title,
+        },
       }
     : firstSource
       ? {
@@ -244,21 +257,26 @@ export function projectDashboard(tiles: readonly ResolvedTile[]): BoardProjectio
           detail: firstSource.detail,
           answeredAt: null,
           source: firstSource.source,
+          answerRefresh: null,
         }
       : commitments.length === 0 && hasGoodZero
         ? {
             label: "Current state",
             title: "Nothing open",
-            detail: "The board's configured commitment views have no open items.",
+            detail:
+              "The board's configured commitment views have no open items.",
             answeredAt: null,
             source: null,
+            answerRefresh: null,
           }
         : {
             label: "Current state",
             title: "No readable material yet",
-            detail: "Add a note, recording or document, or unlock a sealed source.",
+            detail:
+              "Add a note, recording or document, or unlock a sealed source.",
             answeredAt: null,
             source: null,
+            answerRefresh: null,
           };
 
   return {

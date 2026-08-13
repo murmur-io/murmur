@@ -184,7 +184,7 @@ async function enterCompose(
   page: import("@playwright/test").Page,
 ): Promise<void> {
   await page.getByRole("button", { name: "Compose", exact: true }).click();
-  await page.locator('section[aria-label="Compose board tiles"]').waitFor();
+  await page.locator('[data-testid="dashboard-compose"]').waitFor();
 }
 
 async function assertNoSealedSecret(
@@ -448,11 +448,19 @@ test("Dashboard workspace: keyboard tile movement persists the same order shown 
   await mockTauri(
     page,
     {
-      reorder_dashboard_tiles: async (args: unknown) => {
-        (globalThis as { __dashboardReorder?: unknown }).__dashboardReorder =
-          args;
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        return null;
+      reorder_dashboard_tiles: (args: unknown) => {
+        const target = globalThis as {
+          __dashboardReorders?: unknown[];
+          __resolveHeldReorder?: () => void;
+        };
+        target.__dashboardReorders = [
+          ...(target.__dashboardReorders ?? []),
+          args,
+        ];
+        if (target.__dashboardReorders.length > 1) return null;
+        return new Promise((resolve) => {
+          target.__resolveHeldReorder = () => resolve(null);
+        });
       },
     },
     {
@@ -464,34 +472,261 @@ test("Dashboard workspace: keyboard tile movement persists the same order shown 
   await page.goto(`/dashboards/${BOARD.id}`);
   await enterCompose(page);
 
-  const first = page.locator("app-dashboard-tile").first();
+  const first = page.locator(".compose-row").first();
   await expect(first).toHaveAttribute("data-tile-id", "t-note");
-  await first.getByRole("button", { name: "Move tile later" }).click();
-  await expect(page.locator("app-dashboard-tile").first()).toHaveAttribute(
+  const handle = page.getByRole("button", {
+    name: /Drag to reorder Atlas launch plan/,
+  });
+  await handle.focus();
+  await handle.press("Alt+ArrowDown");
+  await expect(page.locator(".compose-row").first()).toHaveAttribute(
     "data-tile-id",
     "t-recording",
   );
-  await expect(page.locator("app-dashboard-tile").nth(1)).toHaveAttribute(
+  await expect(page.locator(".compose-row").nth(1)).toHaveAttribute(
     "data-tile-id",
     "t-note",
   );
 
-  const sent = (await expect
+  await expect
     .poll(() =>
       page.evaluate(
         () =>
-          (globalThis as { __dashboardReorder?: unknown }).__dashboardReorder,
+          (globalThis as { __dashboardReorders?: unknown[] })
+            .__dashboardReorders?.length ?? 0,
       ),
     )
-    .toBeTruthy()
-    .then(() =>
-      page.evaluate(
-        () =>
-          (globalThis as { __dashboardReorder?: unknown }).__dashboardReorder,
-      ),
-    )) as { dashboardId?: string; tileIds?: string[] };
+    .toBe(1);
+  await expect(handle).toBeFocused();
+  await expect(page.locator(".compose-row")).toHaveCount(TILES.length);
+
+  await page.evaluate(() => {
+    (
+      globalThis as { __resolveHeldReorder?: () => void }
+    ).__resolveHeldReorder?.();
+  });
+  const sent = (await page.evaluate(
+    () =>
+      (globalThis as { __dashboardReorders?: unknown[] })
+        .__dashboardReorders?.[0],
+  )) as { dashboardId?: string; tileIds?: string[] };
   expect(sent.dashboardId).toBe(BOARD.id);
   expect(sent.tileIds?.slice(0, 2)).toEqual(["t-recording", "t-note"]);
+  await expect(handle).toBeFocused();
+
+  await page
+    .getByRole("button", { name: "Move later Atlas launch plan" })
+    .click();
+  await expect(page.locator(".compose-row").nth(2)).toHaveAttribute(
+    "data-tile-id",
+    "t-note",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as { __dashboardReorders?: unknown[] })
+            .__dashboardReorders?.length ?? 0,
+      ),
+    )
+    .toBe(2);
+  const clickSent = (await page.evaluate(
+    () =>
+      (globalThis as { __dashboardReorders?: unknown[] })
+        .__dashboardReorders?.[1],
+  )) as { tileIds?: string[] };
+  const domOrder = await page
+    .locator(".compose-row")
+    .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-tile-id")));
+  expect(clickSent.tileIds).toEqual(domOrder);
+});
+
+test("Dashboard Compose is a canonical compact list for readable, missing, sealed, and unconfigured rows", async ({
+  page,
+}) => {
+  const longTitle = `Long board title ${"without overflow ".repeat(18)}`;
+  const detail = {
+    ...BOARD,
+    tiles: [
+      {
+        ...tile(
+          "t-long",
+          "note",
+          "n-long",
+          {
+            kind: "note",
+            id: "n-long",
+            title: longTitle,
+            snippet: "Readable material",
+            updatedAt: 1_786_400_000_000,
+          },
+          0,
+        ),
+        title: longTitle,
+      },
+      {
+        ...tile("t-locked-middle", "note", "n-locked", { kind: "locked" }, 1),
+        title: "LEGACY PRIVATE LOCKED TITLE",
+        config: JSON.stringify({
+          kind: "note",
+          title: "LEGACY PRIVATE LOCKED TITLE",
+        }),
+      },
+      tile("t-missing-middle", "note", "n-gone", { kind: "missing" }, 2),
+      tile(
+        "t-unconfigured-middle",
+        "numbers",
+        null,
+        { kind: "unconfigured" },
+        3,
+      ),
+      TILES[1],
+    ],
+  };
+  await mockTauri(
+    page,
+    {},
+    {
+      list_dashboards: [BOARD],
+      get_dashboard: detail,
+      get_dashboard_sources: [],
+    },
+  );
+  await page.setViewportSize({ width: 900, height: 680 });
+  await page.goto(`/dashboards/${BOARD.id}`);
+  await enterCompose(page);
+
+  const rows = page.locator(".compose-row");
+  await expect(rows).toHaveCount(5);
+  expect(
+    await rows.evaluateAll((items) =>
+      items.map((item) => item.getAttribute("data-tile-id")),
+    ),
+  ).toEqual([
+    "t-long",
+    "t-locked-middle",
+    "t-missing-middle",
+    "t-unconfigured-middle",
+    "t-recording",
+  ]);
+  await expect(rows.nth(1)).toHaveAttribute("data-kind", "locked");
+  await expect(rows.nth(2)).toHaveAttribute("data-kind", "missing");
+  await expect(rows.nth(3)).toHaveAttribute("data-kind", "unconfigured");
+  await expect(rows.nth(1)).toContainText("Sealed item");
+  await expect(
+    page.getByText("LEGACY PRIVATE LOCKED TITLE", { exact: false }),
+  ).toHaveCount(0);
+  await expect(page.locator(".tile-body")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: /Make tile (wider|narrower)/i }),
+  ).toHaveCount(0);
+  await expect(page.locator('[draggable="true"]')).toHaveCount(5);
+  await expect(page.locator('.compose-row[draggable="true"]')).toHaveCount(0);
+  await expect(page.locator('.drag-handle[draggable="true"]')).toHaveCount(5);
+
+  const geometry = await page.evaluate(() => {
+    const composeRows = [
+      ...document.querySelectorAll<HTMLElement>(".compose-row"),
+    ];
+    const boxes = composeRows.map((row) => row.getBoundingClientRect());
+    return {
+      overflow: document.documentElement.scrollWidth > innerWidth,
+      rowOverflow: composeRows.some((row) => row.scrollWidth > row.clientWidth),
+      overlap: boxes.some((box, index) => {
+        const next = boxes[index + 1];
+        return Boolean(next && box.bottom > next.top);
+      }),
+    };
+  });
+  expect(geometry).toEqual({
+    overflow: false,
+    rowOverflow: false,
+    overlap: false,
+  });
+  await expect(
+    page.getByRole("button", { name: "Add to board" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Done", exact: true }),
+  ).toBeVisible();
+
+  await page.setViewportSize({ width: 1500, height: 900 });
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    )
+    .toBe(true);
+  const wideBoxes = await rows.evaluateAll((items) =>
+    items.map((item) => {
+      const box = item.getBoundingClientRect();
+      return { top: box.top, bottom: box.bottom };
+    }),
+  );
+  expect(
+    wideBoxes.some((box, index) => {
+      const next = wideBoxes[index + 1];
+      return Boolean(next && box.bottom > next.top);
+    }),
+  ).toBe(false);
+  await expect(
+    page.getByRole("button", { name: "Add to board" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Done", exact: true }),
+  ).toBeVisible();
+});
+
+test("Dashboard Compose removes optimistically and rolls back without reloading the board", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      delete_dashboard_tile: (args: unknown) => {
+        const target = globalThis as {
+          __removeArgs?: unknown;
+          __rejectHeldRemove?: () => void;
+        };
+        target.__removeArgs = args;
+        return new Promise((_resolve, reject) => {
+          target.__rejectHeldRemove = () =>
+            reject(new Error("simulated remove failure"));
+        });
+      },
+    },
+    {
+      list_dashboards: [BOARD],
+      get_dashboard: DETAIL,
+      get_dashboard_sources: SOURCES,
+    },
+  );
+  await page.goto(`/dashboards/${BOARD.id}`);
+  await enterCompose(page);
+  await expect(page.locator(".compose-row")).toHaveCount(TILES.length);
+
+  await page
+    .getByRole("button", { name: "Remove Atlas launch plan from board" })
+    .click();
+  await expect(page.locator(".compose-row")).toHaveCount(TILES.length - 1);
+  await expect(page.locator('[data-tile-id="t-note"]')).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(
+          (globalThis as { __rejectHeldRemove?: () => void })
+            .__rejectHeldRemove,
+        ),
+      ),
+    )
+    .toBe(true);
+  await page.evaluate(() => {
+    (globalThis as { __rejectHeldRemove?: () => void }).__rejectHeldRemove?.();
+  });
+  await expect(page.locator(".compose-row")).toHaveCount(TILES.length);
+  await expect(page.locator(".compose-row").first()).toHaveAttribute(
+    "data-tile-id",
+    "t-note",
+  );
 });
 
 test("Dashboard workspace: 900x680 keeps primary actions and overlays usable without horizontal overflow", async ({
@@ -547,6 +782,17 @@ test("Dashboard workspace: 900x680 keeps primary actions and overlays usable wit
   await page.getByRole("button", { name: "Close Ask" }).click();
 
   await enterCompose(page);
+  await expect(
+    page.getByRole("button", { name: "Add to board" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Done", exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    )
+    .toBe(true);
   await page.getByRole("button", { name: "Add to board" }).click();
   const palette = page.getByRole("dialog", { name: "Add to board" });
   const box = await palette.boundingBox();
@@ -778,7 +1024,7 @@ test("Dashboard workspace: relock scrubs mounted plaintext even when the folder 
         (globalThis as { __dashboardLocked?: boolean }).__dashboardLocked
           ? []
           : [{ kind: "note", id: "n-relock-failure" }],
-      ask_vault: () => ({
+      ask_vault_persisted: () => ({
         answer: "Nightjar assistant-only risk summary",
         sources: [],
         citations: [],

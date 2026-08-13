@@ -34,11 +34,17 @@ use crate::storage::models::{NoteTemplate, NoteTemplateSection};
 /// the FE matches the `[cloud-consent]` CODE (never the prose) and surfaces the consent prompt.
 #[tauri::command]
 pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_cloud_egress_consent(&state.db)?;
+    if !cache.cloud_egress_consented {
+        state
+            .db
+            .set_cloud_egress_consent_and_advance_ask_dispatch(true)?;
+        cache.cloud_egress_consented = true;
+    }
     Ok(())
 }
 
@@ -50,11 +56,19 @@ pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppErro
 /// Idempotent; a settings save can still neither grant nor revoke (the DTO stays preserve-only).
 #[tauri::command]
 pub fn revoke_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.revoke_cloud_egress(&state.db)?;
+    if cache.cloud_egress_consented {
+        // Revoke in memory before the fallible durable write. If persistence fails, this process
+        // remains fail-closed; the DB transaction changes consent+generation together on success.
+        cache.cloud_egress_consented = false;
+        state
+            .db
+            .set_cloud_egress_consent_and_advance_ask_dispatch(false)?;
+    }
     Ok(())
 }
 
@@ -66,11 +80,15 @@ pub fn revoke_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
 /// brain's tool registry and the redacted query never leaves the device.
 #[tauri::command]
 pub fn consent_to_web_search(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_web_search_consent(&state.db)?;
+    if !cache.web_search_consented {
+        state.db.advance_ask_dispatch_generation()?;
+        cache.grant_web_search_consent(&state.db)?;
+    }
     Ok(())
 }
 
@@ -79,11 +97,15 @@ pub fn consent_to_web_search(state: State<'_, AppState>) -> Result<(), AppError>
 /// (provided Jira is also enabled + configured + a token is stored). Idempotent.
 #[tauri::command]
 pub fn consent_to_jira(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_jira_consent(&state.db)?;
+    if !cache.jira_consented {
+        state.db.advance_ask_dispatch_generation()?;
+        cache.grant_jira_consent(&state.db)?;
+    }
     Ok(())
 }
 
@@ -92,11 +114,15 @@ pub fn consent_to_jira(state: State<'_, AppState>) -> Result<(), AppError> {
 /// (provided Slack is also enabled + a token is stored). Idempotent.
 #[tauri::command]
 pub fn consent_to_slack(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_slack_consent(&state.db)?;
+    if !cache.slack_consented {
+        state.db.advance_ask_dispatch_generation()?;
+        cache.grant_slack_consent(&state.db)?;
+    }
     Ok(())
 }
 
@@ -105,11 +131,15 @@ pub fn consent_to_slack(state: State<'_, AppState>) -> Result<(), AppError> {
 /// tool (provided Notion is also enabled + a token is stored). Idempotent.
 #[tauri::command]
 pub fn consent_to_notion(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_notion_consent(&state.db)?;
+    if !cache.notion_consented {
+        state.db.advance_ask_dispatch_generation()?;
+        cache.grant_notion_consent(&state.db)?;
+    }
     Ok(())
 }
 
@@ -118,11 +148,15 @@ pub fn consent_to_notion(state: State<'_, AppState>) -> Result<(), AppError> {
 /// tool (provided ClickUp is also enabled + a workspace id and token are configured). Idempotent.
 #[tauri::command]
 pub fn consent_to_clickup(state: State<'_, AppState>) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut cache = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_clickup_consent(&state.db)?;
+    if !cache.clickup_consented {
+        state.db.advance_ask_dispatch_generation()?;
+        cache.grant_clickup_consent(&state.db)?;
+    }
     Ok(())
 }
 

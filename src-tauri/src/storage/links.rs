@@ -2707,31 +2707,35 @@ impl Db {
     ) -> Result<Option<String>> {
         match kind {
             crate::links::LinkKind::Meeting => {
-                if !self.meeting_is_visible(id, unlocked)? {
-                    return Ok(None);
-                }
-                let conn = self.lock();
-                conn.query_row(
-                    "SELECT COALESCE(NULLIF(TRIM(title), ''), 'Meeting') FROM meetings WHERE id = ?1",
-                    rusqlite::params![id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(map_err)
+                // One gated SQL read: never authorize and then hydrate the title in a second
+                // connection interval where a relock could land between the two operations.
+                Ok(self.get_meeting_if_visible(id, unlocked)?.map(|meeting| {
+                    meeting
+                        .title
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| "Meeting".to_string())
+                }))
             }
             crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
                 let conn = self.lock();
                 let visible = visibility_clause("f", unlocked);
+                let expected_kind = match kind {
+                    crate::links::LinkKind::Note => "note",
+                    crate::links::LinkKind::Document => "document",
+                    crate::links::LinkKind::Meeting => unreachable!(),
+                };
                 let sql = format!(
                     "SELECT COALESCE(NULLIF(TRIM(d.title), ''), d.name)
                        FROM documents d
                        JOIN folders f ON f.id = d.folder_id
-                      WHERE d.id = ?1 AND {visible}
+                      WHERE d.id = ?1 AND d.kind = ?2 AND {visible}
                       LIMIT 1"
                 );
-                conn.query_row(&sql, rusqlite::params![id], |r| r.get::<_, String>(0))
-                    .optional()
-                    .map_err(map_err)
+                conn.query_row(&sql, rusqlite::params![id, expected_kind], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(map_err)
             }
         }
     }

@@ -15,7 +15,6 @@ import { ActivatedRoute, Router } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
 import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
 import type {
-  ChatTurn,
   DashboardDetail,
   ResolvedTile,
   SourceRef,
@@ -34,12 +33,9 @@ import {
   TilePaletteService,
   type TileChoice,
 } from "../../../services/tile-palette.service";
-import { DashboardTileComponent } from "../dashboard-tile/dashboard-tile.component";
+import { DashboardComposeComponent } from "../dashboard-compose/dashboard-compose.component";
 import { DashboardReadComponent } from "../dashboard-read/dashboard-read.component";
-import {
-  projectDashboard,
-  type DashboardLens,
-} from "../dashboard-projection";
+import { projectDashboard, type DashboardLens } from "../dashboard-projection";
 
 interface BoardTurn {
   id: number;
@@ -48,7 +44,6 @@ interface BoardTurn {
   retry?: string;
 }
 
-const HISTORY_TURNS = 12;
 const SUGGESTIONS = [
   "What needs attention?",
   "Which commitments are still open?",
@@ -70,7 +65,7 @@ const LENSES: readonly { id: DashboardLens; label: string }[] = [
     MurEmptyStateComponent,
     MurIconComponent,
     MurSpinnerComponent,
-    DashboardTileComponent,
+    DashboardComposeComponent,
     DashboardReadComponent,
     MarkdownComponent,
   ],
@@ -89,8 +84,8 @@ export class DashboardViewComponent {
   private removePrivacyInvalidator: (() => void) | null = null;
 
   constructor() {
-    this.removePrivacyInvalidator = this.privacyBarrier.registerInvalidator(() =>
-      this.invalidateAndRefresh(),
+    this.removePrivacyInvalidator = this.privacyBarrier.registerInvalidator(
+      () => this.invalidateAndRefresh(),
     );
     void this.privacyBarrier.ensureReady();
     inject(DestroyRef).onDestroy(() => {
@@ -107,7 +102,8 @@ export class DashboardViewComponent {
   readonly boardUnavailable = signal(false);
   readonly privacyReady = this.privacyBarrier.ready;
   readonly privacyError = this.privacyBarrier.error;
-  readonly error = this.service.error;
+  private readonly mutationError = signal<string | null>(null);
+  readonly error = computed(() => this.mutationError() ?? this.service.error());
   readonly paletteOpen = this.palette.open;
   readonly mode = signal<"read" | "compose">("read");
   readonly lens = signal<DashboardLens>("brief");
@@ -154,35 +150,44 @@ export class DashboardViewComponent {
 
   readonly renaming = signal(false);
   readonly renameDraft = signal("");
-  private readonly renameField = viewChild<ElementRef<HTMLInputElement>>("renameField");
+  private readonly renameField =
+    viewChild<ElementRef<HTMLInputElement>>("renameField");
   private readonly _focusRename = effect(() => {
     this.renameField()?.nativeElement.select();
   });
 
-  readonly draggingId = signal<string | null>(null);
-  readonly dropTargetId = signal<string | null>(null);
+  readonly composeBusy = signal(false);
 
   readonly turns = signal<BoardTurn[]>([]);
   readonly asking = signal(false);
   readonly draft = signal("");
-  readonly sourceCount = signal(0);
+  readonly sourceCount = computed(
+    () => this.projection().readableMaterialCount,
+  );
   readonly askOpen = signal(false);
   readonly suggestions = SUGGESTIONS;
   private askToken = 0;
+  private readonly conversationId = signal<string | null>(null);
   private nextTurnId = 1;
   private refreshToken = 0;
+  private answerRefreshToken = 0;
+  readonly answerRefreshingTileId = signal<string | null>(null);
   private folderVisibilityStamp: string | null = null;
 
   private readonly _resetOnBoardChange = effect(() => {
     this.id();
     untracked(() => {
       this.askToken += 1;
+      this.answerRefreshToken += 1;
+      this.answerRefreshingTileId.set(null);
+      this.conversationId.set(null);
       this.turns.set([]);
       this.draft.set("");
       this.asking.set(false);
       this.askOpen.set(false);
       this.mode.set("read");
       this.lens.set("brief");
+      this.composeBusy.set(false);
     });
   });
 
@@ -200,7 +205,6 @@ export class DashboardViewComponent {
         // become admissible after the barrier has moved to error.
         this.refreshToken += 1;
         this.board.set(null);
-        this.sourceCount.set(0);
         this.loading.set(privacyError === null);
         this.privacyRefreshing.set(privacyError === null);
         this.boardUnavailable.set(privacyError !== null);
@@ -225,6 +229,9 @@ export class DashboardViewComponent {
 
   private invalidateAndRefresh(): void {
     this.askToken += 1;
+    this.answerRefreshToken += 1;
+    this.answerRefreshingTileId.set(null);
+    this.conversationId.set(null);
     this.refreshToken += 1;
     this.turns.set([]);
     this.draft.set("");
@@ -234,10 +241,9 @@ export class DashboardViewComponent {
     this.renameDraft.set("");
     this.mode.set("read");
     this.lens.set("brief");
-    this.sourceCount.set(0);
+    this.composeBusy.set(false);
     this.board.set(null);
     this.orderOverride.set(null);
-    this.onDragEnd();
     if (this.palette.open()) this.palette.dismiss();
     const id = this.id();
     if (id && this.privacyReady()) {
@@ -260,7 +266,9 @@ export class DashboardViewComponent {
     const values: string[] = [];
     const visit = (items: typeof nodes): void => {
       for (const node of items) {
-        values.push(`${node.id}:${node.locked ? 1 : 0}:${node.unlocked ? 1 : 0}`);
+        values.push(
+          `${node.id}:${node.locked ? 1 : 0}:${node.unlocked ? 1 : 0}`,
+        );
         visit((node.children ?? []) as typeof nodes);
       }
     };
@@ -275,10 +283,7 @@ export class DashboardViewComponent {
     this.privacyRefreshing.set(true);
     this.loading.set(true);
     try {
-      const [detail, sources] = await Promise.all([
-        this.ipc.getDashboard(id),
-        this.ipc.getDashboardSources(id),
-      ]);
+      const detail = await this.ipc.getDashboard(id);
       if (
         token !== this.refreshToken ||
         this.id() !== id ||
@@ -287,12 +292,10 @@ export class DashboardViewComponent {
         return;
       }
       if (detail === null) {
-        this.sourceCount.set(0);
         this.boardUnavailable.set(true);
         return;
       }
       this.board.set(detail);
-      this.sourceCount.set(sources.length);
       this.boardUnavailable.set(false);
     } catch {
       if (
@@ -303,7 +306,6 @@ export class DashboardViewComponent {
         return;
       }
       this.board.set(null);
-      this.sourceCount.set(0);
       this.boardUnavailable.set(true);
     } finally {
       if (
@@ -368,15 +370,15 @@ export class DashboardViewComponent {
   }
 
   leaveCompose(): void {
-    this.draggingId.set(null);
-    this.dropTargetId.set(null);
     this.mode.set("read");
   }
 
   startRename(): void {
     const board = this.board();
     if (!board) return;
-    this.renameDraft.set(board.emoji ? `${board.emoji} ${board.title}` : board.title);
+    this.renameDraft.set(
+      board.emoji ? `${board.emoji} ${board.title}` : board.title,
+    );
     this.renaming.set(true);
   }
 
@@ -394,58 +396,73 @@ export class DashboardViewComponent {
     if (!typed || !board) return;
     this.renaming.set(false);
     const { emoji, title } = splitLeadingEmoji(typed);
-    if (title === board.title && (emoji ?? null) === (board.emoji ?? null)) return;
+    if (title === board.title && (emoji ?? null) === (board.emoji ?? null))
+      return;
+    this.resetAskContext();
     await this.service.update(board.id, { title, emoji: emoji ?? "" });
     await this.refresh(board.id);
   }
 
-  onDragStart(tile: ResolvedTile, event: DragEvent): void {
-    if (this.mode() !== "compose") return;
-    this.draggingId.set(tile.id);
-    event.dataTransfer?.setData("text/plain", tile.id);
-    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
-  }
-
-  onDragOver(tile: ResolvedTile, event: DragEvent): void {
-    if (this.mode() !== "compose" || !this.draggingId()) return;
-    event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-    this.dropTargetId.set(tile.id);
-  }
-
-  onDragLeave(tile: ResolvedTile): void {
-    if (this.dropTargetId() === tile.id) this.dropTargetId.set(null);
-  }
-
-  onDragEnd(): void {
-    this.draggingId.set(null);
-    this.dropTargetId.set(null);
-  }
-
-  async onDrop(target: ResolvedTile, event: DragEvent): Promise<void> {
-    event.preventDefault();
-    const sourceId = this.draggingId();
-    this.onDragEnd();
-    if (!sourceId || sourceId === target.id) return;
-    await this.moveTo(sourceId, this.tiles().findIndex((tile) => tile.id === target.id));
-  }
-
   async moveTile(tile: ResolvedTile, delta: -1 | 1): Promise<void> {
-    const index = this.tiles().findIndex((candidate) => candidate.id === tile.id);
+    const index = this.tiles().findIndex(
+      (candidate) => candidate.id === tile.id,
+    );
     await this.moveTo(tile.id, index + delta);
+  }
+
+  async reorderTile(event: {
+    tileId: string;
+    targetId: string;
+  }): Promise<void> {
+    const destination = this.tiles().findIndex(
+      (tile) => tile.id === event.targetId,
+    );
+    await this.moveTo(event.tileId, destination);
   }
 
   private async moveTo(tileId: string, destination: number): Promise<void> {
     const ids = this.tiles().map((tile) => tile.id);
     const from = ids.indexOf(tileId);
-    if (from < 0 || destination < 0 || destination >= ids.length || from === destination) return;
+    if (
+      from < 0 ||
+      destination < 0 ||
+      destination >= ids.length ||
+      from === destination
+    )
+      return;
+    this.resetAskContext();
     ids.splice(destination, 0, ...ids.splice(from, 1));
+    const previous = this.tiles().map((tile) => tile.id);
+    const token = ++this.refreshToken;
     this.orderOverride.set(ids);
+    this.composeBusy.set(true);
+    this.mutationError.set(null);
     try {
-      await this.service.reorderTiles(this.id(), ids);
-      await this.refresh(this.id());
+      await this.ipc.reorderDashboardTiles(this.id(), ids);
+      if (token !== this.refreshToken || !this.privacyReady()) return;
+      // Keep the optimistic canonical order mounted so keyboard focus and the
+      // compact list never disappear during a slow persistence round trip.
+      this.board.update((board) =>
+        board
+          ? {
+              ...board,
+              tiles: ids
+                .map((id) => board.tiles.find((tile) => tile.id === id))
+                .filter((tile): tile is ResolvedTile => tile !== undefined),
+            }
+          : board,
+      );
+    } catch {
+      if (token !== this.refreshToken || !this.privacyReady()) return;
+      this.orderOverride.set(previous);
+      this.mutationError.set(
+        "Couldn’t save the new board order. The previous order was restored.",
+      );
     } finally {
-      this.orderOverride.set(null);
+      if (token === this.refreshToken) {
+        this.orderOverride.set(null);
+        this.composeBusy.set(false);
+      }
     }
   }
 
@@ -456,12 +473,13 @@ export class DashboardViewComponent {
   async openPalette(event?: Event): Promise<void> {
     if (!this.privacyReady()) return;
     const explicit = event?.currentTarget;
-    const invoker = explicit instanceof HTMLElement
-      ? explicit
-      : document.activeElement instanceof HTMLElement &&
-          document.activeElement !== document.body
-        ? document.activeElement
-        : null;
+    const invoker =
+      explicit instanceof HTMLElement
+        ? explicit
+        : document.activeElement instanceof HTMLElement &&
+            document.activeElement !== document.body
+          ? document.activeElement
+          : null;
     const choice = await this.palette.request();
     if (choice) await this.addTile(choice);
     if (invoker?.isConnected) invoker.focus();
@@ -474,6 +492,7 @@ export class DashboardViewComponent {
 
   async addTile(choice: TileChoice): Promise<void> {
     if (!this.privacyReady()) return;
+    this.resetAskContext();
     await this.service.addTile(this.id(), choice.kind, {
       refId: choice.refId,
       title: choice.title,
@@ -483,21 +502,34 @@ export class DashboardViewComponent {
   }
 
   async removeTile(tile: ResolvedTile): Promise<void> {
-    if (!this.privacyReady()) return;
-    await this.service.removeTile(tile.id);
-    await this.refresh(this.id());
-  }
-
-  async widen(tile: ResolvedTile): Promise<void> {
-    if (!this.privacyReady()) return;
-    await this.service.updateTile(tile.id, { span: Math.min(12, tile.span + 1) });
-    await this.refresh(this.id());
-  }
-
-  async narrow(tile: ResolvedTile): Promise<void> {
-    if (!this.privacyReady()) return;
-    await this.service.updateTile(tile.id, { span: Math.max(3, tile.span - 1) });
-    await this.refresh(this.id());
+    if (!this.privacyReady() || this.composeBusy()) return;
+    const before = this.board();
+    if (!before) return;
+    this.resetAskContext();
+    const token = ++this.refreshToken;
+    this.composeBusy.set(true);
+    this.mutationError.set(null);
+    this.board.set({
+      ...before,
+      tiles: before.tiles.filter((candidate) => candidate.id !== tile.id),
+    });
+    try {
+      const removed = await this.ipc.deleteDashboardTile(tile.id);
+      if (!removed) throw new Error("Tile was not removed");
+    } catch {
+      if (
+        token === this.refreshToken &&
+        this.id() === before.id &&
+        this.privacyReady()
+      ) {
+        this.board.set(before);
+        this.mutationError.set(
+          "Couldn’t remove this board item. It was restored.",
+        );
+      }
+    } finally {
+      if (token === this.refreshToken) this.composeBusy.set(false);
+    }
   }
 
   openSource(source: SourceRef): void {
@@ -510,6 +542,94 @@ export class DashboardViewComponent {
         break;
       default:
         void this.router.navigate(["/brain"]);
+    }
+  }
+
+  async refreshLivingAnswer(answer: {
+    tileId: string;
+    question: string;
+  }): Promise<void> {
+    const board = this.board();
+    const question = answer.question.trim();
+    const tile = board?.tiles.find(
+      (candidate) => candidate.id === answer.tileId,
+    );
+    if (
+      !board ||
+      !this.privacyReady() ||
+      this.answerRefreshingTileId() !== null ||
+      !question ||
+      tile?.data.kind !== "livingAnswer" ||
+      tile.data.withheld ||
+      tile.data.question.trim() !== question
+    ) {
+      return;
+    }
+
+    this.resetAskContext();
+    const boardId = board.id;
+    const refreshWitness = this.refreshToken;
+    const token = ++this.answerRefreshToken;
+    const owns = (): boolean =>
+      token === this.answerRefreshToken &&
+      refreshWitness === this.refreshToken &&
+      this.id() === boardId &&
+      this.privacyReady();
+    this.answerRefreshingTileId.set(tile.id);
+    this.mutationError.set(null);
+
+    try {
+      const refreshed = await this.ipc.refreshDashboardAnswer(
+        boardId,
+        tile.id,
+        question,
+      );
+      if (!owns()) return;
+      if (
+        refreshed.kind !== "livingAnswer" ||
+        refreshed.withheld ||
+        refreshed.question.trim() !== question ||
+        !refreshed.answer?.trim()
+      ) {
+        throw new Error("The refreshed answer was not readable.");
+      }
+
+      const current = this.board()?.tiles.find(
+        (candidate) => candidate.id === tile.id,
+      );
+      if (
+        current?.data.kind !== "livingAnswer" ||
+        current.data.withheld ||
+        current.data.question.trim() !== question
+      ) {
+        return;
+      }
+      this.board.update((detail) =>
+        detail?.id === boardId
+          ? {
+              ...detail,
+              tiles: detail.tiles.map((candidate) =>
+                candidate.id === tile.id
+                  ? { ...candidate, data: refreshed }
+                  : candidate,
+              ),
+            }
+          : detail,
+      );
+
+      const latest = await this.ipc.getDashboard(boardId);
+      if (!owns()) return;
+      if (latest === null) {
+        throw new Error("The refreshed board is no longer available.");
+      }
+      this.board.set(latest);
+    } catch (error) {
+      if (!owns()) return;
+      this.mutationError.set(this.errors.humanize(error, "generic"));
+    } finally {
+      if (token === this.answerRefreshToken) {
+        this.answerRefreshingTileId.set(null);
+      }
     }
   }
 
@@ -535,6 +655,7 @@ export class DashboardViewComponent {
     if (!this.privacyReady()) return;
     const question = this.draft().trim();
     if (!question || this.asking()) return;
+    const conversationId = this.conversationId() ?? undefined;
     this.draft.set("");
     this.turns.update((turns) => [
       ...turns,
@@ -546,37 +667,24 @@ export class DashboardViewComponent {
     const current = () => this.askToken === token;
     const owns = () => current() && this.id() === boardId;
     try {
-      const sources = await this.ipc.getDashboardSources(boardId);
-      if (!owns()) return;
-      this.sourceCount.set(sources.length);
-      if (sources.length === 0 && this.tiles().length === 0) {
-        this.turns.update((turns) => [
-          ...turns,
-          {
-            id: this.nextTurnId++,
-            role: "assistant",
-            text: "This board has no readable sources yet — add a note, recording or document, or unlock a sealed source, and ask again.",
-          },
-        ]);
-        return;
-      }
-      const result = await this.ipc.askVault(
+      const result = await this.ipc.askVaultPersisted(
+        { kind: "vault" },
         question,
-        this.askHistory(),
+        conversationId,
         undefined,
-        sources,
         undefined,
         boardId,
       );
       if (!owns()) return;
+      this.conversationId.set(result.conversationId ?? null);
       this.turns.update((turns) => [
         ...turns,
         { id: this.nextTurnId++, role: "assistant", text: result.answer },
       ]);
     } catch (error) {
       if (!owns()) return;
-      this.turns.update((turns) => [
-        ...turns,
+      this.conversationId.set(null);
+      this.turns.set([
         {
           id: this.nextTurnId++,
           role: "error",
@@ -589,21 +697,22 @@ export class DashboardViewComponent {
     }
   }
 
-  private askHistory(): ChatTurn[] {
-    return this.turns()
-      .filter((turn) => turn.role !== "error")
-      .slice(-HISTORY_TURNS)
-      .map((turn) => ({
-        role: turn.role as "user" | "assistant",
-        content: turn.text,
-      }));
+  private resetAskContext(): void {
+    this.askToken += 1;
+    this.answerRefreshToken += 1;
+    this.answerRefreshingTileId.set(null);
+    this.conversationId.set(null);
+    this.turns.set([]);
+    this.draft.set("");
+    this.asking.set(false);
   }
 
   retry(turn: BoardTurn): void {
     if (!turn.retry) return;
-    this.turns.update((turns) => turns.filter((candidate) => candidate.id !== turn.id));
+    this.turns.update((turns) =>
+      turns.filter((candidate) => candidate.id !== turn.id),
+    );
     this.draft.set(turn.retry);
     void this.ask();
   }
-
 }

@@ -82,8 +82,7 @@ export interface AppInfo {
 }
 
 export type Availability =
-  | { Available: true }
-  | { Unavailable: { reason: string } };
+  { Available: true } | { Unavailable: { reason: string } };
 
 export interface ProviderStatus {
   id: string;
@@ -651,11 +650,7 @@ export interface WhisperRecommendationDto {
  * Mirrors the Rust `LiveCaptions::dto_state`.
  */
 export type LiveCaptionsState =
-  | ""
-  | "ready"
-  | "noModel"
-  | "modelMissing"
-  | "pinnedHeavy";
+  "" | "ready" | "noModel" | "modelMissing" | "pinnedHeavy";
 
 /**
  * What a `download_model` call ended up doing. A user-initiated CANCEL is a
@@ -1023,12 +1018,7 @@ export interface StopResult {
 }
 
 export type MeetingStatus =
-  | "DRAFT"
-  | "RECORDING"
-  | "TRANSCRIBED"
-  | "SUMMARIZED"
-  | "EXPORTED"
-  | "ERROR";
+  "DRAFT" | "RECORDING" | "TRANSCRIBED" | "SUMMARIZED" | "EXPORTED" | "ERROR";
 
 export interface Meeting {
   id: string;
@@ -1421,11 +1411,7 @@ export interface BriefProposedPayload {
 
 /** Vault Audit — the deterministic hygiene-pass kinds. */
 export type AuditFindingKind =
-  | "broken_link"
-  | "orphan"
-  | "stale"
-  | "contradiction"
-  | "unlinked_mention";
+  "broken_link" | "orphan" | "stale" | "contradiction" | "unlinked_mention";
 
 /**
  * Vault Audit — one run's summary (`run_vault_audit` / the audit-updated
@@ -1507,8 +1493,7 @@ export interface ChatTurn {
 
 /** Exact durable Ask-history namespace. Org and dashboard Ask stay stateless. */
 export type AskConversationScope =
-  | { kind: "vault" }
-  | { kind: "note" | "meeting"; refId: string };
+  { kind: "vault" } | { kind: "note" | "meeting"; refId: string };
 
 /** One bounded, newest-first row in the durable Ask-history browser. */
 export interface AskConversationSummary {
@@ -1537,6 +1522,8 @@ export interface AskConversation {
   scope: AskConversationScope;
   title: string;
   selectedSources: SourceRef[];
+  /** Live-resolved composite scope; null when absent, deleted or not readable. */
+  dashboard?: DashboardScopeRef | null;
   messages: AskConversationMessage[];
   createdAt: string;
   updatedAt: string;
@@ -1795,6 +1782,20 @@ export interface SourceRef {
   kind: LinkKind;
   id: string;
   title?: string;
+}
+
+/**
+ * Metadata-only identity of the ONE user-composed dashboard that scopes an Ask.
+ *
+ * This deliberately is not a {@link SourceRef}: a dashboard is a composite over
+ * live, backend-gated material and derived views, never a fourth `LinkKind`.
+ * `title` and `emoji` are display metadata resolved live by the backend on
+ * history load; only `id` is authoritative and persisted.
+ */
+export interface DashboardScopeRef {
+  id: string;
+  title: string;
+  emoji: string | null;
 }
 
 /**
@@ -3249,12 +3250,7 @@ export function parseViewConfig(config: string): ViewConfig {
 
 /** Cosmetic accent key; the FE maps it to a design token, never a raw colour. */
 export type DashboardTint =
-  | "indigo"
-  | "amber"
-  | "mint"
-  | "orchid"
-  | "azure"
-  | "coral";
+  "indigo" | "amber" | "mint" | "orchid" | "azure" | "coral";
 
 /** Every tile kind the backend can store AND resolve. */
 export type TileKind =
@@ -3382,6 +3378,9 @@ export type TileData =
       /** True when a cached answer is being withheld because a source is sealed. */
       withheld: boolean;
     };
+
+/** The only tile payload the backend-owned Living Answer refresh may return. */
+export type LivingAnswerTileData = Extract<TileData, { kind: "livingAnswer" }>;
 
 /** A tile plus its resolved (already gated) payload. */
 export interface ResolvedTile extends DashboardTile {

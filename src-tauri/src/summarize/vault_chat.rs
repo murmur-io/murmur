@@ -57,6 +57,32 @@ Never output YAML or front-matter.\n\n\
     (system, render_conversation(history, question))
 }
 
+/// Board-scoped variant for a mixed user-composed corpus. The grounding may contain notes,
+/// recordings, imported documents, capped linked context, and rendered derived views, so the
+/// meeting-notes-only persona would describe its provenance falsely.
+pub fn build_for_dashboard(corpus: &str, history: &[ChatTurn], question: &str) -> (String, String) {
+    let system = format!(
+        "You answer questions about ONE USER-COMPOSED DASHBOARD, using ONLY the readable grounding \
+material provided below. The dashboard can contain meeting recordings, authored notes, imported \
+documents, capped active linked context, and derived views already computed by Murmur.\n\
+Rules:\n\
+- Treat this as dashboard context and preserve its curated scope; never search or infer from the \
+rest of the vault.\n\
+- Answer strictly from the readable material and derived views below. If the answer is not there, \
+say you don't know. Never invent facts, decisions, or attributions.\n\
+- Cite named source material inline using its [[Title]] exactly as given when available.\n\
+- Do not claim that dashboard context is unavailable merely because some dashboard items are \
+sealed, missing, or omitted by the privacy gate.\n\
+- Be concise and concrete.\n\
+{coordinates}\n\
+- Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight bullets or \
+short `##` sections. Never output YAML or front-matter.\n\n\
+DASHBOARD GROUNDING:\n{corpus}",
+        coordinates = FACT_COORDINATE_RULES,
+    );
+    (system, render_conversation(history, question))
+}
+
 /// Render the optional USER MEMORY block. EMPTY brief ⇒ EMPTY string (byte-identical prompt); a
 /// present brief ⇒ a small labelled block terminated by a blank line so the following section header
 /// stays on its own line. Shared by the corpus floor ([`build`]) and the agentic persona
@@ -307,6 +333,29 @@ mod tests {
         assert!(s.contains("[[Sync]]"));
         assert!(u.contains("User: What shipped?"));
         assert!(u.trim_end().ends_with("Assistant:"));
+    }
+
+    #[test]
+    fn dashboard_prompt_describes_mixed_composite_provenance() {
+        let (system, user) = build_for_dashboard(
+            "### [[Plan]] · document\nbody\n\n- promises\n    · ship it",
+            &[],
+            "What is next?",
+        );
+        assert!(system.contains("USER-COMPOSED DASHBOARD"));
+        assert!(system.contains("derived views"));
+        assert!(system.contains("DASHBOARD GROUNDING"));
+        assert!(!system.contains("using ONLY the meeting notes"));
+        assert!(!system.contains("MEETING NOTES:"));
+        assert!(user.contains("User: What is next?"));
+    }
+
+    #[test]
+    fn dashboard_builder_does_not_change_non_dashboard_prompt() {
+        let normal = build("corpus", &[], "question", "");
+        assert!(normal.0.contains("PAST MEETINGS"));
+        assert!(normal.0.contains("MEETING NOTES:"));
+        assert!(!normal.0.contains("USER-COMPOSED DASHBOARD"));
     }
 
     /// RED-before-GREEN from the local Qwen bake-off: one negative budget status must not negate an

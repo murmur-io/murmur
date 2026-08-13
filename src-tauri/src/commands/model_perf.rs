@@ -156,12 +156,21 @@ pub fn brain_posture(state: State<'_, AppState>) -> Result<crate::settings::Post
 pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<(), AppError> {
     let p = crate::settings::Posture::from_settable(&posture)
         .ok_or_else(|| AppError::InvalidArg(format!("not a settable posture: {posture}")))?;
+    // A posture can change the Ask connection and therefore its dashboard packing budget. Keep
+    // the same lifecycle -> config -> DB order as save_config so an in-flight witness observes
+    // either the complete old posture or the complete new one.
+    let _lifecycle = super::lifecycle_guard(state.inner());
     let mut c = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    crate::settings::postures::apply_posture(&mut c, p);
-    c.save(&state.db)?;
+    let mut new_config = c.clone();
+    crate::settings::postures::apply_posture(&mut new_config, p);
+    if super::ask_dispatch_projection(&c) != super::ask_dispatch_projection(&new_config) {
+        state.db.advance_ask_dispatch_generation()?;
+    }
+    new_config.save(&state.db)?;
+    *c = new_config;
     Ok(())
 }
 
@@ -235,21 +244,27 @@ pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Resul
 pub(crate) fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), AppError> {
     let model = crate::reason::brain_model_by_id(&model_id)
         .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
+    let _lifecycle = super::lifecycle_guard(state);
     let mut c = state
         .config
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    let mut next = c.clone();
     // Keep the legacy single-model id (BrainBackend::Local + custom-path fallback) …
-    c.brain_model_id = Some(model_id.clone());
+    next.brain_model_id = Some(model_id.clone());
     // … AND wire the CLASS handle so the Brain-Live `light()` / Fully-Local `heavy()` handles actually
     // use what the user just selected. Without this, selecting a light model leaves `light()` pointing
     // at the registry DEFAULT (a different, un-downloaded GGUF) → it silently resolves to the stub and
     // Realtime Reactions never fire despite Brain Live being "on".
     match model.class {
-        crate::reason::ModelClass::Light => c.brain_light_model_id = Some(model_id),
-        crate::reason::ModelClass::Heavy => c.brain_heavy_model_id = Some(model_id),
+        crate::reason::ModelClass::Light => next.brain_light_model_id = Some(model_id),
+        crate::reason::ModelClass::Heavy => next.brain_heavy_model_id = Some(model_id),
     }
-    c.save(&state.db)?;
+    if super::ask_dispatch_projection(&c) != super::ask_dispatch_projection(&next) {
+        state.db.advance_ask_dispatch_generation()?;
+    }
+    next.save(&state.db)?;
+    *c = next;
     Ok(())
 }
 
@@ -350,6 +365,7 @@ pub(crate) fn select_embed_model_inner(
     let model = crate::embed::embed_model_by_id(&model_id)
         .ok_or_else(|| AppError::InvalidArg(format!("unknown embed model id: {model_id}")))?;
 
+    let _lifecycle = super::lifecycle_guard(state);
     let reindex_needed = crate::embed::with_embed_selection_update(|| {
         let mut c = state
             .config
@@ -372,9 +388,13 @@ pub(crate) fn select_embed_model_inner(
         // all old-model vector partitions with the setting write; chunks/FTS remain available.
         let mut candidate = c.clone();
         candidate.embed_model_id = Some(model.id.to_string());
-        state
-            .db
-            .set_embed_model_selection(model.id, reindex_needed)?;
+        if reindex_needed {
+            state
+                .db
+                .set_embed_model_selection_for_ask(model.id, true)?;
+        } else {
+            state.db.set_embed_model_selection(model.id, false)?;
+        }
         let selected_id = candidate.embed_model_id.clone();
         *c = candidate;
         Ok((reindex_needed, selected_id))

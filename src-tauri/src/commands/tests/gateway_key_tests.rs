@@ -3,7 +3,7 @@ use super::*;
 /// `set_gateway_key("")` must return `InvalidArg`, not silently succeed.
 #[test]
 fn set_gateway_key_empty_is_invalid_arg() {
-    let err = set_gateway_key(String::new()).unwrap_err();
+    let err = validate_gateway_key("").unwrap_err();
     assert!(
         matches!(err, AppError::InvalidArg(_)),
         "empty gateway key must be InvalidArg, got: {err:?}"
@@ -13,7 +13,7 @@ fn set_gateway_key_empty_is_invalid_arg() {
 /// `set_gateway_key("   ")` (whitespace-only) is also invalid.
 #[test]
 fn set_gateway_key_whitespace_is_invalid_arg() {
-    let err = set_gateway_key("   ".to_string()).unwrap_err();
+    let err = validate_gateway_key("   ").unwrap_err();
     assert!(
         matches!(err, AppError::InvalidArg(_)),
         "whitespace-only gateway key must be InvalidArg"
