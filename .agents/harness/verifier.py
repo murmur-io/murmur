@@ -62,6 +62,31 @@ ALLOWED_PROBES = {
 MAX_PROBE_EXECUTIONS_PER_ID = 2
 DEFAULT_REVIEW_STREAM_BYTES = 2_048
 NPM_LOCK_REVIEW_STREAM_BYTES = 65_536
+PROTOCOL_SERVER_FACTS_PREFIX = "MURMUR_HARNESS_PROTOCOL_SERVER_FACTS="
+PROTOCOL_SERVER_CHECK_MARKER = "protocol_server_check.py"
+PROTOCOL_SERVER_FACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "revision",
+        "head",
+        "head_tree",
+        "detached",
+        "clean",
+        "checkout_mode",
+        "git_metadata_mode",
+        "git_dir",
+        "git_common_dir",
+        "git_metadata_sha256",
+        "head_manifest_sha256",
+        "index_manifest_sha256",
+        "worktree_manifest_sha256",
+        "checkout_snapshot_sha256",
+        "tracked_entry_count",
+        "metadata_entry_count",
+        "pre_exec_rechecks",
+        "facts_sha256",
+    }
+)
 SPECIALIST_TEST_FOCUS_LINES_PER_TERM = 12
 SPECIALIST_TEST_FOCUS_BYTES = 32_768
 SPECIALIST_SOURCE_CONTEXT_BYTES = 32_768
@@ -1203,6 +1228,215 @@ def _bounded_stream_summary(
     return summary
 
 
+def server_checkout_facts_hash(facts: Mapping[str, Any]) -> str:
+    """Hash the canonical server-checkout statement, excluding its hash slot."""
+
+    return canonical_hash(
+        {key: value for key, value in facts.items() if key != "facts_sha256"}
+    )
+
+
+def _validated_server_checkout_facts(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != PROTOCOL_SERVER_FACT_KEYS:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts have a non-canonical shape"
+        )
+    facts = copy.deepcopy(dict(value))
+    if (
+        type(facts.get("schema_version")) is not int
+        or facts.get("schema_version") != 2
+    ):
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts schema changed"
+        )
+    revision = facts.get("revision")
+    head = facts.get("head")
+    head_tree = facts.get("head_tree")
+    if (
+        not isinstance(revision, str)
+        or runtime.SHA1_RE.fullmatch(revision) is None
+        or not isinstance(head, str)
+        or runtime.SHA1_RE.fullmatch(head) is None
+        or head != revision
+        or not isinstance(head_tree, str)
+        or runtime.SHA1_RE.fullmatch(head_tree) is None
+    ):
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts do not prove the exact revision"
+        )
+    if facts.get("detached") is not True:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts do not prove detached HEAD"
+        )
+    if facts.get("clean") is not True:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts do not prove a clean checkout"
+        )
+    if facts.get("checkout_mode") not in {
+        "local-shared-clone",
+        "local-isolated-clone",
+    }:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout mode is not isolated"
+        )
+    if (
+        facts.get("git_metadata_mode") != "isolated"
+        or facts.get("git_dir") != ".git"
+        or facts.get("git_common_dir") != ".git"
+        or not isinstance(facts.get("git_metadata_sha256"), str)
+        or runtime.SHA256_RE.fullmatch(facts["git_metadata_sha256"]) is None
+    ):
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts do not prove isolated Git metadata"
+        )
+    digest_keys = (
+        "head_manifest_sha256",
+        "index_manifest_sha256",
+        "worktree_manifest_sha256",
+        "checkout_snapshot_sha256",
+    )
+    if any(
+        not isinstance(facts.get(key), str)
+        or runtime.SHA256_RE.fullmatch(facts[key]) is None
+        for key in digest_keys
+    ):
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout manifests are malformed"
+        )
+    if facts["head_manifest_sha256"] != facts["index_manifest_sha256"]:
+        raise runtime.HarnessError(
+            "v2 protocol-server index differs from the pinned tree"
+        )
+    if (
+        type(facts.get("tracked_entry_count")) is not int
+        or facts["tracked_entry_count"] <= 0
+        or type(facts.get("metadata_entry_count")) is not int
+        or facts["metadata_entry_count"] <= 0
+        or type(facts.get("pre_exec_rechecks")) is not int
+        or facts["pre_exec_rechecks"] != 1
+    ):
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout snapshot counts are malformed"
+        )
+    snapshot_values = {
+        "revision": facts["revision"],
+        "head_tree": facts["head_tree"],
+        "checkout_mode": facts["checkout_mode"],
+        "git_metadata_sha256": facts["git_metadata_sha256"],
+        "head_manifest_sha256": facts["head_manifest_sha256"],
+        "index_manifest_sha256": facts["index_manifest_sha256"],
+        "worktree_manifest_sha256": facts["worktree_manifest_sha256"],
+        "tracked_entry_count": facts["tracked_entry_count"],
+        "metadata_entry_count": facts["metadata_entry_count"],
+    }
+    if facts["checkout_snapshot_sha256"] != canonical_hash(snapshot_values):
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout snapshot hash changed"
+        )
+    expected_hash = server_checkout_facts_hash(facts)
+    if facts.get("facts_sha256") != expected_hash:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts hash changed"
+        )
+    return facts
+
+
+def _protocol_server_facts_required(check_id: Any, command: Any) -> bool:
+    """Keep historical receipts reconstructable while hardening new attempts."""
+
+    return (
+        check_id == "protocol-server"
+        and isinstance(command, str)
+        and PROTOCOL_SERVER_CHECK_MARKER in command
+    )
+
+
+def _server_checkout_facts_from_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    task_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    raw_path = evidence.get("stdout_path")
+    expected_hash = evidence.get("stdout_sha256")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise runtime.HarnessError(
+            "v2 protocol-server stdout artifact is missing"
+        )
+    path = Path(raw_path)
+    if task_dir is not None:
+        try:
+            path.resolve(strict=True).relative_to(task_dir.resolve())
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise runtime.HarnessError(
+                "protocol-server checkout facts stdout is missing or outside the v2 task store"
+            ) from exc
+    try:
+        artifact = runtime.stable_single_link_bytes(
+            path,
+            label="v2 protocol-server stdout artifact",
+        )
+    except runtime.HarnessError as exc:
+        raise runtime.HarnessError(
+            "v2 protocol-server stdout artifact is not immutable"
+        ) from exc
+    if (
+        not isinstance(expected_hash, str)
+        or runtime.SHA256_RE.fullmatch(expected_hash) is None
+        or runtime.sha256_bytes(artifact) != expected_hash
+    ):
+        raise runtime.HarnessError(
+            "v2 protocol-server stdout artifact is not immutable"
+        )
+    first_line_bytes = artifact.split(b"\n", 1)[0].rstrip(b"\r")
+    if len(first_line_bytes) > 65_536:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts line exceeds its byte bound"
+        )
+    try:
+        first_line = first_line_bytes.decode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts stdout is unreadable"
+        ) from exc
+    if not first_line.startswith(PROTOCOL_SERVER_FACTS_PREFIX):
+        raise runtime.HarnessError(
+            "v2 protocol-server stdout lacks runner-owned checkout facts"
+        )
+    try:
+        value = json.loads(first_line.removeprefix(PROTOCOL_SERVER_FACTS_PREFIX))
+    except json.JSONDecodeError as exc:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts are not canonical JSON"
+        ) from exc
+    facts = _validated_server_checkout_facts(value)
+    canonical_line = PROTOCOL_SERVER_FACTS_PREFIX + runtime.canonical_json(
+        facts
+    ).decode("utf-8")
+    if first_line != canonical_line:
+        raise runtime.HarnessError(
+            "v2 protocol-server checkout facts line is not canonical"
+        )
+    return facts
+
+
+def _server_checkout_record_facts(
+    item: Mapping[str, Any], task_dir: Path
+) -> Dict[str, Any]:
+    evidence = item.get("evidence", item)
+    if not isinstance(evidence, Mapping):
+        raise runtime.HarnessError(
+            "v2 protocol-server check evidence is malformed"
+        )
+    facts = _server_checkout_facts_from_evidence(
+        evidence, task_dir=task_dir
+    )
+    if item.get("server_checkout") != facts:
+        raise runtime.HarnessError(
+            "v2 protocol-server record checkout facts differ from stdout"
+        )
+    return facts
+
+
 def _review_evidence_summary(
     item: Mapping[str, Any],
     task_dir: Path,
@@ -1214,6 +1448,7 @@ def _review_evidence_summary(
     if not isinstance(evidence, Mapping):
         raise runtime.HarnessError("v2 review check evidence is malformed")
     check_id = item.get("id")
+    command = item.get("command", evidence.get("command"))
     if channel not in {"planned-check", "reviewer-probe"}:
         raise runtime.HarnessError(
             f"invalid review evidence channel: {channel}"
@@ -1246,10 +1481,10 @@ def _review_evidence_summary(
                 )
             }
         )
-    return {
+    summary = {
         "id": check_id,
         "source": channel,
-        "command": item.get("command", evidence.get("command")),
+        "command": command,
         "passed": evidence.get("passed"),
         "outcome": evidence.get("outcome"),
         "exit_code": evidence.get("exit_code"),
@@ -1273,6 +1508,11 @@ def _review_evidence_summary(
         ),
         "request_contexts": request_contexts,
     }
+    if _protocol_server_facts_required(check_id, command):
+        summary["server_checkout"] = _server_checkout_record_facts(
+            item, task_dir
+        )
+    return summary
 
 
 def _bounded_source_excerpt(source: bytes, limit: int) -> Tuple[bytes, bool]:
@@ -1707,6 +1947,90 @@ NONBLOCKING_PROOF_GAP_REVIEW_CLOSING = (
 )
 
 
+def _review_server_checkout_attestation(
+    worktree: Path,
+    task_dir: Path,
+    summaries: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Bind protocol-check stdout facts to the runner's fixed runtime record."""
+
+    observed = [
+        summary.get("server_checkout")
+        for summary in summaries
+        if summary.get("id") == "protocol-server"
+        and "server_checkout" in summary
+    ]
+    if not observed:
+        return None
+    facts = _validated_server_checkout_facts(observed[0])
+    if any(_validated_server_checkout_facts(item) != facts for item in observed[1:]):
+        raise runtime.HarnessError(
+            "v2 protocol-server check/probe checkout facts disagree"
+        )
+
+    runtime_path = task_dir / "runtime.json"
+    try:
+        runtime_bytes = runtime.stable_single_link_bytes(
+            runtime_path,
+            label="v2 protocol-server runner runtime record",
+            max_bytes=1024 * 1024,
+        )
+        runtime_doc = json.loads(runtime_bytes.decode("utf-8", "strict"))
+    except (runtime.HarnessError, UnicodeError, json.JSONDecodeError) as exc:
+        raise runtime.HarnessError(
+            "v2 protocol-server runner runtime record is unsafe"
+        ) from exc
+    if not isinstance(runtime_doc, dict):
+        raise runtime.HarnessError(
+            "v2 protocol-server runner runtime record is unsafe"
+        )
+    expected_server = worktree.resolve().parent / "murmur-server"
+    raw_server = runtime_doc.get("server_worktree")
+    if not isinstance(raw_server, str) or not raw_server:
+        raise runtime.HarnessError(
+            "v2 protocol-server runner runtime path is missing"
+        )
+    if not Path(raw_server).is_absolute() or Path(raw_server) != expected_server:
+        raise runtime.HarnessError(
+            "v2 protocol-server runner runtime path differs from the task sibling"
+        )
+    if runtime_doc.get("server_revision") != facts["revision"]:
+        raise runtime.HarnessError(
+            "v2 protocol-server runner revision differs from check evidence"
+        )
+    if runtime_doc.get("server_checkout_mode") != facts["checkout_mode"]:
+        raise runtime.HarnessError(
+            "v2 protocol-server runner checkout mode differs from check evidence"
+        )
+
+    pin_path = worktree / ".murmur-server-revision"
+    try:
+        pin = runtime.stable_single_link_bytes(
+            pin_path,
+            label="v2 protocol-server snapshot pin",
+            max_bytes=128,
+        ).decode("ascii", "strict").strip()
+    except (runtime.HarnessError, UnicodeError) as exc:
+        raise runtime.HarnessError(
+            "v2 protocol-server snapshot pin is unreadable"
+        ) from exc
+    if pin != facts["revision"]:
+        raise runtime.HarnessError(
+            "v2 protocol-server check evidence differs from the snapshot pin"
+        )
+
+    runtime_binding = {
+        "server_worktree": str(expected_server),
+        "server_revision": runtime_doc["server_revision"],
+        "server_checkout_mode": runtime_doc["server_checkout_mode"],
+    }
+    return {
+        **facts,
+        "server_worktree_role": "runner-owned-task-sibling",
+        "runtime_binding_sha256": canonical_hash(runtime_binding),
+    }
+
+
 def combined_review_prompt(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1754,6 +2078,19 @@ def combined_review_prompt(
         )
         for item in probes
     ]
+    server_checkout = _review_server_checkout_attestation(
+        worktree, task_dir, check_summary
+    )
+    server_section = (
+        "Pinned server checkout required: "
+        f"{'yes' if plan.get('server_required') else 'no'}\n"
+    )
+    if server_checkout is not None:
+        server_section += (
+            "Pinned server checkout facts (runner-owned and hash-bound): "
+            f"{json.dumps(server_checkout, sort_keys=True)}\n"
+        )
+    server_section += "\n"
     eligible_probes = allowed_probe_ids(plan)
     source_context = specialist_source_context(worktree, plan, kind)
     learnings = review_learnings_section(worktree, plan, kind)
@@ -1773,8 +2110,7 @@ def combined_review_prompt(
         f"{json.dumps(check_summary, sort_keys=True)}\n"
         f"{specialist_source_context_section(source_context)}"
         f"Context-eligible probe IDs: {json.dumps(eligible_probes)}\n"
-        "Pinned server checkout required: "
-        f"{'yes' if plan.get('server_required') else 'no'}\n\n"
+        f"{server_section}"
         "## Exact diff\n"
         f"{diff.decode('utf-8', 'replace')}\n\n"
         # Repo-authored text never occupies the final position: the harness's
@@ -1947,7 +2283,7 @@ def invoke_readonly_review(
 def check_record(
     check: Mapping[str, Any], plan: Mapping[str, Any], evidence: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    return {
+    record = {
         "schema_version": 2,
         **evidence_binding(plan),
         "id": check["id"],
@@ -1955,6 +2291,13 @@ def check_record(
         "evidence": dict(evidence),
         "created_at": runtime.utc_now(),
     }
+    if _protocol_server_facts_required(
+        check.get("id"), check.get("command")
+    ):
+        record["server_checkout"] = _server_checkout_facts_from_evidence(
+            evidence
+        )
+    return record
 
 
 def canonical_probe_request_contexts(
@@ -2309,6 +2652,20 @@ def validate_check_checkpoint(
         raise runtime.HarnessError("v2 check result id changed")
     if result.get("command") != declared.get("command"):
         raise runtime.HarnessError("v2 check result command changed")
+    if _protocol_server_facts_required(
+        declared.get("id"), declared.get("command")
+    ):
+        expected_server_checkout = _server_checkout_facts_from_evidence(
+            result, task_dir=task_dir
+        )
+        if record.get("server_checkout") != expected_server_checkout:
+            raise runtime.HarnessError(
+                "v2 protocol-server record checkout facts differ from stdout"
+            )
+    elif "server_checkout" in record:
+        raise runtime.HarnessError(
+            "v2 non-canonical check injected server checkout facts"
+        )
     expected_bound_environment = (
         {"MURMUR_HARNESS_BASE_SHA": str(plan["base_sha"])}
         if declared.get("id") == "npm-lock"
