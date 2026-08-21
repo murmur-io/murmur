@@ -1,6 +1,9 @@
 import { test, expect } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
+const OWNED_ORG_ID = "11111111-1111-4111-8111-111111111111";
+const SELECTED_ORG_ID = "22222222-2222-4222-8222-222222222222";
+
 /**
  * feat/org-share-visible — the remediation for "a member can't see a note a
  * colleague shared into their org". Two surfaces, driven against the extended
@@ -34,7 +37,7 @@ const ACCOUNT_STATUS = () => ({
 // Two orgs the user belongs to (drives both the Settings list AND the picker).
 const TWO_ORGS = () => [
   {
-    orgId: "org-owned",
+    orgId: "11111111-1111-4111-8111-111111111111",
     name: "Acme Inc.",
     role: "owner",
     memberCount: 3,
@@ -45,7 +48,7 @@ const TWO_ORGS = () => [
     pendingShares: 0,
   },
   {
-    orgId: "org-siema",
+    orgId: "22222222-2222-4222-8222-222222222222",
     name: "Siema",
     role: "member",
     memberCount: 4,
@@ -75,7 +78,7 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
       org_status: () => null,
       // One item shared INTO the "Siema" org — what a colleague published.
       list_org_items: (args: { orgId: string }) =>
-        args.orgId === "org-siema"
+        args.orgId === "22222222-2222-4222-8222-222222222222"
           ? [
               {
                 itemId: "it-42",
@@ -152,7 +155,7 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
       org_list_statuses: TWO_ORGS,
       // The share panel's gate section still reads the single-org status.
       org_status: () => ({
-        orgId: "org-owned",
+        orgId: "11111111-1111-4111-8111-111111111111",
         name: "Acme Inc.",
         role: "owner",
         memberCount: 3,
@@ -209,11 +212,23 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
     await expect(select.locator("option")).toHaveCount(2);
     await expect(select.locator("option").nth(0)).toHaveText("Acme Inc.");
     await expect(select.locator("option").nth(1)).toHaveText("Siema");
+    await expect(select).toHaveValue(OWNED_ORG_ID);
 
     // Choose "Siema" (org-siema) — the org the colleague couldn't see into.
-    await select.selectOption("org-siema");
+    await select.selectOption(SELECTED_ORG_ID);
     // The audience line reflects the chosen org.
     await expect(dialog.getByText("4 members of Siema")).toBeVisible();
+
+    // Permission is explicit and fail-closed: View only by default, with a
+    // bounded Can edit option that does not imply access management.
+    const viewOnly = dialog.getByRole("button", { name: /View only Members can/ });
+    const canEdit = dialog.getByRole("button", { name: /Can edit Members can/ });
+    await expect(viewOnly).toHaveAttribute("aria-pressed", "true");
+    await canEdit.click();
+    await expect(canEdit).toHaveAttribute("aria-pressed", "true");
+    await expect(
+      dialog.getByText(/Related link is private to its device and never grants access/),
+    ).toBeVisible();
 
     // Confirm the publish; the CHOSEN orgId must reach share_document_to_org.
     await dialog.getByRole("button", { name: "Add to Org Brain" }).click();
@@ -226,7 +241,9 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
               .__shareCalls,
         ),
       )
-      .toContainEqual(expect.objectContaining({ orgId: "org-siema" }));
+      .toContainEqual(
+        expect.objectContaining({ orgId: SELECTED_ORG_ID, access: "edit" }),
+      );
 
     await page.screenshot({
       path: "e2e/org/__screens__/org-share-picker.png",
@@ -253,7 +270,7 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
       org_status: () => null,
       org_list_statuses: () => [
         {
-          orgId: "org-invited",
+          orgId: "33333333-3333-4333-8333-333333333333",
           name: "Invited Co.",
           role: "member",
           memberCount: 6,

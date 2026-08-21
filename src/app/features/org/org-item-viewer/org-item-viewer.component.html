@@ -82,14 +82,14 @@
             <h1 class="oi-title">{{ it.title }}</h1>
           }
 
-          <!-- Edit-in-place + remove-from-org (author only; work on any of the author's machines). -->
-          @if (it.editable) {
+          <!-- Editing follows server-authoritative document access; management stays author/Owner-only. -->
+          @if (canEdit(it)) {
             <div class="oi-actions">
               @if (editing()) {
                 <button
                   type="button"
                   class="btn btn-ghost"
-                  [disabled]="saving()"
+                  [disabled]="saving() || openingLatest()"
                   (click)="cancelEdit()"
                 >
                   Cancel
@@ -97,7 +97,7 @@
                 <button
                   type="button"
                   class="btn btn-primary"
-                  [disabled]="saving()"
+                  [disabled]="saving() || openingLatest()"
                   (click)="saveEdit()"
                 >
                   {{ saving() ? "Saving…" : "Save" }}
@@ -128,13 +128,15 @@
                 >
                   Edit
                 </button>
-                <button
-                  type="button"
-                  class="btn btn-ghost oi-remove-btn"
-                  (click)="askRemove()"
-                >
-                  Remove
-                </button>
+                @if (canManage(it)) {
+                  <button
+                    type="button"
+                    class="btn btn-ghost oi-remove-btn"
+                    (click)="askRemove()"
+                  >
+                    Remove
+                  </button>
+                }
               }
             </div>
           } @else if (notEditableReason(); as reason) {
@@ -159,7 +161,58 @@
           <span class="oi-date">{{ formatDate(it.createdAt) }}</span>
           <span class="oi-meta-sep" aria-hidden="true">·</span>
           <span class="oi-rev">revision {{ it.rev }}</span>
+          <span class="oi-meta-sep" aria-hidden="true">·</span>
+          <span class="oi-access-label">{{ accessOf(it) === "edit" ? "Can edit" : "View only" }}</span>
         </div>
+        @if (canManage(it) && !editing()) {
+          <div class="oi-permissions" aria-label="Member access">
+            <span class="oi-permissions-label">Member access</span>
+            <div class="oi-access-options">
+              <button
+                type="button"
+                class="oi-access-option"
+                [class.is-selected]="accessOf(it) === 'view'"
+                [attr.aria-pressed]="accessOf(it) === 'view'"
+                [disabled]="changingAccess()"
+                (click)="setAccess('view')"
+              >View only</button>
+              <button
+                type="button"
+                class="oi-access-option"
+                [class.is-selected]="accessOf(it) === 'edit'"
+                [attr.aria-pressed]="accessOf(it) === 'edit'"
+                [disabled]="changingAccess()"
+                (click)="setAccess('edit')"
+              >Can edit</button>
+            </div>
+            <span class="oi-permissions-note">Related links stay private and never grant access.</span>
+          </div>
+        }
+        @if (editing() && editConflict()) {
+          <div
+            class="oi-edit-conflict"
+            role="alert"
+            data-testid="org-edit-conflict"
+          >
+            <div class="oi-edit-conflict-copy">
+              <strong>Shared note changed elsewhere</strong>
+              <span>Your draft is still here. Open the latest version before trying again.</span>
+              @if (openLatestFailed()) {
+                <span class="oi-edit-conflict-error">
+                  Couldn’t open the latest version. Your draft is still here; try again.
+                </span>
+              }
+            </div>
+            @if (latestLinkId()) {
+              <button
+                type="button"
+                class="btn btn-ghost oi-edit-conflict-open"
+                [disabled]="openingLatest()"
+                (click)="openLatestAfterConflict()"
+              >{{ openingLatest() ? "Opening…" : "Open latest" }}</button>
+            }
+          </div>
+        }
       </header>
       <div class="oi-body">
         @if (editing()) {
@@ -177,6 +230,20 @@
           />
         }
       </div>
+      @if (!editing()) {
+        @if (it.linkId; as linkId) {
+          <app-connections
+            [kind]="'org'"
+            [id]="linkId"
+            [expandedByDefault]="true"
+            [prominent]="true"
+          />
+        } @else {
+          <p class="oi-link-unavailable text-muted">
+            Related links become available after this older shared note is republished.
+          </p>
+        }
+      }
     </article>
   }
       </div>

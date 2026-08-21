@@ -14,6 +14,7 @@ import type {
   AccountStatus,
   MyShareEntry,
   NoteAttachmentDto,
+  OrgAccess,
   OrgShareEntry,
   OrgSourceShareStatus,
   OrgStatus,
@@ -27,6 +28,7 @@ import {
   OrgShareSheetComponent,
   type OrgShareTarget,
 } from "../org-share-sheet/org-share-sheet.component";
+import { Router } from "@angular/router";
 import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { AccountSessionService } from "../../../services/account-session.service";
@@ -46,7 +48,7 @@ export interface LinkShareRow {
   createdAt: string;
   usageLabel: string;
   expiryLabel: string;
-  state: "active" | "limit" | "expired" | "revoked";
+  state: "active" | "limit" | "expired" | "revoked" | "pending";
   /** Non-null ONLY for a link created THIS session (the key is never re-derivable). */
   copyUrl: string | null;
   /** True when the created-this-session link carried a password (best-effort, never wrong). */
@@ -92,6 +94,7 @@ export class SharePanelComponent {
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
   private readonly accountSession = inject(AccountSessionService);
+  private readonly router = inject(Router);
 
   // --- Inputs from the shell ------------------------------------------------
   /** THIS meeting's id (null while the detail is loading), the shares filter key. */
@@ -263,7 +266,9 @@ export class SharePanelComponent {
         const exp = s.expiresAt ? Date.parse(s.expiresAt) : null;
         const expired = exp != null && !Number.isNaN(exp) && exp < now;
         const limit = s.maxDownloads != null && s.downloadCount >= s.maxDownloads;
-        const state: LinkShareRow["state"] = s.revoked
+        const state: LinkShareRow["state"] = s.revokePending
+          ? "pending"
+          : s.revoked
           ? "revoked"
           : limit
             ? "limit"
@@ -296,8 +301,19 @@ export class SharePanelComponent {
   readonly peopleShareCount = computed(
     () =>
       this.myShares().filter(
-        (s) => s.meetingId === this.meetingId() && s.mode === "user",
+        (s) =>
+          s.meetingId === this.meetingId() &&
+          s.mode === "user" &&
+          !s.revoked &&
+          !s.revokePending,
       ).length,
+  );
+  /** Interrupted mode-B setup/revoke journals remain actionable even when absent from the relay. */
+  readonly peopleCleanupRows = computed(() =>
+    this.myShares().filter(
+      (s) =>
+        s.meetingId === this.meetingId() && s.mode === "user" && s.revokePending,
+    ),
   );
 
   // --- Person share (mode B) -----------------------------------------------
@@ -332,6 +348,18 @@ export class SharePanelComponent {
   private readonly _orgSourceShares = signal<OrgSourceShareStatus[]>([]);
   /** True when THIS meeting is already live in ≥1 org (flips the CTA to shared). */
   readonly sourceInOrg = computed(() => this._orgSourceShares().length > 0);
+  /** Origin-device management rows, joined with local org names. */
+  readonly orgSourceRows = computed(() =>
+    this._orgSourceShares().map((share) => ({
+      ...share,
+      access: share.access ?? ("view" as const),
+      orgName:
+        this._orgs().find((org) => org.orgId === share.orgId)?.name ??
+        "Organization",
+    })),
+  );
+  readonly changingOrgAccessId = signal<string | null>(null);
+  readonly orgAccessError = signal<string | null>(null);
   /** True while the org-share PREVIEW SHEET is open (the confirm flow). */
   readonly orgSheetOpen = signal(false);
 
@@ -478,6 +506,34 @@ export class SharePanelComponent {
       await this.refreshOrg(id);
     }
     this.changed.emit();
+  }
+
+  /** Change access for an already-published source without leaving its Share tab. */
+  async setOrgAccess(itemId: string | null, access: OrgAccess): Promise<void> {
+    const id = this.meetingId();
+    if (!id || !itemId || this.changingOrgAccessId()) {
+      return;
+    }
+    this.orgAccessError.set(null);
+    this.changingOrgAccessId.set(itemId);
+    try {
+      await this.ipc.orgSetItemAccess(itemId, access);
+      await this.refreshOrg(id);
+    } catch {
+      this.orgAccessError.set(
+        "Couldn’t change access. Only the author or Org Owner can manage it.",
+      );
+    } finally {
+      this.changingOrgAccessId.set(null);
+    }
+  }
+
+  /** Open the relay's current head after automatic republish stopped on a CAS conflict. */
+  openLatestOrgShare(itemId: string | null): void {
+    if (!itemId) {
+      return;
+    }
+    void this.router.navigate(["/org-item", itemId]);
   }
 
   /**
@@ -661,19 +717,13 @@ export class SharePanelComponent {
     }
   }
 
-  /** Revoke (after the inline confirm), optimistically flip, then re-fetch. */
+  /** Revoke or retry a durable pending revoke. The backend list remains authoritative. */
   async revokeRow(shareId: string): Promise<void> {
     if (this.revokingId()) {
       return;
     }
     this.revokingId.set(shareId);
     this.listError.set(null);
-    // Optimistic: mark the local row revoked immediately.
-    this.myShares.set(
-      this.myShares().map((s) =>
-        s.shareId === shareId ? { ...s, revoked: true } : s,
-      ),
-    );
     try {
       await this.ipc.revokeShare(shareId);
       this.confirmingRevokeId.set(null);

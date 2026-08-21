@@ -33,6 +33,10 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
         (window as unknown as { __lockCalled?: boolean }).__lockCalled = true;
         return null;
       },
+      lock_folder_allow_remote_access: () => {
+        (window as unknown as { __overrideLockCalled?: boolean }).__overrideLockCalled = true;
+        return null;
+      },
       revoke_shares_for_folder: () => null,
     });
 
@@ -56,21 +60,84 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
       ),
     ).toBe(false);
 
-    // Confirm via "Lock anyway" → NOW lock_folder fires.
+    // Confirm via "Lock anyway" → only the explicit retain-remote-access IPC fires.
     await dialog.getByRole("button", { name: "Lock anyway" }).click();
     await expect
       .poll(
         () =>
           page.evaluate(
             () =>
-              (window as unknown as { __lockCalled?: boolean }).__lockCalled ??
+              (window as unknown as { __overrideLockCalled?: boolean }).__overrideLockCalled ??
               false,
           ),
         { timeout: 5_000 },
       )
       .toBe(true);
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __lockCalled?: boolean }).__lockCalled ?? false,
+      ),
+    ).toBe(false);
 
     // The dialog dismisses once the lock lands.
     await expect(dialog).toBeHidden();
+  });
+});
+
+test.describe("Notes — durable share revocation pending", () => {
+  test("a failed retry stays visible and explains why delete or lock is paused", async ({
+    page,
+  }) => {
+    await mockNotes(page, {
+      account_status: () => ({
+        loggedIn: true,
+        email: "owner@example.test",
+        unlockedForSharing: true,
+        shareConsented: true,
+        serverConfigured: true,
+        biometricUnlockAvailable: false,
+      }),
+      list_my_shares: () => [
+        {
+          shareId: "pending-link",
+          title: "My First Note",
+          locked: false,
+          rev: 1,
+          createdAt: "2026-08-20T12:00:00Z",
+          expiresAt: null,
+          revoked: false,
+          revokePending: true,
+          downloadCount: 0,
+          meetingId: null,
+          documentId: "n1",
+          maxDownloads: null,
+          mode: "link",
+        },
+      ],
+      revoke_share: () => {
+        (window as unknown as { __revokeRetryCalled?: boolean }).__revokeRetryCalled = true;
+        throw new Error("remote deletion remains unproven");
+      },
+    });
+
+    await page.goto("/notes/n1");
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("menuitem", { name: "Share…" }).click();
+
+    const modal = page.getByRole("dialog", { name: "Share this note" });
+    await expect(modal).toBeVisible();
+    await expect(modal.getByText("Revocation pending")).toBeVisible();
+    await expect(
+      modal.getByText(
+        "Murmur is safely closing an interrupted share. Local delete or lock stays paused until cleanup succeeds.",
+      ),
+    ).toBeVisible();
+
+    await modal.getByRole("button", { name: "Retry" }).click();
+    await expect.poll(() => page.evaluate(
+      () => (window as unknown as { __revokeRetryCalled?: boolean }).__revokeRetryCalled ?? false,
+    )).toBe(true);
+    await expect(modal.getByText("Revocation pending")).toBeVisible();
+    await expect(modal.getByRole("button", { name: "Retry" })).toBeVisible();
   });
 });

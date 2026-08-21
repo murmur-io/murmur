@@ -17,6 +17,7 @@ import type {
   LinkEdge,
   LinkKind,
   LivingAnswerTileData,
+  ManualLinkEdge,
   SourceRef,
   WikiTarget,
   CompanionAppendResult,
@@ -133,6 +134,7 @@ import type {
   OrgShareEntry,
   OrgSourceShareStatus,
   OrgItemDetail,
+  OrgAccess,
   OrgItemHeader,
   MeetingOrgShareInfo,
   MeetingOrgShareRow,
@@ -738,8 +740,14 @@ export class IpcService {
     meetingId: string,
     orgId: string,
     scrub: boolean,
+    access: OrgAccess,
   ): Promise<void> {
-    return invoke<void>("share_meeting_to_org", { meetingId, orgId, scrub });
+    return invoke<void>("share_meeting_to_org", {
+      meetingId,
+      orgId,
+      scrub,
+      access,
+    });
   }
 
   /**
@@ -751,8 +759,14 @@ export class IpcService {
     documentId: string,
     orgId: string,
     scrub: boolean,
+    access: OrgAccess,
   ): Promise<void> {
-    return invoke<void>("share_document_to_org", { documentId, orgId, scrub });
+    return invoke<void>("share_document_to_org", {
+      documentId,
+      orgId,
+      scrub,
+      access,
+    });
   }
 
   /**
@@ -829,14 +843,19 @@ export class IpcService {
    * the machine that first shared it). Goes through the same consent + seal +
    * verify-before-egress gates as sharing; supersedes the old item (rev+1) and
    * returns the NEW server item id so the caller can navigate to it. Mirrors
-   * `org_update_own_item`.
+   * `org_update_item`.
    */
-  orgUpdateOwnItem(
+  orgUpdateItem(
     itemId: string,
     title: string,
     markdown: string,
   ): Promise<string> {
-    return invoke<string>("org_update_own_item", { itemId, title, markdown });
+    return invoke<string>("org_update_item", { itemId, title, markdown });
+  }
+
+  /** Change a Shared Brain document's member access. Server authorizes managers. */
+  orgSetItemAccess(itemId: string, access: OrgAccess): Promise<void> {
+    return invoke<void>("org_set_item_access", { itemId, access });
   }
 
   /**
@@ -1557,18 +1576,23 @@ export class IpcService {
   }
 
   /**
-   * PR-1 — REMOVE a user-created link from `(srcKind, srcId)` → `(dstKind, dstId)`
-   * (the inverse of {@link linkItems}). Only manual links (`LinkEdge.manual === true`)
-   * are removable this way. GATED — refuses (`Locked`) when either endpoint is sealed.
-   * The caller re-runs {@link listLinks} afterward so the chip drops out.
+   * PR-1 — REMOVE a collapsed chip's exact manual rows (`manualEdges`, one or both directions).
+   * The legacy pair remains the display identity and fallback for older payloads. Only manual links
+   * (`LinkEdge.manual === true`) are removable. GATED — refuses (`Locked`) when either endpoint is
+   * sealed. The caller re-runs {@link listLinks} afterward so a surviving derived edge becomes
+   * non-removable, or the chip drops out when no derived relation remains.
    */
   unlinkItems(
     srcKind: LinkKind,
     srcId: string,
     dstKind: LinkKind,
     dstId: string,
+    manualEdges?: readonly ManualLinkEdge[],
   ): Promise<void> {
-    return invoke<void>("unlink_items", { srcKind, srcId, dstKind, dstId });
+    const pair = { srcKind, srcId, dstKind, dstId };
+    return manualEdges?.length
+      ? invoke<void>("unlink_items", { ...pair, manualEdges })
+      : invoke<void>("unlink_items", pair);
   }
 
   /**
@@ -2685,6 +2709,11 @@ export class IpcService {
   /** Seal a folder: encrypt its notes into content blobs, blank markdown, remove vault .md. */
   lockFolder(folderId: string): Promise<void> {
     return invoke<void>("lock_folder", { folderId });
+  }
+
+  /** Explicitly seal locally while remote share recipients retain access. */
+  lockFolderAllowRemoteAccess(folderId: string): Promise<void> {
+    return invoke<void>("lock_folder_allow_remote_access", { folderId });
   }
 
   /** Session-unlock a sealed folder (decrypt into markdown for this session; no re-export). */

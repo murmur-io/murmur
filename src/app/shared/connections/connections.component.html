@@ -27,7 +27,7 @@
             #pickerAnchor
             type="text"
             class="cx-link-input"
-            placeholder="Link a meeting, note, or document…"
+            placeholder="Link a meeting, note, document, or Shared Brain item…"
             [value]="pickerQuery()"
             (input)="onQueryInput($event)"
             (keydown)="onQueryKey($event)"
@@ -57,7 +57,7 @@
           #pickerAnchor
           type="text"
           class="cx-link-input"
-          placeholder="Link a meeting, note, or document…"
+          placeholder="Link a meeting, note, document, or Shared Brain item…"
           [value]="pickerQuery()"
           (input)="onQueryInput($event)"
           (keydown)="onQueryKey($event)"
@@ -116,7 +116,7 @@
           #pickerAnchor
           type="text"
           class="cx-link-input"
-          placeholder="Link a meeting, note, or document…"
+          placeholder="Link a meeting, note, document, or Shared Brain item…"
           [value]="pickerQuery()"
           (input)="onQueryInput($event)"
           (keydown)="onQueryKey($event)"
@@ -174,7 +174,7 @@
           #pickerAnchor
           type="text"
           class="cx-link-input"
-          placeholder="Link a meeting, note, or document…"
+          placeholder="Link a meeting, note, document, or Shared Brain item…"
           [value]="pickerQuery()"
           (input)="onQueryInput($event)"
           (keydown)="onQueryKey($event)"
@@ -222,6 +222,17 @@
                 (click)="openDocument(row.id, row.title)"
               >
                 <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
+                <span class="cx-title">{{ row.title }}</span>
+                <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
+              </button>
+            } @else if (row.kind === "org") {
+              <button
+                type="button"
+                class="cx-chip cx-chip--open"
+                [attr.aria-label]="'Open Shared Brain item ' + row.title"
+                (click)="openOrgItem(row.navigationId, row.title)"
+              >
+                <span class="cx-kind cx-kind--org" aria-hidden="true">shared</span>
                 <span class="cx-title">{{ row.title }}</span>
                 <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
               </button>
@@ -279,6 +290,9 @@
                 }
                 @case ("document") {
                   <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
+                }
+                @case ("org") {
+                  <span class="cx-kind cx-kind--org" aria-hidden="true">shared</span>
                 }
                 @default {
                   <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>

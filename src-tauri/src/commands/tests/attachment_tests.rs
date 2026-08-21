@@ -49,6 +49,7 @@ fn build_state(tag: &str, vault: Option<&std::path::Path>) -> AppState {
         org_ock_cache: Mutex::new(HashMap::new()),
         account_session: Mutex::new(None),
         share_refresh_lock: tokio::sync::Mutex::new(()),
+        org_share_mutation_lock: tokio::sync::Mutex::new(()),
         lifecycle: Mutex::new(()),
         active_salvages: Mutex::new(HashSet::new()),
         seal_epoch: std::sync::atomic::AtomicU64::new(0),
