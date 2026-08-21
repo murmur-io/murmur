@@ -99,6 +99,327 @@ fn migrate_is_idempotent() {
     );
 }
 
+/// A late migration failure must roll back the entire schema/data upgrade, not leave an earlier
+/// additive table or backfill installed. A deliberately malformed attachment table survives the
+/// failed attempt byte-for-byte; after removing that external obstruction, the same connection
+/// migrates successfully and remains idempotent.
+#[test]
+fn migrate_rolls_back_every_earlier_step_when_a_late_attachment_step_fails() {
+    register_vec_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE note_attachments (sentinel TEXT NOT NULL);
+         INSERT INTO note_attachments(sentinel) VALUES ('keep-me');",
+    )
+    .unwrap();
+    let db = Db {
+        conn: Mutex::new(conn),
+    };
+    let schema_snapshot = |db: &Db| -> Vec<(String, String, String)> {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, COALESCE(sql, '')
+                   FROM sqlite_master
+                  WHERE name NOT LIKE 'sqlite_%'
+                  ORDER BY type, name",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    };
+    let before = schema_snapshot(&db);
+
+    assert!(
+        db.migrate().is_err(),
+        "the malformed late attachment substrate must reject migration"
+    );
+    assert_eq!(
+        schema_snapshot(&db),
+        before,
+        "a late failure must roll back every earlier schema step"
+    );
+    assert_eq!(
+        db.lock()
+            .query_row(
+                "SELECT sentinel FROM note_attachments",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "keep-me",
+        "the pre-existing obstruction must remain untouched"
+    );
+
+    db.lock()
+        .execute_batch("DROP TABLE note_attachments;")
+        .unwrap();
+    db.migrate().unwrap();
+    db.migrate().unwrap();
+    assert!(
+        db.lock()
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='note_attachments'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some(),
+        "the unobstructed retry must install the late schema"
+    );
+}
+
+/// Dispatch correlation is an additive upgrade: legacy share rows remain valid with NULL stamps,
+/// while both tables gain the nullable column and the ledger gains a partial unique index.
+#[test]
+fn migrate_adds_dispatch_correlation_to_legacy_share_tables() {
+    register_vec_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE share_egress_log (
+           id         INTEGER PRIMARY KEY AUTOINCREMENT,
+           ts         INTEGER NOT NULL,
+           host       TEXT NOT NULL,
+           kind       TEXT NOT NULL,
+           byte_count INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO share_egress_log(ts, host, kind, byte_count)
+           VALUES (1, 'relay.example', 'legacy_one', 10),
+                  (2, 'relay.example', 'legacy_two', 20);
+         CREATE TABLE org_shares (
+           id             TEXT PRIMARY KEY,
+           org_id         TEXT NOT NULL,
+           meeting_id     TEXT,
+           document_id    TEXT,
+           kind           TEXT NOT NULL,
+           title          TEXT,
+           rev            INTEGER NOT NULL DEFAULT 1,
+           generation     INTEGER NOT NULL DEFAULT 1,
+           content_sha256 BLOB,
+           item_id        TEXT,
+           scrub          INTEGER NOT NULL DEFAULT 1 CHECK(scrub IN (0,1)),
+           state          TEXT NOT NULL DEFAULT 'queued'
+                          CHECK (state IN ('queued','uploaded','failed','revoke_pending','revoked')),
+           last_error     TEXT,
+           created_at     TEXT NOT NULL,
+           updated_at     TEXT NOT NULL
+         );
+         INSERT INTO org_shares(
+           id, org_id, kind, state, created_at, updated_at
+         ) VALUES (
+           'legacy-share', 'legacy-org', 'note', 'queued', '2026-08-13T00:00:00Z',
+           '2026-08-13T00:00:00Z'
+         );",
+    )
+    .unwrap();
+    let db = Db {
+        conn: Mutex::new(conn),
+    };
+
+    db.migrate().unwrap();
+    db.migrate().unwrap();
+
+    let conn = db.lock();
+    for table in ["org_shares", "share_egress_log"] {
+        let dispatch_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = 'dispatch_id'",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_columns, 1, "{table}.dispatch_id must be additive");
+    }
+    let legacy_null_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM share_egress_log WHERE dispatch_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_null_rows, 2, "legacy NULL ledger rows must coexist");
+    let legacy_org_dispatch: Option<String> = conn
+        .query_row(
+            "SELECT dispatch_id FROM org_shares WHERE id = 'legacy-share'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_org_dispatch, None);
+    let (unique, partial): (i64, i64) = conn
+        .query_row(
+            "SELECT \"unique\", partial
+               FROM pragma_index_list('share_egress_log')
+              WHERE name = 'idx_share_egress_log_dispatch_id'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((unique, partial), (1, 1));
+    let indexed_column: String = conn
+        .query_row(
+            "SELECT name FROM pragma_index_info('idx_share_egress_log_dispatch_id')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_column, "dispatch_id");
+}
+
+#[test]
+fn share_egress_dispatch_rejects_duplicate_non_null_id_but_allows_legacy_nulls() {
+    let db = mem_db();
+    let mut conn = db.lock();
+    conn.execute(
+        "INSERT INTO share_egress_log(ts, host, kind, byte_count) VALUES (1, 'relay', 'legacy', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO share_egress_log(ts, host, kind, byte_count) VALUES (2, 'relay', 'legacy', 0)",
+        [],
+    )
+    .unwrap();
+    {
+        let tx = conn.transaction().unwrap();
+        insert_share_egress_dispatch_tx(&tx, 3, "relay", "org_share_publish", 42, "dispatch-1")
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    {
+        let tx = conn.transaction().unwrap();
+        let duplicate =
+            insert_share_egress_dispatch_tx(&tx, 4, "relay", "org_share_publish", 43, "dispatch-1");
+        assert!(matches!(duplicate, Err(crate::error::AppError::Storage(_))));
+        tx.rollback().unwrap();
+    }
+
+    let (null_rows, stamped_rows): (i64, i64) = conn
+        .query_row(
+            "SELECT SUM(dispatch_id IS NULL), SUM(dispatch_id = 'dispatch-1')
+               FROM share_egress_log",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((null_rows, stamped_rows), (2, 1));
+}
+
+#[test]
+fn share_egress_dispatch_transaction_rollback_leaves_no_ledger_row() {
+    let db = mem_db();
+    let mut conn = db.lock();
+    let row_id = {
+        let tx = conn.transaction().unwrap();
+        let row_id = insert_share_egress_dispatch_tx(
+            &tx,
+            10,
+            "relay",
+            "org_share_publish",
+            99,
+            "dispatch-rollback",
+        )
+        .unwrap();
+        let visible_inside_tx: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM share_egress_log WHERE id = ?1",
+                rusqlite::params![row_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible_inside_tx, 1);
+        tx.rollback().unwrap();
+        row_id
+    };
+    let persisted: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM share_egress_log WHERE id = ?1",
+            rusqlite::params![row_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, 0);
+}
+
+#[test]
+fn org_recovery_read_dispatch_binds_exact_content_free_page_witness() {
+    let db = mem_db();
+    let mut conn = db.lock();
+    let tx = conn.transaction().unwrap();
+    let row_id = insert_org_read_egress_dispatch_tx(
+        &tx,
+        11,
+        "relay.example",
+        "org_document_history_read",
+        "read-dispatch-1",
+        "org-1",
+        "doc-1",
+        200,
+        200,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let witness: (String, String, String, String, i64, i64, i64) = conn
+        .query_row(
+            "SELECT host, kind, dispatch_id, org_id, since_seq, page_limit, byte_count
+               FROM share_egress_log WHERE id = ?1 AND doc_id = 'doc-1'",
+            rusqlite::params![row_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        witness,
+        (
+            "relay.example".into(),
+            "org_document_history_read".into(),
+            "read-dispatch-1".into(),
+            "org-1".into(),
+            200,
+            200,
+            0,
+        )
+    );
+}
+
+#[test]
+fn share_egress_dispatch_rejects_blank_identifiers_and_labels() {
+    let db = mem_db();
+    let mut conn = db.lock();
+    let tx = conn.transaction().unwrap();
+    for (host, kind, dispatch_id) in [
+        ("relay", "org_share_publish", "  "),
+        ("\t", "org_share_publish", "dispatch-host"),
+        ("relay", "\n", "dispatch-kind"),
+    ] {
+        assert!(matches!(
+            insert_share_egress_dispatch_tx(&tx, 1, host, kind, 0, dispatch_id),
+            Err(crate::error::AppError::InvalidArg(_))
+        ));
+    }
+    tx.rollback().unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM share_egress_log", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
 /// MODEL-SELECTION ATOMICITY: publishing a genuinely different embedder must never leave
 /// vectors produced by the previous model in any retrieval partition. Source chunks/FTS are
 /// intentionally retained by the production method; this focused test exercises the four
@@ -251,6 +572,10 @@ fn sha32(tag: u8) -> Vec<u8> {
     vec![tag; 32]
 }
 
+const STABLE_ORG_ID: &str = "11111111-1111-4111-8111-111111111111";
+const STABLE_DOC_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const STABLE_DOC_RACE_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
 /// Join `org_id` locally (enabled by default) — the retrieval legs INNER JOIN `org_state`
 /// (per-instance org toggle), so any test that ingests `org_items` directly must seed this first,
 /// mirroring how production content can never exist without a prior join.
@@ -266,6 +591,1946 @@ fn seed_org_state(db: &Db, org_id: &str) {
         context_enabled: true,
     })
     .unwrap();
+}
+
+#[test]
+fn republish_projection_is_full_witness_monotonic_and_purges_all_older_plaintext() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    db.insert_org_share(
+        "share-projection",
+        STABLE_ORG_ID,
+        None,
+        Some("source-projection"),
+        "note",
+        Some("Title"),
+        3,
+        1,
+        &sha32(3),
+        "2026-08-13T00:00:00Z",
+    )
+    .unwrap();
+    db.lock()
+        .execute(
+            "UPDATE org_shares SET state='uploaded', item_id='head-r3', doc_id=?2,
+                    access='edit', dispatch_id='dispatch-r3',
+                    expected_actor_user_id='owner', expected_owner_user_id='owner'
+              WHERE id=?1",
+            rusqlite::params!["share-projection", STABLE_DOC_ID],
+        )
+        .unwrap();
+    for (item, seq, rev) in [("head-r1", 1_u64, 1_u32), ("head-r2", 2, 2)] {
+        db.upsert_org_item(
+            item,
+            STABLE_ORG_ID,
+            seq,
+            "owner",
+            item,
+            &format!("plaintext-{item}"),
+            "2026-08-13T00:00:00Z",
+            rev,
+            1,
+            &sha32(rev as u8),
+            None,
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item, Some(STABLE_DOC_ID), "edit", Some("owner"))
+            .unwrap();
+    }
+    db.repair_org_reconcile_metadata(
+        "head-r2",
+        STABLE_ORG_ID,
+        1,
+        Some(STABLE_DOC_ID),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    let prepared = Db::prepare_org_item_index("head-r3", "t", "plaintext-r3", None).unwrap();
+    let projection = crate::storage::org_store::OrgRepublishProjection {
+        item_id: "head-r3",
+        seq: 3,
+        author_hint: "owner",
+        title: "head-r3",
+        markdown: "plaintext-r3",
+        created_at: "t",
+        source_kind: None,
+        author_user_id: Some("owner"),
+        prepared: &prepared,
+        attachments: &[],
+    };
+    assert!(db
+        .commit_org_republish_projection_if_current(
+            "share-projection",
+            "dispatch-r3",
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            3,
+            1,
+            &sha32(3),
+            "owner",
+            "owner",
+            None,
+            None,
+            false,
+            &projection,
+        )
+        .unwrap()
+        .changed);
+    for old in ["head-r1", "head-r2"] {
+        let (tombstoned, title, markdown): (i64, String, String) = db
+            .lock()
+            .query_row(
+                "SELECT tombstoned,title,markdown FROM org_items WHERE item_id=?1",
+                [old],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((tombstoned, title, markdown), (1, String::new(), String::new()));
+    }
+
+    let newer = Db::prepare_org_item_index("head-r4", "t", "newer", None).unwrap();
+    db.commit_local_org_replica_with_metadata(
+        "head-r4", STABLE_ORG_ID, 4, "owner", "head-r4", "newer", "t", 4, 1,
+        &sha32(4), None, Some("owner"), &newer, None, Some(STABLE_DOC_ID), "edit",
+        Some("owner"), true,
+    )
+    .unwrap();
+    assert!(!db
+        .commit_org_republish_projection_if_current(
+            "share-projection", "dispatch-r3", STABLE_ORG_ID, STABLE_DOC_ID, "edit", 3, 1,
+            &sha32(3), "owner", "owner", None, None, false, &projection,
+        )
+        .unwrap()
+        .changed);
+    assert_eq!(
+        db.current_org_document_status(STABLE_ORG_ID, STABLE_DOC_ID)
+            .unwrap()
+            .unwrap()
+            .0,
+        "head-r4"
+    );
+}
+
+#[test]
+fn republish_projection_repairs_same_seq_attachment_bundle_before_clearing_journal() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    db.insert_org_share("share-repair", STABLE_ORG_ID, None, Some("source"), "note",
+        Some("Title"), 2, 1, &sha32(2), "t").unwrap();
+    db.lock().execute(
+        "UPDATE org_shares SET state='failed',last_error='projection_pending',item_id='head-r2',
+          doc_id=?2,access='edit',dispatch_id='dispatch-r2',expected_actor_user_id='owner',
+          expected_owner_user_id='owner' WHERE id=?1",
+        rusqlite::params!["share-repair",STABLE_DOC_ID],
+    ).unwrap();
+    let prepared = Db::prepare_org_item_index("Title", "t", "body", None).unwrap();
+    db.upsert_org_item("head-r2", STABLE_ORG_ID, 2, "owner", "Title", "body", "t",
+        2, 1, &sha32(2), None, Some("owner"), None).unwrap();
+    db.set_org_item_document_metadata("head-r2", Some(STABLE_DOC_ID), "edit", Some("owner")).unwrap();
+    db.replace_org_item_attachment_bundle("head-r2", &[crate::storage::IncomingAttachment {
+        id: "stale".into(), mime_type: "image/png".into(), extension: "png".into(),
+        width: 1, height: 1, sha256: [1;32], data: vec![1],
+    }]).unwrap();
+    db.lock().execute("UPDATE org_items SET projection_sha256=NULL WHERE item_id='head-r2'", []).unwrap();
+    let exact = crate::storage::IncomingAttachment {
+        id: "exact".into(), mime_type: "image/png".into(), extension: "png".into(),
+        width: 2, height: 2, sha256: [2;32], data: vec![2,2],
+    };
+    let exact_attachments = vec![exact];
+    let projection = crate::storage::org_store::OrgRepublishProjection {
+        item_id: "head-r2", seq: 2, author_hint: "owner", title: "Title", markdown: "body",
+        created_at: "t", source_kind: None, author_user_id: Some("owner"), prepared: &prepared,
+        attachments: &exact_attachments,
+    };
+    assert!(db.commit_org_republish_projection_if_current(
+        "share-repair","dispatch-r2",STABLE_ORG_ID,STABLE_DOC_ID,"edit",2,1,&sha32(2),
+        "owner","owner",Some("head-r2"),Some("projection_pending"),false,&projection,
+    ).unwrap().changed);
+    let conn = db.lock();
+    assert_eq!(conn.query_row("SELECT group_concat(id) FROM note_attachments WHERE org_item_id='head-r2'", [], |r| r.get::<_,String>(0)).unwrap(), "exact");
+    assert!(conn.query_row("SELECT projection_sha256=?2 FROM org_items WHERE item_id=?1",
+        rusqlite::params!["head-r2",sha32(2)], |r| r.get::<_,bool>(0)).unwrap());
+    assert_eq!(conn.query_row("SELECT state FROM org_shares WHERE id='share-repair'", [], |r| r.get::<_,String>(0)).unwrap(), "uploaded");
+}
+
+#[test]
+fn org_source_counters_are_atomic_row_local_and_debounce_only_invalidates() {
+    let db = mem_db();
+    seed_folder(&db, "f-source", "Source");
+    db.insert_note(
+        "n-source", "f-source", "source", "Title", "A", 1,
+    )
+    .unwrap();
+    for id in ["share-a", "share-b"] {
+        db.insert_org_share(
+            id, STABLE_ORG_ID, None, Some("n-source"), "note", Some("Title"), 1, 1,
+            &sha32(1), "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
+        db.set_org_share_uploaded(id, &format!("item-{id}"), "t")
+            .unwrap();
+    }
+    db.update_note_row_debounced("n-source", "Title", "draft", 2)
+        .unwrap();
+    for id in ["share-a", "share-b"] {
+        assert_eq!(db.org_share_source_counters(id).unwrap(), (1, 0));
+    }
+    db.update_note_row("n-source", "Title", "committed", 3)
+        .unwrap();
+    for id in ["share-a", "share-b"] {
+        assert_eq!(db.org_share_source_counters(id).unwrap(), (2, 1));
+    }
+
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER fail_dirty BEFORE UPDATE OF republish_dirty ON org_shares
+               BEGIN SELECT RAISE(ABORT, 'fail dirty'); END;",
+        )
+        .unwrap();
+    assert!(db
+        .update_note_row("n-source", "Title", "must-roll-back", 4)
+        .is_err());
+    assert_eq!(db.get_note_row("n-source").unwrap().unwrap().text, "committed");
+}
+
+#[test]
+fn attachment_updates_advance_old_and_new_source_witnesses_atomically() {
+    let db = mem_db();
+    seed_folder(&db, "f-attachment-update", "Attachment update");
+    db.insert_note(
+        "n-attachment-old",
+        "f-attachment-update",
+        "source",
+        "Old",
+        "body",
+        1,
+    )
+    .unwrap();
+    db.insert_note(
+        "n-attachment-new",
+        "f-attachment-update",
+        "source",
+        "New",
+        "body",
+        1,
+    )
+    .unwrap();
+    db.lock()
+        .execute(
+            "INSERT INTO note_attachments
+               (id,document_id,mime_type,extension,byte_len,width,height,sha256,data,created_at)
+             VALUES('attachment-update','n-attachment-old','image/png','png',1,1,1,?1,?2,1)",
+            rusqlite::params![sha32(1), vec![1_u8]],
+        )
+        .unwrap();
+
+    for (share_id, document_id) in [
+        ("share-attachment-old", "n-attachment-old"),
+        ("share-attachment-new", "n-attachment-new"),
+    ] {
+        db.insert_org_share(
+            share_id,
+            STABLE_ORG_ID,
+            None,
+            Some(document_id),
+            "note",
+            Some("Title"),
+            1,
+            1,
+            &sha32(1),
+            "t",
+        )
+        .unwrap();
+        db.set_org_share_uploaded(share_id, &format!("item-{share_id}"), "t")
+            .unwrap();
+    }
+
+    db.lock()
+        .execute(
+            "UPDATE note_attachments SET data=?2,sha256=?3,byte_len=2 WHERE id=?1",
+            rusqlite::params!["attachment-update", vec![2_u8, 2], sha32(2)],
+        )
+        .unwrap();
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-old")
+            .unwrap(),
+        (1, 1)
+    );
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-new")
+            .unwrap(),
+        (0, 0)
+    );
+
+    db.lock()
+        .execute(
+            "UPDATE note_attachments SET document_id='n-attachment-new' WHERE id='attachment-update'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-old")
+            .unwrap(),
+        (2, 2)
+    );
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-new")
+            .unwrap(),
+        (1, 1)
+    );
+
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER fail_attachment_source_witness
+               BEFORE UPDATE OF source_version ON org_shares
+               WHEN NEW.id='share-attachment-new'
+               BEGIN SELECT RAISE(ABORT, 'fail attachment witness'); END;",
+        )
+        .unwrap();
+    assert!(db
+        .lock()
+        .execute(
+            "UPDATE note_attachments SET mime_type='image/jpeg' WHERE id='attachment-update'",
+            [],
+        )
+        .is_err());
+    assert_eq!(
+        db.lock()
+            .query_row(
+                "SELECT mime_type FROM note_attachments WHERE id='attachment-update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "image/png"
+    );
+}
+
+#[test]
+fn storage_foundation_keeps_new_permission_and_link_fields_off_the_base_ipc_wire() {
+    let detail = crate::storage::models::OrgItemDetail {
+        item_id: "item".into(),
+        doc_id: Some(STABLE_DOC_ID.into()),
+        link_id: Some(format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}")),
+        author_hint: "author".into(),
+        title: "Title".into(),
+        created_at: "t".into(),
+        rev: 1,
+        markdown: "body".into(),
+        editable: true,
+        access: "edit".into(),
+        can_edit: true,
+        can_manage: true,
+    };
+    let detail = serde_json::to_value(detail).unwrap();
+    for key in ["docId", "linkId", "access", "canEdit", "canManage"] {
+        assert!(detail.get(key).is_none(), "foundation leaked {key} onto IPC");
+    }
+    assert_eq!(detail.get("editable"), Some(&serde_json::json!(true)));
+
+    let header = crate::storage::models::OrgItemHeader {
+        item_id: "item".into(),
+        doc_id: Some(STABLE_DOC_ID.into()),
+        title: "Title".into(),
+        author_hint: "author".into(),
+        created_at: "t".into(),
+        seq: 1,
+        kind: None,
+        owned_source: None,
+    };
+    assert!(serde_json::to_value(header).unwrap().get("docId").is_none());
+
+    let edge = crate::storage::models::LinkEdge {
+        id: 1,
+        direction: "out".into(),
+        other_kind: "org".into(),
+        other_id: format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}"),
+        navigation_id: Some("item".into()),
+        other_title: "Title".into(),
+        edge_type: "manual".into(),
+        created_by: "user".into(),
+        status: "active".into(),
+        score: 1.0,
+        created_at: 1,
+        manual: true,
+        manual_edges: vec![crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: "source".into(),
+            dst_kind: "org".into(),
+            dst_id: format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}"),
+        }],
+    };
+    let edge = serde_json::to_value(edge).unwrap();
+    assert!(edge.get("navigationId").is_none());
+    assert!(edge.get("manualEdges").is_none());
+
+    let target = crate::storage::models::WikiTarget {
+        kind: "org".into(),
+        id: "item".into(),
+        stable_id: Some(format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}")),
+    };
+    assert!(serde_json::to_value(target)
+        .unwrap()
+        .get("stableId")
+        .is_none());
+}
+
+/// RED before UUID admission: malformed stable identities advanced the feed cursor and persisted a
+/// plaintext replica whose later link identity could never be constructed. Validation must happen
+/// before either mutation, while the historical no-docId feed shape remains ingestible.
+#[test]
+fn stable_org_document_uuid_admission_precedes_storage_mutation() {
+    const ORG_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const DOC_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    let db = mem_db();
+    seed_org_state(&db, ORG_ID);
+    let prepared = Db::prepare_org_item_index("Title", "t", "body", None).unwrap();
+    let malformed_doc = db.commit_org_feed_item_with_metadata(
+        "bad-doc-item",
+        ORG_ID,
+        1,
+        "owner",
+        "Title",
+        "body",
+        "2026-08-13T00:00:00Z",
+        1,
+        1,
+        &sha32(1),
+        None,
+        Some("owner"),
+        &prepared,
+        Some("not-a-uuid"),
+        "view",
+        Some("owner"),
+        true,
+    );
+    assert!(matches!(
+        malformed_doc,
+        Err(crate::error::AppError::InvalidArg(_))
+    ));
+    assert_eq!(db.org_last_seq_for(ORG_ID).unwrap(), 0);
+    assert!(db.org_replica_state("bad-doc-item").unwrap().is_none());
+
+    seed_org_state(&db, "not-an-org-uuid");
+    let malformed_org = db.commit_org_feed_item_with_metadata(
+        "bad-org-item",
+        "not-an-org-uuid",
+        1,
+        "owner",
+        "Title",
+        "body",
+        "2026-08-13T00:00:00Z",
+        1,
+        1,
+        &sha32(2),
+        None,
+        Some("owner"),
+        &prepared,
+        Some(DOC_ID),
+        "view",
+        Some("owner"),
+        true,
+    );
+    assert!(matches!(
+        malformed_org,
+        Err(crate::error::AppError::InvalidArg(_))
+    ));
+    assert_eq!(db.org_last_seq_for("not-an-org-uuid").unwrap(), 0);
+    assert!(db.org_replica_state("bad-org-item").unwrap().is_none());
+
+    db.insert_org_share(
+        "share-uuid-admission",
+        ORG_ID,
+        None,
+        Some("local-note"),
+        "note",
+        Some("Local"),
+        1,
+        1,
+        &sha32(3),
+        "2026-08-13T00:00:00Z",
+    )
+    .unwrap();
+    assert!(matches!(
+        db.set_org_share_document_metadata("share-uuid-admission", "not-a-uuid", "edit"),
+        Err(crate::error::AppError::InvalidArg(_))
+    ));
+    let stored_share_doc: Option<String> = db
+        .lock()
+        .query_row(
+            "SELECT doc_id FROM org_shares WHERE id = 'share-uuid-admission'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_share_doc, None);
+
+    assert!(
+        db.commit_org_feed_item_with_metadata(
+            "valid-stable-item",
+            ORG_ID,
+            1,
+            "owner",
+            "Title",
+            "body",
+            "2026-08-13T00:00:00Z",
+            1,
+            1,
+            &sha32(3),
+            None,
+            Some("owner"),
+            &prepared,
+            Some(DOC_ID),
+            "view",
+            Some("owner"),
+            true,
+        )
+        .unwrap()
+        .changed
+    );
+    assert_eq!(db.org_last_seq_for(ORG_ID).unwrap(), 1);
+    assert_eq!(
+        db.org_item_edit_ctx("valid-stable-item")
+            .unwrap()
+            .unwrap()
+            .doc_id
+            .as_deref(),
+        Some(DOC_ID)
+    );
+    assert!(matches!(
+        db.set_org_item_document_metadata(
+            "valid-stable-item",
+            Some("not-a-uuid"),
+            "edit",
+            Some("owner")
+        ),
+        Err(crate::error::AppError::InvalidArg(_))
+    ));
+    let unchanged = db.org_item_edit_ctx("valid-stable-item").unwrap().unwrap();
+    assert_eq!(unchanged.doc_id.as_deref(), Some(DOC_ID));
+    assert_eq!(unchanged.access, "view");
+
+    assert!(
+        db.commit_org_feed_item_with_metadata(
+            "legacy-item",
+            "not-an-org-uuid",
+            1,
+            "owner",
+            "Legacy",
+            "body",
+            "2026-08-13T00:00:01Z",
+            1,
+            1,
+            &sha32(4),
+            None,
+            Some("owner"),
+            &Db::prepare_org_item_index("Legacy", "t", "body", None).unwrap(),
+            None,
+            "view",
+            None,
+            false,
+        )
+        .unwrap()
+        .changed
+    );
+    assert!(db.org_replica_state("legacy-item").unwrap().is_some());
+}
+
+#[test]
+fn org_link_identity_isolated_by_org_and_follows_current_revision() {
+    let db = mem_db();
+    let org_a = "11111111-1111-4111-8111-111111111111";
+    let org_b = "22222222-2222-4222-8222-222222222222";
+    let doc = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let endpoint_a = format!("{org_a}:{doc}");
+    let endpoint_b = format!("{org_b}:{doc}");
+    seed_org_state(&db, org_a);
+    seed_org_state(&db, org_b);
+    for (item, org, title, seq) in [
+        ("a-old", org_a, "A old", 1),
+        ("a-new", org_a, "A current", 2),
+        ("b-item", org_b, "B current", 1),
+    ] {
+        db.upsert_org_item(
+            item,
+            org,
+            seq,
+            "owner",
+            title,
+            "body",
+            "2026-08-12T00:00:00Z",
+            seq as u32,
+            1,
+            &sha32(seq as u8),
+            None,
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item, Some(doc), "view", Some("owner"))
+            .unwrap();
+    }
+    db.repair_org_reconcile_metadata("a-new", org_a, 1, Some(doc), "view", Some("owner"), true)
+        .unwrap();
+    db.repair_org_reconcile_metadata("b-item", org_b, 1, Some(doc), "view", Some("owner"), true)
+        .unwrap();
+
+    assert_eq!(
+        db.org_link_target_visible(&endpoint_a).unwrap(),
+        Some(("a-new".into(), "A current".into()))
+    );
+    assert_eq!(
+        db.org_link_target_visible(&endpoint_b).unwrap(),
+        Some(("b-item".into(), "B current".into()))
+    );
+
+    db.upsert_manual_link("org", &endpoint_a, "org", &endpoint_b)
+        .expect("view-only current org documents are valid private link endpoints");
+    let before_revision = db
+        .links_for_visible(crate::links::LinkKind::Org, &endpoint_b, &HashSet::new())
+        .unwrap();
+    assert_eq!(before_revision.len(), 1);
+    assert_eq!(before_revision[0].other_id, endpoint_a);
+    assert_eq!(before_revision[0].navigation_id.as_deref(), Some("a-new"));
+    assert_eq!(before_revision[0].other_title, "A current");
+
+    db.upsert_org_item(
+        "a-next",
+        org_a,
+        3,
+        "owner",
+        "A next",
+        "body",
+        "2026-08-12T00:00:01Z",
+        3,
+        1,
+        &sha32(3),
+        None,
+        Some("owner"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("a-next", Some(doc), "view", Some("owner"))
+        .unwrap();
+    db.repair_org_reconcile_metadata("a-next", org_a, 1, Some(doc), "view", Some("owner"), true)
+        .unwrap();
+    let after_revision = db
+        .links_for_visible(crate::links::LinkKind::Org, &endpoint_b, &HashSet::new())
+        .unwrap();
+    assert_eq!(after_revision.len(), 1);
+    assert_eq!(
+        after_revision[0].other_id, endpoint_a,
+        "the stored edge identity must remain the stable org+document composite"
+    );
+    assert_eq!(
+        after_revision[0].navigation_id.as_deref(),
+        Some("a-next"),
+        "navigation must follow the authoritative current revision"
+    );
+    assert_eq!(after_revision[0].other_title, "A next");
+    assert_eq!(
+        manual_link_tuple_count(&db, "org", &endpoint_a, "org", &endpoint_b),
+        1
+    );
+
+    db.set_org_context_enabled(org_a, false).unwrap();
+    assert_eq!(
+        db.org_link_target_visible(&endpoint_a).unwrap(),
+        None,
+        "context disable must hide the endpoint"
+    );
+    assert_eq!(
+        link_count(&db, "org", &endpoint_a, "manual"),
+        1,
+        "context disable must preserve the private edge for reversible re-enable"
+    );
+    assert!(
+        db.links_for_visible(crate::links::LinkKind::Org, &endpoint_b, &HashSet::new(),)
+            .unwrap()
+            .is_empty(),
+        "a visible endpoint must not reveal a context-disabled neighbour"
+    );
+    db.set_org_context_enabled(org_a, true).unwrap();
+    assert_eq!(
+        db.org_link_target_visible(&endpoint_a).unwrap(),
+        Some(("a-next".into(), "A next".into()))
+    );
+    db.evict_org_item("a-old").unwrap();
+    db.evict_org_item("a-new").unwrap();
+    assert_eq!(link_count(&db, "org", &endpoint_a, "manual"), 1);
+    db.evict_org_item("a-next").unwrap();
+    assert_eq!(
+        link_count(&db, "org", &endpoint_a, "manual"),
+        1,
+        "final withdrawal withholds rather than destroys a private link"
+    );
+    assert!(db.org_link_target_visible(&endpoint_a).unwrap().is_none());
+}
+
+#[test]
+fn manual_org_links_accept_view_only_same_and_cross_org_but_refuse_noncurrent_head() {
+    let db = mem_db();
+    let org_a = "11111111-1111-4111-8111-111111111111";
+    let org_b = "22222222-2222-4222-8222-222222222222";
+    let doc_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let doc_same_org = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let doc_cross_org = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let doc_noncurrent = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    seed_org_state(&db, org_a);
+    seed_org_state(&db, org_b);
+
+    for (seq, item_id, org_id, doc_id, is_current) in [
+        (1, "a-view", org_a, doc_a, true),
+        (2, "a-other-view", org_a, doc_same_org, true),
+        (3, "b-view", org_b, doc_cross_org, true),
+        (4, "a-obsolete", org_a, doc_noncurrent, false),
+    ] {
+        db.upsert_org_item(
+            item_id,
+            org_id,
+            seq,
+            "owner",
+            item_id,
+            "body",
+            "2026-08-13T00:00:00Z",
+            1,
+            1,
+            &sha32(seq as u8),
+            None,
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item_id, Some(doc_id), "view", Some("owner"))
+            .unwrap();
+        db.repair_org_reconcile_metadata(
+            item_id,
+            org_id,
+            1,
+            Some(doc_id),
+            "view",
+            Some("owner"),
+            is_current,
+        )
+        .unwrap();
+    }
+
+    let a = format!("{org_a}:{doc_a}");
+    let same_org = format!("{org_a}:{doc_same_org}");
+    let cross_org = format!("{org_b}:{doc_cross_org}");
+    let noncurrent = format!("{org_a}:{doc_noncurrent}");
+    db.upsert_manual_link("org", &a, "org", &same_org)
+        .expect("view permission is sufficient for a same-org private link");
+    db.upsert_manual_link("org", &same_org, "org", &cross_org)
+        .expect("view permission is sufficient for a cross-org private link");
+    assert_eq!(manual_link_tuple_count(&db, "org", &a, "org", &same_org), 1);
+    assert_eq!(
+        manual_link_tuple_count(&db, "org", &same_org, "org", &cross_org),
+        1
+    );
+
+    assert!(matches!(
+        db.upsert_manual_link("org", &noncurrent, "org", &a),
+        Err(crate::error::AppError::Locked(_))
+    ));
+    assert_eq!(
+        manual_link_tuple_count(&db, "org", &noncurrent, "org", &a),
+        0,
+        "a live but non-current revision must fail the in-transaction endpoint gate"
+    );
+}
+
+#[test]
+fn bidirectional_org_manual_links_preserve_and_delete_exact_directed_tuples() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let left_doc = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let right_doc = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    seed_org_state(&db, org_id);
+    for (seq, item_id, doc_id) in [
+        (1, "left-current", left_doc),
+        (2, "right-current", right_doc),
+    ] {
+        db.upsert_org_item(
+            item_id,
+            org_id,
+            seq,
+            "owner",
+            item_id,
+            "body",
+            "2026-08-13T00:00:00Z",
+            1,
+            1,
+            &sha32(seq as u8),
+            None,
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item_id, Some(doc_id), "view", Some("owner"))
+            .unwrap();
+        db.repair_org_reconcile_metadata(
+            item_id,
+            org_id,
+            1,
+            Some(doc_id),
+            "view",
+            Some("owner"),
+            true,
+        )
+        .unwrap();
+    }
+    let left = format!("{org_id}:{left_doc}");
+    let right = format!("{org_id}:{right_doc}");
+    let forward = crate::storage::models::ManualLinkEdge {
+        src_kind: "org".into(),
+        src_id: left.clone(),
+        dst_kind: "org".into(),
+        dst_id: right.clone(),
+    };
+    let reverse = crate::storage::models::ManualLinkEdge {
+        src_kind: "org".into(),
+        src_id: right.clone(),
+        dst_kind: "org".into(),
+        dst_id: left.clone(),
+    };
+
+    db.upsert_manual_link("org", &left, "org", &right).unwrap();
+    db.upsert_manual_link("org", &right, "org", &left).unwrap();
+    let collapsed = db
+        .links_for_visible(crate::links::LinkKind::Org, &left, &HashSet::new())
+        .unwrap();
+    assert_eq!(collapsed.len(), 1, "two directions collapse to one chip");
+    assert!(collapsed[0].manual_edges.contains(&forward));
+    assert!(collapsed[0].manual_edges.contains(&reverse));
+
+    db.delete_manual_link("org", &left, "org", &right).unwrap();
+    assert_eq!(manual_link_tuple_count(&db, "org", &left, "org", &right), 0);
+    assert_eq!(
+        manual_link_tuple_count(&db, "org", &right, "org", &left),
+        1,
+        "deleting one direction must preserve the reverse exact tuple"
+    );
+
+    db.upsert_manual_link("org", &left, "org", &right).unwrap();
+    assert!(!db
+        .delete_manual_links(&[forward.clone(), reverse.clone()])
+        .unwrap());
+    assert_eq!(manual_link_tuple_count(&db, "org", &left, "org", &right), 0);
+    assert_eq!(manual_link_tuple_count(&db, "org", &right, "org", &left), 0);
+}
+
+#[test]
+fn leaving_org_preserves_private_composite_link_rows_but_withholds_endpoint() {
+    let db = mem_db();
+    let org_a = "11111111-1111-4111-8111-111111111111";
+    let org_b = "22222222-2222-4222-8222-222222222222";
+    let doc_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let doc_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    seed_org_state(&db, org_a);
+    seed_org_state(&db, org_b);
+    for (item, org, doc) in [("a", org_a, doc_a), ("b", org_b, doc_b)] {
+        db.upsert_org_item(
+            item,
+            org,
+            1,
+            "owner",
+            item,
+            "body",
+            "2026-08-12T00:00:00Z",
+            1,
+            1,
+            &sha32(1),
+            None,
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item, Some(doc), "view", Some("owner"))
+            .unwrap();
+        db.repair_org_reconcile_metadata(item, org, 1, Some(doc), "view", Some("owner"), true)
+            .unwrap();
+    }
+    let endpoint_a = format!("{org_a}:{doc_a}");
+    let endpoint_b = format!("{org_b}:{doc_b}");
+    db.upsert_manual_link("org", &endpoint_a, "org", &endpoint_b)
+        .unwrap();
+
+    assert!(db.delete_org_state(org_a).unwrap());
+    assert_eq!(
+        link_count(&db, "org", &endpoint_a, "manual"),
+        1,
+        "leaving must preserve the user's opaque private graph row"
+    );
+    assert!(
+        db.links_for_visible(crate::links::LinkKind::Org, &endpoint_a, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "the preserved row must remain completely withheld without membership"
+    );
+    assert!(
+        db.links_for_visible(crate::links::LinkKind::Org, &endpoint_b, &HashSet::new())
+            .unwrap()
+            .is_empty(),
+        "a still-joined org must not reveal a neighbour from an org this device left"
+    );
+    assert_eq!(
+        db.org_link_target_visible(&endpoint_b).unwrap(),
+        Some(("b".into(), "b".into())),
+        "leaving one org must not evict another org reusing the link domain"
+    );
+}
+
+/// An item's OCK generation is a historical encryption-key witness, not a requirement that the
+/// locally cached membership generation still equal it. A rotated member may receive an older live
+/// feed cell after learning generation N. Disabling Shared Brain context hides reads, but must not
+/// stall the append-only cursor or discard ciphertext that becomes readable again on re-enable.
+#[test]
+fn historical_generation_and_disabled_context_feed_commit_converge_without_visibility() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    db.set_org_generation(STABLE_ORG_ID, 2).unwrap();
+    db.set_org_context_enabled(STABLE_ORG_ID, false).unwrap();
+    let prepared = Db::prepare_org_item_index("Historical", "t", "private history", None).unwrap();
+
+    let outcome = db
+        .commit_org_feed_item_with_metadata(
+            "historical-item",
+            STABLE_ORG_ID,
+            7,
+            "owner",
+            "Historical",
+            "private history",
+            "2026-08-13T00:00:00Z",
+            1,
+            1,
+            &sha32(7),
+            None,
+            Some("owner"),
+            &prepared,
+            Some(STABLE_DOC_ID),
+            "view",
+            Some("owner"),
+            true,
+        )
+        .unwrap();
+
+    assert!(
+        outcome.changed,
+        "generation N-1 must ingest under membership N"
+    );
+    assert_eq!(
+        db.org_last_seq_for(STABLE_ORG_ID).unwrap(),
+        7,
+        "context disable must not stall the durable feed cursor"
+    );
+    assert!(
+        db.get_org_item("historical-item").unwrap().is_none(),
+        "disabled context must withhold the locally converged plaintext"
+    );
+    assert!(
+        db.search_org_chunks_fts("private history", 10)
+            .unwrap()
+            .is_empty(),
+        "disabled context must also withhold retrieval"
+    );
+
+    db.set_org_context_enabled(STABLE_ORG_ID, true).unwrap();
+    assert_eq!(
+        db.get_org_item("historical-item")
+            .unwrap()
+            .map(|item| item.title),
+        Some("Historical".into()),
+        "re-enable restores the already-converged replica without a replay"
+    );
+
+    let future = Db::prepare_org_item_index("Future", "t", "future body", None).unwrap();
+    let future_outcome = db
+        .commit_org_feed_item_with_metadata(
+            "future-item",
+            STABLE_ORG_ID,
+            8,
+            "owner",
+            "Future",
+            "future body",
+            "2026-08-13T00:00:01Z",
+            1,
+            3,
+            &sha32(8),
+            None,
+            Some("owner"),
+            &future,
+            None,
+            "view",
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(
+        !future_outcome.changed,
+        "a future generation is not yet admissible"
+    );
+    assert_eq!(db.org_last_seq_for(STABLE_ORG_ID).unwrap(), 7);
+}
+
+/// A predecessor tombstone can arrive before this client can open/ingest the successor. The stable
+/// endpoint must be withheld during that gap, not destructively erased from the user's private graph;
+/// once the successor lands, the exact row becomes visible again without reconstruction.
+#[test]
+fn predecessor_tombstone_withholds_stable_link_until_successor_ingest() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let endpoint = format!("{org_id}:{doc_id}");
+    seed_org_state(&db, org_id);
+    let old = Db::prepare_org_item_index("Old", "t", "old body", None).unwrap();
+    db.commit_org_feed_item_with_metadata(
+        "old-item",
+        org_id,
+        1,
+        "owner",
+        "Old",
+        "old body",
+        "2026-08-13T00:00:00Z",
+        1,
+        1,
+        &sha32(1),
+        None,
+        Some("owner"),
+        &old,
+        Some(doc_id),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    db.upsert_manual_link("org", &endpoint, "meeting", "local-anchor")
+        .unwrap();
+
+    assert!(db.commit_org_feed_tombstone(org_id, "old-item", 2).unwrap());
+    assert_eq!(
+        link_count(&db, "org", &endpoint, "manual"),
+        1,
+        "the opaque user edge survives the unavailable-successor gap"
+    );
+    assert!(db.org_link_target_visible(&endpoint).unwrap().is_none());
+
+    let next = Db::prepare_org_item_index("Current", "t", "current body", None).unwrap();
+    db.commit_org_feed_item_with_metadata(
+        "current-item",
+        org_id,
+        3,
+        "owner",
+        "Current",
+        "current body",
+        "2026-08-13T00:00:02Z",
+        2,
+        1,
+        &sha32(2),
+        None,
+        Some("editor"),
+        &next,
+        Some(doc_id),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        db.org_link_target_visible(&endpoint).unwrap(),
+        Some(("current-item".into(), "Current".into()))
+    );
+    assert_eq!(link_count(&db, "org", &endpoint, "manual"), 1);
+}
+
+/// The narrow legacy single-edge API is a restore/retry primitive and therefore idempotent. The
+/// collapsed-chip batch API remains strict and atomic: one stale tuple rolls the complete set back.
+#[test]
+fn single_manual_delete_is_idempotent_while_collapsed_batch_stays_strict() {
+    let db = mem_db();
+    seed_folder(&db, "f1", "Notes");
+    seed_note_doc(&db, "left", "f1", "Left", "");
+    seed_note_doc(&db, "right", "f1", "Right", "");
+
+    db.upsert_manual_link("note", "left", "note", "right")
+        .unwrap();
+    db.delete_manual_link("note", "left", "note", "right")
+        .unwrap();
+    db.delete_manual_link("note", "left", "note", "right")
+        .expect("a restore/retry delete of the same single tuple is success");
+
+    let legacy_marker = crate::enrich::apply_link_markers(
+        "left prose",
+        &[crate::enrich::ContextHit {
+            source: "note".into(),
+            detail: "[[Right]]".into(),
+            url: None,
+        }],
+    );
+    db.set_document_text("left", &legacy_marker).unwrap();
+    db.set_note_doc_exported_path("left", Some("/vault/left.md"))
+        .unwrap();
+    db.delete_manual_link("note", "left", "note", "right")
+        .expect("missing-row retry still commits legacy marker cleanup");
+    let left_text: String = db
+        .lock()
+        .query_row("SELECT text FROM documents WHERE id = 'left'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(!left_text.contains("[[Right]]"));
+    let cleanup = db.pending_lock_marker_export_cleanup().unwrap();
+    assert!(cleanup.iter().any(|row| {
+        row.source_kind == "note"
+            && row.source_id == "left"
+            && row.exported_path == "/vault/left.md"
+    }));
+
+    db.upsert_manual_link("note", "left", "note", "right")
+        .unwrap();
+    db.upsert_manual_link("note", "right", "note", "left")
+        .unwrap();
+    db.delete_manual_link("note", "left", "note", "right")
+        .unwrap();
+    let requested = [
+        crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: "left".into(),
+            dst_kind: "note".into(),
+            dst_id: "right".into(),
+        },
+        crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: "right".into(),
+            dst_kind: "note".into(),
+            dst_id: "left".into(),
+        },
+    ];
+    assert!(db.delete_manual_links(&requested).is_err());
+    assert_eq!(
+        link_count(&db, "note", "right", "manual"),
+        1,
+        "strict batch failure rolls back the still-existing reverse tuple"
+    );
+}
+
+#[test]
+fn locked_manual_marker_cleanup_verifies_seal_before_atomic_replacement() {
+    let db = mem_db();
+    seed_folder(&db, "f-marker-seal", "Locked notes");
+    seed_note_doc(&db, "marker-left", "f-marker-seal", "Left", "");
+    seed_note_doc(&db, "marker-right", "f-marker-seal", "Right", "");
+    let marker = crate::enrich::apply_link_markers(
+        "left prose",
+        &[crate::enrich::ContextHit {
+            source: "note".into(),
+            detail: "[[Right]]".into(),
+            url: None,
+        }],
+    );
+    let stripped = crate::enrich::strip_managed_links_block(&marker);
+    db.set_document_text("marker-left", &marker).unwrap();
+    db.set_note_doc_exported_path("marker-left", Some("/vault/marker-left.md"))
+        .unwrap();
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET locked=1 WHERE id='f-marker-seal';
+             UPDATE documents SET text_blob=X'01' WHERE id='marker-left';",
+        )
+        .unwrap();
+    db.upsert_manual_link("note", "marker-left", "note", "marker-right")
+        .unwrap();
+
+    let edge = crate::storage::models::ManualLinkEdge {
+        src_kind: "note".into(),
+        src_id: "marker-left".into(),
+        dst_kind: "note".into(),
+        dst_id: "marker-right".into(),
+    };
+    let content_key = zeroize::Zeroizing::new([7_u8; 32]);
+    let aad = b"murmur:document:v1|folder=f-marker-seal|document=marker-left|type=document";
+    let blob = crate::crypto::encrypt(&content_key, stripped.as_bytes(), aad).unwrap();
+    let invalid = crate::storage::links::PreparedManualMarkerSeal {
+        note_id: "marker-left".into(),
+        folder_id: "f-marker-seal".into(),
+        stripped_text: stripped.clone(),
+        text_blob: blob.clone(),
+        content_key: zeroize::Zeroizing::new([8_u8; 32]),
+    };
+    assert!(db
+        .delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &[invalid])
+        .is_err());
+    assert_eq!(
+        db.get_note_row("marker-left").unwrap().unwrap().text,
+        marker,
+        "verification failure must preserve the only plaintext"
+    );
+    assert_eq!(link_count(&db, "note", "marker-left", "manual"), 1);
+    assert!(db.pending_lock_marker_export_cleanup().unwrap().is_empty());
+
+    let valid = crate::storage::links::PreparedManualMarkerSeal {
+        note_id: "marker-left".into(),
+        folder_id: "f-marker-seal".into(),
+        stripped_text: stripped.clone(),
+        text_blob: blob,
+        content_key: content_key.clone(),
+    };
+    assert!(db
+        .delete_manual_links_with_marker_seals(&[edge], &[valid])
+        .unwrap());
+    let stored = db.get_note_row("marker-left").unwrap().unwrap();
+    let stored_blob: Vec<u8> = db
+        .lock()
+        .query_row(
+            "SELECT text_blob FROM documents WHERE id='marker-left'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.text.is_empty(),
+        "a locked note must not retain plaintext beside its verified ciphertext"
+    );
+    assert_eq!(
+        crate::crypto::decrypt(&content_key, &stored_blob, aad).unwrap(),
+        stripped.as_bytes(),
+        "the committed locked representation must decrypt byte-identical"
+    );
+    assert_eq!(link_count(&db, "note", "marker-left", "manual"), 0);
+    assert_eq!(db.pending_lock_marker_export_cleanup().unwrap().len(), 1);
+}
+
+#[test]
+fn current_document_management_does_not_mutate_origin_cas_baseline() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    db.insert_org_share(
+        "share-1",
+        STABLE_ORG_ID,
+        None,
+        Some("local-note"),
+        "note",
+        Some("Local"),
+        1,
+        1,
+        &sha32(1),
+        "2026-08-12T00:00:00Z",
+    )
+    .unwrap();
+    db.set_org_share_uploaded("share-1", "old-item", "2026-08-12T00:00:01Z")
+        .unwrap();
+    db.set_org_share_document_metadata("share-1", STABLE_DOC_ID, "view")
+        .unwrap();
+    db.set_org_share_document_metadata("share-1", STABLE_DOC_ID, "edit")
+        .unwrap();
+    db.clear_org_share_document_metadata("share-1").unwrap();
+    let cleared = db.org_share_by_item("old-item").unwrap().unwrap();
+    assert_eq!(cleared.doc_id, None);
+    assert_eq!(cleared.access, "view");
+    db.set_org_share_document_metadata("share-1", STABLE_DOC_ID, "view")
+        .unwrap();
+
+    for (item, seq, rev, access) in [("old-item", 1, 1, "view"), ("remote-current", 2, 2, "edit")] {
+        db.upsert_org_item(
+            item,
+            STABLE_ORG_ID,
+            seq,
+            "owner",
+            item,
+            "body",
+            "2026-08-12T00:00:00Z",
+            rev,
+            1,
+            &sha32(rev as u8),
+            None,
+            Some("editor"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item, Some(STABLE_DOC_ID), access, Some("owner"))
+            .unwrap();
+    }
+    db.repair_org_reconcile_metadata(
+        "remote-current",
+        STABLE_ORG_ID,
+        1,
+        Some(STABLE_DOC_ID),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    db.evict_org_item("old-item").unwrap();
+
+    // Local journal ids and relay item ids are separate namespaces. A colliding local id must not
+    // hijack a revoke request for the current relay item.
+    db.insert_org_share(
+        "remote-current",
+        STABLE_ORG_ID,
+        None,
+        Some("collision-source"),
+        "note",
+        Some("Unrelated"),
+        1,
+        1,
+        &sha32(9),
+        "2026-08-12T00:00:02Z",
+    )
+    .unwrap();
+    db.set_org_share_uploaded(
+        "remote-current",
+        "unrelated-relay-item",
+        "2026-08-12T00:00:03Z",
+    )
+    .unwrap();
+    db.set_org_share_document_metadata(
+        "remote-current",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "view",
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.current_org_document_status(STABLE_ORG_ID, STABLE_DOC_ID)
+            .unwrap(),
+        Some(("remote-current".into(), 2, "edit".into()))
+    );
+    assert!(db.org_share_by_item("remote-current").unwrap().is_none());
+    let management = db
+        .org_share_for_revoke_target("remote-current")
+        .unwrap()
+        .unwrap();
+    assert_eq!(management.id, "share-1");
+    assert_eq!(management.item_id.as_deref(), Some("old-item"));
+    assert_eq!(
+        management.rev, 1,
+        "remote feed must not rewrite expectedRev"
+    );
+
+    assert!(db.evict_org_document(STABLE_ORG_ID, STABLE_DOC_ID).unwrap());
+    assert!(db
+        .current_org_document_status(STABLE_ORG_ID, STABLE_DOC_ID)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn org_access_attempts_are_exact_transactional_cas_across_failures_and_accounts() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+    let other_actor = "d645c7e3-13d2-4d3d-b367-4bf9603c2678";
+    db.upsert_org_item(
+        "access-head",
+        STABLE_ORG_ID,
+        1,
+        actor,
+        "Shared",
+        "body",
+        "2026-08-12T00:00:00Z",
+        1,
+        1,
+        &sha32(1),
+        None,
+        Some(actor),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("access-head", Some(STABLE_DOC_ID), "edit", Some(actor))
+        .unwrap();
+    db.repair_org_reconcile_metadata(
+        "access-head",
+        STABLE_ORG_ID,
+        1,
+        Some(STABLE_DOC_ID),
+        "edit",
+        Some(actor),
+        true,
+    )
+    .unwrap();
+    db.insert_org_share(
+        "access-share",
+        STABLE_ORG_ID,
+        None,
+        Some("access-source"),
+        "note",
+        Some("Shared"),
+        1,
+        1,
+        &sha32(1),
+        "2026-08-12T00:00:00Z",
+    )
+    .unwrap();
+    db.set_org_share_uploaded("access-share", "access-head", "2026-08-12T00:00:01Z")
+        .unwrap();
+    db.set_org_share_document_metadata("access-share", STABLE_DOC_ID, "edit")
+        .unwrap();
+
+    let dispatch_1 = "11111111-2222-4333-8444-555555555555";
+    assert!(db
+        .persist_org_access_attempt_if_current(
+            1,
+            "relay.example",
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+            "2026-08-12T00:00:02Z",
+        )
+        .unwrap());
+    assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
+    assert_eq!(db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
+    assert!(!db
+        .persist_org_access_attempt_if_current(
+            2,
+            "relay.example",
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+            "2026-08-12T00:00:03Z",
+        )
+        .unwrap());
+    assert_eq!(
+        db.count_share_egress_by_kind("org_share_access").unwrap(),
+        1,
+        "a refused duplicate must roll its ledger insert back"
+    );
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            other_actor,
+            actor,
+        )
+        .unwrap());
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .unwrap());
+
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER abort_access_projection
+             BEFORE UPDATE OF access ON org_items
+             BEGIN SELECT RAISE(ABORT, 'access projection fault'); END;",
+        )
+        .unwrap();
+    assert!(db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .is_err());
+    assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
+    assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "edit");
+    assert_eq!(db.get_org_share("access-share").unwrap().unwrap().access, "edit");
+    db.lock()
+        .execute_batch("DROP TRIGGER abort_access_projection;")
+        .unwrap();
+
+    assert!(db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .unwrap());
+    assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "view");
+    assert_eq!(db.get_org_share("access-share").unwrap().unwrap().access, "view");
+    assert!(db.pending_org_access_attempts().unwrap().is_empty());
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .unwrap());
+
+    let dispatch_2 = "22222222-3333-4444-8555-666666666666";
+    assert!(db
+        .persist_org_access_attempt_if_current(
+            3,
+            "relay.example",
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+            "2026-08-12T00:00:04Z",
+        )
+        .unwrap());
+    assert!(!db
+        .fail_org_access_attempt_if_current(
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            other_actor,
+            actor,
+        )
+        .unwrap());
+    assert!(db
+        .fail_org_access_attempt_if_current(
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+        )
+        .unwrap());
+    assert!(db.pending_org_access_attempts().unwrap().is_empty());
+
+    let dispatch_3 = "33333333-4444-4555-8666-777777777777";
+    assert!(db
+        .persist_org_access_attempt_if_current(
+            4,
+            "relay.example",
+            dispatch_3,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+            "2026-08-12T00:00:05Z",
+        )
+        .unwrap());
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+        )
+        .unwrap());
+    db.lock()
+        .execute(
+            "UPDATE org_shares SET state='failed',last_error='direct_put_pending'
+              WHERE id='access-share'",
+            [],
+        )
+        .unwrap();
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_3,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+        )
+        .unwrap());
+    assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "view");
+    assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
+}
+
+#[test]
+fn feed_repairs_stable_metadata_even_when_content_action_is_already_applied() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    db.upsert_org_item(
+        "local-first",
+        STABLE_ORG_ID,
+        5,
+        "owner",
+        "Title",
+        "body",
+        "2026-08-12T00:00:00Z",
+        1,
+        1,
+        &sha32(4),
+        None,
+        Some("owner"),
+        None,
+    )
+    .unwrap();
+    db.set_org_last_seq(STABLE_ORG_ID, 5).unwrap();
+    let prepared = Db::prepare_org_item_index("Title", "t", "body", None).unwrap();
+    let applied = db
+        .commit_org_feed_item_with_metadata(
+            "local-first",
+            STABLE_ORG_ID,
+            5,
+            "owner",
+            "Title",
+            "body",
+            "2026-08-12T00:00:00Z",
+            1,
+            1,
+            &sha32(4),
+            None,
+            Some("owner"),
+            &prepared,
+            Some(STABLE_DOC_ID),
+            "edit",
+            Some("owner"),
+            true,
+        )
+        .unwrap();
+    assert!(
+        applied.changed,
+        "a legacy row without the atomic projection witness must repair its full projection"
+    );
+    assert_eq!(
+        db.org_replica_state("local-first")
+            .unwrap()
+            .unwrap()
+            .projection_sha256
+            .as_deref(),
+        Some(sha32(4).as_slice())
+    );
+    let ctx = db.org_item_edit_ctx("local-first").unwrap().unwrap();
+    assert_eq!(ctx.doc_id.as_deref(), Some(STABLE_DOC_ID));
+    assert_eq!(ctx.access, "edit");
+    assert_eq!(ctx.document_owner_user_id.as_deref(), Some("owner"));
+}
+
+#[test]
+fn anti_entropy_metadata_preserves_org_link_across_supersede_and_repairs_hash_equal_row() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let endpoint = format!("{org_id}:{doc_id}");
+    seed_org_state(&db, org_id);
+    db.upsert_org_item(
+        "old-rev",
+        org_id,
+        1,
+        "owner",
+        "Old",
+        "old body",
+        "2026-08-12T00:00:00Z",
+        1,
+        1,
+        &sha32(1),
+        None,
+        Some("owner"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("old-rev", Some(doc_id), "view", Some("owner"))
+        .unwrap();
+    db.repair_org_reconcile_metadata(
+        "old-rev",
+        org_id,
+        1,
+        Some(doc_id),
+        "view",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    db.upsert_org_item(
+        "attacker-max-rev",
+        org_id,
+        99,
+        "attacker",
+        "Forged max rev",
+        "must never navigate",
+        "2026-08-12T00:00:00Z",
+        u32::MAX,
+        1,
+        &sha32(9),
+        None,
+        Some("attacker"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("attacker-max-rev", Some(doc_id), "edit", Some("attacker"))
+        .unwrap();
+    db.upsert_manual_link("org", &endpoint, "meeting", "local-anchor")
+        .unwrap();
+
+    let prepared = Db::prepare_org_item_index("Current", "t", "current body", None).unwrap();
+    assert!(
+        db.commit_org_reconcile_item_with_metadata(
+            "current-rev",
+            org_id,
+            2,
+            "owner",
+            "Current",
+            "current body",
+            "2026-08-12T00:00:00Z",
+            2,
+            1,
+            &sha32(2),
+            None,
+            Some("editor"),
+            &prepared,
+            Some(doc_id),
+            "edit",
+            Some("owner"),
+            true,
+        )
+        .unwrap()
+        .changed
+    );
+    db.evict_org_item("old-rev").unwrap();
+    assert_eq!(link_count(&db, "org", &endpoint, "manual"), 1);
+    assert_eq!(
+        db.org_link_target_visible(&endpoint).unwrap(),
+        Some(("current-rev".into(), "Current".into()))
+    );
+
+    // A later hash-converged anti-entropy pass repairs permission metadata without re-fetching or
+    // rewriting the already-correct plaintext/index.
+    db.lock()
+        .execute(
+            "UPDATE org_items SET doc_id = NULL, access = 'view', document_owner_user_id = NULL
+              WHERE item_id = 'current-rev'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        db.repair_org_reconcile_metadata(
+            "current-rev",
+            org_id,
+            1,
+            Some(doc_id),
+            "edit",
+            Some("owner"),
+            true,
+        )
+        .unwrap()
+        .changed
+    );
+    let ctx = db.org_item_edit_ctx("current-rev").unwrap().unwrap();
+    assert_eq!(ctx.doc_id.as_deref(), Some(doc_id));
+    assert_eq!(ctx.access, "edit");
+    assert_eq!(ctx.document_owner_user_id.as_deref(), Some("owner"));
+}
+
+/// Every stable-head assignment can demote readable plaintext. The demotion and global-derived Ask
+/// invalidation must be one SQLCipher transaction across local publish, live feed, reconcile ingest,
+/// and metadata-only reconcile (including an explicit current→non-current repair).
+#[test]
+fn stable_current_mutations_atomically_invalidate_global_ask_history() {
+    for mode in [
+        "local",
+        "feed",
+        "reconcile",
+        "repair_assign",
+        "repair_demote",
+    ] {
+        let db = mem_db();
+        seed_org_state(&db, STABLE_ORG_ID);
+        seed_folder(&db, "f-dep", "Dependency");
+        for (item_id, seq, rev) in [("old-current", 1_u64, 1_u32), ("new-head", 2, 2)] {
+            db.upsert_org_item(
+                item_id,
+                STABLE_ORG_ID,
+                seq,
+                "owner",
+                item_id,
+                "shared body",
+                "2026-08-13T00:00:00Z",
+                rev,
+                1,
+                &sha32(rev as u8),
+                None,
+                Some("owner"),
+                None,
+            )
+            .unwrap();
+            db.set_org_item_document_metadata(item_id, Some(STABLE_DOC_ID), "view", Some("owner"))
+                .unwrap();
+        }
+        db.repair_org_reconcile_metadata(
+            "old-current",
+            STABLE_ORG_ID,
+            1,
+            Some(STABLE_DOC_ID),
+            "view",
+            Some("owner"),
+            true,
+        )
+        .unwrap();
+        db.persist_ask_exchange(
+            &crate::storage::models::AskConversationScope::Vault,
+            None,
+            "question",
+            "derived from old current org content",
+            &[],
+            &[],
+            &[],
+            &["f-dep".to_string()],
+            "2026-08-13T00:01:00Z",
+        )
+        .unwrap();
+        let generation_before: i64 = db
+            .lock()
+            .query_row(
+                "SELECT visibility_generation FROM ask_history_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let prepared =
+            Db::prepare_org_item_index("new-head", "2026-08-13T00:00:00Z", "shared body", None)
+                .unwrap();
+
+        match mode {
+            "local" => {
+                db.commit_local_org_replica_with_metadata(
+                    "new-head",
+                    STABLE_ORG_ID,
+                    2,
+                    "owner",
+                    "new-head",
+                    "shared body",
+                    "2026-08-13T00:00:00Z",
+                    2,
+                    1,
+                    &sha32(2),
+                    None,
+                    Some("owner"),
+                    &prepared,
+                    None,
+                    Some(STABLE_DOC_ID),
+                    "view",
+                    Some("owner"),
+                    true,
+                )
+                .unwrap();
+            }
+            "feed" => {
+                db.commit_org_feed_item_with_metadata(
+                    "new-head",
+                    STABLE_ORG_ID,
+                    3,
+                    "owner",
+                    "new-head",
+                    "shared body",
+                    "2026-08-13T00:00:00Z",
+                    3,
+                    1,
+                    &sha32(3),
+                    None,
+                    Some("owner"),
+                    &prepared,
+                    Some(STABLE_DOC_ID),
+                    "view",
+                    Some("owner"),
+                    true,
+                )
+                .unwrap();
+            }
+            "reconcile" => {
+                db.commit_org_reconcile_item_with_metadata(
+                    "new-head",
+                    STABLE_ORG_ID,
+                    3,
+                    "owner",
+                    "new-head",
+                    "shared body",
+                    "2026-08-13T00:00:00Z",
+                    3,
+                    1,
+                    &sha32(3),
+                    None,
+                    Some("owner"),
+                    &prepared,
+                    Some(STABLE_DOC_ID),
+                    "view",
+                    Some("owner"),
+                    true,
+                )
+                .unwrap();
+            }
+            "repair_assign" => {
+                db.repair_org_reconcile_metadata(
+                    "new-head",
+                    STABLE_ORG_ID,
+                    1,
+                    Some(STABLE_DOC_ID),
+                    "view",
+                    Some("owner"),
+                    true,
+                )
+                .unwrap();
+            }
+            "repair_demote" => {
+                db.repair_org_reconcile_metadata(
+                    "old-current",
+                    STABLE_ORG_ID,
+                    1,
+                    Some(STABLE_DOC_ID),
+                    "view",
+                    Some("owner"),
+                    false,
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let conn = db.lock();
+        let generation_after: i64 = conn
+            .query_row(
+                "SELECT visibility_generation FROM ask_history_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_after, generation_before + 1, "mode={mode}");
+        for table in [
+            "ask_conversations",
+            "ask_conversation_messages",
+            "ask_conversation_dependencies",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "mode={mode} table={table}");
+        }
+    }
 }
 
 /// Ingest round-trip: upsert an org item WITH a real (stub) embedder → both the int8 KNN leg AND
@@ -358,6 +2623,91 @@ fn org_ingest_fts_only_when_no_embedder() {
     // The re-embed backlog lists exactly this item.
     let backlog = db.org_items_needing_embed("org-1", 10).unwrap();
     assert_eq!(backlog, vec!["it-x".to_string()]);
+}
+
+/// Stable-document retrieval must follow the relay-authoritative `is_current` witness, never the
+/// largest locally observed revision. A live attacker-controlled high-rev row for the same doc is
+/// kept in the replica for reconciliation, but must stay absent from every content reader and the
+/// re-embed backlog.
+#[test]
+fn org_content_readers_expose_only_authoritative_current_revision() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    seed_org_state(&db, org_id);
+
+    let conn = db.lock();
+    for (item_id, title, rev, is_current) in [
+        ("attacker-high-rev", "Attacker", 999_i64, 0_i64),
+        ("authoritative-current", "Current", 2_i64, 1_i64),
+    ] {
+        conn.execute(
+            "INSERT INTO org_items
+               (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
+                content_sha256, tombstoned, doc_id, is_current)
+             VALUES (?1, ?2, ?3, 'member', ?4, 'sapphire parcel body',
+                     '2026-08-13T00:00:00Z', ?3, 1, ?5, 0, ?6, ?7)",
+            rusqlite::params![
+                item_id,
+                org_id,
+                rev,
+                title,
+                sha32(if is_current == 1 { 2 } else { 9 }),
+                doc_id,
+                is_current,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_chunks (item_id, chunk_idx, text)
+             VALUES (?1, 0, 'sapphire parcel body')",
+            rusqlite::params![item_id],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        let blob = crate::embed::vec_to_int8_blob(&one_hot(0));
+        conn.execute(
+            "INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+            rusqlite::params![chunk_id, blob],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let knn_ids = db
+        .search_org_chunks_knn(&one_hot(0), 10, 0.0)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.item_id)
+        .collect::<Vec<_>>();
+    assert_eq!(knn_ids, vec!["authoritative-current"]);
+
+    let strict_ids = db
+        .search_org_chunks_fts("sapphire parcel", 10)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.item_id)
+        .collect::<Vec<_>>();
+    assert_eq!(strict_ids, vec!["authoritative-current"]);
+
+    let fallback_ids = db
+        .search_org_chunks_fts("missing sapphire", 10)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.item_id)
+        .collect::<Vec<_>>();
+    assert_eq!(fallback_ids, vec!["authoritative-current"]);
+
+    db.lock()
+        .execute(
+            "DELETE FROM org_vec_chunks WHERE chunk_id IN
+                 (SELECT id FROM org_chunks WHERE item_id IN
+                     ('attacker-high-rev', 'authoritative-current'))",
+            [],
+        )
+        .unwrap();
+    let backlog = db.org_items_needing_embed(org_id, 10).unwrap();
+    assert_eq!(backlog, vec!["authoritative-current"]);
 }
 
 /// Crash boundary: fetching a page never makes its advertised tail durable. Each successful
@@ -610,7 +2960,9 @@ fn membership_withdrawal_purges_stale_history_even_with_empty_replica() {
     assert!(db.delete_org_state("org-1").unwrap());
     let count: i64 = db
         .lock()
-        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(count, 0);
 }
@@ -785,9 +3137,14 @@ fn local_org_replica_commit_reports_transactional_supersede_once() {
     assert!(db.org_replica_state("it-old").unwrap().unwrap().tombstoned);
     let ask_rows: i64 = db
         .lock()
-        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    assert_eq!(ask_rows, 0, "supersede atomically purges derived Ask history");
+    assert_eq!(
+        ask_rows, 0,
+        "supersede atomically purges derived Ask history"
+    );
 
     let second = db
         .commit_local_org_replica(
@@ -873,6 +3230,125 @@ fn org_vector_reindex_primitives_preserve_replica_chunks_fts_and_cursor() {
         .unwrap();
     assert_eq!(vectors_after, chunks_before);
     assert_eq!(db.org_last_seq_for("org-1").unwrap(), 15);
+}
+
+/// Global rebuild/startup-repair readers must never materialize plaintext from an obsolete stable
+/// document revision. The attacker row sorts first and has the larger revision, while the relay
+/// witness deliberately marks only the lower revision current.
+#[test]
+fn org_vector_rebuild_readers_skip_live_noncurrent_revision() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    let conn = db.lock();
+    for (item_id, rev, is_current) in [
+        ("a-attacker-high-rev", 999_i64, 0_i64),
+        ("z-authoritative-current", 2_i64, 1_i64),
+    ] {
+        conn.execute(
+            "INSERT INTO org_items
+               (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
+                content_sha256, tombstoned, doc_id, is_current)
+             VALUES (?1, 'org-1', ?2, 'member', ?1, 'vector repair secret', 't', ?2, 1,
+                     ?3, 0, 'doc-1', ?4)",
+            rusqlite::params![
+                item_id,
+                rev,
+                sha32(if is_current == 1 { 2 } else { 9 }),
+                is_current
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_chunks (item_id, chunk_idx, text)
+             VALUES (?1, 0, 'vector repair secret')",
+            rusqlite::params![item_id],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    assert_eq!(
+        db.next_org_item_vector_batch(None)
+            .unwrap()
+            .expect("current rebuild batch")
+            .item_id,
+        "z-authoritative-current"
+    );
+    assert_eq!(
+        db.next_missing_org_item_vector_batch(None)
+            .unwrap()
+            .expect("current repair batch")
+            .item_id,
+        "z-authoritative-current"
+    );
+    assert!(db
+        .org_item_vector_batch("a-attacker-high-rev")
+        .unwrap()
+        .is_none());
+}
+
+/// Embedding runs outside the DB transaction. If a revision is current at read time but is demoted
+/// before the vector batch commits, the transaction must reject that stale batch and persist no
+/// searchable vector rows.
+#[test]
+fn org_vector_batch_commit_rejects_revision_demoted_after_read() {
+    let db = mem_db();
+    seed_org_state(&db, STABLE_ORG_ID);
+    let emb = crate::embed::StubEmbedder;
+    db.upsert_org_item(
+        "current-before-embed",
+        STABLE_ORG_ID,
+        2,
+        "member",
+        "Current",
+        "demotion race content",
+        "t",
+        2,
+        1,
+        &sha32(2),
+        None,
+        Some("author-1"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata(
+        "current-before-embed",
+        Some(STABLE_DOC_RACE_ID),
+        "view",
+        Some("author-1"),
+    )
+    .unwrap();
+    db.repair_org_reconcile_metadata(
+        "current-before-embed",
+        STABLE_ORG_ID,
+        1,
+        Some(STABLE_DOC_RACE_ID),
+        "view",
+        Some("author-1"),
+        true,
+    )
+    .unwrap();
+
+    let batch = db
+        .org_item_vector_batch("current-before-embed")
+        .unwrap()
+        .expect("current batch before embedding");
+    let vectors = Db::prepare_org_vector_blobs(&batch.texts, &emb).unwrap();
+
+    db.lock()
+        .execute(
+            "UPDATE org_items SET is_current = 0 WHERE item_id = 'current-before-embed'",
+            [],
+        )
+        .unwrap();
+    assert!(!db
+        .commit_org_item_vectors_if_unchanged(&batch, &vectors)
+        .unwrap());
+    let persisted: i64 = db
+        .lock()
+        .query_row("SELECT COUNT(*) FROM org_vec_chunks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(persisted, 0, "demoted revision must receive no vectors");
 }
 
 /// CAS must compare content as well as rowids: SQLite can reuse deleted max INTEGER PRIMARY KEY
@@ -1071,7 +3547,9 @@ fn org_tombstone_evicts_from_retrieval_and_viewer() {
     assert_eq!(n, 0, "org_chunks purged on tombstone");
     let ask_count: i64 = db
         .lock()
-        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(ask_count, 0, "org tombstone must purge global-derived Ask");
     // Idempotent re-tombstone.
@@ -1087,6 +3565,145 @@ fn org_tombstone_evicts_from_retrieval_and_viewer() {
 /// re-pull stays idempotent — so the CASCADE never fired and a withdrawn colleague's pictures stayed
 /// as plaintext BLOBs in SQLite. Also asserts the primitive's return value: `true` only when a LIVE
 /// row was actually evicted, so callers can count real convergence work.
+#[test]
+fn org_feed_attachment_collision_rolls_back_item_cursor_and_completeness_witness() {
+    let db = mem_db();
+    let org_id = "33333333-3333-4333-8333-333333333333";
+    seed_org_state(&db, org_id);
+    db.upsert_org_item(
+        "other", org_id, 1, "owner", "Other", "body", "t", 1, 1,
+        &sha32(1), None, Some("owner"), None,
+    ).unwrap();
+    db.replace_org_item_attachment_bundle(
+        "other",
+        &[crate::storage::IncomingAttachment {
+            id: "collision".into(), mime_type: "image/png".into(), extension: "png".into(),
+            width: 1, height: 1, sha256: [2; 32], data: vec![2],
+        }],
+    ).unwrap();
+    let prepared = Db::prepare_org_item_index("Target", "t", "private target", None).unwrap();
+    let attachment = crate::storage::IncomingAttachment {
+        id: "collision".into(), mime_type: "image/png".into(), extension: "png".into(),
+        width: 1, height: 1, sha256: [3; 32], data: vec![3],
+    };
+    let failed = db.commit_org_feed_item_with_metadata_and_attachments(
+        "target", org_id, 2, "owner", "Target", "private target", "t", 1, 1,
+        &sha32(4), None, Some("owner"), &prepared, Some("11111111-1111-4111-8111-111111111111"),
+        "view", Some("owner"), true, &[attachment],
+    );
+    assert!(failed.is_err());
+    let conn = db.lock();
+    assert_eq!(conn.query_row("SELECT last_seq FROM org_state WHERE org_id=?1", [org_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM org_items WHERE item_id='target'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    drop(conn);
+    db.lock().execute("DELETE FROM note_attachments WHERE id='collision'", []).unwrap();
+    let repaired = crate::storage::IncomingAttachment {
+        id: "target-image".into(), mime_type: "image/png".into(), extension: "png".into(),
+        width: 1, height: 1, sha256: [3; 32], data: vec![3],
+    };
+    assert!(db.commit_org_feed_item_with_metadata_and_attachments(
+        "target", org_id, 2, "owner", "Target", "private target", "t", 1, 1,
+        &sha32(4), None, Some("owner"), &prepared, Some("11111111-1111-4111-8111-111111111111"),
+        "view", Some("owner"), true, &[repaired],
+    ).unwrap().changed);
+    let conn = db.lock();
+    assert!(conn.query_row("SELECT projection_sha256=?2 FROM org_items WHERE item_id=?1", rusqlite::params!["target",sha32(4)], |r| r.get::<_, bool>(0)).unwrap());
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM note_attachments WHERE org_item_id='target'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+}
+
+#[test]
+fn org_feed_atomically_closes_projection_pending_and_preserves_newer_source_dirty() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = "22222222-2222-4222-8222-222222222222";
+    seed_org_state(&db, org_id);
+    db.insert_org_share(
+        "share-a", org_id, None, Some("source-b"), "note", Some("B"), 2, 1,
+        &sha32(4), "2026-08-13T00:00:00Z",
+    ).unwrap();
+    db.set_org_share_document_metadata("share-a", doc_id, "view").unwrap();
+    {
+        let conn = db.lock();
+        conn.execute(
+            "UPDATE org_shares SET state='failed',last_error='projection_pending',
+              item_id='item-a',dispatch_id='dispatch-a',expected_actor_user_id='actor',
+              expected_owner_user_id='owner',republish_dirty=1 WHERE id='share-a'", [],
+        ).unwrap();
+    }
+    let prepared = Db::prepare_org_item_index("A", "t", "remote A", None).unwrap();
+    let outcome = db.commit_org_feed_item_with_metadata_and_attachments(
+        "item-a", org_id, 2, "actor", "A", "remote A", "t", 2, 1, &sha32(4),
+        None, Some("actor"), &prepared, Some(doc_id), "view", Some("owner"), true, &[],
+    ).unwrap();
+    assert!(outcome.changed);
+    let row = db.get_org_share("share-a").unwrap().unwrap();
+    assert_eq!(row.state, "uploaded");
+    assert_eq!(row.last_error, None);
+    assert_eq!(row.republish_dirty, 1, "newer source B remains queued after A closes");
+    assert_eq!(db.org_replica_state("item-a").unwrap().unwrap().projection_sha256, Some(sha32(4)));
+}
+
+#[test]
+fn org_feed_tombstone_closes_projection_pending_journals_without_resurrection() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    seed_org_state(&db, org_id);
+    for (id, source) in [("anchored", Some("source")), ("journal", None)] {
+        db.insert_org_share(id, org_id, None, source, "note", Some("T"), 2, 1,
+            &sha32(5), "2026-08-13T00:00:00Z").unwrap();
+        db.lock().execute(
+            "UPDATE org_shares SET state='failed',last_error='projection_pending',item_id='item-a'
+              WHERE id=?1", [id],
+        ).unwrap();
+    }
+    assert!(db.commit_org_feed_tombstone(org_id, "item-a", 1).unwrap());
+    assert_eq!(db.get_org_share("anchored").unwrap().unwrap().last_error.as_deref(), Some("org_edit_conflict"));
+    assert!(db.get_org_share("journal").unwrap().is_none());
+}
+
+#[test]
+fn confirmed_document_delete_terminalizes_sibling_anchors_and_plaintext_in_one_tx() {
+    let db = mem_db();
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = "22222222-2222-4222-8222-222222222222";
+    seed_org_state(&db, org_id);
+    for (index, item) in ["item-1", "item-2"].into_iter().enumerate() {
+        db.insert_org_share(item, org_id, None, Some(item), "note", Some("T"),
+            (index + 1) as u32, 1, &sha32(index as u8), "2026-08-13T00:00:00Z").unwrap();
+        db.set_org_share_uploaded(item, item, "2026-08-13T00:00:01Z").unwrap();
+        db.set_org_share_document_metadata(item, doc_id, "view").unwrap();
+        db.upsert_org_item(item, org_id, (index + 1) as u64, "owner", "T", "secret",
+            "t", (index + 1) as u32, 1, &sha32(index as u8), None, Some("owner"), None).unwrap();
+        db.set_org_item_document_metadata(item, Some(doc_id), "view", Some("owner")).unwrap();
+    }
+    let endpoint = format!("{org_id}:{doc_id}");
+    db.lock()
+        .execute(
+            "INSERT INTO links
+               (src_kind,src_id,dst_kind,dst_id,edge_type,created_at)
+             VALUES('org',?1,'note','local-note','manual',1)",
+            [&endpoint],
+        )
+        .unwrap();
+    assert!(db.terminalize_and_evict_org_document(org_id, doc_id, "2026-08-13T00:00:02Z").unwrap());
+    for id in ["item-1", "item-2"] {
+        assert_eq!(db.get_org_share(id).unwrap().unwrap().state, "revoked");
+        let item = db.get_org_item(id).unwrap();
+        assert!(item.is_none(), "tombstoned plaintext is not readable");
+    }
+    assert_eq!(
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE src_kind='org' AND src_id=?1",
+                [&endpoint],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "confirmed stable-document destruction must purge private graph tuples"
+    );
+}
+
 #[test]
 fn evicting_an_org_item_purges_its_attachment_blobs_on_every_path() {
     let attachment_count = |db: &Db, item_id: &str| -> i64 {
@@ -1221,18 +3838,23 @@ fn reconcile_commit_writes_below_the_live_cursor_but_never_resurrects_a_tombston
     db.set_org_last_seq("org-1", 42).unwrap();
     let prepared = Db::prepare_org_item_index("Recovered", "t", "recovered body", None).unwrap();
 
-    // Below the live cursor: the feed-commit path refuses (its cursor claim fails), the reconcile
-    // commit succeeds — and leaves the live cursor exactly where it was.
-    assert!(!db
-        .commit_org_feed_item(
-            "it-below", "org-1", 5, "anna", "Recovered", "recovered body", "t", 1, 1, &sha32(6),
-            None, None, &prepared,
-        )
-        .unwrap());
+    // Below the live cursor, reconcile still installs the complete projection and leaves the live
+    // cursor exactly where it was. Feed's legacy-incomplete repair behavior has its own oracle.
     assert!(db
         .commit_org_reconcile_item(
-            "it-below", "org-1", 5, "anna", "Recovered", "recovered body", "t", 1, 1, &sha32(6),
-            None, None, &prepared,
+            "it-below",
+            "org-1",
+            5,
+            "anna",
+            "Recovered",
+            "recovered body",
+            "t",
+            1,
+            1,
+            &sha32(6),
+            None,
+            None,
+            &prepared,
         )
         .unwrap());
     assert!(db.get_org_item("it-below").unwrap().is_some());
@@ -1242,8 +3864,19 @@ fn reconcile_commit_writes_below_the_live_cursor_but_never_resurrects_a_tombston
     assert!(db.evict_org_item("it-below").unwrap());
     assert!(!db
         .commit_org_reconcile_item(
-            "it-below", "org-1", 5, "anna", "Recovered", "recovered body", "t", 2, 1, &sha32(6),
-            None, None, &prepared,
+            "it-below",
+            "org-1",
+            5,
+            "anna",
+            "Recovered",
+            "recovered body",
+            "t",
+            2,
+            1,
+            &sha32(6),
+            None,
+            None,
+            &prepared,
         )
         .unwrap());
     assert!(db.get_org_item("it-below").unwrap().is_none());
@@ -1251,8 +3884,19 @@ fn reconcile_commit_writes_below_the_live_cursor_but_never_resurrects_a_tombston
     // Withdrawn membership can never be followed by a plaintext replica resurrection.
     assert!(!db
         .commit_org_reconcile_item(
-            "it-gone-org", "org-left", 5, "anna", "Recovered", "recovered body", "t", 1, 1,
-            &sha32(6), None, None, &prepared,
+            "it-gone-org",
+            "org-left",
+            5,
+            "anna",
+            "Recovered",
+            "recovered body",
+            "t",
+            1,
+            1,
+            &sha32(6),
+            None,
+            None,
+            &prepared,
         )
         .unwrap());
     assert!(db.get_org_item("it-gone-org").unwrap().is_none());
@@ -1753,6 +4397,38 @@ fn org_shared_content_hashes_are_collected() {
     assert!(hashes.contains(&sha32(8)));
 }
 
+#[test]
+fn org_share_scrub_is_explicit_and_legacy_default_is_fail_safe() {
+    let db = mem_db();
+    let now = "2026-08-12T00:00:00Z";
+    db.lock()
+        .execute(
+            "INSERT INTO org_shares
+               (id, org_id, meeting_id, kind, title, rev, generation, content_sha256,
+                state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'note', 'Legacy', 1, 1, ?4, 'queued', ?5, ?5)",
+            rusqlite::params!["legacy-default", "org-1", "m1", sha32(1), now],
+        )
+        .unwrap();
+    db.insert_org_share_with_scrub(
+        "explicit-off",
+        "org-1",
+        Some("m2"),
+        None,
+        "note",
+        Some("Explicit"),
+        1,
+        1,
+        &sha32(2),
+        false,
+        now,
+    )
+    .unwrap();
+
+    assert!(db.get_org_share("legacy-default").unwrap().unwrap().scrub);
+    assert!(!db.get_org_share("explicit-off").unwrap().unwrap().scrub);
+}
+
 /// `org_shares_for_source` (the re-publish-on-edit enumerator) returns EVERY uploaded row for a
 /// source ACROSS ALL orgs (a note may be shared to several), and ONLY `uploaded` rows — a
 /// `queued`/`failed`/`revoked` row is excluded (no live server item to supersede). A `None`/`None`
@@ -1924,8 +4600,8 @@ fn org_shares_for_source_includes_failed_rows_with_a_live_item_id() {
 }
 
 /// `uploaded_org_shares_for_source_in_org` is (org, source)-SCOPED and OLDEST-FIRST: only the
-/// `uploaded` rows for the EXACT (org, source), earliest `created_at` first (so `[0]` is the dedup
-/// keeper), excluding another org, another source, and any non-uploaded (queued / revoked) row.
+/// Known-live rows plus fail-closed admission blockers for the EXACT (org, source), with uploaded
+/// keepers first and blockers last. Another org/source and revoked rows remain excluded.
 #[test]
 fn uploaded_org_shares_for_source_in_org_scopes_and_orders_oldest_first() {
     let db = mem_db();
@@ -1975,7 +4651,8 @@ fn uploaded_org_shares_for_source_in_org_scopes_and_orders_oldest_first() {
     .unwrap();
     db.set_org_share_uploaded("u-c", "item-c", "2026-07-11T00:03:00Z")
         .unwrap();
-    // A still-`queued` row for the same (org, source) — EXCLUDED (no live server item).
+    // A still-`queued` row is retained as an admission blocker: NULL item identity is not proof that
+    // an older client never dispatched it.
     db.insert_org_share(
         "u-q",
         "org-1",
@@ -2046,8 +4723,8 @@ fn uploaded_org_shares_for_source_in_org_scopes_and_orders_oldest_first() {
     let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(
         ids,
-        vec!["u-a", "u-b", "u-c"],
-        "only (org-1,d1) uploaded rows, oldest-first"
+        vec!["u-a", "u-b", "u-c", "u-q"],
+        "known-live rows are first, followed by the exact-source admission blocker"
     );
     // The both-None guard returns empty (no source ⇒ nothing).
     assert!(db
@@ -2180,12 +4857,227 @@ fn duplicate_uploaded_org_shares_returns_only_the_extras() {
     );
 }
 
-/// `cancel_pending_org_shares_for_source_in_org` cancels ONLY the (org, source) `queued`/`failed`
-/// rows, leaving `uploaded` keepers and other orgs/sources untouched.
+#[test]
+fn known_uploaded_share_is_keeper_ahead_of_older_ambiguous_null_item() {
+    let db = mem_db();
+    db.insert_org_share("ambiguous", "org-1", None, Some("d1"), "note", Some("T"),
+        1, 1, &sha32(1), "2026-07-11T00:00:00Z").unwrap();
+    db.set_org_share_failed("ambiguous", "initial_post_pending", "2026-07-11T00:00:01Z").unwrap();
+    db.insert_org_share("live", "org-1", None, Some("d1"), "note", Some("T"),
+        1, 1, &sha32(2), "2026-07-11T00:01:00Z").unwrap();
+    db.set_org_share_uploaded("live", "item-live", "2026-07-11T00:01:01Z").unwrap();
+    let rows = db.uploaded_org_shares_for_source_in_org("org-1", None, Some("d1")).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, "live");
+    assert_eq!(rows[1].id, "ambiguous");
+    assert!(!db.acquire_new_org_share_for_source(
+        "third", "org-1", None, Some("d1"), "note", Some("T"), 1, 1,
+        &sha32(3), true, "2026-07-11T00:02:00Z",
+    ).unwrap());
+}
+
+#[test]
+fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
+    let db = mem_db();
+    db.insert_folder(&Folder {
+        id: "closing-folder".into(),
+        name: "Closing".into(),
+        path: "Closing".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-08-14T00:00:00Z".into(),
+    })
+    .unwrap();
+    db.insert_document(
+        "closing-doc",
+        "closing-folder",
+        "doc.md",
+        "body",
+        "document",
+        1,
+    )
+    .unwrap();
+    db.begin_org_folder_closure("closing-folder").unwrap();
+    assert!(db
+        .insert_outbound_note_share(
+            "blocked-link",
+            "closing-doc",
+            "link",
+            1,
+            "2026-08-14T00:00:01Z",
+        )
+        .is_err(), "folder closure must reject link/user share admission too");
+    assert!(db
+        .insert_org_share(
+            "blocked-folder",
+            "org-1",
+            None,
+            Some("closing-doc"),
+            "note",
+            Some("T"),
+            1,
+            1,
+            &sha32(1),
+            "t",
+        )
+        .is_err());
+    db.clear_org_folder_closure("closing-folder").unwrap();
+    db.insert_org_share(
+        "share",
+        "org-1",
+        None,
+        Some("closing-doc"),
+        "note",
+        Some("T"),
+        1,
+        1,
+        &sha32(1),
+        "t",
+    )
+    .unwrap();
+    db.begin_org_source_closure("document", "closing-doc").unwrap();
+    assert!(db
+        .insert_outbound_note_share(
+            "blocked-source-link",
+            "closing-doc",
+            "link",
+            1,
+            "2026-08-14T00:00:02Z",
+        )
+        .is_err(), "source closure must reject link/user share admission too");
+    assert!(db
+        .lock()
+        .execute(
+            "UPDATE documents SET text='edited while closing' WHERE id='closing-doc'",
+            [],
+        )
+        .is_err(), "a destructive closure must freeze the source during remote revoke");
+    for sql in [
+        "UPDATE documents SET name='renamed.md' WHERE id='closing-doc'",
+        "UPDATE documents SET kind='note' WHERE id='closing-doc'",
+    ] {
+        assert!(db.lock().execute(sql, []).is_err(), "every envelope identity field is frozen");
+    }
+    assert!(db
+        .reset_org_share_for_retry_with_scrub("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
+        .is_err());
+    db.clear_org_source_closure("document", "closing-doc").unwrap();
+    db.reset_org_share_for_retry_with_scrub("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
+        .unwrap();
+}
+
+#[test]
+fn meeting_source_closure_blocks_provider_insert_delete_and_title_changes() {
+    let db = mem_db();
+    db.insert_folder(&Folder {
+        id: "meeting-close-folder".into(), name: "Closing".into(), path: "Closing".into(),
+        parent_id: None, locked: false, created_at: "2026-08-14T00:00:00Z".into(),
+    }).unwrap();
+    db.insert_meeting(&Meeting {
+        id: "meeting-close".into(), started_at: "t".into(), ended_at: None,
+        title: Some("Before".into()), duration_s: 0, audio_path: None,
+        status: MeetingStatus::Summarized, folder_id: Some("meeting-close-folder".into()),
+    }).unwrap();
+    db.upsert_note(&NoteRecord {
+        meeting_id: "meeting-close".into(), provider_id: "provider-a".into(),
+        markdown: "body".into(), created_at: "t".into(), exported_path: None,
+        model_requested: None, model_served: None, gateway_host: None,
+    }).unwrap();
+    db.begin_org_source_closure("meeting", "meeting-close").unwrap();
+
+    assert!(db.upsert_note(&NoteRecord {
+        meeting_id: "meeting-close".into(), provider_id: "provider-b".into(),
+        markdown: "other".into(), created_at: "t2".into(), exported_path: None,
+        model_requested: None, model_served: None, gateway_host: None,
+    }).is_err());
+    assert!(db.lock().execute(
+        "DELETE FROM notes WHERE meeting_id='meeting-close' AND provider_id='provider-a'", [],
+    ).is_err());
+    assert!(db.lock().execute(
+        "UPDATE meetings SET title='After' WHERE id='meeting-close'", [],
+    ).is_err());
+}
+
+#[test]
+fn source_closure_blocks_manual_attachment_mutation_but_allows_authorized_parent_cascade() {
+    let db = mem_db();
+    db.insert_folder(&Folder {
+        id: "attachment-folder".into(), name: "Attachments".into(), path: "Attachments".into(),
+        parent_id: None, locked: false, created_at: "2026-08-14T00:00:00Z".into(),
+    }).unwrap();
+    db.insert_document("attachment-doc", "attachment-folder", "note.md", "body", "note", 1).unwrap();
+    let owner = crate::storage::AttachmentOwner::Document { document_id: "attachment-doc".into() };
+    let hash = [3u8; 32];
+    db.insert_attachment(&crate::storage::NewAttachment {
+        id: "attachment-one", owner: &owner, mime_type: "image/png", extension: "png",
+        width: 1, height: 1, sha256: &hash, byte_len: 1, data: &[1], data_blob: None,
+        created_at: 1,
+    }).unwrap();
+    db.begin_org_source_closure("document", "attachment-doc").unwrap();
+    assert!(db.delete_attachment(&owner, "attachment-one").is_err());
+    db.delete_document("attachment-doc").unwrap();
+    assert!(db.list_attachments(&owner).unwrap().is_empty());
+    let phase: String = db.lock().query_row(
+        "SELECT phase FROM org_share_closures
+          WHERE scope_kind='document' AND scope_id='attachment-doc'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(phase, "closed", "parent cascade and barrier completion commit together");
+}
+
+#[test]
+fn source_delete_with_attachment_rolls_back_until_every_share_is_terminal() {
+    let db = mem_db();
+    db.insert_folder(&Folder {
+        id: "atomic-delete-folder".into(), name: "Atomic".into(), path: "Atomic".into(),
+        parent_id: None, locked: false, created_at: "2026-08-14T00:00:00Z".into(),
+    }).unwrap();
+    db.insert_document("atomic-delete-doc", "atomic-delete-folder", "note.md", "body", "note", 1).unwrap();
+    let owner = crate::storage::AttachmentOwner::Document { document_id: "atomic-delete-doc".into() };
+    db.insert_attachment(&crate::storage::NewAttachment {
+        id: "atomic-image", owner: &owner, mime_type: "image/png", extension: "png",
+        width: 1, height: 1, sha256: &[7; 32], byte_len: 1, data: &[7], data_blob: None,
+        created_at: 1,
+    }).unwrap();
+    db.insert_outbound_share_attempt(
+        "atomic-share", None, Some("atomic-delete-doc"), "link", 1,
+        "c534b6d2-02c1-4c2c-a256-3af8592b1567", "t",
+    ).unwrap();
+    db.begin_org_source_closure("document", "atomic-delete-doc").unwrap();
+
+    assert!(db.delete_document("atomic-delete-doc").is_err());
+    let exists: i64 = db.lock().query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE id='atomic-delete-doc')", [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(exists, 1);
+    assert_eq!(db.list_attachments(&owner).unwrap().len(), 1);
+    let phase: String = db.lock().query_row(
+        "SELECT phase FROM org_share_closures
+          WHERE scope_kind='document' AND scope_id='atomic-delete-doc'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(phase, "closing");
+
+    db.set_outbound_share_state("atomic-share", "revoked").unwrap();
+    db.delete_document("atomic-delete-doc").unwrap();
+    let exists: i64 = db.lock().query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE id='atomic-delete-doc')", [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(exists, 0);
+    assert!(db.list_attachments(&owner).unwrap().is_empty());
+    let phase: String = db.lock().query_row(
+        "SELECT phase FROM org_share_closures
+          WHERE scope_kind='document' AND scope_id='atomic-delete-doc'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(phase, "closed");
+}
+
+/// Duplicate collapse cancels only rows with durable proof that no remote publish exists. Legacy
+/// queued/generic-failed NULL identities are preserved because old clients dispatched while queued.
 #[test]
 fn cancel_pending_org_shares_scopes_to_org_and_source() {
     let db = mem_db();
-    // Target (org-1, d1): one queued + one failed → both cancelled.
+    // Legacy queued + generic failed are NOT safe to cancel from local state alone.
     db.insert_org_share(
         "q",
         "org-1",
@@ -2214,6 +5106,36 @@ fn cancel_pending_org_shares_scopes_to_org_and_source() {
     .unwrap();
     db.set_org_share_failed("f", "boom", "2026-07-11T00:02:30Z")
         .unwrap();
+    db.insert_org_share(
+        "too-large","org-1",None,Some("d1"),"note",Some("T"),1,1,&sha32(8),
+        "2026-07-11T00:02:35Z",
+    ).unwrap();
+    db.set_org_share_failed("too-large","too_large","2026-07-11T00:02:36Z").unwrap();
+    // Ambiguous stable-document attempts carry durable recovery witnesses and must never be
+    // collapsed as ordinary pending duplicates, even when they share this exact local source.
+    for (id, reason, byte) in [
+        ("direct", "direct_put_pending", 21u8),
+        ("republish-put", "republish_put_pending", 24u8),
+        ("edit-conflict", "org_edit_conflict", 27u8),
+        ("initial", "initial_post_pending", 22u8),
+        ("replayable", "initial_post_replayable", 23u8),
+    ] {
+        db.insert_org_share(
+            id,
+            "org-1",
+            None,
+            Some("d1"),
+            "note",
+            Some("T"),
+            1,
+            1,
+            &sha32(byte),
+            "2026-07-11T00:02:45Z",
+        )
+        .unwrap();
+        db.set_org_share_failed(id, reason, "2026-07-11T00:02:50Z")
+            .unwrap();
+    }
     // An UPLOADED row for the same (org, source) — NOT cancelled.
     db.insert_org_share(
         "u",
@@ -2266,12 +5188,23 @@ fn cancel_pending_org_shares_scopes_to_org_and_source() {
             "2026-07-11T01:00:00Z",
         )
         .unwrap();
-    assert_eq!(
-        n, 2,
-        "both the queued and failed (org-1,d1) rows are cancelled"
-    );
-    assert_eq!(db.get_org_share("q").unwrap().unwrap().state, "revoked");
-    assert_eq!(db.get_org_share("f").unwrap().unwrap().state, "revoked");
+    assert_eq!(n,2,"only authenticated-absence and exact pre-dispatch failures cancel");
+    assert_eq!(db.get_org_share("q").unwrap().unwrap().state,"queued");
+    assert_eq!(db.get_org_share("f").unwrap().unwrap().state,"failed");
+    assert_eq!(db.get_org_share("too-large").unwrap().unwrap().state,"revoked");
+    for id in [
+        "direct",
+        "republish-put",
+        "edit-conflict",
+        "initial",
+    ] {
+        assert_eq!(
+            db.get_org_share(id).unwrap().unwrap().state,
+            "failed",
+            "an ambiguous recovery witness is preserved"
+        );
+    }
+    assert_eq!(db.get_org_share("replayable").unwrap().unwrap().state,"revoked");
     assert_eq!(
         db.get_org_share("u").unwrap().unwrap().state,
         "uploaded",
@@ -2292,6 +5225,167 @@ fn cancel_pending_org_shares_scopes_to_org_and_source() {
         db.cancel_pending_org_shares_for_source_in_org("org-1", None, None, "x")
             .unwrap(),
         0
+    );
+}
+
+#[test]
+fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
+    let db = mem_db();
+    let insert = |id: &str, source: &str, byte: u8| {
+        db.insert_org_share(
+            id,
+            "org-1",
+            None,
+            Some(source),
+            "note",
+            Some("T"),
+            1,
+            1,
+            &sha32(byte),
+            "2026-07-11T00:00:00Z",
+        )
+        .unwrap();
+    };
+
+    insert("plain", "plain-source", 1);
+    assert_eq!(
+        db.find_reusable_org_share("org-1", None, Some("plain-source"))
+            .unwrap()
+            .unwrap()
+            .id,
+        "plain",
+        "a normal queued row with NULL last_error remains reusable"
+    );
+    db.reset_org_share_for_retry_with_scrub(
+        "plain",
+        Some("Changed"),
+        1,
+        1,
+        &sha32(2),
+        true,
+        "2026-07-11T00:01:00Z",
+    )
+    .unwrap();
+
+    insert("direct", "direct-source", 3);
+    db.set_org_share_failed("direct", "direct_put_pending", "2026-07-11T00:01:00Z")
+        .unwrap();
+    assert!(db
+        .find_reusable_org_share("org-1", None, Some("direct-source"))
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.reset_org_share_for_retry_with_scrub(
+            "direct",
+            Some("T"),
+            1,
+            1,
+            &sha32(3),
+            true,
+            "2026-07-11T00:02:00Z",
+        ),
+        Err(crate::error::AppError::Unavailable(_))
+    ));
+    assert_eq!(
+        db.get_org_share("direct")
+            .unwrap()
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("direct_put_pending")
+    );
+
+    insert("republish-put", "republish-put-source", 6);
+    db.set_org_share_failed(
+        "republish-put",
+        "republish_put_pending",
+        "2026-07-11T00:01:00Z",
+    )
+    .unwrap();
+    assert!(db
+        .find_reusable_org_share("org-1", None, Some("republish-put-source"))
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.reset_org_share_for_retry_with_scrub(
+            "republish-put",
+            Some("T"),
+            1,
+            1,
+            &sha32(6),
+            true,
+            "2026-07-11T00:02:00Z",
+        ),
+        Err(crate::error::AppError::Unavailable(_))
+    ));
+
+    let (id, reason, byte) = ("edit-conflict", "org_edit_conflict", 9u8);
+        insert(id, id, byte);
+        db.set_org_share_failed(id, reason, "2026-07-11T00:01:00Z")
+            .unwrap();
+        assert!(db
+            .find_reusable_org_share("org-1", None, Some(id))
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            db.reset_org_share_for_retry_with_scrub(
+                id,
+                Some("T"),
+                1,
+                1,
+                &sha32(byte),
+                true,
+                "2026-07-11T00:02:00Z",
+            ),
+            Err(crate::error::AppError::Unavailable(_))
+        ));
+        assert_eq!(
+            db.get_org_share(id).unwrap().unwrap().last_error.as_deref(),
+            Some(reason)
+        );
+
+    insert("replay", "replay-source", 4);
+    db.set_org_share_failed("replay", "initial_post_replayable", "2026-07-11T00:01:00Z")
+        .unwrap();
+    assert_eq!(
+        db.find_reusable_org_share("org-1", None, Some("replay-source"))
+            .unwrap()
+            .unwrap()
+            .id,
+        "replay"
+    );
+    assert!(matches!(
+        db.reset_org_share_for_retry_with_scrub(
+            "replay",
+            Some("Changed"),
+            1,
+            1,
+            &sha32(5),
+            true,
+            "2026-07-11T00:02:00Z",
+        ),
+        Err(crate::error::AppError::Unavailable(_))
+    ));
+    assert!(matches!(
+        db.reset_org_share_for_retry_with_scrub(
+            "replay",
+            Some("T"),
+            1,
+            1,
+            &sha32(4),
+            true,
+            "2026-07-11T00:03:00Z",
+        ),
+        Err(crate::error::AppError::Unavailable(_))
+    ));
+    assert_eq!(
+        db.get_org_share("replay")
+            .unwrap()
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("initial_post_replayable"),
+        "only the actor/owner/doc/access-bound replay CAS may re-arm an ambiguous initial POST"
     );
 }
 
@@ -3571,22 +6665,41 @@ fn resolve_wikilink_hides_sealed_target() {
 #[test]
 fn resolve_wikilink_falls_back_to_org_item_exact_title_match() {
     let db = mem_db();
-    seed_org_state(&db, "org-1");
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    seed_org_state(&db, org_id);
     let emb = crate::embed::StubEmbedder;
-    db.upsert_org_item(
-        "it-shared",
-        "org-1",
+    for (item_id, seq, rev) in [
+        ("attacker-max-rev", 99, 99),
+        ("authoritative-current", 2, 2),
+    ] {
+        db.upsert_org_item(
+            item_id,
+            org_id,
+            seq,
+            "anna",
+            "Nebula Rollout",
+            "the nebula rollout plan for q3",
+            "2026-07-10T09:00:00Z",
+            rev,
+            1,
+            &sha32(rev as u8),
+            None,
+            None,
+            Some(&emb),
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item_id, Some(doc_id), "view", Some("owner"))
+            .unwrap();
+    }
+    db.repair_org_reconcile_metadata(
+        "authoritative-current",
+        org_id,
         1,
-        "anna",
-        "Nebula Rollout",
-        "the nebula rollout plan for q3",
-        "2026-07-10T09:00:00Z",
-        1,
-        1,
-        &sha32(9),
-        None,
-        None,
-        Some(&emb),
+        Some(doc_id),
+        "view",
+        Some("owner"),
+        true,
     )
     .unwrap();
 
@@ -3597,8 +6710,55 @@ fn resolve_wikilink_falls_back_to_org_item_exact_title_match() {
         .expect("an exact-title org item must resolve");
     assert_eq!(t.kind, "org");
     assert_eq!(
-        t.id, "it-shared",
-        "org leg must carry the ORG item id, never a local id"
+        t.id, "authoritative-current",
+        "exact-title resolution must follow the relay-authoritative current head, not max rev"
+    );
+    let expected_link_id = format!("{org_id}:{doc_id}");
+    assert_eq!(t.stable_id.as_deref(), Some(expected_link_id.as_str()));
+}
+
+/// Rows ingested before stable document identities existed remain navigable by their immutable feed
+/// item identity. They are never promoted into a durable stable-link target: autocomplete/manual
+/// graph writes still require an authenticated `(org_id, doc_id)` composite.
+#[test]
+fn resolve_wikilink_keeps_legacy_org_item_navigable_without_stable_link_identity() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    db.upsert_org_item(
+        "legacy-item",
+        "org-1",
+        1,
+        "anna",
+        "Legacy Shared Note",
+        "legacy shared body",
+        "2026-07-10T09:00:00Z",
+        1,
+        1,
+        &sha32(12),
+        None,
+        Some("anna"),
+        None,
+    )
+    .unwrap();
+
+    let target = db
+        .resolve_wikilink("Legacy Shared Note", &HashSet::new())
+        .unwrap()
+        .expect("legacy shared title remains readable and navigable");
+    assert_eq!(target.kind, "org");
+    assert_eq!(target.id, "legacy-item");
+    assert_eq!(
+        target.stable_id, None,
+        "pre-docId rows must never fabricate a durable stable identity"
+    );
+    assert!(db
+        .org_link_doc_id_for_item_visible("legacy-item")
+        .unwrap()
+        .is_none());
+    assert!(
+        db.upsert_manual_link("org", "legacy-item", "meeting", "local-anchor")
+            .is_err(),
+        "a raw legacy item id cannot become an opaque persistent org endpoint"
     );
 }
 
@@ -3609,12 +6769,16 @@ fn resolve_wikilink_falls_back_to_org_item_exact_title_match() {
 #[test]
 fn resolve_wikilink_excludes_tombstoned_and_disabled_org_items() {
     let db = mem_db();
-    seed_org_state(&db, "org-1");
-    seed_org_state(&db, "org-2");
+    let org_1 = "11111111-1111-4111-8111-111111111111";
+    let org_2 = "22222222-2222-4222-8222-222222222222";
+    let doc_1 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let doc_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    seed_org_state(&db, org_1);
+    seed_org_state(&db, org_2);
     let emb = crate::embed::StubEmbedder;
     db.upsert_org_item(
         "it-gone",
-        "org-1",
+        org_1,
         1,
         "anna",
         "Ghost Doc",
@@ -3630,7 +6794,7 @@ fn resolve_wikilink_excludes_tombstoned_and_disabled_org_items() {
     .unwrap();
     db.upsert_org_item(
         "it-disabled",
-        "org-2",
+        org_2,
         1,
         "bob",
         "Disabled Org Doc",
@@ -3644,6 +6808,20 @@ fn resolve_wikilink_excludes_tombstoned_and_disabled_org_items() {
         Some(&emb),
     )
     .unwrap();
+    for (item_id, org_id, doc_id) in [("it-gone", org_1, doc_1), ("it-disabled", org_2, doc_2)] {
+        db.set_org_item_document_metadata(item_id, Some(doc_id), "view", Some("owner"))
+            .unwrap();
+        db.repair_org_reconcile_metadata(
+            item_id,
+            org_id,
+            1,
+            Some(doc_id),
+            "view",
+            Some("owner"),
+            true,
+        )
+        .unwrap();
+    }
 
     let nothing = std::collections::HashSet::new();
     // Sanity: both resolve before we exclude them.
@@ -3664,7 +6842,7 @@ fn resolve_wikilink_excludes_tombstoned_and_disabled_org_items() {
         "a tombstoned org item must not resolve as a wikilink target"
     );
 
-    db.set_org_context_enabled("org-2", false).unwrap();
+    db.set_org_context_enabled(org_2, false).unwrap();
     assert!(
         db.resolve_wikilink("Disabled Org Doc", &nothing)
             .unwrap()
@@ -6210,7 +9388,9 @@ fn vec_knn_orders_nearest_first() {
     insert_known_chunk(&db, "m-far", "far", &one_hot(2));
 
     let nothing = std::collections::HashSet::new();
-    let hits = db.search_semantic_visible(&query, 3, 0.0, &nothing).unwrap();
+    let hits = db
+        .search_semantic_visible(&query, 3, 0.0, &nothing)
+        .unwrap();
     let order: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     assert_eq!(
         order,
@@ -6239,7 +9419,9 @@ fn vec_semantic_search_is_gated_by_visibility() {
     let query = one_hot(0);
     // Empty unlock set → excluded.
     let nothing = std::collections::HashSet::new();
-    let hidden = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
+    let hidden = db
+        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
         "sealed-not-unlocked meeting leaked through the semantic gate"
@@ -6247,7 +9429,9 @@ fn vec_semantic_search_is_gated_by_visibility() {
     // Folder session-unlocked → present.
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
-    let shown = db.search_semantic_visible(&query, 10, 0.0, &unlocked).unwrap();
+    let shown = db
+        .search_semantic_visible(&query, 10, 0.0, &unlocked)
+        .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
         "session-unlocked meeting must reappear in semantic results"
@@ -6694,7 +9878,9 @@ fn doc_chunk_search_is_gated_by_visibility() {
 
     // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
     db.set_folder_locked("f-locked", true, None).unwrap();
-    let hidden = db.search_doc_chunks_visible(&query, 10, 0.0, &nothing).unwrap();
+    let hidden = db
+        .search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        .unwrap();
     assert!(
         !hidden.iter().any(|h| h.document_id == "d1"),
         "sealed-not-unlocked document chunk leaked through the gate"
@@ -6703,7 +9889,9 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Session-unlock → present again.
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
-    let shown = db.search_doc_chunks_visible(&query, 10, 0.0, &unlocked).unwrap();
+    let shown = db
+        .search_doc_chunks_visible(&query, 10, 0.0, &unlocked)
+        .unwrap();
     assert!(
         shown.iter().any(|h| h.document_id == "d1"),
         "session-unlocked document chunk must reappear in search"
@@ -7398,6 +10586,24 @@ fn link_count(db: &Db, kind: &str, id: &str, edge_type: &str) -> i64 {
                      AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))",
             rusqlite::params![kind, id, edge_type],
             |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn manual_link_tuple_count(
+    db: &Db,
+    src_kind: &str,
+    src_id: &str,
+    dst_kind: &str,
+    dst_id: &str,
+) -> i64 {
+    db.lock()
+        .query_row(
+            "SELECT COUNT(*) FROM links
+              WHERE src_kind = ?1 AND src_id = ?2 AND dst_kind = ?3 AND dst_id = ?4
+                AND edge_type = 'manual'",
+            rusqlite::params![src_kind, src_id, dst_kind, dst_id],
+            |row| row.get(0),
         )
         .unwrap()
 }
@@ -8221,6 +11427,85 @@ fn links_for_visible_dedupes_manual_and_wikilink() {
     assert!(
         to_target[0].manual,
         "the collapsed chip is flagged as a removable manual link"
+    );
+}
+
+/// The display representative may point in the opposite direction from the exact manual row. The
+/// chip must carry that stored tuple rather than asking the FE to reconstruct it from `direction`.
+#[test]
+fn links_for_visible_preserves_opposite_manual_tuple_under_wikilink() {
+    let db = mem_db();
+    seed_folder(&db, "f1", "Notes");
+    seed_note_doc(&db, "source", "f1", "Source", "");
+    seed_note_doc(&db, "target", "f1", "Target", "");
+    let unlocked = HashSet::new();
+
+    db.index_wikilinks_for_source(
+        crate::links::LinkKind::Note,
+        "source",
+        "see [[Target]]",
+        &unlocked,
+    )
+    .unwrap();
+    db.upsert_manual_link("note", "target", "note", "source")
+        .unwrap();
+
+    let edges = db
+        .links_for_visible(crate::links::LinkKind::Note, "source", &unlocked)
+        .unwrap();
+    let chip = edges.iter().find(|edge| edge.other_id == "target").unwrap();
+    assert_eq!(chip.edge_type, "wikilink");
+    assert_eq!(chip.direction, "out");
+    // This storage-first layer keeps exact unlink handles internal. The following stacked command
+    // and frontend layer deliberately activates their IPC representation only after this schema is
+    // present, so this oracle binds durable tuple preservation rather than the future wire shape.
+    assert_eq!(
+        chip.manual_edges,
+        vec![crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: "target".into(),
+            dst_kind: "note".into(),
+            dst_id: "source".into(),
+        }],
+        "the removable chip must retain the opposite directed manual tuple"
+    );
+}
+
+/// Both directed manual rows collapse to one neighbour chip, but neither exact unlink handle may be
+/// lost: one click must be able to remove the complete hidden set atomically.
+#[test]
+fn links_for_visible_preserves_bidirectional_manual_tuples() {
+    let db = mem_db();
+    seed_folder(&db, "f1", "Notes");
+    seed_note_doc(&db, "left", "f1", "Left", "");
+    seed_note_doc(&db, "right", "f1", "Right", "");
+    db.upsert_manual_link("note", "left", "note", "right")
+        .unwrap();
+    db.upsert_manual_link("note", "right", "note", "left")
+        .unwrap();
+
+    let edges = db
+        .links_for_visible(crate::links::LinkKind::Note, "left", &HashSet::new())
+        .unwrap();
+    let chip = edges.iter().find(|edge| edge.other_id == "right").unwrap();
+    assert_eq!(edges.len(), 1, "the pair remains one displayed chip");
+    assert_eq!(
+        chip.manual_edges,
+        vec![
+            crate::storage::models::ManualLinkEdge {
+                src_kind: "note".into(),
+                src_id: "left".into(),
+                dst_kind: "note".into(),
+                dst_id: "right".into(),
+            },
+            crate::storage::models::ManualLinkEdge {
+                src_kind: "note".into(),
+                src_id: "right".into(),
+                dst_kind: "note".into(),
+                dst_id: "left".into(),
+            },
+        ],
+        "both exact directed manual tuples must survive display collapse"
     );
 }
 
@@ -9895,7 +13180,9 @@ fn transcript_chunks_are_gated_by_visibility_semantic() {
 
     let query = one_hot(0);
     let nothing = std::collections::HashSet::new();
-    let hidden = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
+    let hidden = db
+        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
         "sealed meeting's TRANSCRIPT chunk leaked through the semantic gate"
@@ -9903,7 +13190,9 @@ fn transcript_chunks_are_gated_by_visibility_semantic() {
     // Session-unlock → it reappears (proves the row + gate, not purge).
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
-    let shown = db.search_semantic_visible(&query, 10, 0.0, &unlocked).unwrap();
+    let shown = db
+        .search_semantic_visible(&query, 10, 0.0, &unlocked)
+        .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
         "session-unlocked meeting's transcript chunk must reappear in semantic results"
@@ -10263,7 +13552,9 @@ fn no_entity_match_leaves_hybrid_identical_to_two_leg_fusion() {
 
     // Expected = RRF over EXACTLY the two legs.
     let fts = db.search_visible("budget planning", 10, &nothing).unwrap();
-    let sem = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
+    let sem = db
+        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .unwrap();
     let fts_ids: Vec<String> = fts.iter().map(|h| h.meeting.id.clone()).collect();
     let sem_ids: Vec<String> = sem.iter().map(|h| h.meeting.id.clone()).collect();
     let expected: Vec<String> = crate::embed::rrf_fuse(&[fts_ids, sem_ids], crate::embed::RRF_K)
@@ -11271,7 +14562,9 @@ fn s1_floor_drops_orthogonal_semantic_neighbour() {
     let query = one_hot(0);
 
     // No floor (0.0) → BOTH returned.
-    let all = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
+    let all = db
+        .search_semantic_visible(&query, 10, 0.0, &nothing)
+        .unwrap();
     let ids: Vec<&str> = all.iter().map(|h| h.meeting.id.as_str()).collect();
     assert!(
         ids.contains(&"m-near") && ids.contains(&"m-far"),
@@ -11279,7 +14572,9 @@ fn s1_floor_drops_orthogonal_semantic_neighbour() {
     );
 
     // Floor 0.75 → only the near (cos 1.0) survives.
-    let floored = db.search_semantic_visible(&query, 10, 0.75, &nothing).unwrap();
+    let floored = db
+        .search_semantic_visible(&query, 10, 0.75, &nothing)
+        .unwrap();
     let fids: Vec<&str> = floored.iter().map(|h| h.meeting.id.as_str()).collect();
     assert_eq!(
         fids,
@@ -11359,7 +14654,12 @@ fn s1_floor_keeps_fts_hit_when_vector_leg_floored_empty() {
     db.insert_meeting(&sample_meeting("m-budget", "2026-06-24T10:00:00Z"))
         .unwrap();
     // FTS text carries "budget"; the ONLY chunk is orthogonal (one_hot(2)) to the query one_hot(0).
-    note_for(&db, "m-budget", "claude_code", "the quarterly budget review");
+    note_for(
+        &db,
+        "m-budget",
+        "claude_code",
+        "the quarterly budget review",
+    );
     insert_known_chunk(&db, "m-budget", "the quarterly budget review", &one_hot(2));
 
     let nothing = std::collections::HashSet::new();
@@ -11577,7 +14877,12 @@ fn org_fts_or_fallback_requires_ceil_half_exact_unique_content_terms() {
 
     // The strict phase remains the full original query: once a row matching all 65 terms exists,
     // strict AND returns it and the fallback must not also admit a row matching only the first 16.
-    ingest("strict-full-query", "Strict full query", &overlong_query, 11);
+    ingest(
+        "strict-full-query",
+        "Strict full query",
+        &overlong_query,
+        11,
+    );
     let strict_overlong = db.search_org_chunks_fts(&overlong_query, 10).unwrap();
     let strict_ids = strict_overlong
         .iter()
@@ -11658,7 +14963,9 @@ fn s2_precision_preserved_no_shared_content_word() {
     assert!(
         hits.is_empty(),
         "OR fallback must NOT match when no content word is shared, got {:?}",
-        hits.iter().map(|h| h.meeting.id.clone()).collect::<Vec<_>>()
+        hits.iter()
+            .map(|h| h.meeting.id.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -11672,11 +14979,15 @@ fn s2_stopword_only_overlap_does_not_hit() {
         .unwrap();
     note_for(&db, "m1", "claude_code", "the plan is done");
     let nothing = std::collections::HashSet::new();
-    let hits = db.search_visible("what is the status", 10, &nothing).unwrap();
+    let hits = db
+        .search_visible("what is the status", 10, &nothing)
+        .unwrap();
     assert!(
         hits.is_empty(),
         "stopword-only overlap must not produce a hit through the OR fallback, got {:?}",
-        hits.iter().map(|h| h.meeting.id.clone()).collect::<Vec<_>>()
+        hits.iter()
+            .map(|h| h.meeting.id.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -11687,7 +14998,11 @@ fn s2_stopword_only_overlap_does_not_hit() {
 fn sweep_removes_stale_fixtures_of_both_prefix_families() {
     let root = unique_temp_path("murmur-sweep-scope", "dir");
     std::fs::create_dir_all(&root).unwrap();
-    for name in ["murmur-old.sqlite", "murmur-old.sqlite-wal", "meetnotes-old.sqlite"] {
+    for name in [
+        "murmur-old.sqlite",
+        "murmur-old.sqlite-wal",
+        "meetnotes-old.sqlite",
+    ] {
         std::fs::write(root.join(name), b"x").unwrap();
     }
     // Callers pass ext = "dir"; directories must be reclaimed too, not just files.
