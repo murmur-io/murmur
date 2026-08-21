@@ -175,13 +175,22 @@ impl Db {
     }
 
     pub fn set_meeting_title(&self, id: &str, title: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx.execute(
             "UPDATE meetings SET title = ?2 WHERE id = ?1",
             rusqlite::params![id, title],
         )
         .map_err(map_err)?;
-        Ok(())
+        if changed != 0 {
+            tx.execute(
+                "UPDATE org_shares SET republish_dirty = republish_dirty + 1
+                  WHERE meeting_id = ?1 AND state IN ('queued','uploaded','failed')",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)
     }
 
     /// Upsert the meeting's typed-notes plaintext. Used by the FE autosave (write the whole buffer)

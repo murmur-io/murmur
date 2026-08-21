@@ -934,6 +934,143 @@
         );
     }
 
+    #[test]
+    fn unlink_refuses_sealed_not_session_unlocked_note_without_any_cleanup_side_effect() {
+        let vault = tmp_vault("unlink-sealed-refusal");
+        let state = build_state_with_vault("unlink-sealed-refusal", &vault);
+        let folder_id = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let source_id = create_note_inner(&state, Some(&folder_id), "Source Note").unwrap();
+        let target_id = create_note_inner(&state, Some(&folder_id), "Target Note").unwrap();
+        let legacy_hit = crate::enrich::ContextHit {
+            source: "note".into(),
+            detail: "[[Target Note]]".into(),
+            url: None,
+        };
+        let legacy_body =
+            crate::enrich::apply_link_markers("original body\n", std::slice::from_ref(&legacy_hit));
+        update_note_doc_inner(&state, &source_id, "Source Note", &legacy_body).unwrap();
+        state
+            .db
+            .upsert_manual_link("note", &source_id, "note", &target_id)
+            .unwrap();
+        let exported_path = state
+            .db
+            .get_note_row(&source_id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .unwrap();
+
+        lock_folder_inner(&state, folder_id).unwrap();
+        let before: (String, Option<Vec<u8>>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT text,text_blob FROM documents WHERE id=?1",
+                rusqlite::params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(before.0.is_empty());
+        assert!(before.1.is_some());
+        assert!(!std::path::Path::new(&exported_path).exists());
+        let links_before = manual_link_count(&state, "note", &source_id);
+
+        let err = unlink_items_inner(&state, "note", &source_id, "note", &target_id).unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)));
+
+        let after: (String, Option<Vec<u8>>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT text,text_blob FROM documents WHERE id=?1",
+                rusqlite::params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before, "sealed plaintext/blob must remain byte-identical");
+        assert_eq!(manual_link_count(&state, "note", &source_id), links_before);
+        assert!(state.db.pending_lock_marker_export_cleanup().unwrap().is_empty());
+        assert!(
+            !std::path::Path::new(&exported_path).exists(),
+            "the failed command must not recreate or mutate the sealed vault export"
+        );
+    }
+
+    #[test]
+    fn session_unlocked_unlink_seals_marker_cleanup_and_scrubs_vault_before_success() {
+        let vault = tmp_vault("unlink-session-unlocked").canonicalize().unwrap();
+        let state = build_state_with_vault("unlink-session-unlocked", &vault);
+        state
+            .db
+            .set_setting("vault_path", &vault.to_string_lossy())
+            .unwrap();
+        let folder_id = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let source_id = create_note_inner(&state, Some(&folder_id), "Source Note").unwrap();
+        let target_id = create_note_inner(&state, Some(&folder_id), "Target Note").unwrap();
+        let legacy_hit = crate::enrich::ContextHit {
+            source: "note".into(),
+            detail: "[[Target Note]]".into(),
+            url: None,
+        };
+        let legacy_body =
+            crate::enrich::apply_link_markers("original body\n", std::slice::from_ref(&legacy_hit));
+        update_note_doc_inner(&state, &source_id, "Source Note", &legacy_body).unwrap();
+        state
+            .db
+            .upsert_manual_link("note", &source_id, "note", &target_id)
+            .unwrap();
+
+        lock_folder_inner(&state, folder_id.clone()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&folder_id).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&folder_id)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        unseal_folder_extras(&state, &folder_id, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(folder_id.clone());
+        state
+            .db
+            .upsert_manual_link("note", &source_id, "note", &target_id)
+            .unwrap();
+        let exported_path = state
+            .db
+            .get_note_row(&source_id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .unwrap();
+        assert!(std::fs::read_to_string(&exported_path)
+            .unwrap()
+            .contains("[[Target Note]]"));
+
+        unlink_items_inner(&state, "note", &source_id, "note", &target_id).unwrap();
+
+        assert_eq!(manual_link_count(&state, "note", &source_id), 0);
+        assert!(state.db.pending_lock_marker_export_cleanup().unwrap().is_empty());
+        let (text, blob): (String, Vec<u8>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT text,text_blob FROM documents WHERE id=?1",
+                rusqlite::params![source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(text.is_empty(), "locked cleanup must not retain plaintext beside its seal");
+        assert_eq!(
+            crate::crypto::decrypt(&ck, &blob, &aad_document(&folder_id, &source_id)).unwrap(),
+            b"original body\n"
+        );
+        let exported = std::fs::read_to_string(&exported_path).unwrap();
+        assert!(!exported.contains("[[Target Note]]"));
+        assert!(!exported.contains("murmur:links"));
+    }
+
     /// A sealed-and-not-session-unlocked endpoint refuses the link with `AppError::Locked` BEFORE any
     /// write — never link behind a lock, never reveal a locked neighbour.
     #[test]
@@ -18135,6 +18272,39 @@
         );
     }
 
+    /// The org browser header reader is intentionally finite. A corrupt/oversized local replica
+    /// must not turn one IPC call into an unbounded allocation; retain the newest 500 rows only.
+    #[test]
+    fn list_org_items_is_bounded_to_the_newest_500_headers() {
+        let state = build_state("org-list-items-bound");
+        for seq in 1_u64..=501 {
+            state
+                .db
+                .upsert_org_item(
+                    &format!("bounded-{seq}"),
+                    "org-bounded",
+                    seq,
+                    "member",
+                    &format!("Item {seq}"),
+                    "body",
+                    "2026-07-11T09:00:00Z",
+                    1,
+                    1,
+                    &[seq as u8; 32],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        let items = state.db.list_org_items("org-bounded").unwrap();
+        assert_eq!(items.len(), 500);
+        assert_eq!(items.first().unwrap().seq, 501);
+        assert_eq!(items.last().unwrap().seq, 2);
+        assert!(items.iter().all(|item| item.item_id != "bounded-1"));
+    }
+
     /// F-org-editable: `list_org_items_inner` ENRICHES an item the caller published with an
     /// `owned_source` ref plus the source's CURRENT title (so the author's own card links to the
     /// editable original and never shows a stale publish-time snapshot), while an item shared by
@@ -20457,7 +20627,7 @@
             .db
             .set_org_share_uploaded("dup", "item-dup", "2026-07-11T09:05:00Z")
             .unwrap();
-        // A NOT-yet-uploaded sibling (a stuck pending retry) for the same source — redundant, cancelled.
+        // A NOT-yet-uploaded sibling is ambiguous: NULL item id is not proof the remote POST never landed.
         state
             .db
             .insert_org_share(
@@ -20500,8 +20670,8 @@
         );
         assert_eq!(
             state.db.get_org_share("pending").unwrap().unwrap().state,
-            "revoked",
-            "a redundant not-yet-uploaded sibling is cancelled locally (no server item)"
+            "queued",
+            "an ambiguous queued NULL-item sibling stays fail-closed"
         );
     }
 
@@ -20645,6 +20815,135 @@
             state.db.get_org_state("org-b").unwrap().unwrap().last_seq,
             20
         );
+    }
+
+    /// The authenticated feed/import path is membership-gated before its first socket, then commits
+    /// an opened envelope only while that same local org membership still exists. This is the
+    /// command-level companion to the storage race oracle: a guessed org id gets zero network and
+    /// zero plaintext; a joined org traverses the real feed + blob + open + storage chain.
+    #[test]
+    fn org_sync_import_requires_membership_before_feed_and_plaintext_commit() {
+        use std::io::{Read, Write};
+        use crate::share::org_envelope::{
+            seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind,
+        };
+
+        let ock = [9_u8; 32];
+        let env = OrgEnvelope::new(
+            OrgItemKind::Note,
+            "Member plan",
+            "authenticated member-only body",
+            "anna",
+            "2026-07-11T09:00:00Z",
+            1,
+            OrgSourceKind::Document,
+        );
+        let sha = env.content_sha256();
+        let nonce = org_item_nonce(&sha);
+        let (ciphertext, _) = seal_org_envelope(&ock, &env, "org-member", &nonce).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_for_server = std::sync::Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut served = 0usize;
+            while served < 2 && std::time::Instant::now() < deadline {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("member import mock accept failed: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = [0_u8; 8192];
+                let read = socket.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let first_line = request.lines().next().unwrap_or_default().to_string();
+                requests_for_server.lock().unwrap().push(first_line.clone());
+                assert!(
+                    request.to_ascii_lowercase().contains("authorization: bearer a"),
+                    "both feed and blob reads must use the authenticated session"
+                );
+
+                if first_line.contains("/v1/orgs/org-member/items?") {
+                    let body = format!(
+                        "{{\"items\":[{{\"itemId\":\"member-item\",\"seq\":1,\"authorUserId\":\"author-1\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-07-11T09:00:00Z\",\"tombstoned\":false,\"blobId\":\"member-blob\",\"contentSha256\":\"{}\"}}],\"nextSeq\":1}}",
+                        murmur_protocol::b64::encode(&sha)
+                    );
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                } else if first_line.contains("/v1/blobs/member-blob") {
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        ciphertext.len()
+                    )
+                    .unwrap();
+                    socket.write_all(&ciphertext).unwrap();
+                } else {
+                    panic!("unexpected member import request: {first_line}");
+                }
+                socket.flush().unwrap();
+                served += 1;
+            }
+            served
+        });
+
+        let state = build_state("org-sync-member-admission");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        seed_live_session(&state);
+
+        assert!(matches!(
+            block_on(org_sync_one_now_inner(&state, "org-outsider")),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a non-member org id must be rejected before the first socket"
+        );
+        assert!(state.db.list_org_items("org-outsider").unwrap().is_empty());
+
+        seed_org(&state.db, "org-member", "Member org", "member", 1);
+        state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .insert(("org-member".to_string(), 1), Zeroizing::new(ock));
+        let report = block_on(org_sync_one_now_inner(&state, "org-member")).unwrap();
+        assert_eq!(server.join().unwrap(), 2, "one feed plus one blob read");
+        assert_eq!(report.pulled, 1);
+        assert_eq!(report.ingested, 1);
+        let stored = state
+            .db
+            .get_org_item("member-item")
+            .unwrap()
+            .expect("the authenticated member envelope must commit");
+        assert_eq!(stored.markdown, "authenticated member-only body");
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT org_id FROM org_items WHERE item_id='member-item'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "org-member"
+        );
+        assert_eq!(state.db.org_last_seq_for("org-member").unwrap(), 1);
     }
 
     /// FIX D (per-item sync robustness, RED→GREEN): a TERMINAL-bad item at seq N must NOT stall the
@@ -22135,7 +22434,9 @@
             .db
             .set_org_share_failed("s-stuck", "republish_upload_failed", "t")
             .unwrap();
-        // A never-published failed row (no item_id) must stay excluded — no live server item.
+        // A legacy generic-failed row with no item_id is ambiguous and must stay visible to every
+        // destructive folder/revoke gate; old clients could lose a POST response before persisting
+        // the returned server identity.
         state
             .db
             .insert_note("n2", "f1", "doc", "Doc2", "# body2", 1)
@@ -22162,21 +22463,27 @@
 
         let active = state.db.active_org_shares_for_folder("f1").unwrap();
         assert_eq!(
-                active.len(),
-                1,
-                "the stuck failed-with-item_id share IS surfaced; the never-published failed row stays excluded: {active:?}"
-            );
+            active.len(),
+            2,
+            "destructive folder enumeration must include the legacy generic-failed NULL identity: {active:?}"
+        );
         assert_eq!(active[0].0.as_deref(), Some("item-stuck"));
+        assert!(
+            active.iter().any(|(item_id, _)| item_id.is_none()),
+            "the second active row must be the ambiguous NULL-item legacy share: {active:?}"
+        );
 
         // Same fix must apply to the bulk-revoke enumeration (`revoke_shares_for_folder`'s source).
         let ids = state.db.active_org_share_ids_for_folder("f1").unwrap();
         assert_eq!(
             ids.len(),
-            1,
-            "bulk-revoke must also see the stuck failed-with-item_id share: {ids:?}"
+            2,
+            "bulk revoke must see both the known-live and ambiguous legacy rows: {ids:?}"
         );
         assert_eq!(ids[0].0, "s-stuck");
         assert_eq!(ids[0].1.as_deref(), Some("item-stuck"));
+        assert_eq!(ids[1].0, "s-dead");
+        assert_eq!(ids[1].1, None);
     }
 
     /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
