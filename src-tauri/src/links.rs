@@ -4,7 +4,7 @@
 //! co-located with the schema, as every other table). THIS module owns the parts that are pure
 //! functions of their inputs — no DB, no clock, no network — so they are unit-testable in isolation:
 //!
-//! - the [`LinkKind`] endpoint enum (`meeting|note|document`) + its string round-trip;
+//! - the [`LinkKind`] endpoint enum (`meeting|note|document|org`) + its string round-trip;
 //! - the [`EdgeType`] enum (`wikilink|companion|semantic`) + directedness;
 //! - endpoint CANONICALIZATION for undirected (semantic) edges (`src<dst` so a pair is stored once);
 //! - the SEMANTIC AUTO-LINKER math: the mutual-kNN / floor / cap candidate selection over already-
@@ -43,6 +43,9 @@ pub enum LinkKind {
     Meeting,
     Note,
     Document,
+    /// A private local edge to a Shared Brain document. Its local id is the revision-stable,
+    /// org-scoped `org_id:doc_id` composite, never a feed `item_id` and never uploaded.
+    Org,
 }
 
 impl LinkKind {
@@ -52,6 +55,7 @@ impl LinkKind {
             LinkKind::Meeting => "meeting",
             LinkKind::Note => "note",
             LinkKind::Document => "document",
+            LinkKind::Org => "org",
         }
     }
 
@@ -62,6 +66,7 @@ impl LinkKind {
             "meeting" => Some(LinkKind::Meeting),
             "note" => Some(LinkKind::Note),
             "document" => Some(LinkKind::Document),
+            "org" => Some(LinkKind::Org),
             _ => None,
         }
     }
@@ -196,7 +201,12 @@ mod tests {
 
     #[test]
     fn link_kind_and_edge_type_round_trip_strings() {
-        for k in [LinkKind::Meeting, LinkKind::Note, LinkKind::Document] {
+        for k in [
+            LinkKind::Meeting,
+            LinkKind::Note,
+            LinkKind::Document,
+            LinkKind::Org,
+        ] {
             assert_eq!(LinkKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(LinkKind::parse("bogus"), None);

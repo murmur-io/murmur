@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension};
+use zeroize::Zeroizing;
 
 use crate::error::{AppError, Result};
 use crate::storage::db::{
@@ -21,6 +22,23 @@ use crate::storage::db::{
     Db, LinkRowRaw,
 };
 use crate::storage::models::{BacklinkSource, SourceKind, WikiTarget};
+
+fn parse_stable_uuid(value: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(value).ok()
+}
+
+fn org_link_id(org_id: &str, doc_id: &str) -> Option<String> {
+    parse_stable_uuid(org_id)?;
+    parse_stable_uuid(doc_id)?;
+    Some(format!("{org_id}:{doc_id}"))
+}
+
+fn parse_org_link_id(id: &str) -> Option<(&str, &str)> {
+    let (org_id, doc_id) = id.split_once(':')?;
+    parse_stable_uuid(org_id)?;
+    parse_stable_uuid(doc_id)?;
+    Some((org_id, doc_id))
+}
 
 fn parse_marker_identity(value: Option<String>, field: &str) -> Result<Option<u64>> {
     value
@@ -57,6 +75,25 @@ pub(crate) struct LockMarkerExportPublish {
     pub(crate) stage_device: Option<u64>,
     pub(crate) stage_inode: Option<u64>,
     pub(crate) state: String,
+}
+
+/// Verify-before-destroy result prepared by the command layer for a legacy marker living in a
+/// session-unlocked but durably locked note. The plaintext is included only to bind the ciphertext
+/// to the exact transaction-computed scrub; this struct never crosses IPC or leaves process memory.
+#[derive(Clone)]
+pub(crate) struct PreparedManualMarkerSeal {
+    pub(crate) note_id: String,
+    pub(crate) folder_id: String,
+    pub(crate) stripped_text: String,
+    pub(crate) text_blob: Vec<u8>,
+    pub(crate) content_key: Zeroizing<[u8; 32]>,
+}
+
+fn document_seal_aad(folder_id: &str, document_id: &str) -> Vec<u8> {
+    format!(
+        "murmur:document:v1|folder={folder_id}|document={document_id}|type=document"
+    )
+    .into_bytes()
 }
 
 /// TOCTOU seal re-check for a MEETING endpoint, run INSIDE the caller's write transaction — the
@@ -100,6 +137,29 @@ fn link_endpoint_sealed_at_rest_tx(
         // A `note` id IS a `documents` id, so both non-meeting kinds probe the documents row.
         crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
             doc_sealed_at_rest_tx(tx, id)
+        }
+        // Org items have no folder seal domain. Availability is a joined+enabled+live local replica
+        // check, repeated inside the edge write transaction to close context/leave races.
+        crate::links::LinkKind::Org => {
+            let Some((org_id, doc_id)) = parse_org_link_id(id) else {
+                return Ok(true);
+            };
+            let visible = tx
+                .query_row(
+                    "SELECT 1
+                      FROM org_items oi
+                      JOIN org_state os ON os.org_id = oi.org_id
+                     WHERE oi.org_id = ?1 AND oi.doc_id = ?2
+                        AND oi.tombstoned = 0 AND oi.is_current = 1
+                        AND os.context_enabled = 1
+                      LIMIT 1",
+                    rusqlite::params![org_id, doc_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_err)?
+                .is_some();
+            Ok(!visible)
         }
     }
 }
@@ -285,6 +345,7 @@ impl Db {
                 return Ok(Some(WikiTarget {
                     kind: "note".to_string(),
                     id,
+                    stable_id: None,
                 }));
             }
         }
@@ -294,12 +355,14 @@ impl Db {
             return Ok(Some(WikiTarget {
                 kind: "meeting".to_string(),
                 id: m.id,
+                stable_id: None,
             }));
         }
         if let Some(m) = self.meeting_by_title_folded_visible(title, unlocked)? {
             return Ok(Some(WikiTarget {
                 kind: "meeting".to_string(),
                 id: m.id,
+                stable_id: None,
             }));
         }
         // Document leg — AFTER meetings, BEFORE org. A note that links a document materializes
@@ -343,6 +406,7 @@ impl Db {
                 return Ok(Some(WikiTarget {
                     kind: "document".to_string(),
                     id,
+                    stable_id: None,
                 }));
             }
         }
@@ -354,25 +418,38 @@ impl Db {
         // touches `org_items`.
         {
             let conn = self.lock();
-            let org_id: Option<String> = conn
+            let org_target: Option<(String, String, Option<String>)> = conn
                 .query_row(
-                    "SELECT oi.item_id
+                    "SELECT oi.item_id, oi.org_id, oi.doc_id
                        FROM org_items oi
                        JOIN org_state os ON os.org_id = oi.org_id
                       WHERE oi.tombstoned = 0
                         AND os.context_enabled = 1
+                        AND ((oi.doc_id IS NOT NULL AND oi.is_current = 1)
+                             OR oi.doc_id IS NULL)
                         AND oi.title = ?1
-                      ORDER BY oi.created_at DESC, oi.item_id ASC
+                      ORDER BY CASE WHEN oi.doc_id IS NOT NULL THEN 0 ELSE 1 END,
+                               oi.rev DESC, oi.seq DESC, oi.item_id ASC
                       LIMIT 1",
                     rusqlite::params![title],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()
                 .map_err(map_err)?;
-            if let Some(id) = org_id {
+            if let Some((item_id, org_id, doc_id)) = org_target {
+                let stable_id = match doc_id {
+                    Some(doc_id) => {
+                        let Some(stable_id) = org_link_id(&org_id, &doc_id) else {
+                            return Ok(None);
+                        };
+                        Some(stable_id)
+                    }
+                    None => None,
+                };
                 return Ok(Some(WikiTarget {
                     kind: "org".to_string(),
-                    id,
+                    id: item_id,
+                    stable_id,
                 }));
             }
         }
@@ -880,15 +957,18 @@ impl Db {
                 let kind = match target.kind.as_str() {
                     "meeting" => crate::links::LinkKind::Meeting,
                     "note" => crate::links::LinkKind::Note,
-                    // "org" targets live outside the folder-lock link domain (PR-4) — skip.
+                    // Org relationships are explicit/manual only. A title collision in a local note
+                    // must not silently create a private Shared Brain relation on save.
+                    "org" => continue,
                     _ => continue,
                 };
                 // Never self-link (a note whose title resolves to itself).
                 if kind == src_kind && target.id == src_id {
                     continue;
                 }
-                if !targets.iter().any(|(k, i)| *k == kind && i == &target.id) {
-                    targets.push((kind, target.id));
+                let endpoint_id = target.stable_id.unwrap_or(target.id);
+                if !targets.iter().any(|(k, i)| *k == kind && i == &endpoint_id) {
+                    targets.push((kind, endpoint_id));
                 }
             }
         }
@@ -1131,11 +1211,12 @@ impl Db {
     /// note↔meeting-links PR-1 — upsert ONE user-initiated DIRECTED `manual` edge (`created_by='user'`,
     /// `status='active'`, `score=1.0`). Idempotent on the table's UNIQUE key (a repeat link is a no-op
     /// refresh, never a duplicate row). Directed like wikilink/companion — endpoints are stored AS
-    /// PASSED (never canonicalized). The CALLER (`link_items_inner`) has already gated BOTH endpoints
-    /// session-visible before this write, so a `manual` row is never created behind a lock. Purged on
-    /// seal by the edge-type-agnostic `purge_links_tx`; read through the both-endpoint-gated
-    /// `links_for_visible`. This wrapper exposes the private `upsert_link_tx` to the command layer
-    /// exactly as `set_companion_link` does for the companion edge — no new SQL surface.
+    /// PASSED (never canonicalized). The CALLER (`link_items_inner`) gates BOTH endpoints
+    /// session-visible, and this transaction repeats the at-rest endpoint gate immediately before
+    /// insertion so a concurrent seal, context-disable, leave, or final withdrawal cannot race a
+    /// stale snapshot into a durable row. Local folder seals purge affected local endpoints; org
+    /// withdrawal instead withholds the opaque private row through the both-endpoint-gated
+    /// `links_for_visible` until a live successor exists again.
     pub fn upsert_manual_link(
         &self,
         src_kind: &str,
@@ -1146,6 +1227,17 @@ impl Db {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let src = crate::links::LinkKind::parse(src_kind)
+            .ok_or_else(|| AppError::InvalidArg("invalid source link kind".into()))?;
+        let dst = crate::links::LinkKind::parse(dst_kind)
+            .ok_or_else(|| AppError::InvalidArg("invalid destination link kind".into()))?;
+        if link_endpoint_sealed_at_rest_tx(&tx, src, src_id)?
+            || link_endpoint_sealed_at_rest_tx(&tx, dst, dst_id)?
+        {
+            return Err(AppError::Locked(
+                "one of these items is no longer available to link".into(),
+            ));
+        }
         Self::upsert_link_tx(
             &tx, src_kind, src_id, dst_kind, dst_id, "manual", 1.0, "user", "active", now,
         )?;
@@ -1162,8 +1254,9 @@ impl Db {
     /// note↔meeting-links PR-1 — delete ONLY the DIRECTED `manual` edge for `(src → dst)`. NEVER
     /// touches a `wikilink`/`companion`/`semantic` row for the same pair (the `edge_type='manual'`
     /// predicate is exact): unlinking a manual link leaves any derived wikilink/companion/semantic
-    /// relation intact. Idempotent (0 rows for an already-absent edge). The CALLER strips the
-    /// materialized `[[Title]]` from the source note's body separately (best-effort).
+    /// relation intact. This narrow restore/retry API is idempotent for a missing exact row; the
+    /// collapsed multi-edge [`Self::delete_manual_links`] API remains strict and atomic. Legacy
+    /// marker preparation is performed transactionally by that batch primitive.
     pub fn delete_manual_link(
         &self,
         src_kind: &str,
@@ -1171,14 +1264,16 @@ impl Db {
         dst_kind: &str,
         dst_id: &str,
     ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "DELETE FROM links
-               WHERE src_kind = ?1 AND src_id = ?2 AND dst_kind = ?3 AND dst_id = ?4
-                 AND edge_type = 'manual'",
-            rusqlite::params![src_kind, src_id, dst_kind, dst_id],
-        )
-        .map_err(map_err)?;
+        let _cleanup_queued = self.delete_manual_links_with_marker_seals_mode(
+            &[crate::storage::models::ManualLinkEdge {
+                src_kind: src_kind.to_string(),
+                src_id: src_id.to_string(),
+                dst_kind: dst_kind.to_string(),
+                dst_id: dst_id.to_string(),
+            }],
+            &[],
+            false,
+        )?;
         tracing::info!(
             target: "links",
             src_kind = src_kind,
@@ -1186,6 +1281,267 @@ impl Db {
             "delete_manual_link"
         );
         Ok(())
+    }
+
+    /// Delete a collapsed chip's complete set of exact directed `manual` rows in ONE transaction.
+    /// Every endpoint is re-checked for at-rest availability before the first mutation. For every
+    /// legacy note-source marker, the same transaction strips the DB body and journals its exact
+    /// vault export BEFORE deleting the last naming edge. A preparation error rolls the whole set
+    /// back, so a concurrent seal cannot lose the only durable cleanup intent. Derived
+    /// `wikilink`/`companion`/`semantic` rows are excluded by the exact `edge_type` predicate.
+    /// Returns whether at least one vault-cleanup outbox row was queued.
+    pub fn delete_manual_links(
+        &self,
+        manual_edges: &[crate::storage::models::ManualLinkEdge],
+    ) -> Result<bool> {
+        self.delete_manual_links_with_marker_seals(manual_edges, &[])
+    }
+
+    /// Command-layer twin of [`Self::delete_manual_links`] carrying verified fresh seals for any
+    /// session-unlocked locked source whose legacy marker is mutated in the transaction.
+    pub(crate) fn delete_manual_links_with_marker_seals(
+        &self,
+        manual_edges: &[crate::storage::models::ManualLinkEdge],
+        prepared_seals: &[PreparedManualMarkerSeal],
+    ) -> Result<bool> {
+        self.delete_manual_links_with_marker_seals_mode(manual_edges, prepared_seals, true)
+    }
+
+    fn delete_manual_links_with_marker_seals_mode(
+        &self,
+        manual_edges: &[crate::storage::models::ManualLinkEdge],
+        prepared_seals: &[PreparedManualMarkerSeal],
+        strict_missing: bool,
+    ) -> Result<bool> {
+        if manual_edges.is_empty() || manual_edges.len() > 2 {
+            return Err(AppError::InvalidArg(
+                "a collapsed pair must contain one or two manual link edges".into(),
+            ));
+        }
+        for (index, edge) in manual_edges.iter().enumerate() {
+            if manual_edges[..index].contains(edge) {
+                return Err(AppError::InvalidArg(
+                    "duplicate manual link edge in unlink request".into(),
+                ));
+            }
+        }
+        for (index, seal) in prepared_seals.iter().enumerate() {
+            if seal.text_blob.is_empty()
+                || prepared_seals[..index]
+                    .iter()
+                    .any(|prior| prior.note_id == seal.note_id)
+            {
+                return Err(AppError::InvalidArg(
+                    "invalid prepared manual-marker seal set".into(),
+                ));
+            }
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        for edge in manual_edges {
+            let src = crate::links::LinkKind::parse(&edge.src_kind)
+                .ok_or_else(|| AppError::InvalidArg("invalid source link kind".into()))?;
+            let dst = crate::links::LinkKind::parse(&edge.dst_kind)
+                .ok_or_else(|| AppError::InvalidArg("invalid destination link kind".into()))?;
+            if link_endpoint_sealed_at_rest_tx(&tx, src, &edge.src_id)?
+                || link_endpoint_sealed_at_rest_tx(&tx, dst, &edge.dst_id)?
+            {
+                return Err(AppError::Locked(
+                    "one of these items is no longer available to unlink".into(),
+                ));
+            }
+        }
+        let cleanup_queued =
+            Self::prepare_manual_marker_cleanup_tx(&tx, manual_edges, prepared_seals)?;
+        for edge in manual_edges {
+            let deleted = tx
+                .execute(
+                    "DELETE FROM links
+                   WHERE src_kind = ?1 AND src_id = ?2 AND dst_kind = ?3 AND dst_id = ?4
+                     AND edge_type = 'manual'",
+                    rusqlite::params![edge.src_kind, edge.src_id, edge.dst_kind, edge.dst_id],
+                )
+                .map_err(map_err)?;
+            if strict_missing && deleted != 1 {
+                return Err(AppError::InvalidArg(
+                    "one of the selected manual link edges no longer exists".into(),
+                ));
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        tracing::info!(
+            target: "links",
+            count = manual_edges.len(),
+            "delete_manual_links"
+        );
+        Ok(cleanup_queued)
+    }
+
+    /// Resolve the current marker title while holding the exact unlink transaction. This is not a
+    /// general read surface: the command already gated both endpoints, and the transaction repeats
+    /// their at-rest availability check before calling it. `None` is a fail-closed preparation
+    /// refusal for a note-source edge, never permission to delete first and guess later.
+    fn manual_marker_title_tx(
+        tx: &rusqlite::Transaction<'_>,
+        kind: crate::links::LinkKind,
+        id: &str,
+    ) -> Result<Option<String>> {
+        match kind {
+            crate::links::LinkKind::Meeting => tx
+                .query_row(
+                    "SELECT COALESCE(NULLIF(TRIM(title), ''), 'Meeting')
+                       FROM meetings WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(map_err),
+            crate::links::LinkKind::Note | crate::links::LinkKind::Document => tx
+                .query_row(
+                    "SELECT COALESCE(NULLIF(TRIM(title), ''), name)
+                       FROM documents WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(map_err),
+            crate::links::LinkKind::Org => {
+                let Some((org_id, doc_id)) = parse_org_link_id(id) else {
+                    return Ok(None);
+                };
+                tx.query_row(
+                    "SELECT oi.title
+                       FROM org_items oi
+                       JOIN org_state os ON os.org_id = oi.org_id
+                      WHERE oi.org_id = ?1 AND oi.doc_id = ?2
+                        AND oi.tombstoned = 0 AND oi.is_current = 1
+                        AND os.context_enabled = 1
+                      LIMIT 1",
+                    rusqlite::params![org_id, doc_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(map_err)
+            }
+        }
+    }
+
+    /// Prepare every legacy note-source marker cleanup in the unlink transaction. Only a real
+    /// machine-owned marker is mutated/journalled; ordinary user-authored wikilinks outside the
+    /// managed block are untouched. The returned flag tells the command whether it must drain the
+    /// durable filesystem outbox before reporting success.
+    fn prepare_manual_marker_cleanup_tx(
+        tx: &rusqlite::Transaction<'_>,
+        manual_edges: &[crate::storage::models::ManualLinkEdge],
+        prepared_seals: &[PreparedManualMarkerSeal],
+    ) -> Result<bool> {
+        let mut titles_by_note: std::collections::HashMap<
+            String,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+        for edge in manual_edges {
+            let src = crate::links::LinkKind::parse(&edge.src_kind)
+                .ok_or_else(|| AppError::InvalidArg("invalid source link kind".into()))?;
+            if src != crate::links::LinkKind::Note {
+                continue;
+            }
+            let dst = crate::links::LinkKind::parse(&edge.dst_kind)
+                .ok_or_else(|| AppError::InvalidArg("invalid destination link kind".into()))?;
+            let title = Self::manual_marker_title_tx(tx, dst, &edge.dst_id)?.ok_or_else(|| {
+                AppError::Locked("one of these items is no longer available to unlink".into())
+            })?;
+            let title = crate::enrich::sanitize(&title);
+            if title.trim().is_empty() {
+                return Err(AppError::InvalidArg(
+                    "a linked item has no usable marker title".into(),
+                ));
+            }
+            titles_by_note
+                .entry(edge.src_id.clone())
+                .or_default()
+                .insert(title);
+        }
+
+        let mut cleanup_queued = false;
+        let mut used_seals = std::collections::HashSet::new();
+        for (note_id, titles) in titles_by_note {
+            let row: Option<(String, Option<String>, bool, String)> = tx
+                .query_row(
+                    "SELECT COALESCE(d.text, ''), d.exported_path, f.locked, d.folder_id
+                       FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE d.id = ?1 AND d.kind = 'note'",
+                    rusqlite::params![note_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(map_err)?;
+            let Some((text, exported_path, folder_locked, folder_id)) = row else {
+                return Err(AppError::Locked(
+                    "a linked note is no longer available to unlink".into(),
+                ));
+            };
+            let Some(stripped) = Self::strip_titles_from_managed_block(&text, &titles) else {
+                continue;
+            };
+            if let Some(path) = exported_path.filter(|path| !path.is_empty()) {
+                for title in &titles {
+                    Self::enqueue_marker_export_cleanup_tx(tx, false, &note_id, "", &path, title)?;
+                }
+                cleanup_queued = true;
+            }
+            let changed = if folder_locked {
+                let prepared = prepared_seals
+                    .iter()
+                    .find(|prepared| prepared.note_id == note_id)
+                    .ok_or_else(|| {
+                        AppError::Locked(
+                            "locked note marker cleanup has no verified fresh seal".into(),
+                        )
+                    })?;
+                if prepared.stripped_text != stripped {
+                    return Err(AppError::Locked(
+                        "linked note changed while its marker cleanup was prepared".into(),
+                    ));
+                }
+                if prepared.folder_id != folder_id
+                    || crate::crypto::decrypt(
+                        &prepared.content_key,
+                        &prepared.text_blob,
+                        &document_seal_aad(&folder_id, &note_id),
+                    )? != stripped.as_bytes()
+                {
+                    return Err(AppError::Locked(
+                        "locked note marker cleanup seal did not verify byte-identical".into(),
+                    ));
+                }
+                used_seals.insert(note_id.clone());
+                tx.execute(
+                    "UPDATE documents SET text = '', text_blob = ?2
+                       WHERE id = ?1 AND kind = 'note' AND text = ?3",
+                    rusqlite::params![note_id, prepared.text_blob, text],
+                )
+                .map_err(map_err)?
+            } else {
+                tx.execute(
+                    "UPDATE documents SET text = ?2
+                       WHERE id = ?1 AND kind = 'note' AND text = ?3",
+                    rusqlite::params![note_id, stripped, text],
+                )
+                .map_err(map_err)?
+            };
+            if changed != 1 {
+                return Err(AppError::Storage(
+                    "linked note changed while preparing marker cleanup".into(),
+                ));
+            }
+        }
+        if used_seals.len() != prepared_seals.len() {
+            return Err(AppError::InvalidArg(
+                "prepared manual-marker seal does not belong to this unlink".into(),
+            ));
+        }
+        Ok(cleanup_queued)
     }
 
     /// TEST-ONLY: insert one raw `links` row and return its row id, so sibling-crate test modules
@@ -1525,7 +1881,7 @@ impl Db {
 
     /// PURE: strip the `[[title]]` hits named by `titles` from the MACHINE-OWNED `murmur:links` block
     /// of `body`, via [`crate::enrich::extract_link_hits`] + `apply_link_markers` (the exact inverse
-    /// the command-layer `strip_manual_link_marker` uses). Returns `Some(new_body)` iff a hit was
+    /// the transactional manual-unlink preparation uses). Returns `Some(new_body)` iff a hit was
     /// removed (so the caller only writes on a real change), else `None`. A user-typed `[[Title]]`
     /// OUTSIDE the managed block is never in `extract_link_hits`'s output, so it is never stripped.
     pub(crate) fn strip_titles_from_managed_block(
@@ -2022,6 +2378,7 @@ impl Db {
                    JOIN doc_chunks dc ON dc.id = v.chunk_id
                   WHERE dc.document_id = ?1"
             }
+            crate::links::LinkKind::Org => return Ok(None),
         };
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
         let rows = stmt
@@ -2152,6 +2509,7 @@ impl Db {
                 "AND kd.chunk_id NOT IN (SELECT id FROM doc_chunks WHERE document_id = ?3)"
                     .to_string(),
             ),
+            crate::links::LinkKind::Org => return Ok(Vec::new()),
         };
         // Each vec0 table gets its own single-MATCH CTE (vec0 allows one MATCH+k per query); the
         // meeting leg maps chunk→meeting and gates on the meeting's note folder; the doc leg maps
@@ -2462,6 +2820,16 @@ impl Db {
         };
         let mut edges: Vec<crate::storage::models::LinkEdge> = Vec::new();
         for (lid, sk, si, dk, di, et, cb, st, score, created_at) in rows {
+            let manual_edges = if et == "manual" {
+                vec![crate::storage::models::ManualLinkEdge {
+                    src_kind: sk.clone(),
+                    src_id: si.clone(),
+                    dst_kind: dk.clone(),
+                    dst_id: di.clone(),
+                }]
+            } else {
+                Vec::new()
+            };
             // Identify the OTHER endpoint (the one that is NOT the queried item) + the direction.
             let (direction, other_kind_s, other_id) = if sk == kind.as_str() && si == id {
                 ("out", dk, di)
@@ -2477,11 +2845,18 @@ impl Db {
             else {
                 continue;
             };
+            let navigation_id = if other_kind == crate::links::LinkKind::Org {
+                self.org_link_target_visible(&other_id)?
+                    .map(|(item_id, _title)| item_id)
+            } else {
+                None
+            };
             edges.push(crate::storage::models::LinkEdge {
                 id: lid,
                 direction: direction.to_string(),
                 other_kind: other_kind_s,
                 other_id,
+                navigation_id,
                 other_title,
                 edge_type: et,
                 created_by: cb,
@@ -2490,7 +2865,8 @@ impl Db {
                 created_at,
                 // Set on the base build; the collapse pass below flips it true per (other_kind,
                 // other_id) pair that carries a `manual` edge.
-                manual: false,
+                manual: !manual_edges.is_empty(),
+                manual_edges,
             });
         }
         let edges = Self::collapse_manual_duplicate_edges(edges);
@@ -2632,8 +3008,10 @@ impl Db {
     /// - PREFER the DETERMINISTIC edge (`wikilink` > `companion` > `semantic`) for the surviving
     ///   row's stable `id`/`edge_type` (its id is what accept/dismiss already key on), falling back to
     ///   the `manual` row when it is the only edge for the pair.
-    /// - Set `manual = true` on the surviving row iff ANY edge in the group is a `manual` edge — so
-    ///   the FE knows the chip is user-created + REMOVABLE regardless of which `edge_type` won.
+    /// - Preserve every exact directed manual tuple in `manual_edges` (at most two: one per direction
+    ///   under the table UNIQUE key), and set `manual = true` iff that list is non-empty. The FE can
+    ///   therefore remove the whole hidden manual set without reconstructing direction from the
+    ///   representative.
     ///
     /// Input order is already the reader's stable sort (active-then-suggested, score DESC, id ASC);
     /// this preserves the FIRST-seen group's position so the output order stays deterministic. Pairs
@@ -2664,27 +3042,23 @@ impl Db {
             (String, String),
             crate::storage::models::LinkEdge,
         > = std::collections::HashMap::new();
-        for edge in edges {
+        for mut edge in edges {
             let key = (edge.other_kind.clone(), edge.other_id.clone());
-            let has_manual = edge.edge_type == "manual";
             match groups.get_mut(&key) {
                 None => {
                     order.push(key.clone());
-                    let mut rep = edge;
-                    rep.manual = has_manual;
-                    groups.insert(key, rep);
+                    edge.manual = !edge.manual_edges.is_empty();
+                    groups.insert(key, edge);
                 }
                 Some(rep) => {
-                    // A manual edge anywhere in the group makes the surviving chip removable.
-                    if has_manual {
-                        rep.manual = true;
-                    }
+                    let mut manual_edges = std::mem::take(&mut rep.manual_edges);
+                    manual_edges.append(&mut edge.manual_edges);
                     // Promote the representative to the more-deterministic edge (lower rank wins).
                     if edge_rank(&edge.edge_type) < edge_rank(&rep.edge_type) {
-                        let manual_flag = rep.manual; // carry the group's removable flag forward.
                         *rep = edge;
-                        rep.manual = manual_flag;
                     }
+                    rep.manual = !manual_edges.is_empty();
+                    rep.manual_edges = manual_edges;
                 }
             }
         }
@@ -2722,7 +3096,7 @@ impl Db {
                 let expected_kind = match kind {
                     crate::links::LinkKind::Note => "note",
                     crate::links::LinkKind::Document => "document",
-                    crate::links::LinkKind::Meeting => unreachable!(),
+                    crate::links::LinkKind::Meeting | crate::links::LinkKind::Org => unreachable!(),
                 };
                 let sql = format!(
                     "SELECT COALESCE(NULLIF(TRIM(d.title), ''), d.name)
@@ -2737,6 +3111,54 @@ impl Db {
                 .optional()
                 .map_err(map_err)
             }
+            crate::links::LinkKind::Org => self
+                .org_link_target_visible(id)
+                .map(|target| target.map(|(_item_id, title)| title)),
         }
+    }
+
+    /// Resolve a strict stable Shared Brain `org_id:doc_id` composite to its current live feed item
+    /// and title. The SQL join is the org read gate: membership must still exist locally, context
+    /// must be enabled, and at least one non-tombstoned current replica revision must exist.
+    /// Unknown/revoked/left/disabled are all indistinguishable `None` so a private edge never becomes
+    /// an existence or title oracle.
+    pub fn org_link_target_visible(&self, link_id: &str) -> Result<Option<(String, String)>> {
+        let Some((org_id, doc_id)) = parse_org_link_id(link_id) else {
+            return Ok(None);
+        };
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT oi.item_id, oi.title
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.org_id = ?1 AND oi.doc_id = ?2
+                AND oi.tombstoned = 0 AND oi.is_current = 1 AND os.context_enabled = 1
+              LIMIT 1",
+            rusqlite::params![org_id, doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Translate one current feed revision id to its stable link identity. This is used only while
+    /// building the already-gated org candidate page; legacy rows without a `doc_id` are deliberately
+    /// not offered because an item-id edge would break on the next revision.
+    pub fn org_link_doc_id_for_item_visible(&self, item_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let target: Option<(String, String)> = conn
+            .query_row(
+                "SELECT oi.org_id, oi.doc_id
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND oi.doc_id IS NOT NULL AND oi.is_current = 1
+              LIMIT 1",
+                rusqlite::params![item_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(target.and_then(|(org_id, doc_id)| org_link_id(&org_id, &doc_id)))
     }
 }

@@ -767,31 +767,39 @@ pub struct OrgChunkHit {
 #[serde(rename_all = "camelCase")]
 pub struct OrgItemDetail {
     pub item_id: String,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub doc_id: Option<String>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub link_id: Option<String>,
     pub author_hint: String,
     pub title: String,
     pub created_at: String,
     pub rev: u32,
     pub markdown: String,
-    /// True when the CALLER authored this item (their `server_user_id` matches the item's stored
-    /// `author_user_id`) — so the viewer can offer edit-in-place on ANY of the author's machines, not
-    /// just the one that first shared it (the origin machine redirects to the local source instead;
-    /// a second machine has no local `org_shares` row, so this server-authoritative author check is
-    /// what unlocks editing there). Computed by the `org_get_item` command (needs the session);
-    /// `Db::get_org_item` always sets it `false`. 2026-07-14.
+    /// Compatibility mirror of `can_edit` for older frontends. Permission-aware clients use
+    /// `can_edit`/`can_manage`, computed from stable ownership, org role, and document access.
     pub editable: bool,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub access: String,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub can_edit: bool,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub can_manage: bool,
 }
 
-/// Internal (not FE-facing) context the `org_update_own_item` egress command needs to re-publish an
-/// edited org item the caller authored: which org to publish into, the current rev (→ rev+1 supersede),
-/// the original `created_at` + `source_kind` to preserve on the wire, and the stored `author_user_id`
-/// for the ownership gate. Resolved by [`Db::org_item_edit_ctx`] for a LIVE (non-tombstoned) item.
+/// Internal edit/management context for a live org item. It preserves immutable envelope provenance
+/// and separates the revision actor (`author_user_id`) from the stable document manager.
 #[derive(Debug, Clone)]
 pub struct OrgItemEditCtx {
     pub org_id: String,
+    pub doc_id: Option<String>,
     pub rev: u32,
     pub created_at: String,
+    pub author_hint: String,
     pub source_kind: Option<String>,
     pub author_user_id: Option<String>,
+    pub document_owner_user_id: Option<String>,
+    pub access: String,
 }
 
 /// Shared Brain v1 — a LIST-row header for one live org item (the browsable org-items list, so a
@@ -803,6 +811,8 @@ pub struct OrgItemEditCtx {
 #[serde(rename_all = "camelCase")]
 pub struct OrgItemHeader {
     pub item_id: String,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub doc_id: Option<String>,
     pub title: String,
     pub author_hint: String,
     pub created_at: String,
@@ -1631,6 +1641,18 @@ pub struct BacklinkSource {
     pub timestamp: String,
 }
 
+/// One exact, directed user-created row in the `links` table. A displayed [`LinkEdge`] may collapse
+/// several rows for the same neighbour (including both `A -> B` and `B -> A`), so removability must
+/// carry the stored tuples instead of reconstructing one from the display representative.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualLinkEdge {
+    pub src_kind: String,
+    pub src_id: String,
+    pub dst_kind: String,
+    pub dst_id: String,
+}
+
 /// Brain v3 PR-3 — one persisted `links` row surfaced to the FE, with the OTHER endpoint's display
 /// title resolved through the SAME visibility gate as the queried endpoint (both-endpoint gating).
 /// `direction` says whether the queried item is this edge's `src` ("out") or `dst` ("in") so the FE
@@ -1640,22 +1662,28 @@ pub struct BacklinkSource {
 /// (1.0 for the deterministic wikilink/companion/manual edges). Only ever built when BOTH endpoints
 /// are VISIBLE — a sealed neighbour can never appear, and a sealed queried item yields an empty list.
 ///
-/// `manual` (note↔meeting-links PR-1) is the DISPLAY-DEDUPE flag: when a user-initiated `manual` edge
+/// `manual` (note↔meeting-links PR-1) is the backward-compatible DISPLAY-DEDUPE flag: when a
+/// user-initiated `manual` edge
 /// AND a derived `wikilink` (or another deterministic edge) exist for the SAME `(other_kind,
 /// other_id)` pair, `links_for_visible` collapses them to ONE row (preferring the deterministic
 /// `edge_type` for its stable id) but sets `manual = true` so the FE knows the chip is user-created +
 /// REMOVABLE (renders the `×` → `unlink_items`). A pair with no `manual` edge has `manual = false`
-/// (an auto wikilink/semantic chip — not user-removable). Always present, defaults `false` for any
-/// non-manual edge, so an old FE reads it as absent.
+/// (an auto wikilink/semantic chip — not user-removable). `manual_edges` is the authoritative exact
+/// directed set behind that flag (one or both directions); it lets unlink remove every collapsed row
+/// atomically even when the representative points the other way. Both fields default empty/false.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkEdge {
     pub id: i64,
     /// "out" (queried item is `src`) | "in" (queried item is `dst`).
     pub direction: String,
-    /// The neighbour endpoint kind: `meeting|note|document`.
+    /// The neighbour endpoint kind: `meeting|note|document|org`.
     pub other_kind: String,
     pub other_id: String,
+    /// Current navigation id when the stable endpoint id differs from the routed id. Present for an
+    /// `org` edge (`other_id = org_id:doc_id`, `navigation_id = current item_id`) and omitted locally.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub navigation_id: Option<String>,
     /// The neighbour's current display title, resolved through the visibility gate.
     pub other_title: String,
     pub edge_type: String,
@@ -1669,6 +1697,11 @@ pub struct LinkEdge {
     /// a `manual` chip. Defaults `false` (serde default) for every non-manual pair.
     #[serde(default)]
     pub manual: bool,
+    /// Every exact directed `manual` row folded into this displayed chip. Empty for derived-only
+    /// chips. The unlink command removes this whole set in one transaction; `manual` remains as the
+    /// backward-compatible display flag.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub manual_edges: Vec<ManualLinkEdge>,
 }
 
 /// A resolved `[[Title]]` wikilink navigation target — the VISIBLE note, meeting, document, or
@@ -1688,6 +1721,10 @@ pub struct WikiTarget {
     /// `"meeting"` | `"note"` | `"document"` | `"org"`.
     pub kind: String,
     pub id: String,
+    /// Revision-stable endpoint id used by the private link graph. For org targets this is the
+    /// strict `org_id:doc_id` composite; `id` remains the current `item_id` for navigation.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub stable_id: Option<String>,
 }
 
 /// note↔meeting-links PR-2 — one EXPLICIT source the user pinned in the Ask source picker: a
@@ -1894,8 +1931,16 @@ pub struct OrgShareRow {
     pub generation: u32,
     pub content_sha256: Option<Vec<u8>>,
     pub item_id: Option<String>,
+    pub doc_id: Option<String>,
+    pub access: String,
+    /// The caller's durable PII-scrub choice. Legacy rows migrate to fail-safe `true`.
+    pub scrub: bool,
     pub state: String,
     pub last_error: Option<String>,
+    pub expected_actor_user_id: Option<String>,
+    pub expected_owner_user_id: Option<String>,
+    pub source_version: u64,
+    pub republish_dirty: u64,
     pub created_at: String,
     pub updated_at: String,
 }

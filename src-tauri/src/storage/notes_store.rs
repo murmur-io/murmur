@@ -278,14 +278,46 @@ impl Db {
         text: &str,
         updated_at: i64,
     ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx.execute(
             "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
                WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id, title, text, updated_at],
         )
         .map_err(map_err)?;
-        Ok(())
+        if changed != 0 {
+            tx.execute(
+            "UPDATE org_shares SET republish_dirty = republish_dirty + 1, republish_deferred=0
+              WHERE document_id = ?1 AND state IN ('queued','uploaded','failed')",
+            rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)
+    }
+
+    pub fn update_note_row_debounced(
+        &self,
+        id: &str,
+        title: &str,
+        text: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
+               WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, title, text, updated_at],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE org_shares SET republish_deferred=1
+              WHERE document_id=?1 AND state IN ('queued','uploaded','failed')",
+            rusqlite::params![id],
+        ).map_err(map_err)?;
+        tx.commit().map_err(map_err)
     }
 
     /// Background auto-title CAS. It changes ONLY `title` + `updated_at`, and only while the exact
@@ -302,8 +334,9 @@ impl Db {
         title: &str,
         updated_at: i64,
     ) -> Result<bool> {
-        let conn = self.lock();
-        let changed = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx
             .execute(
                 "UPDATE documents
                     SET title = ?5, updated_at = ?6
@@ -328,6 +361,15 @@ impl Db {
                 ],
             )
             .map_err(map_err)?;
+        if changed != 0 {
+            tx.execute(
+                "UPDATE org_shares SET republish_dirty = republish_dirty + 1
+                  WHERE document_id = ?1 AND state IN ('queued','uploaded','failed')",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
         Ok(changed == 1)
     }
 
@@ -345,14 +387,47 @@ impl Db {
         text_blob: &[u8],
         updated_at: i64,
     ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx.execute(
             "UPDATE documents SET title = ?2, text = ?3, text_blob = ?4, updated_at = ?5
                WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id, title, text, text_blob, updated_at],
         )
         .map_err(map_err)?;
-        Ok(())
+        if changed != 0 {
+            tx.execute(
+            "UPDATE org_shares SET republish_dirty = republish_dirty + 1, republish_deferred=0
+              WHERE document_id = ?1 AND state IN ('queued','uploaded','failed')",
+            rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)
+    }
+
+    pub fn update_note_row_sealed_debounced(
+        &self,
+        id: &str,
+        title: &str,
+        text: &str,
+        text_blob: &[u8],
+        updated_at: i64,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "UPDATE documents SET title = ?2, text = ?3, text_blob = ?4, updated_at = ?5
+               WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, title, text, text_blob, updated_at],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE org_shares SET republish_deferred=1
+              WHERE document_id=?1 AND state IN ('queued','uploaded','failed')",
+            rusqlite::params![id],
+        ).map_err(map_err)?;
+        tx.commit().map_err(map_err)
     }
 
     /// MOVE-INTO-LOCKED twin of [`Db::update_note_row_sealed`] (2026-07-10 residual W2): reassign an
@@ -664,8 +739,9 @@ impl Db {
     }
 
     pub fn upsert_note(&self, note: &NoteRecord) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
             "INSERT INTO notes
                (meeting_id, provider_id, markdown, created_at, exported_path,
                 model_requested, model_served, gateway_host)
@@ -689,7 +765,13 @@ impl Db {
             ],
         )
         .map_err(map_err)?;
-        Ok(())
+        tx.execute(
+            "UPDATE org_shares SET republish_dirty = republish_dirty + 1
+              WHERE meeting_id = ?1 AND state IN ('queued','uploaded','failed')",
+            rusqlite::params![note.meeting_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)
     }
 
     /// SEAL-ON-WRITE twin of [`Db::upsert_note`] for a meeting whose folder is LOCKED (and
@@ -742,6 +824,12 @@ impl Db {
                 content_blob,
                 folder_id,
             ],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE org_shares SET republish_dirty = republish_dirty + 1
+              WHERE meeting_id = ?1 AND state IN ('queued','uploaded','failed')",
+            rusqlite::params![note.meeting_id],
         )
         .map_err(map_err)?;
         tx.commit().map_err(map_err)
@@ -798,7 +886,8 @@ impl Db {
         conn.query_row(
             "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
                     model_requested, model_served, gateway_host
-               FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
+               FROM notes WHERE meeting_id = ?1
+               ORDER BY created_at DESC, provider_id DESC LIMIT 1",
             rusqlite::params![meeting_id],
             row_to_note,
         )
