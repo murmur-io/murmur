@@ -521,6 +521,9 @@ pub(crate) fn resolve_vault_context_pinned_visible_inputs(
             }
             LinkKind::Note => db.note_is_visible(&source.id, unlocked)?,
             LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
+            // Org context activation belongs to the following command/IPC stack. Storage-only org
+            // endpoints remain invisible to the base provider context so no egress widens early.
+            LinkKind::Org => false,
         };
         if typed_visible && explicit_keys.insert(key) {
             explicit_refs.push(source.clone());
@@ -649,6 +652,16 @@ fn resolve_pinned_source(
                 true,
                 Vec::new(),
             )
+        }
+        LinkKind::Org => {
+            return Ok(ResolvedPinnedSource {
+                source: source.clone(),
+                header: String::new(),
+                body: String::new(),
+                body_required: true,
+                manifest_digest: source_manifest_digest("", None, false, ""),
+                vault_sources: Vec::new(),
+            });
         }
     };
     let manifest_digest =

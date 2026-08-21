@@ -133,6 +133,104 @@ impl Db {
                ON note_attachments(org_item_id);",
         )
         .map_err(map_err)?;
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS org_share_attachment_source_version_ai
+               AFTER INSERT ON note_attachments
+               BEGIN
+                 UPDATE org_items SET projection_sha256=NULL WHERE item_id=NEW.org_item_id;
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE (NEW.document_id IS NOT NULL AND document_id = NEW.document_id)
+                     OR (NEW.meeting_id IS NOT NULL AND meeting_id = NEW.meeting_id);
+                 UPDATE org_shares SET republish_dirty = republish_dirty + 1
+                  WHERE state IN ('queued','uploaded','failed') AND
+                    ((NEW.document_id IS NOT NULL AND document_id = NEW.document_id)
+                     OR (NEW.meeting_id IS NOT NULL AND meeting_id = NEW.meeting_id));
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'document',NEW.document_id,1 WHERE NEW.document_id IS NOT NULL
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'meeting',NEW.meeting_id,1 WHERE NEW.meeting_id IS NOT NULL
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_attachment_source_version_ad
+               AFTER DELETE ON note_attachments
+               BEGIN
+                 UPDATE org_items SET projection_sha256=NULL WHERE item_id=OLD.org_item_id;
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE (OLD.document_id IS NOT NULL AND document_id = OLD.document_id)
+                     OR (OLD.meeting_id IS NOT NULL AND meeting_id = OLD.meeting_id);
+                 UPDATE org_shares SET republish_dirty = republish_dirty + 1
+                  WHERE state IN ('queued','uploaded','failed') AND
+                    ((OLD.document_id IS NOT NULL AND document_id = OLD.document_id)
+                     OR (OLD.meeting_id IS NOT NULL AND meeting_id = OLD.meeting_id));
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'document',OLD.document_id,1 WHERE OLD.document_id IS NOT NULL
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'meeting',OLD.meeting_id,1 WHERE OLD.meeting_id IS NOT NULL
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_item_attachment_projection_au
+               AFTER UPDATE ON note_attachments
+               BEGIN
+                 UPDATE org_items SET projection_sha256=NULL
+                  WHERE item_id IS OLD.org_item_id OR item_id IS NEW.org_item_id;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_attachment_source_version_au_v2
+               AFTER UPDATE ON note_attachments
+               BEGIN
+                 UPDATE org_items SET projection_sha256=NULL
+                  WHERE item_id IS OLD.org_item_id OR item_id IS NEW.org_item_id;
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE (OLD.document_id IS NOT NULL AND document_id = OLD.document_id)
+                     OR (OLD.meeting_id IS NOT NULL AND meeting_id = OLD.meeting_id)
+                     OR (NEW.document_id IS NOT NULL AND document_id = NEW.document_id)
+                     OR (NEW.meeting_id IS NOT NULL AND meeting_id = NEW.meeting_id);
+                 UPDATE org_shares SET republish_dirty = republish_dirty + 1
+                  WHERE state IN ('queued','uploaded','failed') AND
+                    ((OLD.document_id IS NOT NULL AND document_id = OLD.document_id)
+                     OR (OLD.meeting_id IS NOT NULL AND meeting_id = OLD.meeting_id)
+                     OR (NEW.document_id IS NOT NULL AND document_id = NEW.document_id)
+                     OR (NEW.meeting_id IS NOT NULL AND meeting_id = NEW.meeting_id));
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'document',OLD.document_id,1 WHERE OLD.document_id IS NOT NULL
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'document',NEW.document_id,1
+                    WHERE NEW.document_id IS NOT NULL AND NEW.document_id IS NOT OLD.document_id
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'meeting',OLD.meeting_id,1 WHERE OLD.meeting_id IS NOT NULL
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   SELECT 'meeting',NEW.meeting_id,1
+                    WHERE NEW.meeting_id IS NOT NULL AND NEW.meeting_id IS NOT OLD.meeting_id
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS closing_attachment_insert_guard
+               BEFORE INSERT ON note_attachments
+               WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 (c.scope_kind='document' AND c.scope_id=NEW.document_id) OR
+                 (c.scope_kind='meeting' AND c.scope_id=NEW.meeting_id))
+               BEGIN SELECT RAISE(ABORT,'share source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_attachment_delete_guard
+               BEFORE DELETE ON note_attachments
+               WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 ((c.scope_kind='document' AND c.scope_id=OLD.document_id) OR
+                  (c.scope_kind='meeting' AND c.scope_id=OLD.meeting_id))
+                 AND ((c.scope_kind='document' AND EXISTS(
+                        SELECT 1 FROM documents d WHERE d.id=OLD.document_id)) OR
+                      (c.scope_kind='meeting' AND EXISTS(
+                        SELECT 1 FROM meetings m WHERE m.id=OLD.meeting_id))))
+               BEGIN SELECT RAISE(ABORT,'share source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_attachment_update_guard
+               BEFORE UPDATE ON note_attachments
+               WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 (c.scope_kind='document' AND (c.scope_id=OLD.document_id OR c.scope_id=NEW.document_id)) OR
+                 (c.scope_kind='meeting' AND (c.scope_id=OLD.meeting_id OR c.scope_id=NEW.meeting_id)))
+               BEGIN SELECT RAISE(ABORT,'share source is closing'); END;",
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -156,7 +254,7 @@ impl Db {
                 let provider_id = conn
                     .query_row(
                         "SELECT provider_id FROM notes WHERE meeting_id = ?1
-                           ORDER BY created_at DESC LIMIT 1",
+                           ORDER BY created_at DESC, provider_id DESC LIMIT 1",
                         rusqlite::params![owner_id],
                         |r| r.get::<_, String>(0),
                     )
