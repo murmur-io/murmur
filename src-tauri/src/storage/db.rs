@@ -113,6 +113,79 @@ pub(crate) fn map_err(e: rusqlite::Error) -> AppError {
     AppError::Storage(e.to_string())
 }
 
+/// Insert one content-free outbound-share egress row inside the caller's transaction.
+///
+/// The dispatch id is the durable idempotency key shared with the state-machine write. Keeping
+/// both writes in the same transaction means a failed/rolled-back dispatch never leaves a phantom
+/// ledger row, while the partial unique index rejects a second non-NULL record for the same
+/// dispatch. The row carries metadata only: never a URL, key, title, or note body.
+#[allow(dead_code)]
+pub(crate) fn insert_share_egress_dispatch_tx(
+    tx: &rusqlite::Transaction<'_>,
+    ts: i64,
+    host: &str,
+    kind: &str,
+    bytes: usize,
+    dispatch_id: &str,
+) -> Result<i64> {
+    if dispatch_id.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "share egress dispatch id must not be blank".into(),
+        ));
+    }
+    if host.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "share egress host must not be blank".into(),
+        ));
+    }
+    if kind.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "share egress kind must not be blank".into(),
+        ));
+    }
+    let byte_count = i64::try_from(bytes).map_err(|_| {
+        AppError::InvalidArg("share egress byte count exceeds SQLite INTEGER range".into())
+    })?;
+    tx.execute(
+        "INSERT INTO share_egress_log (ts, host, kind, byte_count, dispatch_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![ts, host, kind, byte_count, dispatch_id],
+    )
+    .map_err(map_err)?;
+    Ok(tx.last_insert_rowid())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn insert_org_read_egress_dispatch_tx(
+    tx: &rusqlite::Transaction<'_>,
+    ts: i64,
+    host: &str,
+    kind: &str,
+    dispatch_id: &str,
+    org_id: &str,
+    doc_id: &str,
+    since_seq: u64,
+    limit: u32,
+) -> Result<i64> {
+    if org_id.trim().is_empty() || doc_id.trim().is_empty() || limit == 0 {
+        return Err(AppError::InvalidArg(
+            "org recovery read witness must be complete".into(),
+        ));
+    }
+    let row_id = insert_share_egress_dispatch_tx(tx, ts, host, kind, 0, dispatch_id)?;
+    let since_seq = i64::try_from(since_seq)
+        .map_err(|_| AppError::InvalidArg("org recovery cursor exceeds SQLite range".into()))?;
+    tx.execute(
+        "UPDATE share_egress_log
+            SET org_id = ?2, doc_id = ?3, since_seq = ?4, page_limit = ?5
+          WHERE id = ?1 AND dispatch_id = ?6",
+        rusqlite::params![row_id, org_id, doc_id, since_seq, limit as i64, dispatch_id],
+    )
+    .map_err(map_err)?;
+    Ok(row_id)
+}
+
 /// Process-global, one-time registration of the sqlite-vec `vec0` virtual-table module through
 /// SQLite's auto-extension hook, so EVERY connection opened afterwards (the main keyed handle, the
 /// MCP reader thread, file-backed test DBs) can CREATE and query `vec_chunks`. MUST run BEFORE
@@ -293,11 +366,25 @@ pub struct EgressLedger {
     pub recent: Vec<EgressRecentRow>,
 }
 
+/// Content-free local witness for an outbound share whose remote revocation is not yet proven.
+/// The owner binding prevents another signed-in account from seeing or retrying this journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct OutboundRevokePendingRow {
+    pub share_id: String,
+    pub meeting_id: Option<String>,
+    pub document_id: Option<String>,
+    pub mode: String,
+    pub rev: u32,
+    pub created_at: String,
+}
+
 /// Thread-safe SQLite wrapper (internal Mutex<rusqlite::Connection>).
 pub struct Db {
     conn: Mutex<Connection>,
 }
 
+#[allow(dead_code)]
 impl Db {
     /// Opens the encrypted DB (fetching the SQLCipher key from the Keychain) + runs migrations.
     /// This is the path used by the MCP server thread too — it transparently keys the handle.
@@ -357,7 +444,9 @@ impl Db {
         Ok(db)
     }
 
-    /// Idempotent CREATE TABLE IF NOT EXISTS migrations.
+    /// Idempotent CREATE TABLE IF NOT EXISTS migrations. Every schema/data step after the
+    /// read-only legacy preflight runs in one outer transaction: a late migration failure must
+    /// never leave an earlier table, trigger, column, or backfill looking successfully installed.
     pub fn migrate(&self) -> Result<()> {
         let mut conn = self.lock();
         let ask_dispatch_state_existed = conn
@@ -407,8 +496,10 @@ impl Db {
                     "Ask dispatch generation is unavailable".into(),
                 ));
             }
-            let tx = conn.transaction().map_err(map_err)?;
-            tx.execute_batch(
+        }
+        let conn = conn.transaction().map_err(map_err)?;
+        if !ask_dispatch_state_existed {
+            conn.execute_batch(
                 "CREATE TABLE ask_dispatch_state (
                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                    generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation >= 0)
@@ -416,7 +507,6 @@ impl Db {
                  INSERT INTO ask_dispatch_state(singleton,generation) VALUES (1,0);",
             )
             .map_err(map_err)?;
-            tx.commit().map_err(map_err)?;
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meetings (
@@ -910,6 +1000,121 @@ impl Db {
         // deliberately separate from note_chunks so the load-bearing meeting-gating joins stay
         // untouched. Additive + guarded so migrate() stays idempotent.
         Self::migrate_documents(&conn)?;
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS org_shares_closure_insert_guard
+             BEFORE INSERT ON org_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND (
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 (c.scope_kind='meeting' AND c.scope_id=NEW.meeting_id) OR
+                 (c.scope_kind='document' AND c.scope_id=NEW.document_id)) OR
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE c.scope_kind='folder' AND (
+                 (NEW.document_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM documents d WHERE d.id=NEW.document_id AND d.folder_id=c.scope_id)) OR
+                 (NEW.meeting_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM notes n WHERE n.meeting_id=NEW.meeting_id
+                    AND n.folder_id=c.scope_id))))
+             ) BEGIN SELECT RAISE(ABORT,'org share source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS org_shares_closure_update_guard
+             BEFORE UPDATE ON org_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND (
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 (c.scope_kind='meeting' AND c.scope_id=NEW.meeting_id) OR
+                 (c.scope_kind='document' AND c.scope_id=NEW.document_id)) OR
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE c.scope_kind='folder' AND (
+                 (NEW.document_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM documents d WHERE d.id=NEW.document_id AND d.folder_id=c.scope_id)) OR
+                 (NEW.meeting_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM notes n WHERE n.meeting_id=NEW.meeting_id
+                    AND n.folder_id=c.scope_id))))
+             ) BEGIN SELECT RAISE(ABORT,'org share source is closing'); END;
+             ",
+        )
+        .map_err(map_err)?;
+        // Freeze the exact plaintext source while a destructive revoke is in flight: a cleanup may
+        // either revoke+delete the snapshot or observe a prior edit and abandon, but it can never
+        // revoke an old snapshot and then keep a newly-edited source locally.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS closing_document_content_update_guard
+             BEFORE UPDATE OF folder_id,name,kind,title,text,created_at ON documents
+             WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+               c.scope_kind='document' AND c.scope_id=OLD.id)
+             BEGIN SELECT RAISE(ABORT,'document source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_meeting_note_insert_guard
+             BEFORE INSERT ON notes
+             WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+               c.scope_kind='meeting' AND c.scope_id=NEW.meeting_id)
+             BEGIN SELECT RAISE(ABORT,'meeting source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_meeting_note_update_guard
+             BEFORE UPDATE OF folder_id,markdown,created_at,provider_id ON notes
+             WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+               c.scope_kind='meeting' AND c.scope_id=OLD.meeting_id)
+             BEGIN SELECT RAISE(ABORT,'meeting source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_meeting_note_delete_guard
+             BEFORE DELETE ON notes
+             WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+               c.scope_kind='meeting' AND c.scope_id=OLD.meeting_id)
+               AND EXISTS(SELECT 1 FROM meetings m WHERE m.id=OLD.meeting_id)
+             BEGIN SELECT RAISE(ABORT,'meeting source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_meeting_title_update_guard
+             BEFORE UPDATE OF title ON meetings
+             WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+               c.scope_kind='meeting' AND c.scope_id=OLD.id)
+             BEGIN SELECT RAISE(ABORT,'meeting source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS closing_document_identity_update_guard_v2
+             BEFORE UPDATE OF name,kind ON documents
+             WHEN EXISTS(SELECT 1 FROM org_share_closures c WHERE
+               c.scope_kind='document' AND c.scope_id=OLD.id)
+             BEGIN SELECT RAISE(ABORT,'document source is closing'); END;",
+        )
+        .map_err(map_err)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_source_versions (
+               source_kind TEXT NOT NULL CHECK(source_kind IN ('meeting','document')),
+               source_id TEXT NOT NULL,
+               version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0),
+               PRIMARY KEY(source_kind, source_id)
+             );",
+        )
+        .map_err(map_err)?;
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS org_share_note_source_version_au
+               AFTER UPDATE OF markdown, created_at, provider_id ON notes
+               WHEN OLD.markdown IS NOT NEW.markdown OR OLD.created_at IS NOT NEW.created_at
+                 OR OLD.provider_id IS NOT NEW.provider_id
+               BEGIN
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE meeting_id = NEW.meeting_id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   VALUES('meeting',NEW.meeting_id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_note_source_version_ai AFTER INSERT ON notes
+               BEGIN
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE meeting_id = NEW.meeting_id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   VALUES('meeting',NEW.meeting_id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_note_source_version_ad AFTER DELETE ON notes
+               BEGIN
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE meeting_id = OLD.meeting_id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   VALUES('meeting',OLD.meeting_id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_meeting_source_version_au
+               AFTER UPDATE OF title ON meetings WHEN OLD.title IS NOT NEW.title
+               BEGIN
+                 UPDATE org_shares SET source_version = source_version + 1
+                  WHERE meeting_id = NEW.id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   VALUES('meeting',NEW.id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;",
+        )
+        .map_err(map_err)?;
         // NOTES feature — AUTHORED `documents(kind='note')` rows gain an authoring layer over the
         // existing document substrate (seal/gate/brain-index reused verbatim). Three additive,
         // guarded columns (idempotent; NULL-safe for every legacy row):
@@ -927,6 +1132,38 @@ impl Db {
         Self::add_column_if_missing(&conn, "documents", "title", "TEXT")?;
         Self::add_column_if_missing(&conn, "documents", "updated_at", "INTEGER")?;
         Self::add_column_if_missing(&conn, "documents", "exported_path", "TEXT")?;
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS org_share_document_source_version_au
+               AFTER UPDATE OF title, text ON documents
+               WHEN OLD.title IS NOT NEW.title OR OLD.text IS NOT NEW.text
+               BEGIN
+                 UPDATE org_shares SET source_version = source_version + 1 WHERE document_id = NEW.id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version) VALUES('document',NEW.id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_document_source_version_ai AFTER INSERT ON documents
+               BEGIN
+                 INSERT INTO org_source_versions(source_kind,source_id,version) VALUES('document',NEW.id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_document_source_version_ad AFTER DELETE ON documents
+               BEGIN
+                 UPDATE org_shares SET source_version = source_version + 1 WHERE document_id = OLD.id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version) VALUES('document',OLD.id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS org_share_document_identity_source_version_au_v2
+               AFTER UPDATE OF folder_id,name,kind,created_at ON documents
+               WHEN OLD.folder_id IS NOT NEW.folder_id OR OLD.name IS NOT NEW.name
+                 OR OLD.kind IS NOT NEW.kind OR OLD.created_at IS NOT NEW.created_at
+               BEGIN
+                 UPDATE org_shares SET source_version=source_version+1 WHERE document_id=NEW.id;
+                 INSERT INTO org_source_versions(source_kind,source_id,version)
+                   VALUES('document',NEW.id,1)
+                   ON CONFLICT(source_kind,source_id) DO UPDATE SET version=version+1;
+               END;",
+        )
+        .map_err(map_err)?;
         // Export-collision guard (2026-07-16): the authored-note twin of `notes.exported_hash` —
         // the SHA-256 (lowercase hex) of the text Murmur last wrote to this note's exported vault
         // `.md`. Refreshed on every vault (re)export; NULL for legacy rows (grandfathered). See the
@@ -1017,6 +1254,7 @@ impl Db {
                mode       TEXT NOT NULL,
                rev        INTEGER NOT NULL DEFAULT 1,
                state      TEXT NOT NULL DEFAULT 'active',
+               owner_user_id TEXT,
                created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_outbound_shares_meeting ON outbound_shares(meeting_id);
@@ -1027,8 +1265,25 @@ impl Db {
                ts         INTEGER NOT NULL,
                host       TEXT NOT NULL,
                kind       TEXT NOT NULL,
-               byte_count INTEGER NOT NULL DEFAULT 0
+               byte_count INTEGER NOT NULL DEFAULT 0,
+               dispatch_id TEXT,
+               org_id      TEXT,
+               doc_id      TEXT,
+               since_seq   INTEGER,
+               page_limit  INTEGER
              );",
+        )
+        .map_err(map_err)?;
+        Self::add_column_if_missing(&conn, "share_egress_log", "dispatch_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "share_egress_log", "org_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "share_egress_log", "doc_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "share_egress_log", "since_seq", "INTEGER")?;
+        Self::add_column_if_missing(&conn, "share_egress_log", "page_limit", "INTEGER")?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_share_egress_log_dispatch_id
+               ON share_egress_log(dispatch_id)
+             WHERE dispatch_id IS NOT NULL",
+            [],
         )
         .map_err(map_err)?;
 
@@ -1095,6 +1350,40 @@ impl Db {
         // resolves the NOTE title (gated on the note's folder) instead. Legacy meeting shares keep
         // `document_id` NULL → byte-identical behavior.
         Self::add_column_if_missing(&conn, "outbound_shares", "document_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "owner_user_id", "TEXT")?;
+        // The durable close barrier governs every remote sharing mode. Create these guards only
+        // after the additive `outbound_shares.document_id` migration exists on both fresh and
+        // upgraded databases.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS outbound_shares_closure_insert_guard
+             BEFORE INSERT ON outbound_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND (
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 (c.scope_kind='meeting' AND c.scope_id=NEW.meeting_id) OR
+                 (c.scope_kind='document' AND c.scope_id=NEW.document_id)) OR
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE c.scope_kind='folder' AND (
+                 (NEW.document_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM documents d WHERE d.id=NEW.document_id AND d.folder_id=c.scope_id)) OR
+                 (NEW.meeting_id <> '' AND EXISTS(
+                   SELECT 1 FROM notes n WHERE n.meeting_id=NEW.meeting_id
+                    AND n.folder_id=c.scope_id))))
+             ) BEGIN SELECT RAISE(ABORT,'share source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS outbound_shares_closure_update_guard
+             BEFORE UPDATE ON outbound_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND (
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE
+                 (c.scope_kind='meeting' AND c.scope_id=NEW.meeting_id) OR
+                 (c.scope_kind='document' AND c.scope_id=NEW.document_id)) OR
+               EXISTS(SELECT 1 FROM org_share_closures c WHERE c.scope_kind='folder' AND (
+                 (NEW.document_id IS NOT NULL AND EXISTS(
+                   SELECT 1 FROM documents d WHERE d.id=NEW.document_id AND d.folder_id=c.scope_id)) OR
+                 (NEW.meeting_id <> '' AND EXISTS(
+                   SELECT 1 FROM notes n WHERE n.meeting_id=NEW.meeting_id
+                    AND n.folder_id=c.scope_id))))
+             ) BEGIN SELECT RAISE(ABORT,'share source is closing'); END;
+             ",
+        )
+        .map_err(map_err)?;
 
         // Re-Truth: guarded ALTERs for the supersession undo pre-images. The columns are also in the
         // `CREATE TABLE IF NOT EXISTS supersessions` above (so a fresh DB gets them there and these are
@@ -1160,6 +1449,7 @@ impl Db {
         // re-gated at read time (`visibility_clause` / `meeting_is_unlocked`), so a board can
         // never become an ungated back door into a sealed folder.
         Self::migrate_dashboards(&conn)?;
+        conn.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -1397,8 +1687,7 @@ impl Db {
             "INSERT INTO fts_doc_chunks(rowid, text) SELECT id, text FROM doc_chunks;"
         };
         let batch = format!(
-            "BEGIN IMMEDIATE;
-             CREATE VIRTUAL TABLE IF NOT EXISTS fts_doc_chunks USING fts5(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_doc_chunks USING fts5(
                  text,
                  content='doc_chunks',
                  content_rowid='id',
@@ -1420,16 +1709,10 @@ impl Db {
                    VALUES ('delete', old.id, old.text);
                  INSERT INTO fts_doc_chunks(rowid, text) VALUES (new.id, new.text);
              END;
-             {backfill}
-             COMMIT;"
+             {backfill}"
         );
-        let res = conn.execute_batch(&batch);
-        if res.is_err() {
-            // A failed batch leaves the explicit transaction open on this connection — roll it
-            // back so the error path hands later code a clean connection state.
-            let _ = conn.execute_batch("ROLLBACK;");
-        }
-        res.map_err(map_err)?;
+        // The caller-wide migration transaction owns CREATE + backfill atomicity.
+        conn.execute_batch(&batch).map_err(map_err)?;
         Ok(())
     }
 
@@ -1686,15 +1969,13 @@ impl Db {
             conn.execute_batch(CREATE).map_err(map_err)?;
             return Ok(());
         }
-        // First build: create + one-time backfill ATOMICALLY (rollback-on-drop guards a crash).
-        let tx = conn.unchecked_transaction().map_err(map_err)?;
-        tx.execute_batch(CREATE).map_err(map_err)?;
-        tx.execute_batch(
+        // The caller-wide migration transaction owns CREATE + one-time backfill atomicity.
+        conn.execute_batch(CREATE).map_err(map_err)?;
+        conn.execute_batch(
             "INSERT INTO fts_user_facts(rowid, subject, predicate, object)
                SELECT rowid, subject, predicate, object FROM user_facts;",
         )
         .map_err(map_err)?;
-        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -1798,17 +2079,71 @@ impl Db {
                generation     INTEGER NOT NULL DEFAULT 1,
                content_sha256 BLOB,
                item_id        TEXT,
+               scrub          INTEGER NOT NULL DEFAULT 1 CHECK(scrub IN (0,1)),
                state          TEXT NOT NULL DEFAULT 'queued'
                               CHECK (state IN ('queued','uploaded','failed','revoke_pending','revoked')),
                last_error     TEXT,
                created_at     TEXT NOT NULL,
-               updated_at     TEXT NOT NULL
+               updated_at     TEXT NOT NULL,
+               dispatch_id    TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_org_shares_org ON org_shares(org_id);
              CREATE INDEX IF NOT EXISTS idx_org_shares_state ON org_shares(state);
              CREATE INDEX IF NOT EXISTS idx_org_shares_item ON org_shares(item_id);",
         )
         .map_err(map_err)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_share_closures (
+               scope_kind TEXT NOT NULL CHECK(scope_kind IN ('meeting','document','folder')),
+               scope_id TEXT NOT NULL,
+               phase TEXT NOT NULL CHECK(phase IN ('closing','closed')),
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(scope_kind,scope_id)
+             );",
+        )
+        .map_err(map_err)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_access_attempts (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT,
+               dispatch_id TEXT NOT NULL UNIQUE,
+               org_id TEXT NOT NULL,
+               doc_id TEXT NOT NULL,
+               old_access TEXT NOT NULL CHECK(old_access IN ('view','edit')),
+               new_access TEXT NOT NULL CHECK(new_access IN ('view','edit')),
+               actor_user_id TEXT NOT NULL,
+               owner_user_id TEXT NOT NULL,
+               state TEXT NOT NULL DEFAULT 'pending'
+                 CHECK(state IN ('pending','applied','failed')),
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_access_attempts_document
+               ON org_access_attempts(org_id,doc_id,seq);",
+        )
+        .map_err(map_err)?;
+        Self::add_column_if_missing(conn, "org_shares", "dispatch_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "org_shares",
+            "republish_dirty",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(republish_dirty >= 0)",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "org_shares",
+            "source_version",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(source_version >= 0)",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "org_shares",
+            "republish_deferred",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(republish_deferred IN (0,1))",
+        )?;
+        conn.execute(
+            "UPDATE org_shares SET republish_dirty=republish_dirty+1, republish_deferred=0
+              WHERE republish_deferred=1 AND state IN ('queued','uploaded','failed')",
+            [],
+        ).map_err(map_err)?;
         // Per-instance org toggle: which JOINED orgs actually contribute content on THIS install
         // (Settings → Organization). Default enabled (1) so every existing membership stays active
         // pre-upgrade. Guarded/additive per the migration rule.
@@ -1868,6 +2203,7 @@ impl Db {
                rev            INTEGER NOT NULL DEFAULT 1,
                generation     INTEGER NOT NULL DEFAULT 1,
                content_sha256 BLOB,
+               is_current     INTEGER NOT NULL DEFAULT 0,
                tombstoned     INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS idx_org_items_org ON org_items(org_id);
@@ -1896,6 +2232,73 @@ impl Db {
         // for the local-replica upserts done at share/republish time (the next feed sync fills it in;
         // those machines already edit via their local source). Guarded so a re-migrated DB is a no-op.
         Self::add_column_if_missing(conn, "org_items", "author_user_id", "TEXT")?;
+        // Stable opaque document identity + server-enforced collaboration metadata. Legacy rows
+        // remain readable with NULL doc/owner and default view; they are not durable link targets.
+        Self::add_column_if_missing(conn, "org_items", "doc_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "org_items",
+            "access",
+            "TEXT NOT NULL DEFAULT 'view' CHECK(access IN ('view','edit'))",
+        )?;
+        Self::add_column_if_missing(conn, "org_items", "document_owner_user_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "org_items",
+            "is_current",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(is_current IN (0,1))",
+        )?;
+        Self::add_column_if_missing(conn, "org_items", "projection_sha256", "BLOB")?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_org_items_doc ON org_items(org_id, doc_id, rev DESC)",
+            [],
+        )
+        .map_err(map_err)?;
+        Self::add_column_if_missing(conn, "org_shares", "doc_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "org_shares",
+            "access",
+            "TEXT NOT NULL DEFAULT 'view' CHECK(access IN ('view','edit'))",
+        )?;
+        // Persist the caller's scrub choice so a crash/ambiguous POST retry seals the same canonical
+        // plaintext. Existing rows default fail-safe to scrubbed.
+        Self::add_column_if_missing(
+            conn,
+            "org_shares",
+            "scrub",
+            "INTEGER NOT NULL DEFAULT 1 CHECK(scrub IN (0,1))",
+        )?;
+        Self::add_column_if_missing(conn, "org_shares", "expected_actor_user_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "org_shares", "expected_owner_user_id", "TEXT")?;
+        conn.execute(
+            "UPDATE org_shares SET last_error='recovery_witness_missing'
+              WHERE state='failed'
+                AND last_error IN ('initial_post_pending','initial_post_replayable','direct_put_pending',
+                                   'republish_put_pending','republish_post_pending',
+                                   'projection_pending')
+                AND (dispatch_id IS NULL OR trim(dispatch_id)='' OR length(dispatch_id)!=36
+                  OR substr(dispatch_id,9,1)!='-' OR substr(dispatch_id,14,1)!='-'
+                  OR substr(dispatch_id,19,1)!='-' OR substr(dispatch_id,24,1)!='-'
+                  OR doc_id IS NULL OR trim(doc_id)='' OR length(doc_id)!=36
+                  OR substr(doc_id,9,1)!='-' OR substr(doc_id,14,1)!='-'
+                  OR substr(doc_id,19,1)!='-' OR substr(doc_id,24,1)!='-'
+                  OR trim(org_id)='' OR length(org_id)!=36
+                  OR substr(org_id,9,1)!='-' OR substr(org_id,14,1)!='-'
+                  OR substr(org_id,19,1)!='-' OR substr(org_id,24,1)!='-'
+                  OR content_sha256 IS NULL OR length(content_sha256)!=32
+                  OR expected_actor_user_id IS NULL OR trim(expected_actor_user_id)=''
+                  OR expected_owner_user_id IS NULL OR trim(expected_owner_user_id)=''
+                  OR access NOT IN ('view','edit') OR rev < 1 OR generation < 1
+                  OR (meeting_id IS NOT NULL AND document_id IS NOT NULL)
+                  OR (last_error IN ('initial_post_pending','initial_post_replayable','republish_put_pending',
+                                     'republish_post_pending')
+                      AND meeting_id IS NULL AND document_id IS NULL)
+                  OR (last_error IN ('direct_put_pending','republish_put_pending')
+                      AND (item_id IS NULL OR trim(item_id)='')))",
+            [],
+        )
+        .map_err(map_err)?;
         // vec0 int8 KNN table (width = EMBED_DIM; compile-time const, no user input). int8 per the
         // scale spike — see the doc comment. Values are inserted via `vec_int8(?)` (a raw i8 blob).
         conn.execute_batch(&format!(
@@ -1998,6 +2401,38 @@ impl Db {
         Ok(())
     }
 
+    /// Durable pre-dispatch journal for a mode-A link create. A lost response therefore still
+    /// leaves enough source identity for folder/source revoke to DELETE the remote share id before
+    /// sealing or destroying local plaintext.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_outbound_share_attempt(
+        &self,
+        share_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+        mode: &str,
+        rev: u32,
+        owner_user_id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        if meeting_id.is_some() == document_id.is_some() {
+            return Err(crate::error::AppError::InvalidArg(
+                "exactly one outbound share source is required".into(),
+            ));
+        }
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO outbound_shares
+               (share_id,meeting_id,document_id,mode,rev,state,owner_user_id,created_at)
+             VALUES(?1,COALESCE(?2,''),?3,?4,?5,'create_pending',?6,?7)",
+            rusqlite::params![
+                share_id, meeting_id, document_id, mode, rev as i64, owner_user_id, created_at
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Record an outbound NOTE share (WP6). The share anchors on a `documents(kind='note')` id in the
     /// additive `document_id` column; the NOT NULL `meeting_id` is stored as '' so the meeting-title
     /// join skips it and `list_my_shares` resolves the NOTE title instead. Mirrors
@@ -2094,6 +2529,44 @@ impl Db {
         Ok(())
     }
 
+    /// Owner-bound local revoke journals, including rows no longer returned by the relay. These
+    /// rows remain user-visible until a verified DELETE completes; absence from a list response is
+    /// not deletion proof.
+    pub(crate) fn outbound_revoke_pending_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<OutboundRevokePendingRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT share_id,NULLIF(meeting_id,''),document_id,mode,rev,created_at
+                   FROM outbound_shares
+                  WHERE state='revoke_pending' AND owner_user_id=?1
+                  ORDER BY created_at DESC,share_id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([owner_user_id], |row| {
+                let rev = row.get::<_, i64>(4)?;
+                Ok(OutboundRevokePendingRow {
+                    share_id: row.get(0)?,
+                    meeting_id: row.get(1)?,
+                    document_id: row.get(2)?,
+                    mode: row.get(3)?,
+                    rev: u32::try_from(rev).map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(4, rev)
+                    })?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     // `insert_share_egress` / `count_share_egress_by_kind` moved to `storage::egress_store`
     // (God-file split) alongside the other egress-ledger writers — still callable as inherent
     // `db.method()` cross-file. Content-free `share_egress_log` rows.
@@ -2168,11 +2641,11 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT s.share_id, s.mode
+                "SELECT DISTINCT s.share_id, s.mode
                    FROM outbound_shares s
                    LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
                    LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE s.state IN ('active', 'sent', 'awaiting_key')
+                  WHERE s.state <> 'revoked'
                     AND (n.folder_id = ?1 OR d.folder_id = ?1)",
             )
             .map_err(map_err)?;
@@ -2186,6 +2659,102 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok(out)
+    }
+
+    /// True when any local remote-share journal (link, directed user, or organization) still
+    /// represents potentially-readable server ciphertext for this exact source. All non-terminal
+    /// rows count, including ambiguous create attempts: absence of a success response is not proof
+    /// that the relay did not commit the mutation.
+    pub(crate) fn source_has_active_remote_share(
+        &self,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<bool> {
+        if meeting_id.is_some() == document_id.is_some() {
+            return Err(crate::error::AppError::InvalidArg(
+                "exactly one share source is required".into(),
+            ));
+        }
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM outbound_shares
+                WHERE state <> 'revoked'
+                  AND ((?1 IS NOT NULL AND meeting_id=?1)
+                    OR (?2 IS NOT NULL AND document_id=?2))
+               UNION ALL
+               SELECT 1 FROM org_shares
+                WHERE state <> 'revoked'
+                  AND ((?1 IS NOT NULL AND meeting_id=?1)
+                    OR (?2 IS NOT NULL AND document_id=?2))
+             )",
+            rusqlite::params![meeting_id, document_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_err)
+        .map(|exists| exists != 0)
+    }
+
+    pub(crate) fn active_outbound_shares_for_source(
+        &self,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<Vec<String>> {
+        if meeting_id.is_some() == document_id.is_some() {
+            return Err(crate::error::AppError::InvalidArg(
+                "exactly one share source is required".into(),
+            ));
+        }
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT share_id FROM outbound_shares
+                  WHERE state <> 'revoked'
+                    AND ((?1 IS NOT NULL AND meeting_id=?1)
+                      OR (?2 IS NOT NULL AND document_id=?2))
+                  ORDER BY share_id",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id, document_id], |row| row.get(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn outbound_shares_in_state(&self, state: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT share_id FROM outbound_shares WHERE state=?1 ORDER BY share_id")
+            .map_err(map_err)?;
+        let rows = stmt.query_map([state], |row| row.get(0)).map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn outbound_share_owner(&self, share_id: &str) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT owner_user_id FROM outbound_shares WHERE share_id=?1",
+                [share_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_err)
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn folder_has_active_remote_share(&self, folder_id: &str) -> Result<bool> {
+        if !self.active_link_user_shares_for_folder(folder_id)?.is_empty() {
+            return Ok(true);
+        }
+        Ok(!self.active_org_share_ids_for_folder(folder_id)?.is_empty())
     }
 
     // `active_org_share_ids_for_folder` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
@@ -2234,6 +2803,45 @@ impl Db {
     /// for the gated title derivation (NO title column, spec §7). `state` = `'sent'` (registered) or
     /// `'awaiting_key'` (invited/unregistered). New rows leave the legacy raw `nk` column NULL; the
     /// wrapped key means a re-locked session (no MK) can no longer decrypt an already-shared envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_outbound_user_share_with_owner(
+        &self,
+        share_id: &str,
+        meeting_id: &str,
+        rev: u32,
+        created_at: &str,
+        state: &str,
+        nk_wrapped: &[u8],
+        recipient_acct_id: &str,
+        recipient_email: &str,
+        content_hash: &[u8],
+        owner_user_id: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO outbound_shares
+               (share_id, meeting_id, mode, rev, state, created_at,
+                nk_wrapped, recipient_acct_id, recipient_email, content_hash, owner_user_id)
+             VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                share_id,
+                meeting_id,
+                rev as i64,
+                state,
+                created_at,
+                nk_wrapped,
+                recipient_acct_id,
+                recipient_email,
+                content_hash,
+                owner_user_id
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Backward-compatible journal writer for the command layer at this stack's base revision.
+    /// The next stack layer switches production calls to the owner-bound variant above.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_outbound_user_share(
         &self,
@@ -2547,6 +3155,7 @@ impl Db {
     pub fn delete_meeting(&self, id: &str) -> Result<Vec<String>> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let has_share_closure = Self::source_closure_ready_for_delete_tx(&tx, "meeting", id)?;
         Self::refuse_nonterminal_recording_generation_tx(&tx, id)?;
         // Drop derived chunks/vectors FIRST, in the same tx. `vec_chunks` is a vec0 virtual table
         // with no foreign key, so the `meetings` ON DELETE CASCADE reaches `note_chunks` but NOT
@@ -2597,6 +3206,14 @@ impl Db {
         Self::purge_retired_recording_generations_tx(&tx, id)?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
+        if has_share_closure {
+            tx.execute(
+                "UPDATE org_share_closures SET phase='closed'
+                  WHERE scope_kind='meeting' AND scope_id=?1 AND phase='closing'",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
         tx.commit().map_err(map_err)?;
         Ok(rollup_exports)
     }
@@ -4403,6 +5020,7 @@ impl Db {
     pub fn delete_document(&self, id: &str) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let has_share_closure = Self::source_closure_ready_for_delete_tx(&tx, "document", id)?;
         Self::purge_doc_chunks_tx(&tx, &[id.to_string()])?;
         // Brain v3 PR-3: purge every `links` row whose SRC OR DST is this deleted document/note in the
         // same tx — a note id IS a document id, so both kinds are covered by `purge_links_tx`. A
@@ -4414,8 +5032,75 @@ impl Db {
         Self::purge_all_ask_conversations_tx(&tx)?;
         tx.execute("DELETE FROM documents WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
+        if has_share_closure {
+            tx.execute(
+                "UPDATE org_share_closures SET phase='closed'
+                  WHERE scope_kind='document' AND scope_id=?1 AND phase='closing'",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
         tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// If a destructive share barrier exists, deletion may cross it only after every local
+    /// journal for the exact source is terminal. The caller's parent DELETE, attachment cascade,
+    /// and closure phase transition then commit in the same SQLite transaction.
+    fn source_closure_ready_for_delete_tx(
+        tx: &rusqlite::Transaction<'_>,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<bool> {
+        let has_closure = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_share_closures
+                  WHERE scope_kind=?1 AND scope_id=?2 AND phase='closing')",
+                rusqlite::params![source_kind, source_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_err)?
+            != 0;
+        let nonterminal: i64 = match source_kind {
+            "meeting" => tx
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM outbound_shares
+                         WHERE meeting_id=?1 AND state<>'revoked') +
+                       (SELECT COUNT(*) FROM org_shares
+                         WHERE meeting_id=?1 AND state<>'revoked')",
+                    [source_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?,
+            "document" => tx
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM outbound_shares
+                         WHERE document_id=?1 AND state<>'revoked') +
+                       (SELECT COUNT(*) FROM org_shares
+                         WHERE document_id=?1 AND state<>'revoked')",
+                    [source_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?,
+            _ => {
+                return Err(crate::error::AppError::InvalidArg(
+                    "invalid share closure source".into(),
+                ));
+            }
+        };
+        if nonterminal != 0 {
+            return Err(crate::error::AppError::Unavailable(
+                if has_closure {
+                    "remote share revocation is not yet durably complete"
+                } else {
+                    "source deletion requires a durable share closure before remote revocation"
+                }
+                .into(),
+            ));
+        }
+        Ok(has_closure)
     }
 
     /// (Re)index a VISIBLE document's plaintext into `doc_chunks` (always — the `fts_doc_chunks`

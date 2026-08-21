@@ -249,6 +249,10 @@ fn link_endpoint_is_unlocked(
             let unlocked = unlocked_snapshot(state)?;
             Ok(state.db.document_is_visible(id, &unlocked)?)
         }
+        // Org endpoints are introduced at the storage layer first. Until the stacked command/IPC
+        // activation lands, every base command treats them as unavailable rather than widening a
+        // content surface early.
+        crate::links::LinkKind::Org => Ok(false),
     }
 }
 
@@ -352,9 +356,13 @@ pub(crate) fn unlink_items_inner(
 ) -> Result<(), AppError> {
     let src = parse_link_kind(src_kind)?;
     let dst = parse_link_kind(dst_kind)?;
-    // SCOPE the guard around gate + row-delete only; release before the note-body strip below (which
-    // re-enters the guard via `update_note_doc_inner`). Same non-reentrancy discipline as `link_items`.
-    {
+    let edge = crate::storage::models::ManualLinkEdge {
+        src_kind: src_kind.to_string(),
+        src_id: src_id.to_string(),
+        dst_kind: dst_kind.to_string(),
+        dst_id: dst_id.to_string(),
+    };
+    let cleanup_queued = {
         let _lifecycle = lifecycle_guard(state);
         // ── GATE both endpoints (never mutate a note body / reveal a neighbour behind a lock). ──
         if !link_endpoint_is_unlocked(state, src, src_id)?
@@ -364,26 +372,16 @@ pub(crate) fn unlink_items_inner(
                 "one of these items is locked — unlock it to unlink".into(),
             ));
         }
-        // ── Delete ONLY the manual edge (wikilink/companion/semantic rows for the pair untouched). ──
+        let prepared_seals = prepare_manual_marker_seals(state, std::slice::from_ref(&edge))?;
+        // Strip any legacy source marker, enqueue its exact vault cleanup, and delete ONLY the
+        // selected manual edge in one transaction. A stale/missing seal rolls every mutation back.
         state
             .db
-            .delete_manual_link(src.as_str(), src_id, dst.as_str(), dst_id)?;
-    }
-    // ── A NOTE source: strip the matching [[Title]] from its managed block (best-effort). ──
-    if matches!(src, crate::links::LinkKind::Note) {
-        let unlocked = unlocked_snapshot(state)?;
-        if let Some(title) = state
-            .db
-            .link_endpoint_title_visible(dst, dst_id, &unlocked)?
-        {
-            if let Err(e) = strip_manual_link_marker(state, src_id, &title) {
-                tracing::warn!(
-                    target: "links",
-                    error = %e,
-                    "manual link marker strip skipped (row removed)"
-                );
-            }
-        }
+            .delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &prepared_seals)?
+    };
+    if cleanup_queued {
+        let _lifecycle = lifecycle_guard(state);
+        drain_lock_marker_export_cleanup(&state.db)?;
     }
     tracing::info!(
         target: "links",
@@ -394,46 +392,68 @@ pub(crate) fn unlink_items_inner(
     Ok(())
 }
 
-/// note↔meeting-links PR-1 — LEGACY CLEANUP: remove ONE `[[title]]` [`ContextHit`] from an owned
-/// note's PRE-EXISTING managed `murmur:links` block (imported before the block was retired), re-
-/// applying the block with that hit filtered out. Reuses [`crate::enrich::extract_link_hits`] +
-/// [`crate::enrich::apply_link_markers`] so any other hits that lived alongside it survive and the
-/// block strips to nothing once its last hit is removed. WRITE-GATED via `update_note_doc_inner`
-/// (refuses a sealed folder). A no-op (the note is unchanged) when the block never carried the hit —
-/// which is the common case now, since `link_items` no longer WRITES the marker.
-fn strip_manual_link_marker(state: &AppState, note_id: &str, title: &str) -> Result<(), AppError> {
-    let row = {
-        let _lifecycle = lifecycle_guard(state);
-        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
-            return Ok(());
-        };
-        if !folder_is_unlocked(state, &folder_id)? {
-            return Err(AppError::Locked(
-                "this note is locked — unlock it before removing its link marker".into(),
+/// Prepare verify-before-destroy ciphertext for a legacy marker in a session-unlocked locked note.
+/// The storage transaction independently recomputes the stripped plaintext and accepts this blob
+/// only when it decrypts byte-identical under the same folder/note AAD.
+fn prepare_manual_marker_seals(
+    state: &AppState,
+    manual_edges: &[crate::storage::models::ManualLinkEdge],
+) -> Result<Vec<crate::storage::links::PreparedManualMarkerSeal>, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    let mut titles_by_note: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for edge in manual_edges {
+        let src = parse_link_kind(&edge.src_kind)?;
+        if src != crate::links::LinkKind::Note {
+            continue;
+        }
+        let dst = parse_link_kind(&edge.dst_kind)?;
+        let title = state
+            .db
+            .link_endpoint_title_visible(dst, &edge.dst_id, &unlocked)?
+            .ok_or_else(|| {
+                AppError::Locked("one of these items is no longer available to unlink".into())
+            })?;
+        let title = crate::enrich::sanitize(&title);
+        if title.trim().is_empty() {
+            return Err(AppError::InvalidArg(
+                "a linked item has no usable marker title".into(),
             ));
         }
-        let Some(row) = state.db.get_note_row(note_id)? else {
-            return Ok(());
+        titles_by_note
+            .entry(edge.src_id.clone())
+            .or_default()
+            .insert(title);
+    }
+
+    let mut prepared = Vec::new();
+    for (note_id, titles) in titles_by_note {
+        let row = state.db.get_note_row(&note_id)?.ok_or_else(|| {
+            AppError::Locked("a linked note is no longer available to unlink".into())
+        })?;
+        let Some(stripped_text) =
+            crate::storage::Db::strip_titles_from_managed_block(&row.text, &titles)
+        else {
+            continue;
         };
-        row
-    };
-    let marker = format!("[[{title}]]");
-    let mut hits = crate::enrich::extract_link_hits(&row.text);
-    let before = hits.len();
-    hits.retain(|h| h.detail != marker);
-    if hits.len() == before {
-        return Ok(()); // the marker was not in the managed block → note unchanged.
+        let folder_locked = state
+            .db
+            .folder_by_id(&row.folder_id)?
+            .map(|folder| folder.locked)
+            .ok_or_else(|| AppError::Locked("a linked note folder is unavailable".into()))?;
+        if folder_locked {
+            let text_blob = sealed_document_blob(state, &row.folder_id, &note_id, &stripped_text)?;
+            let content_key = session_folder_ck(state, &row.folder_id)?;
+            prepared.push(crate::storage::links::PreparedManualMarkerSeal {
+                note_id,
+                folder_id: row.folder_id,
+                stripped_text,
+                text_blob,
+                content_key,
+            });
+        }
     }
-    let merged = crate::enrich::apply_link_markers(&row.text, &hits);
-    if merged != row.text {
-        let title_disp = row
-            .title
-            .clone()
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| row.name.clone());
-        update_note_doc_inner(state, note_id, &title_disp, &merged)?;
-    }
-    Ok(())
+    Ok(prepared)
 }
 
 /// Resolve a clicked `[[Title]]` wikilink to a VISIBLE note/meeting/org-item to navigate to.
