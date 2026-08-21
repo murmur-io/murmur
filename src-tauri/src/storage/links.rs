@@ -17,15 +17,12 @@ use rusqlite::{Connection, OptionalExtension};
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, Result};
+use crate::share::org_dto::parse_stable_uuid;
 use crate::storage::db::{
     backlink_sort_key, doc_sealed_at_rest_tx, extract_wikilink_titles, map_err, visibility_clause,
     Db, LinkRowRaw,
 };
 use crate::storage::models::{BacklinkSource, SourceKind, WikiTarget};
-
-fn parse_stable_uuid(value: &str) -> Option<uuid::Uuid> {
-    uuid::Uuid::parse_str(value).ok()
-}
 
 fn org_link_id(org_id: &str, doc_id: &str) -> Option<String> {
     parse_stable_uuid(org_id)?;
@@ -60,6 +57,7 @@ pub(crate) struct LockMarkerExportCleanup {
     pub(crate) provider_id: String,
     pub(crate) exported_path: String,
     pub(crate) sealed_title: String,
+    pub(crate) expected_hash: Option<String>,
 }
 
 /// SQLCipher-backed provenance for the one temporary inode used to publish a marker scrub.
@@ -205,6 +203,7 @@ impl Db {
                provider_id TEXT NOT NULL DEFAULT '',
                exported_path TEXT NOT NULL,
                sealed_title TEXT NOT NULL,
+               expected_hash TEXT,
                PRIMARY KEY (source_kind, source_id, provider_id, exported_path, sealed_title)
              );
              CREATE TABLE IF NOT EXISTS lock_marker_export_publish (
@@ -1485,8 +1484,17 @@ impl Db {
                 continue;
             };
             if let Some(path) = exported_path.filter(|path| !path.is_empty()) {
+                let expected_hash = crate::export::note_content_hash(&stripped);
                 for title in &titles {
-                    Self::enqueue_marker_export_cleanup_tx(tx, false, &note_id, "", &path, title)?;
+                    Self::enqueue_marker_export_cleanup_tx(
+                        tx,
+                        false,
+                        &note_id,
+                        "",
+                        &path,
+                        title,
+                        &expected_hash,
+                    )?;
                 }
                 cleanup_queued = true;
             }
@@ -1627,17 +1635,21 @@ impl Db {
         provider_id: &str,
         exported_path: &str,
         sealed_title: &str,
+        expected_hash: &str,
     ) -> Result<()> {
         tx.execute(
-            "INSERT OR IGNORE INTO lock_marker_export_cleanup(
-               source_kind, source_id, provider_id, exported_path, sealed_title
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO lock_marker_export_cleanup(
+               source_kind, source_id, provider_id, exported_path, sealed_title, expected_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(source_kind,source_id,provider_id,exported_path,sealed_title)
+             DO UPDATE SET expected_hash=excluded.expected_hash",
             rusqlite::params![
                 if is_meeting { "meeting" } else { "note" },
                 source_id,
                 provider_id,
                 exported_path,
                 sealed_title,
+                expected_hash,
             ],
         )
         .map_err(map_err)?;
@@ -1817,9 +1829,12 @@ impl Db {
         };
         let mut changed = false;
         for (provider_id, markdown, exported_path) in provider_rows {
+            let stripped = Self::strip_titles_from_managed_block(&markdown, titles)
+                .unwrap_or_else(|| markdown.clone());
             // Enqueue even when this DB row is already scrubbed: that is the replay path after a
             // previous strip commit crashed before the exact provider export was rewritten.
             if let Some(path) = exported_path.filter(|path| !path.is_empty()) {
+                let expected_hash = crate::export::note_content_hash(&stripped);
                 for title in titles {
                     Self::enqueue_marker_export_cleanup_tx(
                         tx,
@@ -1828,12 +1843,13 @@ impl Db {
                         &provider_id,
                         &path,
                         title,
+                        &expected_hash,
                     )?;
                 }
             }
-            let Some(stripped) = Self::strip_titles_from_managed_block(&markdown, titles) else {
+            if stripped == markdown {
                 continue;
-            };
+            }
             tx.execute(
                 "UPDATE notes SET markdown = ?3 WHERE meeting_id = ?1 AND provider_id = ?2",
                 rusqlite::params![meeting_id, provider_id, stripped],
@@ -1863,14 +1879,25 @@ impl Db {
         let Some((text, exported_path)) = row else {
             return Ok(false);
         };
+        let stripped = Self::strip_titles_from_managed_block(&text, titles)
+            .unwrap_or_else(|| text.clone());
         if let Some(path) = exported_path.filter(|path| !path.is_empty()) {
+            let expected_hash = crate::export::note_content_hash(&stripped);
             for title in titles {
-                Self::enqueue_marker_export_cleanup_tx(tx, false, note_id, "", &path, title)?;
+                Self::enqueue_marker_export_cleanup_tx(
+                    tx,
+                    false,
+                    note_id,
+                    "",
+                    &path,
+                    title,
+                    &expected_hash,
+                )?;
             }
         }
-        let Some(stripped) = Self::strip_titles_from_managed_block(&text, titles) else {
+        if stripped == text {
             return Ok(false);
-        };
+        }
         tx.execute(
             "UPDATE documents SET text = ?2 WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![note_id, stripped],
@@ -1951,7 +1978,8 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT source_kind, source_id, provider_id, exported_path, sealed_title
+                "SELECT source_kind, source_id, provider_id, exported_path, sealed_title,
+                        expected_hash
                    FROM lock_marker_export_cleanup
                   ORDER BY exported_path, source_kind, source_id, provider_id, sealed_title",
             )
@@ -1964,6 +1992,7 @@ impl Db {
                     provider_id: r.get(2)?,
                     exported_path: r.get(3)?,
                     sealed_title: r.get(4)?,
+                    expected_hash: r.get(5)?,
                 })
             })
             .map_err(map_err)?;
@@ -2152,35 +2181,80 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         if let (Some(body), Some(hash)) = (final_body, canonical_hash) {
-            match first.source_kind.as_str() {
+            let sealed_body_witness = rows
+                .iter()
+                .all(|row| row.expected_hash.as_deref() == Some(hash))
+                as i64;
+            let changed = match first.source_kind.as_str() {
                 "meeting" => {
                     tx.execute(
                         "UPDATE notes SET exported_hash = ?4
                            WHERE meeting_id = ?1 AND provider_id = ?2 AND exported_path = ?3
-                             AND markdown = ?5",
+                             AND (markdown = ?5 OR
+                               (markdown = '' AND content_blob IS NOT NULL AND ?6 = 1))",
                         rusqlite::params![
                             first.source_id,
                             first.provider_id,
                             first.exported_path,
                             hash,
                             body,
+                            sealed_body_witness,
                         ],
                     )
-                    .map_err(map_err)?;
+                    .map_err(map_err)?
                 }
                 "note" => {
                     tx.execute(
                         "UPDATE documents SET exported_hash = ?3
-                           WHERE id = ?1 AND kind = 'note' AND exported_path = ?2 AND text = ?4",
-                        rusqlite::params![first.source_id, first.exported_path, hash, body],
+                           WHERE id = ?1 AND kind = 'note' AND exported_path = ?2
+                             AND (text = ?4 OR
+                               (text = '' AND text_blob IS NOT NULL AND ?5 = 1))",
+                        rusqlite::params![
+                            first.source_id,
+                            first.exported_path,
+                            hash,
+                            body,
+                            sealed_body_witness,
+                        ],
                     )
-                    .map_err(map_err)?;
+                    .map_err(map_err)?
                 }
                 _ => {
                     return Err(AppError::Storage(
                         "invalid marker-export cleanup source kind".into(),
                     ));
                 }
+            };
+            // A deleted source can legitimately leave this crash-recovery row behind: the exact
+            // vault file has just been durably scrubbed, but there is no canonical row whose
+            // `exported_hash` remains to be stamped. Close that orphaned journal. If the source
+            // still exists, however, a zero-row UPDATE means its path/body witness drifted and we
+            // must retain the journal fail-closed rather than bless unrelated bytes.
+            let source_exists = match first.source_kind.as_str() {
+                "meeting" => tx
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM notes WHERE meeting_id = ?1 AND provider_id = ?2
+                         )",
+                        rusqlite::params![first.source_id, first.provider_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(map_err)?,
+                "note" => tx
+                    .query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM documents WHERE id = ?1 AND kind = 'note'
+                         )",
+                        rusqlite::params![first.source_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(map_err)?,
+                _ => unreachable!("source kind was validated above"),
+            };
+            if changed != 1 && source_exists != 0 {
+                return Err(AppError::Storage(
+                    "marker-export cleanup no longer matches its canonical source".into(),
+                ));
             }
         }
         for row in rows {

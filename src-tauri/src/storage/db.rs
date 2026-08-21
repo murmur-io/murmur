@@ -119,7 +119,6 @@ pub(crate) fn map_err(e: rusqlite::Error) -> AppError {
 /// both writes in the same transaction means a failed/rolled-back dispatch never leaves a phantom
 /// ledger row, while the partial unique index rejects a second non-NULL record for the same
 /// dispatch. The row carries metadata only: never a URL, key, title, or note body.
-#[allow(dead_code)]
 pub(crate) fn insert_share_egress_dispatch_tx(
     tx: &rusqlite::Transaction<'_>,
     ts: i64,
@@ -156,7 +155,6 @@ pub(crate) fn insert_share_egress_dispatch_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(crate) fn insert_org_read_egress_dispatch_tx(
     tx: &rusqlite::Transaction<'_>,
     ts: i64,
@@ -366,11 +364,10 @@ pub struct EgressLedger {
     pub recent: Vec<EgressRecentRow>,
 }
 
-/// Content-free local witness for an outbound share whose remote revocation is not yet proven.
-/// The owner binding prevents another signed-in account from seeing or retrying this journal.
+/// Content-free local witness for an outbound share whose setup or remote revocation has not yet
+/// converged. The owner binding prevents another signed-in account from seeing or retrying it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct OutboundRevokePendingRow {
+pub(crate) struct OutboundCleanupPendingRow {
     pub share_id: String,
     pub meeting_id: Option<String>,
     pub document_id: Option<String>,
@@ -384,7 +381,6 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
-#[allow(dead_code)]
 impl Db {
     /// Opens the encrypted DB (fetching the SQLCipher key from the Keychain) + runs migrations.
     /// This is the path used by the MCP server thread too — it transparently keys the handle.
@@ -1351,6 +1347,12 @@ impl Db {
         // `document_id` NULL → byte-identical behavior.
         Self::add_column_if_missing(&conn, "outbound_shares", "document_id", "TEXT")?;
         Self::add_column_if_missing(&conn, "outbound_shares", "owner_user_id", "TEXT")?;
+        // Exact content/delete dispatch witness for the 1:1 share socket boundary. Commitments are
+        // SHA-256 values over encrypted wire data and the local source lifecycle tuple; no title,
+        // plaintext, URL fragment, key, recipient address, or source id enters the egress ledger.
+        Self::add_column_if_missing(&conn, "outbound_shares", "dispatch_id", "TEXT")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "content_commitment", "BLOB")?;
+        Self::add_column_if_missing(&conn, "outbound_shares", "source_commitment", "BLOB")?;
         // The durable close barrier governs every remote sharing mode. Create these guards only
         // after the additive `outbound_shares.document_id` migration exists on both fresh and
         // upgraded databases.
@@ -1441,6 +1443,16 @@ impl Db {
         // migrate() stays idempotent. Runs LAST so the companion backfill can read the (now-migrated)
         // `documents.meeting_id` column. See `migrate_links`.
         Self::migrate_links(&conn)?;
+        // Durable exact-body witness for marker cleanup of session-unlocked sealed notes. The
+        // filesystem publish happens after the seal transaction; this hash lets its acknowledgement
+        // advance the export-integrity baseline without pretending blank at-rest plaintext is the
+        // canonical body. Legacy in-flight rows remain NULL and therefore fail closed.
+        Self::add_column_if_missing(
+            &conn,
+            "lock_marker_export_cleanup",
+            "expected_hash",
+            "TEXT",
+        )?;
 
         // Dashboards — user-composed boards of tiles over EXISTING sources. Additive + guarded so
         // migrate() stays idempotent. Runs last: a tile's `ref_id` points at a meeting/document/
@@ -2414,7 +2426,7 @@ impl Db {
         rev: u32,
         owner_user_id: &str,
         created_at: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if meeting_id.is_some() == document_id.is_some() {
             return Err(crate::error::AppError::InvalidArg(
                 "exactly one outbound share source is required".into(),
@@ -2424,13 +2436,19 @@ impl Db {
         conn.execute(
             "INSERT INTO outbound_shares
                (share_id,meeting_id,document_id,mode,rev,state,owner_user_id,created_at)
-             VALUES(?1,COALESCE(?2,''),?3,?4,?5,'create_pending',?6,?7)",
+             SELECT ?1,COALESCE(?2,''),?3,?4,?5,'create_pending',?6,?7
+              WHERE NOT EXISTS(
+                SELECT 1 FROM outbound_shares
+                 WHERE state='create_pending' AND mode=?4 AND owner_user_id=?6
+                   AND ((?2 IS NOT NULL AND meeting_id=?2)
+                     OR (?3 IS NOT NULL AND document_id=?3))
+              )",
             rusqlite::params![
                 share_id, meeting_id, document_id, mode, rev as i64, owner_user_id, created_at
             ],
         )
-        .map_err(map_err)?;
-        Ok(())
+        .map_err(map_err)
+        .map(|changed| changed == 1)
     }
 
     /// Record an outbound NOTE share (WP6). The share anchors on a `documents(kind='note')` id in the
@@ -2529,26 +2547,26 @@ impl Db {
         Ok(())
     }
 
-    /// Owner-bound local revoke journals, including rows no longer returned by the relay. These
-    /// rows remain user-visible until a verified DELETE completes; absence from a list response is
-    /// not deletion proof.
-    pub(crate) fn outbound_revoke_pending_for_owner(
+    /// Owner-bound local cleanup journals, including pre-capability creates and rows no longer
+    /// returned by the relay. They remain user-visible until the exact id is reserved and a
+    /// verified DELETE completes; absence from a list response is never deletion proof.
+    pub(crate) fn outbound_cleanup_pending_for_owner(
         &self,
         owner_user_id: &str,
-    ) -> Result<Vec<OutboundRevokePendingRow>> {
+    ) -> Result<Vec<OutboundCleanupPendingRow>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT share_id,NULLIF(meeting_id,''),document_id,mode,rev,created_at
                    FROM outbound_shares
-                  WHERE state='revoke_pending' AND owner_user_id=?1
+                  WHERE state IN ('create_pending','revoke_pending') AND owner_user_id=?1
                   ORDER BY created_at DESC,share_id ASC",
             )
             .map_err(map_err)?;
         let rows = stmt
             .query_map([owner_user_id], |row| {
                 let rev = row.get::<_, i64>(4)?;
-                Ok(OutboundRevokePendingRow {
+                Ok(OutboundCleanupPendingRow {
                     share_id: row.get(0)?,
                     meeting_id: row.get(1)?,
                     document_id: row.get(2)?,
@@ -2565,6 +2583,121 @@ impl Db {
             out.push(row.map_err(map_err)?);
         }
         Ok(out)
+    }
+
+    /// The immutable owner/mode plus current cleanup phase for one locally-created share.
+    pub(crate) fn outbound_share_cleanup_context(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<(String, String, String, u32)>> {
+        self.lock()
+            .query_row(
+                "SELECT owner_user_id,mode,state,rev FROM outbound_shares WHERE share_id=?1",
+                [share_id],
+                |row| {
+                    let rev = row.get::<_, i64>(3)?;
+                    Ok((
+                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        row.get(1)?,
+                        row.get(2)?,
+                        u32::try_from(rev)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, rev))?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
+    /// Persist the exact encrypted content dispatch witness and its content-free ledger row in one
+    /// transaction. The row must still be the owner-bound pre-create journal reserved by the relay.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn persist_outbound_content_dispatch(
+        &self,
+        share_id: &str,
+        owner_user_id: &str,
+        mode: &str,
+        rev: u32,
+        dispatch_id: &str,
+        content_commitment: &[u8; 32],
+        source_commitment: &[u8; 32],
+        ts: i64,
+        host: &str,
+        kind: &str,
+        byte_count: usize,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx
+            .execute(
+                "UPDATE outbound_shares
+                    SET dispatch_id=?5,content_commitment=?6,source_commitment=?7
+                  WHERE share_id=?1 AND owner_user_id=?2 AND mode=?3 AND rev=?4
+                    AND state='create_pending'",
+                rusqlite::params![
+                    share_id,
+                    owner_user_id,
+                    mode,
+                    rev as i64,
+                    dispatch_id,
+                    content_commitment.as_slice(),
+                    source_commitment.as_slice()
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        insert_share_egress_dispatch_tx(
+            &tx,
+            ts,
+            host,
+            kind,
+            byte_count,
+            dispatch_id,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    /// Persist `revoke_pending` plus the exact owner/mode/share-id DELETE dispatch and content-free
+    /// ledger in one transaction. A stale owner, mode, or terminal row cannot mint a socket permit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn persist_outbound_delete_dispatch(
+        &self,
+        share_id: &str,
+        owner_user_id: &str,
+        mode: &str,
+        rev: u32,
+        dispatch_id: &str,
+        ts: i64,
+        host: &str,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx
+            .execute(
+                "UPDATE outbound_shares
+                    SET state='revoke_pending',dispatch_id=?5,
+                        content_commitment=NULL,source_commitment=NULL
+                  WHERE share_id=?1 AND owner_user_id=?2 AND mode=?3 AND rev=?4
+                    AND state<>'revoked'",
+                rusqlite::params![share_id, owner_user_id, mode, rev as i64, dispatch_id],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        insert_share_egress_dispatch_tx(
+            &tx,
+            ts,
+            host,
+            "share_revoke",
+            0,
+            dispatch_id,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
     }
 
     // `insert_share_egress` / `count_share_egress_by_kind` moved to `storage::egress_store`
@@ -2738,18 +2871,6 @@ impl Db {
         Ok(out)
     }
 
-    pub(crate) fn outbound_share_owner(&self, share_id: &str) -> Result<Option<String>> {
-        self.lock()
-            .query_row(
-                "SELECT owner_user_id FROM outbound_shares WHERE share_id=?1",
-                [share_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(map_err)
-            .map(Option::flatten)
-    }
-
     pub(crate) fn folder_has_active_remote_share(&self, folder_id: &str) -> Result<bool> {
         if !self.active_link_user_shares_for_folder(folder_id)?.is_empty() {
             return Ok(true);
@@ -2804,7 +2925,7 @@ impl Db {
     /// `'awaiting_key'` (invited/unregistered). New rows leave the legacy raw `nk` column NULL; the
     /// wrapped key means a re-locked session (no MK) can no longer decrypt an already-shared envelope.
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_outbound_user_share_with_owner(
+    pub fn insert_outbound_user_share(
         &self,
         share_id: &str,
         meeting_id: &str,
@@ -2840,41 +2961,43 @@ impl Db {
         Ok(())
     }
 
-    /// Backward-compatible journal writer for the command layer at this stack's base revision.
-    /// The next stack layer switches production calls to the owner-bound variant above.
+    /// Add the encrypted mode-B retry material to an already durable `create_pending` journal.
+    /// The recipient address lives only in the SQLCipher database (never in the content-free
+    /// egress ledger). The phase intentionally stays `create_pending` until the POST returns 201;
+    /// a crash before that point is recovered by reservation + DELETE, never by redispatching
+    /// ciphertext.
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_outbound_user_share(
+    pub(crate) fn prepare_outbound_user_share_attempt(
         &self,
         share_id: &str,
         meeting_id: &str,
         rev: u32,
-        created_at: &str,
-        state: &str,
         nk_wrapped: &[u8],
         recipient_acct_id: &str,
         recipient_email: &str,
         content_hash: &[u8],
-    ) -> Result<()> {
+        owner_user_id: &str,
+    ) -> Result<bool> {
         let conn = self.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO outbound_shares
-               (share_id, meeting_id, mode, rev, state, created_at,
-                nk_wrapped, recipient_acct_id, recipient_email, content_hash)
-             VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "UPDATE outbound_shares
+                SET nk_wrapped=?3, recipient_acct_id=?4, recipient_email=?5, content_hash=?6
+              WHERE share_id=?1 AND meeting_id=?2 AND document_id IS NULL
+                AND mode='user' AND rev=?7 AND state='create_pending'
+                AND owner_user_id=?8",
             rusqlite::params![
                 share_id,
                 meeting_id,
-                rev as i64,
-                state,
-                created_at,
                 nk_wrapped,
                 recipient_acct_id,
                 recipient_email,
-                content_hash
+                content_hash,
+                rev as i64,
+                owner_user_id,
             ],
         )
-        .map_err(map_err)?;
-        Ok(())
+        .map_err(map_err)
+        .map(|changed| changed == 1)
     }
 
     /// Every mode-B outbound share still `'awaiting_key'` (the recipient was unregistered at share

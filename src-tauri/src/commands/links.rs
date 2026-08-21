@@ -4,7 +4,7 @@
 //! Stage-2 re-link trigger), `link_meeting_entities` (entity extraction + graph persist),
 //! `list_links`, `accept_link`, `dismiss_link`, `link_items`, `unlink_items`, `resolve_wikilink`,
 //! `list_link_candidates`, plus the link-only helpers (`parse_link_kind`,
-//! `link_endpoint_is_unlocked`, `strip_manual_link_marker`).
+//! `link_endpoint_is_unlocked`, `prepare_manual_marker_seals`).
 //!
 //! LOCK-MODEL (byte-identical to the pre-move form): every READ gates — `list_links` returns edges
 //! only when BOTH endpoints are session-VISIBLE (`Db::links_for_visible`, no existence leak),
@@ -16,10 +16,10 @@
 //! `link_items`/`accept_link` are GRAPH-ONLY (they persist/flip the edge and write NO note body) —
 //! the machine `murmur:links` block that used to mirror links into a note body was removed (it went
 //! stale + rendered as raw junk in the plain-text editor; the live `links` table drives the Related
-//! panel). `unlink_items` still strips any PRE-EXISTING manual `[[Title]]` marker via
-//! `strip_manual_link_marker`, whose `update_note_doc_inner` write re-takes the non-reentrant
-//! `Mutex<()>` — so its lifecycle guard is scoped in a `{ }` block RELEASED before that strip
-//! (composing them under one held guard would self-DEADLOCK; the deadlock discipline is preserved).
+//! panel). `unlink_items` still strips any PRE-EXISTING manual `[[Title]]` marker, but now prepares
+//! that DB scrub + its durable vault-cleanup outbox inside the SAME transaction as the exact edge
+//! delete. The lifecycle guard is released only after that transaction commits; filesystem drain is
+//! retryable and propagates failures instead of silently leaving a plaintext marker behind.
 //! `link_meeting_entities` READ-GATES the meeting's note (`meeting_is_unlocked`) before any
 //! extraction/egress.
 //!
@@ -82,7 +82,7 @@ pub async fn link_meeting_entities(
 fn parse_link_kind(s: &str) -> Result<crate::links::LinkKind, AppError> {
     crate::links::LinkKind::parse(s).ok_or_else(|| {
         AppError::InvalidArg(format!(
-            "unknown link kind {s:?} (expected \"meeting\", \"note\", or \"document\")"
+            "unknown link kind {s:?} (expected \"meeting\", \"note\", \"document\", or \"org\")"
         ))
     })
 }
@@ -99,6 +99,7 @@ pub fn list_links(
     kind: String,
     id: String,
 ) -> Result<Vec<crate::storage::models::LinkEdge>, AppError> {
+    let _lifecycle = lifecycle_guard(state.inner());
     let link_kind = parse_link_kind(&kind)?;
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.links_for_visible(link_kind, &id, &unlocked)
@@ -234,9 +235,7 @@ fn link_endpoint_is_unlocked(
     match kind {
         crate::links::LinkKind::Meeting => meeting_is_unlocked(state, id),
         crate::links::LinkKind::Note => match state.db.note_gate_anchor(id)? {
-            Some((folder_id, _created_at, _updated_at)) => {
-                folder_is_unlocked(state, &folder_id)
-            }
+            Some((folder_id, _created_at, _updated_at)) => folder_is_unlocked(state, &folder_id),
             None => Ok(false), // unknown note → nothing to surface. Fail-closed.
         },
         crate::links::LinkKind::Document => {
@@ -249,10 +248,10 @@ fn link_endpoint_is_unlocked(
             let unlocked = unlocked_snapshot(state)?;
             Ok(state.db.document_is_visible(id, &unlocked)?)
         }
-        // Org endpoints are introduced at the storage layer first. Until the stacked command/IPC
-        // activation lands, every base command treats them as unavailable rather than widening a
-        // content surface early.
-        crate::links::LinkKind::Org => Ok(false),
+        // An org endpoint id is the strict stable `org_id:doc_id` composite. This reader joins the
+        // locally-held replica to a still-joined, context-enabled org and requires a current
+        // non-tombstoned revision.
+        crate::links::LinkKind::Org => Ok(state.db.org_link_target_visible(id)?.is_some()),
     }
 }
 
@@ -260,9 +259,10 @@ fn link_endpoint_is_unlocked(
 /// GRAPH-ONLY — writes NO note body.
 ///
 /// GATE (BEFORE any write): BOTH endpoints must be session-VISIBLE — a `meeting` via
-/// [`meeting_is_unlocked`], a `note`/`document` via its folder ([`folder_is_unlocked`]). If either is
-/// sealed-and-not-session-unlocked → `AppError::Locked` (never link behind a lock, never reveal a
-/// locked neighbour). Unknown kinds are `AppError::InvalidArg`.
+/// [`meeting_is_unlocked`], a `note`/`document` via its folder ([`folder_is_unlocked`]), and an `org`
+/// endpoint through its joined, context-enabled current replica. If either is unavailable →
+/// `AppError::Locked` (never link behind a lock, never reveal a withheld neighbour). Unknown kinds
+/// are `AppError::InvalidArg`.
 ///
 /// The `manual` row (`created_by='user'`, `status='active'`, `score=1.0`) is idempotent on the
 /// table's UNIQUE key. It is the AUTHORITATIVE record of the link; the live `links` table drives the
@@ -328,13 +328,14 @@ pub(crate) fn link_items_inner(
     Ok(())
 }
 
-/// note↔meeting-links PR-1 — REMOVE a user-initiated link: delete ONLY the directed `manual` edge
-/// `(src → dst)` and, when the source is an OWNED note, strip the matching `[[dst Title]]` from its
-/// managed `murmur:links` block. NEVER touches a `wikilink`/`companion`/`semantic` row for the pair.
+/// note↔meeting-links PR-1 — REMOVE a user-initiated link: delete every exact directed `manual` row
+/// carried by the collapsed chip (one or both directions), and when a source is an OWNED note strip
+/// its matching legacy `[[dst Title]]` marker. NEVER touches a `wikilink`/`companion`/`semantic` row
+/// for the pair. A legacy caller that omits `manual_edges` removes the one `(src → dst)` tuple.
 ///
 /// GATE: BOTH endpoints must be session-VISIBLE (same gate as `link_items`) — never mutate a note's
-/// body behind a lock, never reveal a locked neighbour's title. The strip is BEST-EFFORT (a failure
-/// logs and never fails the unlink — the graph row is the authoritative removal). Unknown kinds are
+/// body behind a lock, never reveal a locked neighbour's title. Legacy marker preparation is part of
+/// the edge-delete transaction; a failure rolls back the full unlink. Unknown kinds are
 /// `AppError::InvalidArg`.
 #[tauri::command]
 pub fn unlink_items(
@@ -343,10 +344,27 @@ pub fn unlink_items(
     src_id: String,
     dst_kind: String,
     dst_id: String,
+    manual_edges: Option<Vec<crate::storage::models::ManualLinkEdge>>,
 ) -> Result<(), AppError> {
-    unlink_items_inner(state.inner(), &src_kind, &src_id, &dst_kind, &dst_id)
+    let manual_edges = manual_edges.unwrap_or_else(|| {
+        vec![crate::storage::models::ManualLinkEdge {
+            src_kind: src_kind.clone(),
+            src_id: src_id.clone(),
+            dst_kind: dst_kind.clone(),
+            dst_id: dst_id.clone(),
+        }]
+    });
+    unlink_manual_edges_inner(
+        state.inner(),
+        &src_kind,
+        &src_id,
+        &dst_kind,
+        &dst_id,
+        &manual_edges,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn unlink_items_inner(
     state: &AppState,
     src_kind: &str,
@@ -354,47 +372,25 @@ pub(crate) fn unlink_items_inner(
     dst_kind: &str,
     dst_id: &str,
 ) -> Result<(), AppError> {
-    let src = parse_link_kind(src_kind)?;
-    let dst = parse_link_kind(dst_kind)?;
-    let edge = crate::storage::models::ManualLinkEdge {
-        src_kind: src_kind.to_string(),
-        src_id: src_id.to_string(),
-        dst_kind: dst_kind.to_string(),
-        dst_id: dst_id.to_string(),
-    };
-    let cleanup_queued = {
-        let _lifecycle = lifecycle_guard(state);
-        // ── GATE both endpoints (never mutate a note body / reveal a neighbour behind a lock). ──
-        if !link_endpoint_is_unlocked(state, src, src_id)?
-            || !link_endpoint_is_unlocked(state, dst, dst_id)?
-        {
-            return Err(AppError::Locked(
-                "one of these items is locked — unlock it to unlink".into(),
-            ));
-        }
-        let prepared_seals = prepare_manual_marker_seals(state, std::slice::from_ref(&edge))?;
-        // Strip any legacy source marker, enqueue its exact vault cleanup, and delete ONLY the
-        // selected manual edge in one transaction. A stale/missing seal rolls every mutation back.
-        state
-            .db
-            .delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &prepared_seals)?
-    };
-    if cleanup_queued {
-        let _lifecycle = lifecycle_guard(state);
-        drain_lock_marker_export_cleanup(&state.db)?;
-    }
-    tracing::info!(
-        target: "links",
-        src_kind = src.as_str(),
-        dst_kind = dst.as_str(),
-        "unlink_items"
-    );
-    Ok(())
+    unlink_manual_edges_inner(
+        state,
+        src_kind,
+        src_id,
+        dst_kind,
+        dst_id,
+        &[crate::storage::models::ManualLinkEdge {
+            src_kind: src_kind.to_string(),
+            src_id: src_id.to_string(),
+            dst_kind: dst_kind.to_string(),
+            dst_id: dst_id.to_string(),
+        }],
+    )
 }
 
-/// Prepare verify-before-destroy ciphertext for a legacy marker in a session-unlocked locked note.
-/// The storage transaction independently recomputes the stripped plaintext and accepts this blob
-/// only when it decrypts byte-identical under the same folder/note AAD.
+/// Prepare verify-before-destroy ciphertext for a legacy marker that lives in a session-unlocked
+/// locked note. The storage transaction independently recomputes the exact stripped plaintext and
+/// accepts this blob only when it matches byte-for-byte, preventing a stale preparation from being
+/// paired with the edge delete.
 fn prepare_manual_marker_seals(
     state: &AppState,
     manual_edges: &[crate::storage::models::ManualLinkEdge],
@@ -456,6 +452,87 @@ fn prepare_manual_marker_seals(
     Ok(prepared)
 }
 
+/// Remove every exact directed manual row hidden behind one displayed neighbour chip. The display
+/// representative may be an oppositely-directed wikilink, so `manual_edges` is authoritative; the
+/// legacy `(src, dst)` arguments bind that list to one unordered endpoint pair and prevent a caller
+/// from smuggling unrelated deletes into the same transaction.
+pub(crate) fn unlink_manual_edges_inner(
+    state: &AppState,
+    src_kind: &str,
+    src_id: &str,
+    dst_kind: &str,
+    dst_id: &str,
+    manual_edges: &[crate::storage::models::ManualLinkEdge],
+) -> Result<(), AppError> {
+    let src = parse_link_kind(src_kind)?;
+    let dst = parse_link_kind(dst_kind)?;
+    if manual_edges.is_empty() || manual_edges.len() > 2 {
+        return Err(AppError::InvalidArg(
+            "a collapsed pair must contain one or two manual link edges".into(),
+        ));
+    }
+    for (index, edge) in manual_edges.iter().enumerate() {
+        if manual_edges[..index].contains(edge) {
+            return Err(AppError::InvalidArg(
+                "duplicate manual link edge in unlink request".into(),
+            ));
+        }
+        let edge_src = parse_link_kind(&edge.src_kind)?;
+        let edge_dst = parse_link_kind(&edge.dst_kind)?;
+        let direct =
+            edge_src == src && edge.src_id == src_id && edge_dst == dst && edge.dst_id == dst_id;
+        let reverse =
+            edge_src == dst && edge.src_id == dst_id && edge_dst == src && edge.dst_id == src_id;
+        if !(direct || reverse) {
+            return Err(AppError::InvalidArg(
+                "manual link edge does not belong to the displayed endpoint pair".into(),
+            ));
+        }
+    }
+    let cleanup_queued = {
+        let _lifecycle = lifecycle_guard(state);
+        // ── GATE every exact tuple's endpoints before the atomic delete. ──
+        for edge in manual_edges {
+            let edge_src = parse_link_kind(&edge.src_kind)?;
+            let edge_dst = parse_link_kind(&edge.dst_kind)?;
+            if !link_endpoint_is_unlocked(state, edge_src, &edge.src_id)?
+                || !link_endpoint_is_unlocked(state, edge_dst, &edge.dst_id)?
+            {
+                return Err(AppError::Locked(
+                    "one of these items is locked — unlock it to unlink".into(),
+                ));
+            }
+        }
+        // Delete the COMPLETE collapsed manual set atomically. The DB transaction repeats its
+        // at-rest endpoint checks before deleting and never touches a derived edge.
+        let prepared_seals = prepare_manual_marker_seals(state, manual_edges)?;
+        // The DB transaction first strips any legacy source marker and enqueues the exact vault
+        // cleanup intent, then deletes every requested manual tuple. Preparation failure rolls back
+        // all mutations, so relock can never lose the last edge before a durable scrub exists.
+        state
+            .db
+            .delete_manual_links_with_marker_seals(manual_edges, &prepared_seals)?
+    };
+    // Filesystem publication runs after the DB commit, from a SQLCipher-backed retryable outbox.
+    // Propagate failure: the DB marker is already safe and the outbox remains for relock/startup,
+    // but callers must never receive false success while an exact vault export still needs scrub.
+    if cleanup_queued {
+        // Re-acquire (rather than retain) the lifecycle guard: a destination relock is allowed to
+        // win this boundary and drain the same durable intent first, but two filesystem drainers
+        // can never race one another's authenticated stage reservation.
+        let _lifecycle = lifecycle_guard(state);
+        drain_lock_marker_export_cleanup(&state.db)?;
+    }
+    tracing::info!(
+        target: "links",
+        src_kind = src.as_str(),
+        dst_kind = dst.as_str(),
+        count = manual_edges.len(),
+        "unlink_items"
+    );
+    Ok(())
+}
+
 /// Resolve a clicked `[[Title]]` wikilink to a VISIBLE note/meeting/org-item to navigate to.
 /// Returns `None` when nothing matches OR the only local match is a
 /// sealed-and-not-session-unlocked target (gated in `Db::resolve_wikilink`) — so a wikilink click
@@ -467,6 +544,7 @@ pub fn resolve_wikilink(
     state: State<'_, AppState>,
     title: String,
 ) -> Result<Option<crate::storage::models::WikiTarget>, AppError> {
+    let _lifecycle = lifecycle_guard(state.inner());
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.resolve_wikilink(&title, &unlocked)
 }
@@ -480,8 +558,8 @@ pub fn resolve_wikilink(
 /// org items go through `search_org_brain_hits`, the SAME retrieval-only, membership+enabled-gated,
 /// zero-egress reader `find_related` already uses (never a provider/egress call). Reuses
 /// [`crate::storage::models::NoteCitation`] — the popover renders it exactly like a `find_related`
-/// citation row, and `kind == "org"` carries an org item id (never a local id), matching that
-/// contract verbatim.
+/// citation row. For `kind == "org"`, `id` carries the stable `org_id:doc_id` link identity;
+/// navigation/display readers resolve that composite to the current item revision.
 ///
 /// PAGINATED (2026-07-17 — the picker is an infinite scroll over the whole vault now, not a fixed
 /// top-8): one call returns the `limit`-sized page at `offset` of the stable combined ordering
@@ -495,6 +573,7 @@ pub fn list_link_candidates(
     offset: Option<u32>,
     limit: Option<u32>,
 ) -> Result<Vec<crate::storage::models::NoteCitation>, AppError> {
+    let _lifecycle = lifecycle_guard(state.inner());
     const DEFAULT_PAGE: i64 = 40;
     const MAX_PAGE: i64 = 100;
     let limit = limit.map_or(DEFAULT_PAGE, i64::from).clamp(1, MAX_PAGE);
@@ -521,9 +600,12 @@ pub fn list_link_candidates(
             let remaining = (limit - out.len() as i64).max(0) as usize;
             let org_hits = crate::tools::search_org_brain_hits(&state.db, &config, q)?;
             for hit in org_hits.into_iter().skip(org_skip).take(remaining) {
+                let Some(doc_id) = state.db.org_link_doc_id_for_item_visible(&hit.item_id)? else {
+                    continue;
+                };
                 out.push(crate::storage::models::NoteCitation {
                     kind: "org".into(),
-                    id: hit.item_id,
+                    id: doc_id,
                     title: hit.title,
                     snippet: hit.snippet,
                 });

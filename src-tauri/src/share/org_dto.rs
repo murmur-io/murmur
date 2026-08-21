@@ -21,6 +21,13 @@ fn one() -> u32 {
     1
 }
 
+/// Parse one server-issued stable identity. Stable organization/document ids are UUIDs on the
+/// relay; keeping this as the single parser authority prevents storage and link identities from
+/// accepting different syntax. Callers choose the domain-specific error surface.
+pub(crate) fn parse_stable_uuid(value: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(value).ok()
+}
+
 /// `POST /v1/orgs {name}`.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -140,9 +147,40 @@ pub struct KeyGrantsResponse {
 }
 
 /// `POST /v1/orgs/{id}/items` — exactly one of legacy `blobId` or atomic inline `contentCell`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OrgItemAccess {
+    #[default]
+    View,
+    Edit,
+}
+
+impl OrgItemAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Edit => "edit",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "view" => Some(Self::View),
+            "edit" => Some(Self::Edit),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishItemRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<OrgItemAccess>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", with = "b64::opt")]
@@ -166,6 +204,91 @@ pub struct PublishItemRequest {
 pub struct PublishItemResponse {
     pub item_id: String,
     pub seq: u64,
+    pub doc_id: Option<String>,
+    #[serde(default)]
+    pub access: OrgItemAccess,
+    pub document_owner_user_id: Option<String>,
+}
+
+impl PublishItemResponse {
+    /// Validate the internally-consistent compatibility shape before durable metadata is admitted.
+    /// Historical servers may omit both stable-document fields. Once `docId` is present, however,
+    /// the stable owner is authorization metadata and MUST be present and non-blank; accepting a
+    /// partial shape would let command code fall back to legacy author-based management.
+    pub fn validate_document_metadata(&self) -> std::result::Result<(), &'static str> {
+        match (
+            self.doc_id.as_deref(),
+            self.document_owner_user_id.as_deref(),
+        ) {
+            (None, None) => Ok(()),
+            (Some(doc_id), _) if parse_stable_uuid(doc_id).is_none() => {
+                Err("durable org document response carried invalid docId")
+            }
+            (Some(_), Some(owner)) if !owner.trim().is_empty() => Ok(()),
+            (Some(_), _) => Err("durable org document response omitted its owner"),
+            (None, Some(_)) => Err("legacy org item response carried an owner without a document"),
+        }
+    }
+}
+
+/// CAS replacement of the current encrypted document head.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOrgItemRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutation_id: Option<String>,
+    pub expected_rev: u32,
+    #[serde(with = "b64")]
+    pub content_cell: Vec<u8>,
+    #[serde(with = "b64")]
+    pub content_sha256: Vec<u8>,
+    pub generation: u32,
+}
+
+#[derive(Deserialize,Clone,Debug)]
+#[serde(rename_all="camelCase")]
+pub struct OrgDocumentMutationReceipt {
+    pub mutation_id: String,
+    pub org_id: String,
+    pub doc_id: String,
+    pub predecessor_item_id: Option<String>,
+    pub predecessor_rev: Option<u32>,
+    pub target_item_id: String,
+    pub target_seq: u64,
+    pub actor_user_id: String,
+    pub document_owner_user_id: String,
+    #[serde(default)]
+    pub access: OrgItemAccess,
+    pub rev: u32,
+    pub generation: u32,
+    #[serde(with="b64")]
+    pub content_sha256: Vec<u8>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOrgItemAccessRequest {
+    pub access: OrgItemAccess,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgDocumentAccessResponse {
+    pub doc_id: String,
+    pub access: OrgItemAccess,
+    pub document_owner_user_id: String,
+}
+
+impl OrgDocumentAccessResponse {
+    pub fn validate_document_metadata(&self) -> std::result::Result<(), &'static str> {
+        if parse_stable_uuid(&self.doc_id).is_none() {
+            return Err("org document access response carried invalid docId");
+        }
+        if self.document_owner_user_id.trim().is_empty() {
+            return Err("org document access response omitted its owner");
+        }
+        Ok(())
+    }
 }
 
 /// One feed entry. A LIVE item carries `blobId` + `contentSha256`; a TOMBSTONE carries
@@ -176,6 +299,17 @@ pub struct OrgItemEntry {
     pub item_id: String,
     pub seq: u64,
     pub author_user_id: String,
+    #[serde(default)]
+    pub doc_id: Option<String>,
+    #[serde(default)]
+    pub access: OrgItemAccess,
+    #[serde(default)]
+    pub document_owner_user_id: Option<String>,
+    /// Authoritative durable-resource head marker. `None` means an older/incompatible server omitted
+    /// the field; it is deliberately distinct from `Some(false)`, which is a real demotion. Feed
+    /// admission must validate the whole page before mutating a cursor or local head.
+    #[serde(default)]
+    pub is_current: Option<bool>,
     pub rev: u32,
     #[serde(default = "one")]
     pub generation: u32,
@@ -194,6 +328,29 @@ pub struct OrgItemsResponse {
     pub next_seq: u64,
 }
 
+impl OrgItemsResponse {
+    /// Validate server-owned authorization/head metadata for the complete page. The caller must run
+    /// this before any feed action or cursor mutation, so an older/partial server response preserves
+    /// the last known-good local replica instead of silently demoting or re-authorizing it.
+    pub fn validate_authoritative_metadata(&self) -> std::result::Result<(), &'static str> {
+        self.items.iter().try_for_each(|item| {
+            let Some(doc_id) = item.doc_id.as_deref() else {
+                return Ok(());
+            };
+            if parse_stable_uuid(doc_id).is_none() {
+                return Err("durable org feed item carried invalid docId");
+            }
+            if item.is_current.is_none() {
+                return Err("durable org feed item omitted isCurrent");
+            }
+            match item.document_owner_user_id.as_deref() {
+                Some(owner) if !owner.trim().is_empty() => Ok(()),
+                _ => Err("durable org feed item omitted its owner"),
+            }
+        })
+    }
+}
+
 /// Response to `{blobId}` from `POST /v1/blobs`.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -204,6 +361,8 @@ pub struct BlobCreatedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DOC_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     /// A create request serializes with the exact camelCase key the server's `deny_unknown_fields`
     /// DTO expects.
@@ -238,6 +397,9 @@ mod tests {
     #[test]
     fn publish_item_request_wire_shape() {
         let r = PublishItemRequest {
+            mutation_id: None,
+            doc_id: Some(DOC_ID.into()),
+            access: Some(OrgItemAccess::Edit),
             blob_id: None,
             content_cell: Some(vec![0xAB, 0xCD]),
             content_sha256: vec![1u8; 32],
@@ -247,10 +409,123 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert!(v.get("blobId").is_none());
-        assert_eq!(v["contentCell"], murmur_protocol::b64::encode(&[0xAB, 0xCD]));
+        assert_eq!(
+            v["contentCell"],
+            murmur_protocol::b64::encode(&[0xAB, 0xCD])
+        );
         assert_eq!(v["rev"], 1);
         assert_eq!(v["generation"], 3);
+        assert_eq!(v["docId"], DOC_ID);
+        assert_eq!(v["access"], "edit");
+        assert!(v.get("mutationId").is_none());
         assert_eq!(v["contentSha256"], murmur_protocol::b64::encode(&[1u8; 32]));
+    }
+
+    /// Omitting the new permission key is the historical wire shape. The pinned relay interprets
+    /// it as the enum default (`view`), so old callers never gain edit access.
+    #[test]
+    fn publish_item_request_missing_access_is_least_privilege() {
+        let request = PublishItemRequest {
+            mutation_id: None,
+            doc_id: Some(DOC_ID.into()),
+            access: None,
+            blob_id: None,
+            content_cell: Some(vec![0xAB]),
+            content_sha256: vec![1; 32],
+            rev: 1,
+            generation: 1,
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert!(value.get("access").is_none());
+        assert_eq!(OrgItemAccess::default(), OrgItemAccess::View);
+    }
+
+    #[test]
+    fn publish_response_rejects_partial_stable_owner_metadata() {
+        let legacy: PublishItemResponse =
+            serde_json::from_str(r#"{"itemId":"i1","seq":1,"access":"view"}"#).unwrap();
+        assert!(legacy.validate_document_metadata().is_ok());
+
+        let complete: PublishItemResponse = serde_json::from_str(
+            r#"{"itemId":"i2","seq":2,"docId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","access":"edit",
+                "documentOwnerUserId":"owner"}"#,
+        )
+        .unwrap();
+        assert!(complete.validate_document_metadata().is_ok());
+
+        let missing_owner: PublishItemResponse =
+            serde_json::from_str(r#"{"itemId":"i3","seq":3,"docId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","access":"view"}"#)
+                .unwrap();
+        assert_eq!(
+            missing_owner.validate_document_metadata(),
+            Err("durable org document response omitted its owner")
+        );
+
+        let malformed: PublishItemResponse = serde_json::from_str(
+            r#"{"itemId":"i4","seq":4,"docId":"not-a-uuid","access":"view",
+                "documentOwnerUserId":"owner"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            malformed.validate_document_metadata(),
+            Err("durable org document response carried invalid docId")
+        );
+    }
+
+    #[test]
+    fn update_and_access_requests_match_stable_document_wire() {
+        let update = UpdateOrgItemRequest {
+            mutation_id: None,
+            expected_rev: 7,
+            content_cell: vec![0xAB],
+            content_sha256: vec![3; 32],
+            generation: 2,
+        };
+        let value = serde_json::to_value(update).unwrap();
+        let keys: std::collections::BTreeSet<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "contentCell",
+                "contentSha256",
+                "expectedRev",
+                "generation",
+            ])
+        );
+        assert_eq!(value["expectedRev"], 7);
+        assert_eq!(value["contentCell"], murmur_protocol::b64::encode(&[0xAB]));
+        assert_eq!(
+            value["contentSha256"],
+            murmur_protocol::b64::encode(&[3; 32])
+        );
+        assert_eq!(value["generation"], 2);
+        assert!(value.get("mutationId").is_none());
+        let access = serde_json::to_value(SetOrgItemAccessRequest {
+            access: OrgItemAccess::View,
+        })
+        .unwrap();
+        assert_eq!(access, serde_json::json!({"access": "view"}));
+        assert!(serde_json::from_str::<OrgItemAccess>(r#""owner""#).is_err());
+
+        let valid_access: OrgDocumentAccessResponse = serde_json::from_str(
+            r#"{"docId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","access":"edit",
+                "documentOwnerUserId":"owner"}"#,
+        )
+        .unwrap();
+        assert!(valid_access.validate_document_metadata().is_ok());
+        let invalid_access: OrgDocumentAccessResponse = serde_json::from_str(
+            r#"{"docId":"not-a-uuid","access":"view","documentOwnerUserId":"owner"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_access.validate_document_metadata(),
+            Err("org document access response carried invalid docId")
+        );
     }
 
     /// A feed response deserializes a LIVE item + a TOMBSTONE with the right optionality.
@@ -259,7 +534,9 @@ mod tests {
         let sha = murmur_protocol::b64::encode(&[2u8; 32]);
         let json = format!(
             r#"{{"items":[
-                {{"itemId":"i1","seq":1,"authorUserId":"a","rev":1,"generation":1,
+                {{"itemId":"i1","seq":1,"authorUserId":"editor","docId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                  "access":"edit","documentOwnerUserId":"owner","isCurrent":true,
+                  "rev":1,"generation":1,
                   "createdAt":"2026-07-10T00:00:00Z","tombstoned":false,
                   "blobId":"b1","contentSha256":"{sha}"}},
                 {{"itemId":"i2","seq":2,"authorUserId":"a","rev":1,"generation":1,
@@ -272,9 +549,102 @@ mod tests {
         assert!(!resp.items[0].tombstoned);
         assert_eq!(resp.items[0].blob_id.as_deref(), Some("b1"));
         assert_eq!(resp.items[0].content_sha256, Some(vec![2u8; 32]));
+        assert_eq!(resp.items[0].doc_id.as_deref(), Some(DOC_ID));
+        assert_eq!(resp.items[0].access, OrgItemAccess::Edit);
+        assert_eq!(
+            resp.items[0].document_owner_user_id.as_deref(),
+            Some("owner")
+        );
+        assert_eq!(resp.items[0].is_current, Some(true));
         assert!(resp.items[1].tombstoned);
+        assert_eq!(resp.items[1].access, OrgItemAccess::View);
+        assert_eq!(resp.items[1].is_current, None);
         assert!(resp.items[1].blob_id.is_none());
         assert!(resp.items[1].content_sha256.is_none());
+        assert!(resp.validate_authoritative_metadata().is_ok());
+    }
+
+    /// Presence is security-significant: omission is unknown, while an explicit false is an
+    /// authoritative demotion and must not be rewritten to a compatibility default.
+    #[test]
+    fn stable_feed_head_marker_distinguishes_absent_true_and_false() {
+        fn item(marker: &str, owner: &str) -> OrgItemEntry {
+            serde_json::from_str(&format!(
+                r#"{{"itemId":"i1","seq":1,"authorUserId":"author","docId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "access":"view"{owner},"rev":1,"generation":1,
+                    "createdAt":"2026-08-12T00:00:00Z","tombstoned":false{marker}}}"#
+            ))
+            .unwrap()
+        }
+
+        let absent = item("", r#","documentOwnerUserId":"owner""#);
+        let current = item(r#","isCurrent":true"#, r#","documentOwnerUserId":"owner""#);
+        let demoted = item(r#","isCurrent":false"#, r#","documentOwnerUserId":"owner""#);
+        assert_eq!(absent.is_current, None);
+        assert_eq!(current.is_current, Some(true));
+        assert_eq!(demoted.is_current, Some(false));
+
+        let absent_page = OrgItemsResponse {
+            items: vec![absent],
+            next_seq: 1,
+        };
+        assert_eq!(
+            absent_page.validate_authoritative_metadata(),
+            Err("durable org feed item omitted isCurrent")
+        );
+
+        for entry in [current, demoted] {
+            let page = OrgItemsResponse {
+                items: vec![entry],
+                next_seq: 1,
+            };
+            assert!(page.validate_authoritative_metadata().is_ok());
+        }
+    }
+
+    #[test]
+    fn stable_feed_missing_owner_fails_page_but_legacy_item_remains_compatible() {
+        let stable_without_owner: OrgItemsResponse = serde_json::from_str(
+            r#"{"items":[{"itemId":"i1","seq":1,"authorUserId":"author","docId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "access":"view","isCurrent":true,"rev":1,"generation":1,
+                "createdAt":"2026-08-12T00:00:00Z","tombstoned":false}],"nextSeq":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stable_without_owner.validate_authoritative_metadata(),
+            Err("durable org feed item omitted its owner")
+        );
+
+        let legacy: OrgItemsResponse = serde_json::from_str(
+            r#"{"items":[{"itemId":"i0","seq":1,"authorUserId":"author","rev":1,
+                "generation":1,"createdAt":"2026-08-12T00:00:00Z","tombstoned":false}],
+                "nextSeq":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.items[0].access, OrgItemAccess::View);
+        assert_eq!(legacy.items[0].is_current, None);
+        assert!(legacy.validate_authoritative_metadata().is_ok());
+
+        let malformed: OrgItemsResponse = serde_json::from_str(
+            r#"{"items":[{"itemId":"i2","seq":2,"authorUserId":"author",
+                "docId":"not-a-uuid","access":"view","documentOwnerUserId":"owner",
+                "isCurrent":true,"rev":1,"generation":1,
+                "createdAt":"2026-08-12T00:00:00Z","tombstoned":false}],"nextSeq":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            malformed.validate_authoritative_metadata(),
+            Err("durable org feed item carried invalid docId")
+        );
+    }
+
+    #[test]
+    fn unknown_access_rejects_the_whole_feed_response() {
+        let json = r#"{"items":[{"itemId":"i1","seq":1,"authorUserId":"author","docId":"d1",
+            "access":"full","documentOwnerUserId":"owner","isCurrent":true,"rev":1,
+            "generation":1,"createdAt":"2026-08-12T00:00:00Z","tombstoned":false}],
+            "nextSeq":1}"#;
+        assert!(serde_json::from_str::<OrgItemsResponse>(json).is_err());
     }
 
     /// A response DTO tolerates an UNKNOWN field (forward-compat: no `deny_unknown_fields`).

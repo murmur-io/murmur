@@ -66,6 +66,35 @@
       <p class="sheet-error" role="alert">{{ err }}</p>
     }
 
+    <fieldset class="access-pick" [disabled]="sharing()">
+      <legend class="section-label">Member access</legend>
+      <div class="access-options">
+        <button
+          type="button"
+          class="access-option"
+          [class.is-selected]="access() === 'view'"
+          [attr.aria-pressed]="access() === 'view'"
+          (click)="setAccess('view')"
+        >
+          <span class="access-title">View only</span>
+          <span class="access-copy">Members can read, search, and privately link it.</span>
+        </button>
+        <button
+          type="button"
+          class="access-option"
+          [class.is-selected]="access() === 'edit'"
+          [attr.aria-pressed]="access() === 'edit'"
+          (click)="setAccess('edit')"
+        >
+          <span class="access-title">Can edit</span>
+          <span class="access-copy">Members can publish new revisions; only you and the Org Owner manage access.</span>
+        </button>
+      </div>
+      <p class="access-note">
+        Content stays end-to-end encrypted. A Related link is private to its device and never grants access.
+      </p>
+    </fieldset>
+
     <!-- The exact outgoing markdown (scrollable) + its size. Honesty invariant:
          the user sees EXACTLY what would leave the Mac before confirming. -->
     <div class="preview-block">

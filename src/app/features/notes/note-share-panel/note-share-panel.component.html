@@ -76,6 +76,52 @@
            Generic CTA: the org is PICKED in the sheet (a member can be in many). -->
       @if (org()) {
         <mur-org-brain-cta [shared]="sourceInOrg()" (add)="openOrgSheet()" />
+        @if (orgSourceRows().length) {
+          <div class="org-access-manage" aria-label="Shared Brain access">
+            @for (share of orgSourceRows(); track share.orgId) {
+              <div class="org-access-row" [class.is-conflicted]="share.conflicted">
+                <span class="org-access-name">{{ share.orgName }}</span>
+                @if (share.conflicted) {
+                  <div class="org-share-conflict" role="alert" data-testid="org-share-conflict">
+                    <span>Shared copy changed elsewhere. Automatic updates stopped to protect the latest version.</span>
+                    @if (share.itemId) {
+                      <button
+                        type="button"
+                        class="btn btn-ghost org-conflict-open"
+                        (click)="openLatestOrgShare(share.itemId)"
+                      >Open latest</button>
+                    } @else {
+                      <span class="org-conflict-action">Open Shared Brain to review the latest version.</span>
+                    }
+                  </div>
+                } @else {
+                  <div class="org-access-options">
+                    <button
+                      type="button"
+                      class="org-access-btn"
+                      [class.is-selected]="share.access === 'view'"
+                      [attr.aria-pressed]="share.access === 'view'"
+                      [disabled]="changingOrgAccessId() === share.itemId"
+                      (click)="setOrgAccess(share.itemId, 'view')"
+                    >View only</button>
+                    <button
+                      type="button"
+                      class="org-access-btn"
+                      [class.is-selected]="share.access === 'edit'"
+                      [attr.aria-pressed]="share.access === 'edit'"
+                      [disabled]="changingOrgAccessId() === share.itemId"
+                      (click)="setOrgAccess(share.itemId, 'edit')"
+                    >Can edit</button>
+                  </div>
+                }
+              </div>
+            }
+            <p class="hint">Related links stay private and never grant access.</p>
+            @if (orgAccessError(); as err) {
+              <p class="msg msg-error" role="alert">{{ err }}</p>
+            }
+          </div>
+        }
       }
 
       <!-- CONFIGURE — password FIRST → expires → open limit → consent → Create. -->
@@ -293,6 +339,9 @@
               <li class="row">
                 <div class="row-meta">
                   @switch (r.state) {
+                    @case ("pending") {
+                      <span class="pill is-warning"><i class="pill-dot"></i>Revocation pending</span>
+                    }
                     @case ("revoked") {
                       <span class="pill is-muted"><i class="pill-dot"></i>Revoked</span>
                     }
@@ -319,9 +368,23 @@
                     <span class="row-sep" aria-hidden="true">·</span>
                     <span>{{ r.expiryLabel }}</span>
                   }
+                  @if (r.state === "pending") {
+                    <span class="hint">
+                      Murmur is safely closing an interrupted share. Local delete or lock stays paused until cleanup succeeds.
+                    </span>
+                  }
                 </div>
                 <div class="row-actions">
-                  @if (r.state !== "revoked") {
+                  @if (r.state === "pending") {
+                    <button
+                      type="button"
+                      class="btn btn-ghost mini-btn revoke-btn"
+                      (click)="revokeRow(r.shareId)"
+                      [disabled]="revokingId() === r.shareId"
+                    >
+                      {{ revokingId() === r.shareId ? "Retrying…" : "Retry" }}
+                    </button>
+                  } @else if (r.state !== "revoked") {
                     <button
                       type="button"
                       class="btn btn-ghost mini-btn"

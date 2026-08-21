@@ -346,6 +346,10 @@ pub struct AppState {
     /// here which are never held across an `await`); the winner rotates + persists the new pair, losers
     /// re-read the freshened session token. `()` because it guards a section, not state.
     pub share_refresh_lock: tokio::sync::Mutex<()>,
+    /// Serializes organization mutation/recovery/revoke flows across network awaits. Destructive
+    /// source/folder closures acquire this before becoming durable, so an already-dispatched share
+    /// finishes first and no later mutation can cross the closure barrier.
+    pub org_share_mutation_lock: tokio::sync::Mutex<()>,
     /// BLK-1 coarse LIFECYCLE lock. Serializes the folder-lock state machine
     /// (`lock_folder` / `unlock_folder` / `relock_folder` / `relock_all_inner` / `remove_lock` /
     /// the seal half of `move_note`) so two of them can NEVER interleave their multi-step
@@ -619,6 +623,7 @@ impl AppState {
             org_ock_cache: Mutex::new(std::collections::HashMap::new()),
             account_session: Mutex::new(None),
             share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),
             active_salvages: Mutex::new(std::collections::HashSet::new()),
             seal_epoch: AtomicU64::new(0),

@@ -16,12 +16,41 @@ import { TabsService } from "../../../core/tabs.service";
 import { tabKeyFor } from "../../../core/tab-keys";
 import type {
   NoteAttachmentDto,
+  OrgAccess,
   OrgItemDetail,
 } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { NoteChatComponent } from "../../notes/note-chat/note-chat.component";
 import { ToastService } from "../../../services/toast.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+
+const STABLE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Accept only the backend-issued stable identity for this exact document. A
+ * historical/malformed detail falls back to its immutable item id instead of
+ * letting arbitrary punctuation turn a route id into a stable-head lookup.
+ */
+function stableLinkIdOf(item: OrgItemDetail | null): string | null {
+  const docId = item?.docId?.trim();
+  const linkId = item?.linkId?.trim();
+  if (!docId || !linkId) {
+    return null;
+  }
+  const parts = linkId.split(":");
+  if (
+    parts.length !== 2 ||
+    !STABLE_UUID_PATTERN.test(parts[0]) ||
+    !STABLE_UUID_PATTERN.test(parts[1]) ||
+    !STABLE_UUID_PATTERN.test(docId) ||
+    parts[1].toLowerCase() !== docId.toLowerCase()
+  ) {
+    return null;
+  }
+  return `${parts[0]}:${parts[1]}`;
+}
 
 /**
  * Viewer for ONE org-brain item (`/org-item/:id`). Reached from an org-origin
@@ -54,7 +83,7 @@ import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 @Component({
   selector: "app-org-item-viewer",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, NoteChatComponent],
+  imports: [MarkdownComponent, NoteChatComponent, ConnectionsComponent],
   templateUrl: "./org-item-viewer.component.html",
   styleUrl: "./org-item-viewer.component.scss",
 })
@@ -115,15 +144,15 @@ export class OrgItemViewerComponent {
    */
   readonly notEditableReason = computed<string | null>(() => {
     const it = this._item();
-    if (!it || it.editable) {
+    if (!it || this.canEdit(it)) {
       return null;
     }
     return this._loggedIn()
-      ? "Only the author can edit this note."
-      : "Sign in to edit notes you authored.";
+      ? "View only — the author or Org Owner can enable editing."
+      : "Sign in to use the permissions granted to your account.";
   });
 
-  // --- Edit-in-place (author only; F-org-editable-any-device) ---------------
+  // --- Edit-in-place (server-authorized author/owner/editor) ----------------
   /** True while the author is editing this item in place (drives the editor UI). */
   readonly editing = signal(false);
   /** Draft title/body bound to the inline editor while {@link editing}. */
@@ -131,6 +160,24 @@ export class OrgItemViewerComponent {
   readonly markdownDraft = signal("");
   /** True while `orgUpdateOwnItem` (seal → publish → tombstone-old) is in flight. */
   readonly saving = signal(false);
+  /**
+   * Fixed, content-free state for a lost optimistic-concurrency race. The draft
+   * signals remain untouched until the user explicitly chooses to open the
+   * authoritative head.
+   */
+  private readonly _editConflict = signal(false);
+  readonly editConflict = this._editConflict.asReadonly();
+  /** True while the explicit sync + current-head read is in flight. */
+  readonly openingLatest = signal(false);
+  /** Fixed failure state; raw sync/read errors never reach the template. */
+  private readonly _openLatestFailed = signal(false);
+  readonly openLatestFailed = this._openLatestFailed.asReadonly();
+  /** Strict `orgId:docId` identity used by the explicit recovery read. */
+  readonly latestLinkId = computed<string | null>(() =>
+    stableLinkIdOf(this._item()),
+  );
+  /** True while a manager changes this document's organization-wide access. */
+  readonly changingAccess = signal(false);
 
   /**
    * Ask Brain pane open/closed — the read-only viewer's right-hand "Ask about this note" split. It
@@ -195,32 +242,40 @@ export class OrgItemViewerComponent {
    * ignored: a transient error must never be mistaken for "withdrawn".
    */
   private async revalidate(): Promise<void> {
-    const id = this.itemId();
-    if (!id || this._removed() || this.loading()) {
+    const routeId = this.itemId();
+    if (!routeId || this._removed() || this.loading()) {
       return;
     }
+    // A successful edit replaces the immutable feed item id. During conflict
+    // recovery, orgSyncNow can emit this event before its Promise resolves, so
+    // the route still names the predecessor. Resolve through the validated
+    // stable document identity when the loaded detail provides one.
+    const lookupId = stableLinkIdOf(this._item()) ?? routeId;
     let detail: OrgItemDetail | null;
     try {
-      detail = await this.ipc.orgGetItem(id);
+      detail = await this.ipc.orgGetItem(lookupId);
     } catch {
       return;
     }
-    if (this.itemId() !== id || this._removed()) {
+    if (this.itemId() !== routeId || this._removed()) {
       return;
     }
     if (!detail) {
-      this.markRemoved(id);
+      // `null` from a validated stable lookup is a real resource withdrawal,
+      // not merely a superseded immutable revision. Keep that fail-closed
+      // eviction behavior even while an edit/recovery operation is in flight.
+      this.markRemoved(routeId);
       return;
     }
-    if (this.editing() || this.saving()) {
+    if (this.editing() || this.saving() || this.openingLatest()) {
       return;
     }
     this._item.set(detail);
     this.tabsService.setTitle(
-      tabKeyFor("org-item", id),
+      tabKeyFor("org-item", routeId),
       detail.title || "Shared note",
     );
-    void this.reloadAttachments(id);
+    void this.reloadAttachments(detail.itemId, routeId);
   }
 
   /**
@@ -234,17 +289,29 @@ export class OrgItemViewerComponent {
     this._item.set(null);
     this.attachments.set([]);
     this.editing.set(false);
+    this._editConflict.set(false);
+    this._openLatestFailed.set(false);
     this.confirmingRemove.set(false);
     this.orgChatOpen.set(false);
     this.toast.info("This shared note is no longer available in the org.");
     void this.tabsService.closeTab(tabKeyFor("org-item", id));
   }
 
-  /** Refresh the decrypted attachment DTOs for `id`. Stale-guarded, never throws. */
-  private async reloadAttachments(id: string): Promise<void> {
+  /**
+   * Refresh attachments for the returned live item, independently of the
+   * possibly-superseded route id. Stale-guarded, never throws.
+   */
+  private async reloadAttachments(
+    ownerItemId: string,
+    routeId: string,
+  ): Promise<void> {
     try {
-      const rows = await this.ipc.listNoteAttachments("org", id);
-      if (this.itemId() === id && !this._removed()) {
+      const rows = await this.ipc.listNoteAttachments("org", ownerItemId);
+      if (
+        this.itemId() === routeId &&
+        this._item()?.itemId === ownerItemId &&
+        !this._removed()
+      ) {
         this.attachments.set(Array.isArray(rows) ? rows : []);
       }
     } catch {
@@ -274,6 +341,8 @@ export class OrgItemViewerComponent {
     this._orgName.set("");
     // A route change (incl. the post-save redirect to the superseded item) always exits edit mode.
     this.editing.set(false);
+    this._editConflict.set(false);
+    this._openLatestFailed.set(false);
     try {
       const ref = await this.ipc.orgResolveSource(id);
       if (this.itemId() !== id) {
@@ -314,17 +383,9 @@ export class OrgItemViewerComponent {
         return;
       }
       this._item.set(item);
-      try {
-        const rows = await this.ipc.listNoteAttachments("org", id);
-        if (this.itemId() !== id) {
-          return;
-        }
-        this.attachments.set(Array.isArray(rows) ? rows : []);
-      } catch {
-        if (this.itemId() !== id) {
-          return;
-        }
-        this.attachments.set([]);
+      await this.reloadAttachments(item.itemId, id);
+      if (this.itemId() !== id) {
+        return;
       }
       // Adopt the real title (mirrors note-editor's setTitle) — the caller
       // already passes a best-known title when opening the tab, but this
@@ -387,23 +448,27 @@ export class OrgItemViewerComponent {
     }
   }
 
-  /** Enter edit mode (author only), seeding the drafts from the loaded item. */
+  /** Enter edit mode when the server grants it, seeding drafts from the item. */
   startEdit(): void {
     const it = this._item();
-    if (!it || !it.editable) {
+    if (!it || !this.canEdit(it)) {
       return;
     }
     this.titleDraft.set(it.title);
     this.markdownDraft.set(it.markdown);
+    this._editConflict.set(false);
+    this._openLatestFailed.set(false);
     this.editing.set(true);
   }
 
   /** Leave edit mode without saving (ignored mid-save). */
   cancelEdit(): void {
-    if (this.saving()) {
+    if (this.saving() || this.openingLatest()) {
       return;
     }
     this.editing.set(false);
+    this._editConflict.set(false);
+    this._openLatestFailed.set(false);
   }
 
   /**
@@ -415,24 +480,134 @@ export class OrgItemViewerComponent {
    */
   async saveEdit(): Promise<void> {
     const it = this._item();
-    if (!it || this.saving()) {
+    if (!it || this.saving() || this.openingLatest()) {
       return;
     }
     const title = this.titleDraft().trim();
     const markdown = this.markdownDraft();
     this.saving.set(true);
     try {
-      const newId = await this.ipc.orgUpdateOwnItem(it.itemId, title, markdown);
+      const newId = await this.ipc.orgUpdateItem(it.itemId, title, markdown);
       this.editing.set(false);
+      this._editConflict.set(false);
+      this._openLatestFailed.set(false);
       this.toast.success("Changes shared to the org");
       // The superseded item has a new id — land on it so the viewer reloads fresh.
       await this.router.navigate(["/org-item", newId], { replaceUrl: true });
     } catch (e) {
-      this.toast.danger("Couldn’t save your changes. Please try again.");
-      console.error("org edit save failed", e);
+      if (this.errorCopy.is(e, "org-edit-conflict")) {
+        // Keep both draft signals byte-for-byte intact. Recovery is explicit:
+        // no automatic re-share, permission write, sync, or content replacement.
+        this._editConflict.set(true);
+        this._openLatestFailed.set(false);
+      } else {
+        this.toast.danger(
+          "Couldn’t save. Check that you still have edit access; your draft is still here.",
+        );
+      }
     } finally {
       this.saving.set(false);
     }
+  }
+
+  /**
+   * Resolve the relay-authoritative current head after a direct-edit conflict.
+   *
+   * The backend accepts the stable `orgId:docId` link identity in `orgGetItem`.
+   * We first sync that org only after this explicit click, then perform the
+   * read-only stable-id lookup and replace-navigate to the returned live item.
+   * This path never re-shares content or changes document access.
+   */
+  async openLatestAfterConflict(): Promise<void> {
+    const conflicted = this._item();
+    const linkId = this.latestLinkId();
+    if (!this._editConflict() || !linkId || this.openingLatest()) {
+      return;
+    }
+    const [orgId] = linkId.split(":");
+
+    const routeId = this.itemId();
+    this.openingLatest.set(true);
+    this._openLatestFailed.set(false);
+    try {
+      await this.ipc.orgSyncNow(orgId);
+      const latest = await this.ipc.orgGetItem(linkId);
+      if (this.itemId() !== routeId || this._item() !== conflicted) {
+        return;
+      }
+      if (!latest) {
+        this._openLatestFailed.set(true);
+        return;
+      }
+
+      // The user explicitly chose the current head, so the old draft can now
+      // leave the editor. Adopt the already-resolved detail before navigating;
+      // the route effect then revalidates it by its current item id.
+      this._item.set(latest);
+      this.attachments.set([]);
+      this.editing.set(false);
+      this._editConflict.set(false);
+      this.tabsService.setTitle(
+        tabKeyFor("org-item", latest.itemId),
+        latest.title || "Shared note",
+      );
+      await this.router.navigate(["/org-item", latest.itemId], {
+        replaceUrl: true,
+      });
+    } catch {
+      if (this.itemId() === routeId) {
+        this._openLatestFailed.set(true);
+      }
+    } finally {
+      this.openingLatest.set(false);
+    }
+  }
+
+  /** Change member access, then re-read server-authoritative permissions. */
+  async setAccess(access: OrgAccess): Promise<void> {
+    const it = this._item();
+    if (
+      !it ||
+      !this.canManage(it) ||
+      this.changingAccess() ||
+      this.accessOf(it) === access
+    ) {
+      return;
+    }
+    this.changingAccess.set(true);
+    try {
+      await this.ipc.orgSetItemAccess(it.itemId, access);
+      const fresh = await this.ipc.orgGetItem(it.itemId);
+      if (!fresh) {
+        this.markRemoved(it.itemId);
+        return;
+      }
+      this._item.set(fresh);
+      this.toast.success(
+        access === "edit" ? "Members can now edit" : "Changed to view only",
+      );
+    } catch {
+      this.toast.danger(
+        "Couldn’t change access. Only the author or Org Owner can manage it.",
+      );
+    } finally {
+      this.changingAccess.set(false);
+    }
+  }
+
+  /** Compatibility helper while replicas made by an older client still expose `editable`. */
+  canEdit(item: OrgItemDetail): boolean {
+    return item.canEdit ?? item.editable ?? false;
+  }
+
+  /** Compatibility for author-owned replicas created before the permission split. */
+  canManage(item: OrgItemDetail): boolean {
+    return item.canManage ?? item.editable ?? false;
+  }
+
+  /** Historical replicas predate access metadata and are fail-closed view-only. */
+  accessOf(item: OrgItemDetail): OrgAccess {
+    return item.access ?? "view";
   }
 
   /** Back returns to the Notes home (mirrors the note-editor `back()`, B1). */
@@ -456,7 +631,7 @@ export class OrgItemViewerComponent {
 
   async doRemove(): Promise<void> {
     const it = this._item();
-    if (!it || this.saving()) {
+    if (!it || !this.canManage(it) || this.saving()) {
       return;
     }
     this.saving.set(true);

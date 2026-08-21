@@ -130,7 +130,7 @@ export class FolderLockFlowService {
     this._busy.set(true);
     this._error.set(null);
     try {
-      await this.folders.lock(pending.folderId);
+      await this.folders.lockAllowRemoteAccess(pending.folderId);
       await pending.onLocked();
       this._pending.set(null);
     } catch {

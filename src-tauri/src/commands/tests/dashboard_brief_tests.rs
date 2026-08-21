@@ -2052,6 +2052,7 @@ fn brief_state(tag: &str) -> crate::state::AppState {
         lifecycle: Mutex::new(()),
         active_salvages: Mutex::new(HashSet::new()),
         share_refresh_lock: tokio::sync::Mutex::new(()),
+        org_share_mutation_lock: tokio::sync::Mutex::new(()),
         seal_epoch: std::sync::atomic::AtomicU64::new(0),
         heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
     }
