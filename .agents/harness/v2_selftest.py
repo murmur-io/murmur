@@ -2634,6 +2634,172 @@ def specialist_source_context_cases(test: Tests) -> None:
         )
 
 
+def large_review_prompt_cases(test: Tests) -> None:
+    """Keep every changed line while bounding oversized reviewer prompts."""
+
+    with tempfile.TemporaryDirectory(prefix="murmur-v2-large-review-") as raw:
+        repo = Path(raw) / "repo"
+        base_sha = _init_repo(repo)
+        contract = {
+            "task_id": "large-review-selftest",
+            "description": "review a large exact diff without dropping changes",
+        }
+        plan: Dict[str, Any] = {
+            "base_sha": base_sha,
+            "changed_paths": ["owned.txt"],
+            "claims": [],
+            "actual_risk_flags": [],
+            "checks": [],
+            "diff_sha256": "0" * 64,
+            "plan_sha256": "1" * 64,
+            "protocol_sha256": "2" * 64,
+            "server_required": False,
+        }
+
+        small_diff = (
+            b"diff --git a/owned.txt b/owned.txt\n"
+            b"--- a/owned.txt\n"
+            b"+++ b/owned.txt\n"
+            b"@@ -1,2 +1,2 @@\n"
+            b" unchanged-small-context\n"
+            b"-old\n"
+            b"+new\n"
+        )
+        small_prompt = verifier.combined_review_prompt(
+            contract,
+            {
+                **plan,
+                "diff_sha256": hashlib.sha256(small_diff).hexdigest(),
+            },
+            small_diff,
+            [],
+            "combined",
+            repo,
+            repo,
+            policy_text="policy",
+            proof_gap_policy_text="policy",
+        )
+        test.true(
+            "LARGE REVIEW keeps historical full rendering below the bound",
+            " unchanged-small-context" in small_prompt
+            and verifier.REVIEW_DIFF_CONTEXT_ELISION_NOTE not in small_prompt,
+        )
+
+        context_line = " unique-unchanged-context-to-elide\n"
+        context_count = (
+            verifier.REVIEW_PROMPT_MAX_CHARS // len(context_line)
+        ) + 128
+        large_diff = (
+            "diff --git a/owned.txt b/owned.txt\n"
+            "--- a/owned.txt\n"
+            "+++ b/owned.txt\n"
+            f"@@ -1,{context_count + 1} +1,{context_count + 1} @@\n"
+            + (context_line * context_count)
+            + "-changed-old-sentinel\n"
+            + "+changed-new-sentinel\n"
+            + "diff --git a/blob.bin b/blob.bin\n"
+            + "GIT binary patch\n"
+            + "literal 3\n"
+            + "binary-patch-sentinel\n"
+        ).encode("utf-8")
+        large_plan = {
+            **plan,
+            "diff_sha256": hashlib.sha256(large_diff).hexdigest(),
+        }
+        first = verifier.combined_review_prompt(
+            contract,
+            large_plan,
+            large_diff,
+            [],
+            "combined",
+            repo,
+            repo,
+            policy_text="policy",
+            proof_gap_policy_text="policy",
+        )
+        second = verifier.combined_review_prompt(
+            contract,
+            large_plan,
+            large_diff,
+            [],
+            "combined",
+            repo,
+            repo,
+            policy_text="policy",
+            proof_gap_policy_text="policy",
+        )
+        test.true(
+            "LARGE REVIEW elides only hunk context and stays deterministic",
+            first == second
+            and len(first) <= verifier.REVIEW_PROMPT_MAX_CHARS
+            and verifier.REVIEW_DIFF_CONTEXT_ELISION_NOTE in first
+            and "unique-unchanged-context-to-elide" not in first
+            and "-changed-old-sentinel" in first
+            and "+changed-new-sentinel" in first
+            and "binary-patch-sentinel" in first
+            and large_plan["diff_sha256"] in first,
+        )
+
+        unicode_path = repo / "unicode.txt"
+        unicode_path.write_text(
+            "old\u0085 continuation-nel-old\u2028 continuation-ls-old"
+            "\u2029 continuation-ps-old\n",
+            encoding="utf-8",
+        )
+        _git(repo, "add", unicode_path.relative_to(repo).as_posix())
+        _git(repo, "commit", "-q", "-m", "unicode diff base")
+        unicode_path.write_text(
+            "new\u0085 continuation-nel-new\u2028 continuation-ls-new"
+            "\u2029 continuation-ps-new\n",
+            encoding="utf-8",
+        )
+        unicode_diff = _git(repo, "diff", "--binary")
+        unicode_rendered = verifier._review_diff_without_hunk_context(
+            unicode_diff
+        )
+        test.true(
+            "LARGE REVIEW preserves Git changed lines containing Unicode separators",
+            all(
+                marker in unicode_rendered
+                for marker in (
+                    "continuation-nel-old",
+                    "continuation-ls-old",
+                    "continuation-ps-old",
+                    "continuation-nel-new",
+                    "continuation-ls-new",
+                    "continuation-ps-new",
+                )
+            ),
+        )
+
+        changed_only_diff = (
+            "diff --git a/owned.txt b/owned.txt\n"
+            "--- a/owned.txt\n"
+            "+++ b/owned.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+"
+            + ("x" * (verifier.REVIEW_PROMPT_MAX_CHARS + 1))
+        ).encode("utf-8")
+        test.raises(
+            "LARGE REVIEW fails closed when changed lines alone exceed the bound",
+            lambda: verifier.combined_review_prompt(
+                contract,
+                {
+                    **plan,
+                    "diff_sha256": hashlib.sha256(changed_only_diff).hexdigest(),
+                },
+                changed_only_diff,
+                [],
+                "combined",
+                repo,
+                repo,
+                policy_text="policy",
+                proof_gap_policy_text="policy",
+            ),
+            "remains over the reviewer input bound",
+        )
+
+
 def _learnings_segment(prompt: str) -> str:
     """Return the injected learnings block, or "" when none was bound."""
 
@@ -9999,6 +10165,7 @@ def main() -> int:
     verdict_cases(test)
     focused_review_evidence_cases(test)
     specialist_source_context_cases(test)
+    large_review_prompt_cases(test)
     review_learnings_prompt_cases(test)
     instruction_paths_learnings_cases(test)
     retry_cases(test)
