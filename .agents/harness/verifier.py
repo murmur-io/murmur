@@ -95,6 +95,14 @@ SPECIALIST_SOURCE_CONTEXT_LABEL = (
     "(snapshot-derived source evidence only; not runtime proof): "
 )
 MAX_LEARNINGS_BYTES = 16_000
+REVIEW_PROMPT_MAX_CHARS = 1_040_000
+REVIEW_DIFF_CONTEXT_ELISION_NOTE = (
+    "Review rendering: unchanged unified-diff hunk context was elided because "
+    "the complete review prompt exceeded the bounded reviewer input. Every "
+    "added or removed line, file header, hunk header, and binary-patch "
+    "representation remains. The canonical full diff SHA-256 above is "
+    "authoritative.\n"
+)
 LEARNINGS_DIR = ".claude/learnings"
 LEARNINGS_HEADING = "## Recurring patterns"
 # The header carries the guard, not just the body: a reviewer who skims or whose
@@ -2031,6 +2039,31 @@ def _review_server_checkout_attestation(
     }
 
 
+def _review_diff_without_hunk_context(diff: str) -> str:
+    """Drop only unchanged unified-diff hunk lines from reviewer rendering."""
+
+    rendered: List[str] = []
+    in_hunk = False
+    # A Git patch is LF-delimited.  str.splitlines() also treats Unicode NEL,
+    # LINE SEPARATOR, and PARAGRAPH SEPARATOR as boundaries, which can split a
+    # single changed Git line and make its continuation look like removable
+    # context.  Splitting and joining on literal LF preserves every such code
+    # point inside the changed line as Git emitted it.
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            rendered.append(line)
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            rendered.append(line)
+            continue
+        if in_hunk and line.startswith(" "):
+            continue
+        rendered.append(line)
+    return "\n".join(rendered)
+
+
 def combined_review_prompt(
     contract: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -2094,31 +2127,49 @@ def combined_review_prompt(
     eligible_probes = allowed_probe_ids(plan)
     source_context = specialist_source_context(worktree, plan, kind)
     learnings = review_learnings_section(worktree, plan, kind)
-    return (
-        f"{policy}\n\n"
-        "## Exact v2 task\n"
-        f"Task: {contract['task_id']}\n"
-        f"Acceptance contract:\n{contract['description']}\n\n"
-        f"Changed paths: {json.dumps(plan['changed_paths'])}\n"
-        f"Claims: {json.dumps(plan['claims'])}\n"
-        f"Actual sensitive risks: {json.dumps(plan['actual_risk_flags'])}\n"
-        f"Diff SHA-256: {plan['diff_sha256']}\n"
-        f"Plan SHA-256: {plan['plan_sha256']}\n"
-        f"Protocol SHA-256: {plan['protocol_sha256']}\n"
-        "Check and probe evidence (commands, hashes, bounded output, and any "
-        "source proof gaps): "
-        f"{json.dumps(check_summary, sort_keys=True)}\n"
-        f"{specialist_source_context_section(source_context)}"
-        f"Context-eligible probe IDs: {json.dumps(eligible_probes)}\n"
-        f"{server_section}"
-        "## Exact diff\n"
-        f"{diff.decode('utf-8', 'replace')}\n\n"
-        # Repo-authored text never occupies the final position: the harness's
-        # own non-negotiable closing instruction stays last, so no learnings
-        # line is the last thing the reviewer reads before deciding.
-        f"{learnings}"
-        f"{review_closing}"
-    )
+
+    def render(exact_diff: str, rendering_note: str = "") -> str:
+        return (
+            f"{policy}\n\n"
+            "## Exact v2 task\n"
+            f"Task: {contract['task_id']}\n"
+            f"Acceptance contract:\n{contract['description']}\n\n"
+            f"Changed paths: {json.dumps(plan['changed_paths'])}\n"
+            f"Claims: {json.dumps(plan['claims'])}\n"
+            f"Actual sensitive risks: {json.dumps(plan['actual_risk_flags'])}\n"
+            f"Diff SHA-256: {plan['diff_sha256']}\n"
+            f"Plan SHA-256: {plan['plan_sha256']}\n"
+            f"Protocol SHA-256: {plan['protocol_sha256']}\n"
+            "Check and probe evidence (commands, hashes, bounded output, and any "
+            "source proof gaps): "
+            f"{json.dumps(check_summary, sort_keys=True)}\n"
+            f"{specialist_source_context_section(source_context)}"
+            f"Context-eligible probe IDs: {json.dumps(eligible_probes)}\n"
+            f"{server_section}"
+            "## Exact diff\n"
+            f"{rendering_note}"
+            f"{exact_diff}\n\n"
+            # Repo-authored text never occupies the final position: the harness's
+            # own non-negotiable closing instruction stays last, so no learnings
+            # line is the last thing the reviewer reads before deciding.
+            f"{learnings}"
+            f"{review_closing}"
+        )
+
+    full_diff = diff.decode("utf-8", "replace")
+    full_prompt = render(full_diff)
+    if len(full_prompt) <= REVIEW_PROMPT_MAX_CHARS:
+        return full_prompt
+
+    rendered_diff = _review_diff_without_hunk_context(full_diff)
+    bounded_prompt = render(rendered_diff, REVIEW_DIFF_CONTEXT_ELISION_NOTE)
+    if len(bounded_prompt) > REVIEW_PROMPT_MAX_CHARS:
+        raise runtime.HarnessError(
+            "v2 review prompt remains over the reviewer input bound after "
+            "eliding unchanged hunk context; split the task without dropping "
+            "changed lines"
+        )
+    return bounded_prompt
 
 
 def invoke_readonly_review(
