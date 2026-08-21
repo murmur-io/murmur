@@ -15,6 +15,7 @@ import {
 import { FormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
 import type {
+  OrgAccess,
   OrgSharePreview,
   OrgSourceShareStatus,
   OrgStatus,
@@ -116,6 +117,8 @@ export class OrgShareSheetComponent {
 
   /** Whether the regex PII scrub is on (default ON per the redaction policy). */
   readonly scrub = signal(true);
+  /** Member access for this document. View-only is the fail-closed default. */
+  readonly access = signal<OrgAccess>("view");
 
   /** The current preview (null while loading / on error). */
   private readonly _preview = signal<OrgSharePreview | null>(null);
@@ -255,6 +258,13 @@ export class OrgShareSheetComponent {
     this.scrub.set((event.target as HTMLInputElement).checked);
   }
 
+  /** Choose the precise member capability; management remains author/Owner-only. */
+  setAccess(access: OrgAccess): void {
+    if (!this.sharing()) {
+      this.access.set(access);
+    }
+  }
+
   /**
    * Confirm the publish. Threads the CHOSEN org id through the meeting/note
    * command; on success emits `shared`.
@@ -275,13 +285,14 @@ export class OrgShareSheetComponent {
     }
     const t = this.target();
     const scrub = this.scrub();
+    const access = this.access();
     this.shareError.set(null);
     this.sharing.set(true);
     try {
       if (t.kind === "meeting") {
-        await this.ipc.shareMeetingToOrg(t.id, orgId, scrub);
+        await this.ipc.shareMeetingToOrg(t.id, orgId, scrub, access);
       } else {
-        await this.ipc.shareDocumentToOrg(t.id, orgId, scrub);
+        await this.ipc.shareDocumentToOrg(t.id, orgId, scrub, access);
       }
       this.shared.emit();
     } catch (e) {

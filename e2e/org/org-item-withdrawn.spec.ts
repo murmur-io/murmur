@@ -1,6 +1,10 @@
 import { test, expect, type Page } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
+const ORG_ID = "11111111-1111-4111-8111-111111111111";
+const DOC_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const ORG_LINK_ID = `${ORG_ID}:${DOC_ID}`;
+
 /**
  * ORG REPLICA CONVERGENCE (2026-07-26), item 5 — the org-item viewer must not keep
  * showing content the org has withdrawn.
@@ -22,7 +26,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
 
 const ORG_STATUSES = () => [
   {
-    orgId: "org-1",
+    orgId: "11111111-1111-4111-8111-111111111111",
     name: "Acme Inc.",
     role: "member",
     memberCount: 3,
@@ -55,12 +59,18 @@ const ORG_GET_ITEM = () =>
     ? null
     : {
         itemId: "it-1",
+        docId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        linkId:
+          "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         authorHint: "kasia",
         title: "Acme onboarding brief",
         createdAt: "2026-07-10T09:00:00Z",
         rev: 3,
         markdown:
           "# Acme onboarding brief\n\n- Kickoff Monday\n- Owner: Kasia\n- zephyrine budget approved",
+        access: "view",
+        canEdit: false,
+        canManage: false,
         editable: false,
       };
 
@@ -79,6 +89,7 @@ test.describe("org-item viewer — withdrawn content (mocked IPC)", () => {
   test("an org-feed update that withdraws the item evicts the open viewer", async ({
     page,
   }) => {
+    expect(ORG_LINK_ID).toBe(`${ORG_ID}:${DOC_ID}`);
     const consoleErrors: string[] = [];
     page.on("console", (m) => {
       if (m.type() === "error") {
@@ -94,6 +105,7 @@ test.describe("org-item viewer — withdrawn content (mocked IPC)", () => {
       org_list_statuses: ORG_STATUSES,
       list_org_items: ORG_ITEMS,
       list_note_attachments: () => [],
+      list_links: () => [],
     });
     await page.goto("/org-item/it-1");
 
@@ -104,6 +116,7 @@ test.describe("org-item viewer — withdrawn content (mocked IPC)", () => {
     await expect(
       page.getByText("zephyrine budget approved").first(),
     ).toBeVisible();
+    await expect(page.locator("app-connections")).toBeVisible();
 
     // A ping that does NOT withdraw anything must leave the view exactly as it was
     // (a re-fetch is not an excuse to flash or blank a healthy item).
@@ -122,6 +135,7 @@ test.describe("org-item viewer — withdrawn content (mocked IPC)", () => {
     const removed = page.locator("[data-testid='org-item-removed']");
     await expect(removed).toBeVisible({ timeout: 10_000 });
     await expect(page.locator(".oi-title")).toHaveCount(0);
+    await expect(page.locator("app-connections")).toHaveCount(0);
     await expect(page.getByText("zephyrine budget approved")).toHaveCount(0);
     await expect(removed).toContainText("This shared note is no longer available");
 
