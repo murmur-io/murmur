@@ -11,6 +11,64 @@
     // A fixed dev master KEK so lock/unlock/remove use a deterministic key WITHOUT the Keychain or a
     // Touch ID prompt (the `MURMUR_DEV_KEK` debug-only escape hatch in `secrets::keychain`).
     const DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const STABLE_ORG_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const STABLE_DOC_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn accept_with_timeout(
+        listener: &std::net::TcpListener,
+    ) -> (std::net::TcpStream, std::net::SocketAddr) {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok(connection) => return connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for the expected mock HTTP request"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("mock HTTP accept failed: {error}"),
+            }
+        }
+    }
+
+    fn read_http_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut expected = None;
+        loop {
+            let n = socket.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..n]);
+            if expected.is_none() {
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let len = headers.lines().find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    });
+                    expected = Some(end + 4 + len.unwrap_or(0));
+                }
+            }
+            if expected.is_some_and(|len| request.len() >= len) {
+                break;
+            }
+        }
+        request
+    }
 
     static KEK_ENV: Once = Once::new();
     fn ensure_dev_kek() {
@@ -61,6 +119,7 @@
             lifecycle: Mutex::new(()),
             active_salvages: Mutex::new(HashSet::new()),
             share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
             seal_epoch: std::sync::atomic::AtomicU64::new(0),
             heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
         }
@@ -391,8 +450,8 @@
         );
         assert!(once.markdown.contains("> [!verify]- Source check (as of "));
         assert!(once.markdown.contains(
-                "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
-            ));
+                            "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
+                        ));
         // Persisted CANONICALLY (upsert_note): the DB row carries the callout, so it seals with
         // the note under a folder lock.
         let db_md = state
@@ -734,6 +793,117 @@
         state.db.link_edge_count(kind, id, "manual")
     }
 
+    #[test]
+    fn link_items_command_allows_org_to_org_except_exact_self() {
+        const SECOND_ORG_ID: &str = "22222222-2222-4222-8222-222222222222";
+        const SAME_ORG_DOC_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const CROSS_ORG_DOC_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+        fn seed_current_head(
+            state: &AppState,
+            item_id: &str,
+            org_id: &str,
+            doc_id: &str,
+            title: &str,
+        ) {
+            state
+                .db
+                .upsert_org_item(
+                    item_id,
+                    org_id,
+                    1,
+                    "colleague",
+                    title,
+                    "visible shared body",
+                    "2026-08-13T00:00:00Z",
+                    1,
+                    1,
+                    &[9u8; 32],
+                    Some("document"),
+                    Some("colleague-user-id"),
+                    None,
+                )
+                .unwrap();
+            state
+                .db
+                .set_org_item_document_metadata(
+                    item_id,
+                    Some(doc_id),
+                    "view",
+                    Some("colleague-user-id"),
+                )
+                .unwrap();
+            state
+                .db
+                .repair_org_reconcile_metadata(
+                    item_id,
+                    org_id,
+                    1,
+                    Some(doc_id),
+                    "view",
+                    Some("colleague-user-id"),
+                    true,
+                )
+                .unwrap();
+        }
+
+        let state = build_state("link-org-to-org-command");
+        seed_org(&state.db, STABLE_ORG_ID, "Alpha org", "member", 1);
+        seed_org(&state.db, SECOND_ORG_ID, "Beta org", "member", 1);
+        seed_current_head(
+            &state,
+            "item-org-source",
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "Org source",
+        );
+        seed_current_head(
+            &state,
+            "item-org-same-target",
+            STABLE_ORG_ID,
+            SAME_ORG_DOC_ID,
+            "Same-org target",
+        );
+        seed_current_head(
+            &state,
+            "item-org-cross-target",
+            SECOND_ORG_ID,
+            CROSS_ORG_DOC_ID,
+            "Cross-org target",
+        );
+
+        let source = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        let same_org_target = format!("{STABLE_ORG_ID}:{SAME_ORG_DOC_ID}");
+        let cross_org_target = format!("{SECOND_ORG_ID}:{CROSS_ORG_DOC_ID}");
+        link_items_inner(&state, "org", &source, "org", &same_org_target).unwrap();
+        link_items_inner(&state, "org", &source, "org", &cross_org_target).unwrap();
+
+        let exact_directed_count = |src_id: &str, dst_id: &str| -> i64 {
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM links
+                      WHERE src_kind = 'org' AND src_id = ?1
+                        AND dst_kind = 'org' AND dst_id = ?2
+                        AND edge_type = 'manual' AND status = 'active'",
+                    rusqlite::params![src_id, dst_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(exact_directed_count(&source, &same_org_target), 1);
+        assert_eq!(exact_directed_count(&source, &cross_org_target), 1);
+        assert_eq!(exact_directed_count(&same_org_target, &source), 0);
+        assert_eq!(exact_directed_count(&cross_org_target, &source), 0);
+
+        assert!(matches!(
+            link_items_inner(&state, "org", &source, "org", &source),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert_eq!(manual_link_count(&state, "org", &source), 2);
+    }
+
     /// A MEETING source creates a `manual` row but writes NO markdown into the meeting's note (a
     /// meeting has no owned editable body — row only, per fork #2).
     #[test]
@@ -934,6 +1104,379 @@
         );
     }
 
+    /// Lock-review regression: marker scrub + vault-cleanup intent commit before the exact manual
+    /// edge disappears. Force a real destination relock immediately after that DB boundary.
+    #[test]
+    fn unlink_prepares_marker_cleanup_before_destination_relock() {
+        let vault = tmp_vault("unlink-marker-relock").canonicalize().unwrap();
+        let state = build_state_with_vault("unlink-marker-relock", &vault);
+        state
+            .db
+            .set_setting("vault_path", &vault.to_string_lossy())
+            .unwrap();
+        let source_folder = create_note_folder_inner(&state, "Open source", None)
+            .unwrap()
+            .id;
+        let destination_folder = create_note_folder_inner(&state, "Locked target", None)
+            .unwrap()
+            .id;
+        let source = create_note_inner(&state, Some(&source_folder), "Source").unwrap();
+        let destination = create_note_inner(&state, Some(&destination_folder), "Sealed Title").unwrap();
+        update_note_doc_inner(&state, &destination, "Sealed Title", "private target body").unwrap();
+
+        lock_folder_inner(&state, destination_folder.clone()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state
+            .db
+            .folder_wrapped_key(&destination_folder)
+            .unwrap()
+            .unwrap();
+        let ck_vec =
+            crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&destination_folder)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        unseal_folder_extras(&state, &destination_folder, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(destination_folder.clone());
+
+        let legacy_hit = crate::enrich::ContextHit {
+            source: "note".to_string(),
+            detail: "[[Sealed Title]]".to_string(),
+            url: None,
+        };
+        let legacy_body = crate::enrich::apply_link_markers(
+            "source prose stays\n",
+            std::slice::from_ref(&legacy_hit),
+        );
+        update_note_doc_inner(&state, &source, "Source", &legacy_body).unwrap();
+        let exported = state
+            .db
+            .get_note_row(&source)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("source note exported");
+        assert!(std::fs::read_to_string(&exported)
+            .unwrap()
+            .contains("[[Sealed Title]]"));
+
+        // Model the legacy-marker-only shape from the finding: the managed block remains in the
+        // canonical body/export, but there is no derived wikilink row for relock to discover after
+        // the last manual edge disappears.
+        state
+            .db
+            .index_wikilinks_for_source(
+                crate::links::LinkKind::Note,
+                &source,
+                "source prose stays\n",
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(state.db.link_edge_count("note", &source, "wikilink"), 0);
+
+        link_items_inner(&state, "note", &source, "note", &destination).unwrap();
+        let edge = crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: source.clone(),
+            dst_kind: "note".into(),
+            dst_id: destination.clone(),
+        };
+
+        // Exact boundary under test: deletion committed, then the destination relocks before a
+        // separate unlink cleanup turn. The DB scrub/outbox must already be durable.
+        state.db.delete_manual_links(&[edge]).unwrap();
+        assert_eq!(manual_link_count(&state, "note", &source), 0);
+        relock_all_inner(&state).unwrap();
+
+        let stored = state.db.get_note_row(&source).unwrap().unwrap().text;
+        assert!(
+            !stored.contains("[[Sealed Title]]"),
+            "DB source must be scrubbed before edge deletion: {stored:?}"
+        );
+        let on_disk = std::fs::read_to_string(&exported).unwrap();
+        assert!(
+            !on_disk.contains("[[Sealed Title]]"),
+            "relock must drain the durable scrub for the exact vault export: {on_disk:?}"
+        );
+        assert!(state
+            .db
+            .pending_lock_marker_export_cleanup()
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A storage caller without command-layer CK authority cannot mutate a legacy marker in a
+    /// durably locked source. The missing verified fresh seal rolls back marker/outbox/edge changes.
+    #[test]
+    fn unlink_marker_cleanup_without_locked_source_seal_rolls_back() {
+        let state = build_state("unlink-marker-locked-source-refusal");
+        make_open_folder(&state.db, "f-source", "Source");
+        make_open_folder(&state.db, "f-target", "Target");
+        let hit = crate::enrich::ContextHit {
+            source: "note".into(),
+            detail: "[[Target]]".into(),
+            url: None,
+        };
+        let body = crate::enrich::apply_link_markers("source prose\n", &[hit]);
+        seed_note_doc_cmd(&state.db, "source", "f-source", "Source", &body);
+        seed_note_doc_cmd(&state.db, "target", "f-target", "Target", "target body");
+        link_items_inner(&state, "note", "source", "note", "target").unwrap();
+        state
+            .db
+            .set_folder_locked("f-source", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-source".into());
+        let edge = crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: "source".into(),
+            dst_kind: "note".into(),
+            dst_id: "target".into(),
+        };
+
+        let error = state.db.delete_manual_links(&[edge]).unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert_eq!(manual_link_count(&state, "note", "source"), 1);
+        assert!(state
+            .db
+            .get_note_row("source")
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("[[Target]]"));
+        assert!(state
+            .db
+            .pending_lock_marker_export_cleanup()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The command-owned path has CK authority: it verify-seals the scrubbed source text in the same
+    /// unlink transaction. Relock + a second unseal restores the scrubbed bytes, not the stale blob.
+    #[test]
+    fn unlink_reseals_locked_source_marker_before_relock_round_trip() {
+        let vault = tmp_vault("unlink-locked-source-roundtrip")
+            .canonicalize()
+            .unwrap();
+        let state = build_state_with_vault("unlink-locked-source-roundtrip", &vault);
+        state
+            .db
+            .set_setting("vault_path", &vault.to_string_lossy())
+            .unwrap();
+        let source_folder = create_note_folder_inner(&state, "Locked source", None)
+            .unwrap()
+            .id;
+        let target_folder = create_note_folder_inner(&state, "Open target", None)
+            .unwrap()
+            .id;
+        let source = create_note_inner(&state, Some(&source_folder), "Source").unwrap();
+        let target = create_note_inner(&state, Some(&target_folder), "Target").unwrap();
+        update_note_doc_inner(&state, &source, "Source", "initial source").unwrap();
+        update_note_doc_inner(&state, &target, "Target", "target body").unwrap();
+
+        lock_folder_inner(&state, source_folder.clone()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state
+            .db
+            .folder_wrapped_key(&source_folder)
+            .unwrap()
+            .unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&source_folder)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        unseal_folder_extras(&state, &source_folder, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(source_folder.clone());
+
+        let hit = crate::enrich::ContextHit {
+            source: "note".into(),
+            detail: "[[Target]]".into(),
+            url: None,
+        };
+        let marked = crate::enrich::apply_link_markers("source prose survives\n", &[hit]);
+        update_note_doc_inner(&state, &source, "Source", &marked).unwrap();
+        link_items_inner(&state, "note", &source, "note", &target).unwrap();
+
+        unlink_items_inner(&state, "note", &source, "note", &target).unwrap();
+        let scrubbed = state.db.get_note_row(&source).unwrap().unwrap();
+        assert!(!scrubbed.text.contains("[[Target]]"));
+        let scrubbed_export = scrubbed
+            .exported_path
+            .expect("source export survives unlink");
+        assert!(!std::fs::read_to_string(&scrubbed_export)
+            .unwrap()
+            .contains("[[Target]]"));
+
+        relock_all_inner(&state).unwrap();
+        assert_eq!(state.db.get_note_row(&source).unwrap().unwrap().text, "");
+        unseal_folder_extras(&state, &source_folder, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(source_folder.clone());
+        let restored = state.db.get_note_row(&source).unwrap().unwrap();
+        assert_eq!(restored.text, "source prose survives\n");
+        let restored_export = restored.exported_path.expect("restored source re-exported");
+        assert!(!std::fs::read_to_string(restored_export)
+            .unwrap()
+            .contains("[[Target]]"));
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// One displayed chip can hide an opposite-direction manual row plus a second manual row in the
+    /// representative direction. Unlink consumes the exact tuple list atomically, while the derived
+    /// wikilink survives and becomes a non-removable chip after refetch.
+    #[test]
+    fn unlink_collapsed_manual_set_preserves_derived_wikilink() {
+        let state = build_state("unlink-collapsed-set");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(&state.db, "left", "f-open", "Left", "see [[Right]]");
+        seed_note_doc_cmd(&state.db, "right", "f-open", "Right", "right body");
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        state
+            .db
+            .index_wikilinks_for_source(
+                crate::links::LinkKind::Note,
+                "left",
+                "see [[Right]]",
+                &unlocked,
+            )
+            .unwrap();
+        link_items_inner(&state, "note", "left", "note", "right").unwrap();
+        link_items_inner(&state, "note", "right", "note", "left").unwrap();
+
+        let before = state
+            .db
+            .links_for_visible(crate::links::LinkKind::Note, "left", &unlocked)
+            .unwrap();
+        let chip = before.iter().find(|edge| edge.other_id == "right").unwrap();
+        assert_eq!(chip.edge_type, "wikilink");
+        assert_eq!(
+            chip.manual_edges.len(),
+            2,
+            "both manual directions are folded"
+        );
+
+        unlink_manual_edges_inner(&state, "note", "left", "note", "right", &chip.manual_edges).unwrap();
+
+        assert_eq!(link_count_in(&state, "note", "left", "manual"), 0);
+        assert_eq!(link_count_in(&state, "note", "right", "manual"), 0);
+        let after = state
+            .db
+            .links_for_visible(crate::links::LinkKind::Note, "left", &unlocked)
+            .unwrap();
+        let derived = after.iter().find(|edge| edge.other_id == "right").unwrap();
+        assert_eq!(derived.edge_type, "wikilink", "derived relation survives");
+        assert!(!derived.manual, "surviving wikilink is not removable");
+        assert!(derived.manual_edges.is_empty());
+        assert!(
+            state
+                .db
+                .pending_lock_marker_export_cleanup()
+                .unwrap()
+                .is_empty(),
+            "marker-free two-direction unlink must not enqueue filesystem work"
+        );
+    }
+
+    /// The multi-edge command keeps the existing both-endpoint lock refusal and performs no delete
+    /// when either endpoint is sealed-and-not-session-unlocked.
+    #[test]
+    fn unlink_collapsed_manual_set_refuses_locked_endpoint_without_partial_delete() {
+        let state = build_state("unlink-collapsed-locked");
+        make_open_folder(&state.db, "f-left", "Left folder");
+        make_open_folder(&state.db, "f-right", "Right folder");
+        seed_note_doc_cmd(&state.db, "left", "f-left", "Left", "left body");
+        seed_note_doc_cmd(&state.db, "right", "f-right", "Right", "right body");
+        link_items_inner(&state, "note", "left", "note", "right").unwrap();
+        link_items_inner(&state, "note", "right", "note", "left").unwrap();
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        let chip = state
+            .db
+            .links_for_visible(crate::links::LinkKind::Note, "left", &unlocked)
+            .unwrap()
+            .into_iter()
+            .find(|edge| edge.other_id == "right")
+            .unwrap();
+        assert_eq!(chip.manual_edges.len(), 2);
+
+        state
+            .db
+            .set_folder_locked("f-right", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let error =
+            unlink_manual_edges_inner(&state, "note", "left", "note", "right", &chip.manual_edges)
+                .unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert_eq!(link_count_in(&state, "note", "left", "manual"), 2);
+        assert_eq!(link_count_in(&state, "note", "right", "manual"), 2);
+    }
+
+    /// IPC payload hardening: one unordered pair has at most two exact directed rows. Duplicate or
+    /// oversized lists are refused before the transaction and cannot turn unlink into an unbounded
+    /// delete loop or produce a misleading partial success.
+    #[test]
+    fn unlink_collapsed_manual_set_rejects_duplicates_and_oversized_payloads() {
+        let state = build_state("unlink-collapsed-bounds");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(&state.db, "left", "f-open", "Left", "left body");
+        seed_note_doc_cmd(&state.db, "right", "f-open", "Right", "right body");
+        link_items_inner(&state, "note", "left", "note", "right").unwrap();
+        let edge = crate::storage::models::ManualLinkEdge {
+            src_kind: "note".into(),
+            src_id: "left".into(),
+            dst_kind: "note".into(),
+            dst_id: "right".into(),
+        };
+
+        let duplicate = vec![edge.clone(), edge.clone()];
+        let duplicate_error =
+            unlink_manual_edges_inner(&state, "note", "left", "note", "right", &duplicate).unwrap_err();
+        assert!(matches!(duplicate_error, AppError::InvalidArg(_)));
+
+        let oversized = vec![edge.clone(), edge.clone(), edge];
+        let oversized_error =
+            unlink_manual_edges_inner(&state, "note", "left", "note", "right", &oversized).unwrap_err();
+        assert!(matches!(oversized_error, AppError::InvalidArg(_)));
+
+        let stale_pair = vec![
+            crate::storage::models::ManualLinkEdge {
+                src_kind: "note".into(),
+                src_id: "left".into(),
+                dst_kind: "note".into(),
+                dst_id: "right".into(),
+            },
+            crate::storage::models::ManualLinkEdge {
+                src_kind: "note".into(),
+                src_id: "right".into(),
+                dst_kind: "note".into(),
+                dst_id: "left".into(),
+            },
+        ];
+        let stale_error =
+            unlink_manual_edges_inner(&state, "note", "left", "note", "right", &stale_pair)
+                .unwrap_err();
+        assert!(matches!(stale_error, AppError::InvalidArg(_)));
+        assert_eq!(
+            link_count_in(&state, "note", "left", "manual"),
+            1,
+            "invalid or stale multi-row payloads must roll back the existing row"
+        );
+    }
+
     #[test]
     fn unlink_refuses_sealed_not_session_unlocked_note_without_any_cleanup_side_effect() {
         let vault = tmp_vault("unlink-sealed-refusal");
@@ -960,7 +1503,6 @@
             .unwrap()
             .exported_path
             .unwrap();
-
         lock_folder_inner(&state, folder_id).unwrap();
         let before: (String, Option<Vec<u8>>) = state
             .db
@@ -975,10 +1517,8 @@
         assert!(before.1.is_some());
         assert!(!std::path::Path::new(&exported_path).exists());
         let links_before = manual_link_count(&state, "note", &source_id);
-
         let err = unlink_items_inner(&state, "note", &source_id, "note", &target_id).unwrap_err();
         assert!(matches!(err, AppError::Locked(_)));
-
         let after: (String, Option<Vec<u8>>) = state
             .db
             .lock()
@@ -991,10 +1531,7 @@
         assert_eq!(after, before, "sealed plaintext/blob must remain byte-identical");
         assert_eq!(manual_link_count(&state, "note", &source_id), links_before);
         assert!(state.db.pending_lock_marker_export_cleanup().unwrap().is_empty());
-        assert!(
-            !std::path::Path::new(&exported_path).exists(),
-            "the failed command must not recreate or mutate the sealed vault export"
-        );
+        assert!(!std::path::Path::new(&exported_path).exists());
     }
 
     #[test]
@@ -1020,7 +1557,6 @@
             .db
             .upsert_manual_link("note", &source_id, "note", &target_id)
             .unwrap();
-
         lock_folder_inner(&state, folder_id.clone()).unwrap();
         let kek = secrets::get_or_create_master_kek().unwrap();
         let wrapped = state.db.folder_wrapped_key(&folder_id).unwrap().unwrap();
@@ -1028,11 +1564,7 @@
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         unseal_folder_extras(&state, &folder_id, &ck, None).unwrap();
-        state
-            .unlocked_folders
-            .lock()
-            .unwrap()
-            .insert(folder_id.clone());
+        state.unlocked_folders.lock().unwrap().insert(folder_id.clone());
         state
             .db
             .upsert_manual_link("note", &source_id, "note", &target_id)
@@ -1044,12 +1576,7 @@
             .unwrap()
             .exported_path
             .unwrap();
-        assert!(std::fs::read_to_string(&exported_path)
-            .unwrap()
-            .contains("[[Target Note]]"));
-
         unlink_items_inner(&state, "note", &source_id, "note", &target_id).unwrap();
-
         assert_eq!(manual_link_count(&state, "note", &source_id), 0);
         assert!(state.db.pending_lock_marker_export_cleanup().unwrap().is_empty());
         let (text, blob): (String, Vec<u8>) = state
@@ -1061,7 +1588,7 @@
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert!(text.is_empty(), "locked cleanup must not retain plaintext beside its seal");
+        assert!(text.is_empty());
         assert_eq!(
             crate::crypto::decrypt(&ck, &blob, &aad_document(&folder_id, &source_id)).unwrap(),
             b"original body\n"
@@ -1682,15 +2209,16 @@
             }
             let body = r#"{"accessToken":"fresh-access","refreshToken":"fresh-refresh","deviceId":"dev-1","accessExpiresAt":"2099-01-01T00:00:00Z"}"#;
             let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
             sock.write_all(resp.as_bytes()).unwrap();
             String::from_utf8_lossy(&req).to_string()
         });
 
         let state = build_state("refresh-stale-bearer");
         state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        state.config.lock().unwrap().org_egress_consented = true;
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
             account_id: "acct-1".into(),
             email: "user@example.com".into(),
@@ -2940,6 +3468,159 @@
     }
 
     #[test]
+    fn conversion_private_org_links_never_enter_provider_context() {
+        const ORG_TITLE_SENTINEL: &str = "ORG_CONVERSION_PRIVATE_TITLE_SENTINEL";
+        const ORG_BODY_SENTINEL: &str = "ORG_CONVERSION_PRIVATE_BODY_SENTINEL";
+
+        struct CapturingProvider {
+            request: std::sync::Mutex<Option<crate::summarize::provider::SummarizeRequest>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::summarize::provider::SummarizerProvider for CapturingProvider {
+            fn id(&self) -> &str {
+                "conversion-private-org-capture"
+            }
+
+            async fn availability(&self) -> crate::summarize::provider::Availability {
+                crate::summarize::provider::Availability::Available
+            }
+
+            async fn summarize(
+                &self,
+                request: &crate::summarize::provider::SummarizeRequest,
+            ) -> crate::error::Result<String> {
+                *self.request.lock().unwrap() = Some(request.clone());
+                Ok("---\ntitle: Private-link-safe conversion\n---\n\n# Converted".into())
+            }
+
+            async fn complete(
+                &self,
+                _system: &str,
+                _user: &str,
+            ) -> crate::error::Result<String> {
+                Err(AppError::Unavailable("unused conversion completion".into()))
+            }
+        }
+
+        let state = build_state("conversion-private-org-context");
+        seed_meeting(
+            &state.db,
+            "m-private-org-context",
+            "# Primary meeting note",
+            None,
+        );
+        seed_org(&state.db, STABLE_ORG_ID, "Private org", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "item-private-org-context",
+                STABLE_ORG_ID,
+                1,
+                "colleague",
+                ORG_TITLE_SENTINEL,
+                ORG_BODY_SENTINEL,
+                "2026-08-13T00:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                Some("document"),
+                Some("colleague-user-id"),
+                None,
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_item_document_metadata(
+                "item-private-org-context",
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("colleague-user-id"),
+            )
+            .unwrap();
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                "item-private-org-context",
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("colleague-user-id"),
+                true,
+            )
+            .unwrap();
+        let org_link_id = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+        state
+            .db
+            .upsert_manual_link(
+                "meeting",
+                "m-private-org-context",
+                "org",
+                &org_link_id,
+            )
+            .unwrap();
+
+        let org_item = state
+            .db
+            .get_org_item("item-private-org-context")
+            .unwrap()
+            .expect("org item remains visible");
+        assert_eq!(org_item.title, ORG_TITLE_SENTINEL);
+        assert_eq!(org_item.markdown, ORG_BODY_SENTINEL);
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        let visible_links = state
+            .db
+            .links_for_visible(
+                crate::links::LinkKind::Meeting,
+                "m-private-org-context",
+                &unlocked,
+            )
+            .unwrap();
+        assert!(visible_links.iter().any(|edge| {
+            edge.other_kind == crate::links::LinkKind::Org.as_str()
+                && edge.other_id == org_link_id
+                && edge.other_title == ORG_TITLE_SENTINEL
+        }));
+        assert!(
+            capture_meeting_content_snapshot(&state, "m-private-org-context")
+                .unwrap()
+                .active_related
+                .is_empty(),
+            "a private org relation must not enter the conversion admission witness"
+        );
+
+        let provider = std::sync::Arc::new(CapturingProvider {
+            request: std::sync::Mutex::new(None),
+        });
+        let converted = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            "m-private-org-context".into(),
+            None,
+            Some(provider.clone()),
+        ));
+        assert!(converted.is_ok(), "conversion must still succeed: {converted:?}");
+
+        let request = provider
+            .request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("conversion provider was called exactly once");
+        for sentinel in [ORG_TITLE_SENTINEL, ORG_BODY_SENTINEL] {
+            assert!(
+                !request.transcript.contains(sentinel),
+                "private org content entered conversion transcript: {sentinel}"
+            );
+            assert!(
+                request.vault_titles.iter().all(|title| !title.contains(sentinel)),
+                "private org content entered conversion vault titles: {sentinel}"
+            );
+        }
+    }
+
+    #[test]
     fn conversion_command_provider_and_canonical_write_failures_preserve_existing_bytes() {
         let state = build_state("conversion-command-preserve-failures");
         seed_meeting(&state.db, "m-existing", "# Existing source", None);
@@ -3629,6 +4310,10 @@
                 .is_none(),
             "the empty companion note is gone"
         );
+        assert!(state.db.insert_org_share(
+            "after-companion-delete","org-1",None,Some(&r.note_id),"note",Some("T"),
+            1,1,&[1u8;32],"t",
+        ).is_err(), "a deleted companion keeps its terminal source closure");
 
         // Case B: a companion note WITH user content is KEPT untouched.
         let state2 = build_state("companion-delete-nonempty");
@@ -3654,6 +4339,98 @@
         // No companion note at all ⇒ false (nothing to clean up), not an error.
         let none = block_on(delete_companion_note_if_empty_inner(&state2, "m-never")).unwrap();
         assert!(!none, "no companion note ⇒ false");
+    }
+
+    #[test]
+    fn companion_edit_winning_before_close_barrier_preserves_share_and_returns_false() {
+        let state = std::sync::Arc::new(build_state("companion-delete-edit-race"));
+        state.db.insert_meeting(&Meeting {
+            id: "m-race".into(),
+            started_at: "2026-08-14T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Race".into()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        }).unwrap();
+        let companion = get_or_create_companion_note_inner(&state, "m-race").unwrap();
+        state.db.insert_outbound_share_attempt(
+            "companion-link", None, Some(&companion.note_id), "link", 1,
+            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T09:00:01Z",
+        ).unwrap();
+        state.db.set_outbound_share_state("companion-link", "active").unwrap();
+
+        // Keep cleanup queued before its authoritative recheck. The editor wins while cleanup is
+        // waiting, so the recheck must return false without touching the remote-share journal.
+        let mutation = block_on(state.org_share_mutation_lock.lock());
+        let cleanup_state = state.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            block_on(delete_companion_note_if_empty_inner(&cleanup_state, "m-race"))
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        save_note_text_inner(
+            &state, &companion.note_id, "Race", "---\nmeeting: \"[[Race]]\"\n---\nA late jot",
+        ).unwrap();
+        drop(mutation);
+
+        assert!(!cleanup.join().unwrap().unwrap());
+        assert!(state.db.get_note_row(&companion.note_id).unwrap().unwrap().text.contains("A late jot"));
+        assert_eq!(
+            state.db.lock().query_row(
+                "SELECT state FROM outbound_shares WHERE share_id='companion-link'", [],
+                |row| row.get::<_, String>(0),
+            ).unwrap(),
+            "active",
+        );
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 0);
+    }
+
+    #[test]
+    fn companion_close_barrier_refuses_edit_during_remote_revoke_and_never_abandons_afterward() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
+            assert!(request.starts_with("DELETE /v1/shares/companion-race-link "));
+            seen_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            write!(socket, "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        let state = std::sync::Arc::new(build_state("companion-network-edit-race"));
+        state.db.insert_meeting(&Meeting {
+            id: "m-network-race".into(), started_at: "2026-08-14T09:30:00Z".into(),
+            ended_at: None, title: Some("Network race".into()), duration_s: 0,
+            audio_path: None, status: MeetingStatus::Recording, folder_id: None,
+        }).unwrap();
+        let companion = get_or_create_companion_note_inner(&state, "m-network-race").unwrap();
+        state.db.insert_outbound_share_attempt(
+            "companion-race-link", None, Some(&companion.note_id), "link", 1,
+            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T09:30:01Z",
+        ).unwrap();
+        state.db.set_outbound_share_state("companion-race-link", "active").unwrap();
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        let cleanup_state = state.clone();
+        let cleanup = std::thread::spawn(move || {
+            block_on(delete_companion_note_if_empty_inner(&cleanup_state, "m-network-race"))
+        });
+        seen_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(save_note_text_inner(
+            &state, &companion.note_id, "Network race", "A too-late edit",
+        ).is_err(), "the durable close barrier freezes content after remote revoke begins");
+        release_tx.send(()).unwrap();
+        assert!(cleanup.join().unwrap().unwrap());
+        server.join().unwrap();
+        assert!(state.db.get_note_row(&companion.note_id).unwrap().is_none());
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 1);
     }
 
     /// #2 (0.7 security fast-follow): `list_meetings` MUST mask a sealed-and-NOT-session-unlocked
@@ -3724,6 +4501,7 @@
     #[test]
     fn delete_meeting_revokes_a_live_org_share() {
         let state = build_state("meeting-delete-org-revoke");
+        state.config.lock().unwrap().org_egress_consented = true;
         let db = &state.db;
         make_open_folder(db, "f-open", "Standups");
         seed_titled_meeting(db, "m1", "Shared standup", "/data/m1.wav", "f-open");
@@ -4663,9 +5441,9 @@
         let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
         assert_eq!(sugg.len(), 1, "the prior match surfaces one suggestion");
         assert_eq!(
-                sugg[0].speaker, "Speaker 2",
-                "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
-            );
+                            sugg[0].speaker, "Speaker 2",
+                            "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
+                        );
         assert_eq!(sugg[0].suggested_label, "Anna");
     }
 
@@ -5051,19 +5829,19 @@
             })
             .unwrap();
         state
-                .db
-                .upsert_note(&NoteRecord {
-                    meeting_id: "m1".to_string(),
-                    provider_id: "claude_code".to_string(),
-                    // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
-                    markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
-                    created_at: "2026-06-27T09:05:00Z".to_string(),
-                    exported_path: None,
-                    model_requested: None,
-                    model_served: None,
-                    gateway_host: None,
-                })
-                .unwrap();
+                            .db
+                            .upsert_note(&NoteRecord {
+                                meeting_id: "m1".to_string(),
+                                provider_id: "claude_code".to_string(),
+                                // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
+                                markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
+                                created_at: "2026-06-27T09:05:00Z".to_string(),
+                                exported_path: None,
+                                model_requested: None,
+                                model_served: None,
+                                gateway_host: None,
+                            })
+                            .unwrap();
         state
             .db
             .insert_segments(
@@ -5382,6 +6160,7 @@
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
             .unwrap();
+        state.db.begin_org_folder_closure("f-lock").unwrap();
 
         let node = block_on(discard_unrecoverable_folder_lock_with_candidates_for_test(
             &state,
@@ -5404,6 +6183,10 @@
             notes.iter().all(|n| n.content_blob.is_none()),
             "the undecryptable sealed blobs are discarded"
         );
+        state.db.insert_org_share(
+            "after-discard","org-1",Some("m1"),None,"meeting",Some("T"),
+            1,1,&[1u8;32],"t",
+        ).expect("successful permanent reopen clears the folder share closure");
     }
 
     /// PRESERVE-NEVER-SEALED (2026-07-05 lock-security finding): discard must destroy only the
@@ -5521,10 +6304,10 @@
         // The RED anchor: the RAW read still returns 2 rows (text blanked) — an UNGATED lazy read
         // would leak exactly these, so the gate below must collapse them to [].
         assert_eq!(
-                state.db.raw_segments("m1").unwrap().len(),
-                2,
-                "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
-            );
+                            state.db.raw_segments("m1").unwrap().len(),
+                            2,
+                            "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
+                        );
 
         // GATE: sealed-not-unlocked → empty Vec. RED-if-`meeting_is_unlocked`-gate-removed.
         let masked = get_meeting_segments_inner(&state, "m1").unwrap();
@@ -5598,7 +6381,12 @@
         // Cache the KEK for remove_lock (it reads the gated master KEK), then permanently remove.
         let kek = secrets::get_or_create_master_kek().unwrap();
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        state.db.begin_org_folder_closure("f-lock").unwrap();
         remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+        state.db.insert_org_share(
+            "after-remove-lock","org-1",Some("m1"),None,"meeting",Some("T"),
+            1,1,&[1u8;32],"t",
+        ).expect("successful permanent unlock clears the folder share closure");
 
         let rn = state.db.raw_manual_notes("m1").unwrap().unwrap();
         assert_eq!(
@@ -6148,6 +6936,7 @@
     #[test]
     fn delete_document_revokes_a_live_org_share() {
         let state = build_state("doc-delete-org-revoke");
+        state.config.lock().unwrap().org_egress_consented = true;
         make_open_folder(&state.db, "f-open", "Project");
         let md = write_temp_doc("del-org", "md", "alpha bravo charlie");
         let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
@@ -6184,7 +6973,7 @@
         assert_ne!(
             row.state, "uploaded",
             "a live org share must be (at least) marked revoke_pending before the delete gives up, \
-                 never left uploaded — that's the resurrection bug"
+                             never left uploaded — that's the resurrection bug"
         );
     }
 
@@ -6237,6 +7026,7 @@
     #[test]
     fn delete_note_revokes_a_live_org_share() {
         let state = build_state("note-delete-org-revoke");
+        state.config.lock().unwrap().org_egress_consented = true;
         let id = create_note_inner(&state, None, "Shared note").unwrap();
 
         state
@@ -6268,7 +7058,7 @@
         assert_ne!(
             row.state, "uploaded",
             "a live org share must be moved off `uploaded` before the delete gives up — \
-                 never left dangling live, that's the resurrection bug"
+                             never left dangling live, that's the resurrection bug"
         );
         // The local note row must SURVIVE the failed delete — fail loud means fail WHOLE, not
         // half-deleted-locally-with-a-dangling-server-copy.
@@ -6442,6 +7232,37 @@
         // A meeting-folder target and the vault root are allowed.
         assert!(ensure_meeting_folder_target(&state.db, Some("mf1")).is_ok());
         assert!(ensure_meeting_folder_target(&state.db, None).is_ok());
+    }
+
+    #[test]
+    fn move_link_shared_note_into_locked_folder_is_refused_before_reassignment() {
+        let state = build_state("move-shared-note-locked");
+        let source = create_note_folder_inner(&state, "Source", None).unwrap();
+        let target = create_note_folder_inner(&state, "Target", None).unwrap();
+        let note_id = create_note_inner(&state, Some(&source.id), "Shared").unwrap();
+        update_note_doc_inner(&state, &note_id, "Shared", "body").unwrap();
+        lock_folder_inner(&state, target.id.clone()).unwrap();
+        session_unlock(&state, &target.id);
+        state.db.insert_outbound_note_share(
+            "move-link", &note_id, "link", 1, "2026-08-14T11:00:00Z",
+        ).unwrap();
+
+        assert!(matches!(
+            move_note_doc_inner(&state, &note_id, &target.id),
+            Err(AppError::Unavailable(_))
+        ));
+        assert_eq!(
+            state.db.note_gate_anchor(&note_id).unwrap().unwrap().0,
+            source.id,
+            "the share check runs at the lifecycle-protected reassignment boundary",
+        );
+        assert_eq!(
+            state.db.lock().query_row(
+                "SELECT state FROM outbound_shares WHERE share_id='move-link'", [],
+                |row| row.get::<_, String>(0),
+            ).unwrap(),
+            "active",
+        );
     }
 
     /// Feature C (RED-before-GREEN): `set_note_folder_schema` on a SEALED-and-not-session-unlocked
@@ -6853,8 +7674,8 @@
         );
         // The user pastes a bare forged links fence AFTER the real machine block.
         let stored = format!(
-                "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
-            );
+                            "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
+                        );
         seed_note_doc_cmd(&state.db, "scanall", "f-open", "ScanAll", &stored);
 
         let doc = get_note_inner(&state, "scanall").unwrap();
@@ -7604,9 +8425,9 @@
         );
         let row = state.db.get_note_row(&id).unwrap().unwrap();
         assert_eq!(
-                row.folder_id, src,
-                "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
-            );
+                            row.folder_id, src,
+                            "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
+                        );
         assert!(!row.sealed, "no stale/wrong-CK blob may be written");
         assert_eq!(
             row.exported_path.as_deref(),
@@ -7832,7 +8653,7 @@
             assert!(
                 system.contains("the same language as the selected text"),
                 "{action} must always match the selection's own language, ignoring the \
-                     note_language pin ('pl'); got: {system}"
+                                 note_language pin ('pl'); got: {system}"
             );
             assert!(
                 !system.contains("language code 'pl'"),
@@ -8624,7 +9445,7 @@
         assert!(
             out.contains("Ulubiony"),
             "search_meetings must surface document CONTENT (not just echo the query in an \
-                 empty-result sentinel); got: {out:?}"
+                             empty-result sentinel); got: {out:?}"
         );
         let out2 = crate::tools::execute_tool(
             &crate::tools::ToolCall::SearchSemantic {
@@ -8638,7 +9459,7 @@
         assert!(
             out2.contains("Ulubiony"),
             "search_semantic (flag OFF) must fall back to gated keyword doc search and surface \
-                 document CONTENT; got: {out2:?}"
+                             document CONTENT; got: {out2:?}"
         );
     }
 
@@ -8675,7 +9496,7 @@
         assert!(
             out.contains("Ulubiony"),
             "semantic ON + no model must degrade to gated keyword doc search and surface CONTENT; \
-                 got: {out:?}"
+                             got: {out:?}"
         );
     }
 
@@ -8857,9 +9678,9 @@
         // RED on the pre-fix code (unseal_folder_extras had no meeting re-index → stayed 0).
         unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
         assert!(
-                state.db.note_chunk_count("m1").unwrap() > 0,
-                "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
-            );
+                            state.db.note_chunk_count("m1").unwrap() > 0,
+                            "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+                        );
         assert!(
             state.db.note_vec_count("m1").unwrap() > 0,
             "production unlock re-indexes meeting vec_chunks when the e5 model is present"
@@ -8918,9 +9739,9 @@
         unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder))
             .unwrap();
         assert!(
-                state.db.note_chunk_count("m1").unwrap() > 0,
-                "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
-            );
+                            state.db.note_chunk_count("m1").unwrap() > 0,
+                            "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+                        );
         assert!(
             state.db.note_vec_count("m1").unwrap() > 0,
             "remove-lock re-indexes meeting vec_chunks"
@@ -9166,7 +9987,7 @@
                 .saw_guard_held
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the lifecycle guard must be RELEASED before the embed leg — holding it delays \
-                 auto-relock and every lock/unlock op"
+                             auto-relock and every lock/unlock op"
         );
     }
 
@@ -9350,9 +10171,9 @@
             "the note BODY is chunked by the reindex"
         );
         assert!(
-            !chunks.contains("zzfrontmattertag"),
-            "front-matter must NEVER reach an authored note's chunks (RED pre-fix: raw text was chunked)"
-        );
+                        !chunks.contains("zzfrontmattertag"),
+                        "front-matter must NEVER reach an authored note's chunks (RED pre-fix: raw text was chunked)"
+                    );
     }
 
     /// Brain v3 finding 4 (RED-before-GREEN): INGEST of a `kind='note'` via `import_text` raw-chunked
@@ -9377,9 +10198,9 @@
             "the pasted note BODY is chunked at ingest"
         );
         assert!(
-            !chunks.contains("zzingestfmtag"),
-            "front-matter must NEVER reach an ingested note's chunks (RED pre-fix: raw ingest chunking)"
-        );
+                        !chunks.contains("zzingestfmtag"),
+                        "front-matter must NEVER reach an ingested note's chunks (RED pre-fix: raw ingest chunking)"
+                    );
     }
 
     /// Brain v3 audit gap #2 — the startup REPAIR TICK is complete and IDEMPOTENT:
@@ -9437,9 +10258,9 @@
             "model absent: no meeting indexing (no stub vectors)"
         );
         assert_eq!(
-            docs, 2,
-            "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
-        );
+                        docs, 2,
+                        "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
+                    );
         let (d_chunks, d_vecs) = state.db.doc_chunk_vector_counts("d1").unwrap();
         assert!(d_chunks > 0, "doc chunks present after the chunk-only pass");
         assert_eq!(d_vecs, 0, "no vectors without the model");
@@ -9980,9 +10801,9 @@
             "moved note must be sealed at rest (content_blob set)"
         );
         assert_eq!(
-            n.markdown, MD,
-            "moved note must stay READABLE in-session (regression: it used to come back empty under the open padlock)"
-        );
+                        n.markdown, MD,
+                        "moved note must stay READABLE in-session (regression: it used to come back empty under the open padlock)"
+                    );
         assert!(
             n.exported_path.is_none(),
             "no vault .md for a note in a locked folder"
@@ -10164,11 +10985,9 @@
         let archive_bytes = b"RIFF-canonical-archive-v1".to_vec();
         std::fs::write(&archive_path, &archive_bytes).unwrap();
         let archive_file = crate::audio::source::verify_existing_file(&archive_path).unwrap();
-        let archive = crate::storage::recording_store::VerifiedArchiveArtifact::from_file(
-            &key,
-            &archive_file,
-        )
-        .unwrap();
+        let archive =
+            crate::storage::recording_store::VerifiedArchiveArtifact::from_file(&key, &archive_file)
+                .unwrap();
         state
             .db
             .archive_recording_generation(&key, &recording.lease, &archive)
@@ -12115,7 +12934,7 @@
             let mut stmt = conn
                 .prepare(
                     "SELECT dependency_ref FROM ask_conversation_dependencies
-                      WHERE conversation_id = ?1 ORDER BY dependency_ref",
+                                  WHERE conversation_id = ?1 ORDER BY dependency_ref",
                 )
                 .unwrap();
             stmt.query_map([committed.conversation_id], |row| row.get::<_, String>(0))
@@ -12426,9 +13245,9 @@
 
         let segs = state.db.raw_segments("m-sum").unwrap();
         assert!(
-            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
-            "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
-        );
+                        !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+                        "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
+                    );
         assert!(
             wav.exists(),
             "the only plaintext audio copy must also survive"
@@ -12477,9 +13296,9 @@
 
         let segs = state.db.raw_segments("m-err").unwrap();
         assert!(
-            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
-            "an Error meeting's blob-less rows survive when its audio is gone (nothing to re-derive from)"
-        );
+                        !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+                        "an Error meeting's blob-less rows survive when its audio is gone (nothing to re-derive from)"
+                    );
     }
 
     /// LOCK MODEL (2026-07-16 lock-review fix direction): with the session KEK cached (the
@@ -12609,19 +13428,19 @@
     #[test]
     fn dto_omitting_mcp_require_token_defaults_true() {
         let json = r#"{
-            "providerId":"claude_code",
-            "anthropicModel":"claude-opus-4-8",
-            "ollamaBaseUrl":"http://localhost:11434",
-            "ollamaModel":"llama3.1",
-            "claudeBinary":"claude",
-            "captureSystemAudio":false,
-            "modelSize":"large-v3",
-            "voiceTrigger":false,
-            "onboarded":true,
-            "noteStyle":"standard",
-            "autoOrganize":false,
-            "noteLanguage":"auto"
-        }"#;
+                        "providerId":"claude_code",
+                        "anthropicModel":"claude-opus-4-8",
+                        "ollamaBaseUrl":"http://localhost:11434",
+                        "ollamaModel":"llama3.1",
+                        "claudeBinary":"claude",
+                        "captureSystemAudio":false,
+                        "modelSize":"large-v3",
+                        "voiceTrigger":false,
+                        "onboarded":true,
+                        "noteStyle":"standard",
+                        "autoOrganize":false,
+                        "noteLanguage":"auto"
+                    }"#;
         let dto: AppConfigDto = serde_json::from_str(json).unwrap();
         assert!(
             dto.mcp_require_token,
@@ -13099,23 +13918,23 @@
         // (f) the FE sends camelCase `brainModelPath`; it must deserialize into the field (and an
         // omitted value defaults to None). Same minimal-but-valid JSON shape as case (c) below.
         let json_path = r#"{
-                "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
-                "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-                "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
-                "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
-                "brainModelPath":"/m/x.gguf"
-            }"#;
+                            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+                            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+                            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+                            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+                            "brainModelPath":"/m/x.gguf"
+                        }"#;
         let parsed: AppConfigDto = serde_json::from_str(json_path).unwrap();
         assert_eq!(parsed.brain_model_path.as_deref(), Some("/m/x.gguf"));
 
         // (c) an unknown/omitted brainBackend token deserializes to the default Cloud (no crash),
         // then flows through dto_to_config as Cloud.
         let json = r#"{
-                "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
-                "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-                "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
-                "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
-            }"#;
+                            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+                            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+                            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+                            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
+                        }"#;
         let dto_bad: AppConfigDto = serde_json::from_str(json).unwrap();
         assert_eq!(
             dto_bad.brain_backend,
@@ -13246,9 +14065,9 @@
         ));
         let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
         assert_eq!(
-                url,
-                "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
-            );
+                            url,
+                            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
+                        );
         assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
     }
 
@@ -15118,7 +15937,7 @@
                 catalog.source,
                 crate::commands::SOURCE_BUNDLED,
                 "{conn}: a compile-time catalog must declare itself bundled AT THE CATALOG level, \
-                 so an EMPTY one still carries provenance"
+                             so an EMPTY one still carries provenance"
             );
             let options = catalog.options;
             assert!(!options.is_empty(), "{conn} must offer at least one model");
@@ -15133,7 +15952,7 @@
                     option.source,
                     crate::commands::SOURCE_BUNDLED,
                     "{conn}: a compile-time list must not claim to be live, or the FE offers a \
-                     Refresh button that cannot do anything"
+                                 Refresh button that cannot do anything"
                 );
             }
             let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
@@ -15315,7 +16134,7 @@
                 dto_to_config(dto, &current).role_notes_model,
                 long_but_valid,
                 "an INHERITING role's model is never sent, so {default_engine:?} being the default \
-                 must not destroy it"
+                             must not destroy it"
             );
         }
         // Transport safety still applies to an inherited role — it is inert, not unchecked.
@@ -15539,11 +16358,11 @@
         let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
 
         for (provider_id, role_connection) in [
-            ("ollama", "claude_code"),  // the gap: explicit CLI role inheriting an Ollama default
-            ("ollama", ""),             // inherited role under a JSON default
-            ("claude_code", ""),        // inherited role under a CLI default
+            ("ollama", "claude_code"), // the gap: explicit CLI role inheriting an Ollama default
+            ("ollama", ""),            // inherited role under a JSON default
+            ("claude_code", ""),       // inherited role under a CLI default
             ("anthropic", "codex_cli"), // explicit CLI role under a direct-API default
-            ("gateway", "ollama"),      // JSON everywhere
+            ("gateway", "ollama"),     // JSON everywhere
         ] {
             let stored = crate::settings::config::AppConfig {
                 provider_id: provider_id.into(),
@@ -15568,12 +16387,12 @@
             }
             let usable = crate::commands::model_predicate_for(&target.connection)(&target.model);
             assert!(
-                usable,
-                "provider_id={provider_id:?} role={role_connection:?} resolved to \
-                 connection {:?} with model {:?}, which that arm cannot send — the ledger would \
-                 report a model the wire drops",
-                target.connection, target.model
-            );
+                        usable,
+                        "provider_id={provider_id:?} role={role_connection:?} resolved to \
+                             connection {:?} with model {:?}, which that arm cannot send — the ledger would \
+                             report a model the wire drops",
+                        target.connection, target.model
+                    );
         }
 
         // SECOND PASS, and the reason this test is worth anything on the argv legs.
@@ -15597,9 +16416,9 @@
         // does not exist for explicit role keys.
         let mut argv_legs_asserted = 0;
         for (provider_id, role_connection, seed_role_model) in [
-            ("ollama", "claude_code", true),   // explicit role → reads role_notes_model
-            ("anthropic", "codex_cli", true),  // explicit role → reads role_notes_model
-            ("claude_code", "", false),        // inherit → legacy_default_target reads provider_model
+            ("ollama", "claude_code", true), // explicit role → reads role_notes_model
+            ("anthropic", "codex_cli", true), // explicit role → reads role_notes_model
+            ("claude_code", "", false),      // inherit → legacy_default_target reads provider_model
         ] {
             let stored = crate::settings::config::AppConfig {
                 provider_id: provider_id.into(),
@@ -15622,18 +16441,18 @@
             assert!(
                 crate::commands::connection_builds_argv(&target.connection),
                 "leg provider_id={provider_id:?} role={role_connection:?} was chosen because it \
-                 resolves to an argv arm, but resolved to {:?}",
+                             resolves to an argv arm, but resolved to {:?}",
                 target.connection
             );
             assert!(
                 !target.model.is_empty(),
                 "provider_id={provider_id:?} role={role_connection:?} resolved to an EMPTY model, \
-                 so this leg proves nothing — the vacuity this pass exists to remove"
+                             so this leg proves nothing — the vacuity this pass exists to remove"
             );
             assert_ne!(
                 target.model, long,
                 "an argv arm resolved to a loosely-validated field's value; `model_args` would \
-                 drop it while `effective_model_requested` still reported it to the ledger"
+                             drop it while `effective_model_requested` still reported it to the ledger"
             );
             assert!(
                 crate::commands::model_predicate_for(&target.connection)(&target.model),
@@ -15661,11 +16480,11 @@
             ..Default::default()
         };
         assert_eq!(
-            resolve(Role::Notes, &inheriting).model,
-            "",
-            "an explicit role connection must read its OWN model key only; inheriting \
-             `provider_model` here is the shape that would let a JSON-arm id reach an argv arm"
-        );
+                resolve(Role::Notes, &inheriting).model,
+                "",
+                "an explicit role connection must read its OWN model key only; inheriting \
+                         `provider_model` here is the shape that would let a JSON-arm id reach an argv arm"
+            );
     }
 
     /// A6 STATED DIRECTLY: the LEDGER value equals the WIRE value.
@@ -15758,7 +16577,7 @@
             assert_eq!(
                 ledger, wire,
                 "provider_id={provider_id:?} role={role_connection:?} seed={seed:?} resolved to \
-                 {:?}: the ledger would record {ledger:?} while the wire carries {wire:?}",
+                             {:?}: the ledger would record {ledger:?} while the wire carries {wire:?}",
                 target.connection
             );
             if long_provider_model {
@@ -15863,11 +16682,11 @@
         let saved = dto_to_config(dto, &current);
 
         assert_eq!(
-            loaded.provider_model, saved.provider_model,
-            "load and save must not disagree on an empty engine; one of them would then \
-             silently undo the other on the next launch (empty engine reachable after load: \
-             {empty_engine_is_reachable})"
-        );
+                loaded.provider_model, saved.provider_model,
+                "load and save must not disagree on an empty engine; one of them would then \
+                         silently undo the other on the next launch (empty engine reachable after load: \
+                         {empty_engine_is_reachable})"
+            );
     }
 
     /// A6 ON THE SERIALIZED BODY: what the ledger records is the `model` field the request carries.
@@ -15990,7 +16809,7 @@
             provider.model_for_test(),
             ledger,
             "if these ever become equal the substitution was removed — update this test's premise \
-             rather than deleting it"
+                         rather than deleting it"
         );
         assert!(
             !provider.model_for_test().is_empty(),
@@ -16041,11 +16860,17 @@
                         continue;
                     }
                     if KEYS.iter().any(|k| line.contains(k))
-                        || ["\"provider_model\"", "\"anthropic_model\"", "\"ollama_model\"",
-                            "\"gateway_model\"", "\"role_notes_model\"", "\"role_ask_model\"",
-                            "\"role_live_model\""]
-                            .iter()
-                            .any(|k| line.contains(k))
+                        || [
+                            "\"provider_model\"",
+                            "\"anthropic_model\"",
+                            "\"ollama_model\"",
+                            "\"gateway_model\"",
+                            "\"role_notes_model\"",
+                            "\"role_ask_model\"",
+                            "\"role_live_model\"",
+                        ]
+                        .iter()
+                        .any(|k| line.contains(k))
                     {
                         offenders.push(format!("{name}:{}", n + 1));
                     }
@@ -16053,9 +16878,9 @@
             }
         }
         assert!(
-            offenders.is_empty(),
-            "a model-id setting is written outside AppConfig::save, bypassing both sanitizers: {offenders:?}"
-        );
+                        offenders.is_empty(),
+                        "a model-id setting is written outside AppConfig::save, bypassing both sanitizers: {offenders:?}"
+                    );
     }
 
     /// A7 GUARD. This diff changes which model ids can be CHOSEN and how they are DISPLAYED. It
@@ -16284,8 +17109,7 @@
             available: true,
             reason: None,
         };
-        let available =
-            append_codex_provider_status(vec![existing.clone()], Availability::Available);
+        let available = append_codex_provider_status(vec![existing.clone()], Availability::Available);
         assert_eq!(
             available
                 .iter()
@@ -17568,9 +18392,9 @@
         // Past the (now-passing) read-gate AND the (now-passing) empty-body guard, the next real gate is
         // org-egress consent (no consent granted in this fixture) — NOT InvalidArg.
         assert!(
-                matches!(err, AppError::Unavailable(_)),
-                "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
-            );
+                            matches!(err, AppError::Unavailable(_)),
+                            "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
+                        );
     }
 
     /// `preview_org_share` never egresses AND still enforces the read-gate: a sealed meeting refuses.
@@ -17743,7 +18567,7 @@
                 Some(existing) => {
                     state
                         .db
-                        .reset_org_share_for_retry(&existing.id, Some(title), 1, 1, &sha, ts)
+                        .reset_org_share_for_retry(&existing.id, Some(title), 1, 1, &sha, true, ts)
                         .unwrap();
                     existing.id
                 }
@@ -17934,6 +18758,70 @@
         assert!(state.db.get_org_item("nope").unwrap().is_none());
     }
 
+    #[test]
+    fn org_get_item_stable_link_resolves_only_the_visible_current_head() {
+        let state = build_state("org-get-item-stable-link");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        for (item_id, seq, rev) in [("old-head", 1, 1), ("current-head", 2, 2)] {
+            state
+                .db
+                .upsert_org_item(
+                    item_id,
+                    STABLE_ORG_ID,
+                    seq,
+                    "anna",
+                    item_id,
+                    "body",
+                    "2026-08-13T00:00:00Z",
+                    rev,
+                    1,
+                    &[rev as u8; 32],
+                    Some("document"),
+                    Some("owner-user"),
+                    None,
+                )
+                .unwrap();
+            state
+                .db
+                .set_org_item_document_metadata(
+                    item_id,
+                    Some(STABLE_DOC_ID),
+                    "edit",
+                    Some("owner-user"),
+                )
+                .unwrap();
+        }
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                "current-head",
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "edit",
+                Some("owner-user"),
+                true,
+            )
+            .unwrap();
+        let stable = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
+
+        let detail = org_get_item_inner(&state, &stable)
+            .unwrap()
+            .expect("a visible stable identity resolves its current head");
+        assert_eq!(detail.item_id, "current-head");
+        assert_eq!(detail.link_id.as_deref(), Some(stable.as_str()));
+        assert!(
+            org_get_item_inner(&state, "old-head").unwrap().is_none(),
+            "the demoted revision cannot be read by exact id"
+        );
+
+        state.db.set_org_context_enabled(STABLE_ORG_ID, false).unwrap();
+        assert!(org_get_item_inner(&state, &stable).unwrap().is_none());
+        state.db.set_org_context_enabled(STABLE_ORG_ID, true).unwrap();
+        assert!(state.db.delete_org_state(STABLE_ORG_ID).unwrap());
+        assert!(org_get_item_inner(&state, &stable).unwrap().is_none());
+    }
+
     /// REGRESSION (app-hang on Accept): the old accept held the non-reentrant `lifecycle_guard` across
     /// a note-body materialize whose `update_note_doc_inner` re-took the SAME guard → a same-thread
     /// DEADLOCK on a NOTE↔NOTE accept. The materialize (and the whole `murmur:links` body block) is now
@@ -18115,11 +19003,11 @@
             .lock()
             .execute(
                 "INSERT INTO org_items
-                    (item_id, org_id, seq, author_hint, title, markdown, created_at,
-                     rev, generation, content_sha256, tombstoned)
-                 VALUES ('it-p', 'org-1', 2, 'mallory', 'Orphan title',
-                         'Cloud Gateway orphan secret', '2026-07-10T10:00:00Z',
-                         1, 1, X'01', 0)",
+                                (item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                 rev, generation, content_sha256, tombstoned)
+                             VALUES ('it-p', 'org-1', 2, 'mallory', 'Orphan title',
+                                     'Cloud Gateway orphan secret', '2026-07-10T10:00:00Z',
+                                     1, 1, X'01', 0)",
                 [],
             )
             .unwrap();
@@ -18721,7 +19609,7 @@
         // review of PR #340 found the un-tightened version of this assertion still passed with
         // the ownership gate deleted entirely).
         assert!(
-            matches!(&err, AppError::Auth(msg) if msg == "you can only remove org notes you authored"),
+            matches!(&err, AppError::Auth(msg) if msg == "only the document owner or organization owner can remove this shared document"),
             "expected the ownership-gate's exact Auth refusal, got {err:?}"
         );
         // Untouched: still live, still Bob's — the ownership gate ran before any tombstone attempt.
@@ -18792,6 +19680,7 @@
             )
             .unwrap();
         state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        state.config.lock().unwrap().org_egress_consented = true;
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
             account_id: "me@example.com".into(),
             email: "me@example.com".into(),
@@ -19248,9 +20137,9 @@
             "a stuck failed-with-item_id row still shows the source's CURRENT title"
         );
         let owned = stuck
-                .owned_source
-                .as_ref()
-                .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
+                            .owned_source
+                            .as_ref()
+                            .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
         assert_eq!(owned.kind, "document");
         assert_eq!(owned.id, "n-stuck");
 
@@ -19634,6 +20523,12 @@
             state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
             epoch + 1
         );
+        org_set_context_enabled_inner(&state, "org-1", false).unwrap();
+        assert_eq!(
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch + 1,
+            "a no-op disable must not bump the visibility epoch again"
+        );
 
         // Refuses a non-member — never toggles an org the caller isn't in.
         assert!(matches!(
@@ -19724,10 +20619,12 @@
         let notifier = RecordingNotifier(std::sync::atomic::AtomicUsize::new(0));
         let epoch = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst);
 
-        assert!(commit_org_visibility_reduction(&state, Some(&notifier), || {
-            state.db.evict_org_item("it-1")
-        })
-        .unwrap());
+        assert!(
+            commit_org_visibility_reduction(&state, Some(&notifier), || {
+                state.db.evict_org_item("it-1")
+            })
+            .unwrap()
+        );
         assert_eq!(
             state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
             epoch + 1
@@ -19737,15 +20634,18 @@
             state
                 .db
                 .lock()
-                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
 
-        assert!(!commit_org_visibility_reduction(&state, Some(&notifier), || {
-            state.db.evict_org_item("it-1")
-        })
-        .unwrap());
+        assert!(
+            !commit_org_visibility_reduction(&state, Some(&notifier), || {
+                state.db.evict_org_item("it-1")
+            })
+            .unwrap()
+        );
         assert_eq!(
             state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
             epoch + 1,
@@ -19762,6 +20662,179 @@
         });
         assert!(matches!(refused, Err(AppError::Auth(_))));
         assert_eq!(notifier.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stable_current_demotion_invalidates_in_flight_and_existing_ask_history_once() {
+        struct RecordingNotifier(std::sync::atomic::AtomicUsize);
+        impl AskHistoryInvalidationNotifier for RecordingNotifier {
+            fn ask_history_invalidated(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let state = build_state("org-current-head-ask-invalidation");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-dep", "Dependency");
+        for (item_id, seq, rev) in [("old-head", 1_u64, 1_u32), ("new-head", 2, 2)] {
+            state
+                .db
+                .upsert_org_item(
+                    item_id,
+                    STABLE_ORG_ID,
+                    seq,
+                    "owner",
+                    item_id,
+                    "shared body",
+                    "2026-08-13T00:00:00Z",
+                    rev,
+                    1,
+                    &[rev as u8; 32],
+                    None,
+                    Some("owner"),
+                    None,
+                )
+                .unwrap();
+            state
+                .db
+                .set_org_item_document_metadata(
+                    item_id,
+                    Some(STABLE_DOC_ID),
+                    "edit",
+                    Some("owner"),
+                )
+                .unwrap();
+        }
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                "old-head",
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "edit",
+                Some("owner"),
+                true,
+            )
+            .unwrap();
+        state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "question",
+                "derived from the old head",
+                &[],
+                &[],
+                &[],
+                &["f-dep".to_string()],
+                "2026-08-13T00:01:00Z",
+            )
+            .unwrap();
+
+        let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
+        let notifier = RecordingNotifier(std::sync::atomic::AtomicUsize::new(0));
+        let epoch_before = state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let generation_before: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT visibility_generation FROM ask_history_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let outcome = commit_org_metadata_mutation(&state, Some(&notifier), || {
+            state.db.repair_org_reconcile_metadata(
+                "new-head",
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "edit",
+                Some("owner"),
+                true,
+            )
+        })
+        .unwrap();
+        assert!(outcome.changed);
+        assert!(outcome.visibility_reduced);
+        assert_eq!(
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch_before + 1
+        );
+        assert_eq!(notifier.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            require_durable_scope_for_dispatch(&state, &snapshot, None),
+            Err(AppError::Locked(_))
+        ));
+        let conn = state.db.lock();
+        let generation_after: i64 = conn
+            .query_row(
+                "SELECT visibility_generation FROM ask_history_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_after, generation_before + 1);
+        for table in [
+            "ask_conversations",
+            "ask_conversation_messages",
+            "ask_conversation_dependencies",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "table={table}");
+        }
+        drop(conn);
+
+        // An access downgrade does not hide the current plaintext head. It therefore must not purge,
+        // advance the epoch/generation, or emit a second invalidation.
+        state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "new question",
+                "still valid",
+                &[],
+                &[],
+                &[],
+                &["f-dep".to_string()],
+                "2026-08-13T00:02:00Z",
+            )
+            .unwrap();
+        let access_outcome = commit_org_metadata_mutation(&state, Some(&notifier), || {
+            state.db.repair_org_reconcile_metadata(
+                "new-head",
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("owner"),
+                true,
+            )
+        })
+        .unwrap();
+        assert!(access_outcome.changed);
+        assert!(!access_outcome.visibility_reduced);
+        assert_eq!(
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch_before + 1
+        );
+        assert_eq!(notifier.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM ask_conversations", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display
@@ -19861,6 +20934,92 @@
             "a session-unlocked meeting's org-share status is visible again"
         );
         assert_eq!(unlocked_shares[0].org_id, "org-1");
+    }
+
+    /// TOCTOU oracle: both badge readers own one lifecycle interval from their visibility gate
+    /// through the final DTO. A lock transition queued ahead of either read therefore wins; the
+    /// reader cannot return the share metadata observed before that transition.
+    #[test]
+    fn meeting_org_share_badge_reads_wait_for_lock_and_then_hide() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let state = Arc::new(build_state("meeting-org-share-badge-lock-race"));
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-race", "Race");
+        seed_meeting(&state.db, "m-race", "# note", Some("f-race"));
+        state
+            .db
+            .insert_org_share(
+                "s-race",
+                "org-1",
+                Some("m-race"),
+                None,
+                "meeting",
+                Some("Secret badge"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-race", "item-race", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let guard = lifecycle_guard(&state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader_state = Arc::clone(&state);
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(meeting_org_shares_inner(&reader_state, "m-race"))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "single-meeting badge reader must wait for the lifecycle interval"
+        );
+        state.db.set_folder_locked("f-race", true, None).unwrap();
+        drop(guard);
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        reader.join().unwrap();
+        assert!(meeting_org_shares_inner(&state, "m-race")
+            .unwrap()
+            .is_empty());
+
+        state.db.set_folder_locked("f-race", false, None).unwrap();
+        let guard = lifecycle_guard(&state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader_state = Arc::clone(&state);
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(list_meeting_org_shares_inner(&reader_state))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "bulk badge reader must wait for the lifecycle interval"
+        );
+        state.db.set_folder_locked("f-race", true, None).unwrap();
+        drop(guard);
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        reader.join().unwrap();
+        assert!(list_meeting_org_shares_inner(&state).unwrap().is_empty());
     }
 
     /// `list_meeting_org_shares`: the BULK Library-row variant of `meeting_org_shares` — one row per
@@ -20136,6 +21295,13 @@
     fn org_status_item_count_includes_stuck_failed_rows_with_a_live_item_id() {
         let state = build_state("org-item-count-stuck");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-open", "Open");
+        for note_id in ["n-up", "n-stuck", "n-dead"] {
+            state
+                .db
+                .insert_note(note_id, "f-open", note_id, "T", "body", 1)
+                .unwrap();
+        }
         let now = "2026-07-12T00:00:00Z";
 
         // One cleanly-uploaded share.
@@ -20213,7 +21379,7 @@
         assert_eq!(
             status.item_count, 2,
             "item_count includes the uploaded row AND the stuck failed-with-item_id row, \
-                 excluding the never-published failed row"
+                             excluding the never-published failed row"
         );
     }
 
@@ -20477,14 +21643,14 @@
     }
 
     /// INLINE REPUBLISH: there is one atomic `/items` request and no anonymous `/blobs` staging
-    /// request. A source move after the server has received that request cannot retract already-sent
-    /// bytes; the published snapshot is the one authorized at the request boundary.
+    /// request. Source moves are serialized by the public mutation command and covered by their
+    /// barrier oracles; this test pins the single-request transport contract itself.
     #[test]
-    fn republish_move_during_inline_publish_uses_one_atomic_request() {
+    fn republish_inline_publish_uses_one_atomic_request() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         let state = build_state("org-republish-move-during-upload");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-before", "Before");
         make_open_folder(&state.db, "f-after", "After");
         state
@@ -20495,7 +21661,7 @@
             .db
             .insert_org_share(
                 "s-race",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n-race"),
                 "note",
@@ -20513,16 +21679,22 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
-        let db = Arc::clone(&state.db);
         let mock = std::thread::spawn(move || {
             let req = server
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap()
                 .expect("republish must issue one inline publish");
             assert_eq!(req.method(), &tiny_http::Method::Post);
-            assert_eq!(req.url().split('?').next(), Some("/v1/orgs/org-1/items"));
+            assert_eq!(
+                req.url().split('?').next(),
+                Some(concat!(
+                    "/v1/orgs/",
+                    "11111111-1111-4111-8111-111111111111",
+                    "/items"
+                ))
+            );
 
             let mut req = req;
             let mut body = String::new();
@@ -20530,11 +21702,12 @@
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(json.get("blobId").is_none());
             assert!(json.get("contentCell").and_then(|v| v.as_str()).is_some());
+            let doc_id = json["docId"].as_str().unwrap();
 
-            // Land the OPEN→OPEN move after the atomic request has already crossed the egress seam.
-            db.set_note_doc_folder("n-race", "f-after").unwrap();
-            let response = tiny_http::Response::from_string(r#"{"itemId":"item-new","seq":2}"#)
-                .with_header(
+            let response = tiny_http::Response::from_string(format!(
+                r#"{{"itemId":"item-new","seq":2,"docId":"{doc_id}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
+            ))
+            .with_header(
                     "Content-Type: application/json"
                         .parse::<tiny_http::Header>()
                         .unwrap(),
@@ -20565,7 +21738,10 @@
         .unwrap();
         assert_eq!(republished, 1, "one authorized snapshot was published");
         let (tombstone_path, extra) = mock.join().unwrap();
-        assert_eq!(tombstone_path, "/v1/orgs/org-1/items/item-old");
+        assert_eq!(
+            tombstone_path,
+            format!("/v1/orgs/{STABLE_ORG_ID}/items/item-old")
+        );
         assert_eq!(extra, None, "no staging or duplicate publish request");
 
         let row = state.db.get_org_share("s-race").unwrap().unwrap();
@@ -20582,7 +21758,8 @@
     #[test]
     fn share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest() {
         let state = build_state("org-share-collapse");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        state.config.lock().unwrap().org_egress_consented = true;
         make_open_folder(&state.db, "f-collapse", "Team");
         state
             .db
@@ -20593,7 +21770,7 @@
             .db
             .insert_org_share(
                 "keep",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n1"),
                 "note",
@@ -20612,7 +21789,7 @@
             .db
             .insert_org_share(
                 "dup",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n1"),
                 "note",
@@ -20627,12 +21804,12 @@
             .db
             .set_org_share_uploaded("dup", "item-dup", "2026-07-11T09:05:00Z")
             .unwrap();
-        // A NOT-yet-uploaded sibling is ambiguous: NULL item id is not proof the remote POST never landed.
+        // A NOT-yet-uploaded sibling (a stuck pending retry) for the same source — redundant, cancelled.
         state
             .db
             .insert_org_share(
                 "pending",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n1"),
                 "note",
@@ -20646,7 +21823,7 @@
 
         let entry = block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n1".to_string()),
             false,
@@ -20671,7 +21848,7 @@
         assert_eq!(
             state.db.get_org_share("pending").unwrap().unwrap().state,
             "queued",
-            "an ambiguous queued NULL-item sibling stays fail-closed"
+            "a queued NULL-item sibling is not proof of remote absence and stays fail-closed"
         );
     }
 
@@ -20702,6 +21879,54 @@
         // for pre-multi-org FE callers.
         let first = block_on(org_status_inner(&state)).unwrap();
         assert!(first.is_some(), "legacy org_status still returns the first");
+    }
+
+    #[test]
+    fn org_list_statuses_keeps_other_rows_when_one_refresh_is_unavailable() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            // An authenticated but mismatched per-org response is unavailable/fail-closed for the
+            // refresh. The aggregate must still return the cached content-free status.
+            let body = r#"{"orgId":"wrong-org","name":"Wrong","role":"member","createdAt":"2026-08-13T00:00:00Z","currentGeneration":1}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-list-statuses-partial-unavailable");
+        seed_org(&state.db, "org-live", "Cached", "member", 1);
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        let statuses = block_on(org_list_statuses_inner(&state)).unwrap();
+        server.join().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].org_id, "org-live");
+        assert_eq!(statuses[0].name, "Cached");
+    }
+
+    #[test]
+    fn missing_org_share_access_defaults_to_view_at_command_boundary() {
+        assert_eq!(
+            org_access_or_view_for_test(None),
+            crate::share::org_dto::OrgItemAccess::View
+        );
+        assert_eq!(
+            org_access_or_view_for_test(Some(
+                crate::share::org_dto::OrgItemAccess::Edit
+            )),
+            crate::share::org_dto::OrgItemAccess::Edit
+        );
     }
 
     /// MEMBERSHIP RECONCILE (DB core, network-free): `reconcile_org_state_into_db` must ADD an org the
@@ -20763,6 +21988,201 @@
         assert_eq!(new.joined_at, "2026-07-11T09:00:00Z");
         assert!(!new.consented);
         assert_eq!(new.last_seq, 0);
+    }
+
+    #[test]
+    fn single_authenticated_empty_org_list_cannot_purge_live_membership_or_private_links() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            let body = r#"{"orgs":[]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            loop {
+                match listener.accept() {
+                    Ok((mut unexpected, _)) => {
+                        let _ = unexpected.read(&mut request).unwrap();
+                        return 2usize;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return 1usize;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("empty-membership mock accept failed: {error}"),
+                }
+            }
+        });
+
+        let state = build_state("org-empty-list-corroboration");
+        let org_id = "11111111-1111-4111-8111-111111111111";
+        let link_id = format!("{org_id}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        seed_org(&state.db, org_id, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-empty", "Empty reconcile");
+        seed_meeting(&state.db, "private-local-anchor", "# local", Some("f-empty"));
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        state.db.lock().execute(
+            "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+             VALUES ('org',?1,'meeting','private-local-anchor','manual',1.0,'user','active',1)",
+            [link_id.as_str()],
+        ).unwrap();
+
+        block_on(org_reconcile_memberships_notifying(&state, None)).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "without org-egress consent there is no per-org status request"
+        );
+        assert!(state.db.get_org_state(org_id).unwrap().is_some());
+        let private_links: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE src_kind='org' AND src_id=?1",
+                [link_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(private_links, 1);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_membership_corroborate")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn consented_membership_corroboration_ledgers_success_and_preserves_on_error() {
+        use std::io::{Read, Write};
+
+        fn run(tag: &str, exact_status: &str) -> AppState {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let exact_status = exact_status.to_string();
+            let server = std::thread::spawn(move || {
+                for response in [
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"orgs\":[]}".to_string(),
+                    format!(
+                        "HTTP/1.1 {exact_status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    ),
+                ] {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    let _ = socket.read(&mut request).unwrap();
+                    socket.write_all(response.as_bytes()).unwrap();
+                }
+            });
+            let state = build_state(tag);
+            seed_org(
+                &state.db,
+                "11111111-1111-4111-8111-111111111111",
+                "Acme",
+                "member",
+                1,
+            );
+            state
+                .db
+                .lock()
+                .execute(
+                    "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+                     VALUES ('org','11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','note','local-note','manual',1.0,'user','active',1)",
+                    [],
+                )
+                .unwrap();
+            seed_live_session(&state);
+            state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+            state.config.lock().unwrap().org_egress_consented = true;
+            block_on(org_reconcile_memberships_notifying(&state, None)).unwrap();
+            server.join().unwrap();
+            state
+        }
+
+        let absent = run("org-corroborate-404", "404 Not Found");
+        assert!(absent
+            .db
+            .get_org_state("11111111-1111-4111-8111-111111111111")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            absent
+                .db
+                .count_share_egress_by_kind("org_membership_corroborate")
+                .unwrap(),
+            1,
+            "an exact successful absence check is recorded content-free"
+        );
+
+        let failed = run("org-corroborate-error", "500 Internal Server Error");
+        assert!(
+            failed
+                .db
+                .get_org_state("11111111-1111-4111-8111-111111111111")
+                .unwrap()
+                .is_some(),
+            "a failed corroboration preserves cached membership"
+        );
+        let private_links: i64 = failed
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE src_kind='org' AND edge_type='manual'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(private_links, 1, "a failed corroboration preserves private links");
+        assert_eq!(
+            failed
+                .db
+                .count_share_egress_by_kind("org_membership_corroborate")
+                .unwrap(),
+            1,
+            "the exact pre-dispatch attempt is ledgered even when the server returns an error"
+        );
+    }
+
+    #[test]
+    fn uncorroborated_empty_reconcile_core_is_non_destructive() {
+        let state = build_state("org-empty-core-fail-safe");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-empty-core", "Empty core");
+        seed_meeting(
+            &state.db,
+            "private-local-anchor",
+            "# local",
+            Some("f-empty-core"),
+        );
+        state.db.lock().execute(
+            "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+             VALUES ('org','org-1:doc-1','meeting','private-local-anchor','manual',1.0,'user','active',1)",
+            [],
+        ).unwrap();
+
+        let outcome = reconcile_org_state_into_db(&state, &[]).unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert!(state.db.get_org_state("org-1").unwrap().is_some());
+        let count: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// MULTI-ORG SYNC services ALL orgs across bounded round-robin turns. Each invocation owns one
@@ -20969,9 +22389,9 @@
             // seq 6: TOMBSTONE → applies without a key/blob (the "good" item behind the poison one).
             let body = r#"{"items":[{"itemId":"poison","seq":5,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":null,"contentSha256":null},{"itemId":"good-tomb","seq":6,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:01:00Z","tombstoned":true,"blobId":null,"contentSha256":null}],"nextSeq":6}"#;
             let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
             let _ = sock.write_all(resp.as_bytes());
         });
 
@@ -21064,9 +22484,9 @@
                     r#"{"items":[],"nextSeq":5}"#.to_string()
                 };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
                 let _ = sock.write_all(resp.as_bytes());
                 let _ = sock.flush();
                 let _ = sock.shutdown(std::net::Shutdown::Write);
@@ -21314,9 +22734,9 @@
         assert_eq!(second[0].document_id.as_deref(), Some("n-share"));
         let first = state.db.list_org_shares_for_org("org-first").unwrap();
         assert!(
-                first.is_empty(),
-                "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
-            );
+                            first.is_empty(),
+                            "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
+                        );
     }
 
     // ── RE-PUBLISH-ON-EDIT (the stale-org-copy fix) — end-to-end against a MOCK org server ─────────
@@ -21326,8 +22746,11 @@
     /// republish test assert BOTH the new-item-published AND the old-item-tombstoned sides.
     #[derive(Default)]
     struct MockOrgLog {
+        requests: Vec<String>,
         published: Vec<String>,
         tombstoned: Vec<String>,
+        published_content_sha256: Vec<String>,
+        published_content_cells: Vec<String>,
         /// The feed the mock serves from `GET /v1/orgs/{id}/items?sinceSeq=&limit=`, ascending by
         /// `seq`. Seeded by a test (see `MockOrgServer::seed_feed`) so the anti-entropy reconcile
         /// sweep can be driven headless. METADATA ONLY — a record that is tombstoned, or whose
@@ -21387,10 +22810,10 @@
                 None => String::new(),
             };
             format!(
-                "{{\"itemId\":\"{}\",\"seq\":{},\"authorUserId\":\"author-1\",\"rev\":1,\
-                  \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}}}",
-                self.item_id, self.seq, self.tombstoned, sha
-            )
+                        "{{\"itemId\":\"{}\",\"seq\":{},\"authorUserId\":\"author-1\",\"rev\":1,\
+                              \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}}}",
+                        self.item_id, self.seq, self.tombstoned, sha
+                    )
         }
     }
 
@@ -21422,19 +22845,82 @@
                         break;
                     }
                     match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(Some(req)) => {
+                        Ok(Some(mut req)) => {
                             let method = req.method().clone();
                             let url = req.url().to_string();
                             let path = url.split('?').next().unwrap_or("").to_string();
-                            // POST /v1/orgs/{id}/items → {"itemId": "...", "seq": N} (fresh id each call)
-                            if method == tiny_http::Method::Post
+                            log_t
+                                .lock()
+                                .unwrap()
+                                .requests
+                                .push(format!("{method} {url}"));
+                            if method == tiny_http::Method::Delete {
+                                assert_eq!(url, path, "DELETE identifiers belong only in the path");
+                                assert!(
+                                    req.headers().iter().any(|header| {
+                                        header.field.equiv("Authorization")
+                                            && header.value.as_str().starts_with("Bearer ")
+                                    }),
+                                    "the access token must be carried only by Authorization"
+                                );
+                                let mut body = String::new();
+                                std::io::Read::read_to_string(req.as_reader(), &mut body).unwrap();
+                                assert!(body.is_empty(), "DELETE must carry no request body");
+                            }
+                            // POST creates a stable document; PUT CAS-replaces its head. Both return
+                            // the same publish response shape and mint a fresh revision item id.
+                            let is_post = method == tiny_http::Method::Post
                                 && path.starts_with("/v1/orgs/")
-                                && path.ends_with("/items")
-                            {
+                                && path.ends_with("/items");
+                            let is_put = method == tiny_http::Method::Put
+                                && path.starts_with("/v1/orgs/")
+                                && path.contains("/documents/");
+                            if is_post || is_put {
+                                let mut request_body = String::new();
+                                let _ =
+                                    std::io::Read::read_to_string(req.as_reader(), &mut request_body);
+                                let parsed = serde_json::from_str::<serde_json::Value>(&request_body)
+                                    .unwrap_or(serde_json::Value::Null);
+                                {
+                                    let body = &parsed;
+                                    if let Some(sha) = body
+                                        .get("contentSha256")
+                                        .and_then(serde_json::Value::as_str)
+                                    {
+                                        log_t
+                                            .lock()
+                                            .unwrap()
+                                            .published_content_sha256
+                                            .push(sha.to_string());
+                                    }
+                                    if let Some(cell) =
+                                        body.get("contentCell").and_then(serde_json::Value::as_str)
+                                    {
+                                        log_t
+                                            .lock()
+                                            .unwrap()
+                                            .published_content_cells
+                                            .push(cell.to_string());
+                                    }
+                                }
                                 seq += 1;
                                 let item_id = format!("item-{seq}");
                                 log_t.lock().unwrap().published.push(item_id.clone());
-                                let body = format!("{{\"itemId\":\"{item_id}\",\"seq\":{seq}}}");
+                                let doc_id = if is_put {
+                                    path.rsplit('/').next().unwrap_or("doc-1")
+                                } else {
+                                    parsed
+                                        .get("docId")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("doc-1")
+                                };
+                                let access = parsed
+                                    .get("access")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("view");
+                                let body = format!(
+                                                "{{\"itemId\":\"{item_id}\",\"seq\":{seq},\"docId\":\"{doc_id}\",\"access\":\"{access}\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}"
+                                            );
                                 let resp = tiny_http::Response::from_string(body).with_header(
                                     "Content-Type: application/json"
                                         .parse::<tiny_http::Header>()
@@ -21477,8 +22963,7 @@
                                     .map(MockFeedEntry::to_json)
                                     .collect::<Vec<_>>()
                                     .join(",");
-                                let body =
-                                    format!("{{\"items\":[{items}],\"nextSeq\":{next_seq}}}");
+                                let body = format!("{{\"items\":[{items}],\"nextSeq\":{next_seq}}}");
                                 let resp = tiny_http::Response::from_string(body).with_header(
                                     "Content-Type: application/json"
                                         .parse::<tiny_http::Header>()
@@ -21559,16 +23044,1684 @@
             .insert((org_id.to_string(), generation), Zeroizing::new([9u8; 32]));
     }
 
+    fn seed_editable_stable_org_item(state: &AppState, item_id: &str, access: &str) {
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                item_id,
+                STABLE_ORG_ID,
+                1,
+                "user",
+                "Draft",
+                "old body",
+                "2026-08-13T00:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                Some("document"),
+                Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+                None,
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_item_document_metadata(
+                item_id,
+                Some(STABLE_DOC_ID),
+                access,
+                Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+            )
+            .unwrap();
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                item_id,
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                access,
+                Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+                true,
+            )
+            .unwrap();
+        seed_live_session(state);
+        seed_ock(state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+    }
+
+    fn direct_put_lost_response_server(
+        authoritative_access: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut put, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut put);
+            let request_line = String::from_utf8_lossy(&request);
+            assert!(request_line.starts_with(&format!(
+                "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
+            )));
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert!(json.get("mutationId").is_none(), "old strict relay rejects even a null mutationId");
+            assert_eq!(json["expectedRev"], 1);
+            assert_eq!(json["generation"], 1);
+            let sha = json["contentSha256"].as_str().unwrap().to_string();
+            drop(put); // the relay committed, but the success response was lost
+
+            let (mut get, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-new\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"{authoritative_access}\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
+            );
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (format!("http://{addr}/"), server)
+    }
+
+    #[test]
+    fn direct_put_response_lost_accepts_only_the_exact_authoritative_head() {
+        let state = build_state("org-direct-put-lost-exact");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
+        let (base, server) = direct_put_lost_response_server("edit");
+        state.config.lock().unwrap().share_base_url = base;
+
+        let updated = block_on(org_update_own_item_inner(
+            &state,
+            "item-old",
+            "Updated",
+            "new body",
+        ));
+        server.join().unwrap();
+        assert_eq!(updated.unwrap(), "item-new");
+        assert!(state.db.get_org_item("item-old").unwrap().is_none());
+        let current = state.db.get_org_item("item-new").unwrap().unwrap();
+        assert_eq!(current.title, "Updated");
+        assert_eq!(current.access, "edit");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1,
+            "dispatch and exact recovery share one idempotent ledger row"
+        );
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+    }
+
+    #[test]
+    fn direct_put_head_mismatch_is_terminal_and_never_retried() {
+        let state = build_state("org-direct-put-lost-mismatch");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
+        let (base, server) = direct_put_lost_response_server("view");
+        state.config.lock().unwrap().share_base_url = base;
+
+        let error = block_on(org_update_own_item_inner(
+            &state,
+            "item-old",
+            "Updated",
+            "new body",
+        ));
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            Err(AppError::InvalidArg(message)) if message.starts_with("[org-edit-conflict] ")
+        ));
+        let attempt = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.last_error.as_deref() == Some(ORG_SHARE_ERR_EDIT_CONFLICT))
+            .expect("the exact draft commitment remains durably terminal");
+        assert_eq!(attempt.item_id.as_deref(), Some("item-old"));
+        assert_eq!(attempt.doc_id.as_deref(), Some(STABLE_DOC_ID));
+        assert_eq!(attempt.rev, 2);
+        assert_eq!(attempt.generation, 1);
+        assert_eq!(attempt.access, "edit");
+        assert!(attempt.content_sha256.is_some());
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+        assert!(state.db.get_org_item("item-old").unwrap().is_some());
+        assert!(state.db.get_org_item("item-new").unwrap().is_none());
+    }
+
+    #[test]
+    fn direct_put_demoted_exact_target_behind_newer_head_remains_inconclusive() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut put, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut put);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            let sha = json["contentSha256"].as_str().unwrap();
+            drop(put);
+            let (mut get, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut get);
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"attempt-a\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"newer-b\",\"seq\":3,\"authorUserId\":\"other\",\"rev\":3,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"contentSha256\":\"{}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":3}}",
+                murmur_protocol::b64::encode(&[9u8;32]),
+            );
+            write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let state = build_state("org-direct-demoted-inconclusive");
+        seed_editable_stable_org_item(&state,"item-old","edit");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        assert!(matches!(block_on(org_update_own_item_inner(&state,"item-old","Updated","body")), Err(AppError::Unavailable(_))));
+        server.join().unwrap();
+        let pending = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(pending.len(),1);
+        assert_eq!(pending[0].last_error.as_deref(),Some("direct_put_pending"));
+        assert!(state.db.get_org_item("attempt-a").unwrap().is_none());
+    }
+
+    #[test]
+    fn direct_put_wrong_doc_id_with_only_old_head_stays_pending_in_command_and_sweep() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut put, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut put);
+            assert!(String::from_utf8_lossy(&request).starts_with(&format!(
+                "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
+            )));
+            let wrong_doc = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+            let wrong = format!(
+                "{{\"itemId\":\"wrong-doc-head\",\"seq\":2,\"docId\":\"{wrong_doc}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}"
+            );
+            write!(
+                put,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                wrong.len(),
+                wrong
+            )
+            .unwrap();
+
+            let old_hash = murmur_protocol::b64::encode(&[1u8; 32]);
+            let old = format!(
+                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{old_hash}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":1}}"
+            );
+            for _ in 0..2 {
+                let (mut get, _) = accept_with_timeout(&listener);
+                let request = read_http_request(&mut get);
+                assert!(String::from_utf8_lossy(&request)
+                    .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+                write!(
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    old.len(), old
+                )
+                .unwrap();
+            }
+        });
+
+        let state = build_state("org-direct-put-wrong-doc-2xx");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        let result = block_on(org_update_own_item_inner(
+            &state,
+            "item-old",
+            "Updated",
+            "new body",
+        ));
+        assert!(matches!(result, Err(AppError::Unavailable(_))));
+        let attempt = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        assert_eq!(attempt.doc_id.as_deref(), Some(STABLE_DOC_ID));
+        assert_eq!(attempt.access, "edit");
+        assert_eq!(attempt.last_error.as_deref(), Some("direct_put_pending"));
+        assert!(state.db.get_org_item("wrong-doc-head").unwrap().is_none());
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+        server.join().unwrap();
+        let still_pending = state.db.get_org_share(&attempt.id).unwrap().unwrap();
+        assert_eq!(still_pending.last_error.as_deref(), Some("direct_put_pending"));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1,
+            "query-only recovery must not duplicate the dispatch ledger"
+        );
+    }
+
+    #[test]
+    fn direct_put_explicit_409_is_terminal_but_dispatch_is_ledgered() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut put, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut put);
+            assert!(String::from_utf8_lossy(&request).starts_with(&format!(
+                "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
+            )));
+            write!(
+                put,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let state = build_state("org-direct-put-409-ledger");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        let result = block_on(org_update_own_item_inner(
+            &state,
+            "item-old",
+            "Updated",
+            "new body",
+        ));
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(AppError::InvalidArg(message)) if message.starts_with("[org-edit-conflict] ")
+        ));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn direct_put_unavailable_head_stays_pending_then_sweep_queries_only() {
+        use std::io::Write;
+
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let first_server = std::thread::spawn(move || {
+            let (mut put, _) = accept_with_timeout(&first);
+            let request = read_http_request(&mut put);
+            assert!(String::from_utf8_lossy(&request).starts_with(&format!(
+                "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
+            )));
+            drop(put);
+            let (mut get, _) = accept_with_timeout(&first);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            write!(
+                get,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-direct-put-query-only-sweep");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
+        make_open_folder(&state.db, "f-direct-origin", "Origin");
+        state
+            .db
+            .insert_note(
+                "n-direct-origin",
+                "f-direct-origin",
+                "direct-origin",
+                "Draft",
+                "old body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "share-direct-origin",
+                STABLE_ORG_ID,
+                None,
+                Some("n-direct-origin"),
+                "note",
+                Some("Draft"),
+                1,
+                1,
+                &[1u8; 32],
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded(
+                "share-direct-origin",
+                "item-old",
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata("share-direct-origin", STABLE_DOC_ID, "edit")
+            .unwrap();
+        state.config.lock().unwrap().share_base_url = format!("http://{first_addr}/");
+        assert!(matches!(
+            block_on(org_update_own_item_inner(
+                &state,
+                "item-old",
+                "Updated",
+                "new body",
+            )),
+            Err(AppError::Unavailable(_))
+        ));
+        first_server.join().unwrap();
+        let pending = state
+            .db
+            .list_org_shares_in_state("failed")
+            .unwrap()
+            .remove(0);
+        assert_eq!(pending.last_error.as_deref(), Some("direct_put_pending"));
+        assert_eq!(pending.expected_actor_user_id.as_deref(), Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"));
+        assert_eq!(pending.expected_owner_user_id.as_deref(), Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"));
+
+        let no_mutation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        no_mutation.set_nonblocking(true).unwrap();
+        state.config.lock().unwrap().share_base_url =
+            format!("http://{}/", no_mutation.local_addr().unwrap());
+        let duplicate = block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-direct-origin".into()),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(duplicate.item_id.as_deref(), Some("item-old"));
+        assert_eq!(duplicate.state, "failed");
+        assert!(matches!(
+            no_mutation.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap().len(),
+            1,
+            "sharing during direct reconciliation must not mint a second row"
+        );
+
+        // A later local save is not permission to replace or redispatch the unresolved PUT. The
+        // original exact draft witness stays byte-identical until authenticated reconciliation.
+        state
+            .db
+            .update_note_row(
+                "n-direct-origin",
+                "Later local edit",
+                "a different local body",
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            block_on(republish_org_shares_for_source(
+                &state,
+                None,
+                Some("n-direct-origin"),
+            ))
+            .unwrap(),
+            0
+        );
+        assert!(matches!(
+            no_mutation.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let still_pending = state.db.get_org_share("share-direct-origin").unwrap().unwrap();
+        assert_eq!(still_pending.last_error.as_deref(), Some("direct_put_pending"));
+        assert_eq!(still_pending.rev, pending.rev);
+        assert_eq!(still_pending.content_sha256, pending.content_sha256);
+        assert_eq!(
+            still_pending.expected_actor_user_id,
+            pending.expected_actor_user_id
+        );
+        assert_eq!(
+            still_pending.expected_owner_user_id,
+            pending.expected_owner_user_id
+        );
+
+        let sha = murmur_protocol::b64::encode(pending.content_sha256.as_deref().unwrap());
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let second_server = std::thread::spawn(move || {
+            let (mut get, _) = accept_with_timeout(&second);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-new\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
+            );
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{second_addr}/");
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
+        second_server.join().unwrap();
+        let confirmed = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].last_error.as_deref(), Some("projection_pending"));
+        assert_eq!(confirmed[0].item_id.as_deref(), Some("item-new"));
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(), 1);
+    }
+
+    /// An ambiguous initial POST may have committed remotely even though its response was lost.
+    /// The retry must preserve an explicit `scrub=false`, producing the same canonical plaintext hash
+    /// while a fresh random seal produces different ciphertext for the replay request.
+    #[test]
+    fn org_sweep_replays_unscrubbed_initial_post_with_same_semantic_hash() {
+        use std::io::Write;
+        let lost_server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = lost_server.server_addr().to_ip().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let lost_response_server = std::thread::spawn(move || {
+            let mut request = lost_server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .expect("initial lost-response request was never dispatched");
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body).unwrap();
+            request_tx.send(body).unwrap();
+            request
+                .respond(tiny_http::Response::from_string("{").with_status_code(200))
+                .unwrap();
+            let request = lost_server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .expect("ambiguous POST recovery GET was never dispatched");
+            assert_eq!(request.method().as_str(), "GET");
+            request
+                .respond(tiny_http::Response::empty(503))
+                .unwrap();
+        });
+
+        let state = build_state("org-sweep-unscrubbed-replay");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-replay", "Replay");
+        state
+            .db
+            .insert_note(
+                "n-replay",
+                "f-replay",
+                "replay",
+                "Replay",
+                "Contact alice@example.com",
+                1,
+            )
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+
+        let initial = block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-replay".to_string()),
+            false,
+        ));
+        assert!(
+            initial.is_err(),
+            "the intentionally lost response must fail locally"
+        );
+        let first_body = request_rx.recv().unwrap();
+        lost_response_server.join().unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_sha = first_json["contentSha256"].as_str().unwrap().to_string();
+        let first_cell = first_json["contentCell"].as_str().unwrap().to_string();
+        let failed = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(
+            !failed[0].scrub,
+            "the explicit opt-out is durable before retry"
+        );
+        let stored_hash = failed[0].content_sha256.clone().unwrap();
+
+        let replay_server = MockOrgServer::start();
+        state.config.lock().unwrap().share_base_url = replay_server.base.clone();
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
+
+        let retried = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].state, "uploaded", "row after replay: {:?}", retried[0]);
+        assert!(!retried[0].scrub, "the sweep must replay with scrub=false");
+        assert_eq!(
+            retried[0].content_sha256.as_deref(),
+            Some(stored_hash.as_slice())
+        );
+        let log = replay_server.log.lock().unwrap();
+        assert_eq!(log.published_content_sha256, vec![first_sha]);
+        assert_eq!(log.published_content_cells.len(), 1);
+        assert_ne!(
+            log.published_content_cells[0], first_cell,
+            "a fresh random nonce changes ciphertext while semantic replay keeps the plaintext hash"
+        );
+        drop(log);
+
+        // Automatic edits have no warning surface. Pause after request dispatch but before a usable
+        // response/local success commit: the forced-scrub semantic attempt must already be durable.
+        let lost_edit_server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let lost_addr = lost_edit_server.server_addr().to_ip().unwrap();
+        let (edit_request_tx, edit_request_rx) = std::sync::mpsc::channel();
+        let lost_edit_response_server = std::thread::spawn(move || {
+            let mut request = lost_edit_server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .expect("automatic edit request was never dispatched");
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body).unwrap();
+            edit_request_tx.send(body).unwrap();
+            request
+                .respond(tiny_http::Response::from_string("{").with_status_code(200))
+                .unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{lost_addr}/");
+        update_note_doc_inner(
+            &state,
+            "n-replay",
+            "Replay",
+            "Contact bob@example.com after the edit",
+        )
+        .unwrap();
+        assert_eq!(
+            block_on(republish_org_shares_for_source(
+                &state,
+                None,
+                Some("n-replay")
+            ))
+            .unwrap(),
+            0,
+            "a lost response does not count as a locally committed republish"
+        );
+        let edit_body = edit_request_rx.recv().unwrap();
+        lost_edit_response_server.join().unwrap();
+        let edit_json: serde_json::Value = serde_json::from_slice(&edit_body).unwrap();
+        let edit_sha = edit_json["contentSha256"].as_str().unwrap().to_string();
+        let edit_rev = edit_json["expectedRev"].as_u64().unwrap() as u32 + 1;
+
+        let pending = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(pending[0].state, "failed");
+        assert!(pending[0].scrub, "forced scrub must be durable pre-egress");
+        assert_eq!(pending[0].rev, edit_rev);
+        assert_eq!(
+            pending[0].content_sha256.as_deref(),
+            Some(murmur_protocol::b64::decode(&edit_sha).unwrap().as_slice())
+        );
+
+        let old_item_id = pending[0].item_id.clone().unwrap();
+        let doc_id = pending[0].doc_id.clone().unwrap();
+        let generation = pending[0].generation;
+        let publish_ledgers_before = state
+            .db
+            .count_share_egress_by_kind("org_share_publish")
+            .unwrap();
+        let recovery = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let recovery_addr = recovery.local_addr().unwrap();
+        let recovery_server = std::thread::spawn(move || {
+            let (mut get, _) = accept_with_timeout(&recovery);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"{old_item_id}\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":{},\"generation\":{generation},\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-edit-recovered\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":{edit_rev},\"generation\":{generation},\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{edit_sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}",
+                edit_rev - 1,
+            );
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{recovery_addr}/");
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
+        recovery_server.join().unwrap();
+        let edited = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(edited[0].state, "uploaded");
+        assert!(edited[0].scrub);
+        assert_eq!(edited[0].rev, edit_rev);
+        assert_eq!(edited[0].item_id.as_deref(), Some("item-edit-recovered"));
+        let _recovered_local = state
+            .db
+            .get_org_item("item-edit-recovered")
+            .unwrap()
+            .expect("query-only recovery must project the authoritative head immediately");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            publish_ledgers_before,
+            "sweep recovery must not dispatch or ledger a second PUT"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_history_read")
+                .unwrap(),
+            1,
+            "the query-only sweep has one pre-send GET receipt"
+        );
+
+        // A genuinely newer local save after A is recovered is a distinct logical attempt, not
+        // silently swallowed by the query-only completion. It sends exactly one fresh PUT.
+        update_note_doc_inner(&state, "n-replay", "Replay", "newer local revision C").unwrap();
+        state.config.lock().unwrap().share_base_url = replay_server.base.clone();
+        assert_eq!(
+            block_on(republish_org_shares_for_source(
+                &state,
+                None,
+                Some("n-replay"),
+            ))
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            publish_ledgers_before + 1,
+            "newer source B produces exactly one distinct mutation after recovering A"
+        );
+    }
+
+    #[test]
+    fn initial_post_replayable_account_switch_sends_nothing_and_preserves_witnesses() {
+        use std::io::Write;
+
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let first_server = std::thread::spawn(move || {
+            let (mut post, _) = accept_with_timeout(&first);
+            let request = read_http_request(&mut post);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
+            write!(
+                post,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{{"
+            )
+            .unwrap();
+            let (mut get, _) = accept_with_timeout(&first);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            write!(
+                get,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-initial-replay-account-switch");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-replay-account", "Replay");
+        state
+            .db
+            .insert_note(
+                "n-replay-account",
+                "f-replay-account",
+                "replay-account",
+                "Replay",
+                "same body",
+                1,
+            )
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{first_addr}/");
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        assert!(block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-replay-account".into()),
+            true,
+        ))
+        .is_err());
+        first_server.join().unwrap();
+
+        let absence = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let absence_addr = absence.local_addr().unwrap();
+        let absence_server = std::thread::spawn(move || {
+            let (mut get, _) = accept_with_timeout(&absence);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            let body = "{\"items\":[],\"nextSeq\":0}";
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{absence_addr}/");
+        assert_eq!(
+            block_on(org_sweep_pending_background_once_inner(&state))
+            .unwrap(),
+            0
+        );
+        absence_server.join().unwrap();
+        let replayable = state
+            .db
+            .list_org_shares_in_state("failed")
+            .unwrap()
+            .remove(0);
+        assert_eq!(replayable.last_error.as_deref(), Some("initial_post_replayable"));
+        let original_actor = replayable.expected_actor_user_id.clone();
+        let original_owner = replayable.expected_owner_user_id.clone();
+        let publish_receipts = state
+            .db
+            .count_share_egress_by_kind("org_share_publish")
+            .unwrap();
+        let read_receipts = state
+            .db
+            .count_share_egress_by_kind("org_document_head_read")
+            .unwrap();
+
+        let no_request = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        no_request.set_nonblocking(true).unwrap();
+        state.config.lock().unwrap().share_base_url =
+            format!("http://{}/", no_request.local_addr().unwrap());
+        assert!(block_on(share_to_org_with_access_inner(
+            &state,
+            STABLE_ORG_ID,
+            "n-replay-account".into(),
+            true,
+            crate::share::org_dto::OrgItemAccess::Edit,
+        ))
+        .is_err());
+        assert!(matches!(
+            no_request.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            publish_receipts,
+            "changing access cannot replay or ledger the durable initial attempt"
+        );
+        assert_eq!(
+            state.db.get_org_share(&replayable.id).unwrap().unwrap().access,
+            "view"
+        );
+
+        state
+            .account_session
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .server_user_id = Some("219d6d11-3796-41c3-b6cf-ef1b3ea75dc1".into());
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+        assert!(matches!(
+            no_request.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let unchanged = state.db.get_org_share(&replayable.id).unwrap().unwrap();
+        assert_eq!(unchanged.last_error.as_deref(), Some("initial_post_replayable"));
+        assert_eq!(unchanged.expected_actor_user_id, original_actor);
+        assert_eq!(unchanged.expected_owner_user_id, original_owner);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            publish_receipts,
+            "an account switch must not create a second mutation receipt"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_head_read")
+                .unwrap(),
+            read_receipts,
+            "an account switch must not dispatch or ledger a recovery read"
+        );
+    }
+
+    #[test]
+    fn stale_initial_post_response_cannot_complete_a_newer_dispatch() {
+        let state = build_state("org-initial-stale-dispatch-cas");
+        let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        let sha = [7u8; 32];
+        state
+            .db
+            .insert_org_share(
+                "stale-dispatch-row",
+                STABLE_ORG_ID,
+                None,
+                Some("local-note"),
+                "note",
+                Some("Title"),
+                1,
+                1,
+                &sha,
+                "2026-08-13T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata(
+                "stale-dispatch-row",
+                STABLE_DOC_ID,
+                "view",
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_shares
+                    SET state = 'failed', last_error = 'initial_post_pending',
+                        expected_actor_user_id = ?2, expected_owner_user_id = ?2,
+                        dispatch_id = 'dispatch-new'
+                  WHERE id = ?1",
+                rusqlite::params!["stale-dispatch-row", actor],
+            )
+            .unwrap();
+        let published = crate::share::org_dto::PublishItemResponse {
+            item_id: "remote-item-old-response".into(),
+            seq: 1,
+            doc_id: Some(STABLE_DOC_ID.into()),
+            access: crate::share::org_dto::OrgItemAccess::View,
+            document_owner_user_id: Some(actor.into()),
+        };
+        assert!(matches!(
+            complete_initial_org_publish_intent(
+                &state,
+                "stale-dispatch-row",
+                &published,
+                actor,
+                actor,
+                STABLE_DOC_ID,
+                crate::share::org_dto::OrgItemAccess::View,
+                1,
+                1,
+                &sha,
+                true,
+                "dispatch-old",
+                "2026-08-13T00:00:01Z",
+            ),
+            Err(AppError::Unavailable(_))
+        ));
+        let row = state
+            .db
+            .get_org_share("stale-dispatch-row")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some("initial_post_pending"));
+        assert_eq!(
+            state
+                .db
+                .org_share_dispatch_id("stale-dispatch-row")
+                .unwrap()
+                .as_deref(),
+            Some("dispatch-new")
+        );
+        assert!(row.item_id.is_none());
+    }
+
+    #[test]
+    fn authoritative_head_pagination_ledgers_each_actual_get_once() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let unrelated_doc = "65cf33ac-21da-4ddb-a97c-572201c29a71";
+            let items = (1..=200)
+                .map(|seq| {
+                    format!(
+                        "{{\"itemId\":\"item-{seq}\",\"seq\":{seq},\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{unrelated_doc}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let first_body = format!("{{\"items\":[{items}],\"nextSeq\":200}}");
+            for (expected_since, body) in [
+                ("sinceSeq=0", first_body),
+                ("sinceSeq=200", "{\"items\":[],\"nextSeq\":200}".to_string()),
+            ] {
+                let (mut get, _) = accept_with_timeout(&listener);
+                let request = read_http_request(&mut get);
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with(&format!(
+                    "GET /v1/orgs/{STABLE_ORG_ID}/items?"
+                )));
+                assert!(request.contains(expected_since));
+                write!(
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                )
+                .unwrap();
+            }
+        });
+
+        let state = build_state("org-head-page-ledger");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        seed_live_session(&state);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        assert!(block_on(authoritative_org_document_head_inner(
+            &state,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+        ))
+        .unwrap()
+        .is_none());
+        server.join().unwrap();
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_head_read")
+                .unwrap(),
+            2,
+            "two actual feed GETs require two distinct durable receipts"
+        );
+        let witnesses: Vec<(i64, i64)> = state
+            .db
+            .lock()
+            .prepare(
+                "SELECT since_seq, page_limit FROM share_egress_log
+                  WHERE kind = 'org_document_head_read' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(witnesses, vec![(0, 200), (200, 200)]);
+    }
+
+    #[test]
+    fn authoritative_head_without_consent_has_no_request_or_receipt() {
+        let state = build_state("org-head-no-consent");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        seed_live_session(&state);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        state.config.lock().unwrap().org_egress_consented = false;
+        state.config.lock().unwrap().share_base_url =
+            format!("http://{}/", listener.local_addr().unwrap());
+
+        let error = block_on(authoritative_org_document_head_inner(
+            &state,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+        ))
+        .expect_err("recovery reads must fail closed without live org consent");
+        assert!(matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] ")));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_head_read")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn initial_post_409_recovers_only_the_exact_authoritative_head() {
+        use std::io::{Read, Write};
+
+        fn read_http_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
+            // `accept_with_timeout` polls a nonblocking listener. An accepted stream may inherit
+            // that mode, so restore blocking I/O before applying the bounded read timeout; otherwise
+            // a scheduled full-suite run can fail immediately with `WouldBlock` mid-request.
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let mut expected = None;
+            loop {
+                let n = socket.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if expected.is_none() {
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers.lines().find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        });
+                        expected = Some(end + 4 + len.unwrap_or(0));
+                    }
+                }
+                if expected.is_some_and(|len| request.len() >= len) {
+                    break;
+                }
+            }
+            request
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut post, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut post);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert!(json.get("mutationId").is_none(), "old strict relay rejects even a null mutationId");
+            let doc_id = json["docId"].as_str().unwrap().to_string();
+            let sha = json["contentSha256"].as_str().unwrap().to_string();
+            write!(
+                post,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let (mut get, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            let body = format!(
+                    "{{\"items\":[{{\"itemId\":\"item-recovered\",\"seq\":7,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":7}}"
+                );
+            write!(
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            doc_id
+        });
+
+        let state = build_state("org-initial-post-409-recovery");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-409", "Recovery");
+        state
+            .db
+            .insert_note("n-409", "f-409", "n-409", "Recovered", "body", 1)
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-409".into()),
+            true,
+        ));
+        // Always reap the bounded mock server before surfacing a command failure. This preserves
+        // the missing-request oracle while preventing an early unwrap from detaching the thread.
+        let doc_id = server.join().unwrap();
+        let entry = entry.unwrap();
+        assert_eq!(entry.item_id.as_deref(), Some("item-recovered"));
+        let row = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.item_id.as_deref(), Some("item-recovered"));
+        assert_eq!(row.doc_id.as_deref(), Some(doc_id.as_str()));
+        assert_eq!(row.state, "uploaded");
+    }
+
+    #[test]
+    fn initial_post_head_with_different_access_remains_conflicted() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut post, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut post);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json["access"], "view");
+            let doc_id = json["docId"].as_str().unwrap();
+            let sha = json["contentSha256"].as_str().unwrap();
+            write!(
+                post,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let (mut get, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut get);
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"different-access\",\"seq\":7,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":7}}"
+            );
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-initial-post-access-mismatch");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-access", "Recovery");
+        state
+            .db
+            .insert_note("n-access", "f-access", "n-access", "Title", "body", 1)
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        let result = block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-access".into()),
+            true,
+        ));
+        server.join().unwrap();
+        assert!(matches!(result, Err(AppError::InvalidArg(_))));
+        let row = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some(ORG_SHARE_ERR_EDIT_CONFLICT));
+        assert_eq!(row.access, "view");
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+    }
+
+    #[test]
+    fn initial_post_lost_then_newer_current_head_remains_inconclusive() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut post, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut post);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert!(json.get("mutationId").is_none());
+            let doc_id = json["docId"].as_str().unwrap().to_string();
+            write!(
+                post,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let newer = format!(
+                "{{\"items\":[{{\"itemId\":\"newer-head\",\"seq\":8,\"authorUserId\":\"other\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":8}}",
+                murmur_protocol::b64::encode(&[4u8; 32]),
+            );
+            for _ in 0..2 {
+                let (mut get, _) = accept_with_timeout(&listener);
+                let request = read_http_request(&mut get);
+                assert!(String::from_utf8_lossy(&request)
+                    .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+                write!(
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    newer.len(),
+                    newer,
+                )
+                .unwrap();
+            }
+        });
+
+        let state = build_state("org-initial-newer-inconclusive");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-newer", "Recovery");
+        state
+            .db
+            .insert_note("n-newer", "f-newer", "n-newer", "Title", "body", 1)
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        assert!(matches!(
+            block_on(share_to_org_inner(
+                &state,
+                STABLE_ORG_ID,
+                None,
+                Some("n-newer".into()),
+                true,
+            )),
+            Err(AppError::Unavailable(_))
+        ));
+        let before = state.db.list_org_shares_in_state("failed").unwrap().remove(0);
+        assert_eq!(before.last_error.as_deref(), Some("initial_post_pending"));
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+        server.join().unwrap();
+        let after = state.db.get_org_share(&before.id).unwrap().unwrap();
+        assert_eq!(after.last_error.as_deref(), Some("initial_post_pending"));
+        assert_eq!(after.content_sha256, before.content_sha256);
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("org_document_head_read").unwrap(), 2);
+    }
+
+    #[test]
+    fn initial_post_lost_then_local_edit_recovers_original_witness_by_get_only() {
+        use std::io::Write;
+
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let first_server = std::thread::spawn(move || {
+            let (mut post, _) = accept_with_timeout(&first);
+            let request = read_http_request(&mut post);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
+            drop(post);
+            let (mut get, _) = accept_with_timeout(&first);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            write!(
+                get,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-initial-post-original-witness");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-initial-witness", "Witness");
+        state
+            .db
+            .insert_note(
+                "n-initial-witness",
+                "f-initial-witness",
+                "initial-witness",
+                "Title",
+                "original body",
+                1,
+            )
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{first_addr}/");
+        assert!(block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-initial-witness".into()),
+            true,
+        ))
+        .is_err());
+        first_server.join().unwrap();
+        let pending = state
+            .db
+            .list_org_shares_in_state("failed")
+            .unwrap()
+            .remove(0);
+        assert_eq!(pending.last_error.as_deref(), Some("initial_post_pending"));
+        let original_hash = pending.content_sha256.clone().unwrap();
+        let doc_id = pending.doc_id.clone().unwrap();
+        update_note_doc_inner(&state, "n-initial-witness", "Title", "newer local body").unwrap();
+        assert_eq!(
+            state.db.get_org_share(&pending.id).unwrap().unwrap().content_sha256,
+            Some(original_hash.clone()),
+            "a later local edit must not overwrite the ambiguous POST witness"
+        );
+
+        let sha = murmur_protocol::b64::encode(&original_hash);
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let second_server = std::thread::spawn(move || {
+            let (mut get, _) = accept_with_timeout(&second);
+            let request = read_http_request(&mut get);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"initial-original\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":1}}"
+            );
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{second_addr}/");
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
+        second_server.join().unwrap();
+        let recovered = state.db.get_org_share(&pending.id).unwrap().unwrap();
+        assert_eq!(recovered.state, "failed");
+        assert_eq!(
+            recovered.last_error.as_deref(),
+            Some("projection_pending"),
+            "the original POST is confirmed without projecting stale plaintext over the newer source"
+        );
+        assert_eq!(recovered.item_id.as_deref(), Some("initial-original"));
+        assert_eq!(recovered.content_sha256, Some(original_hash));
+        assert!(
+            recovered.republish_dirty > 0,
+            "the newer source remains durably scheduled after the original POST is confirmed"
+        );
+    }
+
+    #[test]
+    fn collaborator_advanced_head_is_terminal_even_when_head_scan_is_unavailable() {
+        use std::io::{Read, Write};
+
+        let initial = MockOrgServer::start();
+        let state = build_state("org-collaborator-head-conflict");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-conflict", "Conflict");
+        state
+            .db
+            .insert_note("n-conflict", "f-conflict", "n-conflict", "Title", "v1", 1)
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = initial.base.clone();
+        block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-conflict".into()),
+            true,
+        ))
+        .unwrap();
+        let before = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        let doc_id = before.doc_id.clone().unwrap();
+        drop(initial);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let doc_for_server = doc_id.clone();
+        let server = std::thread::spawn(move || {
+            let (mut put, _) = accept_with_timeout(&listener);
+            let mut request = [0u8; 16384];
+            let n = put.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n])
+                .starts_with(&format!(
+                    "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{doc_for_server}"
+                )));
+            write!(
+                put,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        update_note_doc_inner(&state, "n-conflict", "Title", "v2 local").unwrap();
+        assert_eq!(
+            block_on(republish_org_shares_for_source(
+                &state,
+                None,
+                Some("n-conflict")
+            ))
+            .unwrap(),
+            0
+        );
+        server.join().unwrap();
+
+        let conflicted = state.db.get_org_share(&before.id).unwrap().unwrap();
+        assert_eq!(conflicted.state, "failed");
+        assert_eq!(
+            conflicted.last_error.as_deref(),
+            Some(ORG_SHARE_ERR_EDIT_CONFLICT)
+        );
+        assert_eq!(conflicted.item_id, before.item_id);
+        assert_eq!(conflicted.rev, before.rev + 1);
+        assert_ne!(conflicted.content_sha256, before.content_sha256);
+        assert!(conflicted.scrub, "the terminal draft retains forced scrub intent");
+        let surfaced =
+            org_live_shares_for_source_inner(&state, None, Some("n-conflict")).unwrap();
+        assert_eq!(surfaced.len(), 1);
+        assert!(surfaced[0].conflicted);
+        assert_eq!(surfaced[0].item_id, before.item_id);
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+    }
+
+    #[test]
+    fn publish_response_without_doc_id_is_ambiguous_and_stays_pending() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut publish, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut publish);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
+            let body = "{\"itemId\":\"legacy-item\",\"seq\":1,\"access\":\"view\"}";
+            write!(
+                publish,
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+
+            let (mut reconcile, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut reconcile);
+            assert!(String::from_utf8_lossy(&request)
+                .starts_with(&format!(
+                    "GET /v1/orgs/{STABLE_ORG_ID}/items?sinceSeq=0&limit=200"
+                )));
+            let body = r#"{"items":[],"nextSeq":0}"#;
+            write!(
+                reconcile,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-publish-legacy-response");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-legacy", "Legacy");
+        state
+            .db
+            .insert_note("n-legacy", "f-legacy", "n-legacy", "Legacy", "body", 1)
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        let error = block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-legacy".into()),
+            true,
+        ))
+        .expect_err("a stable publish without docId needs authenticated reconciliation");
+        assert!(matches!(error, AppError::Unavailable(message) if message == "org publish outcome is pending authenticated reconciliation"));
+        server.join().unwrap();
+        let row = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some("initial_post_pending"));
+        assert!(row.item_id.is_none());
+        assert!(row.doc_id.is_some(), "retain the stable identity needed to reconcile");
+        assert_eq!(row.access, "view");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1,
+            "the admitted POST is ledgered exactly once"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            0,
+            "an ambiguous create must not invent a legacy tombstone attempt"
+        );
+    }
+
+    #[test]
+    fn legacy_republish_head_with_different_access_remains_conflicted() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut initial, _) = accept_with_timeout(&listener);
+            let initial_request = read_http_request(&mut initial);
+            assert!(String::from_utf8_lossy(&initial_request)
+                .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
+            let body_at = initial_request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let initial_json: serde_json::Value =
+                serde_json::from_slice(&initial_request[body_at..]).unwrap();
+            let initial_doc_id = initial_json["docId"].as_str().unwrap();
+            let initial_body = format!(
+                r#"{{"itemId":"legacy-old","seq":1,"docId":"{initial_doc_id}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
+            );
+            write!(
+                initial,
+                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                initial_body.len(),
+                initial_body
+            )
+            .unwrap();
+
+            let (mut republish, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut republish);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json["access"], "view");
+            assert_eq!(json["rev"], 2);
+            let doc_id = json["docId"].as_str().unwrap();
+            let sha = json["contentSha256"].as_str().unwrap();
+            write!(
+                republish,
+                "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+
+            let (mut get, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut get);
+            let body = format!(
+                "{{\"items\":[{{\"itemId\":\"legacy-wrong-access\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
+            );
+            write!(
+                get,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let state = build_state("org-legacy-republish-access-mismatch");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-legacy-access", "Legacy");
+        state
+            .db
+            .insert_note(
+                "n-legacy-access",
+                "f-legacy-access",
+                "legacy",
+                "Legacy",
+                "v1",
+                1,
+            )
+            .unwrap();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-legacy-access".into()),
+            true,
+        ))
+        .unwrap();
+        let initial_row = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        state
+            .db
+            .clear_org_share_document_metadata(&initial_row.id)
+            .unwrap();
+        update_note_doc_inner(&state, "n-legacy-access", "Legacy", "v2").unwrap();
+        assert_eq!(
+            block_on(republish_org_shares_for_source(
+                &state,
+                None,
+                Some("n-legacy-access")
+            ))
+            .unwrap(),
+            0
+        );
+        server.join().unwrap();
+        let row = state
+            .db
+            .list_org_shares_for_org(STABLE_ORG_ID)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.item_id.as_deref(), Some("legacy-old"));
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some(ORG_SHARE_ERR_EDIT_CONFLICT));
+        assert_eq!(row.access, "view");
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+    }
+
     /// ITEM 1 — the core republish-on-edit assertion. Share a DOC to a mock org (item rev 1, one
     /// `uploaded` `org_shares` row), then EDIT the note body → the edit re-publishes as a NEW item at
     /// rev 2, the SAME single org_shares row is repointed (new item_id, rev==2, new content hash), the
-    /// OLD item is tombstoned, and the egress ledger carries a publish+revoke pair. RED on the old code
+    /// stable document head advances by CAS without a separate legacy tombstone. RED on the old code
     /// (no edit path re-published → org copy frozen at rev 1); GREEN after.
     #[test]
-    fn republish_bumps_rev_and_tombstones_old_on_edit() {
+    fn republish_bumps_rev_via_stable_document_cas_on_edit() {
         let mock = MockOrgServer::start();
         let state = build_state("org-republish-edit");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-rp", "Team");
         state
             .db
@@ -21578,12 +24731,12 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         // Initial share → item-1, rev 1, one uploaded row.
         let entry = block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-rp".to_string()),
             true,
@@ -21591,7 +24744,7 @@
         .expect("initial share should publish against the mock server");
         assert_eq!(entry.rev, 1, "first share is rev 1");
         assert_eq!(entry.item_id.as_deref(), Some("item-1"));
-        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        let rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(
             rows.len(),
             1,
@@ -21614,7 +24767,7 @@
         block_on(republish_org_shares_for_source(&state, None, Some("n-rp"))).unwrap();
 
         // The edit superseded the org item: a NEW item published, rev bumped, SAME row repointed.
-        let after = state.db.list_org_shares_for_org("org-1").unwrap();
+        let after = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(
             after.len(),
             1,
@@ -21632,19 +24785,16 @@
             "content hash changed (the body was edited)"
         );
 
-        // The mock server saw two publishes and the OLD item tombstoned.
+        // The mock server saw create + stable CAS update. The document route supersedes the old
+        // revision server-side, so the client must not issue a separate legacy item tombstone.
         let log = mock.log.lock().unwrap();
         assert_eq!(
             log.published,
             vec!["item-1".to_string(), "item-2".to_string()]
         );
-        assert_eq!(
-            log.tombstoned,
-            vec!["item-1".to_string()],
-            "the OLD item (item-1) was tombstoned so members evict the stale copy"
-        );
+        assert!(log.tombstoned.is_empty());
 
-        // Egress ledger: two publishes + one revoke (all content-free).
+        // Egress ledger: create + CAS update, with no separate legacy revoke.
         assert_eq!(
             state
                 .db
@@ -21657,7 +24807,8 @@
                 .db
                 .count_share_egress_by_kind("org_share_revoke")
                 .unwrap(),
-            1
+            0,
+            "stable CAS supersedes the old revision server-side without a DELETE attempt"
         );
     }
 
@@ -21670,7 +24821,7 @@
     fn initial_share_populates_local_org_items_replica_immediately() {
         let mock = MockOrgServer::start();
         let state = build_state("org-initial-share-replica");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-sh", "Team");
         state
             .db
@@ -21680,11 +24831,11 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         let entry = block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-sh".to_string()),
             true,
@@ -21694,7 +24845,7 @@
 
         // The local replica must ALREADY hold the item — no feed pull has happened. This is exactly what
         // makes the shared note show up without a manual "Sync now".
-        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let items = list_org_items_inner(&state, STABLE_ORG_ID).unwrap();
         assert_eq!(
             items.len(),
             1,
@@ -21716,7 +24867,7 @@
     fn republish_refuses_when_folder_locked() {
         let mock = MockOrgServer::start();
         let state = build_state("org-republish-locked");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-lk", "Team");
         state
             .db
@@ -21725,11 +24876,11 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-lk".to_string()),
             true,
@@ -21745,7 +24896,7 @@
         // Republish directly (an edit would be gated too; here we exercise the republish skip path).
         block_on(republish_org_shares_for_source(&state, None, Some("n-lk"))).unwrap();
 
-        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        let rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].rev, 1,
@@ -21770,7 +24921,7 @@
     fn republish_noop_when_content_unchanged() {
         let mock = MockOrgServer::start();
         let state = build_state("org-republish-noop");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-nc", "Team");
         state
             .db
@@ -21779,11 +24930,11 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-nc".to_string()),
             true,
@@ -21798,7 +24949,7 @@
         update_note_doc_inner(&state, "n-nc", "Plan", "# same body").unwrap();
         block_on(republish_org_shares_for_source(&state, None, Some("n-nc"))).unwrap();
 
-        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        let rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(rows[0].rev, 1, "no rev bump on unchanged content");
         assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
         assert_eq!(
@@ -21822,12 +24973,13 @@
     }
 
     /// ITEM 6 — the MEETING arm: share a MEETING note → edit the meeting note via `update_note` → the
-    /// same supersede (new item rev 2, repointed row, old item tombstoned) fires for the meeting path.
+    /// same stable CAS supersede (new item rev 2, repointed row, no legacy tombstone) fires for the
+    /// meeting path.
     #[test]
-    fn republish_meeting_note_bumps_rev_and_tombstones_old() {
+    fn republish_meeting_note_bumps_rev_via_stable_document_cas() {
         let mock = MockOrgServer::start();
         let state = build_state("org-republish-meeting");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-mtg", "Team");
         state
             .db
@@ -21860,11 +25012,11 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             Some("m-rp".to_string()),
             None,
             true,
@@ -21875,7 +25027,7 @@
         update_note_inner(&state, "m-rp", "# meeting note EDITED").unwrap();
         block_on(republish_org_shares_for_source(&state, Some("m-rp"), None)).unwrap();
 
-        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        let rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(rows.len(), 1, "one repointed row for the meeting share");
         assert_eq!(rows[0].rev, 2, "meeting republish bumped rev to 2");
         assert_eq!(rows[0].item_id.as_deref(), Some("item-2"));
@@ -21885,12 +25037,12 @@
             log.published,
             vec!["item-1".to_string(), "item-2".to_string()]
         );
-        assert_eq!(log.tombstoned, vec!["item-1".to_string()]);
+        assert!(log.tombstoned.is_empty());
     }
 
     /// STUCK-REPUBLISH FIX (the sweep side): `org_sweep_pending_inner` retries a `failed` row that
     /// STILL carries an `item_id` (a republish that failed transiently, leaving the OLD publish live)
-    /// via `republish_org_shares_for_source` — which SUPERSEDES (new item, bumped rev, old tombstoned)
+    /// via `republish_org_shares_for_source` — which CAS-SUPERSEDES (new item, bumped rev)
     /// — rather than via `share_to_org_inner`, which would wrongly restart at `rev = 1` and mint a
     /// DUPLICATE item alongside the still-live stuck one. Sequence: (1) share n-sw successfully
     /// (item-1, rev 1); (2) evict the cached OCK so the NEXT OCK acquire 404s against the mock server
@@ -21902,7 +25054,7 @@
     fn org_sweep_pending_retries_stuck_failed_rows_via_republish_not_fresh_share() {
         let mock = MockOrgServer::start();
         let state = build_state("org-sweep-stuck-republish");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-sw", "Team");
         state
             .db
@@ -21911,34 +25063,36 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         // (1) Initial share succeeds: item-1, rev 1, one uploaded row.
         let entry = block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-sw".to_string()),
             true,
         ))
         .expect("initial share should publish against the mock server");
         assert_eq!(entry.item_id.as_deref(), Some("item-1"));
-        let row_id = state.db.list_org_shares_for_org("org-1").unwrap()[0]
+        let row_id = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap()[0]
             .id
             .clone();
 
         // Edit the note so the republish has new content to publish.
         update_note_doc_inner(&state, "n-sw", "Plan", "# EDITED body").unwrap();
 
-        // (2) Evict the OCK cache so the republish's `acquire_org_ock` cache-misses and hits the
-        // (unmocked) key-grants endpoint, which 404s → deterministic republish failure.
-        state.org_ock_cache.lock().unwrap().clear();
-        let republished =
-            block_on(republish_org_shares_for_source(&state, None, Some("n-sw"))).unwrap();
-        assert_eq!(
-            republished, 0,
-            "the forced OCK failure republished nothing this call"
-        );
+        // (2) Seed the crash-recovery shape directly. Pre-dispatch failures intentionally avoid a
+        // stale unconditional row rewrite; this oracle owns only the sweep contract for a durable
+        // failed row whose predecessor remains remotely live.
+        state
+            .db
+            .set_org_share_failed(
+                &row_id,
+                "seal_failed",
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
         let stuck = state.db.get_org_share(&row_id).unwrap().unwrap();
         assert_eq!(stuck.state, "failed", "the row landed in failed state");
         assert_eq!(
@@ -21952,7 +25106,7 @@
         );
 
         // (3) The transient blip clears (OCK re-seeded) — run the sweep.
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
         let advanced = block_on(org_sweep_pending_inner(&state)).unwrap();
         assert_eq!(advanced, 1, "the sweep advanced the stuck row");
 
@@ -21971,25 +25125,21 @@
             "the row was repointed to a NEW item that SUPERSEDES item-1"
         );
         // Still exactly ONE org_shares row for this source — no duplicate row was minted.
-        let all_rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        let all_rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(
             all_rows.len(),
             1,
             "no duplicate org_shares row for the source"
         );
 
-        // The mock server saw item-1 published, then item-2 published, then item-1 tombstoned — the
-        // supersede sequence, NOT a second independent rev-1 publish with item-1 left live forever.
+        // The mock server saw item-1 created then item-2 CAS-replace the same document. No separate
+        // legacy tombstone is sent for a stable document.
         let log = mock.log.lock().unwrap();
         assert_eq!(
             log.published,
             vec!["item-1".to_string(), "item-2".to_string()]
         );
-        assert_eq!(
-            log.tombstoned,
-            vec!["item-1".to_string()],
-            "the OLD stuck item was tombstoned once the new one superseded it"
-        );
+        assert!(log.tombstoned.is_empty());
     }
 
     /// Brain v3 ORG PUSH SIZE PRE-CHECK (RED-before-GREEN): the server hard-caps an org item blob
@@ -22002,7 +25152,7 @@
     fn oversized_org_share_fails_terminal_too_large_and_sweep_never_requeues() {
         let mock = MockOrgServer::start();
         let state = build_state("org-share-too-large");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-big", "Team");
         // Each individual canonical field stays within the parser's 8 MiB field bound, while title
         // + markdown + framing exceed the 16 MiB sealed-item cap. This reaches the intended
@@ -22016,12 +25166,12 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         // The share is refused client-side: no blob upload, no publish, terminal reason on the row.
         let res = block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-big".to_string()),
             true,
@@ -22030,7 +25180,7 @@
             res.is_err(),
             "an oversized share is refused before any egress"
         );
-        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        let rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(rows.len(), 1, "exactly one local row records the refusal");
         assert_eq!(rows[0].state, "failed");
         assert_eq!(
@@ -22048,7 +25198,7 @@
         // The launch sweep must NOT requeue it (RED pre-fix: every failed row was re-attempted).
         let advanced = block_on(org_sweep_pending_inner(&state)).unwrap();
         assert_eq!(advanced, 0, "too_large is TERMINAL for the sweep");
-        let row = &state.db.list_org_shares_for_org("org-1").unwrap()[0];
+        let row = &state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap()[0];
         assert_eq!(row.state, "failed", "the row is left exactly where it was");
         assert_eq!(row.last_error.as_deref(), Some(ORG_SHARE_ERR_TOO_LARGE));
         // Binds the sweep EXCLUSION itself (not just the client-side refusal): a re-ATTEMPT would
@@ -22061,6 +25211,17 @@
             mock.log.lock().unwrap().published.is_empty(),
             "the sweep produced no egress for the oversized row"
         );
+
+        update_note_doc_inner(&state, "n-big", "Small", "now within the relay cap").unwrap();
+        assert_eq!(
+            block_on(republish_org_shares_for_source(&state, None, Some("n-big"))).unwrap(),
+            1,
+            "a later full save is the sole retry trigger and publishes the shrunken source"
+        );
+        let healed = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(healed.len(), 1);
+        assert_eq!(healed[0].state, "uploaded");
+        assert_eq!(mock.log.lock().unwrap().published.len(), 1);
     }
 
     /// ITEM 2 — `org_resolve_source` maps an uploaded org item back to its LOCAL editable source, and
@@ -22069,7 +25230,7 @@
     fn org_resolve_source_maps_item_to_local_source() {
         let mock = MockOrgServer::start();
         let state = build_state("org-resolve-source");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         make_open_folder(&state.db, "f-rs", "Team");
         state
             .db
@@ -22078,11 +25239,11 @@
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
+        seed_ock(&state, STABLE_ORG_ID, 1);
 
         let entry = block_on(share_to_org_inner(
             &state,
-            "org-1",
+            STABLE_ORG_ID,
             None,
             Some("n-rs".to_string()),
             true,
@@ -22108,7 +25269,12 @@
     #[test]
     fn org_resolve_source_resolves_stuck_failed_rows_but_not_revoked() {
         let state = build_state("org-resolve-source-stuck");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-stuck-source", "Stuck source");
+        state
+            .db
+            .insert_note("n-stuck", "f-stuck-source", "stuck", "Stuck", "body", 1)
+            .unwrap();
         let now = "2026-07-12T00:00:00Z";
 
         // A row that published successfully once, then a REPUBLISH attempt failed — item_id retained.
@@ -22116,7 +25282,7 @@
             .db
             .insert_org_share(
                 "s-stuck",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n-stuck"),
                 "note",
@@ -22148,7 +25314,7 @@
             .db
             .insert_org_share(
                 "s-revoked",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n-revoked"),
                 "note",
@@ -22218,37 +25384,132 @@
         );
     }
 
-    /// F2 (HARDENING, RED→GREEN): an EMPTY server membership list must NOT wipe all local org replicas.
-    /// `reconcile_org_state_into_db` with an empty target set but a NON-empty local set removes NOTHING
-    /// (a `{"orgs":[]}` from a buggy/hostile/transient server would otherwise purge every local org).
-    /// RED on the pre-fix reconcile (it removed both local orgs = `removed == 2`, both gone); GREEN
-    /// after the empty-server guard (removed == 0, both cached rows kept). A non-empty list omitting a
-    /// SPECIFIC org (the real leave/remove case) still removes it — asserted by
-    /// `reconcile_adds_invited_org_and_removes_departed`.
+    /// An authenticated empty membership list is authoritative: the sole departed org, its
+    /// decrypted replica/retrieval rows/private links and its RAM OCK must all disappear. Network
+    /// failures are handled before this pure reconcile core and therefore cannot masquerade as `[]`.
     #[test]
-    fn reconcile_empty_server_list_keeps_local_orgs() {
+    fn reconcile_authenticated_empty_server_list_purges_the_sole_local_org() {
         let state = build_state("org-reconcile-empty");
-        seed_org(&state.db, "org-a", "A", "owner", 1);
-        seed_org(&state.db, "org-b", "B", "member", 1);
-
-        // Server returns an EMPTY membership list (suspicious while we HAVE local orgs).
-        let server: Vec<crate::share::org_dto::OrgSummary> = Vec::new();
-        let outcome = reconcile_org_state_into_db(&state, &server).unwrap();
-
-        assert_eq!(
-            outcome.removed, 0,
-            "an empty server list removes NOTHING (RED on the pre-fix wipe)"
+        let org_id = "11111111-1111-4111-8111-111111111111";
+        let doc_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        seed_org(&state.db, org_id, "A", "owner", 1);
+        state
+            .db
+            .upsert_org_item(
+                "item-a",
+                org_id,
+                1,
+                "owner",
+                "Secret title",
+                "secret body",
+                "2026-08-12T00:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                None,
+                Some("owner"),
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_item_document_metadata("item-a", Some(doc_id), "view", Some("owner"))
+            .unwrap();
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                "item-a",
+                org_id,
+                1,
+                Some(doc_id),
+                "view",
+                Some("owner"),
+                true,
+            )
+            .unwrap();
+        make_open_folder(&state.db, "f-anchor", "Visible anchor");
+        seed_meeting(
+            &state.db,
+            "local-anchor",
+            "# Local anchor",
+            Some("f-anchor"),
         );
+        state
+            .db
+            .upsert_manual_link(
+                "org",
+                &format!("{org_id}:{doc_id}"),
+                "meeting",
+                "local-anchor",
+            )
+            .unwrap();
+        state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .insert((org_id.into(), 1), Zeroizing::new([9u8; 32]));
+        state
+            .db
+            .persist_ask_exchange(
+                &crate::storage::models::AskConversationScope::Vault,
+                None,
+                "question",
+                "derived answer",
+                &[],
+                &[],
+                &[],
+                &[],
+                "2026-08-12T00:00:00Z",
+            )
+            .unwrap();
+
+        let outcome = reconcile_org_state_into_db_corroborated_empty(&state).unwrap();
+
+        assert_eq!(outcome.removed, 1);
         assert!(outcome.new_orgs.is_empty());
-        // Both local replicas are still present (not purged by an empty/transient server response).
-        assert!(
-            state.db.get_org_state("org-a").unwrap().is_some(),
-            "org-a kept"
+        assert!(state.db.get_org_state(org_id).unwrap().is_none());
+        assert!(state.db.get_org_item("item-a").unwrap().is_none());
+        let conn = state.db.lock();
+        let counts: (i64, i64, i64, i64, i64) = (
+            conn.query_row("SELECT COUNT(*) FROM org_chunks", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM org_vec_chunks", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM fts_org_chunks", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM links WHERE src_kind = 'org' OR dst_kind = 'org'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM ask_conversations", [], |r| r.get(0))
+                .unwrap(),
+        );
+        drop(conn);
+        assert_eq!(
+            counts,
+            (0, 0, 0, 1, 0),
+            "membership removal purges decrypted material but preserves the user's opaque private link"
         );
         assert!(
-            state.db.get_org_state("org-b").unwrap().is_some(),
-            "org-b kept"
+            state
+                .db
+                .links_for_visible(
+                    crate::links::LinkKind::Org,
+                    &format!("{org_id}:{doc_id}"),
+                    &std::collections::HashSet::new(),
+                )
+                .unwrap()
+                .is_empty(),
+            "the preserved private relation must remain completely withheld without membership"
         );
+        assert!(state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|(cached_org, _)| cached_org != org_id));
     }
 
     /// REGRESSION (2026-07-11 live 404): org key-grants MUST key on the stable SERVER USER ID (a UUID),
@@ -22281,6 +25542,160 @@
         set_session(None);
         assert!(matches!(
             session_server_user_id(&state),
+            Err(AppError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn paused_org_status_cannot_cross_leave_rejoin_same_generation_aba() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let body = r#"{"orgId":"org-race","name":"Stale","role":"member","createdAt":"2026-08-12T00:00:00Z","currentGeneration":1}"#;
+            write!(
+                            socket,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .unwrap();
+        });
+
+        let state = Arc::new(build_state("org-status-removal-race"));
+        seed_org(&state.db, "org-race", "Before", "member", 1);
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        let local = state.db.get_org_state("org-race").unwrap().unwrap();
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || block_on(org_status_for(&worker_state, local)));
+
+        seen_rx.recv().unwrap();
+        reconcile_org_state_into_db_corroborated_empty(&state).unwrap();
+        // Rejoin with the exact historical generation/context before the stale response lands.
+        // Only the lifecycle seal epoch distinguishes this membership from the one admitted above.
+        seed_org(&state.db, "org-race", "Rejoined", "member", 1);
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        server.join().unwrap();
+        assert_eq!(
+            state
+                .db
+                .get_org_state("org-race")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Rejoined"
+        );
+        assert!(state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|(org_id, _)| org_id != "org-race"));
+    }
+
+    #[test]
+    fn paused_org_grant_cannot_cross_leave_rejoin_same_generation_aba() {
+        use std::io::{Read, Write};
+
+        let state = Arc::new(build_state("org-grant-removal-race"));
+        seed_org(&state.db, "org-race", "Before", "member", 1);
+        seed_live_session(&state);
+        let account = "user@example.com";
+        let recipient = crate::e2ee::keys::derive_identity(&[7u8; 32], account, 1).unwrap();
+        let fp = crate::e2ee::key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let ock = [9u8; 32];
+        let grant = crate::e2ee::org::wrap_ock_for_member(
+            &ock,
+            "org-race",
+            1,
+            &recipient.pk_enc,
+            &fp,
+            &recipient,
+            &fp,
+            1,
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "grants": [{
+                "userId": "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+                "generation": 1,
+                "wrappedKey": murmur_protocol::b64::encode(&grant.wrapped_key),
+                "grantSig": murmur_protocol::b64::encode(&grant.grant_sig),
+                "createdAt": "2026-08-12T00:00:00Z"
+            }]
+        })
+        .to_string();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            write!(
+                            socket,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .unwrap();
+        });
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            block_on(acquire_org_ock_for_test(&worker_state, "org-race", 1))
+        });
+
+        seen_rx.recv().unwrap();
+        reconcile_org_state_into_db_corroborated_empty(&state).unwrap();
+        // Same generation/context is intentionally valid for historical reads after a genuine
+        // rejoin, but it cannot authorize this pre-leave in-flight grant response.
+        seed_org(&state.db, "org-race", "Rejoined", "member", 1);
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        server.join().unwrap();
+        assert_eq!(
+            state
+                .db
+                .get_org_state("org-race")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Rejoined"
+        );
+        assert!(state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|(org_id, _)| org_id != "org-race"));
+    }
+
+    #[test]
+    fn historical_org_key_requires_live_membership_and_context_not_current_generation_equality() {
+        let state = build_state("org-historical-key-admission");
+        seed_org(&state.db, "org-1", "Acme", "member", 2);
+        seed_ock(&state, "org-1", 1);
+
+        let historical = block_on(acquire_org_ock_for_test(&state, "org-1", 1)).unwrap();
+        assert_eq!(*historical, [9u8; 32]);
+
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(matches!(
+            block_on(acquire_org_ock_for_test(&state, "org-1", 1)),
             Err(AppError::Unavailable(_))
         ));
     }
@@ -22468,22 +25883,55 @@
             "destructive folder enumeration must include the legacy generic-failed NULL identity: {active:?}"
         );
         assert_eq!(active[0].0.as_deref(), Some("item-stuck"));
-        assert!(
-            active.iter().any(|(item_id, _)| item_id.is_none()),
-            "the second active row must be the ambiguous NULL-item legacy share: {active:?}"
-        );
+        assert!(active.iter().any(|(item_id, _)| item_id.is_none()));
 
         // Same fix must apply to the bulk-revoke enumeration (`revoke_shares_for_folder`'s source).
         let ids = state.db.active_org_share_ids_for_folder("f1").unwrap();
-        assert_eq!(
-            ids.len(),
-            2,
-            "bulk revoke must see both the known-live and ambiguous legacy rows: {ids:?}"
-        );
+        assert_eq!(ids.len(),2,"bulk revoke must see both live and ambiguous legacy rows: {ids:?}");
         assert_eq!(ids[0].0, "s-stuck");
         assert_eq!(ids[0].1.as_deref(), Some("item-stuck"));
         assert_eq!(ids[1].0, "s-dead");
         assert_eq!(ids[1].1, None);
+    }
+
+    #[test]
+    fn lock_lifecycle_recheck_refuses_share_moved_into_folder_after_precheck() {
+        let state = build_state("lock-org-share-second-check");
+        make_open_folder(&state.db,"f-target","Target");
+        seed_meeting(&state.db,"m-moved","# body",Some("f-target"));
+        assert!(state.db.active_org_share_ids_for_folder("f-target").unwrap().is_empty());
+        state.db.insert_org_share(
+            "moved-share","org-1",Some("m-moved"),None,"meeting",Some("Moved"),
+            1,1,&[2u8;32],"t",
+        ).unwrap();
+        let error = lock_folder_inner(&state,"f-target".into()).unwrap_err();
+        assert!(matches!(error,AppError::Unavailable(_)));
+        assert!(!state.db.folder_by_id("f-target").unwrap().unwrap().locked);
+    }
+
+    #[test]
+    fn folder_share_enumerator_is_unique_for_multi_provider_meeting() {
+        let state = build_state("folder-org-multi-provider");
+        make_open_folder(&state.db,"f-multi","Team");
+        seed_meeting(&state.db,"m-multi","# first",Some("f-multi"));
+        state.db.upsert_note(&NoteRecord {
+            meeting_id: "m-multi".into(),
+            provider_id: "ollama".into(),
+            markdown: "# second".into(),
+            created_at: "2026-08-14T00:00:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        }).unwrap();
+        state.db.set_note_folder("m-multi",Some("f-multi")).unwrap();
+        state.db.insert_org_share(
+            "one-share","org-1",Some("m-multi"),None,"meeting",Some("Meeting"),
+            1,1,&[3u8;32],"t",
+        ).unwrap();
+        let rows = state.db.active_org_share_ids_for_folder("f-multi").unwrap();
+        assert_eq!(rows.len(),1,"EXISTS folder ownership must not duplicate one share per provider");
+        assert_eq!(rows[0].0,"one-share");
     }
 
     /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
@@ -22551,7 +25999,7 @@
         state
             .db
             .insert_outbound_user_share(
-                "usr-sent", "m1", 1, "t", "sent", b"nk", "acct-1", "a@x.com", b"hash",
+                "usr-sent", "m1", 1, "t", "sent", b"nk", "acct-1", "a@x.com", b"hash", "owner",
             )
             .unwrap();
         state
@@ -22566,6 +26014,7 @@
                 "acct-2",
                 "b@x.com",
                 b"hash",
+                "owner",
             )
             .unwrap();
         // f2/m2: a share in ANOTHER folder must not leak into f1's report.
@@ -22576,10 +26025,10 @@
 
         let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
         assert_eq!(
-                shares.len(),
-                3,
-                "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
-            );
+                            shares.len(),
+                            3,
+                            "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
+                        );
         let links = shares.iter().filter(|(_, m)| m == "link").count();
         let users = shares.iter().filter(|(_, m)| m == "user").count();
         assert_eq!(
@@ -22599,6 +26048,68 @@
             shares.iter().all(|(id, _)| id != "old" && id != "f2lnk"),
             "revoked + other-folder shares excluded"
         );
+    }
+
+    #[test]
+    fn lock_final_recheck_refuses_live_link_or_user_share() {
+        let state = build_state("lock-link-user-share");
+        make_open_folder(&state.db, "shared-folder", "Shared");
+        state.db.insert_meeting(&Meeting {
+            id: "m-shared-link".into(),
+            started_at: "2026-08-14T12:00:00Z".into(),
+            ended_at: None,
+            title: Some("Shared".into()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: Some("shared-folder".into()),
+        }).unwrap();
+        state.db.upsert_note(&NoteRecord {
+            meeting_id: "m-shared-link".into(), provider_id: "provider".into(),
+            markdown: "body".into(), created_at: "t".into(), exported_path: None,
+            model_requested: None, model_served: None, gateway_host: None,
+        }).unwrap();
+        state.db.set_note_folder("m-shared-link", Some("shared-folder")).unwrap();
+        state.db.insert_outbound_share(
+            "live-link", "m-shared-link", "link", 1, "2026-08-14T12:00:01Z",
+        ).unwrap();
+
+        assert!(matches!(
+            lock_folder_inner(&state, "shared-folder".into()),
+            Err(AppError::Unavailable(_))
+        ));
+        assert!(!state.db.folder_by_id("shared-folder").unwrap().unwrap().locked);
+    }
+
+    #[test]
+    fn explicit_lock_anyway_seals_locally_without_revoking_remote_share() {
+        let state = build_state("lock-anyway-live-share");
+        make_open_folder(&state.db, "lock-anyway-folder", "Shared");
+        state.db.insert_meeting(&Meeting {
+            id: "m-lock-anyway".into(),
+            started_at: "2026-08-14T12:10:00Z".into(),
+            ended_at: None,
+            title: Some("Shared".into()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: Some("lock-anyway-folder".into()),
+        }).unwrap();
+        state.db.upsert_note(&NoteRecord {
+            meeting_id: "m-lock-anyway".into(), provider_id: "provider".into(),
+            markdown: "body".into(), created_at: "t".into(), exported_path: None,
+            model_requested: None, model_served: None, gateway_host: None,
+        }).unwrap();
+        state.db.set_note_folder("m-lock-anyway", Some("lock-anyway-folder")).unwrap();
+        state.db.insert_outbound_share(
+            "live-lock-anyway", "m-lock-anyway", "link", 1, "2026-08-14T12:10:01Z",
+        ).unwrap();
+
+        lock_folder_inner_allow_remote_access(&state, "lock-anyway-folder".into()).unwrap();
+
+        assert!(state.db.folder_by_id("lock-anyway-folder").unwrap().unwrap().locked);
+        assert!(state.db.source_has_active_remote_share(Some("m-lock-anyway"), None).unwrap());
+        assert!(!state.db.org_folder_closure_exists("lock-anyway-folder").unwrap());
     }
 
     // ── 2026-07-11 audit remediation: NOTES-1/2/3, SEAM-F1/F2, LOCK-SHARE-INGEST-1, gate ─────────────
@@ -22952,7 +26463,7 @@
         assert_eq!(open.org.len(), 1, "open folder surfaces the org share");
 
         // Lock (NOT session-unlocked) → the report MUST be empty (no title leak).
-        lock_folder_inner(&state, "f".to_string()).unwrap();
+        lock_folder_inner_allow_remote_access(&state, "f".to_string()).unwrap();
         let masked = folder_active_shares_inner(&state, "f").unwrap();
         assert_eq!(masked.links, 0);
         assert_eq!(masked.users, 0);
@@ -23022,7 +26533,7 @@
         let vectors: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM org_vec_chunks WHERE chunk_id IN
-                   (SELECT id FROM org_chunks WHERE item_id = ?1)",
+                               (SELECT id FROM org_chunks WHERE item_id = ?1)",
                 rusqlite::params![item_id],
                 |r| r.get(0),
             )
@@ -23261,21 +26772,29 @@
             state.db.get_org_share("os-rv").unwrap().unwrap().state,
             "revoked"
         );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            1
+        );
     }
 
     /// Seed the exact shape every revoke-window test needs: one joined org with a live session + OCK,
     /// one PUBLISHED share (`os-rv` → `it-rv`) and the publishing device's own fully-indexed,
     /// fully-attached local replica of it.
     fn seed_published_share_with_replica(state: &AppState, base: &str) {
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         state.config.lock().unwrap().share_base_url = base.to_string();
+        state.config.lock().unwrap().org_egress_consented = true;
         seed_live_session(state);
-        seed_ock(state, "org-1", 1);
+        seed_ock(state, STABLE_ORG_ID, 1);
         state
             .db
             .insert_org_share(
                 "os-rv",
-                "org-1",
+                STABLE_ORG_ID,
                 None,
                 Some("n-rv"),
                 "note",
@@ -23290,9 +26809,1047 @@
             .db
             .set_org_share_uploaded("os-rv", "it-rv", "2026-07-11T00:00:00Z")
             .unwrap();
-        seed_replica_item(state, "it-rv", "org-1", 5);
+        seed_replica_item(state, "it-rv", STABLE_ORG_ID, 5);
         let (chunks, vectors, fts, attachments) = replica_counts(state, "it-rv");
         assert!(chunks > 0 && vectors > 0 && fts > 0 && attachments == 1);
+    }
+
+    #[test]
+    fn stable_revoke_without_org_consent_has_no_request_mutation_or_ledger() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-stable-revoke-consent");
+        seed_published_share_with_replica(&state, &mock.base);
+        state
+            .db
+            .set_org_share_document_metadata("os-rv", STABLE_DOC_ID, "view")
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = false;
+        let replica_before = replica_counts(&state, "it-rv");
+
+        let error = block_on(revoke_org_share_inner(&state, "it-rv".into()))
+            .expect_err("withdrawal must fail closed without org consent");
+        assert!(matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] ")));
+        assert!(mock.log.lock().unwrap().requests.is_empty());
+        assert_eq!(state.db.get_org_share("os-rv").unwrap().unwrap().state, "uploaded");
+        assert_eq!(replica_counts(&state, "it-rv"), replica_before);
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(), 0);
+    }
+
+    fn seed_ambiguous_initial_post_share(
+        state: &AppState,
+        note_id: &str,
+        folder_id: &str,
+        base: &str,
+    ) {
+        make_open_folder(&state.db, folder_id, "Shared");
+        state.db.insert_note(note_id,folder_id,"document","Shared","body",1).unwrap();
+        seed_org(&state.db,STABLE_ORG_ID,"Acme","owner",1);
+        seed_live_session(state);
+        state.config.lock().unwrap().share_base_url = base.to_string();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.db.insert_org_share(
+            "ambiguous-initial",STABLE_ORG_ID,None,Some(note_id),"note",Some("Shared"),
+            1,1,&[8u8;32],"t",
+        ).unwrap();
+        state.db.set_org_share_document_metadata(
+            "ambiguous-initial",STABLE_DOC_ID,"view",
+        ).unwrap();
+        state.db.lock().execute(
+            "UPDATE org_shares SET state='failed',last_error='initial_post_pending',
+              item_id=NULL,dispatch_id='initial-dispatch',expected_actor_user_id=?2,
+              expected_owner_user_id=?2 WHERE id=?1",
+            rusqlite::params!["ambiguous-initial","c534b6d2-02c1-4c2c-a256-3af8592b1567"],
+        ).unwrap();
+    }
+
+    fn stable_delete_response_server(status: u16) -> (String,std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut socket,_) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
+            assert!(request.starts_with(&format!(
+                "DELETE /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID} "
+            )),"unexpected request: {request}");
+            write!(socket,"HTTP/1.1 {status} result\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        (format!("http://{addr}/"),handle)
+    }
+
+    #[test]
+    fn source_delete_routes_ambiguous_null_item_initial_post_through_stable_delete() {
+        let (base,server) = stable_delete_response_server(204);
+        let state = build_state("ambiguous-initial-source-delete");
+        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
+        state.db.insert_org_share(
+            "sibling-anchor",STABLE_ORG_ID,None,Some("other-source"),"note",Some("Sibling"),
+            1,1,&[8u8;32],"t2",
+        ).unwrap();
+        state.db.set_org_share_uploaded("sibling-anchor","sibling-item","t2").unwrap();
+        state.db.set_org_share_document_metadata("sibling-anchor",STABLE_DOC_ID,"view").unwrap();
+
+        block_on(delete_note_inner(&state,"note-ambiguous")).unwrap();
+        server.join().unwrap();
+        assert!(state.db.get_note_row("note-ambiguous").unwrap().is_none());
+        assert_eq!(state.db.get_org_share("ambiguous-initial").unwrap().unwrap().state,"revoked");
+        assert_eq!(state.db.get_org_share("sibling-anchor").unwrap().unwrap().state,"revoked");
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+    }
+
+    #[test]
+    fn meeting_delete_revokes_link_and_directed_user_shares_before_local_destruction() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected in ["link-share", "user-share"] {
+                let (mut socket, _) = accept_with_timeout(&listener);
+                let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
+                assert!(request.starts_with(&format!("DELETE /v1/shares/{expected} ")));
+                write!(socket, "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            }
+        });
+
+        let state = build_state("delete-all-share-modes");
+        make_open_folder(&state.db, "all-modes-folder", "All modes");
+        state.db.insert_meeting(&Meeting {
+            id: "m-all-modes".into(),
+            started_at: "2026-08-14T10:00:00Z".into(),
+            ended_at: Some("2026-08-14T10:01:00Z".into()),
+            title: Some("Shared".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: Some("all-modes-folder".into()),
+        }).unwrap();
+        state.db.insert_note(
+            "m-all-modes", "all-modes-folder", "provider", "Shared", "body", 1,
+        ).unwrap();
+        state.db.insert_outbound_share_attempt(
+            "link-share", Some("m-all-modes"), None, "link", 1,
+            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T10:01:01Z",
+        ).unwrap();
+        state.db.set_outbound_share_state("link-share", "active").unwrap();
+        state.db.insert_outbound_user_share(
+            "user-share", "m-all-modes", 1, "2026-08-14T10:01:02Z", "sent",
+            &[1u8; 32], "recipient", "r@example.com", &[2u8; 32],
+            "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+        ).unwrap();
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        block_on(delete_meeting_inner(&state, "m-all-modes")).unwrap();
+        server.join().unwrap();
+        assert!(state.db.get_meeting_gate_anchor("m-all-modes").unwrap().is_none());
+        for share_id in ["link-share", "user-share"] {
+            let status: String = state.db.lock().query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1", [share_id],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(status, "revoked");
+        }
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 2);
+    }
+
+    #[test]
+    fn failed_link_revoke_keeps_source_and_durable_resume_intent() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
+            assert!(request.starts_with("DELETE /v1/shares/link-failure "));
+            write!(socket, "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        let state = build_state("delete-link-failure");
+        make_open_folder(&state.db, "link-failure-folder", "Failure");
+        state.db.insert_meeting(&Meeting {
+            id: "m-link-failure".into(), started_at: "2026-08-14T10:30:00Z".into(),
+            ended_at: None, title: Some("Failure".into()), duration_s: 0, audio_path: None,
+            status: MeetingStatus::Summarized, folder_id: Some("link-failure-folder".into()),
+        }).unwrap();
+        state.db.insert_note(
+            "m-link-failure", "link-failure-folder", "provider", "Failure", "body", 1,
+        ).unwrap();
+        state.db.insert_outbound_share_attempt(
+            "link-failure", Some("m-link-failure"), None, "link", 1,
+            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T10:30:01Z",
+        ).unwrap();
+        state.db.set_outbound_share_state("link-failure", "active").unwrap();
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        assert!(block_on(delete_meeting_inner(&state, "m-link-failure")).is_err());
+        server.join().unwrap();
+        assert!(state.db.get_meeting_gate_anchor("m-link-failure").unwrap().is_some());
+        let status: String = state.db.lock().query_row(
+            "SELECT state FROM outbound_shares WHERE share_id='link-failure'", [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(status, "revoke_pending");
+        assert!(state.db.source_has_active_remote_share(Some("m-link-failure"), None).unwrap());
+    }
+
+    #[test]
+    fn same_owner_list_absence_does_not_resolve_delayed_link_or_user_attempts() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected in ["absent-link", "absent-user"] {
+                let (mut delete, _) = accept_with_timeout(&listener);
+                let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
+                assert!(request.starts_with(&format!("DELETE /v1/shares/{expected} ")));
+                write!(delete, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let state = build_state("absent-link-user-delete");
+        make_open_folder(&state.db, "absent-folder", "Absent");
+        state.db.insert_meeting(&Meeting {
+            id: "m-absent".into(), started_at: "2026-08-14T10:45:00Z".into(), ended_at: None,
+            title: Some("Absent".into()), duration_s: 0, audio_path: None,
+            status: MeetingStatus::Summarized, folder_id: Some("absent-folder".into()),
+        }).unwrap();
+        state.db.insert_note("m-absent", "absent-folder", "provider", "Absent", "body", 1).unwrap();
+        let owner = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        state.db.insert_outbound_share_attempt(
+            "absent-link", Some("m-absent"), None, "link", 1, owner, "t1",
+        ).unwrap();
+        state.db.insert_outbound_user_share(
+            "absent-user", "m-absent", 1, "t2", "create_pending", &[1; 32],
+            "recipient", "r@example.com", &[2; 32], owner,
+        ).unwrap();
+        state.db.set_outbound_share_state("absent-link", "revoke_pending").unwrap();
+        state.db.set_outbound_share_state("absent-user", "revoke_pending").unwrap();
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        for share_id in ["absent-link", "absent-user"] {
+            assert!(block_on(revoke_share_inner(&state, share_id.to_string())).is_err());
+        }
+        server.join().unwrap();
+        assert!(state.db.get_meeting_gate_anchor("m-absent").unwrap().is_some());
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 2);
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke_reconcile").unwrap(), 0);
+        for share_id in ["absent-link", "absent-user"] {
+            let state_value: String = state.db.lock().query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1", [share_id],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(state_value, "revoke_pending");
+        }
+    }
+
+    fn seed_link_share_source(state: &AppState, folder_id: &str, meeting_id: &str, base: &str) {
+        make_open_folder(&state.db, folder_id, "Share source");
+        seed_titled_meeting(
+            &state.db,
+            meeting_id,
+            "Owner claim",
+            "/tmp/owner-claim.wav",
+            folder_id,
+        );
+        seed_live_session(state);
+        let mut config = state.config.lock().unwrap();
+        config.share_egress_consented = true;
+        config.share_base_url = base.to_string();
+    }
+
+    #[test]
+    fn link_share_missing_owner_claim_capability_keeps_retryable_journal_without_content() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = listener.try_clone().unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
+            assert!(request.starts_with("GET /healthz "));
+            assert!(
+                !request.to_ascii_lowercase().contains("authorization:"),
+                "health capability discovery must remain bearer-free"
+            );
+            let body = r#"{"status":"ok","version":"0.1.0"}"#;
+            write!(
+                health,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let state = build_state("link-share-capability-required");
+        seed_link_share_source(
+            &state,
+            "claim-cap-folder",
+            "claim-cap-meeting",
+            &format!("http://{addr}/"),
+        );
+        let error = block_on(share_note_to_link_inner(
+            &state,
+            "claim-cap-meeting".into(),
+            None,
+            None,
+            None,
+        ))
+        .expect_err("an old relay must fail closed before share creation");
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            AppError::Unavailable(message)
+                if message.starts_with("[sharing-upgrade-required] ")
+        ));
+        probe.set_nonblocking(true).unwrap();
+        let second = block_on(share_note_to_link_inner(
+            &state,
+            "claim-cap-meeting".into(),
+            None,
+            None,
+            None,
+        ))
+        .expect_err("the existing cleanup journal bounds repeated old-relay clicks");
+        assert!(matches!(
+            second,
+            AppError::Unavailable(message) if message.contains("cleanup is already pending")
+        ));
+        assert!(matches!(
+            probe.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let journal: (i64, String, String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*),state,mode,owner_user_id FROM outbound_shares",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(journal.0, 1, "one bounded cleanup authority survives capability failure");
+        assert_eq!(journal.1, "create_pending");
+        assert_eq!(journal.2, "link");
+        assert_eq!(journal.3, "c534b6d2-02c1-4c2c-a256-3af8592b1567");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_capability_read")
+                .unwrap(),
+            1
+        );
+        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 0);
+        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 0);
+    }
+
+    #[test]
+    fn user_share_missing_owner_claim_capability_keeps_content_free_retry_journal() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = listener.try_clone().unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
+            assert!(request.starts_with("GET /healthz "));
+            let body = r#"{"status":"ok","version":"0.1.0"}"#;
+            write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+
+        let state = build_state("user-share-capability-required");
+        seed_link_share_source(
+            &state,
+            "user-cap-folder",
+            "user-cap-meeting",
+            &format!("http://{addr}/"),
+        );
+        let error = block_on(share_note_to_user_inner(
+            &state,
+            "user-cap-meeting".into(),
+            "private-recipient@example.com".into(),
+            None,
+        ))
+        .expect_err("an old relay must fail before recipient lookup or content creation");
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            AppError::Unavailable(message)
+                if message.starts_with("[sharing-upgrade-required] ")
+        ));
+        probe.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            probe.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let journal: (String, String, Option<String>, Option<Vec<u8>>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT state,mode,recipient_email,content_hash FROM outbound_shares",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(journal.0, "create_pending");
+        assert_eq!(journal.1, "user");
+        assert_eq!(journal.2, None, "recipient PII is not captured before capability proof");
+        assert_eq!(journal.3, None, "no ciphertext hash exists before capability proof");
+        assert_eq!(state.db.count_share_egress_by_kind("share_capability_read").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 0);
+        assert_eq!(state.db.count_share_egress_by_kind("share_user_send").unwrap(), 0);
+        assert_eq!(state.db.count_share_egress_by_kind("share_user_invite").unwrap(), 0);
+    }
+
+    #[test]
+    fn restart_cleanup_reserves_then_deletes_link_and_user_create_pending_without_redispatch() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (expected_id, expected_mode) in [
+                ("11111111-1111-4111-8111-111111111111", "link"),
+                ("22222222-2222-4222-8222-222222222222", "user"),
+            ] {
+                let (mut health, _) = accept_with_timeout(&listener);
+                let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
+                assert!(request.starts_with("GET /healthz "));
+                let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+                write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+                let (mut reserve, _) = accept_with_timeout(&listener);
+                let request = read_http_request(&mut reserve);
+                let text = String::from_utf8_lossy(&request);
+                assert!(
+                    text.starts_with(&format!(
+                        "PUT /v1/shares/{expected_id}/reservation HTTP/1.1"
+                    )),
+                    "unexpected reservation request for {expected_id}: {text}"
+                );
+                let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+                assert_eq!(json, serde_json::json!({"mode": expected_mode}));
+                write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+
+                let (mut delete, _) = accept_with_timeout(&listener);
+                let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
+                assert!(request.starts_with(&format!("DELETE /v1/shares/{expected_id} ")));
+                write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            }
+        });
+
+        let state = build_state("restart-create-pending-cleanup");
+        seed_link_share_source(
+            &state,
+            "restart-cleanup-folder",
+            "restart-cleanup-meeting",
+            &format!("http://{addr}/"),
+        );
+        let owner = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        for (share_id, mode) in [
+            ("11111111-1111-4111-8111-111111111111", "link"),
+            ("22222222-2222-4222-8222-222222222222", "user"),
+        ] {
+            state.db.insert_outbound_share_attempt(
+                share_id,
+                Some("restart-cleanup-meeting"),
+                None,
+                mode,
+                1,
+                owner,
+                "2026-08-21T10:00:00Z",
+            ).unwrap();
+        }
+
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 2);
+        server.join().unwrap();
+        for share_id in [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ] {
+            let phase: String = state.db.lock().query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1",
+                [share_id],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(phase, "revoked");
+        }
+        assert_eq!(state.db.count_share_egress_by_kind("share_capability_read").unwrap(), 2);
+        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 2);
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 2);
+        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 0);
+        assert_eq!(state.db.count_share_egress_by_kind("share_user_send").unwrap(), 0);
+        assert_eq!(state.db.count_share_egress_by_kind("share_user_invite").unwrap(), 0);
+    }
+
+    #[test]
+    fn link_share_reserves_exact_owner_lane_before_ciphertext_post() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (share_tx, share_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
+            assert!(request.starts_with("GET /healthz "));
+            let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+            write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            let (mut reserve, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut reserve);
+            let request_text = String::from_utf8_lossy(&request);
+            let request_line = request_text.lines().next().unwrap();
+            let share_id = request_line
+                .strip_prefix("PUT /v1/shares/")
+                .and_then(|tail| tail.strip_suffix("/reservation HTTP/1.1"))
+                .expect("reservation path carries the exact client id")
+                .to_string();
+            assert!(uuid::Uuid::parse_str(&share_id).is_ok());
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json, serde_json::json!({"mode":"link"}));
+            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+
+            let (mut create, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut create);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json["shareId"], share_id);
+            assert_eq!(json["mode"], "link");
+            assert!(json["contentCell"].as_str().is_some());
+            let body = format!(
+                "{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}"
+            );
+            write!(create,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            share_tx.send(share_id).unwrap();
+        });
+
+        let state = build_state("link-share-owner-reserve");
+        seed_link_share_source(
+            &state,
+            "claim-ok-folder",
+            "claim-ok-meeting",
+            &format!("http://{addr}/"),
+        );
+        let url = block_on(share_note_to_link_inner(
+            &state,
+            "claim-ok-meeting".into(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        server.join().unwrap();
+        let share_id = share_rx.recv().unwrap();
+        assert!(url.contains(&format!("#{}.", share_id)));
+        let stored_state: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1",
+                [&share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_state, "active");
+        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 0);
+    }
+
+    #[test]
+    fn ambiguous_reserved_link_post_uses_same_id_for_terminal_delete() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (share_tx, share_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut health);
+            let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+            write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            let (mut reserve, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut reserve);
+            let request_line = String::from_utf8_lossy(&request);
+            let share_id = request_line
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("PUT /v1/shares/")
+                .and_then(|tail| tail.strip_suffix("/reservation HTTP/1.1"))
+                .unwrap()
+                .to_string();
+            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+
+            let (mut create, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut create);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json["shareId"], share_id);
+            drop(create); // the content POST outcome is deliberately ambiguous
+
+            let (mut delete, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
+            assert!(request.starts_with(&format!("DELETE /v1/shares/{share_id} ")));
+            write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            share_tx.send(share_id).unwrap();
+        });
+
+        let state = build_state("link-share-ambiguous-cleanup");
+        seed_link_share_source(
+            &state,
+            "claim-amb-folder",
+            "claim-amb-meeting",
+            &format!("http://{addr}/"),
+        );
+        assert!(block_on(share_note_to_link_inner(
+            &state,
+            "claim-amb-meeting".into(),
+            None,
+            None,
+            None,
+        ))
+        .is_err());
+        server.join().unwrap();
+        let share_id = share_rx.recv().unwrap();
+        let stored_state: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1",
+                [&share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_state, "revoked");
+        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 1);
+    }
+
+    #[test]
+    fn source_change_during_reservation_revokes_claim_without_content_post() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut health);
+            let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+            write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            let (mut reserve, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut reserve)).to_string();
+            let share_id = request
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("PUT /v1/shares/")
+                .and_then(|tail| tail.strip_suffix("/reservation HTTP/1.1"))
+                .unwrap()
+                .to_string();
+            reserved_tx.send(share_id.clone()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+
+            let (mut delete, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
+            assert!(
+                request.starts_with(&format!("DELETE /v1/shares/{share_id} ")),
+                "a stale snapshot must DELETE the reservation, never POST ciphertext: {request}"
+            );
+            write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+
+        let state = std::sync::Arc::new(build_state("link-share-reservation-source-race"));
+        seed_link_share_source(
+            &state,
+            "claim-race-folder",
+            "claim-race-meeting",
+            &format!("http://{addr}/"),
+        );
+        let share_state = state.clone();
+        let share = std::thread::spawn(move || {
+            block_on(share_note_to_link_inner(
+                &share_state,
+                "claim-race-meeting".into(),
+                None,
+                None,
+                None,
+            ))
+        });
+        let share_id = reserved_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        state
+            .db
+            .set_meeting_title("claim-race-meeting", "Changed during reservation")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(share.join().unwrap().is_err());
+        server.join().unwrap();
+        let stored_state: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1",
+                [&share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_state, "revoked");
+        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 0);
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 1);
+    }
+
+    #[test]
+    fn directed_user_share_reserves_user_lane_before_content_post() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (share_tx, share_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut health, _) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut health);
+            let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+            write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            let (mut lookup, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut lookup);
+            let text = String::from_utf8_lossy(&request);
+            assert!(text.starts_with("POST /v1/keys/lookup "));
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json, serde_json::json!({"email":"new@example.com"}));
+            let body = r#"{"registered":false}"#;
+            write!(lookup,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+
+            let (mut reserve, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut reserve);
+            let text = String::from_utf8_lossy(&request);
+            let share_id = text
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("PUT /v1/shares/")
+                .and_then(|tail| tail.strip_suffix("/reservation HTTP/1.1"))
+                .unwrap()
+                .to_string();
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json, serde_json::json!({"mode":"user"}));
+            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+
+            let (mut create, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut create);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json["shareId"], share_id);
+            assert_eq!(json["mode"], "user");
+            assert_eq!(json["recipients"][0]["email"], "new@example.com");
+            let body = format!(
+                "{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}"
+            );
+            write!(create,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            share_tx.send(share_id).unwrap();
+        });
+
+        let state = build_state("user-share-owner-reserve");
+        seed_link_share_source(
+            &state,
+            "user-claim-folder",
+            "user-claim-meeting",
+            &format!("http://{addr}/"),
+        );
+        let result = block_on(share_note_to_user_inner(
+            &state,
+            "user-claim-meeting".into(),
+            "new@example.com".into(),
+            None,
+        ))
+        .unwrap();
+        server.join().unwrap();
+        let share_id = share_rx.recv().unwrap();
+        assert_eq!(result.status, "invited");
+        let stored_state: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT state FROM outbound_shares WHERE share_id=?1",
+                [&share_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_state, "awaiting_key");
+        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 1);
+        assert_eq!(state.db.count_share_egress_by_kind("share_user_invite").unwrap(), 1);
+    }
+
+    #[test]
+    fn list_my_shares_unions_owner_bound_pending_rows_and_local_pending_wins() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
+            assert!(request.starts_with("GET /v1/shares "));
+            let body = r#"{"shares":[
+              {"shareId":"pending-overlap","mode":"link","rev":9,"createdAt":"server-t","downloadCount":4},
+              {"shareId":"server-only","mode":"link","rev":2,"createdAt":"server-only-t","downloadCount":1}
+            ]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            ).unwrap();
+        });
+        let state = build_state("list-owner-pending-shares");
+        make_open_folder(&state.db, "pending-list-folder", "Pending");
+        state.db.insert_note(
+            "pending-list-note", "pending-list-folder", "pending.md", "Pending", "body", 1,
+        ).unwrap();
+        let owner = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        for (share_id, row_owner, mode) in [
+            ("pending-overlap", owner, "link"),
+            ("pending-local-only", owner, "user"),
+            (
+                "pending-other-owner",
+                "11111111-1111-4111-8111-111111111111",
+                "link",
+            ),
+        ] {
+            state.db.insert_outbound_share_attempt(
+                share_id, None, Some("pending-list-note"), mode, 1, row_owner, "local-t",
+            ).unwrap();
+        }
+        state.db.set_outbound_share_state("pending-local-only", "revoke_pending").unwrap();
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+
+        let rows = block_on(list_my_shares_inner(&state)).unwrap();
+        server.join().unwrap();
+        assert_eq!(rows.len(), 3, "server-only + overlap + owner-local-only; other owner hidden");
+        let overlap = rows.iter().find(|row| row.share_id == "pending-overlap").unwrap();
+        assert!(overlap.revoke_pending);
+        assert!(!overlap.revoked, "local unproven DELETE must beat a server list row");
+        assert_eq!(overlap.rev, 1, "the durable local attempt metadata wins by share id");
+        assert_eq!(overlap.document_id.as_deref(), Some("pending-list-note"));
+        let local_only = rows.iter().find(|row| row.share_id == "pending-local-only").unwrap();
+        assert!(local_only.revoke_pending, "a server-absent pending row remains visible");
+        assert!(rows.iter().all(|row| row.share_id != "pending-other-owner"));
+        assert!(!rows.iter().find(|row| row.share_id == "server-only").unwrap().revoke_pending);
+
+        let wire = serde_json::to_value(overlap).unwrap();
+        assert_eq!(wire.get("revokePending"), Some(&serde_json::Value::Bool(true)));
+        assert!(wire.get("revoke_pending").is_none());
+    }
+
+    #[test]
+    fn wrong_account_cannot_treat_uniform_share_404_as_absence() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = build_state("wrong-owner-link-delete");
+        make_open_folder(&state.db, "wrong-owner-folder", "Wrong owner");
+        state.db.insert_meeting(&Meeting {
+            id: "m-wrong-owner".into(), started_at: "2026-08-14T11:00:00Z".into(), ended_at: None,
+            title: Some("Wrong owner".into()), duration_s: 0, audio_path: None,
+            status: MeetingStatus::Summarized, folder_id: Some("wrong-owner-folder".into()),
+        }).unwrap();
+        state.db.insert_note(
+            "m-wrong-owner", "wrong-owner-folder", "provider", "Wrong", "body", 1,
+        ).unwrap();
+        state.db.insert_outbound_share_attempt(
+            "wrong-owner-share", Some("m-wrong-owner"), None, "link", 1,
+            "11111111-1111-4111-8111-111111111111", "t",
+        ).unwrap();
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{}/", listener.local_addr().unwrap());
+
+        assert!(block_on(delete_meeting_inner(&state, "m-wrong-owner")).is_err());
+        assert!(state.db.get_meeting_gate_anchor("m-wrong-owner").unwrap().is_some());
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 0);
+    }
+
+    #[test]
+    fn in_flight_share_finishes_before_source_delete_closes_and_revokes_it() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (post_seen_tx,post_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx,release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut post,_) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut post);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap()+4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            let doc_id = json["docId"].as_str().unwrap().to_string();
+            post_seen_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let body = format!("{{\"itemId\":\"landed-item\",\"seq\":1,\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}");
+            write!(post,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            let (mut delete,_) = accept_with_timeout(&listener);
+            let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
+            assert!(request.starts_with(&format!("DELETE /v1/orgs/{STABLE_ORG_ID}/documents/{doc_id} ")));
+            write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+
+        let state = std::sync::Arc::new(build_state("share-delete-barrier"));
+        seed_org(&state.db,STABLE_ORG_ID,"Acme","member",1);
+        make_open_folder(&state.db,"f-race","Race");
+        state.db.insert_note("n-race","f-race","n-race","Race","body",1).unwrap();
+        seed_live_session(&state);
+        seed_ock(&state,STABLE_ORG_ID,1);
+        state.config.lock().unwrap().org_egress_consented=true;
+        state.config.lock().unwrap().share_base_url=format!("http://{addr}/");
+        let share_state=state.clone();
+        let share=std::thread::spawn(move || block_on(share_to_org_inner(
+            &share_state,STABLE_ORG_ID,None,Some("n-race".into()),true,
+        )));
+        post_seen_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let delete_state=state.clone();
+        let delete=std::thread::spawn(move || block_on(delete_note_inner(&delete_state,"n-race")));
+        release_tx.send(()).unwrap();
+        assert!(share.join().unwrap().is_ok());
+        assert!(delete.join().unwrap().is_ok());
+        server.join().unwrap();
+        assert!(state.db.get_note_row("n-race").unwrap().is_none());
+        let rows=state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(rows.len(),1);
+        assert_eq!(rows[0].state,"revoked");
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(),1);
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+
+        let no_socket=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        no_socket.set_nonblocking(true).unwrap();
+        state.config.lock().unwrap().share_base_url=format!("http://{}/",no_socket.local_addr().unwrap());
+        assert!(block_on(share_to_org_inner(
+            &state,STABLE_ORG_ID,None,Some("n-race".into()),true,
+        )).is_err());
+        assert!(matches!(no_socket.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(),1);
+    }
+
+    #[test]
+    fn folder_revoke_routes_ambiguous_null_item_initial_post_through_stable_delete() {
+        let (base,server) = stable_delete_response_server(204);
+        let state = build_state("ambiguous-initial-folder-revoke");
+        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
+
+        block_on(revoke_shares_for_folder_inner(
+            &state,"folder-ambiguous",None,
+        )).unwrap();
+        server.join().unwrap();
+        assert!(state.db.get_note_row("note-ambiguous").unwrap().is_some());
+        assert_eq!(state.db.get_org_share("ambiguous-initial").unwrap().unwrap().state,"revoked");
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+    }
+
+    #[test]
+    fn folder_revoke_barrier_persists_across_second_lock_step() {
+        let (base,server) = stable_delete_response_server(204);
+        let state = build_state("folder-revoke-lock-barrier");
+        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
+        state.db.begin_org_folder_closure("folder-ambiguous").unwrap();
+        block_on(revoke_shares_for_folder_inner(&state,"folder-ambiguous",None)).unwrap();
+        server.join().unwrap();
+        assert!(state.db.insert_org_share(
+            "between-ipcs",STABLE_ORG_ID,None,Some("note-ambiguous"),"note",Some("T"),
+            1,1,&[1u8;32],"t",
+        ).is_err(),"the durable folder barrier blocks a new share between revoke and lock IPCs");
+        lock_folder_inner(&state,"folder-ambiguous".into()).unwrap();
+        assert!(state.db.folder_by_id("folder-ambiguous").unwrap().unwrap().locked);
+        state.db.complete_org_closure("folder","folder-ambiguous").unwrap();
+        assert!(state.db.insert_org_share(
+            "while-locked",STABLE_ORG_ID,None,Some("note-ambiguous"),"note",Some("T"),
+            1,1,&[1u8;32],"t",
+        ).is_err(),"the closure remains terminal while the folder is locked");
+    }
+
+    #[test]
+    fn failed_stable_delete_preserves_ambiguous_journal_and_source() {
+        let (base,server) = stable_delete_response_server(500);
+        let state = build_state("ambiguous-initial-source-delete-fails");
+        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
+
+        assert!(block_on(delete_note_inner(&state,"note-ambiguous")).is_err());
+        server.join().unwrap();
+        assert!(state.db.get_note_row("note-ambiguous").unwrap().is_some());
+        let row = state.db.get_org_share("ambiguous-initial").unwrap().unwrap();
+        assert_eq!(row.state,"revoke_pending");
+        assert_ne!(row.state,"revoked");
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+    }
+
+    #[test]
+    fn folder_revoke_without_consent_preserves_ambiguous_journal_and_source() {
+        let mock = MockOrgServer::start();
+        let state = build_state("ambiguous-initial-folder-no-consent");
+        seed_ambiguous_initial_post_share(
+            &state,"note-ambiguous","folder-ambiguous",&mock.base,
+        );
+        state.config.lock().unwrap().org_egress_consented = false;
+
+        assert!(block_on(revoke_shares_for_folder_inner(
+            &state,"folder-ambiguous",None,
+        )).is_err());
+        assert!(mock.log.lock().unwrap().requests.is_empty());
+        assert!(state.db.get_note_row("note-ambiguous").unwrap().is_some());
+        let row = state.db.get_org_share("ambiguous-initial").unwrap().unwrap();
+        assert_eq!(row.state,"failed");
+        assert_eq!(row.last_error.as_deref(),Some("initial_post_pending"));
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),0);
+    }
+
+    #[test]
+    fn legacy_null_identity_queued_row_blocks_source_delete_without_false_revoke() {
+        let state = build_state("legacy-null-identity-delete-blocked");
+        make_open_folder(&state.db,"folder-legacy","Legacy");
+        state.db.insert_note("note-legacy","folder-legacy","document","Legacy","body",1).unwrap();
+        state.db.insert_org_share(
+            "legacy-queued","org-legacy",None,Some("note-legacy"),"note",Some("Legacy"),
+            1,1,&[3u8;32],"t",
+        ).unwrap();
+
+        assert!(block_on(delete_note_inner(&state,"note-legacy")).is_err());
+        assert!(state.db.get_note_row("note-legacy").unwrap().is_some());
+        let row = state.db.get_org_share("legacy-queued").unwrap().unwrap();
+        assert_eq!(row.state,"queued");
+        assert!(row.item_id.is_none() && row.doc_id.is_none());
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),0);
+    }
+
+    #[test]
+    fn legacy_author_delete_without_org_consent_has_no_request_mutation_or_ledger() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-legacy-delete-consent");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        state.db.upsert_org_item(
+            "legacy-item", STABLE_ORG_ID, 1, "me", "Mine", "# body",
+            "2026-08-13T00:00:00Z", 1, 1, &[9u8; 32], Some("document"),
+            Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"), None,
+        ).unwrap();
+
+        let error = block_on(delete_org_item_as_author_inner(&state, "legacy-item"))
+            .expect_err("legacy withdrawal must fail closed without org consent");
+        assert!(matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] ")));
+        assert!(mock.log.lock().unwrap().requests.is_empty());
+        assert!(state.db.get_org_item("legacy-item").unwrap().is_some());
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(), 0);
     }
 
     /// Install a raw SQLite guard/fault trigger on the test DB (dropped again by `drop_test_trigger`).
@@ -23332,15 +27889,15 @@
         seed_published_share_with_replica(&state, &mock.base);
 
         install_test_trigger(
-            &state,
-            "CREATE TRIGGER guard_revoke_order BEFORE UPDATE ON org_shares
-               WHEN NEW.state = 'revoked'
-                AND EXISTS (SELECT 1 FROM org_items
-                             WHERE item_id = NEW.item_id AND tombstoned = 0)
-             BEGIN
-               SELECT RAISE(ABORT, 'share flipped to revoked while its replica was still live');
-             END;",
-        );
+                &state,
+                "CREATE TRIGGER guard_revoke_order BEFORE UPDATE ON org_shares
+                           WHEN NEW.state = 'revoked'
+                            AND EXISTS (SELECT 1 FROM org_items
+                                         WHERE item_id = NEW.item_id AND tombstoned = 0)
+                         BEGIN
+                           SELECT RAISE(ABORT, 'share flipped to revoked while its replica was still live');
+                         END;",
+            );
 
         block_on(revoke_org_share_inner(&state, "it-rv".to_string()))
             .expect("the eviction must be committed BEFORE the revoked state flip");
@@ -23376,11 +27933,11 @@
 
         // Fault injection: the eviction's tombstone write fails (≙ the process stopping right there).
         install_test_trigger(
-            &state,
-            "CREATE TRIGGER fault_on_evict BEFORE UPDATE ON org_items
-               WHEN NEW.tombstoned = 1
-             BEGIN SELECT RAISE(ABORT, 'simulated interruption during the local eviction'); END;",
-        );
+                    &state,
+                    "CREATE TRIGGER fault_on_evict BEFORE UPDATE ON org_items
+                           WHEN NEW.tombstoned = 1
+                         BEGIN SELECT RAISE(ABORT, 'simulated interruption during the local eviction'); END;",
+                );
 
         block_on(revoke_org_share_inner(&state, "it-rv".to_string()))
             .expect_err("the interrupted eviction must surface, not be silently swallowed");
@@ -23398,7 +27955,7 @@
             state.db.get_org_share("os-rv").unwrap().unwrap().state,
             "revoke_pending",
             "an interruption must NEVER leave a `revoked` row whose replica is still live — that row \
-             re-enters no queue"
+                         re-enters no queue"
         );
 
         // The interruption is over (the app relaunches): the sweep re-drives the `revoke_pending` row.
@@ -23474,6 +28031,21 @@
         }
     }
 
+    #[test]
+    fn org_view_notification_emits_once_only_when_state_changed() {
+        let notifier = RecordingOrgFeedNotifier::default();
+
+        notify_org_views_if_changed(Some(&notifier), false);
+        assert!(notifier.calls.lock().unwrap().is_empty());
+
+        notify_org_views_if_changed(Some(&notifier), true);
+        assert_eq!(
+            *notifier.calls.lock().unwrap(),
+            vec![0],
+            "one changed local visibility state emits one content-free refetch notice"
+        );
+    }
+
     /// `revoke_org_share` was the ONLY org-item-mutating command that never emitted `org-feed-updated`
     /// — every sibling (`delete_org_item_as_author`, the share/publish paths) does. Now that a revoke
     /// mutates the LOCAL replica too, the omission left `OrgBrainService.loadOrgs()`, the Settings
@@ -23519,6 +28091,120 @@
         assert!(notifier.calls.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn unrouted_document_delete_404_keeps_replica_and_revoke_pending() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-stable-delete-unrouted-404");
+        seed_published_share_with_replica(&state, &mock.base);
+        state
+            .db
+            .set_org_share_document_metadata("os-rv", STABLE_DOC_ID, "view")
+            .unwrap();
+        state
+            .db
+            .set_org_item_document_metadata(
+                "it-rv",
+                Some(STABLE_DOC_ID),
+                "view",
+                Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+            )
+            .unwrap();
+        let replica_before = replica_counts(&state, "it-rv");
+        assert!(replica_before.0 > 0 && replica_before.1 > 0 && replica_before.2 > 0);
+
+        let error = block_on(revoke_org_share_inner(&state, "it-rv".into()))
+            .expect_err("generic route 404 is not proof of stable withdrawal");
+        assert!(matches!(
+            error,
+            AppError::InvalidArg(_) | AppError::Unavailable(_)
+        ));
+        assert_eq!(
+            replica_counts(&state, "it-rv"),
+            replica_before,
+            "an unrouted 404 must not evict any decrypted replica material"
+        );
+        assert_eq!(
+            state.db.get_org_share("os-rv").unwrap().unwrap().state,
+            "revoke_pending"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            1,
+            "the destructive request attempt is ledgered before its unrouted 404 response"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_delete_404_read")
+                .unwrap(),
+            1,
+            "the failed 404 corroboration GET has one durable pre-send receipt"
+        );
+    }
+
+    fn seed_legacy_revoke_share(state: &AppState, base: &str) {
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        seed_live_session(state);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = base.to_string();
+        state.db.insert_org_share(
+            "legacy-row",STABLE_ORG_ID,None,Some("legacy-source"),"note",Some("Legacy"),
+            1,1,&[3u8;32],"t",
+        ).unwrap();
+        state.db.set_org_share_uploaded("legacy-row","legacy-item","t").unwrap();
+        state.db.upsert_org_item(
+            "legacy-item",STABLE_ORG_ID,1,"owner","Legacy","secret","t",1,1,&[3u8;32],
+            Some("document"),Some("owner"),None,
+        ).unwrap();
+    }
+
+    #[test]
+    fn legacy_tombstone_unrouted_404_fails_closed() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected in ["DELETE", "GET"] {
+                let (mut socket,_) = accept_with_timeout(&listener);
+                let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
+                assert!(request.starts_with(expected));
+                write!(socket,"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            }
+        });
+        let state = build_state("legacy-tombstone-unrouted");
+        seed_legacy_revoke_share(&state,&format!("http://{addr}/"));
+        assert!(block_on(revoke_org_share_inner(&state,"legacy-item".into())).is_err());
+        server.join().unwrap();
+        assert_eq!(state.db.get_org_share("legacy-row").unwrap().unwrap().state,"revoke_pending");
+        assert!(state.db.get_org_item("legacy-item").unwrap().is_some());
+        assert_eq!(state.db.count_share_egress_by_kind("org_item_tombstone_404_read").unwrap(),1);
+    }
+
+    #[test]
+    fn legacy_tombstone_404_with_authenticated_tombstone_completes() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut delete,_) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut delete);
+            write!(delete,"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            let (mut get,_) = accept_with_timeout(&listener);
+            let _ = read_http_request(&mut get);
+            let body = "{\"items\":[{\"itemId\":\"legacy-item\",\"seq\":1,\"authorUserId\":\"owner\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":true,\"isCurrent\":false}],\"nextSeq\":1}";
+            write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let state = build_state("legacy-tombstone-corroborated");
+        seed_legacy_revoke_share(&state,&format!("http://{addr}/"));
+        block_on(revoke_org_share_inner(&state,"legacy-item".into())).unwrap();
+        server.join().unwrap();
+        assert_eq!(state.db.get_org_share("legacy-row").unwrap().unwrap().state,"revoked");
+        assert!(state.db.get_org_item("legacy-item").unwrap().is_none());
+    }
+
     /// ITEM 4 — `list_org_shares` takes the caller's chosen org. Pre-fix it ignored the caller and
     /// returned `list_org_states().next()` — the FIRST local org — so in a shipped MULTI-org app a
     /// member of two orgs saw the wrong org's share list. An unknown org id returns EMPTY rather than
@@ -23534,6 +28220,15 @@
             "2026-07-01T00:00:00Z",
         );
         seed_org_at(&state.db, "org-b", "Beta", "member", "2026-07-02T00:00:00Z");
+        make_open_folder(&state.db, "f-shares", "Shares");
+        state
+            .db
+            .insert_note("n-a", "f-shares", "n-a", "Alpha note", "body", 1)
+            .unwrap();
+        state
+            .db
+            .insert_note("n-b", "f-shares", "n-b", "Beta note", "body", 2)
+            .unwrap();
         state
             .db
             .insert_org_share(
@@ -23580,4 +28275,442 @@
                 .is_empty(),
             "an unjoined org id returns EMPTY, never another org's shares"
         );
+    }
+
+    /// Direct IPC helpers must not reveal outbound org-share titles/status for a sealed source.
+    /// Session unlock restores both views without mutating the durable share row.
+    #[test]
+    fn org_share_reads_hide_sealed_source_and_restore_on_session_unlock() {
+        let state = build_state("org-share-read-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        state
+            .db
+            .insert_note(
+                "secret-note",
+                "f-secret",
+                "secret-note",
+                "Classified roadmap",
+                "body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "share-secret",
+                "org-1",
+                None,
+                Some("secret-note"),
+                "note",
+                Some("Classified roadmap"),
+                1,
+                1,
+                &[1u8; 32],
+                "2026-08-12T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-secret", "item-secret", "2026-08-12T00:00:01Z")
+            .unwrap();
+        state.db.set_folder_locked("f-secret", true, None).unwrap();
+
+        assert!(list_org_shares_inner(&state, "org-1").unwrap().is_empty());
+        assert!(
+            org_live_shares_for_source_inner(&state, None, Some("secret-note"))
+                .unwrap()
+                .is_empty()
+        );
+
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-secret".into());
+        let listed = list_org_shares_inner(&state, "org-1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title.as_deref(), Some("Classified roadmap"));
+        let status = org_live_shares_for_source_inner(&state, None, Some("secret-note")).unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].item_id.as_deref(), Some("item-secret"));
+    }
+
+    /// Permission management may be launched from the origin share card after a collaborator has
+    /// superseded its `item_id`. Resolve the current stable document and refresh every live local
+    /// revision without rewriting the origin row's rev/item/hash CAS witness.
+    #[test]
+    fn org_set_item_access_from_stale_origin_updates_all_live_document_revisions() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = accept_with_timeout(&listener);
+            let request_bytes = read_http_request(&mut socket);
+            let request = String::from_utf8_lossy(&request_bytes);
+            assert!(
+                request.starts_with(&format!(
+                    "PATCH /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
+                )),
+                "permission update targeted the wrong resource: {}",
+                request.lines().next().unwrap_or("")
+            );
+            let body = format!(
+                r#"{{"docId":"{STABLE_DOC_ID}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
+            );
+            let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+
+        let state = build_state("org-access-stale-origin");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "owner", 1);
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        state
+            .db
+            .insert_org_share(
+                "share-1",
+                STABLE_ORG_ID,
+                None,
+                Some("local-note"),
+                "note",
+                Some("Local"),
+                1,
+                1,
+                &[1u8; 32],
+                "2026-08-12T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-1", "origin-old", "2026-08-12T00:00:01Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata("share-1", STABLE_DOC_ID, "edit")
+            .unwrap();
+
+        for (item_id, seq, rev) in [
+            ("origin-old", 1, 1),
+            ("remote-current", 2, 2),
+            ("remote-duplicate", 3, 3),
+        ] {
+            state
+                .db
+                .upsert_org_item(
+                    item_id,
+                    STABLE_ORG_ID,
+                    seq,
+                    "owner",
+                    item_id,
+                    "body",
+                    "2026-08-12T00:00:00Z",
+                    rev,
+                    1,
+                    &[rev as u8; 32],
+                    None,
+                    Some("editor"),
+                    None,
+                )
+                .unwrap();
+            state
+                .db
+                .set_org_item_document_metadata(
+                    item_id,
+                    Some(STABLE_DOC_ID),
+                    "edit",
+                    Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+                )
+                .unwrap();
+        }
+        state
+            .db
+            .repair_org_reconcile_metadata(
+                "remote-current",
+                STABLE_ORG_ID,
+                1,
+                Some(STABLE_DOC_ID),
+                "edit",
+                Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+                true,
+            )
+            .unwrap();
+        state.db.evict_org_item("origin-old").unwrap();
+
+        let refused = block_on(org_set_item_access_inner(
+            &state,
+            "origin-old",
+            crate::share::org_dto::OrgItemAccess::View,
+        ));
+        assert!(
+            matches!(refused, Err(AppError::Unavailable(message)) if message.starts_with("[org-consent] "))
+        );
+        state.config.lock().unwrap().org_egress_consented = true;
+
+        block_on(org_set_item_access_inner(
+            &state,
+            "origin-old",
+            crate::share::org_dto::OrgItemAccess::View,
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        let live: Vec<(String, String, Option<String>)> = {
+            let conn = state.db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT item_id, access, document_owner_user_id FROM org_items
+                                  WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0
+                                  ORDER BY item_id",
+                )
+                .unwrap();
+            stmt.query_map(
+                rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|(_, access, owner)| {
+            access == "view" && owner.as_deref() == Some("c534b6d2-02c1-4c2c-a256-3af8592b1567")
+        }));
+        let share = state.db.get_org_share("share-1").unwrap().unwrap();
+        assert_eq!(share.access, "view");
+        assert_eq!(share.item_id.as_deref(), Some("origin-old"));
+        assert_eq!(
+            share.rev, 1,
+            "permission PATCH must not advance the CAS witness"
+        );
+        assert_eq!(share.content_sha256, Some(vec![1u8; 32]));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_access")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn org_set_item_access_rejects_wrong_access_or_owner_without_success_mutation() {
+        use std::io::Write;
+
+        for (case, response_access, response_owner) in [
+            ("wrong-access", "edit", "c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+            ("wrong-owner", "view", "11111111-1111-4111-8111-111111111111"),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = accept_with_timeout(&listener);
+                let request = read_http_request(&mut socket);
+                assert!(String::from_utf8_lossy(&request).starts_with(&format!(
+                    "PATCH /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
+                )));
+                let body = format!(
+                    "{{\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"{response_access}\",\"documentOwnerUserId\":\"{response_owner}\"}}"
+                );
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(), body
+                )
+                .unwrap();
+            });
+            let state = build_state(&format!("org-access-{case}"));
+            seed_editable_stable_org_item(&state, "item-old", "edit");
+            state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+            let result = block_on(org_set_item_access_inner(
+                &state,
+                "item-old",
+                crate::share::org_dto::OrgItemAccess::View,
+            ));
+            server.join().unwrap();
+            assert!(matches!(result, Err(AppError::Unavailable(_))));
+            assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "edit");
+            assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn org_access_is_single_flight_and_restart_reconciles_authoritative_access() {
+        let state = build_state("org-access-response-reorder");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
+        state.db.insert_org_share(
+            "share-access",STABLE_ORG_ID,None,Some("source"),"note",Some("Draft"),
+            1,1,&[1u8;32],"t",
+        ).unwrap();
+        state.db.set_org_share_uploaded("share-access","item-old","t").unwrap();
+        state.db.set_org_share_document_metadata("share-access",STABLE_DOC_ID,"edit").unwrap();
+        let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        state.config.lock().unwrap().org_egress_consented = true;
+        let (_permit, dispatch_id) = permit_org_access(
+            &state, "relay.example", STABLE_ORG_ID, STABLE_DOC_ID,
+            crate::share::org_dto::OrgItemAccess::View,
+            crate::share::org_dto::OrgItemAccess::Edit,
+            actor, actor,
+        ).unwrap();
+        assert!(matches!(permit_org_access(
+            &state, "relay.example", STABLE_ORG_ID, STABLE_DOC_ID,
+            crate::share::org_dto::OrgItemAccess::View,
+            crate::share::org_dto::OrgItemAccess::Edit, actor, actor,
+        ), Err(AppError::Unavailable(_))));
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
+        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "edit");
+        let attempt = pending_org_access_attempts(&state).unwrap().remove(0);
+        assert_eq!(attempt.dispatch_id, dispatch_id);
+        let head: crate::share::org_dto::OrgItemEntry = serde_json::from_value(serde_json::json!({
+            "itemId":"item-old","seq":1,"authorUserId":actor,"rev":1,"generation":1,
+            "createdAt":"t","tombstoned":false,"docId":STABLE_DOC_ID,"access":"view",
+            "documentOwnerUserId":actor,"isCurrent":true
+        })).unwrap();
+        state.db.lock().execute(
+            "UPDATE org_shares SET state='failed',last_error='direct_put_pending'
+              WHERE org_id=?1 AND doc_id=?2",
+            rusqlite::params![STABLE_ORG_ID,STABLE_DOC_ID],
+        ).unwrap();
+        assert!(!apply_authoritative_org_access(&state, &attempt, &head).unwrap());
+        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "edit");
+        assert_eq!(pending_org_access_attempts(&state).unwrap().len(), 1);
+        state.db.lock().execute(
+            "UPDATE org_shares SET state='uploaded',last_error=NULL
+              WHERE org_id=?1 AND doc_id=?2",
+            rusqlite::params![STABLE_ORG_ID,STABLE_DOC_ID],
+        ).unwrap();
+        assert!(apply_authoritative_org_access(&state, &attempt, &head).unwrap());
+        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "view");
+        assert!(pending_org_access_attempts(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ambiguous_org_access_response_reconciles_authoritative_head_without_redispatch() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut patch, _) = accept_with_timeout(&listener);
+            assert!(String::from_utf8_lossy(&read_http_request(&mut patch)).starts_with("PATCH "));
+            write!(patch,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{{").unwrap();
+            let (mut get, _) = accept_with_timeout(&listener);
+            assert!(String::from_utf8_lossy(&read_http_request(&mut get)).starts_with("GET "));
+            let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+            let body = format!("{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"{actor}\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"view\",\"documentOwnerUserId\":\"{actor}\",\"isCurrent\":true}}],\"nextSeq\":1}}");
+            write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        let state = build_state("org-access-ambiguous-reconcile");
+        seed_editable_stable_org_item(&state,"item-old","edit");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        block_on(org_set_item_access_inner(&state,"item-old",crate::share::org_dto::OrgItemAccess::View)).unwrap();
+        server.join().unwrap();
+        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access,"view");
+        assert!(pending_org_access_attempts(&state).unwrap().is_empty());
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(),1);
+        assert_eq!(state.db.count_share_egress_by_kind("org_document_head_read").unwrap(),1);
+    }
+
+    #[test]
+    fn ambiguous_org_access_unavailable_head_stays_pending_then_sweep_reconciles_get_only() {
+        use std::io::Write;
+        let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_addr = first_listener.local_addr().unwrap();
+        let first_server = std::thread::spawn(move || {
+            let (mut patch, _) = accept_with_timeout(&first_listener);
+            assert!(String::from_utf8_lossy(&read_http_request(&mut patch)).starts_with("PATCH "));
+            write!(patch,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{{").unwrap();
+            let (mut get, _) = accept_with_timeout(&first_listener);
+            assert!(String::from_utf8_lossy(&read_http_request(&mut get)).starts_with("GET "));
+            write!(get,"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        let state = build_state("org-access-ambiguous-restart");
+        seed_editable_stable_org_item(&state,"item-old","edit");
+        state.config.lock().unwrap().share_base_url = format!("http://{first_addr}/");
+        assert!(matches!(block_on(org_set_item_access_inner(
+            &state,"item-old",crate::share::org_dto::OrgItemAccess::View,
+        )),Err(AppError::Unavailable(_))));
+        first_server.join().unwrap();
+        assert_eq!(pending_org_access_attempts(&state).unwrap().len(),1);
+        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access,"edit");
+
+        let second_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_addr = second_listener.local_addr().unwrap();
+        let second_server = std::thread::spawn(move || {
+            let (mut get, _) = accept_with_timeout(&second_listener);
+            assert!(String::from_utf8_lossy(&read_http_request(&mut get)).starts_with("GET "));
+            let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+            let body = format!("{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"{actor}\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"view\",\"documentOwnerUserId\":\"{actor}\",\"isCurrent\":true}}],\"nextSeq\":1}}");
+            write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        });
+        state.config.lock().unwrap().share_base_url = format!("http://{second_addr}/");
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(),1);
+        second_server.join().unwrap();
+        assert!(pending_org_access_attempts(&state).unwrap().is_empty());
+        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access,"view");
+        assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(),1);
+        assert_eq!(state.db.count_share_egress_by_kind("org_document_head_read").unwrap(),2);
+    }
+
+    #[test]
+    fn org_dispatch_permits_reject_same_length_ciphertext_substitution() {
+        let host = "relay.example";
+        let org_id = STABLE_ORG_ID;
+        let doc_id = STABLE_DOC_ID;
+        let original_cell = vec![1u8, 2, 3, 4];
+        let substituted_cell = vec![4u8, 3, 2, 1];
+        let semantic_sha = vec![9u8; 32];
+        let publish_request = crate::share::org_dto::PublishItemRequest {
+            mutation_id: None,
+            doc_id: Some(doc_id.to_string()),
+            access: Some(crate::share::org_dto::OrgItemAccess::View),
+            blob_id: None,
+            content_cell: Some(original_cell.clone()),
+            content_sha256: semantic_sha.clone(),
+            rev: 1,
+            generation: 1,
+        };
+        let publish_permit = test_org_publish_dispatch_permit(
+            host,
+            org_id,
+            &publish_request,
+            Some("owner"),
+        );
+        let mut substituted_publish = publish_request;
+        substituted_publish.content_cell = Some(substituted_cell.clone());
+        assert!(matches!(
+            publish_permit.authorize_publish(host, org_id, &substituted_publish),
+            Err(AppError::Storage(message)) if message == "org publish dispatch permit mismatch"
+        ));
+
+        let original_update = crate::share::org_dto::UpdateOrgItemRequest {
+            mutation_id: None,
+            expected_rev: 1,
+            content_cell: original_cell,
+            content_sha256: semantic_sha.clone(),
+            generation: 1,
+        };
+        let update_permit = test_org_update_dispatch_permit(
+            host,
+            org_id,
+            doc_id,
+            crate::share::org_dto::OrgItemAccess::Edit,
+            "owner",
+            &original_update,
+        );
+        let substituted_update = crate::share::org_dto::UpdateOrgItemRequest {
+            mutation_id: None,
+            expected_rev: 1,
+            content_cell: substituted_cell,
+            content_sha256: semantic_sha,
+            generation: 1,
+        };
+        assert!(matches!(
+            update_permit.authorize_update(host, org_id, doc_id, &substituted_update),
+            Err(AppError::Storage(message)) if message == "org update dispatch permit mismatch"
+        ));
     }

@@ -347,6 +347,104 @@ fn share_egress_dispatch_transaction_rollback_leaves_no_ledger_row() {
 }
 
 #[test]
+fn outbound_content_and_delete_dispatch_rollback_before_permit_mint() {
+    let db = mem_db();
+    let share_id = "11111111-1111-4111-8111-111111111111";
+    let owner = "22222222-2222-4222-8222-222222222222";
+    assert!(db
+        .insert_outbound_share_attempt(
+            share_id,
+            Some("dispatch-meeting"),
+            None,
+            "link",
+            1,
+            owner,
+            "2026-08-21T00:00:00Z",
+        )
+        .unwrap());
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER reject_outbound_dispatch_ledger
+             BEFORE INSERT ON share_egress_log
+             BEGIN SELECT RAISE(ABORT, 'dispatch ledger fault'); END;",
+        )
+        .unwrap();
+
+    assert!(db
+        .persist_outbound_content_dispatch(
+            share_id,
+            owner,
+            "link",
+            1,
+            "content-dispatch-failed",
+            &[3; 32],
+            &[4; 32],
+            1,
+            "relay",
+            "share_create",
+            3,
+        )
+        .is_err());
+    let (state, dispatch): (String, Option<String>) = db
+        .lock()
+        .query_row(
+            "SELECT state,dispatch_id FROM outbound_shares WHERE share_id=?1",
+            [share_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "create_pending");
+    assert_eq!(dispatch, None);
+
+    db.lock()
+        .execute_batch("DROP TRIGGER reject_outbound_dispatch_ledger;")
+        .unwrap();
+    assert!(db
+        .persist_outbound_content_dispatch(
+            share_id,
+            owner,
+            "link",
+            1,
+            "content-dispatch-ok",
+            &[3; 32],
+            &[4; 32],
+            2,
+            "relay",
+            "share_create",
+            3,
+        )
+        .unwrap());
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER reject_outbound_delete_ledger
+             BEFORE INSERT ON share_egress_log
+             BEGIN SELECT RAISE(ABORT, 'delete ledger fault'); END;",
+        )
+        .unwrap();
+    assert!(db
+        .persist_outbound_delete_dispatch(
+            share_id,
+            owner,
+            "link",
+            1,
+            "delete-dispatch-failed",
+            3,
+            "relay",
+        )
+        .is_err());
+    let (state, dispatch): (String, Option<String>) = db
+        .lock()
+        .query_row(
+            "SELECT state,dispatch_id FROM outbound_shares WHERE share_id=?1",
+            [share_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "create_pending");
+    assert_eq!(dispatch.as_deref(), Some("content-dispatch-ok"));
+}
+
+#[test]
 fn org_recovery_read_dispatch_binds_exact_content_free_page_witness() {
     let db = mem_db();
     let mut conn = db.lock();
@@ -802,182 +900,53 @@ fn org_source_counters_are_atomic_row_local_and_debounce_only_invalidates() {
 fn attachment_updates_advance_old_and_new_source_witnesses_atomically() {
     let db = mem_db();
     seed_folder(&db, "f-attachment-update", "Attachment update");
-    db.insert_note(
-        "n-attachment-old",
-        "f-attachment-update",
-        "source",
-        "Old",
-        "body",
-        1,
-    )
-    .unwrap();
-    db.insert_note(
-        "n-attachment-new",
-        "f-attachment-update",
-        "source",
-        "New",
-        "body",
-        1,
-    )
-    .unwrap();
-    db.lock()
-        .execute(
-            "INSERT INTO note_attachments
-               (id,document_id,mime_type,extension,byte_len,width,height,sha256,data,created_at)
-             VALUES('attachment-update','n-attachment-old','image/png','png',1,1,1,?1,?2,1)",
-            rusqlite::params![sha32(1), vec![1_u8]],
-        )
-        .unwrap();
+    db.insert_note("n-attachment-old", "f-attachment-update", "source", "Old", "body", 1).unwrap();
+    db.insert_note("n-attachment-new", "f-attachment-update", "source", "New", "body", 1).unwrap();
+    db.lock().execute(
+        "INSERT INTO note_attachments
+           (id,document_id,mime_type,extension,byte_len,width,height,sha256,data,created_at)
+         VALUES('attachment-update','n-attachment-old','image/png','png',1,1,1,?1,?2,1)",
+        rusqlite::params![sha32(1), vec![1_u8]],
+    ).unwrap();
 
     for (share_id, document_id) in [
         ("share-attachment-old", "n-attachment-old"),
         ("share-attachment-new", "n-attachment-new"),
     ] {
         db.insert_org_share(
-            share_id,
-            STABLE_ORG_ID,
-            None,
-            Some(document_id),
-            "note",
-            Some("Title"),
-            1,
-            1,
-            &sha32(1),
-            "t",
-        )
-        .unwrap();
-        db.set_org_share_uploaded(share_id, &format!("item-{share_id}"), "t")
-            .unwrap();
+            share_id, STABLE_ORG_ID, None, Some(document_id), "note", Some("Title"),
+            1, 1, &sha32(1), "t",
+        ).unwrap();
+        db.set_org_share_uploaded(share_id, &format!("item-{share_id}"), "t").unwrap();
     }
 
-    db.lock()
-        .execute(
-            "UPDATE note_attachments SET data=?2,sha256=?3,byte_len=2 WHERE id=?1",
-            rusqlite::params!["attachment-update", vec![2_u8, 2], sha32(2)],
-        )
-        .unwrap();
-    assert_eq!(
-        db.org_share_source_counters("share-attachment-old")
-            .unwrap(),
-        (1, 1)
-    );
-    assert_eq!(
-        db.org_share_source_counters("share-attachment-new")
-            .unwrap(),
-        (0, 0)
-    );
+    db.lock().execute(
+        "UPDATE note_attachments SET data=?2,sha256=?3,byte_len=2 WHERE id=?1",
+        rusqlite::params!["attachment-update", vec![2_u8, 2], sha32(2)],
+    ).unwrap();
+    assert_eq!(db.org_share_source_counters("share-attachment-old").unwrap(), (1, 1));
+    assert_eq!(db.org_share_source_counters("share-attachment-new").unwrap(), (0, 0));
 
-    db.lock()
-        .execute(
-            "UPDATE note_attachments SET document_id='n-attachment-new' WHERE id='attachment-update'",
-            [],
-        )
-        .unwrap();
-    assert_eq!(
-        db.org_share_source_counters("share-attachment-old")
-            .unwrap(),
-        (2, 2)
-    );
-    assert_eq!(
-        db.org_share_source_counters("share-attachment-new")
-            .unwrap(),
-        (1, 1)
-    );
+    db.lock().execute(
+        "UPDATE note_attachments SET document_id='n-attachment-new' WHERE id='attachment-update'",
+        [],
+    ).unwrap();
+    assert_eq!(db.org_share_source_counters("share-attachment-old").unwrap(), (2, 2));
+    assert_eq!(db.org_share_source_counters("share-attachment-new").unwrap(), (1, 1));
 
-    db.lock()
-        .execute_batch(
-            "CREATE TRIGGER fail_attachment_source_witness
-               BEFORE UPDATE OF source_version ON org_shares
-               WHEN NEW.id='share-attachment-new'
-               BEGIN SELECT RAISE(ABORT, 'fail attachment witness'); END;",
-        )
-        .unwrap();
-    assert!(db
-        .lock()
-        .execute(
-            "UPDATE note_attachments SET mime_type='image/jpeg' WHERE id='attachment-update'",
-            [],
-        )
-        .is_err());
-    assert_eq!(
-        db.lock()
-            .query_row(
-                "SELECT mime_type FROM note_attachments WHERE id='attachment-update'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-        "image/png"
-    );
-}
-
-#[test]
-fn storage_foundation_keeps_new_permission_and_link_fields_off_the_base_ipc_wire() {
-    let detail = crate::storage::models::OrgItemDetail {
-        item_id: "item".into(),
-        doc_id: Some(STABLE_DOC_ID.into()),
-        link_id: Some(format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}")),
-        author_hint: "author".into(),
-        title: "Title".into(),
-        created_at: "t".into(),
-        rev: 1,
-        markdown: "body".into(),
-        editable: true,
-        access: "edit".into(),
-        can_edit: true,
-        can_manage: true,
-    };
-    let detail = serde_json::to_value(detail).unwrap();
-    for key in ["docId", "linkId", "access", "canEdit", "canManage"] {
-        assert!(detail.get(key).is_none(), "foundation leaked {key} onto IPC");
-    }
-    assert_eq!(detail.get("editable"), Some(&serde_json::json!(true)));
-
-    let header = crate::storage::models::OrgItemHeader {
-        item_id: "item".into(),
-        doc_id: Some(STABLE_DOC_ID.into()),
-        title: "Title".into(),
-        author_hint: "author".into(),
-        created_at: "t".into(),
-        seq: 1,
-        kind: None,
-        owned_source: None,
-    };
-    assert!(serde_json::to_value(header).unwrap().get("docId").is_none());
-
-    let edge = crate::storage::models::LinkEdge {
-        id: 1,
-        direction: "out".into(),
-        other_kind: "org".into(),
-        other_id: format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}"),
-        navigation_id: Some("item".into()),
-        other_title: "Title".into(),
-        edge_type: "manual".into(),
-        created_by: "user".into(),
-        status: "active".into(),
-        score: 1.0,
-        created_at: 1,
-        manual: true,
-        manual_edges: vec![crate::storage::models::ManualLinkEdge {
-            src_kind: "note".into(),
-            src_id: "source".into(),
-            dst_kind: "org".into(),
-            dst_id: format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}"),
-        }],
-    };
-    let edge = serde_json::to_value(edge).unwrap();
-    assert!(edge.get("navigationId").is_none());
-    assert!(edge.get("manualEdges").is_none());
-
-    let target = crate::storage::models::WikiTarget {
-        kind: "org".into(),
-        id: "item".into(),
-        stable_id: Some(format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}")),
-    };
-    assert!(serde_json::to_value(target)
-        .unwrap()
-        .get("stableId")
-        .is_none());
+    db.lock().execute_batch(
+        "CREATE TRIGGER fail_attachment_source_witness
+           BEFORE UPDATE OF source_version ON org_shares
+           WHEN NEW.id='share-attachment-new'
+           BEGIN SELECT RAISE(ABORT, 'fail attachment witness'); END;",
+    ).unwrap();
+    assert!(db.lock().execute(
+        "UPDATE note_attachments SET mime_type='image/jpeg' WHERE id='attachment-update'", [],
+    ).is_err());
+    assert_eq!(db.lock().query_row(
+        "SELECT mime_type FROM note_attachments WHERE id='attachment-update'", [],
+        |row| row.get::<_, String>(0),
+    ).unwrap(), "image/png");
 }
 
 /// RED before UUID admission: malformed stable identities advanced the feed cursor and persisted a
@@ -1729,70 +1698,45 @@ fn locked_manual_marker_cleanup_verifies_seal_before_atomic_replacement() {
     let marker = crate::enrich::apply_link_markers(
         "left prose",
         &[crate::enrich::ContextHit {
-            source: "note".into(),
-            detail: "[[Right]]".into(),
-            url: None,
+            source: "note".into(), detail: "[[Right]]".into(), url: None,
         }],
     );
     let stripped = crate::enrich::strip_managed_links_block(&marker);
     db.set_document_text("marker-left", &marker).unwrap();
-    db.set_note_doc_exported_path("marker-left", Some("/vault/marker-left.md"))
-        .unwrap();
-    db.lock()
-        .execute_batch(
-            "UPDATE folders SET locked=1 WHERE id='f-marker-seal';
-             UPDATE documents SET text_blob=X'01' WHERE id='marker-left';",
-        )
-        .unwrap();
-    db.upsert_manual_link("note", "marker-left", "note", "marker-right")
-        .unwrap();
+    db.set_note_doc_exported_path("marker-left", Some("/vault/marker-left.md")).unwrap();
+    db.lock().execute_batch(
+        "UPDATE folders SET locked=1 WHERE id='f-marker-seal';
+         UPDATE documents SET text_blob=X'01' WHERE id='marker-left';",
+    ).unwrap();
+    db.upsert_manual_link("note", "marker-left", "note", "marker-right").unwrap();
 
     let edge = crate::storage::models::ManualLinkEdge {
-        src_kind: "note".into(),
-        src_id: "marker-left".into(),
-        dst_kind: "note".into(),
-        dst_id: "marker-right".into(),
+        src_kind: "note".into(), src_id: "marker-left".into(),
+        dst_kind: "note".into(), dst_id: "marker-right".into(),
     };
     let content_key = zeroize::Zeroizing::new([7_u8; 32]);
     let aad = b"murmur:document:v1|folder=f-marker-seal|document=marker-left|type=document";
     let blob = crate::crypto::encrypt(&content_key, stripped.as_bytes(), aad).unwrap();
     let invalid = crate::storage::links::PreparedManualMarkerSeal {
-        note_id: "marker-left".into(),
-        folder_id: "f-marker-seal".into(),
-        stripped_text: stripped.clone(),
-        text_blob: blob.clone(),
+        note_id: "marker-left".into(), folder_id: "f-marker-seal".into(),
+        stripped_text: stripped.clone(), text_blob: blob.clone(),
         content_key: zeroize::Zeroizing::new([8_u8; 32]),
     };
-    assert!(db
-        .delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &[invalid])
-        .is_err());
-    assert_eq!(
-        db.get_note_row("marker-left").unwrap().unwrap().text,
-        marker,
-        "verification failure must preserve the only plaintext"
-    );
+    assert!(db.delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &[invalid]).is_err());
+    assert_eq!(db.get_note_row("marker-left").unwrap().unwrap().text, marker);
     assert_eq!(link_count(&db, "note", "marker-left", "manual"), 1);
     assert!(db.pending_lock_marker_export_cleanup().unwrap().is_empty());
 
     let valid = crate::storage::links::PreparedManualMarkerSeal {
-        note_id: "marker-left".into(),
-        folder_id: "f-marker-seal".into(),
-        stripped_text: stripped.clone(),
-        text_blob: blob,
+        note_id: "marker-left".into(), folder_id: "f-marker-seal".into(),
+        stripped_text: stripped.clone(), text_blob: blob,
         content_key: content_key.clone(),
     };
-    assert!(db
-        .delete_manual_links_with_marker_seals(&[edge], &[valid])
-        .unwrap());
+    assert!(db.delete_manual_links_with_marker_seals(&[edge], &[valid]).unwrap());
     let stored = db.get_note_row("marker-left").unwrap().unwrap();
-    let stored_blob: Vec<u8> = db
-        .lock()
-        .query_row(
-            "SELECT text_blob FROM documents WHERE id='marker-left'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let stored_blob: Vec<u8> = db.lock().query_row(
+        "SELECT text_blob FROM documents WHERE id='marker-left'", [], |row| row.get(0),
+    ).unwrap();
     assert!(
         stored.text.is_empty(),
         "a locked note must not retain plaintext beside its verified ciphertext"
@@ -1927,244 +1871,88 @@ fn org_access_attempts_are_exact_transactional_cas_across_failures_and_accounts(
     let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
     let other_actor = "d645c7e3-13d2-4d3d-b367-4bf9603c2678";
     db.upsert_org_item(
-        "access-head",
-        STABLE_ORG_ID,
-        1,
-        actor,
-        "Shared",
-        "body",
-        "2026-08-12T00:00:00Z",
-        1,
-        1,
-        &sha32(1),
-        None,
-        Some(actor),
-        None,
-    )
-    .unwrap();
-    db.set_org_item_document_metadata("access-head", Some(STABLE_DOC_ID), "edit", Some(actor))
-        .unwrap();
+        "access-head", STABLE_ORG_ID, 1, actor, "Shared", "body",
+        "2026-08-12T00:00:00Z", 1, 1, &sha32(1), None, Some(actor), None,
+    ).unwrap();
+    db.set_org_item_document_metadata("access-head", Some(STABLE_DOC_ID), "edit", Some(actor)).unwrap();
     db.repair_org_reconcile_metadata(
-        "access-head",
-        STABLE_ORG_ID,
-        1,
-        Some(STABLE_DOC_ID),
-        "edit",
-        Some(actor),
-        true,
-    )
-    .unwrap();
+        "access-head", STABLE_ORG_ID, 1, Some(STABLE_DOC_ID), "edit", Some(actor), true,
+    ).unwrap();
     db.insert_org_share(
-        "access-share",
-        STABLE_ORG_ID,
-        None,
-        Some("access-source"),
-        "note",
-        Some("Shared"),
-        1,
-        1,
-        &sha32(1),
-        "2026-08-12T00:00:00Z",
-    )
-    .unwrap();
-    db.set_org_share_uploaded("access-share", "access-head", "2026-08-12T00:00:01Z")
-        .unwrap();
-    db.set_org_share_document_metadata("access-share", STABLE_DOC_ID, "edit")
-        .unwrap();
+        "access-share", STABLE_ORG_ID, None, Some("access-source"), "note", Some("Shared"),
+        1, 1, &sha32(1), "2026-08-12T00:00:00Z",
+    ).unwrap();
+    db.set_org_share_uploaded("access-share", "access-head", "2026-08-12T00:00:01Z").unwrap();
+    db.set_org_share_document_metadata("access-share", STABLE_DOC_ID, "edit").unwrap();
 
     let dispatch_1 = "11111111-2222-4333-8444-555555555555";
-    assert!(db
-        .persist_org_access_attempt_if_current(
-            1,
-            "relay.example",
-            dispatch_1,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "edit",
-            "view",
-            actor,
-            actor,
-            "2026-08-12T00:00:02Z",
-        )
-        .unwrap());
+    assert!(db.persist_org_access_attempt_if_current(
+        1, "relay.example", dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID,
+        "edit", "view", actor, actor, "2026-08-12T00:00:02Z",
+    ).unwrap());
     assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
     assert_eq!(db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
-    assert!(!db
-        .persist_org_access_attempt_if_current(
-            2,
-            "relay.example",
-            dispatch_1,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "edit",
-            "view",
-            actor,
-            actor,
-            "2026-08-12T00:00:03Z",
-        )
-        .unwrap());
-    assert_eq!(
-        db.count_share_egress_by_kind("org_share_access").unwrap(),
-        1,
-        "a refused duplicate must roll its ledger insert back"
-    );
-    assert!(!db
-        .apply_org_access_attempt_if_current(
-            dispatch_1,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "edit",
-            "view",
-            other_actor,
-            actor,
-        )
-        .unwrap());
-    assert!(!db
-        .apply_org_access_attempt_if_current(
-            dispatch_1,
-            STABLE_ORG_ID,
-            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-            "edit",
-            "view",
-            actor,
-            actor,
-        )
-        .unwrap());
-
-    db.lock()
-        .execute_batch(
-            "CREATE TRIGGER abort_access_projection
-             BEFORE UPDATE OF access ON org_items
-             BEGIN SELECT RAISE(ABORT, 'access projection fault'); END;",
-        )
-        .unwrap();
-    assert!(db
-        .apply_org_access_attempt_if_current(
-            dispatch_1,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "edit",
-            "view",
-            actor,
-            actor,
-        )
-        .is_err());
+    assert!(!db.persist_org_access_attempt_if_current(
+        2, "relay.example", dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID,
+        "edit", "view", actor, actor, "2026-08-12T00:00:03Z",
+    ).unwrap());
+    assert_eq!(db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
+    assert!(!db.apply_org_access_attempt_if_current(
+        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", other_actor, actor,
+    ).unwrap());
+    assert!(!db.apply_org_access_attempt_if_current(
+        dispatch_1, STABLE_ORG_ID, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "edit", "view", actor, actor,
+    ).unwrap());
+    db.lock().execute_batch(
+        "CREATE TRIGGER abort_access_projection BEFORE UPDATE OF access ON org_items
+         BEGIN SELECT RAISE(ABORT, 'access projection fault'); END;",
+    ).unwrap();
+    assert!(db.apply_org_access_attempt_if_current(
+        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", actor, actor,
+    ).is_err());
     assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
     assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "edit");
     assert_eq!(db.get_org_share("access-share").unwrap().unwrap().access, "edit");
-    db.lock()
-        .execute_batch("DROP TRIGGER abort_access_projection;")
-        .unwrap();
-
-    assert!(db
-        .apply_org_access_attempt_if_current(
-            dispatch_1,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "edit",
-            "view",
-            actor,
-            actor,
-        )
-        .unwrap());
+    db.lock().execute_batch("DROP TRIGGER abort_access_projection;").unwrap();
+    assert!(db.apply_org_access_attempt_if_current(
+        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", actor, actor,
+    ).unwrap());
     assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "view");
     assert_eq!(db.get_org_share("access-share").unwrap().unwrap().access, "view");
     assert!(db.pending_org_access_attempts().unwrap().is_empty());
-    assert!(!db
-        .apply_org_access_attempt_if_current(
-            dispatch_1,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "edit",
-            "view",
-            actor,
-            actor,
-        )
-        .unwrap());
+    assert!(!db.apply_org_access_attempt_if_current(
+        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", actor, actor,
+    ).unwrap());
 
     let dispatch_2 = "22222222-3333-4444-8555-666666666666";
-    assert!(db
-        .persist_org_access_attempt_if_current(
-            3,
-            "relay.example",
-            dispatch_2,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "view",
-            "edit",
-            actor,
-            actor,
-            "2026-08-12T00:00:04Z",
-        )
-        .unwrap());
-    assert!(!db
-        .fail_org_access_attempt_if_current(
-            dispatch_2,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "view",
-            "edit",
-            other_actor,
-            actor,
-        )
-        .unwrap());
-    assert!(db
-        .fail_org_access_attempt_if_current(
-            dispatch_2,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "view",
-            "edit",
-            actor,
-            actor,
-        )
-        .unwrap());
+    assert!(db.persist_org_access_attempt_if_current(
+        3, "relay.example", dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID,
+        "view", "edit", actor, actor, "2026-08-12T00:00:04Z",
+    ).unwrap());
+    assert!(!db.fail_org_access_attempt_if_current(
+        dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", other_actor, actor,
+    ).unwrap());
+    assert!(db.fail_org_access_attempt_if_current(
+        dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", actor, actor,
+    ).unwrap());
     assert!(db.pending_org_access_attempts().unwrap().is_empty());
 
     let dispatch_3 = "33333333-4444-4555-8666-777777777777";
-    assert!(db
-        .persist_org_access_attempt_if_current(
-            4,
-            "relay.example",
-            dispatch_3,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "view",
-            "edit",
-            actor,
-            actor,
-            "2026-08-12T00:00:05Z",
-        )
-        .unwrap());
-    assert!(!db
-        .apply_org_access_attempt_if_current(
-            dispatch_2,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "view",
-            "edit",
-            actor,
-            actor,
-        )
-        .unwrap());
-    db.lock()
-        .execute(
-            "UPDATE org_shares SET state='failed',last_error='direct_put_pending'
-              WHERE id='access-share'",
-            [],
-        )
-        .unwrap();
-    assert!(!db
-        .apply_org_access_attempt_if_current(
-            dispatch_3,
-            STABLE_ORG_ID,
-            STABLE_DOC_ID,
-            "view",
-            "edit",
-            actor,
-            actor,
-        )
-        .unwrap());
+    assert!(db.persist_org_access_attempt_if_current(
+        4, "relay.example", dispatch_3, STABLE_ORG_ID, STABLE_DOC_ID,
+        "view", "edit", actor, actor, "2026-08-12T00:00:05Z",
+    ).unwrap());
+    assert!(!db.apply_org_access_attempt_if_current(
+        dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", actor, actor,
+    ).unwrap());
+    db.lock().execute(
+        "UPDATE org_shares SET state='failed',last_error='direct_put_pending' WHERE id='access-share'",
+        [],
+    ).unwrap();
+    assert!(!db.apply_org_access_attempt_if_current(
+        dispatch_3, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", actor, actor,
+    ).unwrap());
     assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "view");
     assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
 }
@@ -3677,31 +3465,22 @@ fn confirmed_document_delete_terminalizes_sibling_anchors_and_plaintext_in_one_t
         db.set_org_item_document_metadata(item, Some(doc_id), "view", Some("owner")).unwrap();
     }
     let endpoint = format!("{org_id}:{doc_id}");
-    db.lock()
-        .execute(
-            "INSERT INTO links
-               (src_kind,src_id,dst_kind,dst_id,edge_type,created_at)
-             VALUES('org',?1,'note','local-note','manual',1)",
-            [&endpoint],
-        )
-        .unwrap();
+    db.lock().execute(
+        "INSERT INTO links
+           (src_kind,src_id,dst_kind,dst_id,edge_type,created_at)
+         VALUES('org',?1,'note','local-note','manual',1)",
+        [&endpoint],
+    ).unwrap();
     assert!(db.terminalize_and_evict_org_document(org_id, doc_id, "2026-08-13T00:00:02Z").unwrap());
     for id in ["item-1", "item-2"] {
         assert_eq!(db.get_org_share(id).unwrap().unwrap().state, "revoked");
         let item = db.get_org_item(id).unwrap();
         assert!(item.is_none(), "tombstoned plaintext is not readable");
     }
-    assert_eq!(
-        db.lock()
-            .query_row(
-                "SELECT COUNT(*) FROM links WHERE src_kind='org' AND src_id=?1",
-                [&endpoint],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        0,
-        "confirmed stable-document destruction must purge private graph tuples"
-    );
+    assert_eq!(db.lock().query_row(
+        "SELECT COUNT(*) FROM links WHERE src_kind='org' AND src_id=?1", [&endpoint],
+        |row| row.get::<_, i64>(0),
+    ).unwrap(), 0);
 }
 
 #[test]
@@ -4959,10 +4738,10 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
         assert!(db.lock().execute(sql, []).is_err(), "every envelope identity field is frozen");
     }
     assert!(db
-        .reset_org_share_for_retry_with_scrub("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
+        .reset_org_share_for_retry("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
         .is_err());
     db.clear_org_source_closure("document", "closing-doc").unwrap();
-    db.reset_org_share_for_retry_with_scrub("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
+    db.reset_org_share_for_retry("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
         .unwrap();
 }
 
@@ -4996,6 +4775,19 @@ fn meeting_source_closure_blocks_provider_insert_delete_and_title_changes() {
     assert!(db.lock().execute(
         "UPDATE meetings SET title='After' WHERE id='meeting-close'", [],
     ).is_err());
+
+    db.delete_meeting("meeting-close").unwrap();
+    let exists: i64 = db.lock().query_row(
+        "SELECT EXISTS(SELECT 1 FROM meetings WHERE id='meeting-close')", [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(exists, 0);
+    let phase: String = db.lock().query_row(
+        "SELECT phase FROM org_share_closures
+          WHERE scope_kind='meeting' AND scope_id='meeting-close'", [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(phase, "closed", "meeting cascade and barrier completion commit together");
 }
 
 #[test]
@@ -5256,7 +5048,7 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
         "plain",
         "a normal queued row with NULL last_error remains reusable"
     );
-    db.reset_org_share_for_retry_with_scrub(
+    db.reset_org_share_for_retry(
         "plain",
         Some("Changed"),
         1,
@@ -5275,7 +5067,7 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
         .unwrap()
         .is_none());
     assert!(matches!(
-        db.reset_org_share_for_retry_with_scrub(
+        db.reset_org_share_for_retry(
             "direct",
             Some("T"),
             1,
@@ -5307,7 +5099,7 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
         .unwrap()
         .is_none());
     assert!(matches!(
-        db.reset_org_share_for_retry_with_scrub(
+        db.reset_org_share_for_retry(
             "republish-put",
             Some("T"),
             1,
@@ -5328,7 +5120,7 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
             .unwrap()
             .is_none());
         assert!(matches!(
-            db.reset_org_share_for_retry_with_scrub(
+            db.reset_org_share_for_retry(
                 id,
                 Some("T"),
                 1,
@@ -5355,7 +5147,7 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
         "replay"
     );
     assert!(matches!(
-        db.reset_org_share_for_retry_with_scrub(
+        db.reset_org_share_for_retry(
             "replay",
             Some("Changed"),
             1,
@@ -5367,7 +5159,7 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
         Err(crate::error::AppError::Unavailable(_))
     ));
     assert!(matches!(
-        db.reset_org_share_for_retry_with_scrub(
+        db.reset_org_share_for_retry(
             "replay",
             Some("T"),
             1,
@@ -11456,9 +11248,6 @@ fn links_for_visible_preserves_opposite_manual_tuple_under_wikilink() {
     let chip = edges.iter().find(|edge| edge.other_id == "target").unwrap();
     assert_eq!(chip.edge_type, "wikilink");
     assert_eq!(chip.direction, "out");
-    // This storage-first layer keeps exact unlink handles internal. The following stacked command
-    // and frontend layer deliberately activates their IPC representation only after this schema is
-    // present, so this oracle binds durable tuple preservation rather than the future wire shape.
     assert_eq!(
         chip.manual_edges,
         vec![crate::storage::models::ManualLinkEdge {
@@ -11468,6 +11257,16 @@ fn links_for_visible_preserves_opposite_manual_tuple_under_wikilink() {
             dst_id: "source".into(),
         }],
         "the removable chip must retain the opposite directed manual tuple"
+    );
+    let wire = serde_json::to_value(chip).unwrap();
+    let tuple = &wire["manualEdges"][0];
+    assert_eq!(tuple["srcKind"], "note");
+    assert_eq!(tuple["srcId"], "target");
+    assert_eq!(tuple["dstKind"], "note");
+    assert_eq!(tuple["dstId"], "source");
+    assert!(
+        tuple.get("src_kind").is_none() && tuple.get("dst_kind").is_none(),
+        "the IPC tuple must serialize with camelCase keys"
     );
 }
 

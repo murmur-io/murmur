@@ -1,5 +1,22 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
+
+const ORG_ID = "11111111-1111-4111-8111-111111111111";
+const OTHER_ORG_ID = "22222222-2222-4222-8222-222222222222";
+const DOC_OUT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const DOC_IN_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const ORG_OUT_LINK_ID = `${ORG_ID}:${DOC_OUT_ID}`;
+const ORG_IN_LINK_ID = `${ORG_ID}:${DOC_IN_ID}`;
+
+async function emitOrgFeedUpdated(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __demoEmit: (event: string, payload: unknown) => void;
+      }
+    ).__demoEmit("murmur://org-feed-updated", { orgsChanged: 1 });
+  });
+}
 
 /**
  * PR-1 — user-initiated linking UI in the shared `app-connections` panel (mounted
@@ -99,12 +116,17 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
       return out;
     },
 
-    // The single-pick chooser's candidate feed: a note + a meeting + an org row
-    // (org must be filtered out of the chooser as a non-linkable endpoint).
+    // The single-pick chooser's candidate feed includes a revision-stable Shared
+    // Brain endpoint. It used to be rejected by Connections after selection.
     list_link_candidates: () => [
       { kind: "note", id: "n-picked", title: "Picked Note", snippet: "" },
       { kind: "meeting", id: "m-cand", title: "Some meeting", snippet: "" },
-      { kind: "org", id: "org-1", title: "Org item", snippet: "" },
+      {
+        kind: "org",
+        id: "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        title: "Shared roadmap",
+        snippet: "",
+      },
     ],
 
     // Record link/unlink calls + flip the re-fetch flag so list_links changes.
@@ -206,8 +228,8 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
   const picker = page.locator(".link-pop");
   await expect(picker).toBeVisible();
 
-  // The picker offers the candidates (org row is not a valid endpoint; picking a
-  // note candidate invokes link_items(anchor=note/n1 → note/n-picked)).
+  // Picking a local note invokes link_items(anchor=note/n1 → note/n-picked);
+  // the Shared Brain candidate is exercised separately below.
   const pickedRow = picker.getByRole("option", { name: /Picked Note/ });
   await expect(pickedRow).toBeVisible();
   // mousedown is prevented on the popover (no focus steal), then click emits picked.
@@ -223,7 +245,681 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
     args: { srcKind: "note", srcId: "n1", dstKind: "note", dstId: "n-picked" },
   });
 
+  // Regression: a received Shared Brain candidate is a valid private endpoint,
+  // keyed by the backend-composed stable link id (not the current revision id).
+  await panel.getByRole("button", { name: "Link", exact: true }).click();
+  const sharedRow = page
+    .locator(".link-pop")
+    .getByRole("option", { name: /Shared roadmap/ });
+  await expect(sharedRow).toBeVisible();
+  await sharedRow.dispatchEvent("click");
+  const afterOrgLink = await page.evaluate(
+    () => (window as unknown as { __linkCalls?: unknown[] }).__linkCalls || [],
+  );
+  expect(afterOrgLink).toContainEqual({
+    cmd: "link_items",
+    args: {
+      srcKind: "note",
+      srcId: "n1",
+      dstKind: "org",
+      dstId: ORG_OUT_LINK_ID,
+    },
+  });
+
   expect(consoleErrors).toEqual([]);
+});
+
+/**
+ * Directed-edge regression: `list_links` returns every edge incident on the
+ * anchor, but `unlink_items` deletes one exact stored `(src, dst)` tuple. The UI
+ * therefore has to preserve `LinkEdge.direction`: an incoming chip represents
+ * `other → anchor`, while an outgoing chip represents `anchor → other`.
+ *
+ * This mock is deliberately stateful and backend-shaped. It removes a tuple only
+ * when all four endpoint fields match, then derives the next `list_links` reply
+ * from the remaining tuples. An unconditional "after unlink" flag would let the
+ * reverse-direction bug pass while the real Rust command leaves the chip intact.
+ */
+test("unlink preserves the exact directed tuple for outgoing and incoming links", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    list_links: (args: { kind: string; id: string }) => {
+      const w = window as unknown as {
+        __directedLinks?: {
+          id: number;
+          srcKind: string;
+          srcId: string;
+          srcTitle: string;
+          dstKind: string;
+          dstId: string;
+          dstTitle: string;
+        }[];
+      };
+      w.__directedLinks ??= [
+        {
+          id: 101,
+          srcKind: "note",
+          srcId: "n1",
+          srcTitle: "My First Note",
+          dstKind: "meeting",
+          dstId: "m-out",
+          dstTitle: "Outgoing meeting",
+        },
+        {
+          id: 102,
+          srcKind: "org",
+          srcId:
+            "11111111-1111-4111-8111-111111111111:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          srcTitle: "Incoming shared note",
+          dstKind: "note",
+          dstId: "n1",
+          dstTitle: "My First Note",
+        },
+      ];
+      return w.__directedLinks
+        .filter(
+          (edge) =>
+            (edge.srcKind === args.kind && edge.srcId === args.id) ||
+            (edge.dstKind === args.kind && edge.dstId === args.id),
+        )
+        .map((edge) => {
+          const outgoing = edge.srcKind === args.kind && edge.srcId === args.id;
+          return {
+            id: edge.id,
+            direction: outgoing ? "out" : "in",
+            otherKind: outgoing ? edge.dstKind : edge.srcKind,
+            otherId: outgoing ? edge.dstId : edge.srcId,
+            otherTitle: outgoing ? edge.dstTitle : edge.srcTitle,
+            edgeType: "manual",
+            createdBy: "user",
+            status: "active",
+            score: 1,
+            createdAt: 1_720_000_400 + edge.id,
+            manual: true,
+          };
+        });
+    },
+    unlink_items: (args: {
+      srcKind: string;
+      srcId: string;
+      dstKind: string;
+      dstId: string;
+    }) => {
+      const w = window as unknown as {
+        __directedLinks?: {
+          srcKind: string;
+          srcId: string;
+          dstKind: string;
+          dstId: string;
+        }[];
+        __directedUnlinkCalls?: unknown[];
+      };
+      (w.__directedUnlinkCalls ??= []).push(args);
+      const exactIndex = (w.__directedLinks ?? []).findIndex(
+        (edge) =>
+          edge.srcKind === args.srcKind &&
+          edge.srcId === args.srcId &&
+          edge.dstKind === args.dstKind &&
+          edge.dstId === args.dstId,
+      );
+      if (exactIndex >= 0) {
+        w.__directedLinks!.splice(exactIndex, 1);
+      }
+      return null;
+    },
+    get_backlinks: () => [],
+  });
+
+  await page.goto("/notes/n1");
+  const panel = page.locator("app-connections");
+  await panel
+    .getByRole("button", { name: "Show related items and suggestions" })
+    .click();
+
+  await expect(panel.getByText("Outgoing meeting", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByText("Incoming shared note", { exact: true }),
+  ).toBeVisible();
+
+  await panel
+    .getByRole("button", { name: "Remove link to Outgoing meeting" })
+    .click();
+  await expect(panel.getByText("Outgoing meeting", { exact: true })).toHaveCount(0);
+  await expect(
+    panel.getByText("Incoming shared note", { exact: true }),
+  ).toBeVisible();
+
+  await panel
+    .getByRole("button", { name: "Remove link to Incoming shared note" })
+    .click();
+  await expect(
+    panel.getByText("Incoming shared note", { exact: true }),
+  ).toHaveCount(0);
+
+  const calls = await page.evaluate(
+    () =>
+      (window as unknown as { __directedUnlinkCalls?: unknown[] })
+        .__directedUnlinkCalls ?? [],
+  );
+  expect(calls).toEqual([
+    {
+      srcKind: "note",
+      srcId: "n1",
+      dstKind: "meeting",
+      dstId: "m-out",
+    },
+    {
+      srcKind: "org",
+      srcId: ORG_IN_LINK_ID,
+      dstKind: "note",
+      dstId: "n1",
+    },
+  ]);
+});
+
+test("collapsed opposite manual tuple is removed while the wikilink survives", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    list_links: () => {
+      const w = window as unknown as {
+        __oppositeManual?: {
+          srcKind: "note";
+          srcId: string;
+          dstKind: "note";
+          dstId: string;
+        }[];
+      };
+      w.__oppositeManual ??= [
+        {
+          srcKind: "note",
+          srcId: "n-target",
+          dstKind: "note",
+          dstId: "n1",
+        },
+      ];
+      return [
+        {
+          id: 301,
+          direction: "out",
+          otherKind: "note",
+          otherId: "n-target",
+          otherTitle: "Opposite target",
+          edgeType: "wikilink",
+          createdBy: "auto",
+          status: "active",
+          score: 1,
+          createdAt: 1_720_000_301,
+          manual: w.__oppositeManual.length > 0,
+          manualEdges: [...w.__oppositeManual],
+        },
+      ];
+    },
+    unlink_items: (args: {
+      srcKind: string;
+      srcId: string;
+      dstKind: string;
+      dstId: string;
+      manualEdges?: {
+        srcKind: "note";
+        srcId: string;
+        dstKind: "note";
+        dstId: string;
+      }[];
+    }) => {
+      const w = window as unknown as {
+        __oppositeManual?: typeof args.manualEdges;
+        __oppositeUnlink?: typeof args;
+      };
+      w.__oppositeUnlink = args;
+      const exact = args.manualEdges ?? [];
+      w.__oppositeManual = (w.__oppositeManual ?? []).filter(
+        (stored) =>
+          !exact.some(
+            (edge) =>
+              edge.srcKind === stored.srcKind &&
+              edge.srcId === stored.srcId &&
+              edge.dstKind === stored.dstKind &&
+              edge.dstId === stored.dstId,
+          ),
+      );
+      return null;
+    },
+    get_backlinks: () => [],
+  });
+
+  await page.goto("/notes/n1");
+  const panel = page.locator("app-connections");
+  await panel
+    .getByRole("button", { name: "Show related items and suggestions" })
+    .click();
+  await panel
+    .getByRole("button", { name: "Remove link to Opposite target" })
+    .click();
+
+  await expect(panel.getByText("Opposite target", { exact: true })).toBeVisible();
+  await expect(
+    panel.getByRole("button", { name: "Remove link to Opposite target" }),
+  ).toHaveCount(0);
+  const call = await page.evaluate(
+    () =>
+      (window as unknown as { __oppositeUnlink?: unknown }).__oppositeUnlink,
+  );
+  expect(call).toEqual({
+    srcKind: "note",
+    srcId: "n1",
+    dstKind: "note",
+    dstId: "n-target",
+    manualEdges: [
+      {
+        srcKind: "note",
+        srcId: "n-target",
+        dstKind: "note",
+        dstId: "n1",
+      },
+    ],
+  });
+});
+
+test("one collapsed unlink removes both directed manual tuples", async ({ page }) => {
+  await mockNotes(page, {
+    list_links: () => {
+      const w = window as unknown as {
+        __bidirectionalManual?: {
+          srcKind: "note";
+          srcId: string;
+          dstKind: "note";
+          dstId: string;
+        }[];
+      };
+      w.__bidirectionalManual ??= [
+        {
+          srcKind: "note",
+          srcId: "n1",
+          dstKind: "note",
+          dstId: "n-both",
+        },
+        {
+          srcKind: "note",
+          srcId: "n-both",
+          dstKind: "note",
+          dstId: "n1",
+        },
+      ];
+      return w.__bidirectionalManual.length
+        ? [
+            {
+              id: 401,
+              direction: "out",
+              otherKind: "note",
+              otherId: "n-both",
+              otherTitle: "Both directions",
+              edgeType: "manual",
+              createdBy: "user",
+              status: "active",
+              score: 1,
+              createdAt: 1_720_000_401,
+              manual: true,
+              manualEdges: [...w.__bidirectionalManual],
+            },
+          ]
+        : [];
+    },
+    unlink_items: (args: {
+      manualEdges?: {
+        srcKind: "note";
+        srcId: string;
+        dstKind: "note";
+        dstId: string;
+      }[];
+    }) => {
+      const w = window as unknown as {
+        __bidirectionalManual?: typeof args.manualEdges;
+        __bidirectionalUnlink?: typeof args;
+      };
+      w.__bidirectionalUnlink = args;
+      if ((args.manualEdges ?? []).length === 2) {
+        w.__bidirectionalManual = [];
+      }
+      return null;
+    },
+    get_backlinks: () => [],
+  });
+
+  await page.goto("/notes/n1");
+  const panel = page.locator("app-connections");
+  await panel
+    .getByRole("button", { name: "Show related items and suggestions" })
+    .click();
+  await panel
+    .getByRole("button", { name: "Remove link to Both directions" })
+    .click();
+  await expect(panel.getByText("Both directions", { exact: true })).toHaveCount(0);
+
+  const call = await page.evaluate(
+    () =>
+      (window as unknown as { __bidirectionalUnlink?: { manualEdges?: unknown[] } })
+        .__bidirectionalUnlink,
+  );
+  expect(call?.manualEdges).toEqual([
+    {
+      srcKind: "note",
+      srcId: "n1",
+      dstKind: "note",
+      dstId: "n-both",
+    },
+    {
+      srcKind: "note",
+      srcId: "n-both",
+      dstKind: "note",
+      dstId: "n1",
+    },
+  ]);
+});
+
+test("Shared Brain chip follows its stable link to the current live revision", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    list_links: (args: { kind: string }) =>
+      args.kind === "note"
+        ? [
+            {
+              id: 77,
+              direction: "out",
+              otherKind: "org",
+              otherId:
+                "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              navigationId: "item-current-9",
+              otherTitle: "Shared roadmap",
+              edgeType: "manual",
+              createdBy: "user",
+              status: "active",
+              score: 1,
+              createdAt: 1_720_000_200,
+              manual: true,
+            },
+          ]
+        : [],
+    get_backlinks: () => [],
+    org_resolve_source: () => null,
+    org_get_item: () => ({
+      itemId: "item-current-9",
+      docId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      linkId:
+        "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      authorHint: "kasia",
+      title: "Shared roadmap",
+      createdAt: "2026-08-12T10:00:00Z",
+      rev: 9,
+      markdown: "# Current revision",
+      access: "view",
+      canEdit: false,
+      canManage: false,
+    }),
+    org_list_statuses: () => [],
+    list_note_attachments: () => [],
+    account_status: () => ({ loggedIn: true }),
+  });
+
+  await page.goto("/notes/n1");
+  const panel = page.locator("app-connections");
+  await panel
+    .getByRole("button", { name: "Show related items and suggestions" })
+    .click();
+  await panel
+    .getByRole("button", { name: "Open Shared Brain item Shared roadmap" })
+    .click();
+  await expect(page).toHaveURL(/\/org-item\/item-current-9$/);
+  await expect(page.getByText("revision 9")).toBeVisible();
+});
+
+test("org-anchored picker keeps same-org and cross-org stable targets but excludes only exact self", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    org_resolve_source: () => null,
+    org_get_item: () => ({
+      itemId: "item-anchor-r3",
+      docId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      linkId:
+        "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      authorHint: "kasia",
+      title: "Anchor roadmap",
+      createdAt: "2026-08-12T10:00:00Z",
+      rev: 3,
+      markdown: "# Anchor roadmap",
+      access: "edit",
+      canEdit: true,
+      canManage: false,
+    }),
+    list_links: () => [],
+    list_link_candidates: () => [
+      {
+        kind: "org",
+        id: "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        title: "Anchor roadmap",
+        snippet: "",
+      },
+      {
+        kind: "org",
+        id: "11111111-1111-4111-8111-111111111111:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        title: "Same org neighbour",
+        snippet: "",
+      },
+      {
+        kind: "org",
+        id: "22222222-2222-4222-8222-222222222222:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        title: "Same document id in another org",
+        snippet: "",
+      },
+    ],
+    link_items: (args: unknown) => {
+      const target = window as unknown as { __orgToOrgLinkCalls?: unknown[] };
+      (target.__orgToOrgLinkCalls ??= []).push(args);
+      return null;
+    },
+    list_note_attachments: () => [],
+    account_status: () => ({ loggedIn: true }),
+  });
+
+  await page.goto("/org-item/item-anchor-r3");
+  const panel = page.locator("app-connections");
+  await expect(panel).toBeVisible();
+
+  await panel.getByRole("button", { name: "Link", exact: true }).click();
+  const picker = page.locator(".link-pop");
+  await expect(
+    picker.getByRole("option", { name: /Anchor roadmap/ }),
+  ).toHaveCount(0);
+  await expect(
+    picker.getByRole("option", { name: /Same org neighbour/ }),
+  ).toBeVisible();
+  await expect(
+    picker.getByRole("option", {
+      name: /Same document id in another org/,
+    }),
+  ).toBeVisible();
+
+  await picker
+    .getByRole("option", { name: /Same org neighbour/ })
+    .dispatchEvent("click");
+  await panel.getByRole("button", { name: "Link", exact: true }).click();
+  await page
+    .locator(".link-pop")
+    .getByRole("option", { name: /Same document id in another org/ })
+    .dispatchEvent("click");
+
+  const calls = await page.evaluate(
+    () =>
+      (window as unknown as { __orgToOrgLinkCalls?: unknown[] })
+        .__orgToOrgLinkCalls ?? [],
+  );
+  expect(calls).toEqual([
+    {
+      srcKind: "org",
+      srcId: ORG_OUT_LINK_ID,
+      dstKind: "org",
+      dstId: ORG_IN_LINK_ID,
+    },
+    {
+      srcKind: "org",
+      srcId: ORG_OUT_LINK_ID,
+      dstKind: "org",
+      dstId: `${OTHER_ORG_ID}:${DOC_OUT_ID}`,
+    },
+  ]);
+});
+
+test("org feed invalidates Connections immediately and converges revised, withdrawn, and stale neighbours", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    org_resolve_source: () => null,
+    org_get_item: (args: { itemId: string }) => ({
+      itemId: args.itemId,
+      docId:
+        args.itemId === "item-anchor-r1"
+          ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+          : "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      linkId:
+        args.itemId === "item-anchor-r1"
+          ? "11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+          : "11111111-1111-4111-8111-111111111111:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      authorHint: "kasia",
+      title: args.itemId === "item-anchor-r1" ? "Anchor" : "Shared roadmap r4",
+      createdAt: "2026-08-12T10:00:00Z",
+      rev: args.itemId === "item-anchor-r1" ? 1 : 4,
+      markdown: "# Shared item",
+      access: "view",
+      canEdit: false,
+      canManage: false,
+    }),
+    list_links: () => {
+      const target = window as unknown as {
+        __orgLinkMode?: string;
+        __resolveOrgLinkReload?: () => void;
+      };
+      const edge = (
+        title: string,
+        navigationId: string,
+        id: number,
+      ) => ({
+        id,
+        direction: "out",
+        otherKind: "org",
+        otherId:
+          "11111111-1111-4111-8111-111111111111:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        navigationId,
+        otherTitle: title,
+        edgeType: "manual",
+        createdBy: "user",
+        status: "active",
+        score: 1,
+        createdAt: 1_720_000_000 + id,
+        manual: true,
+      });
+      switch (target.__orgLinkMode) {
+        case "revision-pending":
+          return new Promise<unknown[]>((resolve) => {
+            target.__resolveOrgLinkReload = () =>
+              resolve([edge("Shared roadmap r2", "item-neighbour-r2", 702)]);
+          });
+        case "stale-pending":
+          return new Promise<unknown[]>((resolve) => {
+            target.__resolveOrgLinkReload = () =>
+              resolve([edge("Stale roadmap r3", "item-neighbour-r3", 703)]);
+          });
+        case "withdrawn":
+          return [];
+        case "revived":
+          return [edge("Shared roadmap r4", "item-neighbour-r4", 704)];
+        default:
+          return [edge("Shared roadmap r1", "item-neighbour-r1", 701)];
+      }
+    },
+    list_link_candidates: () => [
+      { kind: "note", id: "n-picker", title: "Picker stale row", snippet: "" },
+    ],
+    org_refresh: () => null,
+    org_list_statuses: () => [],
+    list_meeting_org_shares: () => [],
+    list_note_attachments: () => [],
+    account_status: () => ({ loggedIn: true }),
+  });
+
+  await page.goto("/org-item/item-anchor-r1");
+  const panel = page.locator("app-connections");
+  await expect(panel.getByText("Shared roadmap r1", { exact: true })).toBeVisible();
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __demoEventListenerRegistrationCount: (event: string) => number;
+          }
+        ).__demoEventListenerRegistrationCount("murmur://org-feed-updated"),
+      ),
+    )
+    .toBeGreaterThanOrEqual(2);
+
+  await panel.getByRole("button", { name: "Link", exact: true }).click();
+  await expect(
+    page.locator(".link-pop").getByRole("option", { name: /Picker stale row/ }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    (window as unknown as { __orgLinkMode?: string }).__orgLinkMode =
+      "revision-pending";
+  });
+  await emitOrgFeedUpdated(page);
+
+  // Invalidated synchronously, before the replacement `list_links` promise resolves.
+  await expect(panel.getByText("Shared roadmap r1", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".link-pop")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          typeof (window as unknown as { __resolveOrgLinkReload?: unknown })
+            .__resolveOrgLinkReload,
+      ),
+    )
+    .toBe("function");
+  await page.evaluate(() => {
+    (window as unknown as { __resolveOrgLinkReload: () => void })
+      .__resolveOrgLinkReload();
+  });
+  await expect(panel.getByText("Shared roadmap r2", { exact: true })).toBeVisible();
+
+  // A later withdrawal clears the revised chip. A still-later stale request cannot restore it.
+  await page.evaluate(() => {
+    (window as unknown as { __orgLinkMode?: string }).__orgLinkMode =
+      "stale-pending";
+  });
+  await emitOrgFeedUpdated(page);
+  await expect(panel.getByText("Shared roadmap r2", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => {
+    (window as unknown as { __orgLinkMode?: string }).__orgLinkMode = "withdrawn";
+  });
+  await emitOrgFeedUpdated(page);
+  await page.evaluate(() => {
+    (window as unknown as { __resolveOrgLinkReload: () => void })
+      .__resolveOrgLinkReload();
+  });
+  await expect(panel.getByText("Stale roadmap r3", { exact: true })).toHaveCount(0);
+
+  // A fresh live head refreshes both the title and the navigation item id.
+  await page.evaluate(() => {
+    (window as unknown as { __orgLinkMode?: string }).__orgLinkMode = "revived";
+  });
+  await emitOrgFeedUpdated(page);
+  await expect(panel.getByText("Shared roadmap r4", { exact: true })).toBeVisible();
+  await panel
+    .getByRole("button", { name: "Open Shared Brain item Shared roadmap r4" })
+    .click();
+  await expect(page).toHaveURL(/\/org-item\/item-neighbour-r4$/);
 });
 
 /**

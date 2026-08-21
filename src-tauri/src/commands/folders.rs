@@ -356,11 +356,12 @@ fn reexport_notes_under_subtree(state: &AppState, folder_id: &str) -> Result<(),
 ///  - **OPEN (now) →** move every note to the vault ROOT (`folder_id = NULL`), delete the folder row,
 ///    and remove the (now-empty) vault subdir. Notes survive at "All notes".
 #[tauri::command]
-pub fn delete_folder(
+pub async fn delete_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
     delete_folder_inner(state.inner(), folder_id)?;
     emit_ask_history_invalidated_fail_closed(&app);
     Ok(())

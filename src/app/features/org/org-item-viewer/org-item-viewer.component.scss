@@ -188,7 +188,7 @@
   white-space: nowrap;
 }
 
-/* --- Edit-in-place (author only) ----------------------------------------- */
+/* --- Edit-in-place (server-authorized author/owner/editor) --------------- */
 .oi-title-input {
   flex: 1 1 auto;
   min-width: 0;
@@ -225,6 +225,33 @@
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.oi-edit-conflict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+.oi-edit-conflict-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.oi-edit-conflict-copy strong {
+  color: var(--text-primary);
+}
+.oi-edit-conflict-error {
+  color: var(--danger);
+}
+.oi-edit-conflict-open {
+  flex: none;
 }
 /* Metadata strip: Org Brain badge + org name + author + date + revision. */
 .oi-meta {
@@ -266,7 +293,67 @@
 .oi-meta-sep {
   color: var(--border-strong);
 }
+.oi-access-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.oi-permissions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+.oi-permissions-label {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.oi-access-options {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+.oi-access-option {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.oi-access-option:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.oi-access-option.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+.oi-access-option:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.oi-access-option:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.oi-permissions-note {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
 .oi-body {
   color: var(--text-secondary);
   line-height: 1.65;
+}
+.oi-link-unavailable {
+  margin: 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  font-size: 0.78rem;
 }

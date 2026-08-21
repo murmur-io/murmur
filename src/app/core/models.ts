@@ -1742,19 +1742,33 @@ export interface BacklinkSource {
  *   cosine confidence.
  * - `createdBy` — `"user" | "auto" | "accepted"`; `status` — `"active" | "suggested"`
  *   (`"dismissed"` rows are never returned). `score` is `1.0` for deterministic edges.
- * - `manual` (PR-1) — `true` when this chip represents a USER-created link (via the
+ * - `manual` (PR-1) — backward-compatible `true` when this chip represents a USER-created link (via the
  *   `+ Link` chooser → `link_items`) that is removable with a `×` (→ `unlink_items`).
  *   The backend dedupes a manual+wikilink pair into ONE chip and sets `manual:true`
  *   on it. Defaults to `false`/absent for auto (wikilink/companion) and semantic
- *   edges, which are NOT user-removable from the panel. (`#[serde(default)]`.)
+ *   edges, which are NOT user-removable from the panel. `manualEdges` carries the authoritative one
+ *   or two exact directed rows to unlink atomically. (`#[serde(default)]`.)
  *
  * Mirrors the Rust `LinkEdge` (serde camelCase).
  */
+export interface ManualLinkEdge {
+  srcKind: LinkKind;
+  srcId: string;
+  dstKind: LinkKind;
+  dstId: string;
+}
+
 export interface LinkEdge {
   id: number;
   direction: "out" | "in";
-  otherKind: "meeting" | "note" | "document";
+  otherKind: LinkKind;
   otherId: string;
+  /**
+   * Current routable identity for a revision-stable neighbour. For `org`,
+   * `otherId` is the stable document id while this is the current live item id.
+   * Absent for local endpoints and older backends.
+   */
+  navigationId?: string | null;
   otherTitle: string;
   edgeType: "wikilink" | "companion" | "semantic" | "manual";
   createdBy: "user" | "auto" | "accepted";
@@ -1766,10 +1780,16 @@ export interface LinkEdge {
    * removable `×`. Backend field `manual` (`#[serde(default)]` ⇒ may be absent).
    */
   manual?: boolean;
+  /**
+   * Exact directed manual rows collapsed into this chip. A representative may be an
+   * oppositely-directed wikilink, and both manual directions may coexist, so unlink must send this
+   * complete list instead of reconstructing one tuple from `direction`.
+   */
+  manualEdges?: ManualLinkEdge[];
 }
 
 /** The link-endpoint kind an `app-connections` panel is anchored to (`list_links` `kind`). */
-export type LinkKind = "meeting" | "note" | "document";
+export type LinkKind = "meeting" | "note" | "document" | "org";
 
 /**
  * One source the Brain has been scoped to (the `mur-source-picker` chip model) —
@@ -2357,6 +2377,8 @@ export interface MyShareEntry {
   createdAt: string;
   expiresAt: string | null;
   revoked: boolean;
+  /** Local durable setup/DELETE cleanup; remote terminal state is unproven and destruction stays paused. */
+  revokePending: boolean;
   downloadCount: number;
   /**
    * The LOCAL meeting this share belongs to — the filter key for THIS note's Active-links list.
@@ -2626,7 +2648,11 @@ export interface NoteAssistRequest {
  */
 export interface NoteCitation {
   kind: "meeting" | "note" | "person" | "entity" | "org";
-  /** For `kind === "org"` this is the org item id, routed to `/org-item/:id` — never a local id. */
+  /**
+   * For link-candidate `kind === "org"` rows this is the revision-stable
+   * `orgId:docId` endpoint composite. Other citation surfaces may still carry a
+   * current org item id for direct `/org-item/:id` navigation.
+   */
   id: string;
   title: string;
   snippet: string;
@@ -2924,12 +2950,19 @@ export interface OrgScrubCounts {
  */
 export interface OrgShareEntry {
   itemId: string;
+  /** Stable opaque identity shared by every revision of this document. */
+  docId?: string | null;
   kind: "note" | "summary";
   title: string;
   sharedAt: string;
   rev: number;
+  /** Organization-wide document access. Historical rows default to `view`. */
+  access?: OrgAccess;
   state: "queued" | "uploaded" | "failed" | "revoke_pending" | "revoked";
 }
+
+/** Per-document Shared Brain access for active organization members. */
+export type OrgAccess = "view" | "edit";
 
 /**
  * One org a meeting is ACTIVELY shared into (`meetingOrgShares`) — drives the "Shared with
@@ -2966,6 +2999,10 @@ export interface OrgSourceShareStatus {
   orgId: string;
   itemId: string | null;
   rev: number;
+  /** Current member access for the live document; historical rows default to view. */
+  access?: OrgAccess;
+  /** Fixed, content-free signal that automatic source updates stopped on a CAS conflict. */
+  conflicted: boolean;
 }
 
 /**
@@ -2976,19 +3013,28 @@ export interface OrgSourceShareStatus {
  */
 export interface OrgItemDetail {
   itemId: string;
+  /** Server doc id; absent on historical rows created before stable identities. */
+  docId?: string | null;
+  /** Backend-composed private-link identity (`orgId:docId`); absent historically. */
+  linkId?: string | null;
   authorHint: string;
   title: string;
   createdAt: string;
   rev: number;
   markdown: string;
+  /** Effective organization-wide access selected by the document manager. */
+  access: OrgAccess;
+  /** Server-authoritative permission to publish a new encrypted revision. */
+  canEdit: boolean;
+  /** Server-authoritative permission to change access or withdraw the document. */
+  canManage: boolean;
   /**
-   * True when THIS user authored the item (server-authoritative author id) — the
-   * viewer then offers edit-in-place + re-publish (`orgUpdateOwnItem`) on ANY of
-   * the author's machines, even one that never held the local share anchor. On the
-   * origin machine the viewer redirects to the local source before this renders;
-   * a non-author always sees `false`. Mirrors the Rust `OrgItemDetail.editable`.
+   * Backward-compatible alias of `canEdit`. Stable documents derive authorization from the
+   * server-owned document owner/access metadata; historical items without a `docId` may still use
+   * their server-authoritative revision author. The viewer saves through `orgUpdateItem` only
+   * when this value is true. Mirrors the Rust `OrgItemDetail.editable`.
    */
-  editable: boolean;
+  editable?: boolean;
 }
 
 /**
@@ -3022,14 +3068,13 @@ export interface OrgSyncReport {
 }
 
 /**
- * Payload of the `murmur://org-feed-updated` event (`onOrgFeedUpdated`). Emitted
- * by the background org-sync loop ONLY on a PRODUCTIVE tick (≥1 ingest/tombstone
- * changed the local org replica). Content-free — a single count, NO item ids /
- * titles / content; the FE treats any arrival as "re-fetch the org lists".
+ * Payload of the `murmur://org-feed-updated` event (`onOrgFeedUpdated`). Any
+ * arrival invalidates org replica/head/visibility-derived state and requires a
+ * refetch. Content-free — a single count, NO item ids / titles / content.
  * Mirrors the Rust `OrgFeedUpdatedPayload`.
  */
 export interface OrgFeedUpdatedPayload {
-  /** Number of joined orgs whose replica changed this tick (≥1 when emitted). */
+  /** Number of replicas changed; may be 0 for a local visibility/head invalidation. */
   orgsChanged: number;
 }
 

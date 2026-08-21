@@ -119,6 +119,8 @@ export const ERROR_CODES = [
   "sharing-rate-limited",
   "sharing-rejected",
   "sharing-signin-required",
+  "sharing-upgrade-required",
+  "org-edit-conflict",
   "reminders-denied",
 ] as const;
 
@@ -193,6 +195,10 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
   "sharing-rejected":
     "That didn’t work. Check the code (it may have expired) and try again.",
   "sharing-signin-required": "You’ve been signed out — sign in again to continue.",
+  "sharing-upgrade-required":
+    "Sharing is paused until the server supports crash-safe share creation. Try again after the server is updated.",
+  "org-edit-conflict":
+    "This shared note changed elsewhere. Your draft is still here — reload the latest version and try again.",
   "reminders-denied":
     "Grant Reminders access in System Settings ▸ Privacy & Security ▸ Reminders.",
 };
