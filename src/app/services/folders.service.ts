@@ -209,6 +209,18 @@ export class FoldersService {
     }
   }
 
+  /** Explicit user override: seal locally without revoking existing remote shares. */
+  async lockAllowRemoteAccess(folderId: string): Promise<void> {
+    this._error.set(null);
+    try {
+      await this.ipc.lockFolderAllowRemoteAccess(folderId);
+      await this.load();
+    } catch (e) {
+      this._error.set(this.errorCopy.humanize(e));
+      throw e;
+    }
+  }
+
   /** Session-unlock a sealed folder (decrypt into markdown for this session). */
   async unlock(folderId: string): Promise<void> {
     this._error.set(null);

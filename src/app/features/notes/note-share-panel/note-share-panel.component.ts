@@ -14,6 +14,7 @@ import type {
   AccountStatus,
   MyShareEntry,
   NoteAttachmentDto,
+  OrgAccess,
   OrgSourceShareStatus,
   OrgStatus,
 } from "../../../core/models";
@@ -21,6 +22,7 @@ import {
   OrgShareSheetComponent,
   type OrgShareTarget,
 } from "../../detail/org-share-sheet/org-share-sheet.component";
+import { Router } from "@angular/router";
 import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { AccountSessionService } from "../../../services/account-session.service";
@@ -37,7 +39,7 @@ interface LinkShareRow {
   createdAt: string;
   usageLabel: string;
   expiryLabel: string;
-  state: "active" | "limit" | "expired" | "revoked";
+  state: "active" | "limit" | "expired" | "revoked" | "pending";
   /** Non-null ONLY for a link created THIS session (the key is never re-derivable). */
   copyUrl: string | null;
   passwordProtected: boolean;
@@ -79,6 +81,7 @@ export class NoteSharePanelComponent {
   private readonly injector = inject(Injector);
   private readonly errorCopy = inject(ErrorCopyService);
   private readonly accountSession = inject(AccountSessionService);
+  private readonly router = inject(Router);
 
   /** THIS note's document id — the shares filter key. */
   readonly noteId = input.required<string>();
@@ -237,6 +240,17 @@ export class NoteSharePanelComponent {
   private readonly _orgSourceShares = signal<OrgSourceShareStatus[]>([]);
   /** True when THIS note is already live in ≥1 org (flips the CTA to shared). */
   readonly sourceInOrg = computed(() => this._orgSourceShares().length > 0);
+  readonly orgSourceRows = computed(() =>
+    this._orgSourceShares().map((share) => ({
+      ...share,
+      access: share.access ?? ("view" as const),
+      orgName:
+        this._orgs().find((org) => org.orgId === share.orgId)?.name ??
+        "Organization",
+    })),
+  );
+  readonly changingOrgAccessId = signal<string | null>(null);
+  readonly orgAccessError = signal<string | null>(null);
   /** True while the org-share preview sheet is open. */
   readonly orgSheetOpen = signal(false);
 
@@ -257,7 +271,9 @@ export class NoteSharePanelComponent {
         const exp = s.expiresAt ? Date.parse(s.expiresAt) : null;
         const expired = exp != null && !Number.isNaN(exp) && exp < now;
         const limit = s.maxDownloads != null && s.downloadCount >= s.maxDownloads;
-        const state: LinkShareRow["state"] = s.revoked
+        const state: LinkShareRow["state"] = s.revokePending
+          ? "pending"
+          : s.revoked
           ? "revoked"
           : limit
             ? "limit"
@@ -381,6 +397,34 @@ export class NoteSharePanelComponent {
     this.orgSheetOpen.set(false);
     await this.refreshOrg(this.noteId());
     this.changed.emit();
+  }
+
+  /** Manage an existing org share from its origin note, where the viewer redirects here. */
+  async setOrgAccess(itemId: string | null, access: OrgAccess): Promise<void> {
+    const id = this.noteId();
+    if (!id || !itemId || this.changingOrgAccessId()) {
+      return;
+    }
+    this.orgAccessError.set(null);
+    this.changingOrgAccessId.set(itemId);
+    try {
+      await this.ipc.orgSetItemAccess(itemId, access);
+      await this.refreshOrg(id);
+    } catch {
+      this.orgAccessError.set(
+        "Couldn’t change access. Only the author or Org Owner can manage it.",
+      );
+    } finally {
+      this.changingOrgAccessId.set(null);
+    }
+  }
+
+  /** Open the relay's current head after automatic republish stopped on a CAS conflict. */
+  openLatestOrgShare(itemId: string | null): void {
+    if (!itemId) {
+      return;
+    }
+    void this.router.navigate(["/org-item", itemId]);
   }
 
   /** One-tap Touch ID unlock from the gate → re-read status + load this note's shares. */
@@ -552,18 +596,13 @@ export class NoteSharePanelComponent {
     }
   }
 
-  /** Revoke (after the inline confirm), optimistically flip, then re-fetch. */
+  /** Revoke or retry a durable pending revoke. The backend list remains authoritative. */
   async revokeRow(shareId: string): Promise<void> {
     if (this.revokingId()) {
       return;
     }
     this.revokingId.set(shareId);
     this.listError.set(null);
-    this.myShares.set(
-      this.myShares().map((s) =>
-        s.shareId === shareId ? { ...s, revoked: true } : s,
-      ),
-    );
     try {
       await this.ipc.revokeShare(shareId);
       this.confirmingRevokeId.set(null);

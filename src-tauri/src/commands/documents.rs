@@ -483,6 +483,8 @@ async fn delete_document_inner_notifying(
             "unlock this folder to delete a document",
         )));
     }
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    state.db.begin_org_source_closure("document", id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact source
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
@@ -932,6 +934,7 @@ mod smart_note_tests {
             lifecycle: Mutex::new(()),
             active_salvages: Mutex::new(HashSet::new()),
             share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
             seal_epoch: std::sync::atomic::AtomicU64::new(0),
             heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
         }

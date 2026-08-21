@@ -80,7 +80,6 @@ pub(crate) fn create_note_inner(
             "unlock this folder to add a note",
         )));
     }
-
     let title = title.trim();
     // The stored default for a never-named note — coupled to `UNTITLED_TITLE` so the written value and
     // the picker/audit `is_untitled_title` guards can never drift (see `crate::storage::db`).
@@ -595,7 +594,15 @@ pub(crate) fn save_note_text_inner(
     // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh text into
     // `text_blob` in the same write; an open folder takes the plain update. Fail-closed on a
     // missing session KEK.
-    reseal_document_if_locked(state, &folder_id, id, title, markdown, now)?;
+    reseal_document_if_locked_with_mode(
+        state,
+        &folder_id,
+        id,
+        title,
+        markdown,
+        now,
+        false,
+    )?;
     prune_unreferenced_attachments(state, &attachment_owner, markdown)?;
     Ok(now)
 }
@@ -604,12 +611,13 @@ pub(crate) fn save_note_text_inner(
 /// leave plaintext in a locked folder, never move out of a sealed one). Re-exports into the new
 /// folder path (the old vault file is removed by the export path's move). Idempotent.
 #[tauri::command]
-pub fn move_note_doc(
+pub async fn move_note_doc(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     folder_id: String,
 ) -> Result<(), AppError> {
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
     let target_locked = state
         .db
         .folder_by_id(&folder_id)?
@@ -695,6 +703,18 @@ pub(crate) fn move_note_doc_inner(
         .folder_by_id(folder_id)?
         .map(|f| f.locked)
         .unwrap_or(false);
+    let target_closing = state.db.org_folder_closure_exists(folder_id)?;
+    if target_closing {
+        return Err(AppError::Unavailable(
+            "the destination folder is closing or locked for sharing; retry after reopening it"
+                .into(),
+        ));
+    }
+    if target_locked && state.db.source_has_active_remote_share(None, Some(id))? {
+        return Err(AppError::Unavailable(
+            "revoke this note's shares before moving it into a locked folder".into(),
+        ));
+    }
     let attachment_owner = crate::storage::AttachmentOwner::Document {
         document_id: id.to_string(),
     };
@@ -824,6 +844,8 @@ async fn delete_note_inner_notifying(
             "unlock this folder to delete a note",
         )));
     }
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    state.db.begin_org_source_closure("document", id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact note
     // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
@@ -1128,11 +1150,12 @@ pub fn rename_note_folder(
 
 /// Delete a note-folder (reuses the meeting-folder delete machinery). Gated to a note-folder id.
 #[tauri::command]
-pub fn delete_note_folder(
+pub async fn delete_note_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), AppError> {
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
     if state.db.note_folder_by_id(&id)?.is_none() {
         return Err(AppError::InvalidArg(format!("no note folder {id}")));
     }
@@ -1145,11 +1168,12 @@ pub fn delete_note_folder(
 /// note-folder. Rewrites the folder's `path` (and every descendant's) so vault export + gating stay
 /// coherent, holding the lifecycle guard so it can't interleave with a lock/unlock.
 #[tauri::command]
-pub fn move_note_folder(
+pub async fn move_note_folder(
     state: State<'_, AppState>,
     id: String,
     parent_id: Option<String>,
 ) -> Result<(), AppError> {
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
     move_note_folder_inner(state.inner(), &id, parent_id.as_deref())
 }
 

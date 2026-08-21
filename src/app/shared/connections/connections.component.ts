@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   Injector,
   OnInit,
@@ -15,6 +16,7 @@ import {
 import { RouterLink } from "@angular/router";
 
 import { IpcService } from "../../core/ipc.service";
+import { TabsService } from "../../core/tabs.service";
 import type {
   BacklinkSource,
   LinkEdge,
@@ -41,7 +43,7 @@ type RelationTag = "linked" | "mentions" | "companion" | "related";
 interface RelatedRow {
   /** Dedup identity — `${otherKind}:${otherId}`. Also the `@for` track key. */
   readonly key: string;
-  readonly kind: "meeting" | "note" | "document";
+  readonly kind: LinkKind;
   /**
    * The neighbour's raw id (the edge's `otherId` / the backlink's `id`) — the
    * key `route` is built from, AND what a `document` chip passes to
@@ -49,6 +51,8 @@ interface RelatedRow {
    * opens the read-only preview modal instead of navigating).
    */
   readonly id: string;
+  /** Current live item id when `kind === "org"`; local endpoints leave it null. */
+  readonly navigationId: string | null;
   readonly title: string;
   readonly route: unknown[];
   /** The small direction/type tag ("linked" / "mentions" / "companion" / "related"). */
@@ -69,7 +73,7 @@ interface RelatedRow {
  */
 interface SuggestionRow {
   readonly edge: LinkEdge;
-  readonly kind: "meeting" | "note" | "document";
+  readonly kind: LinkKind;
   /** The neighbour's raw id (`edge.otherId`) — the key `route` is built from. */
   readonly id: string;
   readonly title: string;
@@ -118,10 +122,12 @@ interface SuggestionRow {
 })
 export class ConnectionsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
+  private readonly tabs = inject(TabsService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
   private readonly docPreview = inject(DocumentPreviewService);
   private readonly injector = inject(Injector);
+  private readonly destroyRef = inject(DestroyRef);
 
   /** The link-endpoint kind this panel is anchored to. */
   readonly kind = input.required<LinkKind>();
@@ -194,16 +200,13 @@ export class ConnectionsComponent implements OnInit {
   private pickerRepositionQueued = false;
 
   /**
-   * A candidate kind that is NOT a valid `link_items` endpoint (a {@link LinkKind}
-   * is `meeting | note | document`). `list_link_candidates` may surface Shared-Brain
-   * `org` rows (and, in principle, `person`/`entity` from the shared shape); those
-   * are NOT linkable, so a pick is refused with a toast rather than silently
-   * dropped — the picker renders its own rows, so this guards them at pick time.
+   * A candidate kind that is NOT a valid `link_items` endpoint. Shared Brain
+   * `org` rows are valid revision-stable endpoints; people and entities are not.
    */
   private static readonly NON_LINKABLE_KINDS: ReadonlySet<NoteCitation["kind"]> =
-    new Set<NoteCitation["kind"]>(["person", "entity", "org"]);
+    new Set<NoteCitation["kind"]>(["person", "entity"]);
 
-  /** True when a candidate is a linkable meeting/note/document endpoint (not org/person/entity, not self). */
+  /** True when a candidate is a linkable document/org endpoint (not person/entity or self). */
   private isLinkable(c: NoteCitation): boolean {
     return (
       !ConnectionsComponent.NON_LINKABLE_KINDS.has(c.kind) &&
@@ -217,6 +220,15 @@ export class ConnectionsComponent implements OnInit {
    * failure mode #4), the same idiom as `entity-detail`'s `_load`.
    */
   private seq = 0;
+  /**
+   * Content-free, monotonic invalidation token. Bumped synchronously on every
+   * org-feed event so `_load` clears stale org heads/picker rows before its
+   * replacement IPC begins.
+   */
+  private readonly orgFeedRevision = signal(0);
+  private feedUnlisten: (() => void) | null = null;
+  private feedDestroyed = false;
+  private observedOrgFeedRevision = 0;
 
   /**
    * DETERMINISTIC edges only — everything that is NOT a pending semantic suggestion:
@@ -279,6 +291,7 @@ export class ConnectionsComponent implements OnInit {
         key,
         kind: edge.otherKind,
         id: edge.otherId,
+        navigationId: edge.navigationId ?? null,
         title: edge.otherTitle,
         route: this.routeForKind(edge.otherKind, edge.otherId),
         tag: this.tagForEdge(edge),
@@ -299,6 +312,7 @@ export class ConnectionsComponent implements OnInit {
         key,
         kind: bl.kind,
         id: bl.id,
+        navigationId: null,
         title: bl.title,
         route: this.routeForKind(bl.kind, bl.id),
         tag: "mentions",
@@ -389,9 +403,31 @@ export class ConnectionsComponent implements OnInit {
     }
   }
 
+  constructor() {
+    this.destroyRef.onDestroy(() => {
+      this.feedDestroyed = true;
+      this.feedUnlisten?.();
+    });
+    void this.ipc
+      .onOrgFeedUpdated(() => {
+        this.orgFeedRevision.update((revision) => revision + 1);
+      })
+      .then((unlisten) => {
+        if (this.feedDestroyed) {
+          unlisten();
+        } else {
+          this.feedUnlisten = unlisten;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (plain browser) → no live convergence */
+      });
+  }
+
   /**
    * Load BOTH the edges and the inbound backlinks whenever `(kind, id)`,
-   * `locked`, OR the session lock-tree changes. Reading `folders.tree()`
+   * `locked`, the session lock-tree, OR the content-free org-feed revision
+   * changes. Reading `folders.tree()`
    * registers this effect as its dependent so a later unlock/relock re-asks the
    * backend (sealed neighbours drop out / reappear live). A legitimate
    * signal-writing effect (T1): async IPC keyed on inputs with a stale-result
@@ -404,7 +440,20 @@ export class ConnectionsComponent implements OnInit {
     // Establish the lock-tree dependency (value unused — the backend is the
     // authority on visibility; we just re-ask when it may have changed).
     this.folders.tree();
+    const orgFeedRevision = this.orgFeedRevision();
+    const orgFeedChanged =
+      orgFeedRevision !== this.observedOrgFeedRevision;
+    this.observedOrgFeedRevision = orgFeedRevision;
     const seq = ++this.seq;
+    if (orgFeedChanged) {
+      // The event means an org endpoint may have been withdrawn or advanced to
+      // a new head. Hide the old title/navigation target and destroy the
+      // picker's cached candidate rows BEFORE starting the replacement read.
+      // Bumping `seq` above also prevents any pre-event reply restoring them.
+      this.edges.set([]);
+      this.backlinksIn.set([]);
+      this.closePicker();
+    }
     if (locked || !id) {
       this.edges.set([]);
       this.backlinksIn.set([]);
@@ -468,10 +517,7 @@ export class ConnectionsComponent implements OnInit {
    * consumed for `meeting`/`note` chips. It still returns a value for a document
    * (kept as the identity for the row) but the template never binds it there.
    */
-  private routeForKind(
-    kind: "meeting" | "note" | "document",
-    id: string,
-  ): unknown[] {
+  private routeForKind(kind: LinkKind, id: string): unknown[] {
     return kind === "meeting" ? ["/meeting", id] : ["/notes", id];
   }
 
@@ -483,6 +529,15 @@ export class ConnectionsComponent implements OnInit {
    */
   openDocument(id: string, title: string): void {
     this.docPreview.open({ id, name: title, kind: "document" });
+  }
+
+  /** Open the CURRENT live revision behind a stable Shared Brain document link. */
+  openOrgItem(itemId: string | null, title: string): void {
+    if (!itemId) {
+      this.toast.info("This shared note is no longer available.");
+      return;
+    }
+    void this.tabs.openOrgItem(itemId, title || "Shared note");
   }
 
   /** Toggle the whole Related section collapsed ↔ expanded. */
@@ -501,14 +556,29 @@ export class ConnectionsComponent implements OnInit {
   }
 
   /**
-   * PR-1 — remove a user-created link: `unlink_items(anchor → neighbour)`, then
-   * re-fetch so the chip drops out. Guarded by the same pending set (keyed on the
-   * chip's edge id) so its `×` disables mid-flight. Surfaces a failure via a toast.
+   * PR-1 — remove a user-created link using its exact stored direction, then
+   * re-fetch so the chip drops out. An incident `in` edge is `neighbour → anchor`;
+   * an `out` edge is `anchor → neighbour`. Guarded by the same pending set
+   * (keyed on the chip's edge id) so its `×` disables mid-flight. Surfaces a
+   * failure via a toast.
    */
   unlink(e: LinkEdge): void {
+    const anchorKind = this.kind();
+    const anchorId = this.id();
+    const srcKind = e.direction === "in" ? e.otherKind : anchorKind;
+    const srcId = e.direction === "in" ? e.otherId : anchorId;
+    const dstKind = e.direction === "in" ? anchorKind : e.otherKind;
+    const dstId = e.direction === "in" ? anchorId : e.otherId;
     void this.mutate(
       e.id,
-      () => this.ipc.unlinkItems(this.kind(), this.id(), e.otherKind, e.otherId),
+      () =>
+        this.ipc.unlinkItems(
+          srcKind,
+          srcId,
+          dstKind,
+          dstId,
+          e.manualEdges,
+        ),
       "Couldn't remove the link.",
     );
   }
@@ -636,8 +706,8 @@ export class ConnectionsComponent implements OnInit {
   /**
    * A candidate was picked (click or Enter): create the link from this panel's
    * anchor `(kind, id)` → the picked candidate, then re-fetch so the new chip
-   * appears. The picker renders its own rows, so a non-linkable kind (a Shared-Brain
-   * `org` hit / `person` / `entity`, or the anchor itself) is REFUSED here with a
+   * appears. The picker renders its own rows, so a non-linkable kind (`person` /
+   * `entity`, or the anchor itself) is REFUSED here with a
    * toast rather than sent to `link_items`. Guarded by `linking` (a stuck spinner is
    * impossible — cleared in `finally`); a failure surfaces a toast.
    */
@@ -654,7 +724,7 @@ export class ConnectionsComponent implements OnInit {
       this.toast.info(
         isSelf
           ? "You can't link an item to itself."
-          : "You can only link meetings, notes, and documents.",
+          : "You can only link meetings, notes, documents, and Shared Brain items.",
       );
       return;
     }
