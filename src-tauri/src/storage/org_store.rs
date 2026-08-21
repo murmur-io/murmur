@@ -26,7 +26,8 @@ use rusqlite::OptionalExtension;
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::storage::db::{
-    fts_match_content_terms_any, fts_match_query, fts_unicode61_content_terms, map_err, Db,
+    fts_match_content_terms_any, fts_match_query, fts_unicode61_content_terms,
+    insert_share_egress_dispatch_tx, map_err, Db,
 };
 use crate::storage::models::OrgChunkHit;
 
@@ -35,6 +36,13 @@ use crate::storage::models::OrgChunkHit;
 /// also prevents an untrusted query from making SQL preparation scale without bound.
 const MAX_ORG_FTS_CONTENT_TERMS: usize = 32;
 
+fn require_stable_uuid(value: &str, error: &'static str) -> Result<()> {
+    uuid::Uuid::parse_str(value)
+        .ok()
+        .map(|_| ())
+        .ok_or_else(|| crate::error::AppError::InvalidArg(error.into()))
+}
+
 /// Chunk/vector material for one org item, prepared before entering the short feed-commit
 /// transaction. Keeping model inference on this side of the transaction is load-bearing: recording
 /// admission may invalidate the work, while a committed feed action and its cursor must remain one
@@ -42,6 +50,43 @@ const MAX_ORG_FTS_CONTENT_TERMS: usize = 32;
 pub(crate) struct PreparedOrgItemIndex {
     chunks: Vec<String>,
     vector_blobs: Option<Vec<Vec<u8>>>,
+}
+
+/// Result of a stable-document metadata commit. `changed` preserves each caller's historical
+/// boolean (feed/reconcile applied, local predecessor evicted); `visibility_reduced` independently
+/// reports that a previously readable authoritative head was demoted in the same transaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OrgMetadataCommitOutcome {
+    pub(crate) changed: bool,
+    pub(crate) visibility_reduced: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OrgAccessAttemptRow {
+    pub(crate) dispatch_id: String,
+    pub(crate) org_id: String,
+    pub(crate) doc_id: String,
+    pub(crate) old_access: String,
+    pub(crate) new_access: String,
+    pub(crate) actor_user_id: String,
+    pub(crate) owner_user_id: String,
+}
+
+/// Optional plaintext projection carried by an already-authenticated republish completion. All
+/// expensive validation/index preparation happens before the transaction; the storage seam only
+/// installs these exact bytes after the durable dispatch witness still matches.
+#[allow(dead_code)]
+pub(crate) struct OrgRepublishProjection<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) seq: u64,
+    pub(crate) author_hint: &'a str,
+    pub(crate) title: &'a str,
+    pub(crate) markdown: &'a str,
+    pub(crate) created_at: &'a str,
+    pub(crate) source_kind: Option<&'a str>,
+    pub(crate) author_user_id: Option<&'a str>,
+    pub(crate) prepared: &'a PreparedOrgItemIndex,
+    pub(crate) attachments: &'a [crate::storage::IncomingAttachment],
 }
 
 /// What this device currently holds for ONE org item id — the minimum the anti-entropy reconcile
@@ -58,6 +103,8 @@ pub(crate) struct OrgReplicaState {
     /// before the feed carried one. Equality with the feed's hash is what lets the sweep skip an
     /// already-converged item with no blob fetch.
     pub(crate) content_sha256: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    pub(crate) projection_sha256: Option<Vec<u8>>,
 }
 
 /// One live org item's existing chunk rows, loaded for a model-switch reindex. The keyset iterator
@@ -75,7 +122,88 @@ pub(crate) struct OrgItemVectorBatch {
     content_sha256: Option<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 impl Db {
+    pub(crate) fn begin_org_source_closure(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<()> {
+        if !matches!(source_kind, "meeting" | "document") || source_id.trim().is_empty() {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid organization share closure source".into(),
+            ));
+        }
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO org_share_closures(scope_kind,scope_id,phase,created_at)
+             VALUES(?1,?2,'closing',?3)
+             ON CONFLICT(scope_kind,scope_id) DO NOTHING",
+            rusqlite::params![source_kind,source_id,chrono::Utc::now().to_rfc3339()],
+        ).map_err(map_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_org_folder_closure(&self, folder_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "INSERT INTO org_share_closures(scope_kind,scope_id,phase,created_at)
+             VALUES('folder',?1,'closing',?2)
+             ON CONFLICT(scope_kind,scope_id) DO NOTHING",
+            rusqlite::params![folder_id,chrono::Utc::now().to_rfc3339()],
+        ).map_err(map_err)?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn clear_org_folder_closure(&self, folder_id: &str) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM org_share_closures WHERE scope_kind='folder' AND scope_id=?1",
+            [folder_id],
+        ).map_err(map_err)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_org_source_closure(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<()> {
+        if !matches!(source_kind, "meeting" | "document") || source_id.trim().is_empty() {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid organization share closure source".into(),
+            ));
+        }
+        self.lock()
+            .execute(
+                "DELETE FROM org_share_closures WHERE scope_kind=?1 AND scope_id=?2",
+                rusqlite::params![source_kind, source_id],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_org_closure(&self, scope_kind: &str, scope_id: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE org_share_closures SET phase='closed'
+              WHERE scope_kind=?1 AND scope_id=?2",
+            rusqlite::params![scope_kind,scope_id],
+        ).map_err(map_err)?;
+        Ok(())
+    }
+
+    pub(crate) fn org_folder_closure_exists(&self, folder_id: &str) -> Result<bool> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_share_closures
+                  WHERE scope_kind='folder' AND scope_id=?1)",
+                [folder_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_err)
+            .map(|exists| exists != 0)
+    }
+
     /// Upsert the locally-cached membership of an org (create/status). Preserves an existing row's
     /// local `consented` flag, `last_seq` cursor, AND `context_enabled` toggle (an incoming status
     /// refresh MUST NOT reset the consent flag, rewind the sync cursor, or silently re-enable an org
@@ -167,12 +295,13 @@ impl Db {
     pub fn set_org_context_enabled(&self, org_id: &str, enabled: bool) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        let changed = tx.execute(
-            "UPDATE org_state SET context_enabled = ?2
+        let changed = tx
+            .execute(
+                "UPDATE org_state SET context_enabled = ?2
                WHERE org_id = ?1 AND context_enabled != ?2",
-            rusqlite::params![org_id, enabled as i64],
-        )
-        .map_err(map_err)?;
+                rusqlite::params![org_id, enabled as i64],
+            )
+            .map_err(map_err)?;
         if !enabled && changed > 0 {
             Self::purge_all_ask_conversations_tx(&tx)?;
         }
@@ -216,11 +345,12 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         let items = Self::purge_org_replica_tx(&tx, org_id)?;
-        let removed = tx.execute(
-            "DELETE FROM org_state WHERE org_id = ?1",
-            rusqlite::params![org_id],
-        )
-        .map_err(map_err)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM org_state WHERE org_id = ?1",
+                rusqlite::params![org_id],
+            )
+            .map_err(map_err)?;
         if removed > 0 {
             // Membership withdrawal invalidates global-derived Ask even when the decrypted org
             // replica was already empty and the durable conversation is the only derived copy.
@@ -247,12 +377,44 @@ impl Db {
         content_sha256: &[u8],
         created_at: &str,
     ) -> Result<()> {
+        self.insert_org_share_with_scrub(
+            id,
+            org_id,
+            meeting_id,
+            document_id,
+            kind,
+            title,
+            rev,
+            generation,
+            content_sha256,
+            true,
+            created_at,
+        )
+    }
+
+    /// Insert a queued share while durably recording the caller's scrub choice. Retry code must use
+    /// this value so an ambiguous successful POST is replayed with the same canonical content hash.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_org_share_with_scrub(
+        &self,
+        id: &str,
+        org_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+        kind: &str,
+        title: Option<&str>,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        scrub: bool,
+        created_at: &str,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO org_shares
                (id, org_id, meeting_id, document_id, kind, title, rev, generation,
-                content_sha256, item_id, state, last_error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'queued', NULL, ?10, ?10)",
+                content_sha256, item_id, scrub, state, last_error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, 'queued', NULL, ?11, ?11)",
             rusqlite::params![
                 id,
                 org_id,
@@ -263,6 +425,7 @@ impl Db {
                 rev as i64,
                 generation as i64,
                 content_sha256,
+                scrub as i64,
                 created_at
             ],
         )
@@ -278,6 +441,51 @@ impl Db {
             "UPDATE org_shares SET state = 'uploaded', item_id = ?2, last_error = NULL,
                updated_at = ?3 WHERE id = ?1",
             rusqlite::params![id, item_id, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    pub fn set_org_share_document_metadata(
+        &self,
+        id: &str,
+        doc_id: &str,
+        access: &str,
+    ) -> Result<()> {
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
+        let conn = self.lock();
+        let org_id = conn
+            .query_row(
+                "SELECT org_id FROM org_shares WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if let Some(org_id) = org_id.as_deref() {
+            require_stable_uuid(org_id, "invalid organization id")?;
+        }
+        conn.execute(
+            "UPDATE org_shares SET doc_id = ?2, access = ?3 WHERE id = ?1",
+            rusqlite::params![id, doc_id, access],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear server-issued stable-document metadata before retrying a publish against a relay that
+    /// rejected the prior resource. This is one storage-owned mutation so command code never opens
+    /// the SQLCipher connection or risks clearing only half of the identity/permission tuple.
+    pub fn clear_org_share_document_metadata(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET doc_id = NULL, access = 'view' WHERE id = ?1",
+            rusqlite::params![id],
         )
         .map_err(map_err)?;
         Ok(())
@@ -319,16 +527,25 @@ impl Db {
             generation: r.get::<_, i64>(7)? as u32,
             content_sha256: r.get(8)?,
             item_id: r.get(9)?,
-            state: r.get(10)?,
-            last_error: r.get(11)?,
-            created_at: r.get(12)?,
-            updated_at: r.get(13)?,
+            doc_id: r.get(10)?,
+            access: r.get(11)?,
+            scrub: r.get::<_, i64>(12)? != 0,
+            state: r.get(13)?,
+            last_error: r.get(14)?,
+            expected_actor_user_id: r.get(15)?,
+            expected_owner_user_id: r.get(16)?,
+            source_version: r.get::<_, i64>(17)?.max(0) as u64,
+            republish_dirty: r.get::<_, i64>(18)?.max(0) as u64,
+            created_at: r.get(19)?,
+            updated_at: r.get(20)?,
         })
     }
 
     const ORG_SHARE_COLS: &'static str =
         "id, org_id, meeting_id, document_id, kind, title, rev, generation,
-         content_sha256, item_id, state, last_error, created_at, updated_at";
+         content_sha256, item_id, doc_id, access, scrub, state, last_error,
+         expected_actor_user_id, expected_owner_user_id, source_version, republish_dirty,
+         created_at, updated_at";
 
     /// One org share by its local id.
     pub fn get_org_share(&self, id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
@@ -345,12 +562,274 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Content-free dispatch witness for exact attempt completion CAS. Kept separate from the
+    /// general UI row so the transport id is not propagated through unrelated read surfaces.
+    pub fn org_share_dispatch_id(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT dispatch_id FROM org_shares WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
+    }
+
+    /// Persist one content-free access dispatch receipt and its complete local CAS witness in the
+    /// same SQLite transaction. A content mutation journal, stale local access/owner tuple, or an
+    /// existing pending access attempt refuses admission without leaving a phantom egress row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn persist_org_access_attempt_if_current(
+        &self,
+        ts: i64,
+        host: &str,
+        dispatch_id: &str,
+        org_id: &str,
+        doc_id: &str,
+        old_access: &str,
+        new_access: &str,
+        actor_user_id: &str,
+        owner_user_id: &str,
+        created_at: &str,
+    ) -> Result<bool> {
+        for (value, error) in [
+            (dispatch_id, "invalid org access dispatch id"),
+            (org_id, "invalid org id"),
+            (doc_id, "invalid org document id"),
+            (actor_user_id, "invalid org access actor"),
+            (owner_user_id, "invalid org document owner"),
+        ] {
+            require_stable_uuid(value, error)?;
+        }
+        if !matches!(old_access, "view" | "edit") || !matches!(new_access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org document access".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let admissible: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM org_items
+                    WHERE org_id=?1 AND doc_id=?2 AND tombstoned=0 AND is_current=1
+                      AND access=?3 AND document_owner_user_id=?4
+                 )
+                 AND NOT EXISTS(
+                   SELECT 1 FROM org_access_attempts
+                    WHERE org_id=?1 AND doc_id=?2 AND state='pending'
+                 )
+                 AND NOT EXISTS(
+                   SELECT 1 FROM org_access_attempts WHERE dispatch_id=?5
+                 )
+                 AND NOT EXISTS(
+                   SELECT 1 FROM org_shares
+                    WHERE org_id=?1 AND doc_id=?2 AND state='failed'
+                      AND last_error IN (
+                        'direct_put_pending','republish_put_pending','republish_post_pending',
+                        'initial_post_pending','initial_post_replayable','projection_pending',
+                        'recovery_witness_missing','org_edit_conflict'
+                      )
+                 )",
+                rusqlite::params![org_id, doc_id, old_access, owner_user_id, dispatch_id],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if !admissible {
+            return Ok(false);
+        }
+        insert_share_egress_dispatch_tx(
+            &tx,
+            ts,
+            host,
+            "org_share_access",
+            0,
+            dispatch_id,
+        )?;
+        tx.execute(
+            "INSERT INTO org_access_attempts
+              (dispatch_id,org_id,doc_id,old_access,new_access,actor_user_id,owner_user_id,state,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8)",
+            rusqlite::params![
+                dispatch_id,
+                org_id,
+                doc_id,
+                old_access,
+                new_access,
+                actor_user_id,
+                owner_user_id,
+                created_at
+            ],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    pub(crate) fn pending_org_access_attempts(&self) -> Result<Vec<OrgAccessAttemptRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT dispatch_id,org_id,doc_id,old_access,new_access,actor_user_id,owner_user_id
+                   FROM org_access_attempts WHERE state='pending' ORDER BY seq ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(OrgAccessAttemptRow {
+                    dispatch_id: row.get(0)?,
+                    org_id: row.get(1)?,
+                    doc_id: row.get(2)?,
+                    old_access: row.get(3)?,
+                    new_access: row.get(4)?,
+                    actor_user_id: row.get(5)?,
+                    owner_user_id: row.get(6)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Apply a successful PATCH only while every immutable dispatch/document/account/access witness
+    /// still matches and no newer non-failed attempt or blocked content mutation exists. The attempt
+    /// transition and all local replica/journal metadata updates commit or roll back together.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_org_access_attempt_if_current(
+        &self,
+        dispatch_id: &str,
+        org_id: &str,
+        doc_id: &str,
+        old_access: &str,
+        new_access: &str,
+        actor_user_id: &str,
+        owner_user_id: &str,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx
+            .execute(
+                "UPDATE org_access_attempts SET state='applied'
+                  WHERE dispatch_id=?1 AND org_id=?2 AND doc_id=?3 AND old_access=?4
+                    AND new_access=?5 AND actor_user_id=?6 AND owner_user_id=?7 AND state='pending'
+                    AND EXISTS(SELECT 1 FROM org_items
+                      WHERE org_id=?2 AND doc_id=?3 AND tombstoned=0 AND is_current=1
+                        AND access=?4 AND document_owner_user_id=?7)
+                    AND NOT EXISTS(SELECT 1 FROM org_access_attempts newer
+                      WHERE newer.org_id=?2 AND newer.doc_id=?3
+                        AND newer.seq > org_access_attempts.seq AND newer.state != 'failed')
+                    AND NOT EXISTS(SELECT 1 FROM org_shares
+                      WHERE org_id=?2 AND doc_id=?3 AND state='failed'
+                        AND last_error IN (
+                          'direct_put_pending','republish_put_pending','republish_post_pending',
+                          'initial_post_pending','initial_post_replayable','projection_pending',
+                          'recovery_witness_missing','org_edit_conflict'
+                        ))",
+                rusqlite::params![
+                    dispatch_id,
+                    org_id,
+                    doc_id,
+                    old_access,
+                    new_access,
+                    actor_user_id,
+                    owner_user_id
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE org_items SET access=?3,document_owner_user_id=?4
+              WHERE org_id=?1 AND doc_id=?2 AND tombstoned=0",
+            rusqlite::params![org_id, doc_id, new_access, owner_user_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE org_shares SET access=?3 WHERE org_id=?1 AND doc_id=?2",
+            rusqlite::params![org_id, doc_id, new_access],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_access_attempts WHERE org_id=?1 AND doc_id=?2
+              AND seq < (SELECT seq FROM org_access_attempts WHERE dispatch_id=?3)",
+            rusqlite::params![org_id, doc_id, dispatch_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fail_org_access_attempt_if_current(
+        &self,
+        dispatch_id: &str,
+        org_id: &str,
+        doc_id: &str,
+        old_access: &str,
+        new_access: &str,
+        actor_user_id: &str,
+        owner_user_id: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_access_attempts SET state='failed'
+              WHERE dispatch_id=?1 AND org_id=?2 AND doc_id=?3 AND old_access=?4
+                AND new_access=?5 AND actor_user_id=?6 AND owner_user_id=?7 AND state='pending'",
+            rusqlite::params![
+                dispatch_id,
+                org_id,
+                doc_id,
+                old_access,
+                new_access,
+                actor_user_id,
+                owner_user_id
+            ],
+        )
+        .map(|changed| changed == 1)
+        .map_err(map_err)
+    }
+
     /// The org share bearing a given server `item_id` (for revoke-by-item + self-share dedup).
     pub fn org_share_by_item(&self, item_id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
         let conn = self.lock();
         conn.query_row(
             &format!(
                 "SELECT {} FROM org_shares WHERE item_id = ?1",
+                Self::ORG_SHARE_COLS
+            ),
+            rusqlite::params![item_id],
+            Self::map_org_share,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Resolve a revoke request arriving with the CURRENT feed item back to the origin device's
+    /// durable source-share row without changing its CAS baseline (`item_id`/`rev`/hash). Exact
+    /// Server item-id lookup remains the first leg so legacy rows keep working; the stable leg is
+    /// scoped by `(org_id, doc_id)` and is intentionally not used by `org_resolve_source`. A server
+    /// item id must never be interpreted as the local `org_shares.id` namespace.
+    pub fn org_share_for_revoke_target(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<crate::storage::OrgShareRow>> {
+        if let Some(row) = self.org_share_by_item(item_id)? {
+            return Ok(Some(row));
+        }
+        let conn = self.lock();
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM org_shares
+                  WHERE (org_id, doc_id) =
+                        (SELECT org_id, doc_id FROM org_items
+                          WHERE item_id = ?1 AND tombstoned = 0 AND doc_id IS NOT NULL)
+                    AND (state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL))
+                  ORDER BY created_at ASC LIMIT 1",
                 Self::ORG_SHARE_COLS
             ),
             rusqlite::params![item_id],
@@ -388,7 +867,11 @@ impl Db {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {} FROM org_shares
-                   WHERE (state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL))
+                   WHERE (state = 'uploaded'
+                      OR (state = 'failed' AND (item_id IS NOT NULL OR last_error IN
+                         ('initial_post_pending','initial_post_replayable','direct_put_pending',
+                          'republish_put_pending','republish_post_pending','org_edit_conflict',
+                          'recovery_witness_missing','projection_pending','too_large'))))
                      AND ((?1 IS NOT NULL AND meeting_id = ?1)
                        OR (?2 IS NOT NULL AND document_id = ?2))
                    ORDER BY created_at ASC",
@@ -408,12 +891,44 @@ impl Db {
         Ok(out)
     }
 
-    /// Every LIVE (`uploaded`) org share of ONE exact source (`meeting_id` XOR `document_id`) in ONE
+    /// Destructive source operations must see every non-terminal journal, including legacy
+    /// queued/generic-failed NULL-identity rows whose old client may have dispatched a POST without
+    /// recording a witness. The command-layer proof classifier decides DELETE vs local cancellation
+    /// vs fail-closed; this query deliberately makes no remote-absence inference from state/item_id.
+    pub(crate) fn org_shares_for_source_revoke(
+        &self,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        if meeting_id.is_none() && document_id.is_none() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM org_shares
+              WHERE state != 'revoked'
+                AND ((?1 IS NOT NULL AND meeting_id=?1)
+                  OR (?2 IS NOT NULL AND document_id=?2))
+              ORDER BY created_at ASC,id ASC",
+            Self::ORG_SHARE_COLS,
+        )).map_err(map_err)?;
+        let rows = stmt.query_map(
+            rusqlite::params![meeting_id,document_id],Self::map_org_share,
+        ).map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Every LIVE org share of ONE exact source (`meeting_id` XOR `document_id`) in ONE
     /// org, OLDEST-FIRST (stable tie-break on `id`). The `(org, source)`-scoped twin of
     /// `org_shares_for_source` (which spans all orgs): powers the share IDEMPOTENCY guard + the
     /// duplicate collapse — `[0]` is the canonical KEEPER (earliest published, the identity other
-    /// members first saw), `[1..]` are accidental duplicates to tombstone. `state = 'uploaded'` only
-    /// (a queued/failed row has no live server item; a revoked one was intentionally torn down).
+    /// members first saw), `[1..]` are accidental duplicates to tombstone. A durable direct-PUT
+    /// journal remains live because its `item_id` is the still-published predecessor; treating it as
+    /// absent would let a second Share click mint a new document while reconciliation is pending.
     /// `meeting_id`/`document_id` matched NULL-safe via `IS`; both-None ⇒ empty (no source).
     pub fn uploaded_org_shares_for_source_in_org(
         &self,
@@ -428,9 +943,15 @@ impl Db {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {} FROM org_shares
-                   WHERE org_id = ?1 AND state = 'uploaded'
+                   WHERE org_id = ?1
+                     AND (state IN ('queued','uploaded')
+                       OR (state = 'failed' AND (item_id IS NOT NULL OR last_error IN
+                         ('initial_post_pending','initial_post_replayable','direct_put_pending',
+                          'republish_put_pending','republish_post_pending','org_edit_conflict',
+                          'recovery_witness_missing','projection_pending'))))
                      AND meeting_id IS ?2 AND document_id IS ?3
-                   ORDER BY created_at ASC, id ASC",
+                   ORDER BY CASE WHEN state='uploaded' AND item_id IS NOT NULL THEN 0 ELSE 1 END,
+                            created_at ASC, id ASC",
                 Self::ORG_SHARE_COLS
             ))
             .map_err(map_err)?;
@@ -459,6 +980,7 @@ impl Db {
             .prepare(&format!(
                 "SELECT {} FROM org_shares o
                    WHERE o.state = 'uploaded'
+                     AND (o.meeting_id IS NOT NULL OR o.document_id IS NOT NULL)
                      AND EXISTS (
                        SELECT 1 FROM org_shares e
                         WHERE e.state = 'uploaded'
@@ -498,8 +1020,11 @@ impl Db {
         let conn = self.lock();
         let n = conn
             .execute(
-                "UPDATE org_shares SET state = 'revoked', updated_at = ?4
-                   WHERE org_id = ?1 AND state IN ('queued', 'failed')
+                "UPDATE org_shares SET state = 'revoked', last_error=NULL, dispatch_id=NULL,
+                     updated_at = ?4
+                   WHERE org_id = ?1 AND state='failed' AND item_id IS NULL
+                     AND ((last_error='initial_post_replayable') OR
+                       (dispatch_id IS NULL AND last_error IN ('too_large','seal_failed')))
                      AND meeting_id IS ?2 AND document_id IS ?3",
                 rusqlite::params![org_id, meeting_id, document_id, updated_at],
             )
@@ -528,6 +1053,10 @@ impl Db {
                    WHERE org_id = ?1
                      AND meeting_id IS ?2 AND document_id IS ?3
                      AND state IN ('queued', 'failed')
+                     AND (last_error IS NULL OR last_error NOT IN
+                       ('direct_put_pending', 'republish_put_pending', 'republish_post_pending',
+                        'org_edit_conflict', 'recovery_witness_missing', 'projection_pending',
+                        'initial_post_pending'))
                    ORDER BY created_at DESC LIMIT 1",
                 Self::ORG_SHARE_COLS
             ),
@@ -538,11 +1067,77 @@ impl Db {
         .map_err(map_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn acquire_new_org_share_for_source(
+        &self, id: &str, org_id: &str, meeting_id: Option<&str>, document_id: Option<&str>,
+        kind: &str, title: Option<&str>, rev: u32, generation: u32,
+        content_sha256: &[u8], scrub: bool, now: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "INSERT INTO org_shares
+              (id,org_id,meeting_id,document_id,kind,title,rev,generation,content_sha256,
+               scrub,state,created_at,updated_at)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11,?11
+              WHERE NOT EXISTS(SELECT 1 FROM org_shares
+                WHERE org_id=?2 AND meeting_id IS ?3 AND document_id IS ?4
+                  AND state!='revoked')",
+            rusqlite::params![id, org_id, meeting_id, document_id, kind, title, rev as i64,
+                generation as i64, content_sha256, scrub as i64, now],
+        ).map_err(map_err)?;
+        Ok(changed == 1)
+    }
+
     /// SB-3 retry re-arm: reset an EXISTING org-share row back to `queued` for a fresh publish attempt,
     /// refreshing the per-attempt fields (title/content hash/generation/timestamps) and CLEARING any
     /// item_id + last_error. Used by `share_to_org_inner` when it reuses a `find_reusable_org_share`
     /// row instead of inserting a new one — so N failed attempts stay ONE row, and a later success
     /// flips that same row to uploaded (no duplicate). Idempotent on the row id.
+    // One cohesive retry-row mutation; keeping every persisted attempt field visible prevents a
+    // caller from accidentally retaining stale scrub/hash/generation state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reset_org_share_for_retry_with_scrub(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        scrub: bool,
+        updated_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE org_shares SET state = 'queued', item_id = NULL, last_error = NULL,
+               title = ?2, rev = ?3, generation = ?4, content_sha256 = ?5, scrub = ?6,
+               updated_at = ?7
+             WHERE id = ?1
+               AND (last_error IS NULL OR last_error NOT IN
+                 ('direct_put_pending', 'republish_put_pending', 'republish_post_pending',
+                  'org_edit_conflict', 'recovery_witness_missing', 'projection_pending',
+                  'initial_post_pending', 'initial_post_replayable'))",
+                rusqlite::params![
+                    id,
+                    title,
+                    rev as i64,
+                    generation as i64,
+                    content_sha256,
+                    scrub as i64,
+                    updated_at
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Err(crate::error::AppError::Unavailable(
+                "ambiguous org publish source changed before replay".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Backward-compatible retry seam for the command layer from the stack base.
+    /// The follow-up command-layer commit switches to the scrub-bound variant above.
     pub fn reset_org_share_for_retry(
         &self,
         id: &str,
@@ -570,6 +1165,202 @@ impl Db {
         Ok(())
     }
 
+    /// A stable document with an unresolved mutation witness cannot accept a permission PATCH.
+    /// The check is content-free and runs before the PATCH dispatch receipt/socket boundary.
+    pub(crate) fn org_document_has_blocked_republish(
+        &self,
+        org_id: &str,
+        doc_id: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM org_shares
+              WHERE org_id = ?1 AND doc_id = ?2 AND state = 'failed'
+                AND last_error IN ('direct_put_pending', 'republish_put_pending',
+                                   'republish_post_pending', 'initial_post_pending',
+                                   'initial_post_replayable', 'org_edit_conflict',
+                                   'recovery_witness_missing', 'projection_pending'))",
+            rusqlite::params![org_id, doc_id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .map_err(map_err)
+    }
+
+    pub(crate) fn org_share_source_counters(&self, id: &str) -> Result<(u64, u64)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT source_version, republish_dirty FROM org_shares WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            },
+        )
+        .map_err(map_err)
+    }
+
+    pub(crate) fn complete_source_less_projection_if_present(&self, share_id: &str) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed = tx.execute(
+            "DELETE FROM org_shares WHERE id=?1 AND state='failed'
+              AND last_error='projection_pending' AND meeting_id IS NULL AND document_id IS NULL
+              AND EXISTS(SELECT 1 FROM org_items i WHERE i.item_id=org_shares.item_id
+                AND i.org_id=org_shares.org_id AND i.doc_id=org_shares.doc_id
+                AND i.access=org_shares.access AND i.rev=org_shares.rev
+                AND i.generation=org_shares.generation AND i.content_sha256=org_shares.content_sha256
+                AND i.projection_sha256=org_shares.content_sha256
+                AND i.tombstoned=0)",
+            rusqlite::params![share_id],
+        ).map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn terminalize_and_evict_org_document(
+        &self,
+        org_id: &str,
+        doc_id: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        require_stable_uuid(org_id, "invalid organization id")?;
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let item_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT item_id FROM org_items WHERE org_id=?1 AND doc_id=?2 AND tombstoned=0",
+            ).map_err(map_err)?;
+            let rows = stmt.query_map(rusqlite::params![org_id,doc_id], |row| row.get(0))
+                .map_err(map_err)?;
+            let mut ids = Vec::new();
+            for row in rows { ids.push(row.map_err(map_err)?); }
+            ids
+        };
+        let mut evicted = false;
+        for item_id in item_ids {
+            evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
+        }
+        Self::purge_org_document_links_tx(&tx, org_id, doc_id)?;
+        tx.execute(
+            "UPDATE org_shares SET state='revoked', last_error=NULL, item_id=NULL,
+                    dispatch_id=NULL, updated_at=?3
+              WHERE org_id=?1 AND doc_id=?2 AND state!='revoked'",
+            rusqlite::params![org_id,doc_id,updated_at],
+        ).map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_access_attempts WHERE org_id=?1 AND doc_id=?2",
+            rusqlite::params![org_id,doc_id],
+        ).map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(evicted)
+    }
+
+    pub(crate) fn org_source_version(
+        &self,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<u64> {
+        let (kind, id) = match (meeting_id, document_id) {
+            (Some(id), None) => ("meeting", id),
+            (None, Some(id)) => ("document", id),
+            _ => return Err(crate::error::AppError::InvalidArg(
+                "exactly one org share source is required".into(),
+            )),
+        };
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT version FROM org_source_versions WHERE source_kind=?1 AND source_id=?2",
+            rusqlite::params![kind, id],
+            |row| Ok(row.get::<_, i64>(0)?.max(0) as u64),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(|value| value.unwrap_or(0))
+    }
+
+    pub(crate) fn clear_org_share_dirty_if_epoch(
+        &self,
+        id: &str,
+        source_version: u64,
+        dirty_counter: u64,
+        item_id: &str,
+        rev: u32,
+        content_sha256: &[u8],
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE org_shares SET republish_dirty = 0
+                  WHERE id = ?1 AND state = 'uploaded' AND last_error IS NULL
+                    AND source_version = ?2 AND republish_dirty = ?3 AND republish_dirty > 0
+                    AND item_id = ?4 AND rev = ?5 AND content_sha256 = ?6",
+                rusqlite::params![
+                    id,
+                    source_version as i64,
+                    dirty_counter as i64,
+                    item_id,
+                    rev as i64,
+                    content_sha256,
+                ],
+            )
+            .map_err(map_err)?;
+        Ok(changed == 1)
+    }
+
+    /// Re-arm an authenticated-absence initial POST without changing its durable actor/owner
+    /// witnesses. The equality predicates are the DB-level account-switch CAS: a stale caller can
+    /// neither overwrite the witnesses nor make the row dispatchable under another account.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reset_initial_org_share_for_replay(
+        &self,
+        id: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        scrub: bool,
+        doc_id: &str,
+        access: &str,
+        expected_actor_user_id: &str,
+        expected_owner_user_id: &str,
+        current_actor_user_id: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE org_shares
+                    SET state = 'queued', item_id = NULL, last_error = NULL, updated_at = ?11
+                  WHERE id = ?1 AND state = 'failed' AND last_error = 'initial_post_replayable'
+                    AND rev = ?2 AND generation = ?3 AND content_sha256 = ?4 AND scrub = ?5
+                    AND doc_id = ?6 AND access = ?7
+                    AND expected_actor_user_id = ?8 AND expected_owner_user_id = ?9
+                    AND ?10 = ?8 AND ?10 = ?9",
+                rusqlite::params![
+                    id,
+                    rev as i64,
+                    generation as i64,
+                    content_sha256,
+                    scrub as i64,
+                    doc_id,
+                    access,
+                    expected_actor_user_id,
+                    expected_owner_user_id,
+                    current_actor_user_id,
+                    updated_at,
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Err(crate::error::AppError::Unavailable(
+                "ambiguous org publish actor or source changed before replay".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// All org shares in a given `state` (the launch sweep pulls `queued` + `revoke_pending`).
     pub fn list_org_shares_in_state(
         &self,
@@ -592,6 +1383,28 @@ impl Db {
         Ok(out)
     }
 
+    pub(crate) fn list_dirty_uploaded_org_shares(
+        &self,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                  WHERE state = 'uploaded' AND last_error IS NULL
+                    AND republish_dirty > 0
+                    AND (meeting_id IS NOT NULL OR document_id IS NOT NULL)
+                  ORDER BY updated_at ASC, id ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], Self::map_org_share).map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Every LIVE org share across ALL sources/orgs — the un-scoped twin of `org_shares_for_source`,
     /// for callers that need the whole "is this live" set rather than one source (the Library bulk
     /// share-badge listing). Same STUCK-REPUBLISH definition of "live" as `org_shares_for_source`:
@@ -605,7 +1418,7 @@ impl Db {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {} FROM org_shares
-                   WHERE state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL)
+                   WHERE (state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL))
                    ORDER BY created_at ASC",
                 Self::ORG_SHARE_COLS
             ))
@@ -659,13 +1472,13 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT s.item_id, s.title
-                   FROM org_shares s
-                   LEFT JOIN notes n  ON n.meeting_id = s.meeting_id
-                   LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE (s.state IN ('queued','uploaded','revoke_pending')
-                     OR (s.state = 'failed' AND s.item_id IS NOT NULL))
-                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
+                "SELECT s.item_id, s.title FROM org_shares s
+                  WHERE s.state != 'revoked'
+                    AND ((s.document_id IS NOT NULL AND EXISTS(
+                          SELECT 1 FROM documents d WHERE d.id=s.document_id AND d.folder_id=?1))
+                      OR (s.meeting_id IS NOT NULL AND EXISTS(
+                          SELECT 1 FROM notes n WHERE n.meeting_id=s.meeting_id
+                           AND n.folder_id=?1)))",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -697,13 +1510,13 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT s.id, s.item_id, s.title
-                   FROM org_shares s
-                   LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
-                   LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE (s.state IN ('queued','uploaded','revoke_pending')
-                     OR (s.state = 'failed' AND s.item_id IS NOT NULL))
-                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
+                "SELECT s.id, s.item_id, s.title FROM org_shares s
+                  WHERE s.state != 'revoked'
+                    AND ((s.document_id IS NOT NULL AND EXISTS(
+                          SELECT 1 FROM documents d WHERE d.id=s.document_id AND d.folder_id=?1))
+                      OR (s.meeting_id IS NOT NULL AND EXISTS(
+                          SELECT 1 FROM notes n WHERE n.meeting_id=s.meeting_id
+                           AND n.folder_id=?1)))",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -855,17 +1668,75 @@ impl Db {
         prepared: &PreparedOrgItemIndex,
         superseded_item_id: Option<&str>,
     ) -> Result<bool> {
+        self.commit_local_org_replica_with_metadata(
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+            superseded_item_id,
+            None,
+            "view",
+            None,
+            false,
+        )
+        .map(|outcome| outcome.changed)
+    }
+
+    /// Local publish/CAS refresh with stable document metadata stamped before predecessor eviction
+    /// in the same transaction. That ordering lets the tombstone see the new live revision and
+    /// preserve the revision-stable private link edge across supersession.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_local_org_replica_with_metadata(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+        superseded_item_id: Option<&str>,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<OrgMetadataCommitOutcome> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(org_id, "invalid organization id")?;
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        }
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        if !Self::org_membership_exists_tx(&tx, org_id)? {
+        if !Self::org_membership_witness_tx(&tx, org_id, generation)? {
             // The server publish may have raced a local leave/removal. The remote item remains the
             // server's concern, but withdrawn membership must never be followed by a plaintext local
             // replica resurrection.
-            return Ok(false);
+            return Ok(OrgMetadataCommitOutcome::default());
         }
         let existing = tx
             .query_row(
-                "SELECT seq, content_sha256, tombstoned FROM org_items WHERE item_id = ?1",
+                "SELECT seq, content_sha256, tombstoned, projection_sha256
+                   FROM org_items WHERE item_id = ?1",
                 rusqlite::params![item_id],
                 |r| {
                     Ok((
@@ -920,12 +1791,296 @@ impl Db {
             .map_err(map_err)?;
         }
 
+        if doc_id.is_some() || document_owner_user_id.is_some() || access != "view" {
+            Self::set_org_item_document_metadata_tx(
+                &tx,
+                item_id,
+                doc_id,
+                access,
+                document_owner_user_id,
+            )?;
+        }
+        let current_reduced =
+            Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+
         let superseded_evicted = match superseded_item_id.filter(|old| *old != item_id) {
             Some(old_item_id) => Self::tombstone_org_item_tx(&tx, old_item_id)?,
             None => false,
         };
+        // Tombstoning a live predecessor already purges in `tombstone_org_item_tx`; do not advance
+        // the durable generation twice when it is also the distinct head demoted above.
+        if current_reduced && !superseded_evicted {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
         tx.commit().map_err(map_err)?;
-        Ok(superseded_evicted)
+        Ok(OrgMetadataCommitOutcome {
+            changed: superseded_evicted,
+            visibility_reduced: current_reduced || superseded_evicted,
+        })
+    }
+
+    /// Install the plaintext/index/attachment projection of one completed stable PUT only while
+    /// the exact completed dispatch is still the live share head. A concurrent revoke or access
+    /// PATCH changes that witness and makes this a no-op, so a late HTTP response cannot resurrect
+    /// withdrawn content or stale permissions. Every older locally-held revision of the document is
+    /// purged in the same transaction, including revisions that were never the recorded predecessor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_republish_projection_if_current(
+        &self,
+        share_id: &str,
+        dispatch_id: &str,
+        org_id: &str,
+        doc_id: &str,
+        access: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        expected_actor_user_id: &str,
+        document_owner_user_id: &str,
+        expected_predecessor_item_id: Option<&str>,
+        expected_pending_reason: Option<&str>,
+        discard_source_less_anchor: bool,
+        projection: &OrgRepublishProjection<'_>,
+    ) -> Result<OrgMetadataCommitOutcome> {
+        require_stable_uuid(org_id, "invalid organization id")?;
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let witness: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_shares
+                  WHERE id = ?1
+                    AND ((state = 'uploaded' AND last_error IS NULL AND item_id = ?2)
+                      OR (state = 'failed' AND last_error IS ?12 AND item_id IS ?13))
+                    AND org_id = ?9 AND expected_actor_user_id = ?10
+                    AND expected_owner_user_id = ?11
+                    AND doc_id = ?3 AND access = ?4 AND rev = ?5 AND generation = ?6
+                    AND content_sha256 = ?7 AND dispatch_id = ?8)",
+                rusqlite::params![
+                    share_id,
+                    projection.item_id,
+                    doc_id,
+                    access,
+                    rev as i64,
+                    generation as i64,
+                    content_sha256,
+                    dispatch_id,
+                    org_id,
+                    expected_actor_user_id,
+                    document_owner_user_id,
+                    expected_pending_reason,
+                    expected_predecessor_item_id,
+                ],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if !witness || !Self::org_membership_witness_tx(&tx, org_id, generation)? {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+
+        let target_tombstoned = tx
+            .query_row(
+                "SELECT tombstoned FROM org_items WHERE item_id = ?1",
+                rusqlite::params![projection.item_id],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
+        if target_tombstoned {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+        let incompatible_head: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_items
+                  WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0 AND is_current = 1
+                    AND item_id != ?3
+                    AND (generation > ?4 OR (generation = ?4 AND rev >= ?5)
+                      OR seq > ?6))",
+                rusqlite::params![
+                    org_id,
+                    doc_id,
+                    projection.item_id,
+                    generation as i64,
+                    rev as i64,
+                    projection.seq as i64,
+                ],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if incompatible_head {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+
+        let existing_target = tx
+            .query_row(
+                "SELECT seq, content_sha256, tombstoned, projection_sha256
+                   FROM org_items WHERE item_id = ?1",
+                rusqlite::params![projection.item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u64,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let replace_attachments = existing_target.as_ref().map_or(true, |(_, _, _, witness)| {
+            witness.as_deref() != Some(content_sha256)
+        });
+        let replace_target = match existing_target {
+            None => true,
+            Some((_seq, _hash, true, _projection)) => {
+                return Ok(OrgMetadataCommitOutcome::default())
+            }
+            Some((stored_seq, _, false, _projection)) if stored_seq > projection.seq => {
+                return Ok(OrgMetadataCommitOutcome::default())
+            }
+            Some((stored_seq, stored_hash, false, _projection)) if stored_seq == projection.seq => {
+                if stored_hash.as_deref() != Some(content_sha256) {
+                    return Err(crate::error::AppError::Storage(
+                        "conflicting org replica payload at the same feed sequence".into(),
+                    ));
+                }
+                false
+            }
+            Some(_) => true,
+        };
+        let replace_attachments = replace_target || replace_attachments;
+
+        if replace_target {
+            Self::upsert_org_item_prepared_tx(
+                &tx,
+                projection.item_id,
+                org_id,
+                projection.seq,
+                projection.author_hint,
+                projection.title,
+                projection.markdown,
+                projection.created_at,
+                rev,
+                generation,
+                content_sha256,
+                projection.source_kind,
+                projection.author_user_id,
+                projection.prepared,
+            )?;
+        }
+        if replace_attachments {
+            Self::replace_org_item_attachment_bundle_tx(
+                &tx,
+                projection.item_id,
+                projection.attachments,
+                content_sha256,
+            )?;
+        }
+        Self::set_org_item_document_metadata_tx(
+            &tx,
+            projection.item_id,
+            Some(doc_id),
+            access,
+            Some(document_owner_user_id),
+        )?;
+        let current_reduced =
+            Self::set_org_item_current_tx(&tx, projection.item_id, org_id, Some(doc_id), true)?;
+
+        let older_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT item_id FROM org_items
+                      WHERE org_id = ?1 AND doc_id = ?2 AND item_id != ?3 AND tombstoned = 0
+                        AND (generation < ?4 OR (generation = ?4 AND rev < ?5))",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![
+                        org_id,
+                        doc_id,
+                        projection.item_id,
+                        generation as i64,
+                        rev as i64,
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(map_err)?);
+            }
+            ids
+        };
+        let had_older = !older_ids.is_empty();
+        let mut evicted = false;
+        for item_id in older_ids {
+            evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
+        }
+
+        let completion_changed = tx.execute(
+            "UPDATE org_shares SET state='uploaded', item_id=?2, last_error=NULL, updated_at=?11
+              WHERE id=?1 AND state='failed' AND last_error IS ?12 AND item_id IS ?13
+                AND doc_id=?3 AND access=?4 AND rev=?5 AND generation=?6
+                AND content_sha256=?7 AND dispatch_id=?8
+                AND expected_actor_user_id=?9 AND expected_owner_user_id=?10",
+            rusqlite::params![share_id, projection.item_id, doc_id, access, rev as i64,
+                generation as i64, content_sha256, dispatch_id, expected_actor_user_id,
+                document_owner_user_id, chrono::Utc::now().to_rfc3339(),
+                expected_pending_reason, expected_predecessor_item_id],
+        ).map_err(map_err)?;
+        let still_uploaded: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_shares WHERE id=?1 AND state='uploaded'
+                  AND last_error IS NULL AND item_id=?2 AND doc_id=?3 AND access=?4 AND rev=?5
+                  AND generation=?6 AND content_sha256=?7 AND dispatch_id=?8
+                  AND expected_actor_user_id=?9 AND expected_owner_user_id=?10)",
+                rusqlite::params![
+                    share_id,
+                    projection.item_id,
+                    doc_id,
+                    access,
+                    rev as i64,
+                    generation as i64,
+                    content_sha256,
+                    dispatch_id,
+                    expected_actor_user_id,
+                    document_owner_user_id,
+                ],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if !still_uploaded || (expected_pending_reason.is_some() && completion_changed != 1) {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+        if discard_source_less_anchor {
+            tx.execute(
+                "DELETE FROM org_shares WHERE id=?1 AND state='uploaded' AND item_id=?2
+                  AND dispatch_id=?3 AND meeting_id IS NULL AND document_id IS NULL",
+                rusqlite::params![share_id, projection.item_id, dispatch_id],
+            )
+            .map_err(map_err)?;
+        } else {
+            tx.execute(
+                "UPDATE org_shares SET expected_actor_user_id = NULL
+                  WHERE id = ?1 AND dispatch_id = ?2 AND expected_actor_user_id = ?3",
+                rusqlite::params![share_id, dispatch_id, expected_actor_user_id],
+            )
+            .map_err(map_err)?;
+        }
+        if (current_reduced || evicted) && had_older {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(OrgMetadataCommitOutcome {
+            changed: true,
+            visibility_reduced: current_reduced || evicted,
+        })
     }
 
     /// Commit one already-prepared live feed item and advance the org cursor to this action's exact
@@ -948,10 +2103,130 @@ impl Db {
         author_user_id: Option<&str>,
         prepared: &PreparedOrgItemIndex,
     ) -> Result<bool> {
+        self.commit_org_feed_item_with_metadata(
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+            None,
+            "view",
+            None,
+            false,
+        )
+        .map(|outcome| outcome.changed)
+    }
+
+    /// Feed commit plus stable permission/link metadata in the same transaction. Metadata is also
+    /// repaired when the content action is already behind the cursor (`false`), provided the live
+    /// item exists; this closes the local-publish-before-feed gap without rewriting content/indexes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_feed_item_with_metadata(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<OrgMetadataCommitOutcome> {
+        self.commit_org_feed_item_with_metadata_and_attachments(
+            item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
+            content_sha256, source_kind, author_user_id, prepared, doc_id, access,
+            document_owner_user_id, is_current, &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_feed_item_with_metadata_and_attachments(
+        &self, item_id: &str, org_id: &str, seq: u64, author_hint: &str, title: &str,
+        markdown: &str, created_at: &str, rev: u32, generation: u32,
+        content_sha256: &[u8], source_kind: Option<&str>, author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex, doc_id: Option<&str>, access: &str,
+        document_owner_user_id: Option<&str>, is_current: bool,
+        attachments: &[crate::storage::IncomingAttachment],
+    ) -> Result<OrgMetadataCommitOutcome> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(org_id, "invalid organization id")?;
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        }
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
-            return Ok(false);
+        if !Self::org_membership_witness_tx(&tx, org_id, generation)? {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+        let claimed_seq = Self::claim_org_feed_seq_tx(&tx, org_id, seq)?;
+        if !claimed_seq {
+            let projection_complete = tx
+                .query_row(
+                    "SELECT projection_sha256 = ?2 FROM org_items
+                      WHERE item_id = ?1 AND tombstoned = 0",
+                    rusqlite::params![item_id, content_sha256],
+                    |row| Ok(row.get::<_, Option<bool>>(0)?.unwrap_or(false)),
+                )
+                .optional()
+                .map_err(map_err)?
+                .unwrap_or(false);
+            if !projection_complete {
+                // The cursor may have committed before the authenticated attachment bundle in a
+                // legacy build. Repair the whole projection below without moving the cursor.
+            } else {
+            if doc_id.is_some() || document_owner_user_id.is_some() || access != "view" {
+                Self::set_org_item_document_metadata_tx(
+                    &tx,
+                    item_id,
+                    doc_id,
+                    access,
+                    document_owner_user_id,
+                )?;
+            }
+            let visibility_reduced =
+                Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+            Self::close_projection_pending_for_item_tx(
+                &tx,
+                item_id,
+                org_id,
+                doc_id,
+                access,
+                rev,
+                generation,
+                content_sha256,
+                author_user_id,
+                document_owner_user_id,
+            )?;
+            if visibility_reduced {
+                Self::purge_all_ask_conversations_tx(&tx)?;
+            }
+            tx.commit().map_err(map_err)?;
+            return Ok(OrgMetadataCommitOutcome {
+                changed: false,
+                visibility_reduced,
+            });
+            }
         }
         // Tombstones are permanent for an append-only item id. Even a malformed/malicious later live
         // event may advance the org cursor, but it must never restore plaintext for a withdrawn item.
@@ -966,7 +2241,7 @@ impl Db {
             .unwrap_or(false);
         if already_tombstoned {
             tx.commit().map_err(map_err)?;
-            return Ok(false);
+            return Ok(OrgMetadataCommitOutcome::default());
         }
         Self::upsert_org_item_prepared_tx(
             &tx,
@@ -984,8 +2259,38 @@ impl Db {
             author_user_id,
             prepared,
         )?;
+        Self::replace_org_item_attachment_bundle_tx(&tx, item_id, attachments, content_sha256)?;
+        if doc_id.is_some() || document_owner_user_id.is_some() || access != "view" {
+            Self::set_org_item_document_metadata_tx(
+                &tx,
+                item_id,
+                doc_id,
+                access,
+                document_owner_user_id,
+            )?;
+        }
+        let visibility_reduced =
+            Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+        Self::close_projection_pending_for_item_tx(
+            &tx,
+            item_id,
+            org_id,
+            doc_id,
+            access,
+            rev,
+            generation,
+            content_sha256,
+            author_user_id,
+            document_owner_user_id,
+        )?;
+        if visibility_reduced {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
         tx.commit().map_err(map_err)?;
-        Ok(true)
+        Ok(OrgMetadataCommitOutcome {
+            changed: true,
+            visibility_reduced,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1019,7 +2324,7 @@ impl Db {
                rev=excluded.rev, generation=excluded.generation,
                content_sha256=excluded.content_sha256, source_kind=excluded.source_kind,
                author_user_id=COALESCE(excluded.author_user_id, org_items.author_user_id),
-               tombstoned=0",
+               projection_sha256=NULL, tombstoned=0",
             rusqlite::params![
                 item_id,
                 org_id,
@@ -1063,6 +2368,100 @@ impl Db {
         Ok(())
     }
 
+    fn replace_org_item_attachment_bundle_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item_id: &str,
+        attachments: &[crate::storage::IncomingAttachment],
+        content_sha256: &[u8],
+    ) -> Result<()> {
+        tx.execute("DELETE FROM note_attachments WHERE org_item_id=?1", [item_id])
+            .map_err(map_err)?;
+        let created_at = chrono::Utc::now().timestamp_millis();
+        for attachment in attachments {
+            tx.execute(
+                "INSERT INTO note_attachments
+                  (id,document_id,meeting_id,provider_id,org_item_id,mime_type,extension,
+                   byte_len,width,height,sha256,data,data_blob,exported_path,created_at)
+                 VALUES(?1,NULL,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL,?10)",
+                rusqlite::params![attachment.id, item_id, attachment.mime_type,
+                    attachment.extension, i64::try_from(attachment.data.len()).map_err(|_| {
+                        crate::error::AppError::InvalidArg("image is too large".into())
+                    })?, i64::from(attachment.width), i64::from(attachment.height),
+                    attachment.sha256.as_slice(), attachment.data, created_at],
+            ).map_err(map_err)?;
+        }
+        tx.execute(
+            "UPDATE org_items SET projection_sha256=?2
+              WHERE item_id=?1 AND tombstoned=0",
+            rusqlite::params![item_id, content_sha256],
+        ).map_err(map_err)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn close_projection_pending_for_item_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item_id: &str,
+        org_id: &str,
+        doc_id: Option<&str>,
+        access: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        author_user_id: Option<&str>,
+        document_owner_user_id: Option<&str>,
+    ) -> Result<()> {
+        let (Some(doc_id), Some(actor), Some(owner)) =
+            (doc_id, author_user_id, document_owner_user_id)
+        else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE org_shares SET state='uploaded', last_error=NULL,
+                    expected_actor_user_id=NULL, updated_at=?10
+              WHERE state='failed' AND last_error='projection_pending'
+                AND item_id=?1 AND org_id=?2 AND doc_id=?3 AND access=?4
+                AND rev=?5 AND generation=?6 AND content_sha256=?7
+                AND expected_actor_user_id=?8 AND expected_owner_user_id=?9
+                AND (meeting_id IS NOT NULL OR document_id IS NOT NULL)",
+            rusqlite::params![
+                item_id,
+                org_id,
+                doc_id,
+                access,
+                rev as i64,
+                generation as i64,
+                content_sha256,
+                actor,
+                owner,
+                now,
+            ],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_shares
+              WHERE state='failed' AND last_error='projection_pending'
+                AND meeting_id IS NULL AND document_id IS NULL
+                AND item_id=?1 AND org_id=?2 AND doc_id=?3 AND access=?4
+                AND rev=?5 AND generation=?6 AND content_sha256=?7
+                AND expected_actor_user_id=?8 AND expected_owner_user_id=?9",
+            rusqlite::params![
+                item_id,
+                org_id,
+                doc_id,
+                access,
+                rev as i64,
+                generation as i64,
+                content_sha256,
+                actor,
+                owner,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// TOMBSTONE an org item — the discard-the-result alias of the ONE eviction primitive
     /// [`Db::evict_org_item`]. Kept as the historical name used by `delete_org_item_as_author`.
     /// Idempotent — tombstoning an unknown/already-tombstoned id is fine.
@@ -1095,6 +2494,18 @@ impl Db {
             return Ok((false, false));
         }
         let evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE org_shares SET last_error='org_edit_conflict',updated_at=?2
+              WHERE state='failed' AND last_error='projection_pending' AND item_id=?1 AND org_id=?3
+                AND (meeting_id IS NOT NULL OR document_id IS NOT NULL)",
+            rusqlite::params![item_id,now,org_id],
+        ).map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_shares WHERE state='failed' AND last_error='projection_pending'
+              AND item_id=?1 AND org_id=?2 AND meeting_id IS NULL AND document_id IS NULL",
+            rusqlite::params![item_id,org_id],
+        ).map_err(map_err)?;
         tx.commit().map_err(map_err)?;
         Ok((true, evicted))
     }
@@ -1130,6 +2541,55 @@ impl Db {
         Ok(evicted)
     }
 
+    /// Evict every locally-held live revision of one stable org document in one transaction. Used
+    /// after the relay confirms a stable-document DELETE, so a stale origin `item_id` cannot leave a
+    /// remotely-edited current head searchable on this device.
+    pub fn evict_org_document(&self, org_id: &str, doc_id: &str) -> Result<bool> {
+        require_stable_uuid(org_id, "invalid organization id")?;
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let item_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT item_id FROM org_items
+                      WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0
+                      ORDER BY rev ASC, seq ASC, item_id ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![org_id, doc_id], |r| r.get(0))
+                .map_err(map_err)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(map_err)?);
+            }
+            ids
+        };
+        let mut evicted = false;
+        for item_id in item_ids {
+            evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
+        }
+        Self::purge_org_document_links_tx(&tx, org_id, doc_id)?;
+        tx.commit().map_err(map_err)?;
+        Ok(evicted)
+    }
+
+    fn purge_org_document_links_tx(
+        tx: &rusqlite::Transaction<'_>,
+        org_id: &str,
+        doc_id: &str,
+    ) -> Result<usize> {
+        let endpoint = format!("{org_id}:{doc_id}");
+        tx.execute(
+            "DELETE FROM links
+              WHERE (src_kind='org' AND src_id=?1)
+                 OR (dst_kind='org' AND dst_id=?1)",
+            rusqlite::params![endpoint],
+        )
+        .map_err(map_err)
+    }
+
     /// The in-transaction body of [`Db::evict_org_item`]. Returns whether a LIVE row was evicted.
     fn tombstone_org_item_tx(tx: &rusqlite::Transaction<'_>, item_id: &str) -> Result<bool> {
         let was_live: bool = tx
@@ -1148,10 +2608,15 @@ impl Db {
         // text so no reader can ever observe one half of the eviction.
         Self::purge_org_item_attachments_tx(tx, item_id)?;
         tx.execute(
-            "UPDATE org_items SET tombstoned = 1, markdown = '', title = '' WHERE item_id = ?1",
+            "UPDATE org_items SET tombstoned = 1, markdown = '', title = '',
+                 projection_sha256 = NULL WHERE item_id = ?1",
             rusqlite::params![item_id],
         )
         .map_err(map_err)?;
+        // A relay tombstone removes the readable replica, not the user's private graph choice.
+        // `links_for_visible` and every org endpoint resolver join the live membership/context/item
+        // witness, so this opaque SQLCipher row is withheld while no authoritative head exists and
+        // becomes usable again if a successor revision is later ingested.
         if was_live {
             Self::purge_all_ask_conversations_tx(tx)?;
         }
@@ -1175,10 +2640,15 @@ impl Db {
         Ok(changed == 1)
     }
 
-    fn org_membership_exists_tx(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<bool> {
+    fn org_membership_witness_tx(
+        tx: &rusqlite::Transaction<'_>,
+        org_id: &str,
+        generation: u32,
+    ) -> Result<bool> {
         tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM org_state WHERE org_id = ?1)",
-            rusqlite::params![org_id],
+            "SELECT EXISTS(SELECT 1 FROM org_state
+              WHERE org_id = ?1 AND generation >= ?2)",
+            rusqlite::params![org_id, generation as i64],
             |r| r.get::<_, bool>(0),
         )
         .map_err(map_err)
@@ -1203,6 +2673,10 @@ impl Db {
     }
 
     fn purge_org_replica_tx(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<usize> {
+        // Membership withdrawal purges every decrypted org artifact below, but preserves opaque
+        // user-authored `links` rows. All readers require the org_state + enabled + live-item join,
+        // so the private relation is completely withheld after leave and can reappear only after a
+        // genuine rejoin plus successor ingest. Explicit user unlink remains the sole graph delete.
         // vec0 KNN rows for every chunk of every item in this org (the FK-less mirror table).
         tx.execute(
             "DELETE FROM org_vec_chunks WHERE chunk_id IN
@@ -1274,6 +2748,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.tombstoned = 0
+                    AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND (?1 IS NULL OR oi.item_id > ?1)
                     AND EXISTS (SELECT 1 FROM org_chunks oc WHERE oc.item_id = oi.item_id)
                   ORDER BY oi.item_id ASC
@@ -1339,6 +2814,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.tombstoned = 0
+                    AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND (?1 IS NULL OR oi.item_id > ?1)
                     AND EXISTS (
                         SELECT 1 FROM org_chunks oc
@@ -1409,7 +2885,8 @@ impl Db {
                 "SELECT oi.seq, oi.rev, oi.generation, oi.content_sha256
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
-                  WHERE oi.item_id = ?1 AND oi.tombstoned = 0",
+                  WHERE oi.item_id = ?1 AND oi.tombstoned = 0
+                    AND (oi.doc_id IS NULL OR oi.is_current = 1)",
                 rusqlite::params![item_id],
                 |r| {
                     Ok((
@@ -1482,7 +2959,8 @@ impl Db {
         let current_item = tx
             .query_row(
                 "SELECT seq, rev, generation, content_sha256
-                   FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+                   FROM org_items WHERE item_id = ?1 AND tombstoned = 0
+                    AND (doc_id IS NULL OR is_current = 1)",
                 rusqlite::params![batch.item_id],
                 |r| {
                     Ok((
@@ -1658,12 +3136,13 @@ impl Db {
     pub(crate) fn org_replica_state(&self, item_id: &str) -> Result<Option<OrgReplicaState>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT tombstoned, content_sha256 FROM org_items WHERE item_id = ?1",
+            "SELECT tombstoned, content_sha256, projection_sha256 FROM org_items WHERE item_id = ?1",
             rusqlite::params![item_id],
             |r| {
                 Ok(OrgReplicaState {
                     tombstoned: r.get::<_, i64>(0)? != 0,
                     content_sha256: r.get::<_, Option<Vec<u8>>>(1)?,
+                    projection_sha256: r.get::<_, Option<Vec<u8>>>(2)?,
                 })
             },
         )
@@ -1695,10 +3174,78 @@ impl Db {
         author_user_id: Option<&str>,
         prepared: &PreparedOrgItemIndex,
     ) -> Result<bool> {
+        self.commit_org_reconcile_item_with_metadata(
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+            None,
+            "view",
+            None,
+            false,
+        )
+        .map(|outcome| outcome.changed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_reconcile_item_with_metadata(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<OrgMetadataCommitOutcome> {
+        self.commit_org_reconcile_item_with_metadata_and_attachments(
+            item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
+            content_sha256, source_kind, author_user_id, prepared, doc_id, access,
+            document_owner_user_id, is_current, &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_reconcile_item_with_metadata_and_attachments(
+        &self, item_id: &str, org_id: &str, seq: u64, author_hint: &str, title: &str,
+        markdown: &str, created_at: &str, rev: u32, generation: u32,
+        content_sha256: &[u8], source_kind: Option<&str>, author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex, doc_id: Option<&str>, access: &str,
+        document_owner_user_id: Option<&str>, is_current: bool,
+        attachments: &[crate::storage::IncomingAttachment],
+    ) -> Result<OrgMetadataCommitOutcome> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(org_id, "invalid organization id")?;
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        }
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        if !Self::org_membership_exists_tx(&tx, org_id)? {
-            return Ok(false);
+        if !Self::org_membership_witness_tx(&tx, org_id, generation)? {
+            return Ok(OrgMetadataCommitOutcome::default());
         }
         let already_tombstoned = tx
             .query_row(
@@ -1710,7 +3257,7 @@ impl Db {
             .map_err(map_err)?
             .unwrap_or(false);
         if already_tombstoned {
-            return Ok(false);
+            return Ok(OrgMetadataCommitOutcome::default());
         }
         Self::upsert_org_item_prepared_tx(
             &tx,
@@ -1728,8 +3275,110 @@ impl Db {
             author_user_id,
             prepared,
         )?;
+        Self::replace_org_item_attachment_bundle_tx(&tx, item_id, attachments, content_sha256)?;
+        Self::set_org_item_document_metadata_tx(
+            &tx,
+            item_id,
+            doc_id,
+            access,
+            document_owner_user_id,
+        )?;
+        let visibility_reduced =
+            Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+        Self::close_projection_pending_for_item_tx(
+            &tx,
+            item_id,
+            org_id,
+            doc_id,
+            access,
+            rev,
+            generation,
+            content_sha256,
+            author_user_id,
+            document_owner_user_id,
+        )?;
+        if visibility_reduced {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
         tx.commit().map_err(map_err)?;
-        Ok(true)
+        Ok(OrgMetadataCommitOutcome {
+            changed: true,
+            visibility_reduced,
+        })
+    }
+
+    /// Metadata-only anti-entropy repair for a hash-converged live row. No content/chunks are read or
+    /// rewritten, and an existing tombstone remains permanent.
+    // Metadata repair mirrors the authoritative feed identity tuple atomically and intentionally
+    // spells out every witness field at the call site.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn repair_org_reconcile_metadata(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        generation: u32,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<OrgMetadataCommitOutcome> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(org_id, "invalid organization id")?;
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        }
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if !Self::org_membership_witness_tx(&tx, org_id, generation)? {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+        let current = tx
+            .query_row(
+                "SELECT doc_id, access, document_owner_user_id, is_current FROM org_items
+                  WHERE item_id = ?1 AND org_id = ?2 AND tombstoned = 0",
+                rusqlite::params![item_id, org_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some((stored_doc_id, stored_access, stored_owner, stored_current)) = current else {
+            return Ok(OrgMetadataCommitOutcome::default());
+        };
+        if stored_doc_id.as_deref() == doc_id
+            && stored_access == access
+            && stored_owner.as_deref() == document_owner_user_id
+            && stored_current == is_current
+        {
+            return Ok(OrgMetadataCommitOutcome::default());
+        }
+        Self::set_org_item_document_metadata_tx(
+            &tx,
+            item_id,
+            doc_id,
+            access,
+            document_owner_user_id,
+        )?;
+        let visibility_reduced =
+            Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+        if visibility_reduced {
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(OrgMetadataCommitOutcome {
+            changed: true,
+            visibility_reduced,
+        })
     }
 
     /// GATED-FREE (no folder lock applies to org items) semantic KNN over the int8 org partition:
@@ -1770,6 +3419,7 @@ impl Db {
                JOIN org_items oi ON oi.item_id = oc.item_id
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.tombstoned = 0 AND os.context_enabled = 1
+                AND (oi.doc_id IS NULL OR oi.is_current = 1)
               ORDER BY knn.distance ASC, oi.item_id ASC";
         let blob = crate::embed::vec_to_int8_blob(query_vec);
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
@@ -1830,6 +3480,7 @@ impl Db {
                JOIN org_items oi ON oi.item_id = oc.item_id
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND (oi.doc_id IS NULL OR oi.is_current = 1)
               ORDER BY rank ASC, oi.item_id ASC
               LIMIT ?2";
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
@@ -1858,8 +3509,7 @@ impl Db {
         // query. Only an empty strict result may activate the fallback.
         let mut rows_vec = run(&mut stmt, &and_expr)?;
         if rows_vec.is_empty() {
-            let terms =
-                fts_unicode61_content_terms(&conn, q, MAX_ORG_FTS_CONTENT_TERMS)?;
+            let terms = fts_unicode61_content_terms(&conn, q, MAX_ORG_FTS_CONTENT_TERMS)?;
             let Some(any_expr) = fts_match_content_terms_any(&terms) else {
                 return Ok(Vec::new());
             };
@@ -1901,6 +3551,7 @@ impl Db {
                       WHERE fts_org_chunks MATCH ?
                         AND oi.tombstoned = 0
                         AND os.context_enabled = 1
+                        AND (oi.doc_id IS NULL OR oi.is_current = 1)
                       ORDER BY rank ASC, oi.item_id ASC
                       LIMIT ?"
                 );
@@ -1964,22 +3615,29 @@ impl Db {
     ) -> Result<Option<crate::storage::models::OrgItemDetail>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT oi.item_id, oi.author_hint, oi.title, oi.created_at, oi.rev, oi.markdown
+            "SELECT oi.item_id, oi.doc_id, oi.author_hint, oi.title, oi.created_at, oi.rev,
+                    oi.markdown, oi.access
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
-              WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
+              WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND (oi.doc_id IS NULL OR oi.is_current = 1)",
             rusqlite::params![item_id],
             |r| {
                 Ok(crate::storage::models::OrgItemDetail {
                     item_id: r.get(0)?,
-                    author_hint: r.get(1)?,
-                    title: r.get(2)?,
-                    created_at: r.get(3)?,
-                    rev: r.get::<_, i64>(4)? as u32,
-                    markdown: r.get(5)?,
+                    doc_id: r.get(1)?,
+                    link_id: None,
+                    author_hint: r.get(2)?,
+                    title: r.get(3)?,
+                    created_at: r.get(4)?,
+                    rev: r.get::<_, i64>(5)? as u32,
+                    markdown: r.get(6)?,
+                    access: r.get(7)?,
                     // The DB layer has no session context — the `org_get_item` command computes the real
                     // value by comparing the stored `author_user_id` with the caller's `server_user_id`.
                     editable: false,
+                    can_edit: false,
+                    can_manage: false,
                 })
             },
         )
@@ -1998,6 +3656,217 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    pub fn set_org_item_document_metadata(
+        &self,
+        item_id: &str,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        }
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if doc_id.is_some() {
+            let org_id = tx
+                .query_row(
+                    "SELECT org_id FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+                    rusqlite::params![item_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_err)?;
+            if let Some(org_id) = org_id.as_deref() {
+                require_stable_uuid(org_id, "invalid organization id")?;
+            }
+        }
+        Self::set_org_item_document_metadata_tx(
+            &tx,
+            item_id,
+            doc_id,
+            access,
+            document_owner_user_id,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    fn set_org_item_document_metadata_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item_id: &str,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+    ) -> Result<()> {
+        if let Some(doc_id) = doc_id {
+            require_stable_uuid(doc_id, "invalid org document id")?;
+        }
+        tx.execute(
+            "UPDATE org_items SET doc_id = COALESCE(?2, doc_id), access = ?3,
+                    document_owner_user_id = COALESCE(?4, document_owner_user_id)
+              WHERE item_id = ?1 AND tombstoned = 0",
+            rusqlite::params![item_id, doc_id, access, document_owner_user_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    fn set_org_item_current_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item_id: &str,
+        org_id: &str,
+        doc_id: Option<&str>,
+        is_current: bool,
+    ) -> Result<bool> {
+        let target_was_current = tx
+            .query_row(
+                "SELECT is_current FROM org_items
+                  WHERE item_id = ?1 AND org_id = ?2 AND tombstoned = 0",
+                rusqlite::params![item_id, org_id],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(target_was_current) = target_was_current else {
+            return Ok(false);
+        };
+        let visibility_reduced = if is_current {
+            let doc_id = doc_id.ok_or_else(|| {
+                crate::error::AppError::InvalidArg("current org item missing doc id".into())
+            })?;
+            let distinct_current_demoted = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM org_items
+                       WHERE org_id = ?1 AND doc_id = ?2 AND item_id != ?3
+                         AND tombstoned = 0 AND is_current = 1)",
+                    rusqlite::params![org_id, doc_id, item_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?;
+            tx.execute(
+                "UPDATE org_items SET is_current = 0
+                  WHERE org_id = ?1 AND doc_id = ?2 AND item_id != ?3",
+                rusqlite::params![org_id, doc_id, item_id],
+            )
+            .map_err(map_err)?;
+            distinct_current_demoted
+        } else {
+            target_was_current
+        };
+        tx.execute(
+            "UPDATE org_items SET is_current = ?2 WHERE item_id = ?1 AND tombstoned = 0",
+            rusqlite::params![item_id, is_current as i64],
+        )
+        .map_err(map_err)?;
+        Ok(visibility_reduced)
+    }
+
+    /// Current locally-ingested head metadata for a stable document. This is a content-free
+    /// management resolver: it does not mutate the origin share row's CAS baseline.
+    pub fn current_org_document_status(
+        &self,
+        org_id: &str,
+        doc_id: &str,
+    ) -> Result<Option<(String, u32, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT oi.item_id, oi.rev, oi.access
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.org_id = ?1 AND oi.doc_id = ?2 AND oi.tombstoned = 0
+                AND oi.is_current = 1 AND os.context_enabled = 1
+              LIMIT 1",
+            rusqlite::params![org_id, doc_id],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    pub fn set_org_share_access_for_document(
+        &self,
+        org_id: &str,
+        doc_id: &str,
+        access: &str,
+    ) -> Result<()> {
+        require_stable_uuid(org_id, "invalid organization id")?;
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET access = ?3 WHERE org_id = ?1 AND doc_id = ?2",
+            rusqlite::params![org_id, doc_id, access],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Apply the relay-confirmed permission state to the complete local stable-document resource.
+    /// Every LIVE replica revision and the origin share's display metadata move together in ONE
+    /// SQLCipher transaction. The origin share's `item_id`, `rev`, and content hash are deliberately
+    /// untouched: they remain the last-published CAS witness, so a collaborator edit still produces
+    /// a real 409 on the next automatic source republish.
+    pub fn set_org_document_access_metadata(
+        &self,
+        org_id: &str,
+        doc_id: &str,
+        access: &str,
+        document_owner_user_id: &str,
+    ) -> Result<bool> {
+        require_stable_uuid(org_id, "invalid organization id")?;
+        require_stable_uuid(doc_id, "invalid org document id")?;
+        if !matches!(access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid org item access".into(),
+            ));
+        }
+        if document_owner_user_id.trim().is_empty() {
+            return Err(crate::error::AppError::InvalidArg(
+                "missing org document owner".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let blocked: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_shares
+                  WHERE org_id = ?1 AND doc_id = ?2 AND state = 'failed'
+                    AND last_error IN ('direct_put_pending','republish_put_pending',
+                       'republish_post_pending','initial_post_pending','initial_post_replayable',
+                       'projection_pending','recovery_witness_missing','org_edit_conflict'))",
+                rusqlite::params![org_id, doc_id],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if blocked {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE org_items
+                SET access = ?3, document_owner_user_id = ?4
+              WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0",
+            rusqlite::params![org_id, doc_id, access, document_owner_user_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE org_shares SET access = ?3 WHERE org_id = ?1 AND doc_id = ?2",
+            rusqlite::params![org_id, doc_id, access],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
     }
 
     /// The item ids of this org's LIVE (non-tombstoned) local replica rows that are still missing
@@ -2062,16 +3931,56 @@ impl Db {
     ) -> Result<Option<crate::storage::models::OrgItemEditCtx>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT org_id, rev, created_at, source_kind, author_user_id
-               FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+            "SELECT org_id, doc_id, rev, created_at, author_hint, source_kind, author_user_id,
+                    document_owner_user_id, access
+               FROM org_items WHERE item_id = ?1 AND tombstoned = 0
+                AND (doc_id IS NULL OR is_current = 1)",
             rusqlite::params![item_id],
             |r| {
                 Ok(crate::storage::models::OrgItemEditCtx {
                     org_id: r.get(0)?,
-                    rev: r.get::<_, i64>(1)? as u32,
-                    created_at: r.get(2)?,
-                    source_kind: r.get::<_, Option<String>>(3)?,
-                    author_user_id: r.get::<_, Option<String>>(4)?,
+                    doc_id: r.get(1)?,
+                    rev: r.get::<_, i64>(2)? as u32,
+                    created_at: r.get(3)?,
+                    author_hint: r.get(4)?,
+                    source_kind: r.get::<_, Option<String>>(5)?,
+                    author_user_id: r.get::<_, Option<String>>(6)?,
+                    document_owner_user_id: r.get::<_, Option<String>>(7)?,
+                    access: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Resolve the current live revision of a stable document for permission management. The
+    /// origin `org_shares` row is deliberately left untouched so its expected revision remains an
+    /// honest CAS witness and a remote edit produces 409 on automatic republish.
+    pub fn org_item_edit_ctx_by_document(
+        &self,
+        org_id: &str,
+        doc_id: &str,
+    ) -> Result<Option<crate::storage::models::OrgItemEditCtx>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT org_id, doc_id, rev, created_at, author_hint, source_kind, author_user_id,
+                    document_owner_user_id, access
+               FROM org_items
+              WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0 AND is_current = 1
+              LIMIT 1",
+            rusqlite::params![org_id, doc_id],
+            |r| {
+                Ok(crate::storage::models::OrgItemEditCtx {
+                    org_id: r.get(0)?,
+                    doc_id: r.get(1)?,
+                    rev: r.get::<_, i64>(2)? as u32,
+                    created_at: r.get(3)?,
+                    author_hint: r.get(4)?,
+                    source_kind: r.get(5)?,
+                    author_user_id: r.get(6)?,
+                    document_owner_user_id: r.get(7)?,
+                    access: r.get(8)?,
                 })
             },
         )
@@ -2083,7 +3992,9 @@ impl Db {
     /// body; that's [`Db::get_org_item`]). Newest-first by feed `seq`. This is what lets a member SEE
     /// what colleagues shared into the org instead of only search-hitting it. Org items are
     /// deliberately org-disclosed content (no folder lock gate applies); the COMMAND layer re-checks
-    /// the caller is a local member of `org_id` before calling this.
+    /// the caller is a local member of `org_id` before calling this. The result is bounded to the
+    /// newest 500 headers so a malformed or unexpectedly large local replica cannot allocate an
+    /// unbounded IPC payload.
     ///
     /// `kind` is now populated DIRECTLY from the stored `source_kind` column (opened off the item's
     /// `OrgEnvelope` at ingest — see `upsert_org_item`) for EVERY item, not just ones this device
@@ -2098,23 +4009,26 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT item_id, title, author_hint, created_at, seq, source_kind
+                "SELECT item_id, doc_id, title, author_hint, created_at, seq, source_kind
                    FROM org_items
                   WHERE org_id = ?1 AND tombstoned = 0
-                  ORDER BY seq DESC",
+                    AND (doc_id IS NULL OR is_current = 1)
+                  ORDER BY seq DESC
+                  LIMIT 500",
             )
             .map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![org_id], |r| {
                 Ok(crate::storage::models::OrgItemHeader {
                     item_id: r.get(0)?,
-                    title: r.get(1)?,
-                    author_hint: r.get(2)?,
-                    created_at: r.get(3)?,
-                    seq: r.get::<_, i64>(4)? as u64,
+                    doc_id: r.get(1)?,
+                    title: r.get(2)?,
+                    author_hint: r.get(3)?,
+                    created_at: r.get(4)?,
+                    seq: r.get::<_, i64>(5)? as u64,
                     // Direct from storage now (see doc comment above); `list_org_items_inner` may still
                     // enrich/override for the caller's own items via the local `org_shares` resolver.
-                    kind: r.get::<_, Option<String>>(5)?,
+                    kind: r.get::<_, Option<String>>(6)?,
                     owned_source: None,
                 })
             })
@@ -2142,7 +4056,8 @@ impl Db {
             "SELECT COUNT(*)
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
-              WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
+              WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND (oi.doc_id IS NULL OR oi.is_current = 1)",
             rusqlite::params![org_id],
             |r| r.get::<_, i64>(0),
         )
@@ -2181,6 +4096,7 @@ impl Db {
                    JOIN org_items oi ON oi.item_id = oc.item_id
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.org_id = ?1 AND oi.tombstoned = 0
+                    AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND NOT EXISTS (SELECT 1 FROM org_vec_chunks v WHERE v.chunk_id = oc.id)
                   LIMIT ?2",
             )
