@@ -767,9 +767,7 @@ pub struct OrgChunkHit {
 #[serde(rename_all = "camelCase")]
 pub struct OrgItemDetail {
     pub item_id: String,
-    #[serde(skip_serializing, skip_deserializing)]
     pub doc_id: Option<String>,
-    #[serde(skip_serializing, skip_deserializing)]
     pub link_id: Option<String>,
     pub author_hint: String,
     pub title: String,
@@ -779,11 +777,8 @@ pub struct OrgItemDetail {
     /// Compatibility mirror of `can_edit` for older frontends. Permission-aware clients use
     /// `can_edit`/`can_manage`, computed from stable ownership, org role, and document access.
     pub editable: bool,
-    #[serde(skip_serializing, skip_deserializing)]
     pub access: String,
-    #[serde(skip_serializing, skip_deserializing)]
     pub can_edit: bool,
-    #[serde(skip_serializing, skip_deserializing)]
     pub can_manage: bool,
 }
 
@@ -811,7 +806,6 @@ pub struct OrgItemEditCtx {
 #[serde(rename_all = "camelCase")]
 pub struct OrgItemHeader {
     pub item_id: String,
-    #[serde(skip_serializing, skip_deserializing)]
     pub doc_id: Option<String>,
     pub title: String,
     pub author_hint: String,
@@ -1682,7 +1676,7 @@ pub struct LinkEdge {
     pub other_id: String,
     /// Current navigation id when the stable endpoint id differs from the routed id. Present for an
     /// `org` edge (`other_id = org_id:doc_id`, `navigation_id = current item_id`) and omitted locally.
-    #[serde(default, skip_serializing, skip_deserializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub navigation_id: Option<String>,
     /// The neighbour's current display title, resolved through the visibility gate.
     pub other_title: String,
@@ -1700,7 +1694,7 @@ pub struct LinkEdge {
     /// Every exact directed `manual` row folded into this displayed chip. Empty for derived-only
     /// chips. The unlink command removes this whole set in one transaction; `manual` remains as the
     /// backward-compatible display flag.
-    #[serde(default, skip_serializing, skip_deserializing)]
+    #[serde(default)]
     pub manual_edges: Vec<ManualLinkEdge>,
 }
 
@@ -1723,7 +1717,7 @@ pub struct WikiTarget {
     pub id: String,
     /// Revision-stable endpoint id used by the private link graph. For org targets this is the
     /// strict `org_id:doc_id` composite; `id` remains the current `item_id` for navigation.
-    #[serde(default, skip_serializing, skip_deserializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_id: Option<String>,
 }
 

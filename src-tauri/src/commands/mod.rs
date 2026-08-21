@@ -447,6 +447,7 @@ fn active_related_witness(
 /// The canonical companion note is this operation's structural OUTPUT, not user-selected secondary
 /// context. Exclude it by `documents.meeting_id` rather than by edge type: link collapse can expose
 /// the same endpoint through its generated `wikilink` representative instead of `companion`.
+/// Shared Brain Org relations stay private graph metadata and never become conversion input.
 fn active_conversion_related_edges(
     state: &AppState,
     meeting_id: &str,
@@ -459,6 +460,7 @@ fn active_conversion_related_edges(
         .into_iter()
         .filter(|edge| {
             edge.status == "active"
+                && edge.other_kind != crate::links::LinkKind::Org.as_str()
                 && !(edge.other_kind == "note"
                     && companion_note_id.as_deref() == Some(edge.other_id.as_str()))
         })
@@ -3418,10 +3420,44 @@ async fn delete_companion_note_if_empty_inner_notifying(
     if !companion_body_is_empty(&row.text) {
         return Ok(false);
     }
-    // The revoke can await the network. Re-read under lifecycle afterwards so a concurrent edit
-    // cannot turn this stale empty snapshot into destructive authority.
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    // The first snapshot was taken before waiting for the async mutation authority. Re-establish
+    // emptiness under lifecycle immediately before installing the durable close barrier: an editor
+    // that won the wait must keep both its content and its shares.
+    {
+        let _lifecycle = lifecycle_guard(state);
+        if !meeting_is_unlocked(state, meeting_id)?
+            || state.db.companion_note_for_meeting(meeting_id)?.as_deref() != Some(&note_id)
+        {
+            return Ok(false);
+        }
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&note_id)? else {
+            return Ok(false);
+        };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Ok(false);
+        }
+        let Some(current) = state.db.get_note_row(&note_id)? else {
+            return Ok(false);
+        };
+        if !companion_body_is_empty(&current.text) {
+            return Ok(false);
+        }
+        // Source-content migration guards reject subsequent edits while the network revoke is in
+        // flight. Do this in the same lifecycle critical section as the authoritative recheck.
+        state.db.begin_org_source_closure("document", &note_id)?;
+    }
     revoke_org_shares_for_source_notifying(state, None, Some(&note_id), app).await?;
-    delete_companion_after_revoke_if_still_empty(state, meeting_id, &note_id)
+    let deleted = delete_companion_after_revoke_if_still_empty(state, meeting_id, &note_id)?;
+    if !deleted {
+        // Once remote revoke began, a surprising source drift is not authority to reopen admission:
+        // doing so would retain new local content after destroying its remote share. Keep the durable
+        // barrier and surface a retryable failure for explicit recovery.
+        return Err(AppError::Unavailable(
+            "companion changed after share revocation began; cleanup remains safely closed".into(),
+        ));
+    }
+    Ok(deleted)
 }
 
 fn delete_companion_after_revoke_if_still_empty(
@@ -3919,11 +3955,12 @@ pub async fn plan_organize_notes(
 /// — both-sides folder gate + re-export). Non-destructive + best-effort per move (a single failure
 /// logs IDs/stage and continues; the rest still apply). Idempotent on an already-filed note.
 #[tauri::command]
-pub fn apply_organize_plan(
+pub async fn apply_organize_plan(
     app: AppHandle,
     state: State<'_, AppState>,
     plan: OrganizePlan,
 ) -> Result<(), AppError> {
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
     let may_reduce_visibility = plan.moves.iter().any(|mv| {
         mv.to_folder_id
             .as_deref()
@@ -4034,6 +4071,8 @@ async fn delete_meeting_inner_notifying(
             ));
         }
     }
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    state.db.begin_org_source_closure("meeting", meeting_id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact meeting
     // BEFORE the local rows disappear, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
@@ -7819,13 +7858,14 @@ fn ensure_meeting_folder_target(
 /// - **locked + NOT session-unlocked:** REJECTED with [`AppError::Locked`] — there is no CK to seal
 ///   with, so we refuse rather than leave plaintext in a locked folder. The FE must unlock first.
 #[tauri::command]
-pub fn move_note(
+pub async fn move_note(
     app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
-    move_note_command_body(&app, state, meeting_id, folder_id)
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    move_note_command_body(&app, state.inner(), meeting_id, folder_id)
 }
 
 /// Body of [`move_note`], split so the audit-inbox ping fires once after EVERY successful move
@@ -7834,7 +7874,7 @@ pub fn move_note(
 /// correct either way).
 fn move_note_command_body(
     app: &AppHandle,
-    state: State<'_, AppState>,
+    state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
@@ -7848,8 +7888,8 @@ fn move_note_command_body(
     if target_locked {
         emit_ask_history_invalidated_fail_closed(app);
     }
-    move_note_inner_impl(state.inner(), meeting_id, folder_id)?;
-    emit_audit_updated_after_purge(app, state.inner());
+    move_note_inner_impl(state, meeting_id, folder_id)?;
+    emit_audit_updated_after_purge(app, state);
     Ok(())
 }
 
@@ -7887,12 +7927,28 @@ fn move_note_inner_impl(
         }
         None => false,
     };
+    if let Some(folder_id) = folder_id.as_deref() {
+        if state.db.org_folder_closure_exists(folder_id)? {
+            return Err(AppError::Unavailable(
+                "the destination folder is closing or locked for sharing; retry after reopening it"
+                    .into(),
+            ));
+        }
+    }
 
     // ── Target is a LOCKED folder: seal-or-reject (BLK-2) ───────────────────────────────────────
     if target_locked {
         let fid = folder_id.as_deref().ok_or_else(|| {
             AppError::Storage("locked meeting-folder target lost its folder id".into())
         })?;
+        if state
+            .db
+            .source_has_active_remote_share(Some(&meeting_id), None)?
+        {
+            return Err(AppError::Unavailable(
+                "revoke this meeting's shares before moving it into a locked folder".into(),
+            ));
+        }
         return move_into_locked_folder_under_lifecycle(state, &meeting_id, fid);
     }
 
@@ -8134,6 +8190,19 @@ pub fn seal_auto_filed_note(
     meeting_id: &str,
     folder_id: &str,
 ) -> Result<(), AppError> {
+    let _share_mutation = state.org_share_mutation_lock.try_lock().map_err(|_| {
+        AppError::Unavailable(
+            "sharing or folder privacy is changing; retry automatic filing".into(),
+        )
+    })?;
+    if state
+        .db
+        .source_has_active_remote_share(Some(meeting_id), None)?
+    {
+        return Err(AppError::Unavailable(
+            "revoke this meeting's shares before filing it into a locked folder".into(),
+        ));
+    }
     move_into_locked_folder(state, meeting_id, folder_id)
 }
 
@@ -10565,18 +10634,46 @@ fn reseal_document_if_locked(
     text: &str,
     updated_at: i64,
 ) -> Result<(), AppError> {
+    reseal_document_if_locked_with_mode(state, folder_id, doc_id, title, text, updated_at, true)
+}
+
+fn reseal_document_if_locked_with_mode(
+    state: &AppState,
+    folder_id: &str,
+    doc_id: &str,
+    title: &str,
+    text: &str,
+    updated_at: i64,
+    mark_org_dirty: bool,
+) -> Result<(), AppError> {
     let locked = state
         .db
         .folder_by_id(folder_id)?
         .map(|f| f.locked)
         .unwrap_or(false);
     if !locked {
-        return state.db.update_note_row(doc_id, title, text, updated_at);
+        return if mark_org_dirty {
+            state.db.update_note_row(doc_id, title, text, updated_at)
+        } else {
+            state
+                .db
+                .update_note_row_debounced(doc_id, title, text, updated_at)
+        };
     }
     let blob = sealed_document_blob(state, folder_id, doc_id, text)?;
-    state
-        .db
-        .update_note_row_sealed(doc_id, title, text, &blob, updated_at)?;
+    if mark_org_dirty {
+        state
+            .db
+            .update_note_row_sealed(doc_id, title, text, &blob, updated_at)?;
+    } else {
+        state.db.update_note_row_sealed_debounced(
+            doc_id,
+            title,
+            text,
+            &blob,
+            updated_at,
+        )?;
+    }
     tracing::debug!(target: "lock", note_id = %doc_id, "seal-on-write: authored note re-sealed under the folder CK");
     Ok(())
 }

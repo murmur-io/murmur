@@ -38,11 +38,21 @@ use super::*;
 /// DB write but before the `.md` delete leaves a stale plaintext `.md` (reconcilable) — never
 /// lost content.
 #[tauri::command]
-pub fn lock_folder(
+pub async fn lock_folder(
     app: AppHandle,
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    let closure_created = state.db.begin_org_folder_closure(&folder_id)?;
+    if state.db.folder_has_active_remote_share(&folder_id)? {
+        if closure_created {
+            state.db.clear_org_folder_closure(&folder_id)?;
+        }
+        return Err(AppError::Unavailable(
+            "revoke this folder's shares before locking it".into(),
+        ));
+    }
     // Initial sealing revokes content just as a session relock does. Shut down every registered
     // MCP content socket BEFORE waiting on the lifecycle mutex, otherwise a slow reader can keep
     // receiving a pre-lock payload after the command has made the folder private.
@@ -56,10 +66,48 @@ pub fn lock_folder(
         mcp_revocation,
         || emit_reminder_visibility_invalidated_fail_closed(&app),
     );
-    result?;
+    if let Err(error) = result {
+        if closure_created {
+            state.db.clear_org_folder_closure(&folder_id)?;
+        }
+        return Err(error);
+    }
+    state.db.complete_org_closure("folder", &folder_id)?;
     // The seal purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
+}
+
+/// Explicitly seal local plaintext while intentionally leaving remote recipients' ciphertext
+/// readable. This is a separate command so the ordinary lock path can never accidentally inherit
+/// the override. It still serializes against share mutations and uses the normal verified seal.
+#[tauri::command]
+pub async fn lock_folder_allow_remote_access(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    if state.db.org_folder_closure_exists(&folder_id)? {
+        return Err(AppError::Unavailable(
+            "this folder is already closing for verified share revocation".into(),
+        ));
+    }
+    let mcp_revocation = crate::mcp::begin_visibility_revocation(
+        &app,
+        crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+    );
+    let result = lock_folder_with_visibility_revocation_and_notice_policy(
+        state.inner(),
+        &folder_id,
+        mcp_revocation,
+        true,
+        || emit_reminder_visibility_invalidated_fail_closed(&app),
+    );
+    if result.is_ok() {
+        emit_audit_updated_after_purge(&app, state.inner());
+    }
+    result
 }
 
 /// A lock authority transition must synchronously revoke every FE reminder-title cache. If the
@@ -112,8 +160,28 @@ fn lock_folder_with_visibility_revocation_and_notice(
     mcp_revocation: crate::mcp::VisibilityRevocation,
     visibility_revoked: impl FnOnce(),
 ) -> Result<(), AppError> {
-    let result =
-        lock_folder_inner_with_visibility_notice(state, folder_id.to_string(), visibility_revoked);
+    lock_folder_with_visibility_revocation_and_notice_policy(
+        state,
+        folder_id,
+        mcp_revocation,
+        false,
+        visibility_revoked,
+    )
+}
+
+fn lock_folder_with_visibility_revocation_and_notice_policy(
+    state: &AppState,
+    folder_id: &str,
+    mcp_revocation: crate::mcp::VisibilityRevocation,
+    allow_live_remote_shares: bool,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
+    let result = lock_folder_inner_with_visibility_notice_policy(
+        state,
+        folder_id.to_string(),
+        allow_live_remote_shares,
+        visibility_revoked,
+    );
     let logically_revoked = state
         .db
         .folder_by_id(folder_id)
@@ -138,9 +206,27 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     lock_folder_inner_with_visibility_notice(state, folder_id, || {})
 }
 
+#[cfg(test)]
+pub(crate) fn lock_folder_inner_allow_remote_access(
+    state: &AppState,
+    folder_id: String,
+) -> Result<(), AppError> {
+    lock_folder_inner_with_visibility_notice_policy(state, folder_id, true, || {})
+}
+
+#[cfg(test)]
 pub(crate) fn lock_folder_inner_with_visibility_notice(
     state: &AppState,
     folder_id: String,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
+    lock_folder_inner_with_visibility_notice_policy(state, folder_id, false, visibility_revoked)
+}
+
+fn lock_folder_inner_with_visibility_notice_policy(
+    state: &AppState,
+    folder_id: String,
+    allow_live_remote_shares: bool,
     visibility_revoked: impl FnOnce(),
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
@@ -148,6 +234,11 @@ pub(crate) fn lock_folder_inner_with_visibility_notice(
         .db
         .folder_by_id(&folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if !allow_live_remote_shares && state.db.folder_has_active_remote_share(&folder_id)? {
+        return Err(AppError::Unavailable(
+            "remote shares appeared while preparing to lock this folder".into(),
+        ));
+    }
     // The reserved Notes root is the always-open home for unfiled notes — it can NEVER be sealed
     // (unfiled notes are deliberately plaintext; sealing requires filing into a lockable folder). Refuse
     // rather than silently no-op so the FE can guide the user (2026-07-14).
@@ -467,6 +558,7 @@ pub async fn unlock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
     // v0.3.2 — the master KEK is a BIOMETRIC-GATED keychain item. Reading it makes macOS present the
     // Touch ID / passcode sheet directly (with our reason string) and hand back the key — THAT single
     // sheet IS the unlock auth, so there is no separate app-side authentication step (which would
@@ -707,6 +799,7 @@ pub async fn unlock_folder(
         })
     })
     .await?;
+    state.db.clear_org_folder_closure(&folder_id)?;
     Ok(restored)
 }
 
@@ -953,7 +1046,8 @@ fn relock_all_inner_with_visibility_notice(
 /// markdown, clear `content_blob`, set `locked=0` + `wrapped_key=NULL`, and re-export each note's
 /// `.md` to the vault. The folder returns to the default OPEN state.
 #[tauri::command]
-pub fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+pub async fn remove_lock(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
     remove_lock_inner(state.inner(), folder_id)
 }
 
@@ -1188,6 +1282,7 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
         s
     };
     rederive_links_for_folder(state, &folder_id, &live_set);
+    state.db.clear_org_folder_closure(&folder_id)?;
     Ok(())
 }
 
@@ -1211,6 +1306,7 @@ pub async fn discard_unrecoverable_folder_lock(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
     let node = discard_unrecoverable_folder_lock_with_enumeration(
         state.inner(),
         folder_id,
@@ -1352,6 +1448,7 @@ async fn discard_unrecoverable_folder_lock_with_enumeration(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
             .clone()
     };
+    state.db.clear_org_folder_closure(&folder_id)?;
     let counts = state.db.count_notes_per_folder(&unlocked)?;
     let kind = state
         .db
@@ -1405,6 +1502,7 @@ pub async fn discard_unrecoverable_meeting_lock(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<FolderNode>, AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
     let Some(folder_id) = state.db.folder_for_meeting(&meeting_id)? else {
         return Ok(None);
     };

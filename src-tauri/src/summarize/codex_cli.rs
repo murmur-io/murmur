@@ -1896,7 +1896,27 @@ mod tests {
     }
 
     fn installed_codex_for_runtime_proof(skip_marker: &str) -> Option<String> {
-        match resolve_codex_binary(DEFAULT_BINARY) {
+        // Harness deliberately replaces HOME so checks cannot read ambient user config. Its
+        // runner-bound RUSTUP_HOME still identifies the real account home, and the sandbox grants
+        // read/execute only to the trusted tool directories beneath it. Resolve the binary from
+        // that home so the runtime proof exercises the same default candidate as the desktop app,
+        // while CODEX_HOME and every auth/config write remain isolated by the individual test.
+        let resolved = if std::env::var("MURMUR_HARNESS").as_deref() == Ok("1") {
+            std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.file_name() == Some(OsStr::new(".rustup")))
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .ok_or_else(|| {
+                    AppError::Unavailable(
+                        "Harness did not bind the real user home for the Codex runtime proof"
+                            .into(),
+                    )
+                })
+                .and_then(|home| resolve_codex_binary_from(DEFAULT_BINARY, Some(&home), None))
+        } else {
+            resolve_codex_binary(DEFAULT_BINARY)
+        };
+        match resolved {
             Ok(binary) => Some(binary),
             Err(error) if std::env::var("MURMUR_HARNESS").as_deref() == Ok("1") => {
                 panic!(

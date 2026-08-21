@@ -521,8 +521,9 @@ pub(crate) fn resolve_vault_context_pinned_visible_inputs(
             }
             LinkKind::Note => db.note_is_visible(&source.id, unlocked)?,
             LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
-            // Org context activation belongs to the following command/IPC stack. Storage-only org
-            // endpoints remain invisible to the base provider context so no egress widens early.
+            // A Shared Brain edge is a private graph relation, not provider material. Exclude it
+            // before the typed snapshot so it cannot enter the corpus, lifecycle manifest, or
+            // neighbour expansion.
             LinkKind::Org => false,
         };
         if typed_visible && explicit_keys.insert(key) {
@@ -541,6 +542,11 @@ pub(crate) fn resolve_vault_context_pinned_visible_inputs(
             let Some(other_kind) = LinkKind::parse(&edge.other_kind) else {
                 continue;
             };
+            if other_kind == LinkKind::Org {
+                // Private Shared Brain relations are visible in the graph UI only. They never
+                // broaden a local or cloud provider's source snapshot.
+                continue;
+            }
             let key = (edge.other_kind, edge.other_id);
             if explicit_keys.contains(&key) || !seen_neighbours.insert(key.clone()) {
                 continue;
@@ -654,6 +660,8 @@ fn resolve_pinned_source(
             )
         }
         LinkKind::Org => {
+            // All public callers exclude Org before reaching this resolver. Keep the fallback
+            // content-free and fail-closed if a future internal caller bypasses that selection.
             return Ok(ResolvedPinnedSource {
                 source: source.clone(),
                 header: String::new(),
@@ -728,6 +736,11 @@ pub(crate) fn build_vault_context_exact_visible_with_budget(
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut sections = Vec::new();
     for source in sources {
+        if source.kind == LinkKind::Org {
+            // Conversion accepts only local typed sources. Shared Brain relations stay private
+            // graph metadata and are never resolved into provider context.
+            continue;
+        }
         let key = (source.kind.as_str().to_string(), source.id.clone());
         if !seen.insert(key) {
             continue;

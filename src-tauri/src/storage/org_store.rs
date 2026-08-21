@@ -25,6 +25,7 @@ use rusqlite::OptionalExtension;
 
 use crate::embed::Embedder;
 use crate::error::Result;
+use crate::share::org_dto::parse_stable_uuid;
 use crate::storage::db::{
     fts_match_content_terms_any, fts_match_query, fts_unicode61_content_terms,
     insert_share_egress_dispatch_tx, map_err, Db,
@@ -37,8 +38,7 @@ use crate::storage::models::OrgChunkHit;
 const MAX_ORG_FTS_CONTENT_TERMS: usize = 32;
 
 fn require_stable_uuid(value: &str, error: &'static str) -> Result<()> {
-    uuid::Uuid::parse_str(value)
-        .ok()
+    parse_stable_uuid(value)
         .map(|_| ())
         .ok_or_else(|| crate::error::AppError::InvalidArg(error.into()))
 }
@@ -75,7 +75,6 @@ pub(crate) struct OrgAccessAttemptRow {
 /// Optional plaintext projection carried by an already-authenticated republish completion. All
 /// expensive validation/index preparation happens before the transaction; the storage seam only
 /// installs these exact bytes after the durable dispatch witness still matches.
-#[allow(dead_code)]
 pub(crate) struct OrgRepublishProjection<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) seq: u64,
@@ -103,7 +102,6 @@ pub(crate) struct OrgReplicaState {
     /// before the feed carried one. Equality with the feed's hash is what lets the sweep skip an
     /// already-converged item with no blob fetch.
     pub(crate) content_sha256: Option<Vec<u8>>,
-    #[allow(dead_code)]
     pub(crate) projection_sha256: Option<Vec<u8>>,
 }
 
@@ -122,7 +120,6 @@ pub(crate) struct OrgItemVectorBatch {
     content_sha256: Option<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 impl Db {
     pub(crate) fn begin_org_source_closure(
         &self,
@@ -695,9 +692,6 @@ impl Db {
         Ok(out)
     }
 
-    /// Apply a successful PATCH only while every immutable dispatch/document/account/access witness
-    /// still matches and no newer non-failed attempt or blocked content mutation exists. The attempt
-    /// transition and all local replica/journal metadata updates commit or roll back together.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_org_access_attempt_if_current(
         &self,
@@ -792,6 +786,77 @@ impl Db {
         )
         .map(|changed| changed == 1)
         .map_err(map_err)
+    }
+
+    /// Apply an authenticated authoritative head to one still-current access attempt. Transport
+    /// ambiguity may leave the relay at either access value, so recovery projects the authenticated
+    /// value only while the complete durable attempt witness and content barrier still hold.
+    pub(crate) fn apply_authoritative_org_access_if_current(
+        &self,
+        attempt: &OrgAccessAttemptRow,
+        authoritative_access: &str,
+    ) -> Result<bool> {
+        if !matches!(authoritative_access, "view" | "edit") {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid authoritative org document access".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let pending: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM org_access_attempts
+                  WHERE dispatch_id=?1 AND org_id=?2 AND doc_id=?3 AND old_access=?4
+                    AND new_access=?5 AND actor_user_id=?6 AND owner_user_id=?7
+                    AND state='pending'
+                    AND NOT EXISTS(SELECT 1 FROM org_access_attempts newer
+                      WHERE newer.org_id=?2 AND newer.doc_id=?3
+                        AND newer.seq > org_access_attempts.seq AND newer.state != 'failed')
+                    AND NOT EXISTS(SELECT 1 FROM org_shares
+                      WHERE org_id=?2 AND doc_id=?3 AND state='failed'
+                        AND last_error IN (
+                          'direct_put_pending','republish_put_pending','republish_post_pending',
+                          'initial_post_pending','initial_post_replayable','projection_pending',
+                          'recovery_witness_missing','org_edit_conflict'
+                        )))",
+                rusqlite::params![
+                    attempt.dispatch_id,
+                    attempt.org_id,
+                    attempt.doc_id,
+                    attempt.old_access,
+                    attempt.new_access,
+                    attempt.actor_user_id,
+                    attempt.owner_user_id
+                ],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if !pending {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE org_items SET access=?3,document_owner_user_id=?4
+              WHERE org_id=?1 AND doc_id=?2 AND tombstoned=0",
+            rusqlite::params![
+                attempt.org_id,
+                attempt.doc_id,
+                authoritative_access,
+                attempt.owner_user_id
+            ],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE org_shares SET access=?3 WHERE org_id=?1 AND doc_id=?2",
+            rusqlite::params![attempt.org_id, attempt.doc_id, authoritative_access],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_access_attempts WHERE org_id=?1 AND doc_id=?2",
+            rusqlite::params![attempt.org_id, attempt.doc_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
     }
 
     /// The org share bearing a given server `item_id` (for revoke-by-item + self-share dedup).
@@ -1096,7 +1161,7 @@ impl Db {
     // One cohesive retry-row mutation; keeping every persisted attempt field visible prevents a
     // caller from accidentally retaining stale scrub/hash/generation state.
     #[allow(clippy::too_many_arguments)]
-    pub fn reset_org_share_for_retry_with_scrub(
+    pub fn reset_org_share_for_retry(
         &self,
         id: &str,
         title: Option<&str>,
@@ -1133,35 +1198,6 @@ impl Db {
                 "ambiguous org publish source changed before replay".into(),
             ));
         }
-        Ok(())
-    }
-
-    /// Backward-compatible retry seam for the command layer from the stack base.
-    /// The follow-up command-layer commit switches to the scrub-bound variant above.
-    pub fn reset_org_share_for_retry(
-        &self,
-        id: &str,
-        title: Option<&str>,
-        rev: u32,
-        generation: u32,
-        content_sha256: &[u8],
-        updated_at: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_shares SET state = 'queued', item_id = NULL, last_error = NULL,
-               title = ?2, rev = ?3, generation = ?4, content_sha256 = ?5, updated_at = ?6
-             WHERE id = ?1",
-            rusqlite::params![
-                id,
-                title,
-                rev as i64,
-                generation as i64,
-                content_sha256,
-                updated_at
-            ],
-        )
-        .map_err(map_err)?;
         Ok(())
     }
 
@@ -1650,6 +1686,7 @@ impl Db {
     /// returned boolean is the transaction-authoritative visibility-reduction result: callers use it
     /// to bump the lifecycle epoch and invalidate open Ask renderers exactly when a live predecessor
     /// was actually evicted.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_local_org_replica(
         &self,
@@ -2086,6 +2123,7 @@ impl Db {
     /// Commit one already-prepared live feed item and advance the org cursor to this action's exact
     /// sequence in ONE transaction. There is deliberately no fetched-page cursor parameter: a crash
     /// after this method can replay later page entries, but can never skip them.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_org_feed_item(
         &self,
@@ -2128,6 +2166,7 @@ impl Db {
     /// Feed commit plus stable permission/link metadata in the same transaction. Metadata is also
     /// repaired when the content action is already behind the cursor (`false`), provided the live
     /// item exists; this closes the local-publish-before-feed gap without rewriting content/indexes.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_org_feed_item_with_metadata(
         &self,
@@ -3157,6 +3196,7 @@ impl Db {
     /// must not resurrect plaintext), and an existing tombstone is still permanent.
     ///
     /// Returns `true` when the row was actually (re)written.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_org_reconcile_item(
         &self,
@@ -3196,6 +3236,7 @@ impl Db {
         .map(|outcome| outcome.changed)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_org_reconcile_item_with_metadata(
         &self,

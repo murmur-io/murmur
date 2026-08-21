@@ -122,8 +122,13 @@ pub const SHARING_UNREACHABLE: &str = "sharing-unreachable";
 pub const SHARING_RATE_LIMITED: &str = "sharing-rate-limited";
 /// The sharing server rejected the request (4xx) — a wrong or expired code, a used token.
 pub const SHARING_REJECTED: &str = "sharing-rejected";
+/// A Shared Brain edit lost its optimistic-concurrency race. The draft remains local.
+pub const ORG_EDIT_CONFLICT: &str = "org-edit-conflict";
 /// The sharing session is gone (401) — the user must sign in again.
 pub const SHARING_SIGNIN_REQUIRED: &str = "sharing-signin-required";
+/// The configured relay has not advertised the owner-bound share reservation contract required to
+/// prevent a delayed create from resurrecting ciphertext after local deletion/lock.
+pub const SHARING_UPGRADE_REQUIRED: &str = "sharing-upgrade-required";
 
 // ── macOS permissions ───────────────────────────────────────────────────────────────────────
 
@@ -153,7 +158,9 @@ pub const ALL: &[&str] = &[
     SHARING_UNREACHABLE,
     SHARING_RATE_LIMITED,
     SHARING_REJECTED,
+    ORG_EDIT_CONFLICT,
     SHARING_SIGNIN_REQUIRED,
+    SHARING_UPGRADE_REQUIRED,
     REMINDERS_DENIED,
 ];
 
@@ -231,7 +238,9 @@ mod tests {
             "sharing-unreachable",
             "sharing-rate-limited",
             "sharing-rejected",
+            "org-edit-conflict",
             "sharing-signin-required",
+            "sharing-upgrade-required",
             "reminders-denied",
         ];
         assert_eq!(ALL, expected);

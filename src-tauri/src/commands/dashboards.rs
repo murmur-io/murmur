@@ -1451,8 +1451,6 @@ fn source_is_visible(
                 && db.dashboard_ref_exists("meeting", &source.id)?
         }
         LinkKind::Document => db.document_is_visible(&source.id, unlocked)?,
-        // Org graph endpoints are storage-only in this compatibility stack. The command-layer
-        // activation lands in the following stacked change, so base dashboard reads fail closed.
         LinkKind::Org => false,
     })
 }
