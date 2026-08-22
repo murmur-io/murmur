@@ -42,6 +42,12 @@ pub enum OrgItemKind {
     Note,
     /// An explicit standalone summary (reserved for a future "summary" flow; kept distinct on the wire).
     Summary,
+    /// A structured org-owned task. The canonical task JSON lives in `markdown`; images remain in
+    /// the outer authenticated attachment manifest. Tag 3 is reader-first compatible: the shipped
+    /// pre-Task feed loop terminal-skips an authenticated cell its envelope decoder cannot open and
+    /// claims only that exact sequence, so older clients continue to later Note/Summary cells rather
+    /// than stalling or mis-parsing Task plaintext.
+    Task,
 }
 
 impl OrgItemKind {
@@ -49,12 +55,14 @@ impl OrgItemKind {
         match self {
             OrgItemKind::Note => 1,
             OrgItemKind::Summary => 2,
+            OrgItemKind::Task => 3,
         }
     }
     fn from_tag(t: u8) -> Result<Self> {
         match t {
             1 => Ok(OrgItemKind::Note),
             2 => Ok(OrgItemKind::Summary),
+            3 => Ok(OrgItemKind::Task),
             _ => Err(AppError::InvalidArg("unknown org item kind tag".into())),
         }
     }
@@ -63,6 +71,7 @@ impl OrgItemKind {
         match self {
             OrgItemKind::Note => "note",
             OrgItemKind::Summary => "summary",
+            OrgItemKind::Task => "task",
         }
     }
 }
@@ -78,6 +87,8 @@ pub enum OrgSourceKind {
     Document,
     /// Published from a meeting's note/summary.
     Meeting,
+    /// Org-only Task source. Stored in the local SQLCipher replica, never exported to the vault.
+    Task,
 }
 
 impl OrgSourceKind {
@@ -85,12 +96,14 @@ impl OrgSourceKind {
         match self {
             OrgSourceKind::Document => 1,
             OrgSourceKind::Meeting => 2,
+            OrgSourceKind::Task => 3,
         }
     }
     fn from_tag(t: u8) -> Result<Self> {
         match t {
             1 => Ok(OrgSourceKind::Document),
             2 => Ok(OrgSourceKind::Meeting),
+            3 => Ok(OrgSourceKind::Task),
             _ => Err(AppError::InvalidArg("unknown org source kind tag".into())),
         }
     }
@@ -100,6 +113,7 @@ impl OrgSourceKind {
         match self {
             OrgSourceKind::Document => "document",
             OrgSourceKind::Meeting => "meeting",
+            OrgSourceKind::Task => "task",
         }
     }
 }
@@ -534,7 +548,11 @@ mod tests {
     /// A fresh text-only v2 envelope carries `source_kind` and round-trips both source kinds.
     #[test]
     fn text_only_v2_canonical_round_trips_both_source_kinds() {
-        for sk in [OrgSourceKind::Meeting, OrgSourceKind::Document] {
+        for sk in [
+            OrgSourceKind::Meeting,
+            OrgSourceKind::Document,
+            OrgSourceKind::Task,
+        ] {
             let e = OrgEnvelope::new(
                 OrgItemKind::Note,
                 "Standup",
@@ -650,7 +668,7 @@ mod tests {
         assert!(OrgEnvelope::from_canonical_bytes(&[]).is_err());
         assert!(OrgEnvelope::from_canonical_bytes(&[1, 0, 1]).is_err()); // version ok, then truncated
         assert!(OrgEnvelope::from_canonical_bytes(&[9, 9, 1]).is_err()); // unknown version
-        // A length prefix that overruns the buffer.
+                                                                         // A length prefix that overruns the buffer.
         let mut bad = 1u16.to_le_bytes().to_vec();
         bad.push(OrgItemKind::Note.tag());
         bad.extend_from_slice(&0u32.to_le_bytes()); // source_rev
@@ -675,7 +693,10 @@ mod tests {
 
     #[test]
     fn kind_tag_round_trips_and_labels() {
-        assert_eq!(OrgItemKind::from_tag(OrgItemKind::Note.tag()).unwrap(), OrgItemKind::Note);
+        assert_eq!(
+            OrgItemKind::from_tag(OrgItemKind::Note.tag()).unwrap(),
+            OrgItemKind::Note
+        );
         assert_eq!(
             OrgItemKind::from_tag(OrgItemKind::Summary.tag()).unwrap(),
             OrgItemKind::Summary
@@ -683,6 +704,7 @@ mod tests {
         assert!(OrgItemKind::from_tag(0).is_err());
         assert_eq!(OrgItemKind::Note.as_str(), "note");
         assert_eq!(OrgItemKind::Summary.as_str(), "summary");
+        assert_eq!(OrgItemKind::Task.as_str(), "task");
     }
 
     #[test]
@@ -698,6 +720,7 @@ mod tests {
         assert!(OrgSourceKind::from_tag(0).is_err());
         assert_eq!(OrgSourceKind::Document.as_str(), "document");
         assert_eq!(OrgSourceKind::Meeting.as_str(), "meeting");
+        assert_eq!(OrgSourceKind::Task.as_str(), "task");
     }
 
     /// The seal/open AEAD layer round-trips a text-only v2 envelope end to end (models

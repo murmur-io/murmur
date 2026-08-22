@@ -156,8 +156,7 @@
         }
 
         async fn complete(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("stale answer".into())
         }
     }
@@ -247,8 +246,8 @@
             detail: "PROJ-1 not found in Jira".into(),
             url: String::new(),
         };
-        let e2 = apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding])
-            .unwrap_err();
+        let e2 =
+            apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding]).unwrap_err();
         assert!(
             matches!(e2, AppError::Locked(_)),
             "apply must fail Locked, got: {e2:?}"
@@ -442,16 +441,15 @@
             url: "https://x/browse/PROJ-1".into(),
         };
         let once =
-            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding.clone()])
-                .unwrap();
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding.clone()]).unwrap();
         assert!(
             once.markdown.contains("> ⧗ note says"),
             "inline marker present"
         );
         assert!(once.markdown.contains("> [!verify]- Source check (as of "));
         assert!(once.markdown.contains(
-                            "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
-                        ));
+                                "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
+                            ));
         // Persisted CANONICALLY (upsert_note): the DB row carries the callout, so it seals with
         // the note under a folder lock.
         let db_md = state
@@ -463,8 +461,7 @@
         assert_eq!(db_md, once.markdown);
 
         // Re-apply: neither region stacks (one inline marker, one fenced callout).
-        let twice =
-            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
+        let twice = apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
         assert_eq!(
             twice.markdown.matches("(via Jira)").count(),
             2,
@@ -474,8 +471,7 @@
         assert_eq!(twice.markdown.matches("<!-- murmur:verify -->").count(), 1);
 
         // Empty findings: markers + callout stripped, the ORIGINAL note restored byte-exact.
-        let undone =
-            apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
+        let undone = apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
         assert_eq!(
             undone.markdown, original,
             "byte-exact undo through the command"
@@ -799,13 +795,7 @@
         const SAME_ORG_DOC_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         const CROSS_ORG_DOC_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
-        fn seed_current_head(
-            state: &AppState,
-            item_id: &str,
-            org_id: &str,
-            doc_id: &str,
-            title: &str,
-        ) {
+        fn seed_current_head(state: &AppState, item_id: &str, org_id: &str, doc_id: &str, title: &str) {
             state
                 .db
                 .upsert_org_item(
@@ -884,9 +874,9 @@
                 .lock()
                 .query_row(
                     "SELECT COUNT(*) FROM links
-                      WHERE src_kind = 'org' AND src_id = ?1
-                        AND dst_kind = 'org' AND dst_id = ?2
-                        AND edge_type = 'manual' AND status = 'active'",
+                          WHERE src_kind = 'org' AND src_id = ?1
+                            AND dst_kind = 'org' AND dst_id = ?2
+                            AND edge_type = 'manual' AND status = 'active'",
                     rusqlite::params![src_id, dst_id],
                     |row| row.get(0),
                 )
@@ -1298,6 +1288,7 @@
             .lock()
             .unwrap()
             .insert(source_folder.clone());
+        reexport_notes_in_folder(&state, &source_folder);
 
         let hit = crate::enrich::ContextHit {
             source: "note".into(),
@@ -1326,6 +1317,7 @@
             .lock()
             .unwrap()
             .insert(source_folder.clone());
+        reexport_notes_in_folder(&state, &source_folder);
         let restored = state.db.get_note_row(&source).unwrap().unwrap();
         assert_eq!(restored.text, "source prose survives\n");
         let restored_export = restored.exported_path.expect("restored source re-exported");
@@ -1528,9 +1520,16 @@
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(after, before, "sealed plaintext/blob must remain byte-identical");
+        assert_eq!(
+            after, before,
+            "sealed plaintext/blob must remain byte-identical"
+        );
         assert_eq!(manual_link_count(&state, "note", &source_id), links_before);
-        assert!(state.db.pending_lock_marker_export_cleanup().unwrap().is_empty());
+        assert!(state
+            .db
+            .pending_lock_marker_export_cleanup()
+            .unwrap()
+            .is_empty());
         assert!(!std::path::Path::new(&exported_path).exists());
     }
 
@@ -1564,7 +1563,12 @@
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         unseal_folder_extras(&state, &folder_id, &ck, None).unwrap();
-        state.unlocked_folders.lock().unwrap().insert(folder_id.clone());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(folder_id.clone());
+        reexport_notes_in_folder(&state, &folder_id);
         state
             .db
             .upsert_manual_link("note", &source_id, "note", &target_id)
@@ -1578,7 +1582,11 @@
             .unwrap();
         unlink_items_inner(&state, "note", &source_id, "note", &target_id).unwrap();
         assert_eq!(manual_link_count(&state, "note", &source_id), 0);
-        assert!(state.db.pending_lock_marker_export_cleanup().unwrap().is_empty());
+        assert!(state
+            .db
+            .pending_lock_marker_export_cleanup()
+            .unwrap()
+            .is_empty());
         let (text, blob): (String, Vec<u8>) = state
             .db
             .lock()
@@ -2072,18 +2080,14 @@
 
         // No matching candidate → None (the caller surfaces the primary error).
         assert!(
-            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new))
-                .is_none()
+            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new)).is_none()
         );
         // AAD binding holds: the right KEK under the WRONG folder id must not unwrap.
         assert!(
-            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new))
-                .is_none()
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new)).is_none()
         );
         // The already-tried primary is skipped even if listed as a candidate.
-        assert!(
-            try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none()
-        );
+        assert!(try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none());
         // With NO already-tried key (the primary release itself failed), all candidates are tried.
         let (_, winner2, _) = try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", None)
             .expect("recovery with no primary must still find the sealing KEK");
@@ -2209,9 +2213,9 @@
             }
             let body = r#"{"accessToken":"fresh-access","refreshToken":"fresh-refresh","deviceId":"dev-1","accessExpiresAt":"2099-01-01T00:00:00Z"}"#;
             let resp = format!(
-                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
             sock.write_all(resp.as_bytes()).unwrap();
             String::from_utf8_lossy(&req).to_string()
         });
@@ -2303,8 +2307,7 @@
     fn refresh_failure_fallback_policy() {
         let auth = refresh_failure_fallback(AppError::Auth("refused".into()), "cached".into());
         assert!(matches!(auth, Err(AppError::Auth(_))));
-        let net =
-            refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
+        let net = refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
         assert_eq!(net.unwrap(), "cached");
         let storage = refresh_failure_fallback(AppError::Storage("disk".into()), "cached".into());
         assert_eq!(storage.unwrap(), "cached");
@@ -2570,8 +2573,7 @@
         );
 
         // (c) Replay to the WRONG recipient (grant addressed to `recipient`, opened by `attacker`).
-        let attacker =
-            derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
+        let attacker = derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
         let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-c", 1);
         let e = accept_ingest_verified(
             &state, &target, &attacker, &sender_fp, "s", &up, &content, "s-c", 1, 1,
@@ -3041,8 +3043,7 @@
                 .style,
             "action",
         );
-        let selected = resolve_conversion_template(Some("tpl-client"), "brief", db_templates)
-            .unwrap();
+        let selected = resolve_conversion_template(Some("tpl-client"), "brief", db_templates).unwrap();
         let rendered = crate::summarize::template::build_template_from_saved(
             selected.saved.as_ref().unwrap(),
             "auto",
@@ -3186,9 +3187,11 @@
             &self,
             request: &crate::summarize::provider::SummarizeRequest,
         ) -> crate::error::Result<String> {
-            self.templates.lock().unwrap().push(request.template.clone());
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.templates
+                .lock()
+                .unwrap()
+                .push(request.template.clone());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(state) = &self.relock {
                 // The production relock-all state machine runs from inside the provider await.
                 relock_all_inner(state.as_ref())?;
@@ -3199,7 +3202,9 @@
         }
 
         async fn complete(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
-            Err(AppError::Unavailable("unused conversion test completion".into()))
+            Err(AppError::Unavailable(
+                "unused conversion test completion".into(),
+            ))
         }
     }
 
@@ -3220,7 +3225,10 @@
         ));
         assert!(matches!(result, Err(AppError::Locked(_))));
         assert_eq!(provider.count(), 0, "provider must not see sealed content");
-        assert_eq!(state.db.companion_note_for_meeting("m-secret").unwrap(), None);
+        assert_eq!(
+            state.db.companion_note_for_meeting("m-secret").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -3228,7 +3236,7 @@
         let state = build_state("meeting-detail-command-mask");
         make_open_folder(&state.db, "f-detail-secret", "Secret");
         let secret_note = "# PRIVATE DETAIL NOTE\n\n[[PRIVATE WIKILINK TARGET]]\n\n\
-                           ![[murmur-attachment:private-image]]";
+                               ![[murmur-attachment:private-image]]";
         seed_meeting(
             &state.db,
             "m-detail-secret",
@@ -3242,10 +3250,10 @@
         // A real 1x1 PNG keeps this production-chain oracle focused on the
         // sealed-detail mask instead of failing earlier in attachment validation.
         let data = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
-                     \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
-                     \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
-                     \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
-                     \xae\x42\x60\x82";
+                         \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+                         \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+                         \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+                         \xae\x42\x60\x82";
         let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(data).into();
         state
             .db
@@ -3294,12 +3302,7 @@
     fn conversion_command_relock_during_provider_await_writes_nothing() {
         let state = std::sync::Arc::new(build_state("conversion-command-await-relock"));
         make_open_folder(&state.db, "f-relock", "Secret");
-        seed_meeting(
-            &state.db,
-            "m-relock",
-            "# Existing source",
-            Some("f-relock"),
-        );
+        seed_meeting(&state.db, "m-relock", "# Existing source", Some("f-relock"));
         lock_folder_inner(state.as_ref(), "f-relock".into()).unwrap();
         let kek = secrets::get_or_create_master_kek().unwrap();
         let wrapped = state.db.folder_wrapped_key("f-relock").unwrap().unwrap();
@@ -3328,12 +3331,19 @@
             "production relock-all revoked the source folder during provider await"
         );
         let reblanked = state.db.get_segments("m-relock").unwrap();
-        assert_eq!(reblanked.len(), 2, "sealed transcript rows remain canonical");
+        assert_eq!(
+            reblanked.len(),
+            2,
+            "sealed transcript rows remain canonical"
+        );
         assert!(
             reblanked.iter().all(|segment| segment.text.is_empty()),
             "production relock-all reblanked every transcript row"
         );
-        assert_eq!(state.db.companion_note_for_meeting("m-relock").unwrap(), None);
+        assert_eq!(
+            state.db.companion_note_for_meeting("m-relock").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -3377,18 +3387,12 @@
                         "n-related-race",
                     )?,
                     RelatedMutation::Deactivate => self.state.db.dismiss_link(self.link_id)?,
-                    RelatedMutation::DeleteSource => {
-                        self.state.db.delete_document("n-related-race")?
-                    }
+                    RelatedMutation::DeleteSource => self.state.db.delete_document("n-related-race")?,
                 }
                 Ok("---\ntitle: Stale\n---\n\n# Must not persist".into())
             }
 
-            async fn complete(
-                &self,
-                _system: &str,
-                _user: &str,
-            ) -> crate::error::Result<String> {
+            async fn complete(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
                 Err(AppError::Unavailable("unused conversion completion".into()))
             }
         }
@@ -3398,15 +3402,8 @@
             ("deactivate", RelatedMutation::Deactivate),
             ("delete-source", RelatedMutation::DeleteSource),
         ] {
-            let state = std::sync::Arc::new(build_state(&format!(
-                "conversion-related-race-{case}"
-            )));
-            seed_meeting(
-                &state.db,
-                "m-related-race",
-                "# Primary transcript",
-                None,
-            );
+            let state = std::sync::Arc::new(build_state(&format!("conversion-related-race-{case}")));
+            seed_meeting(&state.db, "m-related-race", "# Primary transcript", None);
             make_open_folder(&state.db, "f-related-race", "Related");
             seed_note_doc_cmd(
                 &state.db,
@@ -3494,11 +3491,7 @@
                 Ok("---\ntitle: Private-link-safe conversion\n---\n\n# Converted".into())
             }
 
-            async fn complete(
-                &self,
-                _system: &str,
-                _user: &str,
-            ) -> crate::error::Result<String> {
+            async fn complete(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
                 Err(AppError::Unavailable("unused conversion completion".into()))
             }
         }
@@ -3553,12 +3546,7 @@
         let org_link_id = format!("{STABLE_ORG_ID}:{STABLE_DOC_ID}");
         state
             .db
-            .upsert_manual_link(
-                "meeting",
-                "m-private-org-context",
-                "org",
-                &org_link_id,
-            )
+            .upsert_manual_link("meeting", "m-private-org-context", "org", &org_link_id)
             .unwrap();
 
         let org_item = state
@@ -3600,7 +3588,10 @@
             None,
             Some(provider.clone()),
         ));
-        assert!(converted.is_ok(), "conversion must still succeed: {converted:?}");
+        assert!(
+            converted.is_ok(),
+            "conversion must still succeed: {converted:?}"
+        );
 
         let request = provider
             .request
@@ -3614,7 +3605,10 @@
                 "private org content entered conversion transcript: {sentinel}"
             );
             assert!(
-                request.vault_titles.iter().all(|title| !title.contains(sentinel)),
+                request
+                    .vault_titles
+                    .iter()
+                    .all(|title| !title.contains(sentinel)),
                 "private org content entered conversion vault titles: {sentinel}"
             );
         }
@@ -3634,7 +3628,12 @@
             None,
         )
         .unwrap();
-        let before = state.db.get_note_row(&companion.note_id).unwrap().unwrap().text;
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap()
+            .text;
 
         let provider_failure = block_on(convert_meeting_to_note_inner_with(
             None,
@@ -3644,14 +3643,22 @@
             Some(ConversionProvider::failing()),
         ));
         assert!(matches!(provider_failure, Err(AppError::Unavailable(_))));
-        assert_eq!(state.db.get_note_row(&companion.note_id).unwrap().unwrap().text, before);
+        assert_eq!(
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text,
+            before
+        );
 
         state
             .db
             .lock()
             .execute_batch(&format!(
                 "CREATE TRIGGER conversion_write_fault BEFORE UPDATE ON documents \
-                 WHEN OLD.id = '{}' BEGIN SELECT RAISE(ABORT, 'conversion write fault'); END;",
+                     WHEN OLD.id = '{}' BEGIN SELECT RAISE(ABORT, 'conversion write fault'); END;",
                 companion.note_id
             ))
             .unwrap();
@@ -3666,7 +3673,12 @@
         ));
         assert!(write_failure.is_err());
         assert_eq!(
-            state.db.get_note_row(&companion.note_id).unwrap().unwrap().text,
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text,
             before,
             "canonical update failure preserves the companion byte-for-byte"
         );
@@ -3695,7 +3707,10 @@
         assert!(second.contains("User-authored appendix."));
         assert!(second.contains("Fresh generated body."));
         assert!(!second.contains("Old generated body."));
-        assert!(second.contains("title: First"), "existing front-matter wins");
+        assert!(
+            second.contains("title: First"),
+            "existing front-matter wins"
+        );
         assert!(!second.contains("title: Replacement"));
         assert_eq!(second.matches(CONVERTED_NOTE_START).count(), 1);
 
@@ -3777,9 +3792,9 @@
             .lock()
             .query_row(
                 "SELECT COUNT(*) FROM links
-                  WHERE src_kind = 'note' AND src_id = ?1
-                    AND dst_kind = 'meeting' AND dst_id = 'm-convert'
-                    AND edge_type = 'companion' AND status = 'active'",
+                      WHERE src_kind = 'note' AND src_id = ?1
+                        AND dst_kind = 'meeting' AND dst_id = 'm-convert'
+                        AND edge_type = 'companion' AND status = 'active'",
                 [&first.note_id],
                 |row| row.get(0),
             )
@@ -3842,7 +3857,12 @@
             Err(AppError::Locked(_))
         ));
         assert_eq!(
-            state.db.get_note_row(&second.note_id).unwrap().unwrap().text,
+            state
+                .db
+                .get_note_row(&second.note_id)
+                .unwrap()
+                .unwrap()
+                .text,
             before,
             "stale provider output writes nothing"
         );
@@ -3862,18 +3882,28 @@
             None,
         )
         .is_err());
-        assert_eq!(state.db.companion_note_for_meeting("m-empty").unwrap(), None);
+        assert_eq!(
+            state.db.companion_note_for_meeting("m-empty").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn account_expected_backfills_once_and_local_only_stays_silent() {
         let state = build_state("account-expected-upgrade");
         assert!(!account_expected_with_upgrade(&state, false).unwrap());
-        assert_eq!(state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(), None);
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(),
+            None
+        );
 
         assert!(account_expected_with_upgrade(&state, true).unwrap());
         assert_eq!(
-            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap().as_deref(),
+            state
+                .db
+                .get_setting(ACCOUNT_EXPECTED_SETTING)
+                .unwrap()
+                .as_deref(),
             Some("true")
         );
         assert!(
@@ -3981,7 +4011,11 @@
         let status = finish_account_login_success(&state, test_account_status()).unwrap();
         assert!(status.logged_in && status.account_expected);
         assert_eq!(
-            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap().as_deref(),
+            state
+                .db
+                .get_setting(ACCOUNT_EXPECTED_SETTING)
+                .unwrap()
+                .as_deref(),
             Some("true")
         );
     }
@@ -3997,11 +4031,9 @@
         )
         .unwrap();
 
-        let result = finish_account_login_success_with(
-            &state,
-            test_account_status(),
-            |_| Err(AppError::Storage("injected latch write failure".into())),
-        );
+        let result = finish_account_login_success_with(&state, test_account_status(), |_| {
+            Err(AppError::Storage("injected latch write failure".into()))
+        });
 
         assert!(matches!(result, Err(AppError::Storage(_))));
         assert!(
@@ -4040,7 +4072,10 @@
         assert!(status.server_configured);
         assert_eq!(token_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(biometric_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(), None);
+        assert_eq!(
+            state.db.get_setting(ACCOUNT_EXPECTED_SETTING).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4310,10 +4345,24 @@
                 .is_none(),
             "the empty companion note is gone"
         );
-        assert!(state.db.insert_org_share(
-            "after-companion-delete","org-1",None,Some(&r.note_id),"note",Some("T"),
-            1,1,&[1u8;32],"t",
-        ).is_err(), "a deleted companion keeps its terminal source closure");
+        assert!(
+            state
+                .db
+                .insert_org_share(
+                    "after-companion-delete",
+                    "org-1",
+                    None,
+                    Some(&r.note_id),
+                    "note",
+                    Some("T"),
+                    1,
+                    1,
+                    &[1u8; 32],
+                    "t",
+                )
+                .is_err(),
+            "a deleted companion keeps its terminal source closure"
+        );
 
         // Case B: a companion note WITH user content is KEPT untouched.
         let state2 = build_state("companion-delete-nonempty");
@@ -4344,22 +4393,36 @@
     #[test]
     fn companion_edit_winning_before_close_barrier_preserves_share_and_returns_false() {
         let state = std::sync::Arc::new(build_state("companion-delete-edit-race"));
-        state.db.insert_meeting(&Meeting {
-            id: "m-race".into(),
-            started_at: "2026-08-14T09:00:00Z".into(),
-            ended_at: None,
-            title: Some("Race".into()),
-            duration_s: 0,
-            audio_path: None,
-            status: MeetingStatus::Recording,
-            folder_id: None,
-        }).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-race".into(),
+                started_at: "2026-08-14T09:00:00Z".into(),
+                ended_at: None,
+                title: Some("Race".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
         let companion = get_or_create_companion_note_inner(&state, "m-race").unwrap();
-        state.db.insert_outbound_share_attempt(
-            "companion-link", None, Some(&companion.note_id), "link", 1,
-            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T09:00:01Z",
-        ).unwrap();
-        state.db.set_outbound_share_state("companion-link", "active").unwrap();
+        state
+            .db
+            .insert_outbound_share_attempt(
+                "companion-link",
+                None,
+                Some(&companion.note_id),
+                "link",
+                1,
+                "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+                "2026-08-14T09:00:01Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_outbound_share_state("companion-link", "active")
+            .unwrap();
 
         // Keep cleanup queued before its authoritative recheck. The editor wins while cleanup is
         // waiting, so the recheck must return false without touching the remote-share journal.
@@ -4368,24 +4431,47 @@
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let cleanup = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            block_on(delete_companion_note_if_empty_inner(&cleanup_state, "m-race"))
+            block_on(delete_companion_note_if_empty_inner(
+                &cleanup_state,
+                "m-race",
+            ))
         });
-        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         save_note_text_inner(
-            &state, &companion.note_id, "Race", "---\nmeeting: \"[[Race]]\"\n---\nA late jot",
-        ).unwrap();
+            &state,
+            &companion.note_id,
+            "Race",
+            "---\nmeeting: \"[[Race]]\"\n---\nA late jot",
+        )
+        .unwrap();
         drop(mutation);
 
         assert!(!cleanup.join().unwrap().unwrap());
-        assert!(state.db.get_note_row(&companion.note_id).unwrap().unwrap().text.contains("A late jot"));
+        assert!(state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("A late jot"));
         assert_eq!(
-            state.db.lock().query_row(
-                "SELECT state FROM outbound_shares WHERE share_id='companion-link'", [],
-                |row| row.get::<_, String>(0),
-            ).unwrap(),
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT state FROM outbound_shares WHERE share_id='companion-link'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
             "active",
         );
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 0);
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -4400,37 +4486,77 @@
             let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
             assert!(request.starts_with("DELETE /v1/shares/companion-race-link "));
             seen_tx.send(()).unwrap();
-            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            write!(socket, "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
         let state = std::sync::Arc::new(build_state("companion-network-edit-race"));
-        state.db.insert_meeting(&Meeting {
-            id: "m-network-race".into(), started_at: "2026-08-14T09:30:00Z".into(),
-            ended_at: None, title: Some("Network race".into()), duration_s: 0,
-            audio_path: None, status: MeetingStatus::Recording, folder_id: None,
-        }).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-network-race".into(),
+                started_at: "2026-08-14T09:30:00Z".into(),
+                ended_at: None,
+                title: Some("Network race".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
         let companion = get_or_create_companion_note_inner(&state, "m-network-race").unwrap();
-        state.db.insert_outbound_share_attempt(
-            "companion-race-link", None, Some(&companion.note_id), "link", 1,
-            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T09:30:01Z",
-        ).unwrap();
-        state.db.set_outbound_share_state("companion-race-link", "active").unwrap();
+        state
+            .db
+            .insert_outbound_share_attempt(
+                "companion-race-link",
+                None,
+                Some(&companion.note_id),
+                "link",
+                1,
+                "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+                "2026-08-14T09:30:01Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_outbound_share_state("companion-race-link", "active")
+            .unwrap();
         seed_live_session(&state);
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
 
         let cleanup_state = state.clone();
         let cleanup = std::thread::spawn(move || {
-            block_on(delete_companion_note_if_empty_inner(&cleanup_state, "m-network-race"))
+            block_on(delete_companion_note_if_empty_inner(
+                &cleanup_state,
+                "m-network-race",
+            ))
         });
-        seen_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(save_note_text_inner(
-            &state, &companion.note_id, "Network race", "A too-late edit",
-        ).is_err(), "the durable close barrier freezes content after remote revoke begins");
+        seen_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            save_note_text_inner(
+                &state,
+                &companion.note_id,
+                "Network race",
+                "A too-late edit",
+            )
+            .is_err(),
+            "the durable close barrier freezes content after remote revoke begins"
+        );
         release_tx.send(()).unwrap();
         assert!(cleanup.join().unwrap().unwrap());
         server.join().unwrap();
         assert!(state.db.get_note_row(&companion.note_id).unwrap().is_none());
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 1);
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            1
+        );
     }
 
     /// #2 (0.7 security fast-follow): `list_meetings` MUST mask a sealed-and-NOT-session-unlocked
@@ -4912,8 +5038,8 @@
         ));
 
         // STUB (default install): 0 imported, NO synthetic meeting left behind.
-        let n = import_memories_inner(&state.db, &crate::reason::StubReasoner, true, "I like tea")
-            .unwrap();
+        let n =
+            import_memories_inner(&state.db, &crate::reason::StubReasoner, true, "I like tea").unwrap();
         assert_eq!(n, 0);
         assert_eq!(
             count_import_meetings(&state.db),
@@ -4923,8 +5049,8 @@
         assert!(state.db.user_facts_all().unwrap().is_empty());
 
         // REAL extraction: 2 added, anchored to ONE synthetic meeting, visible via the gated read.
-        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
-            .unwrap();
+        let n =
+            import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text").unwrap();
         assert_eq!(n, 2);
         assert_eq!(count_import_meetings(&state.db), 1);
         let visible = state.db.list_user_facts_visible(&none).unwrap();
@@ -4938,8 +5064,8 @@
             .all(|f| f.meeting_id.as_deref().unwrap().starts_with("import-")));
 
         // RE-IMPORT of the same text: pure dedup — 0 new, and NO second synthetic meeting.
-        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
-            .unwrap();
+        let n =
+            import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text").unwrap();
         assert_eq!(n, 0, "re-import must reconcile to NoOps");
         assert_eq!(
             count_import_meetings(&state.db),
@@ -5441,9 +5567,9 @@
         let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
         assert_eq!(sugg.len(), 1, "the prior match surfaces one suggestion");
         assert_eq!(
-                            sugg[0].speaker, "Speaker 2",
-                            "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
-                        );
+                                sugg[0].speaker, "Speaker 2",
+                                "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
+                            );
         assert_eq!(sugg[0].suggested_label, "Anna");
     }
 
@@ -5624,8 +5750,7 @@
         let state = build_state("lock-clears-live");
         make_open_folder(&state.db, "f-lock", "Secret");
         seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
-        *state.live_transcript.lock().unwrap() =
-            "stale tail of the just-recorded meeting".to_string();
+        *state.live_transcript.lock().unwrap() = "stale tail of the just-recorded meeting".to_string();
         assert!(
             state.recorder.lock().unwrap().is_none(),
             "precondition: not recording"
@@ -5829,19 +5954,19 @@
             })
             .unwrap();
         state
-                            .db
-                            .upsert_note(&NoteRecord {
-                                meeting_id: "m1".to_string(),
-                                provider_id: "claude_code".to_string(),
-                                // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
-                                markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
-                                created_at: "2026-06-27T09:05:00Z".to_string(),
-                                exported_path: None,
-                                model_requested: None,
-                                model_served: None,
-                                gateway_host: None,
-                            })
-                            .unwrap();
+                                .db
+                                .upsert_note(&NoteRecord {
+                                    meeting_id: "m1".to_string(),
+                                    provider_id: "claude_code".to_string(),
+                                    // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
+                                    markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
+                                    created_at: "2026-06-27T09:05:00Z".to_string(),
+                                    exported_path: None,
+                                    model_requested: None,
+                                    model_served: None,
+                                    gateway_host: None,
+                                })
+                                .unwrap();
         state
             .db
             .insert_segments(
@@ -6117,8 +6242,7 @@
         );
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
         let foreign_wrapped =
-            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
-                .unwrap();
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
         state
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
@@ -6183,10 +6307,21 @@
             notes.iter().all(|n| n.content_blob.is_none()),
             "the undecryptable sealed blobs are discarded"
         );
-        state.db.insert_org_share(
-            "after-discard","org-1",Some("m1"),None,"meeting",Some("T"),
-            1,1,&[1u8;32],"t",
-        ).expect("successful permanent reopen clears the folder share closure");
+        state
+            .db
+            .insert_org_share(
+                "after-discard",
+                "org-1",
+                Some("m1"),
+                None,
+                "meeting",
+                Some("T"),
+                1,
+                1,
+                &[1u8; 32],
+                "t",
+            )
+            .expect("successful permanent reopen clears the folder share closure");
     }
 
     /// PRESERVE-NEVER-SEALED (2026-07-05 lock-security finding): discard must destroy only the
@@ -6211,8 +6346,7 @@
 
         // Make the folder unrecoverable (foreign wrapped key no candidate holds).
         let foreign_wrapped =
-            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
-                .unwrap();
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
         state
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
@@ -6304,10 +6438,10 @@
         // The RED anchor: the RAW read still returns 2 rows (text blanked) — an UNGATED lazy read
         // would leak exactly these, so the gate below must collapse them to [].
         assert_eq!(
-                            state.db.raw_segments("m1").unwrap().len(),
-                            2,
-                            "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
-                        );
+                                state.db.raw_segments("m1").unwrap().len(),
+                                2,
+                                "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
+                            );
 
         // GATE: sealed-not-unlocked → empty Vec. RED-if-`meeting_is_unlocked`-gate-removed.
         let masked = get_meeting_segments_inner(&state, "m1").unwrap();
@@ -6383,10 +6517,21 @@
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         state.db.begin_org_folder_closure("f-lock").unwrap();
         remove_lock_inner(&state, "f-lock".to_string()).unwrap();
-        state.db.insert_org_share(
-            "after-remove-lock","org-1",Some("m1"),None,"meeting",Some("T"),
-            1,1,&[1u8;32],"t",
-        ).expect("successful permanent unlock clears the folder share closure");
+        state
+            .db
+            .insert_org_share(
+                "after-remove-lock",
+                "org-1",
+                Some("m1"),
+                None,
+                "meeting",
+                Some("T"),
+                1,
+                1,
+                &[1u8; 32],
+                "t",
+            )
+            .expect("successful permanent unlock clears the folder share closure");
 
         let rn = state.db.raw_manual_notes("m1").unwrap().unwrap();
         assert_eq!(
@@ -6697,8 +6842,8 @@
         let state = build_state("text-import");
         make_open_folder(&state.db, "f-open", "Project");
 
-        let id = import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open")
-            .unwrap();
+        let id =
+            import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open").unwrap();
         assert_eq!(
             get_document_inner(&state, &id).unwrap(),
             "We ship the beta on Friday.",
@@ -6973,7 +7118,7 @@
         assert_ne!(
             row.state, "uploaded",
             "a live org share must be (at least) marked revoke_pending before the delete gives up, \
-                             never left uploaded — that's the resurrection bug"
+                                 never left uploaded — that's the resurrection bug"
         );
     }
 
@@ -7058,7 +7203,7 @@
         assert_ne!(
             row.state, "uploaded",
             "a live org share must be moved off `uploaded` before the delete gives up — \
-                             never left dangling live, that's the resurrection bug"
+                                 never left dangling live, that's the resurrection bug"
         );
         // The local note row must SURVIVE the failed delete — fail loud means fail WHOLE, not
         // half-deleted-locally-with-a-dangling-server-copy.
@@ -7243,9 +7388,10 @@
         update_note_doc_inner(&state, &note_id, "Shared", "body").unwrap();
         lock_folder_inner(&state, target.id.clone()).unwrap();
         session_unlock(&state, &target.id);
-        state.db.insert_outbound_note_share(
-            "move-link", &note_id, "link", 1, "2026-08-14T11:00:00Z",
-        ).unwrap();
+        state
+            .db
+            .insert_outbound_note_share("move-link", &note_id, "link", 1, "2026-08-14T11:00:00Z")
+            .unwrap();
 
         assert!(matches!(
             move_note_doc_inner(&state, &note_id, &target.id),
@@ -7257,10 +7403,15 @@
             "the share check runs at the lifecycle-protected reassignment boundary",
         );
         assert_eq!(
-            state.db.lock().query_row(
-                "SELECT state FROM outbound_shares WHERE share_id='move-link'", [],
-                |row| row.get::<_, String>(0),
-            ).unwrap(),
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT state FROM outbound_shares WHERE share_id='move-link'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
             "active",
         );
     }
@@ -7493,6 +7644,7 @@
         let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
         unseal_folder_extras(&state, &fid, &ck, None).unwrap();
         state.unlocked_folders.lock().unwrap().insert(fid.clone());
+        reexport_notes_in_folder(&state, &fid);
 
         let unlocked = get_note_inner(&state, &id).unwrap();
         assert!(!unlocked.locked);
@@ -7605,8 +7757,7 @@
             detail: "secret link".to_string(),
             url: Some("[[Secret]]".to_string()),
         };
-        let stored =
-            crate::enrich::apply_link_markers("# secret prose\n", std::slice::from_ref(&hit));
+        let stored = crate::enrich::apply_link_markers("# secret prose\n", std::slice::from_ref(&hit));
         let id = create_note_inner(&state, Some(&fid), "Sealed note").unwrap();
         update_note_doc_inner(&state, &id, "Sealed note", &stored).unwrap();
         lock_folder_inner(&state, fid.clone()).unwrap();
@@ -7674,8 +7825,8 @@
         );
         // The user pastes a bare forged links fence AFTER the real machine block.
         let stored = format!(
-                            "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
-                        );
+                                "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
+                            );
         seed_note_doc_cmd(&state.db, "scanall", "f-open", "ScanAll", &stored);
 
         let doc = get_note_inner(&state, "scanall").unwrap();
@@ -7702,8 +7853,7 @@
     fn note_markdown_survives_lock_unlock_byte_identical() {
         let state = build_state("note-seal-cycle");
         let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
-        let original =
-            "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
+        let original = "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
         let id = create_note_inner(&state, Some(&fid), "Decyzja").unwrap();
         update_note_doc_inner(&state, &id, "Decyzja", original).unwrap();
 
@@ -7812,8 +7962,7 @@
         let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
 
         // Cheap save: body persisted + retrievable via get_note, updated_at set…
-        let now =
-            save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        let now = save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
         let doc = get_note_inner(&state, &id).unwrap();
         assert_eq!(doc.markdown, "Alpha bravo cheap-save body.");
         assert_eq!(doc.updated_at, now);
@@ -7910,6 +8059,7 @@
         *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
         unseal_folder_extras(&state, &fid, &ck, None).unwrap();
         state.unlocked_folders.lock().unwrap().insert(fid.clone());
+        reexport_notes_in_folder(&state, &fid);
 
         let reexported = state
             .db
@@ -8425,9 +8575,9 @@
         );
         let row = state.db.get_note_row(&id).unwrap().unwrap();
         assert_eq!(
-                            row.folder_id, src,
-                            "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
-                        );
+                                row.folder_id, src,
+                                "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
+                            );
         assert!(!row.sealed, "no stale/wrong-CK blob may be written");
         assert_eq!(
             row.exported_path.as_deref(),
@@ -8653,7 +8803,7 @@
             assert!(
                 system.contains("the same language as the selected text"),
                 "{action} must always match the selection's own language, ignoring the \
-                                 note_language pin ('pl'); got: {system}"
+                                     note_language pin ('pl'); got: {system}"
             );
             assert!(
                 !system.contains("language code 'pl'"),
@@ -9445,7 +9595,7 @@
         assert!(
             out.contains("Ulubiony"),
             "search_meetings must surface document CONTENT (not just echo the query in an \
-                             empty-result sentinel); got: {out:?}"
+                                 empty-result sentinel); got: {out:?}"
         );
         let out2 = crate::tools::execute_tool(
             &crate::tools::ToolCall::SearchSemantic {
@@ -9459,7 +9609,7 @@
         assert!(
             out2.contains("Ulubiony"),
             "search_semantic (flag OFF) must fall back to gated keyword doc search and surface \
-                             document CONTENT; got: {out2:?}"
+                                 document CONTENT; got: {out2:?}"
         );
     }
 
@@ -9496,7 +9646,7 @@
         assert!(
             out.contains("Ulubiony"),
             "semantic ON + no model must degrade to gated keyword doc search and surface CONTENT; \
-                             got: {out:?}"
+                                 got: {out:?}"
         );
     }
 
@@ -9596,8 +9746,7 @@
         for n in state.db.notes_in_folder(folder_id).unwrap() {
             if let Some(blob) = &n.content_blob {
                 let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
-                let md =
-                    String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                let md = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
                 state
                     .db
                     .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
@@ -9678,9 +9827,9 @@
         // RED on the pre-fix code (unseal_folder_extras had no meeting re-index → stayed 0).
         unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
         assert!(
-                            state.db.note_chunk_count("m1").unwrap() > 0,
-                            "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
-                        );
+                                state.db.note_chunk_count("m1").unwrap() > 0,
+                                "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+                            );
         assert!(
             state.db.note_vec_count("m1").unwrap() > 0,
             "production unlock re-indexes meeting vec_chunks when the e5 model is present"
@@ -9739,9 +9888,9 @@
         unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder))
             .unwrap();
         assert!(
-                            state.db.note_chunk_count("m1").unwrap() > 0,
-                            "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
-                        );
+                                state.db.note_chunk_count("m1").unwrap() > 0,
+                                "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+                            );
         assert!(
             state.db.note_vec_count("m1").unwrap() > 0,
             "remove-lock re-indexes meeting vec_chunks"
@@ -9987,7 +10136,7 @@
                 .saw_guard_held
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the lifecycle guard must be RELEASED before the embed leg — holding it delays \
-                             auto-relock and every lock/unlock op"
+                                 auto-relock and every lock/unlock op"
         );
     }
 
@@ -10008,8 +10157,7 @@
             calls: std::sync::atomic::AtomicUsize::new(0),
             saw_guard_held: std::sync::atomic::AtomicBool::new(false),
         };
-        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe))
-            .unwrap();
+        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe)).unwrap();
         assert!(
             probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the note re-index must actually run (the probe is exercised)"
@@ -10171,9 +10319,9 @@
             "the note BODY is chunked by the reindex"
         );
         assert!(
-                        !chunks.contains("zzfrontmattertag"),
-                        "front-matter must NEVER reach an authored note's chunks (RED pre-fix: raw text was chunked)"
-                    );
+                            !chunks.contains("zzfrontmattertag"),
+                            "front-matter must NEVER reach an authored note's chunks (RED pre-fix: raw text was chunked)"
+                        );
     }
 
     /// Brain v3 finding 4 (RED-before-GREEN): INGEST of a `kind='note'` via `import_text` raw-chunked
@@ -10198,9 +10346,9 @@
             "the pasted note BODY is chunked at ingest"
         );
         assert!(
-                        !chunks.contains("zzingestfmtag"),
-                        "front-matter must NEVER reach an ingested note's chunks (RED pre-fix: raw ingest chunking)"
-                    );
+                            !chunks.contains("zzingestfmtag"),
+                            "front-matter must NEVER reach an ingested note's chunks (RED pre-fix: raw ingest chunking)"
+                        );
     }
 
     /// Brain v3 audit gap #2 — the startup REPAIR TICK is complete and IDEMPOTENT:
@@ -10258,9 +10406,9 @@
             "model absent: no meeting indexing (no stub vectors)"
         );
         assert_eq!(
-                        docs, 2,
-                        "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
-                    );
+                            docs, 2,
+                            "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
+                        );
         let (d_chunks, d_vecs) = state.db.doc_chunk_vector_counts("d1").unwrap();
         assert!(d_chunks > 0, "doc chunks present after the chunk-only pass");
         assert_eq!(d_vecs, 0, "no vectors without the model");
@@ -10268,8 +10416,7 @@
 
         // PASS 2 — MODEL PRESENT (the model-arrived-later recovery the audit gap describes).
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
-                .unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
         assert_eq!(meetings, 1, "the note-carrying meeting is indexed");
         assert_eq!(
             docs, 2,
@@ -10285,8 +10432,7 @@
 
         // PASS 3 — IDEMPOTENT: full coverage ⇒ a re-run touches nothing.
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
-                .unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
         assert_eq!((meetings, docs), (0, 0), "re-run is a no-op");
     }
 
@@ -10347,8 +10493,7 @@
         }
 
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
-                .unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
         assert_eq!(
             (meetings, docs),
             (0, 0),
@@ -10801,9 +10946,9 @@
             "moved note must be sealed at rest (content_blob set)"
         );
         assert_eq!(
-                        n.markdown, MD,
-                        "moved note must stay READABLE in-session (regression: it used to come back empty under the open padlock)"
-                    );
+                            n.markdown, MD,
+                            "moved note must stay READABLE in-session (regression: it used to come back empty under the open padlock)"
+                        );
         assert!(
             n.exported_path.is_none(),
             "no vault .md for a note in a locked folder"
@@ -11363,8 +11508,7 @@
         ));
 
         // Happy path: Error + a real on-disk WAV → claimed (Error → Recording), path resolved.
-        let wav =
-            std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
+        let wav = std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
         std::fs::write(&wav, b"RIFF-fake").unwrap();
         seed_meeting(&state.db, "m-retry", "# err", None);
         state
@@ -11410,8 +11554,7 @@
 
         // Establish a real locked folder and verified encrypted audio, then session-unlock just
         // long enough to capture the one-shot salvage CK.
-        let dir =
-            std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-raced.wav");
@@ -11684,7 +11827,10 @@
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("Living Answer preflight deadlocked on the lifecycle mutex")
             .unwrap();
-        assert!(corpus.is_empty(), "the board contains only the excluded cache");
+        assert!(
+            corpus.is_empty(),
+            "the board contains only the excluded cache"
+        );
     }
 
     #[test]
@@ -11767,8 +11913,8 @@
             let conn = state.db.lock();
             conn.execute_batch(
                 "PRAGMA ignore_check_constraints=ON;
-                 UPDATE ask_dispatch_state SET generation='malformed' WHERE singleton=1;
-                 PRAGMA ignore_check_constraints=OFF;",
+                     UPDATE ask_dispatch_state SET generation='malformed' WHERE singleton=1;
+                     PRAGMA ignore_check_constraints=OFF;",
             )
             .unwrap();
         }
@@ -11779,7 +11925,7 @@
             .lock()
             .query_row(
                 "SELECT typeof(generation),CAST(generation AS TEXT)
-                   FROM ask_dispatch_state WHERE singleton=1",
+                       FROM ask_dispatch_state WHERE singleton=1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -11845,14 +11991,19 @@
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        writer_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap();
+        writer_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             state
                 .db
                 .lock()
-                .query_row("SELECT COUNT(*) FROM ask_conversation_messages", [], |row| {
-                    row.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT COUNT(*) FROM ask_conversation_messages",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
                 .unwrap(),
             2
         );
@@ -11866,13 +12017,7 @@
         let state = Arc::new(build_state("ask-budget-mutation"));
         state
             .db
-            .insert_dashboard(
-                "board-budget",
-                "Budget",
-                None,
-                None,
-                "2026-08-13T10:00:00Z",
-            )
+            .insert_dashboard("board-budget", "Budget", None, None, "2026-08-13T10:00:00Z")
             .unwrap();
         state
             .db
@@ -11887,11 +12032,9 @@
             .unwrap();
         let old_budget = {
             let config = state.config.lock().unwrap();
-            let connection = crate::summarize::roles::provider_target(
-                crate::summarize::roles::Role::Ask,
-                &config,
-            )
-            .connection;
+            let connection =
+                crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
+                    .connection;
             crate::summarize::vault_context::budget_for(&connection)
         };
         let context = crate::commands::dashboards::dashboard_composite_context(
@@ -11939,11 +12082,9 @@
         switch_ask_to_local_under_lifecycle(&state);
         let new_budget = {
             let config = state.config.lock().unwrap();
-            let connection = crate::summarize::roles::provider_target(
-                crate::summarize::roles::Role::Ask,
-                &config,
-            )
-            .connection;
+            let connection =
+                crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
+                    .connection;
             crate::summarize::vault_context::budget_for(&connection)
         };
         assert_ne!(old_budget, new_budget, "the fixture must change Ask budget");
@@ -11965,15 +12106,12 @@
             .lock()
             .execute_batch(&format!(
                 "UPDATE ask_conversations SET title=x'80' WHERE id='{id}';
-                 UPDATE ask_conversation_messages SET content=x'80' WHERE conversation_id='{id}';",
+                     UPDATE ask_conversation_messages SET content=x'80' WHERE conversation_id='{id}';",
                 id = committed.conversation_id
             ))
             .unwrap();
-        list_ask_conversations_inner(
-            &state,
-            &crate::storage::models::AskConversationScope::Vault,
-        )
-        .expect("stale-budget list must reject metadata before hydrating the poisoned title");
+        list_ask_conversations_inner(&state, &crate::storage::models::AskConversationScope::Vault)
+            .expect("stale-budget list must reject metadata before hydrating the poisoned title");
         assert!(matches!(
             load_ask_conversation_inner(
                 &state,
@@ -11988,17 +12126,15 @@
         });
         let gate_state = state.clone();
         let stale_witness = context.witness.clone();
-        let admission = crate::state::ContentDispatchAdmission::for_test(
-            Arc::new(Mutex::new(())),
-            move || {
+        let admission =
+            crate::state::ContentDispatchAdmission::for_test(Arc::new(Mutex::new(())), move || {
                 let _lifecycle = lifecycle_guard(&gate_state);
                 crate::commands::dashboards::require_current_dashboard_context_witness_under_lifecycle(
                     &gate_state,
                     &stale_witness,
                     &HashSet::new(),
                 )
-            },
-        );
+            });
         let dispatch_error = block_on(ask_vault_prepacked_dashboard_dispatch(
             &context,
             "second question",
@@ -12006,10 +12142,7 @@
             admission,
             {
                 let provider = provider.clone();
-                move || {
-                    Ok(provider
-                        as Arc<dyn crate::summarize::provider::SummarizerProvider>)
-                }
+                move || Ok(provider as Arc<dyn crate::summarize::provider::SummarizerProvider>)
             },
         ))
         .unwrap_err();
@@ -12053,12 +12186,7 @@
             citations: Vec::new(),
         };
         assert!(matches!(
-            serialize_durable_send_response(
-                &state,
-                &snapshot,
-                Some(&context.witness),
-                &payload,
-            ),
+            serialize_durable_send_response(&state, &snapshot, Some(&context.witness), &payload,),
             Err(AppError::Locked(_))
         ));
         {
@@ -12096,7 +12224,10 @@
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(answer_type, "null", "stale answer must add no cache content");
+        assert_eq!(
+            answer_type, "null",
+            "stale answer must add no cache content"
+        );
     }
 
     #[test]
@@ -12104,13 +12235,7 @@
         let state = build_state("ask-budget-existing-cache");
         state
             .db
-            .insert_dashboard(
-                "board-cache",
-                "Cache",
-                None,
-                None,
-                "2026-08-13T10:00:00Z",
-            )
+            .insert_dashboard("board-cache", "Cache", None, None, "2026-08-13T10:00:00Z")
             .unwrap();
         state
             .db
@@ -12166,7 +12291,10 @@
 
         switch_ask_to_local_under_lifecycle(&state);
 
-        assert_eq!(state.db.dashboard_context_state("board-cache").unwrap().0, general_before);
+        assert_eq!(
+            state.db.dashboard_context_state("board-cache").unwrap().0,
+            general_before
+        );
         assert_eq!(
             state
                 .db
@@ -12704,13 +12832,13 @@
         let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
 
         state
-            .db
-            .lock()
-            .execute(
-                "UPDATE links SET dst_id='neighbour-b' WHERE src_kind='note' AND src_id='source-note' AND edge_type='manual'",
-                [],
-            )
-            .unwrap();
+                .db
+                .lock()
+                .execute(
+                    "UPDATE links SET dst_id='neighbour-b' WHERE src_kind='note' AND src_id='source-note' AND edge_type='manual'",
+                    [],
+                )
+                .unwrap();
         let after = crate::commands::dashboards::living_answer_composite_context(
             &state.db,
             "board-link",
@@ -12748,7 +12876,10 @@
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(answer_type, "null", "a stale neighbour must persist no cache");
+        assert_eq!(
+            answer_type, "null",
+            "a stale neighbour must persist no cache"
+        );
     }
 
     #[test]
@@ -12934,7 +13065,7 @@
             let mut stmt = conn
                 .prepare(
                     "SELECT dependency_ref FROM ask_conversation_dependencies
-                                  WHERE conversation_id = ?1 ORDER BY dependency_ref",
+                                      WHERE conversation_id = ?1 ORDER BY dependency_ref",
                 )
                 .unwrap();
             stmt.query_map([committed.conversation_id], |row| row.get::<_, String>(0))
@@ -13208,8 +13339,7 @@
     #[test]
     fn relock_reblank_leaves_completed_meeting_even_with_audio_on_disk() {
         let state = build_state("relock-noloss-status-leg");
-        let dir =
-            std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-sum.wav");
@@ -13245,9 +13375,9 @@
 
         let segs = state.db.raw_segments("m-sum").unwrap();
         assert!(
-                        !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
-                        "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
-                    );
+                            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+                            "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
+                        );
         assert!(
             wav.exists(),
             "the only plaintext audio copy must also survive"
@@ -13296,9 +13426,9 @@
 
         let segs = state.db.raw_segments("m-err").unwrap();
         assert!(
-                        !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
-                        "an Error meeting's blob-less rows survive when its audio is gone (nothing to re-derive from)"
-                    );
+                            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+                            "an Error meeting's blob-less rows survive when its audio is gone (nothing to re-derive from)"
+                        );
     }
 
     /// LOCK MODEL (2026-07-16 lock-review fix direction): with the session KEK cached (the
@@ -13428,19 +13558,19 @@
     #[test]
     fn dto_omitting_mcp_require_token_defaults_true() {
         let json = r#"{
-                        "providerId":"claude_code",
-                        "anthropicModel":"claude-opus-4-8",
-                        "ollamaBaseUrl":"http://localhost:11434",
-                        "ollamaModel":"llama3.1",
-                        "claudeBinary":"claude",
-                        "captureSystemAudio":false,
-                        "modelSize":"large-v3",
-                        "voiceTrigger":false,
-                        "onboarded":true,
-                        "noteStyle":"standard",
-                        "autoOrganize":false,
-                        "noteLanguage":"auto"
-                    }"#;
+                            "providerId":"claude_code",
+                            "anthropicModel":"claude-opus-4-8",
+                            "ollamaBaseUrl":"http://localhost:11434",
+                            "ollamaModel":"llama3.1",
+                            "claudeBinary":"claude",
+                            "captureSystemAudio":false,
+                            "modelSize":"large-v3",
+                            "voiceTrigger":false,
+                            "onboarded":true,
+                            "noteStyle":"standard",
+                            "autoOrganize":false,
+                            "noteLanguage":"auto"
+                        }"#;
         let dto: AppConfigDto = serde_json::from_str(json).unwrap();
         assert!(
             dto.mcp_require_token,
@@ -13479,8 +13609,7 @@
             "get_config must carry the stored glossary to Settings"
         );
 
-        let mut old_client_json =
-            serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
+        let mut old_client_json = serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
         old_client_json.as_object_mut().unwrap().remove("glossary");
         let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
         assert_eq!(
@@ -13918,23 +14047,23 @@
         // (f) the FE sends camelCase `brainModelPath`; it must deserialize into the field (and an
         // omitted value defaults to None). Same minimal-but-valid JSON shape as case (c) below.
         let json_path = r#"{
-                            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
-                            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-                            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
-                            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
-                            "brainModelPath":"/m/x.gguf"
-                        }"#;
+                                "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+                                "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+                                "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+                                "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+                                "brainModelPath":"/m/x.gguf"
+                            }"#;
         let parsed: AppConfigDto = serde_json::from_str(json_path).unwrap();
         assert_eq!(parsed.brain_model_path.as_deref(), Some("/m/x.gguf"));
 
         // (c) an unknown/omitted brainBackend token deserializes to the default Cloud (no crash),
         // then flows through dto_to_config as Cloud.
         let json = r#"{
-                            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
-                            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-                            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
-                            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
-                        }"#;
+                                "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+                                "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+                                "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+                                "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
+                            }"#;
         let dto_bad: AppConfigDto = serde_json::from_str(json).unwrap();
         assert_eq!(
             dto_bad.brain_backend,
@@ -14065,9 +14194,9 @@
         ));
         let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
         assert_eq!(
-                            url,
-                            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
-                        );
+                                url,
+                                "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
+                            );
         assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
     }
 
@@ -15128,10 +15257,7 @@
             .unwrap();
         state
             .db
-            .set_note_doc_exported_hash(
-                "n1",
-                Some(&crate::export::note_content_hash("# My Note\n")),
-            )
+            .set_note_doc_exported_hash("n1", Some(&crate::export::note_content_hash("# My Note\n")))
             .unwrap();
         // The user edits the exported file behind Murmur's back.
         std::fs::write(&md, "# My Note\nMY EXTERNAL NOTE\n").unwrap();
@@ -15835,8 +15961,7 @@
             current.save(&state.db).unwrap();
         }
 
-        let mut old_client_json =
-            serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
+        let mut old_client_json = serde_json::to_value(config_to_dto(&AppConfig::default())).unwrap();
         old_client_json.as_object_mut().unwrap().remove("glossary");
         let omitted: AppConfigDto = serde_json::from_value(old_client_json).unwrap();
         save_config_inner(&state, omitted).unwrap();
@@ -15937,7 +16062,7 @@
                 catalog.source,
                 crate::commands::SOURCE_BUNDLED,
                 "{conn}: a compile-time catalog must declare itself bundled AT THE CATALOG level, \
-                             so an EMPTY one still carries provenance"
+                                 so an EMPTY one still carries provenance"
             );
             let options = catalog.options;
             assert!(!options.is_empty(), "{conn} must offer at least one model");
@@ -15952,7 +16077,7 @@
                     option.source,
                     crate::commands::SOURCE_BUNDLED,
                     "{conn}: a compile-time list must not claim to be live, or the FE offers a \
-                                 Refresh button that cannot do anything"
+                                     Refresh button that cannot do anything"
                 );
             }
             let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
@@ -16033,8 +16158,7 @@
         // The load sweep judges `provider_model` by `provider_id`, like the save boundary. It was
         // briefly pinned to `"claude_code"` here, which meant a legitimate long Anthropic id was
         // cleared on EVERY LAUNCH — silently, since load performs no user-visible edit.
-        let db =
-            Db::open_with_key(&tmp_db_path("long-anthropic-model-load"), DB_KEY).expect("open");
+        let db = Db::open_with_key(&tmp_db_path("long-anthropic-model-load"), DB_KEY).expect("open");
         db.migrate().expect("migrate");
         let long = format!("hf.co/{}/model:Q4_K_M", "a".repeat(60));
         db.set_setting("provider_id", "anthropic")
@@ -16134,7 +16258,7 @@
                 dto_to_config(dto, &current).role_notes_model,
                 long_but_valid,
                 "an INHERITING role's model is never sent, so {default_engine:?} being the default \
-                             must not destroy it"
+                                 must not destroy it"
             );
         }
         // Transport safety still applies to an inherited role — it is inert, not unchecked.
@@ -16387,12 +16511,12 @@
             }
             let usable = crate::commands::model_predicate_for(&target.connection)(&target.model);
             assert!(
-                        usable,
-                        "provider_id={provider_id:?} role={role_connection:?} resolved to \
-                             connection {:?} with model {:?}, which that arm cannot send — the ledger would \
-                             report a model the wire drops",
-                        target.connection, target.model
-                    );
+                            usable,
+                            "provider_id={provider_id:?} role={role_connection:?} resolved to \
+                                 connection {:?} with model {:?}, which that arm cannot send — the ledger would \
+                                 report a model the wire drops",
+                            target.connection, target.model
+                        );
         }
 
         // SECOND PASS, and the reason this test is worth anything on the argv legs.
@@ -16441,23 +16565,23 @@
             assert!(
                 crate::commands::connection_builds_argv(&target.connection),
                 "leg provider_id={provider_id:?} role={role_connection:?} was chosen because it \
-                             resolves to an argv arm, but resolved to {:?}",
+                                 resolves to an argv arm, but resolved to {:?}",
                 target.connection
             );
             assert!(
                 !target.model.is_empty(),
                 "provider_id={provider_id:?} role={role_connection:?} resolved to an EMPTY model, \
-                             so this leg proves nothing — the vacuity this pass exists to remove"
+                                 so this leg proves nothing — the vacuity this pass exists to remove"
             );
             assert_ne!(
-                target.model, long,
-                "an argv arm resolved to a loosely-validated field's value; `model_args` would \
-                             drop it while `effective_model_requested` still reported it to the ledger"
-            );
+                    target.model, long,
+                    "an argv arm resolved to a loosely-validated field's value; `model_args` would \
+                                 drop it while `effective_model_requested` still reported it to the ledger"
+                );
             assert!(
                 crate::commands::model_predicate_for(&target.connection)(&target.model),
                 "provider_id={provider_id:?} role={role_connection:?} resolved to connection {:?} \
-                 with model {:?}, which that arm cannot send",
+                     with model {:?}, which that arm cannot send",
                 target.connection,
                 target.model
             );
@@ -16480,11 +16604,11 @@
             ..Default::default()
         };
         assert_eq!(
-                resolve(Role::Notes, &inheriting).model,
-                "",
-                "an explicit role connection must read its OWN model key only; inheriting \
-                         `provider_model` here is the shape that would let a JSON-arm id reach an argv arm"
-            );
+                    resolve(Role::Notes, &inheriting).model,
+                    "",
+                    "an explicit role connection must read its OWN model key only; inheriting \
+                             `provider_model` here is the shape that would let a JSON-arm id reach an argv arm"
+                );
     }
 
     /// A6 STATED DIRECTLY: the LEDGER value equals the WIRE value.
@@ -16561,9 +16685,7 @@
                 "claude_code" => {
                     after_model_flag(crate::summarize::claude_code::model_args(&target.model))
                 }
-                "codex_cli" => {
-                    after_model_flag(crate::summarize::codex_cli::model_args(&target.model))
-                }
+                "codex_cli" => after_model_flag(crate::summarize::codex_cli::model_args(&target.model)),
                 // The JSON arms are NOT re-implemented here. `make_provider_resolved`'s
                 // anthropic/ollama/gateway arms now call `effective_model_requested` themselves, so
                 // asking it again is asking the production expression — not a copy of it that a
@@ -16575,11 +16697,11 @@
                 _ => String::new(),
             };
             assert_eq!(
-                ledger, wire,
-                "provider_id={provider_id:?} role={role_connection:?} seed={seed:?} resolved to \
-                             {:?}: the ledger would record {ledger:?} while the wire carries {wire:?}",
-                target.connection
-            );
+                    ledger, wire,
+                    "provider_id={provider_id:?} role={role_connection:?} seed={seed:?} resolved to \
+                                 {:?}: the ledger would record {ledger:?} while the wire carries {wire:?}",
+                    target.connection
+                );
             if long_provider_model {
                 // Prove the leg is not vacuous in the way that matters: the long id really IS
                 // stored (so a fallback could have reached it) and the resolved model really IS
@@ -16682,11 +16804,11 @@
         let saved = dto_to_config(dto, &current);
 
         assert_eq!(
-                loaded.provider_model, saved.provider_model,
-                "load and save must not disagree on an empty engine; one of them would then \
-                         silently undo the other on the next launch (empty engine reachable after load: \
-                         {empty_engine_is_reachable})"
-            );
+                    loaded.provider_model, saved.provider_model,
+                    "load and save must not disagree on an empty engine; one of them would then \
+                             silently undo the other on the next launch (empty engine reachable after load: \
+                             {empty_engine_is_reachable})"
+                );
     }
 
     /// A6 ON THE SERIALIZED BODY: what the ledger records is the `model` field the request carries.
@@ -16809,7 +16931,7 @@
             provider.model_for_test(),
             ledger,
             "if these ever become equal the substitution was removed — update this test's premise \
-                         rather than deleting it"
+                             rather than deleting it"
         );
         assert!(
             !provider.model_for_test().is_empty(),
@@ -16878,9 +17000,9 @@
             }
         }
         assert!(
-                        offenders.is_empty(),
-                        "a model-id setting is written outside AppConfig::save, bypassing both sanitizers: {offenders:?}"
-                    );
+                            offenders.is_empty(),
+                            "a model-id setting is written outside AppConfig::save, bypassing both sanitizers: {offenders:?}"
+                        );
     }
 
     /// A7 GUARD. This diff changes which model ids can be CHOSEN and how they are DISPLAYED. It
@@ -17200,8 +17322,7 @@
     #[test]
     fn list_models_unknown_connection_refuses() {
         for conn in ["", "openai", "GATEWAY", "claude"] {
-            let err =
-                static_connection_models(conn).expect_err("unknown connection must be refused");
+            let err = static_connection_models(conn).expect_err("unknown connection must be refused");
             assert!(
                 matches!(err, AppError::InvalidArg(_)),
                 "expected InvalidArg for '{conn}', got: {err:?}"
@@ -18392,9 +18513,9 @@
         // Past the (now-passing) read-gate AND the (now-passing) empty-body guard, the next real gate is
         // org-egress consent (no consent granted in this fixture) — NOT InvalidArg.
         assert!(
-                            matches!(err, AppError::Unavailable(_)),
-                            "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
-                        );
+                                matches!(err, AppError::Unavailable(_)),
+                                "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
+                            );
     }
 
     /// `preview_org_share` never egresses AND still enforces the read-gate: a sealed meeting refuses.
@@ -18406,8 +18527,7 @@
         seed_locked_meeting_with_note(&state, "f-prev", "m-prev");
 
         // Sealed → refuse (the preview is a read, so it is gated too).
-        let err =
-            preview_org_share_inner(&state, Some("m-prev".to_string()), None, true).unwrap_err();
+        let err = preview_org_share_inner(&state, Some("m-prev".to_string()), None, true).unwrap_err();
         assert!(
             matches!(err, AppError::Locked(_)),
             "sealed preview must refuse"
@@ -18689,8 +18809,7 @@
         // PUBLISHER seals under hex(content_sha) — NOT the local row id. (The server would assign a
         // different item_id; we simulate that by using a DISTINCT server id below.)
         let publisher_nonce = org_item_nonce(&content_sha);
-        let (ciphertext, feed_sha) =
-            seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
+        let (ciphertext, feed_sha) = seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
         assert_eq!(feed_sha, content_sha, "the feed carries the PLAINTEXT hash");
 
         // CONSUMER derives the nonce from ONLY the feed's content_sha256 (it never learns row_id, and
@@ -18815,9 +18934,15 @@
             "the demoted revision cannot be read by exact id"
         );
 
-        state.db.set_org_context_enabled(STABLE_ORG_ID, false).unwrap();
+        state
+            .db
+            .set_org_context_enabled(STABLE_ORG_ID, false)
+            .unwrap();
         assert!(org_get_item_inner(&state, &stable).unwrap().is_none());
-        state.db.set_org_context_enabled(STABLE_ORG_ID, true).unwrap();
+        state
+            .db
+            .set_org_context_enabled(STABLE_ORG_ID, true)
+            .unwrap();
         assert!(state.db.delete_org_state(STABLE_ORG_ID).unwrap());
         assert!(org_get_item_inner(&state, &stable).unwrap().is_none());
     }
@@ -19003,11 +19128,11 @@
             .lock()
             .execute(
                 "INSERT INTO org_items
-                                (item_id, org_id, seq, author_hint, title, markdown, created_at,
-                                 rev, generation, content_sha256, tombstoned)
-                             VALUES ('it-p', 'org-1', 2, 'mallory', 'Orphan title',
-                                     'Cloud Gateway orphan secret', '2026-07-10T10:00:00Z',
-                                     1, 1, X'01', 0)",
+                                    (item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                     rev, generation, content_sha256, tombstoned)
+                                 VALUES ('it-p', 'org-1', 2, 'mallory', 'Orphan title',
+                                         'Cloud Gateway orphan secret', '2026-07-10T10:00:00Z',
+                                         1, 1, X'01', 0)",
                 [],
             )
             .unwrap();
@@ -20137,9 +20262,9 @@
             "a stuck failed-with-item_id row still shows the source's CURRENT title"
         );
         let owned = stuck
-                            .owned_source
-                            .as_ref()
-                            .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
+                                .owned_source
+                                .as_ref()
+                                .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
         assert_eq!(owned.kind, "document");
         assert_eq!(owned.id, "n-stuck");
 
@@ -20697,12 +20822,7 @@
                 .unwrap();
             state
                 .db
-                .set_org_item_document_metadata(
-                    item_id,
-                    Some(STABLE_DOC_ID),
-                    "edit",
-                    Some("owner"),
-                )
+                .set_org_item_document_metadata(item_id, Some(STABLE_DOC_ID), "edit", Some("owner"))
                 .unwrap();
         }
         state
@@ -21379,7 +21499,7 @@
         assert_eq!(
             status.item_count, 2,
             "item_count includes the uploaded row AND the stuck failed-with-item_id row, \
-                             excluding the never-published failed row"
+                                 excluding the never-published failed row"
         );
     }
 
@@ -21610,13 +21730,10 @@
         let snapshot = build_org_share_snapshot(&state, None, Some("n-move"), true).unwrap();
         state.db.set_note_doc_folder("n-move", "f-b").unwrap();
 
-        assert!(!org_share_snapshot_is_current(
-            &state,
-            None,
-            Some("n-move"),
-            &snapshot.source_version,
-        )
-        .unwrap());
+        assert!(
+            !org_share_snapshot_is_current(&state, None, Some("n-move"), &snapshot.source_version,)
+                .unwrap()
+        );
     }
 
     /// EGRESS TOCTOU: every seal/relock/remove-lock bumps the monotonic epoch. Even when the source
@@ -21633,13 +21750,10 @@
         let snapshot = build_org_share_snapshot(&state, None, Some("n-seal"), true).unwrap();
         bump_seal_epoch(&state);
 
-        assert!(!org_share_snapshot_is_current(
-            &state,
-            None,
-            Some("n-seal"),
-            &snapshot.source_version,
-        )
-        .unwrap());
+        assert!(
+            !org_share_snapshot_is_current(&state, None, Some("n-seal"), &snapshot.source_version,)
+                .unwrap()
+        );
     }
 
     /// INLINE REPUBLISH: there is one atomic `/items` request and no anonymous `/blobs` staging
@@ -21705,13 +21819,13 @@
             let doc_id = json["docId"].as_str().unwrap();
 
             let response = tiny_http::Response::from_string(format!(
-                r#"{{"itemId":"item-new","seq":2,"docId":"{doc_id}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
-            ))
-            .with_header(
-                    "Content-Type: application/json"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                );
+                    r#"{{"itemId":"item-new","seq":2,"docId":"{doc_id}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
+                ))
+                .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    );
             req.respond(response).unwrap();
 
             // A successful supersede has exactly one follow-up: tombstone the old item. There is no
@@ -21870,8 +21984,7 @@
             2,
             "every locally-joined org yields a status (RED on a single-org .next())"
         );
-        let ids: std::collections::HashSet<&str> =
-            statuses.iter().map(|s| s.org_id.as_str()).collect();
+        let ids: std::collections::HashSet<&str> = statuses.iter().map(|s| s.org_id.as_str()).collect();
         assert!(ids.contains("org-own"), "the owned org appears");
         assert!(ids.contains("org-inv"), "the invited org appears");
 
@@ -21895,12 +22008,12 @@
             // refresh. The aggregate must still return the cached content-free status.
             let body = r#"{"orgId":"wrong-org","name":"Wrong","role":"member","createdAt":"2026-08-13T00:00:00Z","currentGeneration":1}"#;
             write!(
-                socket,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
 
         let state = build_state("org-list-statuses-partial-unavailable");
@@ -21922,9 +22035,7 @@
             crate::share::org_dto::OrgItemAccess::View
         );
         assert_eq!(
-            org_access_or_view_for_test(Some(
-                crate::share::org_dto::OrgItemAccess::Edit
-            )),
+            org_access_or_view_for_test(Some(crate::share::org_dto::OrgItemAccess::Edit)),
             crate::share::org_dto::OrgItemAccess::Edit
         );
     }
@@ -22002,12 +22113,12 @@
             let _ = socket.read(&mut request).unwrap();
             let body = r#"{"orgs":[]}"#;
             write!(
-                socket,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
             listener.set_nonblocking(true).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
             loop {
@@ -22032,14 +22143,19 @@
         let link_id = format!("{org_id}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
         seed_org(&state.db, org_id, "Acme", "member", 1);
         make_open_folder(&state.db, "f-empty", "Empty reconcile");
-        seed_meeting(&state.db, "private-local-anchor", "# local", Some("f-empty"));
+        seed_meeting(
+            &state.db,
+            "private-local-anchor",
+            "# local",
+            Some("f-empty"),
+        );
         seed_live_session(&state);
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
         state.db.lock().execute(
-            "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
-             VALUES ('org',?1,'meeting','private-local-anchor','manual',1.0,'user','active',1)",
-            [link_id.as_str()],
-        ).unwrap();
+                "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+                 VALUES ('org',?1,'meeting','private-local-anchor','manual',1.0,'user','active',1)",
+                [link_id.as_str()],
+            ).unwrap();
 
         block_on(org_reconcile_memberships_notifying(&state, None)).unwrap();
         assert_eq!(
@@ -22077,16 +22193,16 @@
             let exact_status = exact_status.to_string();
             let server = std::thread::spawn(move || {
                 for response in [
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"orgs\":[]}".to_string(),
-                    format!(
-                        "HTTP/1.1 {exact_status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                    ),
-                ] {
-                    let (mut socket, _) = listener.accept().unwrap();
-                    let mut request = [0u8; 4096];
-                    let _ = socket.read(&mut request).unwrap();
-                    socket.write_all(response.as_bytes()).unwrap();
-                }
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"orgs\":[]}".to_string(),
+                        format!(
+                            "HTTP/1.1 {exact_status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        ),
+                    ] {
+                        let (mut socket, _) = listener.accept().unwrap();
+                        let mut request = [0u8; 4096];
+                        let _ = socket.read(&mut request).unwrap();
+                        socket.write_all(response.as_bytes()).unwrap();
+                    }
             });
             let state = build_state(tag);
             seed_org(
@@ -22097,14 +22213,14 @@
                 1,
             );
             state
-                .db
-                .lock()
-                .execute(
-                    "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
-                     VALUES ('org','11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','note','local-note','manual',1.0,'user','active',1)",
-                    [],
-                )
-                .unwrap();
+                    .db
+                    .lock()
+                    .execute(
+                        "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+                         VALUES ('org','11111111-1111-4111-8111-111111111111:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','note','local-note','manual',1.0,'user','active',1)",
+                        [],
+                    )
+                    .unwrap();
             seed_live_session(&state);
             state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
             state.config.lock().unwrap().org_egress_consented = true;
@@ -22146,7 +22262,10 @@
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(private_links, 1, "a failed corroboration preserves private links");
+        assert_eq!(
+            private_links, 1,
+            "a failed corroboration preserves private links"
+        );
         assert_eq!(
             failed
                 .db
@@ -22169,10 +22288,10 @@
             Some("f-empty-core"),
         );
         state.db.lock().execute(
-            "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
-             VALUES ('org','org-1:doc-1','meeting','private-local-anchor','manual',1.0,'user','active',1)",
-            [],
-        ).unwrap();
+                "INSERT INTO links (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+                 VALUES ('org','org-1:doc-1','meeting','private-local-anchor','manual',1.0,'user','active',1)",
+                [],
+            ).unwrap();
 
         let outcome = reconcile_org_state_into_db(&state, &[]).unwrap();
         assert_eq!(outcome.removed, 0);
@@ -22243,10 +22362,8 @@
     /// zero plaintext; a joined org traverses the real feed + blob + open + storage chain.
     #[test]
     fn org_sync_import_requires_membership_before_feed_and_plaintext_commit() {
+        use crate::share::org_envelope::{seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind};
         use std::io::{Read, Write};
-        use crate::share::org_envelope::{
-            seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind,
-        };
 
         let ock = [9_u8; 32];
         let env = OrgEnvelope::new(
@@ -22279,6 +22396,7 @@
                     }
                     Err(error) => panic!("member import mock accept failed: {error}"),
                 };
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                     .unwrap();
@@ -22288,29 +22406,31 @@
                 let first_line = request.lines().next().unwrap_or_default().to_string();
                 requests_for_server.lock().unwrap().push(first_line.clone());
                 assert!(
-                    request.to_ascii_lowercase().contains("authorization: bearer a"),
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer a"),
                     "both feed and blob reads must use the authenticated session"
                 );
 
                 if first_line.contains("/v1/orgs/org-member/items?") {
                     let body = format!(
-                        "{{\"items\":[{{\"itemId\":\"member-item\",\"seq\":1,\"authorUserId\":\"author-1\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-07-11T09:00:00Z\",\"tombstoned\":false,\"blobId\":\"member-blob\",\"contentSha256\":\"{}\"}}],\"nextSeq\":1}}",
-                        murmur_protocol::b64::encode(&sha)
-                    );
+                            "{{\"items\":[{{\"itemId\":\"member-item\",\"seq\":1,\"authorUserId\":\"author-1\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-07-11T09:00:00Z\",\"tombstoned\":false,\"blobId\":\"member-blob\",\"contentSha256\":\"{}\"}}],\"nextSeq\":1}}",
+                            murmur_protocol::b64::encode(&sha)
+                        );
                     write!(
-                        socket,
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                    .unwrap();
+                            socket,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .unwrap();
                 } else if first_line.contains("/v1/blobs/member-blob") {
                     write!(
-                        socket,
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        ciphertext.len()
-                    )
-                    .unwrap();
+                            socket,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            ciphertext.len()
+                        )
+                        .unwrap();
                     socket.write_all(&ciphertext).unwrap();
                 } else {
                     panic!("unexpected member import request: {first_line}");
@@ -22389,9 +22509,9 @@
             // seq 6: TOMBSTONE → applies without a key/blob (the "good" item behind the poison one).
             let body = r#"{"items":[{"itemId":"poison","seq":5,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":null,"contentSha256":null},{"itemId":"good-tomb","seq":6,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:01:00Z","tombstoned":true,"blobId":null,"contentSha256":null}],"nextSeq":6}"#;
             let resp = format!(
-                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
             let _ = sock.write_all(resp.as_bytes());
         });
 
@@ -22433,6 +22553,428 @@
             state.db.get_org_state("org-x").unwrap().unwrap().last_seq,
             6,
             "cursor advanced past the terminal item AND the good one (RED on break-all: stayed at 4)"
+        );
+    }
+
+    /// READER-FIRST TASK COMPATIBILITY. This runs the real encrypted feed/blob/open/apply loop with
+    /// the exact kind discriminator frozen from the pre-Task client revision. A Task cell at seq 2
+    /// must fail that old reader closed, claim only seq 2 through the production terminal-skip path,
+    /// and still ingest the following Note at seq 3 in the same page. The pinned revision, source
+    /// blob, source hash and canonical content hashes make this an executable old-client receipt,
+    /// rather than a handwritten assertion that byte tag 3 is merely "unknown".
+    #[test]
+    fn pre_task_reader_terminal_skips_encrypted_task_and_ingests_later_note() {
+        use crate::share::org_envelope::{seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind};
+        use crate::share::task_envelope::{TaskEnvelope, TaskStatus, TASK_ENVELOPE_VERSION};
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+        use std::process::Command;
+
+        let historical_source = |path: &str| -> (String, String) {
+            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap();
+            let revision_path = format!("{PRE_TASK_READER_COMPAT_REVISION}:{path}");
+            let source = Command::new("git")
+                .args(["-C"])
+                .arg(repo)
+                .args(["show", &revision_path])
+                .output()
+                .expect("the pinned pre-Task source revision must be locally readable");
+            assert!(source.status.success(), "git show failed for {revision_path}");
+            let blob = Command::new("git")
+                .args(["-C"])
+                .arg(repo)
+                .args(["rev-parse", &revision_path])
+                .output()
+                .expect("the pinned pre-Task source blob must be locally readable");
+            assert!(blob.status.success(), "git rev-parse failed for {revision_path}");
+            (
+                String::from_utf8(source.stdout).unwrap(),
+                String::from_utf8(blob.stdout).unwrap().trim().to_string(),
+            )
+        };
+        let source_window = |source: &str, marker: &str, line_count: usize| -> String {
+            let start = source
+                .lines()
+                .position(|line| line.contains(marker))
+                .expect("frozen release source marker");
+            let mut window = source
+                .lines()
+                .skip(start)
+                .take(line_count)
+                .collect::<Vec<_>>()
+                .join("\n");
+            window.push('\n');
+            window
+        };
+
+        assert_eq!(
+            PRE_TASK_READER_REVISION,
+            "abb6971607d221bfe728d4ff5202ccde7872fcf8"
+        );
+        assert_eq!(PRE_TASK_READER_RELEASE_TAG, "v1.1.0");
+        assert_eq!(
+            PRE_TASK_READER_RELEASE_SUBJECT,
+            "Merge pull request #533 from murmur-io/chore/release-1.1.0"
+        );
+        assert_eq!(
+            PRE_TASK_READER_COMPAT_REVISION,
+            "2e6ff1eaa35273347a19e7284837f86432f80195"
+        );
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let writer_candidate = Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("the immutable Harness snapshot revision must be readable");
+        assert!(writer_candidate.status.success());
+        let writer_candidate = String::from_utf8(writer_candidate.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(writer_candidate.len(), 40);
+        assert!(writer_candidate.chars().all(|ch| ch.is_ascii_hexdigit()));
+        let ordered = Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                PRE_TASK_READER_COMPAT_REVISION,
+                &writer_candidate,
+            ])
+            .status()
+            .expect("reader-first ancestry must be checkable");
+        assert!(
+            ordered.success(),
+            "the frozen pre-Task compatibility snapshot must precede the Task writer candidate"
+        );
+        println!(
+            "MURMUR_TASK_READER_FIRST_RELEASE tag={} release_sha={} compat_sha={} writer_candidate_sha={}",
+            PRE_TASK_READER_RELEASE_TAG,
+            PRE_TASK_READER_REVISION,
+            PRE_TASK_READER_COMPAT_REVISION,
+            writer_candidate
+        );
+        assert_eq!(
+            PRE_TASK_ORG_ENVELOPE_BLOB_SHA1,
+            "7a49b5b7b70ab3ea0cd66e77280866b61c6780ee"
+        );
+        assert_eq!(
+            PRE_TASK_ORG_ENVELOPE_SOURCE_SHA256,
+            "18e76f37177cee674bec35df3849fcbbbe50d504603f6e40fb36d7660a41070f"
+        );
+        assert_eq!(
+            PRE_TASK_RELEASE_ORG_COMMANDS_BLOB_SHA1,
+            "141290c2e518dfab109df9ff93be09b50d586a65"
+        );
+        assert_eq!(
+            PRE_TASK_RELEASE_ORG_COMMANDS_SOURCE_SHA256,
+            "a88eacd9920b9a47221804910e467f52f7eb546ba9dec676cab7a250a6029392"
+        );
+        assert_eq!(
+            PRE_TASK_KIND_DISCRIMINATOR_SHA256,
+            "6fe0b52de9d7165a21e04dc6b11f92252ca796d2308a02c8427671f233426210"
+        );
+        assert_eq!(
+            PRE_TASK_TERMINAL_SKIP_SHA256,
+            "ee38b7539c693e708a0c9df61fa5404224eb27f82e52fa61c1fe265fd1e5254a"
+        );
+
+        let (envelope_source, envelope_blob) =
+            historical_source("src-tauri/src/share/org_envelope.rs");
+        assert_eq!(envelope_blob, PRE_TASK_ORG_ENVELOPE_BLOB_SHA1);
+        assert_eq!(
+            org_item_nonce(&Sha256::digest(envelope_source.as_bytes())),
+            PRE_TASK_ORG_ENVELOPE_SOURCE_SHA256
+        );
+        let kind_discriminator = source_window(
+            &envelope_source,
+            "fn from_tag(t: u8) -> Result<Self> {",
+            7,
+        );
+        assert_eq!(
+            org_item_nonce(&Sha256::digest(kind_discriminator.as_bytes())),
+            PRE_TASK_KIND_DISCRIMINATOR_SHA256,
+            "the immediate pre-Task reader must retain the exact v1.1.0 kind discriminator"
+        );
+        assert!(envelope_source.contains("1 => Ok(OrgItemKind::Note)"));
+        assert!(envelope_source.contains("2 => Ok(OrgItemKind::Summary)"));
+        assert!(envelope_source.contains(
+            "_ => Err(AppError::InvalidArg(\"unknown org item kind tag\".into()))"
+        ));
+        assert!(
+            !envelope_source.contains("3 => Ok(OrgItemKind::Task)"),
+            "the pinned reader source itself must prove Task tag 3 was unknown"
+        );
+
+        let (feed_source, feed_blob) = historical_source("src-tauri/src/commands/org.rs");
+        assert_eq!(feed_blob, PRE_TASK_COMPAT_ORG_COMMANDS_BLOB_SHA1);
+        assert_eq!(
+            org_item_nonce(&Sha256::digest(feed_source.as_bytes())),
+            PRE_TASK_COMPAT_ORG_COMMANDS_SOURCE_SHA256
+        );
+        let terminal_skip = source_window(
+            &feed_source,
+            "FeedAction::SkipTerminal { seq } => {",
+            6,
+        );
+        assert_eq!(
+            org_item_nonce(&Sha256::digest(terminal_skip.as_bytes())),
+            PRE_TASK_TERMINAL_SKIP_SHA256,
+            "the immediate pre-Task reader must retain the exact v1.1.0 terminal-skip arm"
+        );
+        assert!(feed_source.contains(
+            "let env = match crate::share::org_envelope::open_org_envelope("
+        ));
+        assert!(feed_source.contains("actions.push(FeedAction::SkipTerminal { seq: item.seq });"));
+        assert!(feed_source.contains(
+            "policy.commit(|| db.commit_org_feed_terminal_skip(&org_id, seq))?"
+        ));
+        // Rollout receipt: the verified reader+feed implementation shipped in v1.1.0, the generic
+        // stable-document relay already accepted opaque ciphertext, and only the descendant
+        // immutable Harness writer candidate adds Task writers. Old readers therefore skip tag 3
+        // before any Task writer can publish it.
+
+        let ock = [13_u8; 32];
+        let task_payload = TaskEnvelope {
+            version: TASK_ENVELOPE_VERSION,
+            org_id: STABLE_ORG_ID.into(),
+            title: "Legacy task".into(),
+            description: "must remain opaque to the old reader".into(),
+            status: TaskStatus::Todo,
+            due_at: None,
+            assignee_user_id: None,
+            created_at: "2026-08-22T09:00:01Z".into(),
+            subtasks: Vec::new(),
+            org_refs: Vec::new(),
+            images: Vec::new(),
+        };
+        let task_json = task_payload.to_canonical_json(STABLE_ORG_ID).unwrap();
+        let task = OrgEnvelope::new(
+            OrgItemKind::Task,
+            "Legacy task",
+            task_json,
+            "author",
+            "2026-08-22T09:00:01Z",
+            1,
+            OrgSourceKind::Task,
+        );
+        let later_note = OrgEnvelope::new(
+            OrgItemKind::Note,
+            "Later note",
+            "the old reader must still ingest this plaintext",
+            "author",
+            "2026-08-22T09:00:02Z",
+            1,
+            OrgSourceKind::Document,
+        );
+        let task_sha = task.content_sha256();
+        let note_sha = later_note.content_sha256();
+        assert_eq!(
+            org_item_nonce(&task_sha),
+            "a88cb0d3e7e6666c7fe99a896a0b93d6af359e19c034111f5dc6e91dc60032f3"
+        );
+        assert_eq!(
+            org_item_nonce(&note_sha),
+            "e1016d285098bd1157747918cce8d33ffeb85ad7f27140964e70bd0cf4134916"
+        );
+        let (task_ciphertext, _) = seal_org_envelope(
+            &ock,
+            &task,
+            STABLE_ORG_ID,
+            &org_item_nonce(&task_sha),
+        )
+        .unwrap();
+        let (note_ciphertext, _) = seal_org_envelope(
+            &ock,
+            &later_note,
+            STABLE_ORG_ID,
+            &org_item_nonce(&note_sha),
+        )
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut socket, _) = accept_with_timeout(&listener);
+                socket.set_nonblocking(false).unwrap();
+                let mut request = [0_u8; 8192];
+                let read = socket.read(&mut request).unwrap();
+                let first_line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if first_line.contains("/v1/orgs/") {
+                    let body = format!(
+                        "{{\"items\":[{{\"itemId\":\"legacy-task-item\",\"seq\":2,\"authorUserId\":\"author-1\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-22T09:00:01Z\",\"tombstoned\":false,\"blobId\":\"legacy-task-blob\",\"contentSha256\":\"{}\"}},{{\"itemId\":\"later-note-item\",\"seq\":3,\"authorUserId\":\"author-1\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-22T09:00:02Z\",\"tombstoned\":false,\"blobId\":\"later-note-blob\",\"contentSha256\":\"{}\"}}],\"nextSeq\":3}}",
+                        murmur_protocol::b64::encode(&task_sha),
+                        murmur_protocol::b64::encode(&note_sha),
+                    );
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    )
+                    .unwrap();
+                } else {
+                    let ciphertext = if first_line.contains("/v1/blobs/legacy-task-blob") {
+                        &task_ciphertext
+                    } else if first_line.contains("/v1/blobs/later-note-blob") {
+                        &note_ciphertext
+                    } else {
+                        panic!("unexpected legacy reader request: {first_line}");
+                    };
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        ciphertext.len(),
+                    )
+                    .unwrap();
+                    socket.write_all(ciphertext).unwrap();
+                }
+                socket.flush().unwrap();
+            }
+        });
+
+        let state = build_state("pre-task-reader-feed");
+        seed_org(&state.db, STABLE_ORG_ID, "Reader-first org", "member", 1);
+        let before = Db::prepare_org_item_index("Earlier note", "t", "earlier body", None).unwrap();
+        assert!(state
+            .db
+            .commit_org_feed_item(
+                "earlier-note-item",
+                STABLE_ORG_ID,
+                1,
+                "author",
+                "Earlier note",
+                "earlier body",
+                "2026-08-22T09:00:00Z",
+                1,
+                1,
+                &[1_u8; 32],
+                Some("document"),
+                Some("author-1"),
+                &before,
+            )
+            .unwrap());
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        seed_live_session(&state);
+        state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .insert((STABLE_ORG_ID.to_string(), 1), Zeroizing::new(ock));
+
+        let report = block_on(org_sync_one_now_with_pre_task_reader(
+            &state,
+            STABLE_ORG_ID,
+        ))
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(report.pulled, 2);
+        assert_eq!(report.ingested, 1, "only the later Note may project plaintext");
+        assert_eq!(state.db.org_last_seq_for(STABLE_ORG_ID).unwrap(), 3);
+        assert!(state.db.get_org_item("legacy-task-item").unwrap().is_none());
+        assert!(state.db.list_org_tasks(Some(STABLE_ORG_ID)).unwrap().is_empty());
+        assert_eq!(
+            state
+                .db
+                .get_org_item("later-note-item")
+                .unwrap()
+                .unwrap()
+                .markdown,
+            "the old reader must still ingest this plaintext"
+        );
+        assert!(report.errors.iter().any(|error| {
+            error.contains("legacy-task-item") && error.contains("envelope open failed")
+        }));
+    }
+
+    /// Cross-repository stable-wire receipt. The client-owned JSON vectors are deserialized by the
+    /// exact `murmur_protocol::dto` crate from the sibling server revision pinned by
+    /// `.murmur-server-revision`; this is stronger than checking only a client mock or only the
+    /// server's independent suite.
+    #[test]
+    fn task_stable_post_and_put_vectors_match_pinned_server_protocol() {
+        use crate::share::org_dto::{
+            OrgItemAccess, PublishItemRequest as ClientPublish,
+            UpdateOrgItemRequest as ClientUpdate,
+        };
+        use std::process::Command;
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let pinned = std::fs::read_to_string(repo.join(".murmur-server-revision"))
+            .expect("server revision pin")
+            .trim()
+            .to_string();
+        let server_repo = repo.parent().unwrap().join("murmur-server");
+        let server_head = Command::new("git")
+            .args(["-C"])
+            .arg(&server_repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("pinned sibling server checkout must be readable");
+        assert!(server_head.status.success());
+        assert_eq!(
+            String::from_utf8(server_head.stdout).unwrap().trim(),
+            pinned,
+            "the protocol DTO parser must come from the exact pinned server checkout"
+        );
+
+        let doc_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let cell = vec![0, 255, 1, 254, 2, 253];
+        let semantic_sha = vec![7; 32];
+        let post = ClientPublish {
+            mutation_id: None,
+            doc_id: Some(doc_id.into()),
+            access: Some(OrgItemAccess::Edit),
+            blob_id: None,
+            content_cell: Some(cell.clone()),
+            content_sha256: semantic_sha.clone(),
+            rev: 1,
+            generation: 3,
+        };
+        let post_json = serde_json::to_vec(&post).unwrap();
+        let server_post: murmur_protocol::dto::PublishItemRequest =
+            serde_json::from_slice(&post_json).expect("pinned server must accept Task POST vector");
+        assert_eq!(server_post.doc_id.as_deref(), Some(doc_id));
+        assert_eq!(server_post.rev, 1);
+        assert_eq!(server_post.generation, 3);
+        assert_eq!(server_post.content_cell.as_deref(), Some(cell.as_slice()));
+        assert_eq!(server_post.content_sha256, semantic_sha);
+        assert!(matches!(
+            server_post.access,
+            Some(murmur_protocol::dto::OrgItemAccess::Edit)
+        ));
+
+        let update = ClientUpdate {
+            mutation_id: None,
+            expected_rev: 1,
+            content_cell: cell.clone(),
+            content_sha256: vec![8; 32],
+            generation: 3,
+        };
+        let update_json = serde_json::to_vec(&update).unwrap();
+        let server_update: murmur_protocol::dto::UpdateOrgItemRequest =
+            serde_json::from_slice(&update_json).expect("pinned server must accept Task PUT vector");
+        assert_eq!(server_update.expected_rev, 1);
+        assert_eq!(server_update.generation, 3);
+        assert_eq!(server_update.content_cell, cell);
+        assert_eq!(server_update.content_sha256, vec![8; 32]);
+        assert!(server_update.mutation_id.is_none());
+        println!(
+            "MURMUR_TASK_PINNED_PROTOCOL server_sha={} post_rev=1 put_expected_rev=1 stable_doc_id={}",
+            pinned, doc_id
         );
     }
 
@@ -22484,9 +23026,9 @@
                     r#"{"items":[],"nextSeq":5}"#.to_string()
                 };
                 let resp = format!(
-                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
                 let _ = sock.write_all(resp.as_bytes());
                 let _ = sock.flush();
                 let _ = sock.shutdown(std::net::Shutdown::Write);
@@ -22734,9 +23276,9 @@
         assert_eq!(second[0].document_id.as_deref(), Some("n-share"));
         let first = state.db.list_org_shares_for_org("org-first").unwrap();
         assert!(
-                            first.is_empty(),
-                            "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
-                        );
+                                first.is_empty(),
+                                "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
+                            );
     }
 
     // ── RE-PUBLISH-ON-EDIT (the stale-org-copy fix) — end-to-end against a MOCK org server ─────────
@@ -22751,6 +23293,7 @@
         tombstoned: Vec<String>,
         published_content_sha256: Vec<String>,
         published_content_cells: Vec<String>,
+        published_expected_revs: Vec<Option<u64>>,
         /// The feed the mock serves from `GET /v1/orgs/{id}/items?sinceSeq=&limit=`, ascending by
         /// `seq`. Seeded by a test (see `MockOrgServer::seed_feed`) so the anti-entropy reconcile
         /// sweep can be driven headless. METADATA ONLY — a record that is tombstoned, or whose
@@ -22810,10 +23353,10 @@
                 None => String::new(),
             };
             format!(
-                        "{{\"itemId\":\"{}\",\"seq\":{},\"authorUserId\":\"author-1\",\"rev\":1,\
-                              \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}}}",
-                        self.item_id, self.seq, self.tombstoned, sha
-                    )
+                            "{{\"itemId\":\"{}\",\"seq\":{},\"authorUserId\":\"author-1\",\"rev\":1,\
+                                  \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}}}",
+                            self.item_id, self.seq, self.tombstoned, sha
+                        )
         }
     }
 
@@ -22883,6 +23426,9 @@
                                     .unwrap_or(serde_json::Value::Null);
                                 {
                                     let body = &parsed;
+                                    log_t.lock().unwrap().published_expected_revs.push(
+                                        body.get("expectedRev").and_then(serde_json::Value::as_u64),
+                                    );
                                     if let Some(sha) = body
                                         .get("contentSha256")
                                         .and_then(serde_json::Value::as_str)
@@ -22919,8 +23465,8 @@
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("view");
                                 let body = format!(
-                                                "{{\"itemId\":\"{item_id}\",\"seq\":{seq},\"docId\":\"{doc_id}\",\"access\":\"{access}\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}"
-                                            );
+                                                    "{{\"itemId\":\"{item_id}\",\"seq\":{seq},\"docId\":\"{doc_id}\",\"access\":\"{access}\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}"
+                                                );
                                 let resp = tiny_http::Response::from_string(body).with_header(
                                     "Content-Type: application/json"
                                         .parse::<tiny_http::Header>()
@@ -23106,7 +23652,10 @@
             )));
             let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
-            assert!(json.get("mutationId").is_none(), "old strict relay rejects even a null mutationId");
+            assert!(
+                json.get("mutationId").is_none(),
+                "old strict relay rejects even a null mutationId"
+            );
             assert_eq!(json["expectedRev"], 1);
             assert_eq!(json["generation"], 1);
             let sha = json["contentSha256"].as_str().unwrap().to_string();
@@ -23117,15 +23666,15 @@
             assert!(String::from_utf8_lossy(&request)
                 .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-new\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"{authoritative_access}\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
-            );
+                    "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-new\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"{authoritative_access}\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
+                );
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
         (format!("http://{addr}/"), server)
     }
@@ -23138,10 +23687,7 @@
         state.config.lock().unwrap().share_base_url = base;
 
         let updated = block_on(org_update_own_item_inner(
-            &state,
-            "item-old",
-            "Updated",
-            "new body",
+            &state, "item-old", "Updated", "new body",
         ));
         server.join().unwrap();
         assert_eq!(updated.unwrap(), "item-new");
@@ -23168,10 +23714,7 @@
         state.config.lock().unwrap().share_base_url = base;
 
         let error = block_on(org_update_own_item_inner(
-            &state,
-            "item-old",
-            "Updated",
-            "new body",
+            &state, "item-old", "Updated", "new body",
         ));
         server.join().unwrap();
         assert!(matches!(
@@ -23211,19 +23754,24 @@
             let (mut get, _) = accept_with_timeout(&listener);
             let _ = read_http_request(&mut get);
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"attempt-a\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"newer-b\",\"seq\":3,\"authorUserId\":\"other\",\"rev\":3,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"contentSha256\":\"{}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":3}}",
-                murmur_protocol::b64::encode(&[9u8;32]),
-            );
+                    "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"attempt-a\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"newer-b\",\"seq\":3,\"authorUserId\":\"other\",\"rev\":3,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":false,\"contentSha256\":\"{}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":3}}",
+                    murmur_protocol::b64::encode(&[9u8;32]),
+                );
             write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
         });
         let state = build_state("org-direct-demoted-inconclusive");
-        seed_editable_stable_org_item(&state,"item-old","edit");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
-        assert!(matches!(block_on(org_update_own_item_inner(&state,"item-old","Updated","body")), Err(AppError::Unavailable(_))));
+        assert!(matches!(
+            block_on(org_update_own_item_inner(
+                &state, "item-old", "Updated", "body"
+            )),
+            Err(AppError::Unavailable(_))
+        ));
         server.join().unwrap();
         let pending = state.db.list_org_shares_in_state("failed").unwrap();
-        assert_eq!(pending.len(),1);
-        assert_eq!(pending[0].last_error.as_deref(),Some("direct_put_pending"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].last_error.as_deref(), Some("direct_put_pending"));
         assert!(state.db.get_org_item("attempt-a").unwrap().is_none());
     }
 
@@ -23241,31 +23789,31 @@
             )));
             let wrong_doc = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
             let wrong = format!(
-                "{{\"itemId\":\"wrong-doc-head\",\"seq\":2,\"docId\":\"{wrong_doc}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}"
-            );
+                    "{{\"itemId\":\"wrong-doc-head\",\"seq\":2,\"docId\":\"{wrong_doc}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}"
+                );
             write!(
-                put,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                wrong.len(),
-                wrong
-            )
-            .unwrap();
+                    put,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    wrong.len(),
+                    wrong
+                )
+                .unwrap();
 
             let old_hash = murmur_protocol::b64::encode(&[1u8; 32]);
             let old = format!(
-                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{old_hash}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":1}}"
-            );
+                    "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{old_hash}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":1}}"
+                );
             for _ in 0..2 {
                 let (mut get, _) = accept_with_timeout(&listener);
                 let request = read_http_request(&mut get);
                 assert!(String::from_utf8_lossy(&request)
                     .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
                 write!(
-                    get,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    old.len(), old
-                )
-                .unwrap();
+                        get,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        old.len(), old
+                    )
+                    .unwrap();
             }
         });
 
@@ -23273,10 +23821,7 @@
         seed_editable_stable_org_item(&state, "item-old", "edit");
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
         let result = block_on(org_update_own_item_inner(
-            &state,
-            "item-old",
-            "Updated",
-            "new body",
+            &state, "item-old", "Updated", "new body",
         ));
         assert!(matches!(result, Err(AppError::Unavailable(_))));
         let attempt = state
@@ -23291,7 +23836,10 @@
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
         server.join().unwrap();
         let still_pending = state.db.get_org_share(&attempt.id).unwrap().unwrap();
-        assert_eq!(still_pending.last_error.as_deref(), Some("direct_put_pending"));
+        assert_eq!(
+            still_pending.last_error.as_deref(),
+            Some("direct_put_pending")
+        );
         assert_eq!(
             state
                 .db
@@ -23324,10 +23872,7 @@
         seed_editable_stable_org_item(&state, "item-old", "edit");
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
         let result = block_on(org_update_own_item_inner(
-            &state,
-            "item-old",
-            "Updated",
-            "new body",
+            &state, "item-old", "Updated", "new body",
         ));
         server.join().unwrap();
         assert!(matches!(
@@ -23398,11 +23943,7 @@
             .unwrap();
         state
             .db
-            .set_org_share_uploaded(
-                "share-direct-origin",
-                "item-old",
-                "2026-08-13T00:00:00Z",
-            )
+            .set_org_share_uploaded("share-direct-origin", "item-old", "2026-08-13T00:00:00Z")
             .unwrap();
         state
             .db
@@ -23411,10 +23952,7 @@
         state.config.lock().unwrap().share_base_url = format!("http://{first_addr}/");
         assert!(matches!(
             block_on(org_update_own_item_inner(
-                &state,
-                "item-old",
-                "Updated",
-                "new body",
+                &state, "item-old", "Updated", "new body",
             )),
             Err(AppError::Unavailable(_))
         ));
@@ -23425,8 +23963,14 @@
             .unwrap()
             .remove(0);
         assert_eq!(pending.last_error.as_deref(), Some("direct_put_pending"));
-        assert_eq!(pending.expected_actor_user_id.as_deref(), Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"));
-        assert_eq!(pending.expected_owner_user_id.as_deref(), Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"));
+        assert_eq!(
+            pending.expected_actor_user_id.as_deref(),
+            Some("c534b6d2-02c1-4c2c-a256-3af8592b1567")
+        );
+        assert_eq!(
+            pending.expected_owner_user_id.as_deref(),
+            Some("c534b6d2-02c1-4c2c-a256-3af8592b1567")
+        );
 
         let no_mutation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         no_mutation.set_nonblocking(true).unwrap();
@@ -23447,7 +23991,11 @@
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
         assert_eq!(
-            state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap().len(),
+            state
+                .db
+                .list_org_shares_for_org(STABLE_ORG_ID)
+                .unwrap()
+                .len(),
             1,
             "sharing during direct reconciliation must not mint a second row"
         );
@@ -23476,8 +24024,15 @@
             no_mutation.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
-        let still_pending = state.db.get_org_share("share-direct-origin").unwrap().unwrap();
-        assert_eq!(still_pending.last_error.as_deref(), Some("direct_put_pending"));
+        let still_pending = state
+            .db
+            .get_org_share("share-direct-origin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still_pending.last_error.as_deref(),
+            Some("direct_put_pending")
+        );
         assert_eq!(still_pending.rev, pending.rev);
         assert_eq!(still_pending.content_sha256, pending.content_sha256);
         assert_eq!(
@@ -23498,24 +24053,33 @@
             assert!(String::from_utf8_lossy(&request)
                 .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-new\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
-            );
+                    "{{\"items\":[{{\"itemId\":\"item-old\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-new\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
+                );
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
         state.config.lock().unwrap().share_base_url = format!("http://{second_addr}/");
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
         second_server.join().unwrap();
         let confirmed = state.db.list_org_shares_in_state("failed").unwrap();
         assert_eq!(confirmed.len(), 1);
-        assert_eq!(confirmed[0].last_error.as_deref(), Some("projection_pending"));
+        assert_eq!(
+            confirmed[0].last_error.as_deref(),
+            Some("projection_pending")
+        );
         assert_eq!(confirmed[0].item_id.as_deref(), Some("item-new"));
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(), 1);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1
+        );
     }
 
     /// An ambiguous initial POST may have committed remotely even though its response was lost.
@@ -23543,9 +24107,7 @@
                 .unwrap()
                 .expect("ambiguous POST recovery GET was never dispatched");
             assert_eq!(request.method().as_str(), "GET");
-            request
-                .respond(tiny_http::Response::empty(503))
-                .unwrap();
+            request.respond(tiny_http::Response::empty(503)).unwrap();
         });
 
         let state = build_state("org-sweep-unscrubbed-replay");
@@ -23597,7 +24159,11 @@
 
         let retried = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
         assert_eq!(retried.len(), 1);
-        assert_eq!(retried[0].state, "uploaded", "row after replay: {:?}", retried[0]);
+        assert_eq!(
+            retried[0].state, "uploaded",
+            "row after replay: {:?}",
+            retried[0]
+        );
         assert!(!retried[0].scrub, "the sweep must replay with scrub=false");
         assert_eq!(
             retried[0].content_sha256.as_deref(),
@@ -23677,16 +24243,16 @@
             assert!(String::from_utf8_lossy(&request)
                 .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"{old_item_id}\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":{},\"generation\":{generation},\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-edit-recovered\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":{edit_rev},\"generation\":{generation},\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{edit_sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}",
-                edit_rev - 1,
-            );
+                    "{{\"items\":[{{\"itemId\":\"{old_item_id}\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":{},\"generation\":{generation},\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}},{{\"itemId\":\"item-edit-recovered\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":{edit_rev},\"generation\":{generation},\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{edit_sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}",
+                    edit_rev - 1,
+                );
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                )
+                .unwrap();
         });
         state.config.lock().unwrap().share_base_url = format!("http://{recovery_addr}/");
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
@@ -23753,10 +24319,10 @@
             assert!(String::from_utf8_lossy(&request)
                 .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
             write!(
-                post,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{{"
-            )
-            .unwrap();
+                    post,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{{"
+                )
+                .unwrap();
             let (mut get, _) = accept_with_timeout(&first);
             let request = read_http_request(&mut get);
             assert!(String::from_utf8_lossy(&request)
@@ -23805,17 +24371,16 @@
                 .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
             let body = "{\"items\":[],\"nextSeq\":0}";
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                )
+                .unwrap();
         });
         state.config.lock().unwrap().share_base_url = format!("http://{absence_addr}/");
         assert_eq!(
-            block_on(org_sweep_pending_background_once_inner(&state))
-            .unwrap(),
+            block_on(org_sweep_pending_background_once_inner(&state)).unwrap(),
             0
         );
         absence_server.join().unwrap();
@@ -23824,7 +24389,10 @@
             .list_org_shares_in_state("failed")
             .unwrap()
             .remove(0);
-        assert_eq!(replayable.last_error.as_deref(), Some("initial_post_replayable"));
+        assert_eq!(
+            replayable.last_error.as_deref(),
+            Some("initial_post_replayable")
+        );
         let original_actor = replayable.expected_actor_user_id.clone();
         let original_owner = replayable.expected_owner_user_id.clone();
         let publish_receipts = state
@@ -23861,7 +24429,12 @@
             "changing access cannot replay or ledger the durable initial attempt"
         );
         assert_eq!(
-            state.db.get_org_share(&replayable.id).unwrap().unwrap().access,
+            state
+                .db
+                .get_org_share(&replayable.id)
+                .unwrap()
+                .unwrap()
+                .access,
             "view"
         );
 
@@ -23878,7 +24451,10 @@
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
         let unchanged = state.db.get_org_share(&replayable.id).unwrap().unwrap();
-        assert_eq!(unchanged.last_error.as_deref(), Some("initial_post_replayable"));
+        assert_eq!(
+            unchanged.last_error.as_deref(),
+            Some("initial_post_replayable")
+        );
         assert_eq!(unchanged.expected_actor_user_id, original_actor);
         assert_eq!(unchanged.expected_owner_user_id, original_owner);
         assert_eq!(
@@ -23921,21 +24497,17 @@
             .unwrap();
         state
             .db
-            .set_org_share_document_metadata(
-                "stale-dispatch-row",
-                STABLE_DOC_ID,
-                "view",
-            )
+            .set_org_share_document_metadata("stale-dispatch-row", STABLE_DOC_ID, "view")
             .unwrap();
         state
             .db
             .lock()
             .execute(
                 "UPDATE org_shares
-                    SET state = 'failed', last_error = 'initial_post_pending',
-                        expected_actor_user_id = ?2, expected_owner_user_id = ?2,
-                        dispatch_id = 'dispatch-new'
-                  WHERE id = ?1",
+                        SET state = 'failed', last_error = 'initial_post_pending',
+                            expected_actor_user_id = ?2, expected_owner_user_id = ?2,
+                            dispatch_id = 'dispatch-new'
+                      WHERE id = ?1",
                 rusqlite::params!["stale-dispatch-row", actor],
             )
             .unwrap();
@@ -23991,13 +24563,13 @@
         let server = std::thread::spawn(move || {
             let unrelated_doc = "65cf33ac-21da-4ddb-a97c-572201c29a71";
             let items = (1..=200)
-                .map(|seq| {
-                    format!(
-                        "{{\"itemId\":\"item-{seq}\",\"seq\":{seq},\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{unrelated_doc}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}}"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
+                    .map(|seq| {
+                        format!(
+                            "{{\"itemId\":\"item-{seq}\",\"seq\":{seq},\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":true,\"docId\":\"{unrelated_doc}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":false}}"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
             let first_body = format!("{{\"items\":[{items}],\"nextSeq\":200}}");
             for (expected_since, body) in [
                 ("sinceSeq=0", first_body),
@@ -24006,17 +24578,15 @@
                 let (mut get, _) = accept_with_timeout(&listener);
                 let request = read_http_request(&mut get);
                 let request = String::from_utf8_lossy(&request);
-                assert!(request.starts_with(&format!(
-                    "GET /v1/orgs/{STABLE_ORG_ID}/items?"
-                )));
+                assert!(request.starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
                 assert!(request.contains(expected_since));
                 write!(
-                    get,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body,
-                )
-                .unwrap();
+                        get,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    )
+                    .unwrap();
             }
         });
 
@@ -24046,7 +24616,7 @@
             .lock()
             .prepare(
                 "SELECT since_seq, page_limit FROM share_egress_log
-                  WHERE kind = 'org_document_head_read' ORDER BY id",
+                      WHERE kind = 'org_document_head_read' ORDER BY id",
             )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -24073,7 +24643,9 @@
             STABLE_DOC_ID,
         ))
         .expect_err("recovery reads must fail closed without live org consent");
-        assert!(matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] ")));
+        assert!(
+            matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] "))
+        );
         assert!(matches!(
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -24135,7 +24707,10 @@
             let request = read_http_request(&mut post);
             let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
-            assert!(json.get("mutationId").is_none(), "old strict relay rejects even a null mutationId");
+            assert!(
+                json.get("mutationId").is_none(),
+                "old strict relay rejects even a null mutationId"
+            );
             let doc_id = json["docId"].as_str().unwrap().to_string();
             let sha = json["contentSha256"].as_str().unwrap().to_string();
             write!(
@@ -24149,15 +24724,15 @@
             assert!(String::from_utf8_lossy(&request)
                 .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
             let body = format!(
-                    "{{\"items\":[{{\"itemId\":\"item-recovered\",\"seq\":7,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":7}}"
-                );
+                        "{{\"items\":[{{\"itemId\":\"item-recovered\",\"seq\":7,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":7}}"
+                    );
             write!(
-                    get,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .unwrap();
+                        get,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
             doc_id
         });
 
@@ -24218,15 +24793,15 @@
             let (mut get, _) = accept_with_timeout(&listener);
             let _ = read_http_request(&mut get);
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"different-access\",\"seq\":7,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":7}}"
-            );
+                    "{{\"items\":[{{\"itemId\":\"different-access\",\"seq\":7,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":7}}"
+                );
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
 
         let state = build_state("org-initial-post-access-mismatch");
@@ -24281,21 +24856,21 @@
             .unwrap();
 
             let newer = format!(
-                "{{\"items\":[{{\"itemId\":\"newer-head\",\"seq\":8,\"authorUserId\":\"other\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":8}}",
-                murmur_protocol::b64::encode(&[4u8; 32]),
-            );
+                    "{{\"items\":[{{\"itemId\":\"newer-head\",\"seq\":8,\"authorUserId\":\"other\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":8}}",
+                    murmur_protocol::b64::encode(&[4u8; 32]),
+                );
             for _ in 0..2 {
                 let (mut get, _) = accept_with_timeout(&listener);
                 let request = read_http_request(&mut get);
                 assert!(String::from_utf8_lossy(&request)
                     .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
                 write!(
-                    get,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    newer.len(),
-                    newer,
-                )
-                .unwrap();
+                        get,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        newer.len(),
+                        newer,
+                    )
+                    .unwrap();
             }
         });
 
@@ -24321,15 +24896,31 @@
             )),
             Err(AppError::Unavailable(_))
         ));
-        let before = state.db.list_org_shares_in_state("failed").unwrap().remove(0);
+        let before = state
+            .db
+            .list_org_shares_in_state("failed")
+            .unwrap()
+            .remove(0);
         assert_eq!(before.last_error.as_deref(), Some("initial_post_pending"));
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
         server.join().unwrap();
         let after = state.db.get_org_share(&before.id).unwrap().unwrap();
         assert_eq!(after.last_error.as_deref(), Some("initial_post_pending"));
         assert_eq!(after.content_sha256, before.content_sha256);
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("org_document_head_read").unwrap(), 2);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_head_read")
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -24392,7 +24983,12 @@
         let doc_id = pending.doc_id.clone().unwrap();
         update_note_doc_inner(&state, "n-initial-witness", "Title", "newer local body").unwrap();
         assert_eq!(
-            state.db.get_org_share(&pending.id).unwrap().unwrap().content_sha256,
+            state
+                .db
+                .get_org_share(&pending.id)
+                .unwrap()
+                .unwrap()
+                .content_sha256,
             Some(original_hash.clone()),
             "a later local edit must not overwrite the ambiguous POST witness"
         );
@@ -24406,15 +25002,15 @@
             assert!(String::from_utf8_lossy(&request)
                 .starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/items?")));
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"initial-original\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":1}}"
-            );
+                    "{{\"items\":[{{\"itemId\":\"initial-original\",\"seq\":1,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":1,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":1}}"
+                );
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
         state.config.lock().unwrap().share_base_url = format!("http://{second_addr}/");
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
@@ -24473,10 +25069,9 @@
             let (mut put, _) = accept_with_timeout(&listener);
             let mut request = [0u8; 16384];
             let n = put.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..n])
-                .starts_with(&format!(
-                    "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{doc_for_server}"
-                )));
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with(&format!(
+                "PUT /v1/orgs/{STABLE_ORG_ID}/documents/{doc_for_server}"
+            )));
             write!(
                 put,
                 "HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -24505,9 +25100,11 @@
         assert_eq!(conflicted.item_id, before.item_id);
         assert_eq!(conflicted.rev, before.rev + 1);
         assert_ne!(conflicted.content_sha256, before.content_sha256);
-        assert!(conflicted.scrub, "the terminal draft retains forced scrub intent");
-        let surfaced =
-            org_live_shares_for_source_inner(&state, None, Some("n-conflict")).unwrap();
+        assert!(
+            conflicted.scrub,
+            "the terminal draft retains forced scrub intent"
+        );
+        let surfaced = org_live_shares_for_source_inner(&state, None, Some("n-conflict")).unwrap();
         assert_eq!(surfaced.len(), 1);
         assert!(surfaced[0].conflicted);
         assert_eq!(surfaced[0].item_id, before.item_id);
@@ -24527,27 +25124,26 @@
                 .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
             let body = "{\"itemId\":\"legacy-item\",\"seq\":1,\"access\":\"view\"}";
             write!(
-                publish,
-                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    publish,
+                    "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
 
             let (mut reconcile, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut reconcile);
-            assert!(String::from_utf8_lossy(&request)
-                .starts_with(&format!(
-                    "GET /v1/orgs/{STABLE_ORG_ID}/items?sinceSeq=0&limit=200"
-                )));
+            assert!(String::from_utf8_lossy(&request).starts_with(&format!(
+                "GET /v1/orgs/{STABLE_ORG_ID}/items?sinceSeq=0&limit=200"
+            )));
             let body = r#"{"items":[],"nextSeq":0}"#;
             write!(
-                reconcile,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    reconcile,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
 
         let state = build_state("org-publish-legacy-response");
@@ -24570,7 +25166,9 @@
             true,
         ))
         .expect_err("a stable publish without docId needs authenticated reconciliation");
-        assert!(matches!(error, AppError::Unavailable(message) if message == "org publish outcome is pending authenticated reconciliation"));
+        assert!(
+            matches!(error, AppError::Unavailable(message) if message == "org publish outcome is pending authenticated reconciliation")
+        );
         server.join().unwrap();
         let row = state
             .db
@@ -24580,7 +25178,10 @@
         assert_eq!(row.state, "failed");
         assert_eq!(row.last_error.as_deref(), Some("initial_post_pending"));
         assert!(row.item_id.is_none());
-        assert!(row.doc_id.is_some(), "retain the stable identity needed to reconcile");
+        assert!(
+            row.doc_id.is_some(),
+            "retain the stable identity needed to reconcile"
+        );
         assert_eq!(row.access, "view");
         assert_eq!(
             state
@@ -24611,7 +25212,11 @@
             let initial_request = read_http_request(&mut initial);
             assert!(String::from_utf8_lossy(&initial_request)
                 .starts_with(&format!("POST /v1/orgs/{STABLE_ORG_ID}/items")));
-            let body_at = initial_request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let body_at = initial_request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap()
+                + 4;
             let initial_json: serde_json::Value =
                 serde_json::from_slice(&initial_request[body_at..]).unwrap();
             let initial_doc_id = initial_json["docId"].as_str().unwrap();
@@ -24619,12 +25224,12 @@
                 r#"{{"itemId":"legacy-old","seq":1,"docId":"{initial_doc_id}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
             );
             write!(
-                initial,
-                "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                initial_body.len(),
-                initial_body
-            )
-            .unwrap();
+                    initial,
+                    "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    initial_body.len(),
+                    initial_body
+                )
+                .unwrap();
 
             let (mut republish, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut republish);
@@ -24643,15 +25248,15 @@
             let (mut get, _) = accept_with_timeout(&listener);
             let _ = read_http_request(&mut get);
             let body = format!(
-                "{{\"items\":[{{\"itemId\":\"legacy-wrong-access\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
-            );
+                    "{{\"items\":[{{\"itemId\":\"legacy-wrong-access\",\"seq\":2,\"authorUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"rev\":2,\"generation\":1,\"createdAt\":\"2026-08-13T00:00:00Z\",\"tombstoned\":false,\"contentSha256\":\"{sha}\",\"docId\":\"{doc_id}\",\"access\":\"edit\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\",\"isCurrent\":true}}],\"nextSeq\":2}}"
+                );
             write!(
-                get,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+                    get,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
         });
 
         let state = build_state("org-legacy-republish-access-mismatch");
@@ -24809,6 +25414,336 @@
                 .unwrap(),
             0,
             "stable CAS supersedes the old revision server-side without a DELETE attempt"
+        );
+    }
+
+    /// TASK WIRE PATH — a Task source uses the same stable document POST→PUT lineage as notes,
+    /// while the encrypted envelope keeps both kind axes as `Task`. The local projection is updated
+    /// immediately but remains absent from the generic Org-note surface.
+    #[test]
+    fn task_publish_and_edit_use_stable_document_cas_without_entering_org_notes() {
+        use crate::share::org_envelope::{open_org_envelope, OrgItemKind, OrgSourceKind};
+        use crate::share::task_envelope::{TaskEnvelope, TaskStatus, TASK_ENVELOPE_VERSION};
+
+        let mock = MockOrgServer::start();
+        let state = build_state("org-task-stable-cas");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, STABLE_ORG_ID, 1);
+
+        let source_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let initial = TaskEnvelope {
+            version: TASK_ENVELOPE_VERSION,
+            org_id: STABLE_ORG_ID.to_string(),
+            title: "Ship onboarding for alice@example.com".to_string(),
+            description: "Call +48 600 700 800 before launch".to_string(),
+            status: TaskStatus::Todo,
+            due_at: Some("2026-08-28T09:00:00Z".to_string()),
+            assignee_user_id: None,
+            created_at: "2026-08-21T10:00:00Z".to_string(),
+            subtasks: vec![crate::share::task_envelope::TaskSubtask {
+                id: "77777777-7777-4777-8777-777777777777".into(),
+                title: "Confirm alice@example.com".into(),
+                done: false,
+            }],
+            org_refs: Vec::new(),
+            images: Vec::new(),
+        };
+        let initial_json = initial.to_canonical_json(STABLE_ORG_ID).unwrap();
+        state
+            .db
+            .create_task_source(source_id, &initial.title, &initial_json, 1)
+            .unwrap();
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some(source_id.to_string()),
+            true,
+        ))
+        .expect("task source should publish through the stable document route");
+        assert_eq!(entry.rev, 1);
+        let task_id = format!("{STABLE_ORG_ID}:{source_id}");
+        let projected = state.db.get_org_task(&task_id).unwrap().unwrap();
+        assert_eq!(projected.source_document_id.as_deref(), Some(source_id));
+        state
+            .db
+            .insert_dashboard(
+                "board-task-live-gate",
+                "Task board",
+                None,
+                None,
+                "2026-08-21T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .replace_task_local_refs(
+                &task_id,
+                &[crate::storage::tasks_store::TaskLocalRefRow {
+                    kind: "dashboard".into(),
+                    ref_id: "board-task-live-gate".into(),
+                    position: 0,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            dashboard_work_inner(&state, "board-task-live-gate")
+                .unwrap()
+                .len(),
+            1
+        );
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "task-ref-locked-folder".into(),
+                name: "Locked refs".into(),
+                path: "Locked refs".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-08-21T10:00:00Z".into(),
+            })
+            .unwrap();
+        seed_note_doc_cmd(
+            &state.db,
+            "task-ref-locked-note",
+            "task-ref-locked-folder",
+            "Secret note",
+            "secret body",
+        );
+        let refs_before = state.db.task_local_refs(&task_id).unwrap();
+        let local_ref_error = set_task_local_refs_inner(
+            &state,
+            &task_id,
+            &[TaskLocalRefDto {
+                kind: "note".into(),
+                ref_id: "task-ref-locked-note".into(),
+            }],
+        )
+        .expect_err("a locked local note must not become Task navigation chrome");
+        assert!(matches!(local_ref_error, AppError::Locked(_)));
+        assert_eq!(
+            state.db.task_local_refs(&task_id).unwrap(),
+            refs_before,
+            "a rejected local-reference replacement must be atomic"
+        );
+        assert_eq!(
+            state.db.list_org_items(STABLE_ORG_ID).unwrap().len(),
+            0,
+            "tasks must not enter the generic Org-note surface"
+        );
+
+        let edited = TaskEnvelope {
+            title: "Ship onboarding v2 for bob@example.com".to_string(),
+            description: "Use card 4111 1111 1111 1111".to_string(),
+            status: TaskStatus::InProgress,
+            ..initial.clone()
+        };
+        let edited_json = edited.to_canonical_json(STABLE_ORG_ID).unwrap();
+        assert!(state
+            .db
+            .update_task_source(source_id, &edited.title, &edited_json, 2)
+            .unwrap());
+        block_on(republish_org_shares_for_source(
+            &state,
+            None,
+            Some(source_id),
+        ))
+        .unwrap();
+
+        let shares = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].rev, 2);
+        assert_eq!(shares[0].item_id.as_deref(), Some("item-2"));
+        let projected = state.db.get_org_task(&task_id).unwrap().unwrap();
+        let projected_env = TaskEnvelope::from_json(&projected.envelope_json, STABLE_ORG_ID).unwrap();
+        assert!(!projected_env.title.contains("bob@example.com"));
+        assert!(projected_env.title.contains("EMAIL"));
+        assert!(!projected_env.description.contains("4111 1111 1111 1111"));
+        assert!(projected_env.description.contains("CARD"));
+        assert_eq!(projected_env.subtasks[0].id, initial.subtasks[0].id);
+        assert_eq!(projected_env.status, TaskStatus::InProgress);
+
+        let generic_delete = block_on(delete_document_inner(&state, source_id))
+            .expect_err("generic document deletion must refuse a hidden task source pre-egress");
+        assert!(matches!(generic_delete, AppError::InvalidArg(_)));
+        assert_eq!(
+            state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap()[0].state,
+            "uploaded",
+            "the rejected generic delete must not revoke the remote task"
+        );
+
+        let log = mock.log.lock().unwrap();
+        assert_eq!(
+            log.requests
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.requests
+                .iter()
+                .filter(|request| request.starts_with("PUT "))
+                .count(),
+            1
+        );
+        assert_eq!(log.published_content_cells.len(), 2);
+        assert_eq!(
+            log.published_expected_revs,
+            vec![None, Some(1)],
+            "Task create is a POST and its edit is the same stable-document expectedRev=1 CAS"
+        );
+        let final_sha =
+            murmur_protocol::b64::decode(log.published_content_sha256.last().unwrap()).unwrap();
+        let final_cell =
+            murmur_protocol::b64::decode(log.published_content_cells.last().unwrap()).unwrap();
+        let opened = open_org_envelope(
+            &[9u8; 32],
+            &final_cell,
+            STABLE_ORG_ID,
+            &org_item_nonce(&final_sha),
+        )
+        .unwrap();
+        assert_eq!(opened.kind, OrgItemKind::Task);
+        assert_eq!(opened.source_kind, Some(OrgSourceKind::Task));
+        assert!(!opened.title.contains("bob@example.com"));
+        let opened_task = TaskEnvelope::from_json(&opened.markdown, STABLE_ORG_ID).unwrap();
+        assert!(!opened_task.title.contains("bob@example.com"));
+        assert!(!opened_task.description.contains("4111 1111 1111 1111"));
+        assert_eq!(opened_task.subtasks[0].id, initial.subtasks[0].id);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            2,
+            "task POST and stable PUT each use the content-free org egress ledger"
+        );
+
+        let retained = state.db.get_org_task(&task_id).unwrap().unwrap();
+        state
+            .db
+            .set_org_item_document_metadata(
+                &retained.item_id,
+                Some(&retained.doc_id),
+                "view",
+                Some("different-owner"),
+            )
+            .unwrap();
+        assert!(matches!(
+            require_task_edit_permission(&state, &retained),
+            Err(AppError::Auth(_))
+        ));
+        assert!(matches!(
+            require_task_manage_permission(&state, &retained),
+            Err(AppError::Auth(_))
+        ));
+        state
+            .db
+            .set_org_item_document_metadata(
+                &retained.item_id,
+                Some(&retained.doc_id),
+                "edit",
+                Some("different-owner"),
+            )
+            .unwrap();
+        require_task_edit_permission(&state, &retained).unwrap();
+        assert!(matches!(
+            require_task_manage_permission(&state, &retained),
+            Err(AppError::Auth(_))
+        ));
+        let session = state.account_session.lock().unwrap().take();
+        assert!(task_dto(&state, retained.clone()).is_err());
+        assert!(dashboard_work_inner(&state, "board-task-live-gate")
+            .unwrap()
+            .is_empty());
+        *state.account_session.lock().unwrap() = session;
+        state
+            .db
+            .set_org_context_enabled(STABLE_ORG_ID, false)
+            .unwrap();
+        assert!(matches!(task_dto(&state, retained), Err(AppError::Auth(_))));
+        assert!(dashboard_work_inner(&state, "board-task-live-gate")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn task_assignee_read_requires_consent_and_one_typed_ledger_per_request() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let state = build_state("task-assignee-egress");
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        seed_live_session(&state);
+        state.config.lock().unwrap().share_base_url = base;
+
+        let refused = block_on(validate_task_assignee(
+            &state,
+            STABLE_ORG_ID,
+            Some("member-1"),
+        ));
+        assert!(matches!(refused, Err(AppError::Unavailable(_))));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_task_assignee_read")
+                .unwrap(),
+            0
+        );
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = accept_with_timeout(&listener);
+            let request = String::from_utf8(read_http_request(&mut socket)).unwrap();
+            assert!(request.starts_with(&format!("GET /v1/orgs/{STABLE_ORG_ID}/members HTTP/1.1")));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer a\r\n"));
+            let body = r#"{"members":[{"userId":"member-1","role":"member","createdAt":"2026-08-21T00:00:00Z","email":"alice@example.com"}]}"#;
+            write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+        });
+        state.config.lock().unwrap().org_egress_consented = true;
+        let members = block_on(org_task_list_members_inner(&state, STABLE_ORG_ID)).unwrap();
+        server.join().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].user_id, "member-1");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_task_assignee_read")
+                .unwrap(),
+            1
+        );
+        let ledger: (String, Option<String>, Option<String>, i64) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT kind,org_id,doc_id,byte_count FROM share_egress_log
+                  WHERE kind='org_task_assignee_read'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            ledger,
+            (
+                "org_task_assignee_read".into(),
+                Some(STABLE_ORG_ID.into()),
+                None,
+                0,
+            ),
+            "assignee lookup ledger is exact and content free"
         );
     }
 
@@ -25087,11 +26022,7 @@
         // failed row whose predecessor remains remotely live.
         state
             .db
-            .set_org_share_failed(
-                &row_id,
-                "seal_failed",
-                &chrono::Utc::now().to_rfc3339(),
-            )
+            .set_org_share_failed(&row_id, "seal_failed", &chrono::Utc::now().to_rfc3339())
             .unwrap();
         let stuck = state.db.get_org_share(&row_id).unwrap().unwrap();
         assert_eq!(stuck.state, "failed", "the row landed in failed state");
@@ -25562,12 +26493,12 @@
             release_rx.recv().unwrap();
             let body = r#"{"orgId":"org-race","name":"Stale","role":"member","createdAt":"2026-08-12T00:00:00Z","currentGeneration":1}"#;
             write!(
-                            socket,
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        )
-                        .unwrap();
+                                socket,
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .unwrap();
         });
 
         let state = Arc::new(build_state("org-status-removal-race"));
@@ -25587,12 +26518,7 @@
         assert!(worker.join().unwrap().is_err());
         server.join().unwrap();
         assert_eq!(
-            state
-                .db
-                .get_org_state("org-race")
-                .unwrap()
-                .unwrap()
-                .name,
+            state.db.get_org_state("org-race").unwrap().unwrap().name,
             "Rejoined"
         );
         assert!(state
@@ -25647,12 +26573,12 @@
             seen_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             write!(
-                            socket,
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        )
-                        .unwrap();
+                                socket,
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                            .unwrap();
         });
         let worker_state = Arc::clone(&state);
         let worker = std::thread::spawn(move || {
@@ -25668,12 +26594,7 @@
         assert!(worker.join().unwrap().is_err());
         server.join().unwrap();
         assert_eq!(
-            state
-                .db
-                .get_org_state("org-race")
-                .unwrap()
-                .unwrap()
-                .name,
+            state.db.get_org_state("org-race").unwrap().unwrap().name,
             "Rejoined"
         );
         assert!(state
@@ -25878,16 +26799,20 @@
 
         let active = state.db.active_org_shares_for_folder("f1").unwrap();
         assert_eq!(
-            active.len(),
-            2,
-            "destructive folder enumeration must include the legacy generic-failed NULL identity: {active:?}"
-        );
+                active.len(),
+                2,
+                "destructive folder enumeration must include the legacy generic-failed NULL identity: {active:?}"
+            );
         assert_eq!(active[0].0.as_deref(), Some("item-stuck"));
         assert!(active.iter().any(|(item_id, _)| item_id.is_none()));
 
         // Same fix must apply to the bulk-revoke enumeration (`revoke_shares_for_folder`'s source).
         let ids = state.db.active_org_share_ids_for_folder("f1").unwrap();
-        assert_eq!(ids.len(),2,"bulk revoke must see both live and ambiguous legacy rows: {ids:?}");
+        assert_eq!(
+            ids.len(),
+            2,
+            "bulk revoke must see both live and ambiguous legacy rows: {ids:?}"
+        );
         assert_eq!(ids[0].0, "s-stuck");
         assert_eq!(ids[0].1.as_deref(), Some("item-stuck"));
         assert_eq!(ids[1].0, "s-dead");
@@ -25897,41 +26822,77 @@
     #[test]
     fn lock_lifecycle_recheck_refuses_share_moved_into_folder_after_precheck() {
         let state = build_state("lock-org-share-second-check");
-        make_open_folder(&state.db,"f-target","Target");
-        seed_meeting(&state.db,"m-moved","# body",Some("f-target"));
-        assert!(state.db.active_org_share_ids_for_folder("f-target").unwrap().is_empty());
-        state.db.insert_org_share(
-            "moved-share","org-1",Some("m-moved"),None,"meeting",Some("Moved"),
-            1,1,&[2u8;32],"t",
-        ).unwrap();
-        let error = lock_folder_inner(&state,"f-target".into()).unwrap_err();
-        assert!(matches!(error,AppError::Unavailable(_)));
+        make_open_folder(&state.db, "f-target", "Target");
+        seed_meeting(&state.db, "m-moved", "# body", Some("f-target"));
+        assert!(state
+            .db
+            .active_org_share_ids_for_folder("f-target")
+            .unwrap()
+            .is_empty());
+        state
+            .db
+            .insert_org_share(
+                "moved-share",
+                "org-1",
+                Some("m-moved"),
+                None,
+                "meeting",
+                Some("Moved"),
+                1,
+                1,
+                &[2u8; 32],
+                "t",
+            )
+            .unwrap();
+        let error = lock_folder_inner(&state, "f-target".into()).unwrap_err();
+        assert!(matches!(error, AppError::Unavailable(_)));
         assert!(!state.db.folder_by_id("f-target").unwrap().unwrap().locked);
     }
 
     #[test]
     fn folder_share_enumerator_is_unique_for_multi_provider_meeting() {
         let state = build_state("folder-org-multi-provider");
-        make_open_folder(&state.db,"f-multi","Team");
-        seed_meeting(&state.db,"m-multi","# first",Some("f-multi"));
-        state.db.upsert_note(&NoteRecord {
-            meeting_id: "m-multi".into(),
-            provider_id: "ollama".into(),
-            markdown: "# second".into(),
-            created_at: "2026-08-14T00:00:00Z".into(),
-            exported_path: None,
-            model_requested: None,
-            model_served: None,
-            gateway_host: None,
-        }).unwrap();
-        state.db.set_note_folder("m-multi",Some("f-multi")).unwrap();
-        state.db.insert_org_share(
-            "one-share","org-1",Some("m-multi"),None,"meeting",Some("Meeting"),
-            1,1,&[3u8;32],"t",
-        ).unwrap();
+        make_open_folder(&state.db, "f-multi", "Team");
+        seed_meeting(&state.db, "m-multi", "# first", Some("f-multi"));
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-multi".into(),
+                provider_id: "ollama".into(),
+                markdown: "# second".into(),
+                created_at: "2026-08-14T00:00:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .set_note_folder("m-multi", Some("f-multi"))
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "one-share",
+                "org-1",
+                Some("m-multi"),
+                None,
+                "meeting",
+                Some("Meeting"),
+                1,
+                1,
+                &[3u8; 32],
+                "t",
+            )
+            .unwrap();
         let rows = state.db.active_org_share_ids_for_folder("f-multi").unwrap();
-        assert_eq!(rows.len(),1,"EXISTS folder ownership must not duplicate one share per provider");
-        assert_eq!(rows[0].0,"one-share");
+        assert_eq!(
+            rows.len(),
+            1,
+            "EXISTS folder ownership must not duplicate one share per provider"
+        );
+        assert_eq!(rows[0].0, "one-share");
     }
 
     /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
@@ -25948,8 +26909,7 @@
     /// it didn't catch `active_link_user_shares_for_folder`'s `WHERE state = 'active'` excluding every
     /// real 1:1-person share (100%-reproducible, not an edge case).
     #[test]
-    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders()
-    {
+    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders() {
         let state = build_state("folder-1to1-shares");
         make_open_folder(&state.db, "f1", "Team");
         make_open_folder(&state.db, "f2", "Other");
@@ -26025,10 +26985,10 @@
 
         let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
         assert_eq!(
-                            shares.len(),
-                            3,
-                            "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
-                        );
+                                shares.len(),
+                                3,
+                                "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
+                            );
         let links = shares.iter().filter(|(_, m)| m == "link").count();
         let users = shares.iter().filter(|(_, m)| m == "user").count();
         assert_eq!(
@@ -26054,62 +27014,124 @@
     fn lock_final_recheck_refuses_live_link_or_user_share() {
         let state = build_state("lock-link-user-share");
         make_open_folder(&state.db, "shared-folder", "Shared");
-        state.db.insert_meeting(&Meeting {
-            id: "m-shared-link".into(),
-            started_at: "2026-08-14T12:00:00Z".into(),
-            ended_at: None,
-            title: Some("Shared".into()),
-            duration_s: 0,
-            audio_path: None,
-            status: MeetingStatus::Summarized,
-            folder_id: Some("shared-folder".into()),
-        }).unwrap();
-        state.db.upsert_note(&NoteRecord {
-            meeting_id: "m-shared-link".into(), provider_id: "provider".into(),
-            markdown: "body".into(), created_at: "t".into(), exported_path: None,
-            model_requested: None, model_served: None, gateway_host: None,
-        }).unwrap();
-        state.db.set_note_folder("m-shared-link", Some("shared-folder")).unwrap();
-        state.db.insert_outbound_share(
-            "live-link", "m-shared-link", "link", 1, "2026-08-14T12:00:01Z",
-        ).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-shared-link".into(),
+                started_at: "2026-08-14T12:00:00Z".into(),
+                ended_at: None,
+                title: Some("Shared".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("shared-folder".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-shared-link".into(),
+                provider_id: "provider".into(),
+                markdown: "body".into(),
+                created_at: "t".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .set_note_folder("m-shared-link", Some("shared-folder"))
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share(
+                "live-link",
+                "m-shared-link",
+                "link",
+                1,
+                "2026-08-14T12:00:01Z",
+            )
+            .unwrap();
 
         assert!(matches!(
             lock_folder_inner(&state, "shared-folder".into()),
             Err(AppError::Unavailable(_))
         ));
-        assert!(!state.db.folder_by_id("shared-folder").unwrap().unwrap().locked);
+        assert!(
+            !state
+                .db
+                .folder_by_id("shared-folder")
+                .unwrap()
+                .unwrap()
+                .locked
+        );
     }
 
     #[test]
     fn explicit_lock_anyway_seals_locally_without_revoking_remote_share() {
         let state = build_state("lock-anyway-live-share");
         make_open_folder(&state.db, "lock-anyway-folder", "Shared");
-        state.db.insert_meeting(&Meeting {
-            id: "m-lock-anyway".into(),
-            started_at: "2026-08-14T12:10:00Z".into(),
-            ended_at: None,
-            title: Some("Shared".into()),
-            duration_s: 0,
-            audio_path: None,
-            status: MeetingStatus::Summarized,
-            folder_id: Some("lock-anyway-folder".into()),
-        }).unwrap();
-        state.db.upsert_note(&NoteRecord {
-            meeting_id: "m-lock-anyway".into(), provider_id: "provider".into(),
-            markdown: "body".into(), created_at: "t".into(), exported_path: None,
-            model_requested: None, model_served: None, gateway_host: None,
-        }).unwrap();
-        state.db.set_note_folder("m-lock-anyway", Some("lock-anyway-folder")).unwrap();
-        state.db.insert_outbound_share(
-            "live-lock-anyway", "m-lock-anyway", "link", 1, "2026-08-14T12:10:01Z",
-        ).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-lock-anyway".into(),
+                started_at: "2026-08-14T12:10:00Z".into(),
+                ended_at: None,
+                title: Some("Shared".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("lock-anyway-folder".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-lock-anyway".into(),
+                provider_id: "provider".into(),
+                markdown: "body".into(),
+                created_at: "t".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .set_note_folder("m-lock-anyway", Some("lock-anyway-folder"))
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share(
+                "live-lock-anyway",
+                "m-lock-anyway",
+                "link",
+                1,
+                "2026-08-14T12:10:01Z",
+            )
+            .unwrap();
 
         lock_folder_inner_allow_remote_access(&state, "lock-anyway-folder".into()).unwrap();
 
-        assert!(state.db.folder_by_id("lock-anyway-folder").unwrap().unwrap().locked);
-        assert!(state.db.source_has_active_remote_share(Some("m-lock-anyway"), None).unwrap());
-        assert!(!state.db.org_folder_closure_exists("lock-anyway-folder").unwrap());
+        assert!(
+            state
+                .db
+                .folder_by_id("lock-anyway-folder")
+                .unwrap()
+                .unwrap()
+                .locked
+        );
+        assert!(state
+            .db
+            .source_has_active_remote_share(Some("m-lock-anyway"), None)
+            .unwrap());
+        assert!(!state
+            .db
+            .org_folder_closure_exists("lock-anyway-folder")
+            .unwrap());
     }
 
     // ── 2026-07-11 audit remediation: NOTES-1/2/3, SEAM-F1/F2, LOCK-SHARE-INGEST-1, gate ─────────────
@@ -26384,8 +27406,7 @@
             "2026-07-04T10:00:00Z",
         );
         let accepted =
-            ingest_shared_note(&state, &target, &env, "SENDERFP", "sender-uuid", "share-lk")
-                .unwrap();
+            ingest_shared_note(&state, &target, &env, "SENDERFP", "sender-uuid", "share-lk").unwrap();
         let mid = accepted.meeting_id;
 
         // The note row must be SEALED (blob present) — never a raw plaintext note behind the lock.
@@ -26533,7 +27554,7 @@
         let vectors: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM org_vec_chunks WHERE chunk_id IN
-                               (SELECT id FROM org_chunks WHERE item_id = ?1)",
+                                   (SELECT id FROM org_chunks WHERE item_id = ?1)",
                 rusqlite::params![item_id],
                 |r| r.get(0),
             )
@@ -26828,73 +27849,144 @@
 
         let error = block_on(revoke_org_share_inner(&state, "it-rv".into()))
             .expect_err("withdrawal must fail closed without org consent");
-        assert!(matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] ")));
+        assert!(
+            matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] "))
+        );
         assert!(mock.log.lock().unwrap().requests.is_empty());
-        assert_eq!(state.db.get_org_share("os-rv").unwrap().unwrap().state, "uploaded");
+        assert_eq!(
+            state.db.get_org_share("os-rv").unwrap().unwrap().state,
+            "uploaded"
+        );
         assert_eq!(replica_counts(&state, "it-rv"), replica_before);
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(), 0);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            0
+        );
     }
 
-    fn seed_ambiguous_initial_post_share(
-        state: &AppState,
-        note_id: &str,
-        folder_id: &str,
-        base: &str,
-    ) {
+    fn seed_ambiguous_initial_post_share(state: &AppState, note_id: &str, folder_id: &str, base: &str) {
         make_open_folder(&state.db, folder_id, "Shared");
-        state.db.insert_note(note_id,folder_id,"document","Shared","body",1).unwrap();
-        seed_org(&state.db,STABLE_ORG_ID,"Acme","owner",1);
+        state
+            .db
+            .insert_note(note_id, folder_id, "document", "Shared", "body", 1)
+            .unwrap();
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "owner", 1);
         seed_live_session(state);
         state.config.lock().unwrap().share_base_url = base.to_string();
         state.config.lock().unwrap().org_egress_consented = true;
-        state.db.insert_org_share(
-            "ambiguous-initial",STABLE_ORG_ID,None,Some(note_id),"note",Some("Shared"),
-            1,1,&[8u8;32],"t",
-        ).unwrap();
-        state.db.set_org_share_document_metadata(
-            "ambiguous-initial",STABLE_DOC_ID,"view",
-        ).unwrap();
-        state.db.lock().execute(
-            "UPDATE org_shares SET state='failed',last_error='initial_post_pending',
-              item_id=NULL,dispatch_id='initial-dispatch',expected_actor_user_id=?2,
-              expected_owner_user_id=?2 WHERE id=?1",
-            rusqlite::params!["ambiguous-initial","c534b6d2-02c1-4c2c-a256-3af8592b1567"],
-        ).unwrap();
+        state
+            .db
+            .insert_org_share(
+                "ambiguous-initial",
+                STABLE_ORG_ID,
+                None,
+                Some(note_id),
+                "note",
+                Some("Shared"),
+                1,
+                1,
+                &[8u8; 32],
+                "t",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata("ambiguous-initial", STABLE_DOC_ID, "view")
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_shares SET state='failed',last_error='initial_post_pending',
+                  item_id=NULL,dispatch_id='initial-dispatch',expected_actor_user_id=?2,
+                  expected_owner_user_id=?2 WHERE id=?1",
+                rusqlite::params!["ambiguous-initial", "c534b6d2-02c1-4c2c-a256-3af8592b1567"],
+            )
+            .unwrap();
     }
 
-    fn stable_delete_response_server(status: u16) -> (String,std::thread::JoinHandle<()>) {
+    fn stable_delete_response_server(status: u16) -> (String, std::thread::JoinHandle<()>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let (mut socket,_) = accept_with_timeout(&listener);
+            let (mut socket, _) = accept_with_timeout(&listener);
             let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
-            assert!(request.starts_with(&format!(
-                "DELETE /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID} "
-            )),"unexpected request: {request}");
-            write!(socket,"HTTP/1.1 {status} result\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            assert!(
+                request.starts_with(&format!(
+                    "DELETE /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID} "
+                )),
+                "unexpected request: {request}"
+            );
+            write!(
+                socket,
+                "HTTP/1.1 {status} result\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
-        (format!("http://{addr}/"),handle)
+        (format!("http://{addr}/"), handle)
     }
 
     #[test]
     fn source_delete_routes_ambiguous_null_item_initial_post_through_stable_delete() {
-        let (base,server) = stable_delete_response_server(204);
+        let (base, server) = stable_delete_response_server(204);
         let state = build_state("ambiguous-initial-source-delete");
-        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
-        state.db.insert_org_share(
-            "sibling-anchor",STABLE_ORG_ID,None,Some("other-source"),"note",Some("Sibling"),
-            1,1,&[8u8;32],"t2",
-        ).unwrap();
-        state.db.set_org_share_uploaded("sibling-anchor","sibling-item","t2").unwrap();
-        state.db.set_org_share_document_metadata("sibling-anchor",STABLE_DOC_ID,"view").unwrap();
+        seed_ambiguous_initial_post_share(&state, "note-ambiguous", "folder-ambiguous", &base);
+        state
+            .db
+            .insert_org_share(
+                "sibling-anchor",
+                STABLE_ORG_ID,
+                None,
+                Some("other-source"),
+                "note",
+                Some("Sibling"),
+                1,
+                1,
+                &[8u8; 32],
+                "t2",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("sibling-anchor", "sibling-item", "t2")
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata("sibling-anchor", STABLE_DOC_ID, "view")
+            .unwrap();
 
-        block_on(delete_note_inner(&state,"note-ambiguous")).unwrap();
+        block_on(delete_note_inner(&state, "note-ambiguous")).unwrap();
         server.join().unwrap();
         assert!(state.db.get_note_row("note-ambiguous").unwrap().is_none());
-        assert_eq!(state.db.get_org_share("ambiguous-initial").unwrap().unwrap().state,"revoked");
-        assert_eq!(state.db.get_org_share("sibling-anchor").unwrap().unwrap().state,"revoked");
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+        assert_eq!(
+            state
+                .db
+                .get_org_share("ambiguous-initial")
+                .unwrap()
+                .unwrap()
+                .state,
+            "revoked"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_org_share("sibling-anchor")
+                .unwrap()
+                .unwrap()
+                .state,
+            "revoked"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -26907,49 +27999,97 @@
                 let (mut socket, _) = accept_with_timeout(&listener);
                 let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
                 assert!(request.starts_with(&format!("DELETE /v1/shares/{expected} ")));
-                write!(socket, "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
             }
         });
 
         let state = build_state("delete-all-share-modes");
         make_open_folder(&state.db, "all-modes-folder", "All modes");
-        state.db.insert_meeting(&Meeting {
-            id: "m-all-modes".into(),
-            started_at: "2026-08-14T10:00:00Z".into(),
-            ended_at: Some("2026-08-14T10:01:00Z".into()),
-            title: Some("Shared".into()),
-            duration_s: 60,
-            audio_path: None,
-            status: MeetingStatus::Summarized,
-            folder_id: Some("all-modes-folder".into()),
-        }).unwrap();
-        state.db.insert_note(
-            "m-all-modes", "all-modes-folder", "provider", "Shared", "body", 1,
-        ).unwrap();
-        state.db.insert_outbound_share_attempt(
-            "link-share", Some("m-all-modes"), None, "link", 1,
-            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T10:01:01Z",
-        ).unwrap();
-        state.db.set_outbound_share_state("link-share", "active").unwrap();
-        state.db.insert_outbound_user_share(
-            "user-share", "m-all-modes", 1, "2026-08-14T10:01:02Z", "sent",
-            &[1u8; 32], "recipient", "r@example.com", &[2u8; 32],
-            "c534b6d2-02c1-4c2c-a256-3af8592b1567",
-        ).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-all-modes".into(),
+                started_at: "2026-08-14T10:00:00Z".into(),
+                ended_at: Some("2026-08-14T10:01:00Z".into()),
+                title: Some("Shared".into()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("all-modes-folder".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "m-all-modes",
+                "all-modes-folder",
+                "provider",
+                "Shared",
+                "body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share_attempt(
+                "link-share",
+                Some("m-all-modes"),
+                None,
+                "link",
+                1,
+                "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+                "2026-08-14T10:01:01Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_outbound_share_state("link-share", "active")
+            .unwrap();
+        state
+            .db
+            .insert_outbound_user_share(
+                "user-share",
+                "m-all-modes",
+                1,
+                "2026-08-14T10:01:02Z",
+                "sent",
+                &[1u8; 32],
+                "recipient",
+                "r@example.com",
+                &[2u8; 32],
+                "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+            )
+            .unwrap();
         seed_live_session(&state);
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
 
         block_on(delete_meeting_inner(&state, "m-all-modes")).unwrap();
         server.join().unwrap();
-        assert!(state.db.get_meeting_gate_anchor("m-all-modes").unwrap().is_none());
+        assert!(state
+            .db
+            .get_meeting_gate_anchor("m-all-modes")
+            .unwrap()
+            .is_none());
         for share_id in ["link-share", "user-share"] {
-            let status: String = state.db.lock().query_row(
-                "SELECT state FROM outbound_shares WHERE share_id=?1", [share_id],
-                |row| row.get(0),
-            ).unwrap();
+            let status: String = state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT state FROM outbound_shares WHERE share_id=?1",
+                    [share_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(status, "revoked");
         }
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 2);
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -26961,35 +28101,78 @@
             let (mut socket, _) = accept_with_timeout(&listener);
             let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
             assert!(request.starts_with("DELETE /v1/shares/link-failure "));
-            write!(socket, "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
         let state = build_state("delete-link-failure");
         make_open_folder(&state.db, "link-failure-folder", "Failure");
-        state.db.insert_meeting(&Meeting {
-            id: "m-link-failure".into(), started_at: "2026-08-14T10:30:00Z".into(),
-            ended_at: None, title: Some("Failure".into()), duration_s: 0, audio_path: None,
-            status: MeetingStatus::Summarized, folder_id: Some("link-failure-folder".into()),
-        }).unwrap();
-        state.db.insert_note(
-            "m-link-failure", "link-failure-folder", "provider", "Failure", "body", 1,
-        ).unwrap();
-        state.db.insert_outbound_share_attempt(
-            "link-failure", Some("m-link-failure"), None, "link", 1,
-            "c534b6d2-02c1-4c2c-a256-3af8592b1567", "2026-08-14T10:30:01Z",
-        ).unwrap();
-        state.db.set_outbound_share_state("link-failure", "active").unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-link-failure".into(),
+                started_at: "2026-08-14T10:30:00Z".into(),
+                ended_at: None,
+                title: Some("Failure".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("link-failure-folder".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "m-link-failure",
+                "link-failure-folder",
+                "provider",
+                "Failure",
+                "body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share_attempt(
+                "link-failure",
+                Some("m-link-failure"),
+                None,
+                "link",
+                1,
+                "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+                "2026-08-14T10:30:01Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_outbound_share_state("link-failure", "active")
+            .unwrap();
         seed_live_session(&state);
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
 
         assert!(block_on(delete_meeting_inner(&state, "m-link-failure")).is_err());
         server.join().unwrap();
-        assert!(state.db.get_meeting_gate_anchor("m-link-failure").unwrap().is_some());
-        let status: String = state.db.lock().query_row(
-            "SELECT state FROM outbound_shares WHERE share_id='link-failure'", [],
-            |row| row.get(0),
-        ).unwrap();
+        assert!(state
+            .db
+            .get_meeting_gate_anchor("m-link-failure")
+            .unwrap()
+            .is_some());
+        let status: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT state FROM outbound_shares WHERE share_id='link-failure'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(status, "revoke_pending");
-        assert!(state.db.source_has_active_remote_share(Some("m-link-failure"), None).unwrap());
+        assert!(state
+            .db
+            .source_has_active_remote_share(Some("m-link-failure"), None)
+            .unwrap());
     }
 
     #[test]
@@ -27002,27 +28185,68 @@
                 let (mut delete, _) = accept_with_timeout(&listener);
                 let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
                 assert!(request.starts_with(&format!("DELETE /v1/shares/{expected} ")));
-                write!(delete, "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                write!(
+                    delete,
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
             }
         });
         let state = build_state("absent-link-user-delete");
         make_open_folder(&state.db, "absent-folder", "Absent");
-        state.db.insert_meeting(&Meeting {
-            id: "m-absent".into(), started_at: "2026-08-14T10:45:00Z".into(), ended_at: None,
-            title: Some("Absent".into()), duration_s: 0, audio_path: None,
-            status: MeetingStatus::Summarized, folder_id: Some("absent-folder".into()),
-        }).unwrap();
-        state.db.insert_note("m-absent", "absent-folder", "provider", "Absent", "body", 1).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-absent".into(),
+                started_at: "2026-08-14T10:45:00Z".into(),
+                ended_at: None,
+                title: Some("Absent".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("absent-folder".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("m-absent", "absent-folder", "provider", "Absent", "body", 1)
+            .unwrap();
         let owner = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
-        state.db.insert_outbound_share_attempt(
-            "absent-link", Some("m-absent"), None, "link", 1, owner, "t1",
-        ).unwrap();
-        state.db.insert_outbound_user_share(
-            "absent-user", "m-absent", 1, "t2", "create_pending", &[1; 32],
-            "recipient", "r@example.com", &[2; 32], owner,
-        ).unwrap();
-        state.db.set_outbound_share_state("absent-link", "revoke_pending").unwrap();
-        state.db.set_outbound_share_state("absent-user", "revoke_pending").unwrap();
+        state
+            .db
+            .insert_outbound_share_attempt(
+                "absent-link",
+                Some("m-absent"),
+                None,
+                "link",
+                1,
+                owner,
+                "t1",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_outbound_user_share(
+                "absent-user",
+                "m-absent",
+                1,
+                "t2",
+                "create_pending",
+                &[1; 32],
+                "recipient",
+                "r@example.com",
+                &[2; 32],
+                owner,
+            )
+            .unwrap();
+        state
+            .db
+            .set_outbound_share_state("absent-link", "revoke_pending")
+            .unwrap();
+        state
+            .db
+            .set_outbound_share_state("absent-user", "revoke_pending")
+            .unwrap();
         seed_live_session(&state);
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
 
@@ -27030,14 +28254,32 @@
             assert!(block_on(revoke_share_inner(&state, share_id.to_string())).is_err());
         }
         server.join().unwrap();
-        assert!(state.db.get_meeting_gate_anchor("m-absent").unwrap().is_some());
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 2);
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke_reconcile").unwrap(), 0);
+        assert!(state
+            .db
+            .get_meeting_gate_anchor("m-absent")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            2
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_revoke_reconcile")
+                .unwrap(),
+            0
+        );
         for share_id in ["absent-link", "absent-user"] {
-            let state_value: String = state.db.lock().query_row(
-                "SELECT state FROM outbound_shares WHERE share_id=?1", [share_id],
-                |row| row.get(0),
-            ).unwrap();
+            let state_value: String = state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT state FROM outbound_shares WHERE share_id=?1",
+                    [share_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(state_value, "revoke_pending");
         }
     }
@@ -27074,11 +28316,11 @@
             );
             let body = r#"{"status":"ok","version":"0.1.0"}"#;
             write!(
-                health,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+                    health,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
         });
 
         let state = build_state("link-share-capability-required");
@@ -27128,7 +28370,10 @@
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(journal.0, 1, "one bounded cleanup authority survives capability failure");
+        assert_eq!(
+            journal.0, 1,
+            "one bounded cleanup authority survives capability failure"
+        );
         assert_eq!(journal.1, "create_pending");
         assert_eq!(journal.2, "link");
         assert_eq!(journal.3, "c534b6d2-02c1-4c2c-a256-3af8592b1567");
@@ -27139,8 +28384,17 @@
                 .unwrap(),
             1
         );
-        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 0);
-        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 0);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_reserve")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_create").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -27194,12 +28448,42 @@
             .unwrap();
         assert_eq!(journal.0, "create_pending");
         assert_eq!(journal.1, "user");
-        assert_eq!(journal.2, None, "recipient PII is not captured before capability proof");
-        assert_eq!(journal.3, None, "no ciphertext hash exists before capability proof");
-        assert_eq!(state.db.count_share_egress_by_kind("share_capability_read").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 0);
-        assert_eq!(state.db.count_share_egress_by_kind("share_user_send").unwrap(), 0);
-        assert_eq!(state.db.count_share_egress_by_kind("share_user_invite").unwrap(), 0);
+        assert_eq!(
+            journal.2, None,
+            "recipient PII is not captured before capability proof"
+        );
+        assert_eq!(
+            journal.3, None,
+            "no ciphertext hash exists before capability proof"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_capability_read")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_reserve")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_user_send")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_user_invite")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -27216,7 +28500,8 @@
                 let (mut health, _) = accept_with_timeout(&listener);
                 let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
                 assert!(request.starts_with("GET /healthz "));
-                let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+                let body =
+                    r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
                 write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
 
                 let (mut reserve, _) = accept_with_timeout(&listener);
@@ -27231,12 +28516,20 @@
                 let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
                 let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
                 assert_eq!(json, serde_json::json!({"mode": expected_mode}));
-                write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                write!(
+                    reserve,
+                    "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
 
                 let (mut delete, _) = accept_with_timeout(&listener);
                 let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
                 assert!(request.starts_with(&format!("DELETE /v1/shares/{expected_id} ")));
-                write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                write!(
+                    delete,
+                    "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
             }
         });
 
@@ -27252,15 +28545,18 @@
             ("11111111-1111-4111-8111-111111111111", "link"),
             ("22222222-2222-4222-8222-222222222222", "user"),
         ] {
-            state.db.insert_outbound_share_attempt(
-                share_id,
-                Some("restart-cleanup-meeting"),
-                None,
-                mode,
-                1,
-                owner,
-                "2026-08-21T10:00:00Z",
-            ).unwrap();
+            state
+                .db
+                .insert_outbound_share_attempt(
+                    share_id,
+                    Some("restart-cleanup-meeting"),
+                    None,
+                    mode,
+                    1,
+                    owner,
+                    "2026-08-21T10:00:00Z",
+                )
+                .unwrap();
         }
 
         assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 2);
@@ -27269,19 +28565,53 @@
             "11111111-1111-4111-8111-111111111111",
             "22222222-2222-4222-8222-222222222222",
         ] {
-            let phase: String = state.db.lock().query_row(
-                "SELECT state FROM outbound_shares WHERE share_id=?1",
-                [share_id],
-                |row| row.get(0),
-            ).unwrap();
+            let phase: String = state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT state FROM outbound_shares WHERE share_id=?1",
+                    [share_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(phase, "revoked");
         }
-        assert_eq!(state.db.count_share_egress_by_kind("share_capability_read").unwrap(), 2);
-        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 2);
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 2);
-        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 0);
-        assert_eq!(state.db.count_share_egress_by_kind("share_user_send").unwrap(), 0);
-        assert_eq!(state.db.count_share_egress_by_kind("share_user_invite").unwrap(), 0);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_capability_read")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_reserve")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            2
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_create").unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_user_send")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_user_invite")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -27311,7 +28641,11 @@
             let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
             assert_eq!(json, serde_json::json!({"mode":"link"}));
-            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                reserve,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
 
             let (mut create, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut create);
@@ -27320,9 +28654,8 @@
             assert_eq!(json["shareId"], share_id);
             assert_eq!(json["mode"], "link");
             assert!(json["contentCell"].as_str().is_some());
-            let body = format!(
-                "{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}"
-            );
+            let body =
+                format!("{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}");
             write!(create,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
             share_tx.send(share_id).unwrap();
         });
@@ -27355,9 +28688,21 @@
             )
             .unwrap();
         assert_eq!(stored_state, "active");
-        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 0);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_reserve")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_create").unwrap(),
+            1
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -27384,7 +28729,11 @@
                 .and_then(|tail| tail.strip_suffix("/reservation HTTP/1.1"))
                 .unwrap()
                 .to_string();
-            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                reserve,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
 
             let (mut create, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut create);
@@ -27396,7 +28745,11 @@
             let (mut delete, _) = accept_with_timeout(&listener);
             let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
             assert!(request.starts_with(&format!("DELETE /v1/shares/{share_id} ")));
-            write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                delete,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
             share_tx.send(share_id).unwrap();
         });
 
@@ -27427,9 +28780,21 @@
             )
             .unwrap();
         assert_eq!(stored_state, "revoked");
-        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 1);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_reserve")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_create").unwrap(),
+            1
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -27460,7 +28825,11 @@
             release_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                reserve,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
 
             let (mut delete, _) = accept_with_timeout(&listener);
             let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
@@ -27468,7 +28837,11 @@
                 request.starts_with(&format!("DELETE /v1/shares/{share_id} ")),
                 "a stale snapshot must DELETE the reservation, never POST ciphertext: {request}"
             );
-            write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                delete,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
 
         let state = std::sync::Arc::new(build_state("link-share-reservation-source-race"));
@@ -27508,8 +28881,14 @@
             )
             .unwrap();
         assert_eq!(stored_state, "revoked");
-        assert_eq!(state.db.count_share_egress_by_kind("share_create").unwrap(), 0);
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 1);
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_create").unwrap(),
+            0
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -27549,7 +28928,11 @@
             let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
             assert_eq!(json, serde_json::json!({"mode":"user"}));
-            write!(reserve,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                reserve,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
 
             let (mut create, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut create);
@@ -27558,9 +28941,8 @@
             assert_eq!(json["shareId"], share_id);
             assert_eq!(json["mode"], "user");
             assert_eq!(json["recipients"][0]["email"], "new@example.com");
-            let body = format!(
-                "{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}"
-            );
+            let body =
+                format!("{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}");
             write!(create,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
             share_tx.send(share_id).unwrap();
         });
@@ -27592,8 +28974,20 @@
             )
             .unwrap();
         assert_eq!(stored_state, "awaiting_key");
-        assert_eq!(state.db.count_share_egress_by_kind("share_reserve").unwrap(), 1);
-        assert_eq!(state.db.count_share_egress_by_kind("share_user_invite").unwrap(), 1);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_reserve")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("share_user_invite")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -27606,20 +29000,28 @@
             let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
             assert!(request.starts_with("GET /v1/shares "));
             let body = r#"{"shares":[
-              {"shareId":"pending-overlap","mode":"link","rev":9,"createdAt":"server-t","downloadCount":4},
-              {"shareId":"server-only","mode":"link","rev":2,"createdAt":"server-only-t","downloadCount":1}
-            ]}"#;
+                  {"shareId":"pending-overlap","mode":"link","rev":9,"createdAt":"server-t","downloadCount":4},
+                  {"shareId":"server-only","mode":"link","rev":2,"createdAt":"server-only-t","downloadCount":1}
+                ]}"#;
             write!(
-                socket,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len(),
-            ).unwrap();
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).unwrap();
         });
         let state = build_state("list-owner-pending-shares");
         make_open_folder(&state.db, "pending-list-folder", "Pending");
-        state.db.insert_note(
-            "pending-list-note", "pending-list-folder", "pending.md", "Pending", "body", 1,
-        ).unwrap();
+        state
+            .db
+            .insert_note(
+                "pending-list-note",
+                "pending-list-folder",
+                "pending.md",
+                "Pending",
+                "body",
+                1,
+            )
+            .unwrap();
         let owner = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
         for (share_id, row_owner, mode) in [
             ("pending-overlap", owner, "link"),
@@ -27630,29 +29032,69 @@
                 "link",
             ),
         ] {
-            state.db.insert_outbound_share_attempt(
-                share_id, None, Some("pending-list-note"), mode, 1, row_owner, "local-t",
-            ).unwrap();
+            state
+                .db
+                .insert_outbound_share_attempt(
+                    share_id,
+                    None,
+                    Some("pending-list-note"),
+                    mode,
+                    1,
+                    row_owner,
+                    "local-t",
+                )
+                .unwrap();
         }
-        state.db.set_outbound_share_state("pending-local-only", "revoke_pending").unwrap();
+        state
+            .db
+            .set_outbound_share_state("pending-local-only", "revoke_pending")
+            .unwrap();
         seed_live_session(&state);
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
 
         let rows = block_on(list_my_shares_inner(&state)).unwrap();
         server.join().unwrap();
-        assert_eq!(rows.len(), 3, "server-only + overlap + owner-local-only; other owner hidden");
-        let overlap = rows.iter().find(|row| row.share_id == "pending-overlap").unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "server-only + overlap + owner-local-only; other owner hidden"
+        );
+        let overlap = rows
+            .iter()
+            .find(|row| row.share_id == "pending-overlap")
+            .unwrap();
         assert!(overlap.revoke_pending);
-        assert!(!overlap.revoked, "local unproven DELETE must beat a server list row");
-        assert_eq!(overlap.rev, 1, "the durable local attempt metadata wins by share id");
+        assert!(
+            !overlap.revoked,
+            "local unproven DELETE must beat a server list row"
+        );
+        assert_eq!(
+            overlap.rev, 1,
+            "the durable local attempt metadata wins by share id"
+        );
         assert_eq!(overlap.document_id.as_deref(), Some("pending-list-note"));
-        let local_only = rows.iter().find(|row| row.share_id == "pending-local-only").unwrap();
-        assert!(local_only.revoke_pending, "a server-absent pending row remains visible");
+        let local_only = rows
+            .iter()
+            .find(|row| row.share_id == "pending-local-only")
+            .unwrap();
+        assert!(
+            local_only.revoke_pending,
+            "a server-absent pending row remains visible"
+        );
         assert!(rows.iter().all(|row| row.share_id != "pending-other-owner"));
-        assert!(!rows.iter().find(|row| row.share_id == "server-only").unwrap().revoke_pending);
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.share_id == "server-only")
+                .unwrap()
+                .revoke_pending
+        );
 
         let wire = serde_json::to_value(overlap).unwrap();
-        assert_eq!(wire.get("revokePending"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            wire.get("revokePending"),
+            Some(&serde_json::Value::Bool(true))
+        );
         assert!(wire.get("revoke_pending").is_none());
     }
 
@@ -27662,25 +29104,59 @@
         listener.set_nonblocking(true).unwrap();
         let state = build_state("wrong-owner-link-delete");
         make_open_folder(&state.db, "wrong-owner-folder", "Wrong owner");
-        state.db.insert_meeting(&Meeting {
-            id: "m-wrong-owner".into(), started_at: "2026-08-14T11:00:00Z".into(), ended_at: None,
-            title: Some("Wrong owner".into()), duration_s: 0, audio_path: None,
-            status: MeetingStatus::Summarized, folder_id: Some("wrong-owner-folder".into()),
-        }).unwrap();
-        state.db.insert_note(
-            "m-wrong-owner", "wrong-owner-folder", "provider", "Wrong", "body", 1,
-        ).unwrap();
-        state.db.insert_outbound_share_attempt(
-            "wrong-owner-share", Some("m-wrong-owner"), None, "link", 1,
-            "11111111-1111-4111-8111-111111111111", "t",
-        ).unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-wrong-owner".into(),
+                started_at: "2026-08-14T11:00:00Z".into(),
+                ended_at: None,
+                title: Some("Wrong owner".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("wrong-owner-folder".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "m-wrong-owner",
+                "wrong-owner-folder",
+                "provider",
+                "Wrong",
+                "body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share_attempt(
+                "wrong-owner-share",
+                Some("m-wrong-owner"),
+                None,
+                "link",
+                1,
+                "11111111-1111-4111-8111-111111111111",
+                "t",
+            )
+            .unwrap();
         seed_live_session(&state);
-        state.config.lock().unwrap().share_base_url = format!("http://{}/", listener.local_addr().unwrap());
+        state.config.lock().unwrap().share_base_url =
+            format!("http://{}/", listener.local_addr().unwrap());
 
         assert!(block_on(delete_meeting_inner(&state, "m-wrong-owner")).is_err());
-        assert!(state.db.get_meeting_gate_anchor("m-wrong-owner").unwrap().is_some());
-        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
-        assert_eq!(state.db.count_share_egress_by_kind("share_revoke").unwrap(), 0);
+        assert!(state
+            .db
+            .get_meeting_gate_anchor("m-wrong-owner")
+            .unwrap()
+            .is_some());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("share_revoke").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -27688,147 +29164,303 @@
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (post_seen_tx,post_seen_rx) = std::sync::mpsc::channel();
-        let (release_tx,release_rx) = std::sync::mpsc::channel();
+        let (post_seen_tx, post_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut post,_) = accept_with_timeout(&listener);
+            let (mut post, _) = accept_with_timeout(&listener);
             let request = read_http_request(&mut post);
-            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap()+4;
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
             let doc_id = json["docId"].as_str().unwrap().to_string();
             post_seen_tx.send(()).unwrap();
-            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             let body = format!("{{\"itemId\":\"landed-item\",\"seq\":1,\"docId\":\"{doc_id}\",\"access\":\"view\",\"documentOwnerUserId\":\"c534b6d2-02c1-4c2c-a256-3af8592b1567\"}}");
             write!(post,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
-            let (mut delete,_) = accept_with_timeout(&listener);
+            let (mut delete, _) = accept_with_timeout(&listener);
             let request = String::from_utf8_lossy(&read_http_request(&mut delete)).to_string();
-            assert!(request.starts_with(&format!("DELETE /v1/orgs/{STABLE_ORG_ID}/documents/{doc_id} ")));
-            write!(delete,"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            assert!(request.starts_with(&format!(
+                "DELETE /v1/orgs/{STABLE_ORG_ID}/documents/{doc_id} "
+            )));
+            write!(
+                delete,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
 
         let state = std::sync::Arc::new(build_state("share-delete-barrier"));
-        seed_org(&state.db,STABLE_ORG_ID,"Acme","member",1);
-        make_open_folder(&state.db,"f-race","Race");
-        state.db.insert_note("n-race","f-race","n-race","Race","body",1).unwrap();
+        seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
+        make_open_folder(&state.db, "f-race", "Race");
+        state
+            .db
+            .insert_note("n-race", "f-race", "n-race", "Race", "body", 1)
+            .unwrap();
         seed_live_session(&state);
-        seed_ock(&state,STABLE_ORG_ID,1);
-        state.config.lock().unwrap().org_egress_consented=true;
-        state.config.lock().unwrap().share_base_url=format!("http://{addr}/");
-        let share_state=state.clone();
-        let share=std::thread::spawn(move || block_on(share_to_org_inner(
-            &share_state,STABLE_ORG_ID,None,Some("n-race".into()),true,
-        )));
-        post_seen_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        let delete_state=state.clone();
-        let delete=std::thread::spawn(move || block_on(delete_note_inner(&delete_state,"n-race")));
+        seed_ock(&state, STABLE_ORG_ID, 1);
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        let share_state = state.clone();
+        let share = std::thread::spawn(move || {
+            block_on(share_to_org_inner(
+                &share_state,
+                STABLE_ORG_ID,
+                None,
+                Some("n-race".into()),
+                true,
+            ))
+        });
+        post_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let delete_state = state.clone();
+        let delete = std::thread::spawn(move || block_on(delete_note_inner(&delete_state, "n-race")));
         release_tx.send(()).unwrap();
         assert!(share.join().unwrap().is_ok());
         assert!(delete.join().unwrap().is_ok());
         server.join().unwrap();
         assert!(state.db.get_note_row("n-race").unwrap().is_none());
-        let rows=state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
-        assert_eq!(rows.len(),1);
-        assert_eq!(rows[0].state,"revoked");
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(),1);
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+        let rows = state.db.list_org_shares_for_org(STABLE_ORG_ID).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, "revoked");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            1
+        );
 
-        let no_socket=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let no_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         no_socket.set_nonblocking(true).unwrap();
-        state.config.lock().unwrap().share_base_url=format!("http://{}/",no_socket.local_addr().unwrap());
+        state.config.lock().unwrap().share_base_url =
+            format!("http://{}/", no_socket.local_addr().unwrap());
         assert!(block_on(share_to_org_inner(
-            &state,STABLE_ORG_ID,None,Some("n-race".into()),true,
-        )).is_err());
-        assert!(matches!(no_socket.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_publish").unwrap(),1);
+            &state,
+            STABLE_ORG_ID,
+            None,
+            Some("n-race".into()),
+            true,
+        ))
+        .is_err());
+        assert!(
+            matches!(no_socket.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn folder_revoke_routes_ambiguous_null_item_initial_post_through_stable_delete() {
-        let (base,server) = stable_delete_response_server(204);
+        let (base, server) = stable_delete_response_server(204);
         let state = build_state("ambiguous-initial-folder-revoke");
-        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
+        seed_ambiguous_initial_post_share(&state, "note-ambiguous", "folder-ambiguous", &base);
 
         block_on(revoke_shares_for_folder_inner(
-            &state,"folder-ambiguous",None,
-        )).unwrap();
+            &state,
+            "folder-ambiguous",
+            None,
+        ))
+        .unwrap();
         server.join().unwrap();
         assert!(state.db.get_note_row("note-ambiguous").unwrap().is_some());
-        assert_eq!(state.db.get_org_share("ambiguous-initial").unwrap().unwrap().state,"revoked");
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+        assert_eq!(
+            state
+                .db
+                .get_org_share("ambiguous-initial")
+                .unwrap()
+                .unwrap()
+                .state,
+            "revoked"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn folder_revoke_barrier_persists_across_second_lock_step() {
-        let (base,server) = stable_delete_response_server(204);
+        let (base, server) = stable_delete_response_server(204);
         let state = build_state("folder-revoke-lock-barrier");
-        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
-        state.db.begin_org_folder_closure("folder-ambiguous").unwrap();
-        block_on(revoke_shares_for_folder_inner(&state,"folder-ambiguous",None)).unwrap();
+        seed_ambiguous_initial_post_share(&state, "note-ambiguous", "folder-ambiguous", &base);
+        state
+            .db
+            .begin_org_folder_closure("folder-ambiguous")
+            .unwrap();
+        block_on(revoke_shares_for_folder_inner(
+            &state,
+            "folder-ambiguous",
+            None,
+        ))
+        .unwrap();
         server.join().unwrap();
-        assert!(state.db.insert_org_share(
-            "between-ipcs",STABLE_ORG_ID,None,Some("note-ambiguous"),"note",Some("T"),
-            1,1,&[1u8;32],"t",
-        ).is_err(),"the durable folder barrier blocks a new share between revoke and lock IPCs");
-        lock_folder_inner(&state,"folder-ambiguous".into()).unwrap();
-        assert!(state.db.folder_by_id("folder-ambiguous").unwrap().unwrap().locked);
-        state.db.complete_org_closure("folder","folder-ambiguous").unwrap();
-        assert!(state.db.insert_org_share(
-            "while-locked",STABLE_ORG_ID,None,Some("note-ambiguous"),"note",Some("T"),
-            1,1,&[1u8;32],"t",
-        ).is_err(),"the closure remains terminal while the folder is locked");
+        assert!(
+            state
+                .db
+                .insert_org_share(
+                    "between-ipcs",
+                    STABLE_ORG_ID,
+                    None,
+                    Some("note-ambiguous"),
+                    "note",
+                    Some("T"),
+                    1,
+                    1,
+                    &[1u8; 32],
+                    "t",
+                )
+                .is_err(),
+            "the durable folder barrier blocks a new share between revoke and lock IPCs"
+        );
+        lock_folder_inner(&state, "folder-ambiguous".into()).unwrap();
+        assert!(
+            state
+                .db
+                .folder_by_id("folder-ambiguous")
+                .unwrap()
+                .unwrap()
+                .locked
+        );
+        state
+            .db
+            .complete_org_closure("folder", "folder-ambiguous")
+            .unwrap();
+        assert!(
+            state
+                .db
+                .insert_org_share(
+                    "while-locked",
+                    STABLE_ORG_ID,
+                    None,
+                    Some("note-ambiguous"),
+                    "note",
+                    Some("T"),
+                    1,
+                    1,
+                    &[1u8; 32],
+                    "t",
+                )
+                .is_err(),
+            "the closure remains terminal while the folder is locked"
+        );
     }
 
     #[test]
     fn failed_stable_delete_preserves_ambiguous_journal_and_source() {
-        let (base,server) = stable_delete_response_server(500);
+        let (base, server) = stable_delete_response_server(500);
         let state = build_state("ambiguous-initial-source-delete-fails");
-        seed_ambiguous_initial_post_share(&state,"note-ambiguous","folder-ambiguous",&base);
+        seed_ambiguous_initial_post_share(&state, "note-ambiguous", "folder-ambiguous", &base);
 
-        assert!(block_on(delete_note_inner(&state,"note-ambiguous")).is_err());
+        assert!(block_on(delete_note_inner(&state, "note-ambiguous")).is_err());
         server.join().unwrap();
         assert!(state.db.get_note_row("note-ambiguous").unwrap().is_some());
-        let row = state.db.get_org_share("ambiguous-initial").unwrap().unwrap();
-        assert_eq!(row.state,"revoke_pending");
-        assert_ne!(row.state,"revoked");
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),1);
+        let row = state
+            .db
+            .get_org_share("ambiguous-initial")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "revoke_pending");
+        assert_ne!(row.state, "revoked");
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn folder_revoke_without_consent_preserves_ambiguous_journal_and_source() {
         let mock = MockOrgServer::start();
         let state = build_state("ambiguous-initial-folder-no-consent");
-        seed_ambiguous_initial_post_share(
-            &state,"note-ambiguous","folder-ambiguous",&mock.base,
-        );
+        seed_ambiguous_initial_post_share(&state, "note-ambiguous", "folder-ambiguous", &mock.base);
         state.config.lock().unwrap().org_egress_consented = false;
 
         assert!(block_on(revoke_shares_for_folder_inner(
-            &state,"folder-ambiguous",None,
-        )).is_err());
+            &state,
+            "folder-ambiguous",
+            None,
+        ))
+        .is_err());
         assert!(mock.log.lock().unwrap().requests.is_empty());
         assert!(state.db.get_note_row("note-ambiguous").unwrap().is_some());
-        let row = state.db.get_org_share("ambiguous-initial").unwrap().unwrap();
-        assert_eq!(row.state,"failed");
-        assert_eq!(row.last_error.as_deref(),Some("initial_post_pending"));
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),0);
+        let row = state
+            .db
+            .get_org_share("ambiguous-initial")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.last_error.as_deref(), Some("initial_post_pending"));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn legacy_null_identity_queued_row_blocks_source_delete_without_false_revoke() {
         let state = build_state("legacy-null-identity-delete-blocked");
-        make_open_folder(&state.db,"folder-legacy","Legacy");
-        state.db.insert_note("note-legacy","folder-legacy","document","Legacy","body",1).unwrap();
-        state.db.insert_org_share(
-            "legacy-queued","org-legacy",None,Some("note-legacy"),"note",Some("Legacy"),
-            1,1,&[3u8;32],"t",
-        ).unwrap();
+        make_open_folder(&state.db, "folder-legacy", "Legacy");
+        state
+            .db
+            .insert_note(
+                "note-legacy",
+                "folder-legacy",
+                "document",
+                "Legacy",
+                "body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "legacy-queued",
+                "org-legacy",
+                None,
+                Some("note-legacy"),
+                "note",
+                Some("Legacy"),
+                1,
+                1,
+                &[3u8; 32],
+                "t",
+            )
+            .unwrap();
 
-        assert!(block_on(delete_note_inner(&state,"note-legacy")).is_err());
+        assert!(block_on(delete_note_inner(&state, "note-legacy")).is_err());
         assert!(state.db.get_note_row("note-legacy").unwrap().is_some());
         let row = state.db.get_org_share("legacy-queued").unwrap().unwrap();
-        assert_eq!(row.state,"queued");
+        assert_eq!(row.state, "queued");
         assert!(row.item_id.is_none() && row.doc_id.is_none());
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),0);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -27838,18 +29470,39 @@
         seed_org(&state.db, STABLE_ORG_ID, "Acme", "member", 1);
         state.config.lock().unwrap().share_base_url = mock.base.clone();
         seed_live_session(&state);
-        state.db.upsert_org_item(
-            "legacy-item", STABLE_ORG_ID, 1, "me", "Mine", "# body",
-            "2026-08-13T00:00:00Z", 1, 1, &[9u8; 32], Some("document"),
-            Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"), None,
-        ).unwrap();
+        state
+            .db
+            .upsert_org_item(
+                "legacy-item",
+                STABLE_ORG_ID,
+                1,
+                "me",
+                "Mine",
+                "# body",
+                "2026-08-13T00:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                Some("c534b6d2-02c1-4c2c-a256-3af8592b1567"),
+                None,
+            )
+            .unwrap();
 
         let error = block_on(delete_org_item_as_author_inner(&state, "legacy-item"))
             .expect_err("legacy withdrawal must fail closed without org consent");
-        assert!(matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] ")));
+        assert!(
+            matches!(error, AppError::Unavailable(message) if message.starts_with("[org-consent] "))
+        );
         assert!(mock.log.lock().unwrap().requests.is_empty());
         assert!(state.db.get_org_item("legacy-item").unwrap().is_some());
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_revoke").unwrap(), 0);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
+            0
+        );
     }
 
     /// Install a raw SQLite guard/fault trigger on the test DB (dropped again by `drop_test_trigger`).
@@ -27889,15 +29542,15 @@
         seed_published_share_with_replica(&state, &mock.base);
 
         install_test_trigger(
-                &state,
-                "CREATE TRIGGER guard_revoke_order BEFORE UPDATE ON org_shares
-                           WHEN NEW.state = 'revoked'
-                            AND EXISTS (SELECT 1 FROM org_items
-                                         WHERE item_id = NEW.item_id AND tombstoned = 0)
-                         BEGIN
-                           SELECT RAISE(ABORT, 'share flipped to revoked while its replica was still live');
-                         END;",
-            );
+                    &state,
+                    "CREATE TRIGGER guard_revoke_order BEFORE UPDATE ON org_shares
+                               WHEN NEW.state = 'revoked'
+                                AND EXISTS (SELECT 1 FROM org_items
+                                             WHERE item_id = NEW.item_id AND tombstoned = 0)
+                             BEGIN
+                               SELECT RAISE(ABORT, 'share flipped to revoked while its replica was still live');
+                             END;",
+                );
 
         block_on(revoke_org_share_inner(&state, "it-rv".to_string()))
             .expect("the eviction must be committed BEFORE the revoked state flip");
@@ -27933,11 +29586,11 @@
 
         // Fault injection: the eviction's tombstone write fails (≙ the process stopping right there).
         install_test_trigger(
-                    &state,
-                    "CREATE TRIGGER fault_on_evict BEFORE UPDATE ON org_items
-                           WHEN NEW.tombstoned = 1
-                         BEGIN SELECT RAISE(ABORT, 'simulated interruption during the local eviction'); END;",
-                );
+                        &state,
+                        "CREATE TRIGGER fault_on_evict BEFORE UPDATE ON org_items
+                               WHEN NEW.tombstoned = 1
+                             BEGIN SELECT RAISE(ABORT, 'simulated interruption during the local eviction'); END;",
+                    );
 
         block_on(revoke_org_share_inner(&state, "it-rv".to_string()))
             .expect_err("the interrupted eviction must surface, not be silently swallowed");
@@ -27955,7 +29608,7 @@
             state.db.get_org_share("os-rv").unwrap().unwrap().state,
             "revoke_pending",
             "an interruption must NEVER leave a `revoked` row whose replica is still live — that row \
-                         re-enters no queue"
+                             re-enters no queue"
         );
 
         // The interruption is over (the app relaunches): the sweep re-drives the `revoke_pending` row.
@@ -28150,15 +29803,43 @@
         seed_live_session(state);
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = base.to_string();
-        state.db.insert_org_share(
-            "legacy-row",STABLE_ORG_ID,None,Some("legacy-source"),"note",Some("Legacy"),
-            1,1,&[3u8;32],"t",
-        ).unwrap();
-        state.db.set_org_share_uploaded("legacy-row","legacy-item","t").unwrap();
-        state.db.upsert_org_item(
-            "legacy-item",STABLE_ORG_ID,1,"owner","Legacy","secret","t",1,1,&[3u8;32],
-            Some("document"),Some("owner"),None,
-        ).unwrap();
+        state
+            .db
+            .insert_org_share(
+                "legacy-row",
+                STABLE_ORG_ID,
+                None,
+                Some("legacy-source"),
+                "note",
+                Some("Legacy"),
+                1,
+                1,
+                &[3u8; 32],
+                "t",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("legacy-row", "legacy-item", "t")
+            .unwrap();
+        state
+            .db
+            .upsert_org_item(
+                "legacy-item",
+                STABLE_ORG_ID,
+                1,
+                "owner",
+                "Legacy",
+                "secret",
+                "t",
+                1,
+                1,
+                &[3u8; 32],
+                Some("document"),
+                Some("owner"),
+                None,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -28168,19 +29849,32 @@
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for expected in ["DELETE", "GET"] {
-                let (mut socket,_) = accept_with_timeout(&listener);
+                let (mut socket, _) = accept_with_timeout(&listener);
                 let request = String::from_utf8_lossy(&read_http_request(&mut socket)).to_string();
                 assert!(request.starts_with(expected));
-                write!(socket,"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+                write!(
+                    socket,
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
             }
         });
         let state = build_state("legacy-tombstone-unrouted");
-        seed_legacy_revoke_share(&state,&format!("http://{addr}/"));
-        assert!(block_on(revoke_org_share_inner(&state,"legacy-item".into())).is_err());
+        seed_legacy_revoke_share(&state, &format!("http://{addr}/"));
+        assert!(block_on(revoke_org_share_inner(&state, "legacy-item".into())).is_err());
         server.join().unwrap();
-        assert_eq!(state.db.get_org_share("legacy-row").unwrap().unwrap().state,"revoke_pending");
+        assert_eq!(
+            state.db.get_org_share("legacy-row").unwrap().unwrap().state,
+            "revoke_pending"
+        );
         assert!(state.db.get_org_item("legacy-item").unwrap().is_some());
-        assert_eq!(state.db.count_share_egress_by_kind("org_item_tombstone_404_read").unwrap(),1);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_item_tombstone_404_read")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -28189,19 +29883,26 @@
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (mut delete,_) = accept_with_timeout(&listener);
+            let (mut delete, _) = accept_with_timeout(&listener);
             let _ = read_http_request(&mut delete);
-            write!(delete,"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
-            let (mut get,_) = accept_with_timeout(&listener);
+            write!(
+                delete,
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let (mut get, _) = accept_with_timeout(&listener);
             let _ = read_http_request(&mut get);
             let body = "{\"items\":[{\"itemId\":\"legacy-item\",\"seq\":1,\"authorUserId\":\"owner\",\"rev\":1,\"generation\":1,\"createdAt\":\"t\",\"tombstoned\":true,\"isCurrent\":false}],\"nextSeq\":1}";
             write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
         });
         let state = build_state("legacy-tombstone-corroborated");
-        seed_legacy_revoke_share(&state,&format!("http://{addr}/"));
-        block_on(revoke_org_share_inner(&state,"legacy-item".into())).unwrap();
+        seed_legacy_revoke_share(&state, &format!("http://{addr}/"));
+        block_on(revoke_org_share_inner(&state, "legacy-item".into())).unwrap();
         server.join().unwrap();
-        assert_eq!(state.db.get_org_share("legacy-row").unwrap().unwrap().state,"revoked");
+        assert_eq!(
+            state.db.get_org_share("legacy-row").unwrap().unwrap().state,
+            "revoked"
+        );
         assert!(state.db.get_org_item("legacy-item").unwrap().is_none());
     }
 
@@ -28360,10 +30061,10 @@
                 r#"{{"docId":"{STABLE_DOC_ID}","access":"view","documentOwnerUserId":"c534b6d2-02c1-4c2c-a256-3af8592b1567"}}"#
             );
             let response = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
             socket.write_all(response.as_bytes()).unwrap();
         });
 
@@ -28465,17 +30166,16 @@
             let mut stmt = conn
                 .prepare(
                     "SELECT item_id, access, document_owner_user_id FROM org_items
-                                  WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0
-                                  ORDER BY item_id",
+                                      WHERE org_id = ?1 AND doc_id = ?2 AND tombstoned = 0
+                                      ORDER BY item_id",
                 )
                 .unwrap();
-            stmt.query_map(
-                rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
+            stmt.query_map(rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
         };
         assert_eq!(live.len(), 2);
         assert!(live.iter().all(|(_, access, owner)| {
@@ -28503,8 +30203,16 @@
         use std::io::Write;
 
         for (case, response_access, response_owner) in [
-            ("wrong-access", "edit", "c534b6d2-02c1-4c2c-a256-3af8592b1567"),
-            ("wrong-owner", "view", "11111111-1111-4111-8111-111111111111"),
+            (
+                "wrong-access",
+                "edit",
+                "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+            ),
+            (
+                "wrong-owner",
+                "view",
+                "11111111-1111-4111-8111-111111111111",
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -28515,14 +30223,14 @@
                     "PATCH /v1/orgs/{STABLE_ORG_ID}/documents/{STABLE_DOC_ID}"
                 )));
                 let body = format!(
-                    "{{\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"{response_access}\",\"documentOwnerUserId\":\"{response_owner}\"}}"
-                );
+                        "{{\"docId\":\"{STABLE_DOC_ID}\",\"access\":\"{response_access}\",\"documentOwnerUserId\":\"{response_owner}\"}}"
+                    );
                 write!(
-                    socket,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(), body
-                )
-                .unwrap();
+                        socket,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(), body
+                    )
+                    .unwrap();
             });
             let state = build_state(&format!("org-access-{case}"));
             seed_editable_stable_org_item(&state, "item-old", "edit");
@@ -28534,8 +30242,17 @@
             ));
             server.join().unwrap();
             assert!(matches!(result, Err(AppError::Unavailable(_))));
-            assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "edit");
-            assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
+            assert_eq!(
+                state.db.get_org_item("item-old").unwrap().unwrap().access,
+                "edit"
+            );
+            assert_eq!(
+                state
+                    .db
+                    .count_share_egress_by_kind("org_share_access")
+                    .unwrap(),
+                1
+            );
         }
     }
 
@@ -28543,49 +30260,103 @@
     fn org_access_is_single_flight_and_restart_reconciles_authoritative_access() {
         let state = build_state("org-access-response-reorder");
         seed_editable_stable_org_item(&state, "item-old", "edit");
-        state.db.insert_org_share(
-            "share-access",STABLE_ORG_ID,None,Some("source"),"note",Some("Draft"),
-            1,1,&[1u8;32],"t",
-        ).unwrap();
-        state.db.set_org_share_uploaded("share-access","item-old","t").unwrap();
-        state.db.set_org_share_document_metadata("share-access",STABLE_DOC_ID,"edit").unwrap();
+        state
+            .db
+            .insert_org_share(
+                "share-access",
+                STABLE_ORG_ID,
+                None,
+                Some("source"),
+                "note",
+                Some("Draft"),
+                1,
+                1,
+                &[1u8; 32],
+                "t",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-access", "item-old", "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_document_metadata("share-access", STABLE_DOC_ID, "edit")
+            .unwrap();
         let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
         state.config.lock().unwrap().org_egress_consented = true;
         let (_permit, dispatch_id) = permit_org_access(
-            &state, "relay.example", STABLE_ORG_ID, STABLE_DOC_ID,
+            &state,
+            "relay.example",
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
             crate::share::org_dto::OrgItemAccess::View,
             crate::share::org_dto::OrgItemAccess::Edit,
-            actor, actor,
-        ).unwrap();
-        assert!(matches!(permit_org_access(
-            &state, "relay.example", STABLE_ORG_ID, STABLE_DOC_ID,
-            crate::share::org_dto::OrgItemAccess::View,
-            crate::share::org_dto::OrgItemAccess::Edit, actor, actor,
-        ), Err(AppError::Unavailable(_))));
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
-        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "edit");
+            actor,
+            actor,
+        )
+        .unwrap();
+        assert!(matches!(
+            permit_org_access(
+                &state,
+                "relay.example",
+                STABLE_ORG_ID,
+                STABLE_DOC_ID,
+                crate::share::org_dto::OrgItemAccess::View,
+                crate::share::org_dto::OrgItemAccess::Edit,
+                actor,
+                actor,
+            ),
+            Err(AppError::Unavailable(_))
+        ));
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_access")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state.db.get_org_item("item-old").unwrap().unwrap().access,
+            "edit"
+        );
         let attempt = pending_org_access_attempts(&state).unwrap().remove(0);
         assert_eq!(attempt.dispatch_id, dispatch_id);
         let head: crate::share::org_dto::OrgItemEntry = serde_json::from_value(serde_json::json!({
             "itemId":"item-old","seq":1,"authorUserId":actor,"rev":1,"generation":1,
             "createdAt":"t","tombstoned":false,"docId":STABLE_DOC_ID,"access":"view",
             "documentOwnerUserId":actor,"isCurrent":true
-        })).unwrap();
-        state.db.lock().execute(
-            "UPDATE org_shares SET state='failed',last_error='direct_put_pending'
-              WHERE org_id=?1 AND doc_id=?2",
-            rusqlite::params![STABLE_ORG_ID,STABLE_DOC_ID],
-        ).unwrap();
+        }))
+        .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_shares SET state='failed',last_error='direct_put_pending'
+                  WHERE org_id=?1 AND doc_id=?2",
+                rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID],
+            )
+            .unwrap();
         assert!(!apply_authoritative_org_access(&state, &attempt, &head).unwrap());
-        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "edit");
+        assert_eq!(
+            state.db.get_org_item("item-old").unwrap().unwrap().access,
+            "edit"
+        );
         assert_eq!(pending_org_access_attempts(&state).unwrap().len(), 1);
-        state.db.lock().execute(
-            "UPDATE org_shares SET state='uploaded',last_error=NULL
-              WHERE org_id=?1 AND doc_id=?2",
-            rusqlite::params![STABLE_ORG_ID,STABLE_DOC_ID],
-        ).unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_shares SET state='uploaded',last_error=NULL
+                  WHERE org_id=?1 AND doc_id=?2",
+                rusqlite::params![STABLE_ORG_ID, STABLE_DOC_ID],
+            )
+            .unwrap();
         assert!(apply_authoritative_org_access(&state, &attempt, &head).unwrap());
-        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access, "view");
+        assert_eq!(
+            state.db.get_org_item("item-old").unwrap().unwrap().access,
+            "view"
+        );
         assert!(pending_org_access_attempts(&state).unwrap().is_empty());
     }
 
@@ -28605,14 +30376,34 @@
             write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
         });
         let state = build_state("org-access-ambiguous-reconcile");
-        seed_editable_stable_org_item(&state,"item-old","edit");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
         state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
-        block_on(org_set_item_access_inner(&state,"item-old",crate::share::org_dto::OrgItemAccess::View)).unwrap();
+        block_on(org_set_item_access_inner(
+            &state,
+            "item-old",
+            crate::share::org_dto::OrgItemAccess::View,
+        ))
+        .unwrap();
         server.join().unwrap();
-        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access,"view");
+        assert_eq!(
+            state.db.get_org_item("item-old").unwrap().unwrap().access,
+            "view"
+        );
         assert!(pending_org_access_attempts(&state).unwrap().is_empty());
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(),1);
-        assert_eq!(state.db.count_share_egress_by_kind("org_document_head_read").unwrap(),1);
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_access")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_head_read")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -28626,17 +30417,29 @@
             write!(patch,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{{").unwrap();
             let (mut get, _) = accept_with_timeout(&first_listener);
             assert!(String::from_utf8_lossy(&read_http_request(&mut get)).starts_with("GET "));
-            write!(get,"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+            write!(
+                get,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
         });
         let state = build_state("org-access-ambiguous-restart");
-        seed_editable_stable_org_item(&state,"item-old","edit");
+        seed_editable_stable_org_item(&state, "item-old", "edit");
         state.config.lock().unwrap().share_base_url = format!("http://{first_addr}/");
-        assert!(matches!(block_on(org_set_item_access_inner(
-            &state,"item-old",crate::share::org_dto::OrgItemAccess::View,
-        )),Err(AppError::Unavailable(_))));
+        assert!(matches!(
+            block_on(org_set_item_access_inner(
+                &state,
+                "item-old",
+                crate::share::org_dto::OrgItemAccess::View,
+            )),
+            Err(AppError::Unavailable(_))
+        ));
         first_server.join().unwrap();
-        assert_eq!(pending_org_access_attempts(&state).unwrap().len(),1);
-        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access,"edit");
+        assert_eq!(pending_org_access_attempts(&state).unwrap().len(), 1);
+        assert_eq!(
+            state.db.get_org_item("item-old").unwrap().unwrap().access,
+            "edit"
+        );
 
         let second_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let second_addr = second_listener.local_addr().unwrap();
@@ -28648,12 +30451,27 @@
             write!(get,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).unwrap();
         });
         state.config.lock().unwrap().share_base_url = format!("http://{second_addr}/");
-        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(),1);
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
         second_server.join().unwrap();
         assert!(pending_org_access_attempts(&state).unwrap().is_empty());
-        assert_eq!(state.db.get_org_item("item-old").unwrap().unwrap().access,"view");
-        assert_eq!(state.db.count_share_egress_by_kind("org_share_access").unwrap(),1);
-        assert_eq!(state.db.count_share_egress_by_kind("org_document_head_read").unwrap(),2);
+        assert_eq!(
+            state.db.get_org_item("item-old").unwrap().unwrap().access,
+            "view"
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_share_access")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state
+                .db
+                .count_share_egress_by_kind("org_document_head_read")
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -28674,12 +30492,8 @@
             rev: 1,
             generation: 1,
         };
-        let publish_permit = test_org_publish_dispatch_permit(
-            host,
-            org_id,
-            &publish_request,
-            Some("owner"),
-        );
+        let publish_permit =
+            test_org_publish_dispatch_permit(host, org_id, &publish_request, Some("owner"));
         let mut substituted_publish = publish_request;
         substituted_publish.content_cell = Some(substituted_cell.clone());
         assert!(matches!(

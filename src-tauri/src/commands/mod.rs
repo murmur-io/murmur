@@ -69,6 +69,11 @@ pub use reminders::*;
 mod dashboards;
 pub use dashboards::*;
 
+// Org-owned Tasks — one encrypted stable document per task, projected from the shared org feed.
+// Device-private note/meeting/dashboard refs never enter the Task envelope.
+mod tasks;
+pub use tasks::*;
+
 // Model / capability / performance probes + NER download — no name collision with a crate module.
 mod model_perf;
 pub use model_perf::*;
@@ -2729,8 +2734,7 @@ fn compose_converted_companion_markdown(
             "the note provider returned an empty note".into(),
         ));
     }
-    if generated_body.contains(CONVERTED_NOTE_START)
-        || generated_body.contains(CONVERTED_NOTE_END)
+    if generated_body.contains(CONVERTED_NOTE_START) || generated_body.contains(CONVERTED_NOTE_END)
     {
         return Err(AppError::InvalidArg(
             "the note provider returned Murmur's reserved conversion markers".into(),
@@ -2852,36 +2856,36 @@ fn persist_converted_companion_under_snapshot_with(
     require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)?;
     let meeting_wikilink = format!("[[{meeting_name}]]");
 
-    let (note_id, markdown, created) =
-        if let Some(id) = state.db.companion_note_for_meeting(meeting_id)? {
-            let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&id)? else {
-                return Err(AppError::Storage(
-                    "the companion note disappeared during conversion".into(),
-                ));
-            };
-            if !folder_is_unlocked(state, &folder_id)? {
-                return Err(AppError::Locked(
-                    "unlock the companion note's folder before converting this meeting".into(),
-                ));
-            }
-            let row = state
-                .db
-                .get_note_row(&id)?
-                .ok_or_else(|| AppError::Storage("the companion note is unavailable".into()))?;
-            let markdown =
-                compose_converted_companion_markdown(&row.text, meeting_name, generated)?;
-            (id, markdown, false)
-        } else {
-            // Compose/validate BEFORE birth. An empty or malformed provider response leaves no row.
-            let markdown = compose_converted_companion_markdown("", meeting_name, generated)?;
-            let id = create_generated_root_companion_under_lifecycle_authorized(
-                state,
-                meeting_id,
-                meeting_name,
-                &markdown,
-            )?;
-            (id, markdown, true)
+    let (note_id, markdown, created) = if let Some(id) =
+        state.db.companion_note_for_meeting(meeting_id)?
+    {
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&id)? else {
+            return Err(AppError::Storage(
+                "the companion note disappeared during conversion".into(),
+            ));
         };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Err(AppError::Locked(
+                "unlock the companion note's folder before converting this meeting".into(),
+            ));
+        }
+        let row = state
+            .db
+            .get_note_row(&id)?
+            .ok_or_else(|| AppError::Storage("the companion note is unavailable".into()))?;
+        let markdown = compose_converted_companion_markdown(&row.text, meeting_name, generated)?;
+        (id, markdown, false)
+    } else {
+        // Compose/validate BEFORE birth. An empty or malformed provider response leaves no row.
+        let markdown = compose_converted_companion_markdown("", meeting_name, generated)?;
+        let id = create_generated_root_companion_under_lifecycle_authorized(
+            state,
+            meeting_id,
+            meeting_name,
+            &markdown,
+        )?;
+        (id, markdown, true)
+    };
     if created {
         // DB canonical state is already complete atomically. Vault export remains a derived,
         // best-effort projection just like the ordinary note-update path.
@@ -2963,14 +2967,8 @@ pub async fn convert_meeting_to_note(
     meeting_id: String,
     template_id: Option<String>,
 ) -> Result<CompanionAppendResult, AppError> {
-    convert_meeting_to_note_inner_with(
-        Some(&app),
-        state.inner(),
-        meeting_id,
-        template_id,
-        None,
-    )
-    .await
+    convert_meeting_to_note_inner_with(Some(&app), state.inner(), meeting_id, template_id, None)
+        .await
 }
 
 async fn convert_meeting_to_note_inner_with(
@@ -2978,9 +2976,7 @@ async fn convert_meeting_to_note_inner_with(
     state: &AppState,
     meeting_id: String,
     template_id: Option<String>,
-    provider_override: Option<
-        std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>,
-    >,
+    provider_override: Option<std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>>,
 ) -> Result<CompanionAppendResult, AppError> {
     let config = state
         .config
@@ -2991,50 +2987,44 @@ async fn convert_meeting_to_note_inner_with(
         crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config);
     let snapshot = capture_meeting_content_snapshot(state, &meeting_id)?;
     let (meeting, segments, manual_notes, linked_context, vault_titles) =
-        read_current_meeting_content_under_snapshot(
-            state,
-            &meeting_id,
-            &snapshot,
-            || {
-                let meeting = state
-                    .db
-                    .get_meeting(&meeting_id)?
-                    .ok_or_else(|| AppError::InvalidArg(format!("no meeting {meeting_id}")))?;
-                let segments = state.db.get_segments(&meeting_id)?;
-                let manual_notes = state.db.get_manual_notes(&meeting_id)?;
-                let unlocked = unlocked_snapshot(state)?;
-                let edges =
-                    active_conversion_related_edges(state, &meeting_id, &unlocked)?;
-                let mut sources = Vec::new();
-                let mut vault_titles = Vec::new();
-                for edge in edges {
-                    let Some(kind) = crate::links::LinkKind::parse(&edge.other_kind) else {
-                        continue;
-                    };
-                    sources.push(crate::storage::models::SourceRef {
-                        kind,
-                        id: edge.other_id,
-                    });
-                    if !edge.other_title.trim().is_empty() {
-                        vault_titles.push(edge.other_title);
-                    }
+        read_current_meeting_content_under_snapshot(state, &meeting_id, &snapshot, || {
+            let meeting = state
+                .db
+                .get_meeting(&meeting_id)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no meeting {meeting_id}")))?;
+            let segments = state.db.get_segments(&meeting_id)?;
+            let manual_notes = state.db.get_manual_notes(&meeting_id)?;
+            let unlocked = unlocked_snapshot(state)?;
+            let edges = active_conversion_related_edges(state, &meeting_id, &unlocked)?;
+            let mut sources = Vec::new();
+            let mut vault_titles = Vec::new();
+            for edge in edges {
+                let Some(kind) = crate::links::LinkKind::parse(&edge.other_kind) else {
+                    continue;
+                };
+                sources.push(crate::storage::models::SourceRef {
+                    kind,
+                    id: edge.other_id,
+                });
+                if !edge.other_title.trim().is_empty() {
+                    vault_titles.push(edge.other_title);
                 }
-                let linked_context =
-                    crate::summarize::vault_context::build_vault_context_exact_visible_with_budget(
-                        &state.db,
-                        &sources,
-                        crate::summarize::vault_context::budget_for(&target.connection),
-                        &unlocked,
-                    )?;
-                Ok((
-                    meeting,
-                    segments,
-                    manual_notes,
-                    linked_context,
-                    vault_titles,
-                ))
-            },
-        )?;
+            }
+            let linked_context =
+                crate::summarize::vault_context::build_vault_context_exact_visible_with_budget(
+                    &state.db,
+                    &sources,
+                    crate::summarize::vault_context::budget_for(&target.connection),
+                    &unlocked,
+                )?;
+            Ok((
+                meeting,
+                segments,
+                manual_notes,
+                linked_context,
+                vault_titles,
+            ))
+        })?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg(
             "this meeting has no transcript to convert".into(),
@@ -3431,7 +3421,8 @@ async fn delete_companion_note_if_empty_inner_notifying(
         {
             return Ok(false);
         }
-        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&note_id)? else {
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&note_id)?
+        else {
             return Ok(false);
         };
         if !folder_is_unlocked(state, &folder_id)? {
@@ -3816,13 +3807,11 @@ fn write_note_to_vault(
     let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
+    let owner = crate::storage::AttachmentOwner::Document {
+        document_id: row.id.clone(),
+    };
     let exported_markdown = render_markdown_with_attachments_for_export_under_lifecycle_authorized(
-        state,
-        &crate::storage::AttachmentOwner::Document {
-            document_id: row.id.clone(),
-        },
-        &row.text,
-        vault_root,
+        state, &owner, &row.text, vault_root,
     )?;
     let path = crate::export::write_note(
         vault_root,
@@ -4265,11 +4254,9 @@ pub(crate) fn pack_chat_pinned_sources(
 }
 
 pub(crate) fn resolved_ask_corpus_budget(config: &AppConfig) -> usize {
-    let connection = crate::summarize::roles::provider_target(
-        crate::summarize::roles::Role::Ask,
-        config,
-    )
-    .connection;
+    let connection =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
+            .connection;
     crate::summarize::vault_context::budget_for(&connection)
 }
 
@@ -4283,14 +4270,10 @@ pub(crate) struct AskDispatchSnapshot {
 }
 
 pub(crate) fn ask_dispatch_projection(config: &AppConfig) -> String {
-    let provider = crate::summarize::roles::provider_target(
-        crate::summarize::roles::Role::Ask,
-        config,
-    );
-    let reasoner = crate::summarize::roles::reasoner_target(
-        crate::summarize::roles::Role::Ask,
-        config,
-    );
+    let provider =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config);
+    let reasoner =
+        crate::summarize::roles::reasoner_target(crate::summarize::roles::Role::Ask, config);
     serde_json::json!({
         "provider": [provider.connection, provider.model, provider.effort],
         "reasoner": [reasoner.connection, reasoner.model, reasoner.effort],
@@ -5967,9 +5950,13 @@ pub(crate) async fn ask_vault_prepacked_dashboard_authorized(
     }
     let config = config.clone();
     let heavy = heavy.clone();
-    ask_vault_prepacked_dashboard_dispatch(context, question, history, dispatch_admission, move || {
-        crate::summarize::provider_for(crate::summarize::roles::Role::Ask, &config, &heavy)
-    })
+    ask_vault_prepacked_dashboard_dispatch(
+        context,
+        question,
+        history,
+        dispatch_admission,
+        move || crate::summarize::provider_for(crate::summarize::roles::Role::Ask, &config, &heavy),
+    )
     .await
 }
 
@@ -9732,21 +9719,12 @@ pub(crate) fn unseal_folder_extras(
     // vector; mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
     reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
 
-    // NOTES: re-export each authored note's vault `.md` (deleted on lock). Best-effort — the note's
-    // plaintext text was restored just above (document unseal leg), so `export_note_to_vault` writes
-    // the fresh `.md` + re-records `exported_path`. A failure logs (no PII) and never fails the
-    // unlock.
-    reexport_notes_in_folder(state, folder_id);
     Ok(())
 }
 
-/// Re-export every authored NOTE's vault `.md` in a folder whose plaintext was JUST restored by the
-/// unseal path (session-unlock or permanent remove-lock), re-recording each `exported_path`. Called
-/// from INSIDE the unseal path — the folder is still `locked=1` and not yet in the session unlock set
-/// at this point (see `unlock_folder`'s ordering), so it uses the UNGATED [`write_note_to_vault`]
-/// (authorized by the CK the caller decrypted with), exactly as `unseal_folder_extras` writes the
-/// restored plaintext into the DB without re-gating. Best-effort per note (a failure logs IDs/stage
-/// only and continues). A blanked (still-sealed) row is skipped inside `write_note_to_vault`.
+/// Re-export every authored NOTE's vault `.md` only after the folder is either session-admitted or
+/// durably open. The ordinary attachment owner gate therefore protects every byte written to disk.
+/// Best-effort per note; a blank row is skipped inside [`write_note_to_vault`].
 fn reexport_notes_in_folder(state: &AppState, folder_id: &str) {
     let note_ids = match state.db.note_ids_in_folder(folder_id) {
         Ok(ids) => ids,
@@ -10481,9 +10459,6 @@ pub(crate) fn unseal_folder_extras_permanent(
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
 
-    // NOTES: the folder is permanently open — re-export each authored note's vault `.md` (deleted on
-    // lock) so the note lives on disk again. Best-effort (the plaintext text was restored above).
-    reexport_notes_in_folder(state, folder_id);
     Ok(sealed_audio_to_retire)
 }
 
@@ -10666,13 +10641,9 @@ fn reseal_document_if_locked_with_mode(
             .db
             .update_note_row_sealed(doc_id, title, text, &blob, updated_at)?;
     } else {
-        state.db.update_note_row_sealed_debounced(
-            doc_id,
-            title,
-            text,
-            &blob,
-            updated_at,
-        )?;
+        state
+            .db
+            .update_note_row_sealed_debounced(doc_id, title, text, &blob, updated_at)?;
     }
     tracing::debug!(target: "lock", note_id = %doc_id, "seal-on-write: authored note re-sealed under the folder CK");
     Ok(())
@@ -11470,8 +11441,7 @@ pub async fn account_login(
         unlocked_for_sharing: true,
         share_consented: cfg.share_egress_consented,
         server_configured: !cfg.share_base_url.trim().is_empty(),
-        biometric_unlock_available: crate::secrets::keychain::account_mk_cached()
-            .unwrap_or(false)
+        biometric_unlock_available: crate::secrets::keychain::account_mk_cached().unwrap_or(false)
             || cfg!(all(target_os = "macos", not(debug_assertions))),
     };
     drop(cfg);

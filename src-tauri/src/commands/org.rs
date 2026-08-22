@@ -75,6 +75,36 @@ fn attachment_bundle_for_markdown(
     Ok((markdown, attachments))
 }
 
+fn task_attachment_bundle_for_markdown(
+    state: &AppState,
+    owner: &crate::storage::AttachmentOwner,
+    org_id: &str,
+    markdown: &str,
+) -> Result<(String, Vec<murmur_protocol::envelope::ShareAttachment>), AppError> {
+    let referenced = crate::commands::referenced_attachment_ids(markdown)?;
+    let items = crate::commands::attachment_bundle_for_task_source_authorized(
+        state,
+        owner,
+        org_id,
+        &referenced,
+    )?;
+    let allowed: std::collections::HashSet<String> =
+        items.iter().map(|item| item.id.clone()).collect();
+    let markdown = crate::share::envelope::sanitize_share_images(markdown, &allowed);
+    let attachments = items
+        .into_iter()
+        .map(|item| murmur_protocol::envelope::ShareAttachment {
+            id: item.id,
+            mime_type: item.mime_type,
+            width: item.width,
+            height: item.height,
+            sha256: item.sha256.to_vec(),
+            data: item.data,
+        })
+        .collect();
+    Ok((markdown, attachments))
+}
+
 fn share_envelope_with_attachments(
     state: &AppState,
     owner: &crate::storage::AttachmentOwner,
@@ -151,24 +181,117 @@ pub(crate) fn prepare_incoming_attachment_bundle(
     ))
 }
 
+#[cfg(test)]
+pub(crate) const PRE_TASK_READER_RELEASE_TAG: &str = "v1.1.0";
+#[cfg(test)]
+pub(crate) const PRE_TASK_READER_REVISION: &str =
+    "abb6971607d221bfe728d4ff5202ccde7872fcf8";
+#[cfg(test)]
+pub(crate) const PRE_TASK_READER_COMPAT_REVISION: &str =
+    "2e6ff1eaa35273347a19e7284837f86432f80195";
+#[cfg(test)]
+pub(crate) const PRE_TASK_READER_RELEASE_SUBJECT: &str =
+    "Merge pull request #533 from murmur-io/chore/release-1.1.0";
+#[cfg(test)]
+pub(crate) const PRE_TASK_ORG_ENVELOPE_BLOB_SHA1: &str =
+    "7a49b5b7b70ab3ea0cd66e77280866b61c6780ee";
+#[cfg(test)]
+pub(crate) const PRE_TASK_ORG_ENVELOPE_SOURCE_SHA256: &str =
+    "18e76f37177cee674bec35df3849fcbbbe50d504603f6e40fb36d7660a41070f";
+#[cfg(test)]
+pub(crate) const PRE_TASK_RELEASE_ORG_COMMANDS_BLOB_SHA1: &str =
+    "141290c2e518dfab109df9ff93be09b50d586a65";
+#[cfg(test)]
+pub(crate) const PRE_TASK_RELEASE_ORG_COMMANDS_SOURCE_SHA256: &str =
+    "a88eacd9920b9a47221804910e467f52f7eb546ba9dec676cab7a250a6029392";
+#[cfg(test)]
+pub(crate) const PRE_TASK_COMPAT_ORG_COMMANDS_BLOB_SHA1: &str =
+    "59538a6b230459f96bd4349e85fb4eb9b570951c";
+#[cfg(test)]
+pub(crate) const PRE_TASK_COMPAT_ORG_COMMANDS_SOURCE_SHA256: &str =
+    "3b2cb4688e360e2e16b57136401df938b5a1c33b2c876b64c6346bcec2d1b49d";
+#[cfg(test)]
+pub(crate) const PRE_TASK_KIND_DISCRIMINATOR_SHA256: &str =
+    "6fe0b52de9d7165a21e04dc6b11f92252ca796d2308a02c8427671f233426210";
+#[cfg(test)]
+pub(crate) const PRE_TASK_TERMINAL_SKIP_SHA256: &str =
+    "ee38b7539c693e708a0c9df61fa5404224eb27f82e52fa61c1fe265fd1e5254a";
+
+#[derive(Clone, Copy)]
+enum OrgEnvelopeReader {
+    Current,
+    /// Exact compatibility boundary from the client immediately before Task tag 3 shipped.
+    /// The pinned source accepted only kind tags 1/2; everything else failed closed after AEAD open.
+    #[cfg(test)]
+    PreTaskV110,
+}
+
+impl OrgEnvelopeReader {
+    fn open(
+        self,
+        ock: &[u8; 32],
+        ciphertext: &[u8],
+        org_id: &str,
+        item_nonce: &str,
+    ) -> Result<crate::share::org_envelope::OrgEnvelope, AppError> {
+        match self {
+            Self::Current => crate::share::org_envelope::open_org_envelope(
+                ock,
+                ciphertext,
+                org_id,
+                item_nonce,
+            ),
+            #[cfg(test)]
+            Self::PreTaskV110 => {
+                // Frozen from the released v1.1.0 client revision
+                // abb6971607d221bfe728d4ff5202ccde7872fcf8,
+                // org_envelope.rs Git blob 7a49b5b7b70ab3ea0cd66e77280866b61c6780ee.
+                // Its production `OrgItemKind::from_tag` accepted exactly Note=1/Summary=2.
+                // Decrypt under the real production AAD first, then apply that old discriminator.
+                let aad = crate::share::org_envelope::org_item_aad(org_id, item_nonce);
+                let plaintext = crate::crypto::decrypt(ock, ciphertext, aad.as_bytes())?;
+                match plaintext.get(2) {
+                    Some(1 | 2) => {
+                        crate::share::org_envelope::OrgEnvelope::from_canonical_bytes(&plaintext)
+                    }
+                    _ => Err(AppError::InvalidArg(
+                        "unknown org item kind tag".into(),
+                    )),
+                }
+            }
+        }
+    }
+}
+
 /// Manual org operations remain immediately usable; scheduled work carries one recording-priority
 /// epoch from the beginning of its tick. Every background DB commit revalidates that epoch through
 /// the coordinator, while network/model work happens outside the short commit lease.
 #[derive(Clone, Copy)]
 struct OrgWorkPolicy {
     background_epoch: Option<u64>,
+    reader: OrgEnvelopeReader,
 }
 
 impl OrgWorkPolicy {
     const fn manual() -> Self {
         Self {
             background_epoch: None,
+            reader: OrgEnvelopeReader::Current,
         }
     }
 
     const fn background(epoch: u64) -> Self {
         Self {
             background_epoch: Some(epoch),
+            reader: OrgEnvelopeReader::Current,
+        }
+    }
+
+    #[cfg(test)]
+    const fn pre_task_reader() -> Self {
+        Self {
+            background_epoch: None,
+            reader: OrgEnvelopeReader::PreTaskV110,
         }
     }
 
@@ -361,12 +484,7 @@ pub(crate) async fn share_note_to_link_inner(
     let client = crate::share::client::ShareClient::new(&base)?;
     let share_id = crate::share::new_share_id();
     let rev = 1u32;
-    require_current_org_share_snapshot(
-        state,
-        Some(&meeting_id),
-        None,
-        &source.source_version,
-    )?;
+    require_current_org_share_snapshot(state, Some(&meeting_id), None, &source.source_version)?;
     // Mint the exact owner-bound cleanup authority before capability discovery. An old/unavailable
     // relay therefore leaves a visible, retryable local journal rather than losing the id. Recovery
     // may reserve + DELETE this id, but it never redispatches the content POST.
@@ -473,8 +591,7 @@ pub(crate) async fn share_note_to_link_inner(
     {
         Ok(created) => created,
         Err(error) => {
-            let _ =
-                retire_ambiguous_outbound_share(state, &client, &access_token, &share_id).await;
+            let _ = retire_ambiguous_outbound_share(state, &client, &access_token, &share_id).await;
             return Err(error);
         }
     };
@@ -611,8 +728,7 @@ pub(crate) async fn share_note_to_link_doc_inner(
         murmur_protocol::dto::ShareMode::Link,
     )
     .await?;
-    if let Err(error) =
-        require_current_org_share_snapshot(state, None, Some(&id), &source_version)
+    if let Err(error) = require_current_org_share_snapshot(state, None, Some(&id), &source_version)
     {
         let _ = retire_ambiguous_outbound_share(state, &client, &access_token, &share_id).await;
         return Err(error);
@@ -637,8 +753,7 @@ pub(crate) async fn share_note_to_link_doc_inner(
     {
         Ok(created) => created,
         Err(error) => {
-            let _ =
-                retire_ambiguous_outbound_share(state, &client, &access_token, &share_id).await;
+            let _ = retire_ambiguous_outbound_share(state, &client, &access_token, &share_id).await;
             return Err(error);
         }
     };
@@ -664,9 +779,7 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
     list_my_shares_inner(state.inner()).await
 }
 
-pub(crate) async fn list_my_shares_inner(
-    state: &AppState,
-) -> Result<Vec<MyShareEntry>, AppError> {
+pub(crate) async fn list_my_shares_inner(state: &AppState) -> Result<Vec<MyShareEntry>, AppError> {
     let base = share_base_url(state)?;
     let (access, actor_user_id) = authenticated_org_actor(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -675,9 +788,9 @@ pub(crate) async fn list_my_shares_inner(
         .outbound_cleanup_pending_for_owner(&actor_user_id)?;
     let resp = match client.list_shares(&access).await {
         Ok(resp) => resp,
-        Err(_) if !local_pending.is_empty() => murmur_protocol::dto::SharesResponse {
-            shares: Vec::new(),
-        },
+        Err(_) if !local_pending.is_empty() => {
+            murmur_protocol::dto::SharesResponse { shares: Vec::new() }
+        }
         Err(error) => return Err(error),
     };
 
@@ -784,7 +897,10 @@ fn my_share_local_title_under_lifecycle(
     }
     match local_meeting.filter(|meeting_id| !meeting_id.is_empty()) {
         Some(meeting_id) if meeting_is_unlocked(state, meeting_id)? => Ok((
-            state.db.get_meeting(meeting_id)?.and_then(|meeting| meeting.title),
+            state
+                .db
+                .get_meeting(meeting_id)?
+                .and_then(|meeting| meeting.title),
             false,
         )),
         Some(_) | None => Ok((None, true)),
@@ -804,7 +920,9 @@ pub(crate) async fn revoke_share_inner(state: &AppState, share_id: String) -> Re
     let (expected_owner, mode, phase, rev) = state
         .db
         .outbound_share_cleanup_context(&share_id)?
-        .ok_or_else(|| AppError::Unavailable("the local share recovery witness is missing".into()))?;
+        .ok_or_else(|| {
+            AppError::Unavailable("the local share recovery witness is missing".into())
+        })?;
     if expected_owner.is_empty() {
         return Err(AppError::Unavailable(
             "this legacy share has no durable owner witness; remote deletion cannot be proven"
@@ -822,24 +940,11 @@ pub(crate) async fn revoke_share_inner(state: &AppState, share_id: String) -> Re
     let mode = parse_outbound_share_mode(&mode)?;
     if phase == "create_pending" {
         require_share_owner_claim_capability(state, &client).await?;
-        reserve_outbound_share_id(
-            state,
-            &client,
-            &access,
-            &share_id,
-            &expected_owner,
-            mode,
-        )
-        .await?;
+        reserve_outbound_share_id(state, &client, &access, &share_id, &expected_owner, mode)
+            .await?;
     }
-    let delete_permit = permit_share_delete_dispatch(
-        state,
-        &client.host(),
-        &share_id,
-        &expected_owner,
-        mode,
-        rev,
-    )?;
+    let delete_permit =
+        permit_share_delete_dispatch(state, &client.host(), &share_id, &expected_owner, mode, rev)?;
     match client
         .revoke_share(
             &access,
@@ -942,13 +1047,7 @@ async fn reserve_outbound_share_id(
     owner_user_id: &str,
     mode: murmur_protocol::dto::ShareMode,
 ) -> Result<ReservedShareId, AppError> {
-    let permit = permit_share_reservation(
-        state,
-        &client.host(),
-        share_id,
-        owner_user_id,
-        mode,
-    )?;
+    let permit = permit_share_reservation(state, &client.host(), share_id, owner_user_id, mode)?;
     client
         .reserve_share_id(access_token, share_id, owner_user_id, mode, permit)
         .await?;
@@ -1132,25 +1231,14 @@ async fn retire_ambiguous_outbound_share(
     let (owner_user_id, mode, _, rev) = state
         .db
         .outbound_share_cleanup_context(share_id)?
-        .ok_or_else(|| AppError::Unavailable("the local share recovery witness is missing".into()))?;
+        .ok_or_else(|| {
+            AppError::Unavailable("the local share recovery witness is missing".into())
+        })?;
     let mode = parse_outbound_share_mode(&mode)?;
-    let permit = permit_share_delete_dispatch(
-        state,
-        &client.host(),
-        share_id,
-        &owner_user_id,
-        mode,
-        rev,
-    )?;
+    let permit =
+        permit_share_delete_dispatch(state, &client.host(), share_id, &owner_user_id, mode, rev)?;
     match client
-        .revoke_share(
-            access_token,
-            share_id,
-            &owner_user_id,
-            mode,
-            rev,
-            permit,
-        )
+        .revoke_share(access_token, share_id, &owner_user_id, mode, rev, permit)
         .await?
     {
         crate::share::client::RevokeShareResult::Deleted => {
@@ -1314,12 +1402,7 @@ pub(crate) async fn share_note_to_user_inner(
     let client = crate::share::client::ShareClient::new(&base)?;
     let share_id = crate::share::new_share_id();
     let rev = 1u32;
-    require_current_org_share_snapshot(
-        state,
-        Some(&meeting_id),
-        None,
-        &source.source_version,
-    )?;
+    require_current_org_share_snapshot(state, Some(&meeting_id), None, &source.source_version)?;
     if !state.db.insert_outbound_share_attempt(
         &share_id,
         Some(&meeting_id),
@@ -2423,6 +2506,56 @@ fn scrub_org_markdown(markdown: &str) -> (String, OrgScrubCounts) {
     (scrubbed, counts)
 }
 
+fn add_scrub_counts(total: &mut OrgScrubCounts, next: &OrgScrubCounts) {
+    total.emails += next.emails;
+    total.phones += next.phones;
+    total.cards += next.cards;
+}
+
+/// Redact only Task free-text fields while preserving the typed JSON document, stable ids,
+/// status/dates, same-org references, and attachment UUIDs byte-for-byte. Running the Markdown
+/// scrubber over the serialized JSON would corrupt those protocol fields.
+pub(crate) fn scrub_task_envelope_json(
+    markdown: &str,
+    org_id: &str,
+) -> Result<
+    (
+        crate::share::task_envelope::TaskEnvelope,
+        String,
+        OrgScrubCounts,
+    ),
+    AppError,
+> {
+    let mut task = crate::share::task_envelope::TaskEnvelope::from_json(markdown, org_id)?;
+    let mut counts = OrgScrubCounts::default();
+    let mut scrub = |value: &str| {
+        let (value, next) = scrub_org_markdown(value);
+        add_scrub_counts(&mut counts, &next);
+        value
+    };
+
+    task.title = scrub(&task.title);
+    task.description = scrub(&task.description);
+    for subtask in &mut task.subtasks {
+        subtask.title = scrub(&subtask.title);
+    }
+    for image in &mut task.images {
+        let token = image.reference.trim();
+        let body = token
+            .strip_prefix("![")
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or_else(|| AppError::InvalidArg("task image reference is invalid".into()))?;
+        let (label, attachment_id) = body
+            .split_once("](murmur-attachment://")
+            .ok_or_else(|| AppError::InvalidArg("task image reference is invalid".into()))?;
+        let redacted_label = scrub(label);
+        image.reference = format!("![{redacted_label}](murmur-attachment://{attachment_id})");
+        image.alt = scrub(&image.alt);
+    }
+    let canonical = task.to_canonical_json(org_id)?;
+    Ok((task, canonical, counts))
+}
+
 /// A rough chunk count for the preview (mirrors the retrieval chunker's ~paragraph granularity
 /// without importing it — display-only). Non-empty blank-line-separated blocks, min 1 for any text.
 fn rough_chunk_count(markdown: &str) -> u32 {
@@ -3041,9 +3174,13 @@ async fn org_reconcile_memberships_with_policy(
                 state,
                 &client.host(),
                 "org_membership_corroborate",
-                OrgDispatchOperation::MembershipCorroborate { org_id: local.org_id.clone() },
+                OrgDispatchOperation::MembershipCorroborate {
+                    org_id: local.org_id.clone(),
+                },
             )?;
-            let corroboration = client.org_status_optional(&access, &local.org_id, permit).await;
+            let corroboration = client
+                .org_status_optional(&access, &local.org_id, permit)
+                .await;
             match corroboration {
                 Ok(Some(fresh)) => server_orgs.push(crate::share::org_dto::OrgSummary {
                     org_id: fresh.org_id,
@@ -3352,9 +3489,16 @@ pub async fn org_list_members(
     state: State<'_, AppState>,
     org_id: String,
 ) -> Result<Vec<OrgMember>, AppError> {
-    let org = resolve_org(state.inner(), &org_id)?;
-    let base = share_base_url(state.inner())?;
-    let access = valid_access_token(state.inner()).await?;
+    org_list_members_inner(state.inner(), &org_id).await
+}
+
+pub(crate) async fn org_list_members_inner(
+    state: &AppState,
+    org_id: &str,
+) -> Result<Vec<OrgMember>, AppError> {
+    let org = resolve_org(state, org_id)?;
+    let base = share_base_url(state)?;
+    let access = valid_access_token(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     let resp = client.org_list_members(&access, &org.org_id).await?;
     Ok(resp
@@ -3370,6 +3514,46 @@ pub async fn org_list_members(
             removed: false,
         })
         .collect())
+}
+
+/// Task assignee lookup is a remote, content-free org read. Keep it on a dedicated typed seam so
+/// Task commands cannot accidentally bypass the one-time org consent or issue an unledgered GET.
+pub(crate) async fn org_task_list_members_inner(
+    state: &AppState,
+    org_id: &str,
+) -> Result<Vec<OrgMember>, AppError> {
+    super::tasks::require_task_read_context(state, org_id)?;
+    require_org_egress_consent(state)?;
+    let org = resolve_org(state, org_id)?;
+    let base = share_base_url(state)?;
+    let access = valid_access_token(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let permit = permit_org_task_assignee_read(state, &client.host(), &org.org_id)?;
+    let resp = task_org_members_read_with_permit(&client, &access, &org.org_id, permit).await?;
+    Ok(resp
+        .members
+        .into_iter()
+        .map(|member| OrgMember {
+            user_id: member.user_id,
+            email: member.email,
+            role: member.role,
+            added_at: member.created_at,
+            removed: false,
+        })
+        .collect())
+}
+
+/// The only Task assignee socket boundary. Consuming the move-only permit here makes an
+/// unconsented or unledgered Task lookup impossible even though ordinary Org administration has
+/// its own member-list command.
+async fn task_org_members_read_with_permit(
+    client: &crate::share::client::ShareClient,
+    access_token: &str,
+    org_id: &str,
+    permit: OrgMembersReadPermit,
+) -> Result<crate::share::org_dto::OrgMembersResponse, AppError> {
+    permit.authorize(&client.host(), org_id)?;
+    client.org_list_members(access_token, org_id).await
 }
 
 /// `org_remove_member(org_id, user_id)` — owner soft-removes a member from the TARGETED org, then
@@ -3603,30 +3787,56 @@ pub(crate) fn build_org_share_snapshot(
                         "this note's folder is locked — unlock it to share to the org".into(),
                     ));
                 }
-                let row = state
-                    .db
-                    .get_note_row(did)?
-                    .ok_or_else(|| AppError::InvalidArg(format!("no note {did}")))?;
-                if row.folder_id != folder_id {
-                    return Err(AppError::Unavailable(
-                        "the note moved while preparing the org share — retry".into(),
-                    ));
+                if let Some((title, payload, created_at_ms)) = state.db.task_source(did)? {
+                    let task = crate::share::task_envelope::TaskEnvelope::from_json(
+                        &payload,
+                        // Task source ids are only published through one selected org; validation
+                        // against that org runs again in the publish core before egress.
+                        &task_payload_org_id(&payload)?,
+                    )?;
+                    super::tasks::validate_task_org_refs(state, &task)?;
+                    let created_at =
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(created_at_ms)
+                            .unwrap_or_else(chrono::Utc::now)
+                            .to_rfc3339();
+                    (
+                        title,
+                        serde_json::to_string(&task).map_err(|_| {
+                            AppError::Unavailable("task payload encoding failed".into())
+                        })?,
+                        created_at,
+                        crate::share::org_envelope::OrgItemKind::Task,
+                        Some(folder_id),
+                        crate::storage::AttachmentOwner::Document {
+                            document_id: did.to_string(),
+                        },
+                    )
+                } else {
+                    let row = state
+                        .db
+                        .get_note_row(did)?
+                        .ok_or_else(|| AppError::InvalidArg(format!("no note {did}")))?;
+                    if row.folder_id != folder_id {
+                        return Err(AppError::Unavailable(
+                            "the note moved while preparing the org share — retry".into(),
+                        ));
+                    }
+                    let title = note_display_title(&row);
+                    let created_at =
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
+                            .unwrap_or_else(chrono::Utc::now)
+                            .to_rfc3339();
+                    (
+                        title,
+                        row.text,
+                        created_at,
+                        crate::share::org_envelope::OrgItemKind::Note,
+                        Some(folder_id),
+                        crate::storage::AttachmentOwner::Document {
+                            document_id: did.to_string(),
+                        },
+                    )
                 }
-                let title = note_display_title(&row);
-                let created_at =
-                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
-                        .unwrap_or_else(chrono::Utc::now)
-                        .to_rfc3339();
-                (
-                    title,
-                    row.text,
-                    created_at,
-                    crate::share::org_envelope::OrgItemKind::Note,
-                    Some(folder_id),
-                    crate::storage::AttachmentOwner::Document {
-                        document_id: did.to_string(),
-                    },
-                )
             }
             _ => {
                 return Err(AppError::InvalidArg(
@@ -3636,12 +3846,23 @@ pub(crate) fn build_org_share_snapshot(
         };
 
     // (3) CLEAN (strip frontmatter + flatten wikilinks + drop obsidian:// refs — the leak-safe transform).
-    let cleaned = crate::share::envelope::clean_note_body(&markdown);
-    // (4) regex PII scrub (emails/phones/cards; names KEPT) when requested.
-    let (final_md, counts) = if scrub {
-        scrub_org_markdown(&cleaned)
+    let cleaned = if kind == crate::share::org_envelope::OrgItemKind::Task {
+        markdown
     } else {
-        (cleaned, OrgScrubCounts::default())
+        crate::share::envelope::clean_note_body(&markdown)
+    };
+    // (4) regex PII scrub (emails/phones/cards; names KEPT) when requested.
+    let (final_title, final_md, counts) = if kind == crate::share::org_envelope::OrgItemKind::Task {
+        // Task sharing is always redacted. The hidden source is not a public generic-note surface,
+        // so no caller may opt a structured Task out through the legacy `scrub=false` parameter.
+        let (task, canonical, counts) =
+            scrub_task_envelope_json(&cleaned, &task_payload_org_id(&cleaned)?)?;
+        (task.title, canonical, counts)
+    } else if scrub {
+        let (markdown, counts) = scrub_org_markdown(&cleaned);
+        (title.clone(), markdown, counts)
+    } else {
+        (title.clone(), cleaned, OrgScrubCounts::default())
     };
     // (5) REFUSE AN EMPTY SHARE — root-cause fix for the "blank card" bug: a meeting with no
     // generated note yet, or a note that is frontmatter-only, cleans down to "" (see
@@ -3664,7 +3885,7 @@ pub(crate) fn build_org_share_snapshot(
         ));
     }
     Ok(OrgShareBodySnapshot {
-        title,
+        title: final_title,
         markdown: final_md,
         created_at,
         counts,
@@ -3676,6 +3897,16 @@ pub(crate) fn build_org_share_snapshot(
             content_version: content_version_before,
         },
     })
+}
+
+fn task_payload_org_id(payload: &str) -> Result<String, AppError> {
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|_| AppError::InvalidArg("shared task payload is invalid".into()))?;
+    value
+        .get("orgId")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppError::InvalidArg("shared task payload omitted its organization".into()))
 }
 
 /// Revalidate a plaintext snapshot immediately before egress. This deliberately reacquires the
@@ -3860,6 +4091,37 @@ pub async fn share_document_to_org(
     Ok(entry)
 }
 
+pub(crate) async fn share_task_source_to_org_notifying(
+    state: &AppState,
+    org_id: &str,
+    source_document_id: &str,
+    access: crate::share::org_dto::OrgItemAccess,
+    app: &AppHandle,
+) -> Result<(String, String), AppError> {
+    let entry = share_to_org_notifying(
+        state,
+        org_id,
+        None,
+        Some(source_document_id.to_string()),
+        true,
+        access,
+        Some(app),
+    )
+    .await?;
+    let item_id = entry.item_id.ok_or_else(|| {
+        AppError::Unavailable("task publish is pending authoritative recovery".into())
+    })?;
+    let row = state
+        .db
+        .org_share_by_item(&item_id)?
+        .ok_or_else(|| AppError::Storage("published task journal disappeared".into()))?;
+    let doc_id = row
+        .doc_id
+        .ok_or_else(|| AppError::Storage("published task omitted its stable document id".into()))?;
+    crate::events::emit_org_feed_updated(app, 1);
+    Ok((format!("{org_id}:{doc_id}"), item_id))
+}
+
 fn org_access_or_view(
     access: Option<crate::share::org_dto::OrgItemAccess>,
 ) -> crate::share::org_dto::OrgItemAccess {
@@ -3987,20 +4249,20 @@ async fn share_to_org_inner_with_policy(
             // Continue into the witness-bound replay path below; every other live/ambiguous phase
             // remains an idempotent no-mutation return.
         } else {
-        require_current_org_share_snapshot(
-            state,
-            meeting_id.as_deref(),
-            document_id.as_deref(),
-            &dedup_source.source_version,
-        )?;
-        return Ok(OrgShareEntry {
-            item_id: keeper.item_id,
-            kind: keeper.kind,
-            title: keeper.title,
-            shared_at: keeper.created_at,
-            rev: keeper.rev,
-            state: keeper.state,
-        });
+            require_current_org_share_snapshot(
+                state,
+                meeting_id.as_deref(),
+                document_id.as_deref(),
+                &dedup_source.source_version,
+            )?;
+            return Ok(OrgShareEntry {
+                item_id: keeper.item_id,
+                kind: keeper.kind,
+                title: keeper.title,
+                shared_at: keeper.created_at,
+                rev: keeper.rev,
+                state: keeper.state,
+            });
         }
     }
 
@@ -4406,9 +4668,17 @@ enum OrgDispatchOperation {
         access: crate::share::org_dto::OrgItemAccess,
         owner_user_id: String,
     },
-    DeleteDocument { org_id: String, doc_id: String },
-    Tombstone { org_id: String, item_id: String },
-    MembershipCorroborate { org_id: String },
+    DeleteDocument {
+        org_id: String,
+        doc_id: String,
+    },
+    Tombstone {
+        org_id: String,
+        item_id: String,
+    },
+    MembershipCorroborate {
+        org_id: String,
+    },
 }
 
 impl OrgDispatchPermit {
@@ -4430,11 +4700,16 @@ impl OrgDispatchPermit {
             owner_user_id,
         } = self.operation
         else {
-            return Err(AppError::Storage("org dispatch permit operation mismatch".into()));
+            return Err(AppError::Storage(
+                "org dispatch permit operation mismatch".into(),
+            ));
         };
         if self.host != host
             || expected_org != org_id
-            || request.mutation_id.as_deref().is_some_and(|id| id != self.dispatch_id)
+            || request
+                .mutation_id
+                .as_deref()
+                .is_some_and(|id| id != self.dispatch_id)
             || doc_id.as_deref() != request.doc_id.as_deref()
             || access != request.access
             || rev != request.rev
@@ -4447,7 +4722,9 @@ impl OrgDispatchPermit {
                 .map(org_dispatch_cell_sha256)
                 != Some(cell_sha256)
         {
-            return Err(AppError::Storage("org publish dispatch permit mismatch".into()));
+            return Err(AppError::Storage(
+                "org publish dispatch permit mismatch".into(),
+            ));
         }
         Ok(owner_user_id)
     }
@@ -4471,11 +4748,16 @@ impl OrgDispatchPermit {
             owner_user_id,
         } = self.operation
         else {
-            return Err(AppError::Storage("org dispatch permit operation mismatch".into()));
+            return Err(AppError::Storage(
+                "org dispatch permit operation mismatch".into(),
+            ));
         };
         if self.host != host
             || expected_org != org_id
-            || request.mutation_id.as_deref().is_some_and(|id| id != self.dispatch_id)
+            || request
+                .mutation_id
+                .as_deref()
+                .is_some_and(|id| id != self.dispatch_id)
             || expected_doc != doc_id
             || expected_rev != request.expected_rev
             || generation != request.generation
@@ -4483,7 +4765,9 @@ impl OrgDispatchPermit {
             || cell_len != request.content_cell.len()
             || cell_sha256 != org_dispatch_cell_sha256(&request.content_cell)
         {
-            return Err(AppError::Storage("org update dispatch permit mismatch".into()));
+            return Err(AppError::Storage(
+                "org update dispatch permit mismatch".into(),
+            ));
         }
         Ok((access, owner_user_id))
     }
@@ -4502,14 +4786,18 @@ impl OrgDispatchPermit {
             owner_user_id,
         } = self.operation
         else {
-            return Err(AppError::Storage("org dispatch permit operation mismatch".into()));
+            return Err(AppError::Storage(
+                "org dispatch permit operation mismatch".into(),
+            ));
         };
         if self.host != host
             || expected_org != org_id
             || expected_doc != doc_id
             || access != request.access
         {
-            return Err(AppError::Storage("org access dispatch permit mismatch".into()));
+            return Err(AppError::Storage(
+                "org access dispatch permit mismatch".into(),
+            ));
         }
         let _ = self.dispatch_id;
         Ok(owner_user_id)
@@ -4522,9 +4810,13 @@ impl OrgDispatchPermit {
         doc_id: &str,
     ) -> Result<(), AppError> {
         match self.operation {
-            OrgDispatchOperation::DeleteDocument { org_id: o, doc_id: d }
-                if self.host == host && o == org_id && d == doc_id => Ok(()),
-            _ => Err(AppError::Storage("org delete dispatch permit mismatch".into())),
+            OrgDispatchOperation::DeleteDocument {
+                org_id: o,
+                doc_id: d,
+            } if self.host == host && o == org_id && d == doc_id => Ok(()),
+            _ => Err(AppError::Storage(
+                "org delete dispatch permit mismatch".into(),
+            )),
         }
     }
 
@@ -4535,9 +4827,13 @@ impl OrgDispatchPermit {
         item_id: &str,
     ) -> Result<(), AppError> {
         match self.operation {
-            OrgDispatchOperation::Tombstone { org_id: o, item_id: i }
-                if self.host == host && o == org_id && i == item_id => Ok(()),
-            _ => Err(AppError::Storage("org tombstone dispatch permit mismatch".into())),
+            OrgDispatchOperation::Tombstone {
+                org_id: o,
+                item_id: i,
+            } if self.host == host && o == org_id && i == item_id => Ok(()),
+            _ => Err(AppError::Storage(
+                "org tombstone dispatch permit mismatch".into(),
+            )),
         }
     }
 
@@ -4548,8 +4844,13 @@ impl OrgDispatchPermit {
     ) -> Result<(), AppError> {
         match self.operation {
             OrgDispatchOperation::MembershipCorroborate { org_id: o }
-                if self.host == host && o == org_id => Ok(()),
-            _ => Err(AppError::Storage("org status dispatch permit mismatch".into())),
+                if self.host == host && o == org_id =>
+            {
+                Ok(())
+            }
+            _ => Err(AppError::Storage(
+                "org status dispatch permit mismatch".into(),
+            )),
         }
     }
 }
@@ -4569,6 +4870,24 @@ pub(crate) struct OrgReadPermit {
     purpose: OrgReadPurpose,
     since_seq: u64,
     limit: u32,
+}
+
+#[must_use]
+pub(crate) struct OrgMembersReadPermit {
+    dispatch_id: String,
+    host: String,
+    org_id: String,
+}
+
+impl OrgMembersReadPermit {
+    pub(crate) fn authorize(self, host: &str, org_id: &str) -> Result<(), AppError> {
+        if self.host == host && self.org_id == org_id {
+            let _ = self.dispatch_id;
+            Ok(())
+        } else {
+            Err(AppError::Storage("org member read permit mismatch".into()))
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4599,7 +4918,9 @@ impl OrgReadPermit {
             let _ = self.dispatch_id;
             Ok(())
         } else {
-            Err(AppError::Storage("org recovery read permit mismatch".into()))
+            Err(AppError::Storage(
+                "org recovery read permit mismatch".into(),
+            ))
         }
     }
 }
@@ -4779,8 +5100,9 @@ fn fail_initial_org_publish_pre_dispatch_if_current(
     updated_at: &str,
 ) -> Result<(), AppError> {
     let conn = state.db.lock();
-    let changed = conn.execute(
-        "UPDATE org_shares SET state='failed', last_error=?2,
+    let changed = conn
+        .execute(
+            "UPDATE org_shares SET state='failed', last_error=?2,
             republish_dirty=CASE WHEN ?2='too_large' THEN 0 ELSE republish_dirty END,
             updated_at=?3
           WHERE id=?1 AND state='queued' AND last_error IS NULL AND dispatch_id IS NULL
@@ -4791,10 +5113,25 @@ fn fail_initial_org_publish_pre_dispatch_if_current(
                  OR (source_kind='document' AND source_id=org_shares.document_id)),0)=?10
             AND republish_dirty=?11 AND source_version=?12
             AND org_id=?13 AND meeting_id IS ?14 AND document_id IS ?15",
-        rusqlite::params![row_id, error, updated_at, doc_id, access.as_str(), rev as i64,
-            generation as i64, content_sha256, scrub as i64, source_version as i64,
-            dirty_counter as i64, row_source_version as i64, org_id, meeting_id, document_id],
-    ).map_err(|_| AppError::Storage("fail initial org publish pre-dispatch".into()))?;
+            rusqlite::params![
+                row_id,
+                error,
+                updated_at,
+                doc_id,
+                access.as_str(),
+                rev as i64,
+                generation as i64,
+                content_sha256,
+                scrub as i64,
+                source_version as i64,
+                dirty_counter as i64,
+                row_source_version as i64,
+                org_id,
+                meeting_id,
+                document_id
+            ],
+        )
+        .map_err(|_| AppError::Storage("fail initial org publish pre-dispatch".into()))?;
     if changed != 1 {
         return Err(AppError::Unavailable(
             "initial org share changed before local failure could be recorded".into(),
@@ -4983,16 +5320,19 @@ pub(crate) fn permit_org_access(
             "shared document changed before access dispatch".into(),
         ));
     }
-    Ok((OrgDispatchPermit {
-        dispatch_id: dispatch_id.clone(),
-        host: host.to_string(),
-        operation: OrgDispatchOperation::Access {
-            org_id: org_id.to_string(),
-            doc_id: doc_id.to_string(),
-            access,
-            owner_user_id: owner_user_id.to_string(),
+    Ok((
+        OrgDispatchPermit {
+            dispatch_id: dispatch_id.clone(),
+            host: host.to_string(),
+            operation: OrgDispatchOperation::Access {
+                org_id: org_id.to_string(),
+                doc_id: doc_id.to_string(),
+                access,
+                owner_user_id: owner_user_id.to_string(),
+            },
         },
-    }, dispatch_id))
+        dispatch_id,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5042,7 +5382,9 @@ fn fail_org_access_attempt(
 
 pub(crate) type PendingOrgAccessAttempt = crate::storage::org_store::OrgAccessAttemptRow;
 
-pub(crate) fn pending_org_access_attempts(state: &AppState) -> Result<Vec<PendingOrgAccessAttempt>, AppError> {
+pub(crate) fn pending_org_access_attempts(
+    state: &AppState,
+) -> Result<Vec<PendingOrgAccessAttempt>, AppError> {
     state.db.pending_org_access_attempts()
 }
 
@@ -5074,8 +5416,14 @@ async fn reconcile_pending_org_access_attempt(
     let base = share_base_url(state)?;
     let client = crate::share::client::ShareClient::new(&base)?;
     let Some(head) = authoritative_org_document_head(
-        state, &client, &access_token, &attempt.org_id, &attempt.doc_id,
-    ).await? else {
+        state,
+        &client,
+        &access_token,
+        &attempt.org_id,
+        &attempt.doc_id,
+    )
+    .await?
+    else {
         return Ok(false);
     };
     apply_authoritative_org_access(state, attempt, &head)
@@ -5129,6 +5477,43 @@ fn permit_org_read(
     })
 }
 
+fn permit_org_task_assignee_read(
+    state: &AppState,
+    host: &str,
+    org_id: &str,
+) -> Result<OrgMembersReadPermit, AppError> {
+    require_org_egress_consent(state)?;
+    let dispatch_id = uuid::Uuid::new_v4().to_string();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let mut conn = state.db.lock();
+    let tx = conn
+        .transaction()
+        .map_err(|_| AppError::Storage("start task assignee read dispatch".into()))?;
+    let ledger_id = crate::storage::db::insert_share_egress_dispatch_tx(
+        &tx,
+        ts,
+        host,
+        "org_task_assignee_read",
+        0,
+        &dispatch_id,
+    )?;
+    tx.execute(
+        "UPDATE share_egress_log SET org_id=?2 WHERE id=?1 AND dispatch_id=?3",
+        rusqlite::params![ledger_id, org_id, dispatch_id],
+    )
+    .map_err(|_| AppError::Storage("bind task assignee read dispatch".into()))?;
+    tx.commit()
+        .map_err(|_| AppError::Storage("commit task assignee read dispatch".into()))?;
+    Ok(OrgMembersReadPermit {
+        dispatch_id,
+        host: host.to_string(),
+        org_id: org_id.to_string(),
+    })
+}
+
 fn permit_simple_org_dispatch(
     state: &AppState,
     host: &str,
@@ -5142,12 +5527,17 @@ fn permit_simple_org_dispatch(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
     let mut conn = state.db.lock();
-    let tx = conn.transaction().map_err(|_| AppError::Storage("start org dispatch".into()))?;
-    crate::storage::db::insert_share_egress_dispatch_tx(
-        &tx, ts, host, kind, 0, &dispatch_id,
-    )?;
-    tx.commit().map_err(|_| AppError::Storage("commit org dispatch".into()))?;
-    Ok(OrgDispatchPermit { dispatch_id, host: host.to_string(), operation })
+    let tx = conn
+        .transaction()
+        .map_err(|_| AppError::Storage("start org dispatch".into()))?;
+    crate::storage::db::insert_share_egress_dispatch_tx(&tx, ts, host, kind, 0, &dispatch_id)?;
+    tx.commit()
+        .map_err(|_| AppError::Storage("commit org dispatch".into()))?;
+    Ok(OrgDispatchPermit {
+        dispatch_id,
+        host: host.to_string(),
+        operation,
+    })
 }
 
 fn persist_org_revoke_dispatch(
@@ -5342,19 +5732,35 @@ fn fail_republish_pre_dispatch_if_current(
     updated_at: &str,
 ) -> Result<bool, AppError> {
     let conn = state.db.lock();
-    let changed = conn.execute(
-        "UPDATE org_shares SET state='failed', last_error=?2,
+    let changed = conn
+        .execute(
+            "UPDATE org_shares SET state='failed', last_error=?2,
             republish_dirty=CASE WHEN ?2='too_large' THEN 0 ELSE republish_dirty END,
             updated_at=?3
           WHERE id=?1 AND org_id=?4 AND meeting_id IS ?5 AND document_id IS ?6
             AND item_id IS ?7 AND doc_id IS ?8 AND access=?9 AND rev=?10
             AND generation=?11 AND content_sha256 IS ?12 AND state=?13
             AND last_error IS ?14 AND source_version=?15 AND republish_dirty=?16",
-        rusqlite::params![row.id, error, updated_at, row.org_id, row.meeting_id,
-            row.document_id, row.item_id, row.doc_id, row.access, row.rev as i64,
-            row.generation as i64, row.content_sha256, row.state, row.last_error,
-            observed_source_version as i64, observed_dirty_counter as i64],
-    ).map_err(|_| AppError::Storage("fail org republish pre-dispatch".into()))?;
+            rusqlite::params![
+                row.id,
+                error,
+                updated_at,
+                row.org_id,
+                row.meeting_id,
+                row.document_id,
+                row.item_id,
+                row.doc_id,
+                row.access,
+                row.rev as i64,
+                row.generation as i64,
+                row.content_sha256,
+                row.state,
+                row.last_error,
+                observed_source_version as i64,
+                observed_dirty_counter as i64
+            ],
+        )
+        .map_err(|_| AppError::Storage("fail org republish pre-dispatch".into()))?;
     Ok(changed == 1)
 }
 
@@ -5417,17 +5823,32 @@ fn confirm_org_mutation_for_projection(
     updated_at: &str,
 ) -> Result<(), AppError> {
     let conn = state.db.lock();
-    let changed = conn.execute(
-        "UPDATE org_shares SET item_id=?2, last_error=?3, updated_at=?4
+    let changed = conn
+        .execute(
+            "UPDATE org_shares SET item_id=?2, last_error=?3, updated_at=?4
           WHERE id=?1 AND state='failed' AND last_error=?5 AND item_id IS ?6
             AND org_id=?7 AND doc_id IS ?8 AND access=?9 AND rev=?10 AND generation=?11
             AND content_sha256 IS ?12 AND expected_actor_user_id IS ?13
             AND expected_owner_user_id IS ?14 AND dispatch_id=?15",
-        rusqlite::params![row.id, published.item_id, ORG_SHARE_PROJECTION_PENDING, updated_at,
-            expected_pending_reason, row.item_id, row.org_id, row.doc_id, row.access,
-            row.rev as i64, row.generation as i64, row.content_sha256,
-            row.expected_actor_user_id, row.expected_owner_user_id, expected_dispatch_id],
-    ).map_err(|_| AppError::Storage("confirm org mutation for projection".into()))?;
+            rusqlite::params![
+                row.id,
+                published.item_id,
+                ORG_SHARE_PROJECTION_PENDING,
+                updated_at,
+                expected_pending_reason,
+                row.item_id,
+                row.org_id,
+                row.doc_id,
+                row.access,
+                row.rev as i64,
+                row.generation as i64,
+                row.content_sha256,
+                row.expected_actor_user_id,
+                row.expected_owner_user_id,
+                expected_dispatch_id
+            ],
+        )
+        .map_err(|_| AppError::Storage("confirm org mutation for projection".into()))?;
     if changed != 1 {
         return Err(AppError::Unavailable(
             "org mutation changed before projection confirmation".into(),
@@ -5775,25 +6196,9 @@ async fn authoritative_org_document_scan(
     let mut since = 0u64;
     let mut scan = AuthoritativeOrgDocumentScan::default();
     for _ in 0..MAX_PAGES {
-        let permit = permit_org_read(
-            state,
-            &client.host(),
-            org_id,
-            doc_id,
-            purpose,
-            since,
-            PAGE,
-        )?;
+        let permit = permit_org_read(state, &client.host(), org_id, doc_id, purpose, since, PAGE)?;
         let page = client
-            .org_document_recovery_page(
-                access_token,
-                org_id,
-                doc_id,
-                purpose,
-                since,
-                PAGE,
-                permit,
-            )
+            .org_document_recovery_page(access_token, org_id, doc_id, purpose, since, PAGE, permit)
             .await?;
         page.validate_authoritative_metadata().map_err(|_| {
             AppError::Unavailable(
@@ -5888,8 +6293,7 @@ async fn delete_stable_org_document(
                 Ok(())
             } else {
                 Err(AppError::Unavailable(
-                    "org-delete-document: 404 was not corroborated by authoritative history"
-                        .into(),
+                    "org-delete-document: 404 was not corroborated by authoritative history".into(),
                 ))
             }
         }
@@ -5908,13 +6312,25 @@ async fn corroborate_legacy_org_item_absent_or_tombstoned(
     let mut since = 0u64;
     for _ in 0..MAX_PAGES {
         let permit = permit_org_read(
-            state,&client.host(),org_id,item_id,
-            OrgReadPurpose::Tombstone404Corroboration,since,PAGE,
+            state,
+            &client.host(),
+            org_id,
+            item_id,
+            OrgReadPurpose::Tombstone404Corroboration,
+            since,
+            PAGE,
         )?;
-        let page = client.org_document_recovery_page(
-            access_token,org_id,item_id,OrgReadPurpose::Tombstone404Corroboration,
-            since,PAGE,permit,
-        ).await?;
+        let page = client
+            .org_document_recovery_page(
+                access_token,
+                org_id,
+                item_id,
+                OrgReadPurpose::Tombstone404Corroboration,
+                since,
+                PAGE,
+                permit,
+            )
+            .await?;
         if let Some(item) = page.items.iter().find(|item| item.item_id == item_id) {
             return Ok(item.tombstoned);
         }
@@ -5941,12 +6357,21 @@ async fn delete_legacy_org_item(
     item_id: &str,
     permit: OrgDispatchPermit,
 ) -> Result<(), AppError> {
-    match client.org_tombstone_item(access_token,org_id,item_id,permit).await? {
+    match client
+        .org_tombstone_item(access_token, org_id, item_id, permit)
+        .await?
+    {
         crate::share::client::OrgTombstoneItemResult::Deleted => Ok(()),
         crate::share::client::OrgTombstoneItemResult::NotFound => {
             if corroborate_legacy_org_item_absent_or_tombstoned(
-                state,client,access_token,org_id,item_id,
-            ).await? {
+                state,
+                client,
+                access_token,
+                org_id,
+                item_id,
+            )
+            .await?
+            {
                 Ok(())
             } else {
                 Err(AppError::Unavailable(
@@ -6015,8 +6440,14 @@ async fn reconcile_direct_org_update_attempt(
         }
         if scan.history.iter().any(|item| {
             authoritative_org_item_matches_attempt(
-                item, doc_id, row.rev, row.generation, content_sha256, access,
-                expected_actor_user_id, expected_owner_user_id,
+                item,
+                doc_id,
+                row.rev,
+                row.generation,
+                content_sha256,
+                access,
+                expected_actor_user_id,
+                expected_owner_user_id,
             )
         }) {
             return Ok(DirectOrgUpdateResolution::Inconclusive);
@@ -6148,10 +6579,18 @@ async fn publish_org_body_with_policy(
     // `build_org_share_body` already enforces exactly one of meeting_id/document_id is `Some` (else it
     // errors before this line is reached), so this mirrors that same exclusivity to stamp the wire
     // envelope's SOURCE type (document vs meeting — a new axis, distinct from `kind`/content-shape).
-    let source_kind = if meeting_id.is_some() {
-        crate::share::org_envelope::OrgSourceKind::Meeting
-    } else {
-        crate::share::org_envelope::OrgSourceKind::Document
+    let source_kind = match kind {
+        crate::share::org_envelope::OrgItemKind::Task => {
+            let task = crate::share::task_envelope::TaskEnvelope::from_json(&markdown, org_id)?;
+            if task.org_id != org_id {
+                return Err(AppError::InvalidArg(
+                    "task belongs to a different organization".into(),
+                ));
+            }
+            crate::share::org_envelope::OrgSourceKind::Task
+        }
+        _ if meeting_id.is_some() => crate::share::org_envelope::OrgSourceKind::Meeting,
+        _ => crate::share::org_envelope::OrgSourceKind::Document,
     };
 
     // (2) consent fail-closed (the global one-time org-egress consent).
@@ -6197,8 +6636,14 @@ async fn publish_org_body_with_policy(
     // Persist a queued row FIRST (so a crash between seal + publish is recoverable by the launch
     // sweep).
     let now = chrono::Utc::now().to_rfc3339();
-    let (markdown, attachments) =
-        attachment_bundle_for_markdown(state, &attachment_owner, &markdown)?;
+    if kind == crate::share::org_envelope::OrgItemKind::Task {
+        crate::share::task_envelope::TaskEnvelope::from_json(&markdown, org_id)?;
+    }
+    let (markdown, attachments) = if kind == crate::share::org_envelope::OrgItemKind::Task {
+        task_attachment_bundle_for_markdown(state, &attachment_owner, org_id, &markdown)?
+    } else {
+        attachment_bundle_for_markdown(state, &attachment_owner, &markdown)?
+    };
     let env = crate::share::org_envelope::OrgEnvelope::new(
         kind,
         title.clone(),
@@ -6222,67 +6667,64 @@ async fn publish_org_body_with_policy(
         document_id.as_deref(),
     )? {
         Some(existing) => {
-            let replay_witnesses = if existing.last_error.as_deref()
-                == Some(ORG_SHARE_INITIAL_POST_REPLAYABLE)
-            {
-                Some((
-                    existing.expected_actor_user_id.as_deref().ok_or_else(|| {
-                        AppError::Unavailable(
-                            "ambiguous org publish is missing its actor witness".into(),
-                        )
-                    })?,
-                    existing.expected_owner_user_id.as_deref().ok_or_else(|| {
-                        AppError::Unavailable(
-                            "ambiguous org publish is missing its owner witness".into(),
-                        )
-                    })?,
-                ))
-            } else {
-                None
-            };
+            let replay_witnesses =
+                if existing.last_error.as_deref() == Some(ORG_SHARE_INITIAL_POST_REPLAYABLE) {
+                    Some((
+                        existing.expected_actor_user_id.as_deref().ok_or_else(|| {
+                            AppError::Unavailable(
+                                "ambiguous org publish is missing its actor witness".into(),
+                            )
+                        })?,
+                        existing.expected_owner_user_id.as_deref().ok_or_else(|| {
+                            AppError::Unavailable(
+                                "ambiguous org publish is missing its owner witness".into(),
+                            )
+                        })?,
+                    ))
+                } else {
+                    None
+                };
             if let Some((expected_actor, expected_owner)) = replay_witnesses {
                 if expected_actor != publisher_user_id
                     || expected_owner != publisher_user_id
                     || existing.access != access.as_str()
                 {
                     return Err(AppError::Unavailable(
-                        "ambiguous org publish actor, owner, or access changed before replay".into(),
+                        "ambiguous org publish actor, owner, or access changed before replay"
+                            .into(),
                     ));
                 }
             }
             if policy
-                .commit(|| {
-                    match replay_witnesses {
-                        Some((expected_actor, expected_owner)) => {
-                            state.db.reset_initial_org_share_for_replay(
-                                &existing.id,
-                                rev,
-                                generation,
-                                &content_sha,
-                                scrub,
-                                existing.doc_id.as_deref().ok_or_else(|| {
-                                    AppError::Unavailable(
-                                        "ambiguous org publish is missing its document witness"
-                                            .into(),
-                                    )
-                                })?,
-                                &existing.access,
-                                expected_actor,
-                                expected_owner,
-                                &publisher_user_id,
-                                &now,
-                            )
-                        }
-                        None => state.db.reset_org_share_for_retry(
+                .commit(|| match replay_witnesses {
+                    Some((expected_actor, expected_owner)) => {
+                        state.db.reset_initial_org_share_for_replay(
                             &existing.id,
-                            Some(&title),
                             rev,
                             generation,
                             &content_sha,
                             scrub,
+                            existing.doc_id.as_deref().ok_or_else(|| {
+                                AppError::Unavailable(
+                                    "ambiguous org publish is missing its document witness".into(),
+                                )
+                            })?,
+                            &existing.access,
+                            expected_actor,
+                            expected_owner,
+                            &publisher_user_id,
                             &now,
-                        ),
+                        )
                     }
+                    None => state.db.reset_org_share_for_retry(
+                        &existing.id,
+                        Some(&title),
+                        rev,
+                        generation,
+                        &content_sha,
+                        scrub,
+                        &now,
+                    ),
                 })?
                 .is_none()
             {
@@ -6294,23 +6736,21 @@ async fn publish_org_body_with_policy(
         }
         None => {
             let row_id = crate::share::new_share_id();
-            if policy
-                .commit(|| {
-                    state.db.acquire_new_org_share_for_source(
-                        &row_id,
-                        &org.org_id,
-                        meeting_id.as_deref(),
-                        document_id.as_deref(),
-                        kind.as_str(),
-                        Some(&title),
-                        rev,
-                        generation,
-                        &content_sha,
-                        scrub,
-                        &now,
-                    )
-                })?
-                != Some(true)
+            if policy.commit(|| {
+                state.db.acquire_new_org_share_for_source(
+                    &row_id,
+                    &org.org_id,
+                    meeting_id.as_deref(),
+                    document_id.as_deref(),
+                    kind.as_str(),
+                    Some(&title),
+                    rev,
+                    generation,
+                    &content_sha,
+                    scrub,
+                    &now,
+                )
+            })? != Some(true)
             {
                 return Err(AppError::Unavailable(
                     "this source already has a live or pending share in the organization".into(),
@@ -6323,7 +6763,15 @@ async fn publish_org_body_with_policy(
         .db
         .get_org_share(&row_id)?
         .and_then(|row| row.doc_id)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| {
+            if kind == crate::share::org_envelope::OrgItemKind::Task {
+                document_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            }
+        });
     state
         .db
         .set_org_share_document_metadata(&row_id, &doc_id, access.as_str())?;
@@ -6349,13 +6797,26 @@ async fn publish_org_body_with_policy(
         match crate::share::org_envelope::seal_org_envelope(&ock, &env, &org.org_id, &item_nonce) {
             Ok(v) => v,
             Err(e) => {
-                let _ = policy
-                    .commit(|| fail_initial_org_publish_pre_dispatch_if_current(
-                        state, &row_id, "seal_failed", &org.org_id, meeting_id.as_deref(),
-                        document_id.as_deref(), &doc_id, access, rev, generation,
-                        &content_sha, scrub, source_version.content_version, initial_row_version,
-                        initial_dirty_counter, &now,
-                    ))?;
+                let _ = policy.commit(|| {
+                    fail_initial_org_publish_pre_dispatch_if_current(
+                        state,
+                        &row_id,
+                        "seal_failed",
+                        &org.org_id,
+                        meeting_id.as_deref(),
+                        document_id.as_deref(),
+                        &doc_id,
+                        access,
+                        rev,
+                        generation,
+                        &content_sha,
+                        scrub,
+                        source_version.content_version,
+                        initial_row_version,
+                        initial_dirty_counter,
+                        &now,
+                    )
+                })?;
                 return Err(e);
             }
         };
@@ -6368,10 +6829,22 @@ async fn publish_org_body_with_policy(
     if ciphertext.len() > murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES {
         let _ = policy.commit(|| {
             fail_initial_org_publish_pre_dispatch_if_current(
-                state, &row_id, ORG_SHARE_ERR_TOO_LARGE, &org.org_id,
-                meeting_id.as_deref(), document_id.as_deref(), &doc_id, access, rev, generation,
-                &content_sha, scrub, source_version.content_version, initial_row_version,
-                initial_dirty_counter, &now,
+                state,
+                &row_id,
+                ORG_SHARE_ERR_TOO_LARGE,
+                &org.org_id,
+                meeting_id.as_deref(),
+                document_id.as_deref(),
+                &doc_id,
+                access,
+                rev,
+                generation,
+                &content_sha,
+                scrub,
+                source_version.content_version,
+                initial_row_version,
+                initial_dirty_counter,
+                &now,
             )
         })?;
         return Err(AppError::InvalidArg(format!(
@@ -6389,31 +6862,29 @@ async fn publish_org_body_with_policy(
         document_id.as_deref(),
         &source_version,
     )?;
-    let (dispatch_permit, initial_dispatch_id) = if let Some(attempt) = policy
-        .commit(|| {
-            persist_initial_org_publish_intent(
-                state,
-                &row_id,
-                &org.org_id,
-                meeting_id.as_deref(),
-                document_id.as_deref(),
-                &doc_id,
-                access,
-                rev,
-                generation,
-                &content_sha,
-                scrub,
-                &publisher_user_id,
-                &now,
-                &client.host(),
-                ciphertext.len(),
-                org_dispatch_cell_sha256(&ciphertext),
-                source_version.content_version,
-                initial_row_version,
-                initial_dirty_counter,
-            )
-        })?
-    {
+    let (dispatch_permit, initial_dispatch_id) = if let Some(attempt) = policy.commit(|| {
+        persist_initial_org_publish_intent(
+            state,
+            &row_id,
+            &org.org_id,
+            meeting_id.as_deref(),
+            document_id.as_deref(),
+            &doc_id,
+            access,
+            rev,
+            generation,
+            &content_sha,
+            scrub,
+            &publisher_user_id,
+            &now,
+            &client.host(),
+            ciphertext.len(),
+            org_dispatch_cell_sha256(&ciphertext),
+            source_version.content_version,
+            initial_row_version,
+            initial_dirty_counter,
+        )
+    })? {
         attempt
     } else {
         return Err(AppError::Unavailable(
@@ -6452,9 +6923,19 @@ async fn publish_org_body_with_policy(
         Err(e) if matches!(e, AppError::InvalidArg(_)) && !is_org_edit_conflict(&e) => {
             let _ = policy.commit(|| {
                 transition_initial_org_publish_intent(
-                    state, &row_id, ORG_SHARE_PUBLISH_REJECTED, &publisher_user_id,
-                    &publisher_user_id, &doc_id, access, rev, generation, &content_sha, scrub,
-                    &initial_dispatch_id, &now,
+                    state,
+                    &row_id,
+                    ORG_SHARE_PUBLISH_REJECTED,
+                    &publisher_user_id,
+                    &publisher_user_id,
+                    &doc_id,
+                    access,
+                    rev,
+                    generation,
+                    &content_sha,
+                    scrub,
+                    &initial_dispatch_id,
+                    &now,
                 )
             })?;
             return Err(e);
@@ -6487,9 +6968,19 @@ async fn publish_org_body_with_policy(
                 Ok(Some(head)) if head.rev == rev => {
                     let _ = policy.commit(|| {
                         transition_initial_org_publish_intent(
-                            state, &row_id, ORG_SHARE_ERR_EDIT_CONFLICT, &publisher_user_id,
-                            &publisher_user_id, &doc_id, access, rev, generation, &content_sha,
-                            scrub, &initial_dispatch_id, &now,
+                            state,
+                            &row_id,
+                            ORG_SHARE_ERR_EDIT_CONFLICT,
+                            &publisher_user_id,
+                            &publisher_user_id,
+                            &doc_id,
+                            access,
+                            rev,
+                            generation,
+                            &content_sha,
+                            scrub,
+                            &initial_dispatch_id,
+                            &now,
                         )
                     })?;
                     return Err(AppError::InvalidArg(crate::errcode::tag(
@@ -6516,9 +7007,19 @@ async fn publish_org_body_with_policy(
         Err(e) => {
             let _ = policy.commit(|| {
                 transition_initial_org_publish_intent(
-                    state, &row_id, ORG_SHARE_PUBLISH_REJECTED, &publisher_user_id,
-                    &publisher_user_id, &doc_id, access, rev, generation, &content_sha, scrub,
-                    &initial_dispatch_id, &now,
+                    state,
+                    &row_id,
+                    ORG_SHARE_PUBLISH_REJECTED,
+                    &publisher_user_id,
+                    &publisher_user_id,
+                    &doc_id,
+                    access,
+                    rev,
+                    generation,
+                    &content_sha,
+                    scrub,
+                    &initial_dispatch_id,
+                    &now,
                 )
             })?;
             return Err(e);
@@ -6535,42 +7036,65 @@ async fn publish_org_body_with_policy(
     let initial_pending = state.db.get_org_share(&row_id)?.ok_or_else(|| {
         AppError::Storage("initial org publish attempt disappeared before projection".into())
     })?;
-    let Some(_) = policy.commit(|| confirm_org_mutation_for_projection(
-        state,
-        &initial_pending,
-        &published,
-        ORG_SHARE_INITIAL_POST_PENDING,
-        &initial_dispatch_id,
-        &now,
-    ))? else {
+    let Some(_) = policy.commit(|| {
+        confirm_org_mutation_for_projection(
+            state,
+            &initial_pending,
+            &published,
+            ORG_SHARE_INITIAL_POST_PENDING,
+            &initial_dispatch_id,
+            &now,
+        )
+    })?
+    else {
         return Err(AppError::Unavailable(
             "background org publish deferred before projection".into(),
         ));
     };
     let (local_markdown, local_attachments) =
         prepare_incoming_attachment_bundle(&env.markdown, &env.attachments)?;
-    let prepared = crate::storage::Db::prepare_org_item_index(
-        &env.title, &env.created_at, &local_markdown, None,
+    let prepared = crate::storage::Db::prepare_org_item_index_for_kind(
+        env.kind,
+        &env.title,
+        &env.created_at,
+        &local_markdown,
+        None,
     )?;
     let projected = policy.commit(|| {
         commit_org_metadata_mutation(
             state,
             app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
-            || state.db.commit_org_republish_projection_if_current(
-                &row_id, &initial_dispatch_id, &org.org_id, server_doc_id,
-                published.access.as_str(), rev, generation, &content_sha,
-                &publisher_user_id, &publisher_user_id, Some(&published.item_id),
-                Some(ORG_SHARE_PROJECTION_PENDING), false,
-                &crate::storage::org_store::OrgRepublishProjection {
-                    item_id: &published.item_id, seq: published.seq,
-                    author_hint: &env.author_hint, title: &env.title,
-                    markdown: &local_markdown, created_at: &env.created_at,
-                    source_kind: env.source_kind.map(
-                        crate::share::org_envelope::OrgSourceKind::as_str),
-                    author_user_id: Some(&publisher_user_id), prepared: &prepared,
-                    attachments: &local_attachments,
-                },
-            ),
+            || {
+                state.db.commit_org_republish_projection_if_current(
+                    &row_id,
+                    &initial_dispatch_id,
+                    &org.org_id,
+                    server_doc_id,
+                    published.access.as_str(),
+                    rev,
+                    generation,
+                    &content_sha,
+                    &publisher_user_id,
+                    &publisher_user_id,
+                    Some(&published.item_id),
+                    Some(ORG_SHARE_PROJECTION_PENDING),
+                    false,
+                    &crate::storage::org_store::OrgRepublishProjection {
+                        item_id: &published.item_id,
+                        seq: published.seq,
+                        author_hint: &env.author_hint,
+                        title: &env.title,
+                        markdown: &local_markdown,
+                        created_at: &env.created_at,
+                        source_kind: env
+                            .source_kind
+                            .map(crate::share::org_envelope::OrgSourceKind::as_str),
+                        author_user_id: Some(&publisher_user_id),
+                        prepared: &prepared,
+                        attachments: &local_attachments,
+                    },
+                )
+            },
         )
     })?;
     if !projected.is_some_and(|outcome| outcome.changed) {
@@ -6727,18 +7251,12 @@ async fn republish_org_shares_for_source_with_policy(
             let Some(existing_dispatch_id) = state.db.org_share_dispatch_id(&row.id)? else {
                 continue;
             };
-            let (
-                Some(expected_actor),
-                Some(expected_owner),
-                Some(doc_id),
-                Some(content_sha256),
-            ) = (
+            let (Some(expected_actor), Some(expected_owner), Some(doc_id), Some(content_sha256)) = (
                 row.expected_actor_user_id.as_deref(),
                 row.expected_owner_user_id.as_deref(),
                 row.doc_id.as_deref(),
                 row.content_sha256.as_deref(),
-            )
-            else {
+            ) else {
                 continue;
             };
             let dispatch_id = existing_dispatch_id;
@@ -6773,10 +7291,19 @@ async fn republish_org_shares_for_source_with_policy(
                     recovered_actor = Some(expected_actor.to_string());
                     recovered_dispatch_id = Some(dispatch_id.clone());
                     durable_republish_owner = Some(expected_owner.to_string());
-                    if policy.commit(|| confirm_org_mutation_for_projection(
-                        state, &row, &published, ORG_SHARE_REPUBLISH_PUT_PENDING,
-                        &dispatch_id, &now,
-                    ))?.is_none() {
+                    if policy
+                        .commit(|| {
+                            confirm_org_mutation_for_projection(
+                                state,
+                                &row,
+                                &published,
+                                ORG_SHARE_REPUBLISH_PUT_PENDING,
+                                &dispatch_id,
+                                &now,
+                            )
+                        })?
+                        .is_none()
+                    {
                         return Ok(republished);
                     }
                     let Some(confirmed) = state.db.get_org_share(&row.id)? else {
@@ -6803,7 +7330,9 @@ async fn republish_org_shares_for_source_with_policy(
                             row.generation,
                             content_sha256,
                             &dispatch_id,
-                            row.last_error.as_deref().unwrap_or(ORG_SHARE_REPUBLISH_PUT_PENDING),
+                            row.last_error
+                                .as_deref()
+                                .unwrap_or(ORG_SHARE_REPUBLISH_PUT_PENDING),
                             &now,
                         )
                     })?;
@@ -6850,17 +7379,26 @@ async fn republish_org_shares_for_source_with_policy(
         } = source;
         // `org_shares_for_source` rows always anchor exactly one of meeting_id/document_id (mirrors the
         // exclusivity `build_org_share_body` already enforced when this row was first published).
-        let source_kind = if row.meeting_id.is_some() {
-            crate::share::org_envelope::OrgSourceKind::Meeting
-        } else {
-            crate::share::org_envelope::OrgSourceKind::Document
+        let source_kind = match kind {
+            crate::share::org_envelope::OrgItemKind::Task => {
+                crate::share::org_envelope::OrgSourceKind::Task
+            }
+            _ if row.meeting_id.is_some() => crate::share::org_envelope::OrgSourceKind::Meeting,
+            _ => crate::share::org_envelope::OrgSourceKind::Document,
         };
 
-        let (markdown, attachments) = match attachment_bundle_for_markdown(
-            state,
-            &attachment_owner,
-            &markdown,
-        ) {
+        if kind == crate::share::org_envelope::OrgItemKind::Task
+            && crate::share::task_envelope::TaskEnvelope::from_json(&markdown, &row.org_id).is_err()
+        {
+            tracing::warn!(target: "org", "republish: task image manifest is incomplete; skipped");
+            continue;
+        }
+        let bundle = if kind == crate::share::org_envelope::OrgItemKind::Task {
+            task_attachment_bundle_for_markdown(state, &attachment_owner, &row.org_id, &markdown)
+        } else {
+            attachment_bundle_for_markdown(state, &attachment_owner, &markdown)
+        };
+        let (markdown, attachments) = match bundle {
             Ok(bundle) => bundle,
             Err(e) => {
                 tracing::warn!(target: "org", error = %e, "republish: could not bundle source images; skipped");
@@ -6898,8 +7436,8 @@ async fn republish_org_shares_for_source_with_policy(
         };
 
         let pending_post = row.last_error.as_deref() == Some(ORG_SHARE_REPUBLISH_POST_PENDING);
-        let initial_too_large = row.item_id.is_none()
-            && row.last_error.as_deref() == Some(ORG_SHARE_ERR_TOO_LARGE);
+        let initial_too_large =
+            row.item_id.is_none() && row.last_error.as_deref() == Some(ORG_SHARE_ERR_TOO_LARGE);
         if initial_too_large && row.republish_dirty == 0 {
             continue;
         }
@@ -6934,16 +7472,18 @@ async fn republish_org_shares_for_source_with_policy(
             let recovering_projection = recovered_put.is_some();
             let mut projection_safe = recovered_put.is_none();
             if let Some(published) = recovered_put {
-                let (local_markdown, local_attachments) =
-                    match prepare_incoming_attachment_bundle(&cmp_env.markdown, &cmp_env.attachments)
-                    {
-                        Ok(bundle) => bundle,
-                        Err(error) => {
-                            tracing::warn!(target: "org", error = %error, "republish recovery: local attachment projection failed");
-                            continue;
-                        }
-                    };
-                let prepared = match crate::storage::Db::prepare_org_item_index(
+                let (local_markdown, local_attachments) = match prepare_incoming_attachment_bundle(
+                    &cmp_env.markdown,
+                    &cmp_env.attachments,
+                ) {
+                    Ok(bundle) => bundle,
+                    Err(error) => {
+                        tracing::warn!(target: "org", error = %error, "republish recovery: local attachment projection failed");
+                        continue;
+                    }
+                };
+                let prepared = match crate::storage::Db::prepare_org_item_index_for_kind(
+                    cmp_env.kind,
                     &cmp_env.title,
                     &cmp_env.created_at,
                     &local_markdown,
@@ -7005,9 +7545,9 @@ async fn republish_org_shares_for_source_with_policy(
                                     title: &cmp_env.title,
                                     markdown: &local_markdown,
                                     created_at: &cmp_env.created_at,
-                                    source_kind: cmp_env.source_kind.map(
-                                        crate::share::org_envelope::OrgSourceKind::as_str,
-                                    ),
+                                    source_kind: cmp_env
+                                        .source_kind
+                                        .map(crate::share::org_envelope::OrgSourceKind::as_str),
                                     author_user_id: recovered_actor.as_deref(),
                                     prepared: &prepared,
                                     attachments: &local_attachments,
@@ -7125,10 +7665,16 @@ async fn republish_org_shares_for_source_with_policy(
         // The OLD item stays live on the server (never tombstone-into-nothing); a later edit-save
         // that shrinks the source re-enters via `org_shares_for_source` and heals the row.
         if ciphertext.len() > murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES {
-            let _ = policy.commit(|| fail_republish_pre_dispatch_if_current(
-                state, &row, ORG_SHARE_ERR_TOO_LARGE, observed_source_version,
-                observed_dirty_counter, &now,
-            ))?;
+            let _ = policy.commit(|| {
+                fail_republish_pre_dispatch_if_current(
+                    state,
+                    &row,
+                    ORG_SHARE_ERR_TOO_LARGE,
+                    observed_source_version,
+                    observed_dirty_counter,
+                    &now,
+                )
+            })?;
             tracing::warn!(
                 target: "org",
                 sealed_bytes = ciphertext.len(),
@@ -7154,8 +7700,8 @@ async fn republish_org_shares_for_source_with_policy(
             continue;
         }
         let stable_doc_id = row.doc_id.clone();
-        let use_legacy_post = pending_post || initial_too_large
-            || (!pending_replay && stable_doc_id.is_none());
+        let use_legacy_post =
+            pending_post || initial_too_large || (!pending_replay && stable_doc_id.is_none());
         let post_doc_id = if use_legacy_post {
             Some(
                 stable_doc_id
@@ -7237,17 +7783,14 @@ async fn republish_org_shares_for_source_with_policy(
                     observed_source_version,
                     observed_dirty_counter,
                 )
-            })? else {
+            })?
+            else {
                 return Ok(republished);
             };
             put_dispatch_id = Some(attempt.dispatch_id);
-            client.org_update_item(
-                    &access_token,
-                    &org.org_id,
-                    doc_id,
-                    request,
-                    attempt.permit,
-                ).await
+            client
+                .org_update_item(&access_token, &org.org_id, doc_id, request, attempt.permit)
+                .await
         } else {
             let request = crate::share::org_dto::PublishItemRequest {
                 mutation_id: None,
@@ -7293,11 +7836,14 @@ async fn republish_org_shares_for_source_with_policy(
                     observed_source_version,
                     observed_dirty_counter,
                 )
-            })? else {
+            })?
+            else {
                 return Ok(republished);
             };
             put_dispatch_id = Some(attempt.dispatch_id.clone());
-            client.org_publish_item(&access_token, &org.org_id, request, attempt.permit).await
+            client
+                .org_publish_item(&access_token, &org.org_id, request, attempt.permit)
+                .await
         };
         let expected_doc_id = if use_legacy_post {
             post_doc_id.as_deref()
@@ -7324,7 +7870,8 @@ async fn republish_org_shares_for_source_with_policy(
                     &org.org_id,
                     doc_id,
                 )
-                .await {
+                .await
+                {
                     Ok(Some(head))
                         if head.rev == new_rev
                             && head.generation == generation
@@ -7338,15 +7885,29 @@ async fn republish_org_shares_for_source_with_policy(
                     Ok(Some(_)) => {
                         let _ = policy.commit(|| {
                             conflict_republish_put_intent(
-                                state, &row.id, doc_id, requested_access, &publisher_user_id,
-                                expected_owner_user_id.ok_or_else(|| AppError::Storage(
-                                    "stable org republish lost its owner".into(),
-                                ))?, row.item_id.as_deref().ok_or_else(|| AppError::Storage(
-                                    "stable org republish lost its predecessor".into(),
-                                ))?, new_rev, generation, &content_sha,
-                                put_dispatch_id.as_deref().ok_or_else(|| AppError::Storage(
-                                    "stable org republish lost its dispatch id".into(),
-                                ))?, pending_reason, &now,
+                                state,
+                                &row.id,
+                                doc_id,
+                                requested_access,
+                                &publisher_user_id,
+                                expected_owner_user_id.ok_or_else(|| {
+                                    AppError::Storage("stable org republish lost its owner".into())
+                                })?,
+                                row.item_id.as_deref().ok_or_else(|| {
+                                    AppError::Storage(
+                                        "stable org republish lost its predecessor".into(),
+                                    )
+                                })?,
+                                new_rev,
+                                generation,
+                                &content_sha,
+                                put_dispatch_id.as_deref().ok_or_else(|| {
+                                    AppError::Storage(
+                                        "stable org republish lost its dispatch id".into(),
+                                    )
+                                })?,
+                                pending_reason,
+                                &now,
                             )
                         })?;
                         continue;
@@ -7367,7 +7928,8 @@ async fn republish_org_shares_for_source_with_policy(
                     &org.org_id,
                     doc_id,
                 )
-                .await {
+                .await
+                {
                     Ok(Some(head))
                         if head.rev == new_rev
                             && head.generation == generation
@@ -7384,15 +7946,29 @@ async fn republish_org_shares_for_source_with_policy(
                         // payload, even if the corroborating scan is temporarily unavailable.
                         let _ = policy.commit(|| {
                             conflict_republish_put_intent(
-                                state, &row.id, doc_id, requested_access, &publisher_user_id,
-                                expected_owner_user_id.ok_or_else(|| AppError::Storage(
-                                    "stable org republish lost its owner".into(),
-                                ))?, row.item_id.as_deref().ok_or_else(|| AppError::Storage(
-                                    "stable org republish lost its predecessor".into(),
-                                ))?, new_rev, generation, &content_sha,
-                                put_dispatch_id.as_deref().ok_or_else(|| AppError::Storage(
-                                    "stable org republish lost its dispatch id".into(),
-                                ))?, pending_reason, &now,
+                                state,
+                                &row.id,
+                                doc_id,
+                                requested_access,
+                                &publisher_user_id,
+                                expected_owner_user_id.ok_or_else(|| {
+                                    AppError::Storage("stable org republish lost its owner".into())
+                                })?,
+                                row.item_id.as_deref().ok_or_else(|| {
+                                    AppError::Storage(
+                                        "stable org republish lost its predecessor".into(),
+                                    )
+                                })?,
+                                new_rev,
+                                generation,
+                                &content_sha,
+                                put_dispatch_id.as_deref().ok_or_else(|| {
+                                    AppError::Storage(
+                                        "stable org republish lost its dispatch id".into(),
+                                    )
+                                })?,
+                                pending_reason,
+                                &now,
                             )
                         })?;
                         continue;
@@ -7404,18 +7980,33 @@ async fn republish_org_shares_for_source_with_policy(
                 if is_org_edit_conflict(&error) {
                     let _ = policy.commit(|| {
                         conflict_republish_put_intent(
-                            state, &row.id,
-                            expected_doc_id.ok_or_else(|| AppError::Storage(
-                                "stable org republish lost its document id".into(),
-                            ))?, requested_access, &publisher_user_id,
-                            expected_owner_user_id.ok_or_else(|| AppError::Storage(
-                                "stable org republish lost its owner".into(),
-                            ))?, row.item_id.as_deref().ok_or_else(|| AppError::Storage(
-                                "stable org republish lost its predecessor".into(),
-                            ))?, new_rev, generation, &content_sha,
-                            put_dispatch_id.as_deref().ok_or_else(|| AppError::Storage(
-                                "stable org republish lost its dispatch id".into(),
-                            ))?, pending_reason, &now,
+                            state,
+                            &row.id,
+                            expected_doc_id.ok_or_else(|| {
+                                AppError::Storage(
+                                    "stable org republish lost its document id".into(),
+                                )
+                            })?,
+                            requested_access,
+                            &publisher_user_id,
+                            expected_owner_user_id.ok_or_else(|| {
+                                AppError::Storage("stable org republish lost its owner".into())
+                            })?,
+                            row.item_id.as_deref().ok_or_else(|| {
+                                AppError::Storage(
+                                    "stable org republish lost its predecessor".into(),
+                                )
+                            })?,
+                            new_rev,
+                            generation,
+                            &content_sha,
+                            put_dispatch_id.as_deref().ok_or_else(|| {
+                                AppError::Storage(
+                                    "stable org republish lost its dispatch id".into(),
+                                )
+                            })?,
+                            pending_reason,
+                            &now,
                         )
                     })?;
                 }
@@ -7430,18 +8021,21 @@ async fn republish_org_shares_for_source_with_policy(
         let projection_row = state.db.get_org_share(&row.id)?.ok_or_else(|| {
             AppError::Storage("org republish attempt disappeared before projection".into())
         })?;
-        let projection_dispatch_id = put_dispatch_id.as_deref().ok_or_else(|| {
-            AppError::Storage("stable org republish lost its dispatch id".into())
-        })?;
+        let projection_dispatch_id = put_dispatch_id
+            .as_deref()
+            .ok_or_else(|| AppError::Storage("stable org republish lost its dispatch id".into()))?;
         if projection_row.last_error.as_deref() != Some(ORG_SHARE_PROJECTION_PENDING) {
-            let Some(_) = policy.commit(|| confirm_org_mutation_for_projection(
-                state,
-                &projection_row,
-                &published,
-                pending_reason,
-                projection_dispatch_id,
-                &now,
-            ))? else {
+            let Some(_) = policy.commit(|| {
+                confirm_org_mutation_for_projection(
+                    state,
+                    &projection_row,
+                    &published,
+                    pending_reason,
+                    projection_dispatch_id,
+                    &now,
+                )
+            })?
+            else {
                 return Ok(republished);
             };
         }
@@ -7463,7 +8057,8 @@ async fn republish_org_shares_for_source_with_policy(
         let my_author_id = session_server_user_id(state).ok();
         let replica = match prepare_incoming_attachment_bundle(&env.markdown, &env.attachments) {
             Ok((local_markdown, local_attachments)) => {
-                match crate::storage::Db::prepare_org_item_index(
+                match crate::storage::Db::prepare_org_item_index_for_kind(
+                    env.kind,
                     &env.title,
                     &env.created_at,
                     &local_markdown,
@@ -7479,11 +8074,11 @@ async fn republish_org_shares_for_source_with_policy(
                             continue;
                         }
                         policy.commit(|| {
-                        let outcome = commit_org_metadata_mutation(
-                            state,
-                            app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
-                            || {
-                                state.db.commit_org_republish_projection_if_current(
+                            let outcome = commit_org_metadata_mutation(
+                                state,
+                                app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
+                                || {
+                                    state.db.commit_org_republish_projection_if_current(
                                         &row.id,
                                         put_dispatch_id.as_deref().ok_or_else(|| {
                                             AppError::Storage(
@@ -7526,11 +8121,11 @@ async fn republish_org_shares_for_source_with_policy(
                                             attachments: &local_attachments,
                                         },
                                     )
-                            },
-                        )?;
-                        Ok(outcome)
+                                },
+                            )?;
+                            Ok(outcome)
                         })
-                    },
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -7563,8 +8158,14 @@ async fn republish_org_shares_for_source_with_policy(
                     },
                 )?;
                 match delete_legacy_org_item(
-                    state,&client,&access_token,&org.org_id,old_item,permit,
-                ).await
+                    state,
+                    &client,
+                    &access_token,
+                    &org.org_id,
+                    old_item,
+                    permit,
+                )
+                .await
                 {
                     Ok(()) => {
                         if !policy.is_current() {
@@ -7860,7 +8461,7 @@ pub(crate) async fn revoke_org_share_notifying(
     notifier: &dyn OrgFeedNotifier,
 ) -> Result<(), AppError> {
     let _mutation = state.org_share_mutation_lock.lock().await;
-    revoke_org_share_inner_with_policy(state,item_id,OrgWorkPolicy::manual(),None).await?;
+    revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual(), None).await?;
     notifier.org_feed_updated(1);
     Ok(())
 }
@@ -7925,8 +8526,12 @@ async fn revoke_org_share_row_with_policy(
             rusqlite::params![row.id,now,state_name,last_error,
                 matches!(proof,NeverLandedOrgShare::InitialReplayable) as i64],
         ).map_err(|_| AppError::Storage("cancel proven-absent org publish".into()))?;
-        return if changed == 1 { Ok(()) } else {
-            Err(AppError::Unavailable("org share changed before cancellation".into()))
+        return if changed == 1 {
+            Ok(())
+        } else {
+            Err(AppError::Unavailable(
+                "org share changed before cancellation".into(),
+            ))
         };
     }
     if row.item_id.is_none() && row.doc_id.is_none() {
@@ -7968,9 +8573,9 @@ async fn revoke_org_share_row_with_policy(
             item_id: item_id.clone(),
         },
     };
-    let Some(dispatch_permit) = policy.commit(|| {
-        persist_org_revoke_dispatch(state, &row.id, &now, &client.host(), operation)
-    })? else {
+    let Some(dispatch_permit) = policy
+        .commit(|| persist_org_revoke_dispatch(state, &row.id, &now, &client.host(), operation))?
+    else {
         return Err(AppError::Unavailable(
             "background org revoke deferred for recording".into(),
         ));
@@ -7987,8 +8592,14 @@ async fn revoke_org_share_row_with_policy(
         .await?;
     } else {
         delete_legacy_org_item(
-            state,&client,&access,&row.org_id,&item_id,dispatch_permit,
-        ).await?;
+            state,
+            &client,
+            &access,
+            &row.org_id,
+            &item_id,
+            dispatch_permit,
+        )
+        .await?;
     }
     if !policy.is_current() {
         return Err(AppError::Unavailable(
@@ -8018,11 +8629,11 @@ async fn revoke_org_share_row_with_policy(
             state,
             app.map(|app| app as &dyn AskHistoryInvalidationNotifier),
             || match row.doc_id.as_deref() {
-                Some(doc_id) => state.db.terminalize_and_evict_org_document(
-                    &row.org_id,
-                    doc_id,
-                    &now,
-                ),
+                Some(doc_id) => {
+                    state
+                        .db
+                        .terminalize_and_evict_org_document(&row.org_id, doc_id, &now)
+                }
                 None => state.db.evict_org_item(&item_id),
             },
         )
@@ -8248,20 +8859,14 @@ pub(crate) async fn revoke_shares_for_folder_inner(
         if let Some(doc_id) = row.doc_id.as_ref() {
             let org_id = row.org_id.clone();
             let doc_id = doc_id.clone();
-            if !revoked_documents.insert((org_id,doc_id)) {
+            if !revoked_documents.insert((org_id, doc_id)) {
                 continue;
             }
         }
         // A NULL item id can still name a stable document whose POST response was lost. Passing the
         // row id lets the central proof classifier either cancel a proven pre-dispatch row or route
         // the ambiguous stable document through DELETE and authenticated 404 corroboration.
-        let res = revoke_org_share_row_with_policy(
-            st,
-            row,
-            OrgWorkPolicy::manual(),
-            app,
-        )
-        .await;
+        let res = revoke_org_share_row_with_policy(st, row, OrgWorkPolicy::manual(), app).await;
         if let Err(e) = res {
             first_err.get_or_insert(e);
         }
@@ -8322,17 +8927,11 @@ pub(crate) async fn revoke_org_shares_for_source_notifying(
     for row in rows {
         let org_id = row.org_id.clone();
         if let Some(doc_id) = row.doc_id.as_deref() {
-            if !revoked_documents.insert((org_id.clone(),doc_id.to_string())) {
+            if !revoked_documents.insert((org_id.clone(), doc_id.to_string())) {
                 continue;
             }
         }
-        let res = revoke_org_share_row_with_policy(
-            state,
-            row,
-            OrgWorkPolicy::manual(),
-            app,
-        )
-        .await;
+        let res = revoke_org_share_row_with_policy(state, row, OrgWorkPolicy::manual(), app).await;
         if let Err(e) = res {
             tracing::warn!(
                 target: "org",
@@ -8488,9 +9087,7 @@ async fn authenticated_org_actor(state: &AppState) -> Result<(String, String), A
     let session = crate::share::require_login(&session)?;
     let access_token = session.access_token.clone();
     let actor_user_id = session.server_user_id.clone().ok_or_else(|| {
-        AppError::Unavailable(
-            "sign out and sign back in to recover organization sharing".into(),
-        )
+        AppError::Unavailable("sign out and sign back in to recover organization sharing".into())
     })?;
     Ok((access_token, actor_user_id))
 }
@@ -8586,7 +9183,8 @@ async fn org_sweep_pending_with_policy(
     }
     for row in state.db.list_org_shares_in_state("failed")? {
         if row.last_error.as_deref() == Some(ORG_SHARE_PROJECTION_PENDING)
-            && row.meeting_id.is_none() && row.document_id.is_none()
+            && row.meeting_id.is_none()
+            && row.document_id.is_none()
             && policy.commit(|| state.db.complete_source_less_projection_if_present(&row.id))?
                 == Some(true)
         {
@@ -8646,14 +9244,9 @@ async fn org_sweep_pending_with_policy(
             continue;
         };
         attempted += 1;
-        let head = authoritative_org_document_head(
-            state,
-            &client,
-            &access_token,
-            &row.org_id,
-            doc_id,
-        )
-        .await;
+        let head =
+            authoritative_org_document_head(state, &client, &access_token, &row.org_id, doc_id)
+                .await;
         let now = chrono::Utc::now().to_rfc3339();
         match head {
             Ok(Some(head))
@@ -8668,8 +9261,12 @@ async fn org_sweep_pending_with_policy(
                 if policy
                     .commit(|| {
                         confirm_org_mutation_for_projection(
-                            state, &row, &published, ORG_SHARE_INITIAL_POST_PENDING,
-                            &expected_dispatch_id, &now,
+                            state,
+                            &row,
+                            &published,
+                            ORG_SHARE_INITIAL_POST_PENDING,
+                            &expected_dispatch_id,
+                            &now,
                         )
                     })?
                     .is_some()
@@ -8680,9 +9277,19 @@ async fn org_sweep_pending_with_policy(
             Ok(Some(head)) if head.rev == row.rev => {
                 let _ = policy.commit(|| {
                     transition_initial_org_publish_intent(
-                        state, &row.id, ORG_SHARE_ERR_EDIT_CONFLICT, expected_actor,
-                        expected_owner, doc_id, access, row.rev, row.generation, sha, row.scrub,
-                        &expected_dispatch_id, &now,
+                        state,
+                        &row.id,
+                        ORG_SHARE_ERR_EDIT_CONFLICT,
+                        expected_actor,
+                        expected_owner,
+                        doc_id,
+                        access,
+                        row.rev,
+                        row.generation,
+                        sha,
+                        row.scrub,
+                        &expected_dispatch_id,
+                        &now,
                     )
                 })?;
             }
@@ -8690,9 +9297,19 @@ async fn org_sweep_pending_with_policy(
             Ok(None) => {
                 let _ = policy.commit(|| {
                     transition_initial_org_publish_intent(
-                        state, &row.id, ORG_SHARE_INITIAL_POST_REPLAYABLE, expected_actor,
-                        expected_owner, doc_id, access, row.rev, row.generation, sha, row.scrub,
-                        &expected_dispatch_id, &now,
+                        state,
+                        &row.id,
+                        ORG_SHARE_INITIAL_POST_REPLAYABLE,
+                        expected_actor,
+                        expected_owner,
+                        doc_id,
+                        access,
+                        row.rev,
+                        row.generation,
+                        sha,
+                        row.scrub,
+                        &expected_dispatch_id,
+                        &now,
                     )
                 })?;
             }
@@ -8725,7 +9342,7 @@ async fn org_sweep_pending_with_policy(
                     &row,
                     expected_actor,
                 )
-                    .await
+                .await
             }
             _ => continue,
         };
@@ -8741,8 +9358,12 @@ async fn org_sweep_pending_with_policy(
                 if policy
                     .commit(|| {
                         confirm_org_mutation_for_projection(
-                            state, &row, &published, ORG_SHARE_DIRECT_PUT_PENDING,
-                            &dispatch_id, &now,
+                            state,
+                            &row,
+                            &published,
+                            ORG_SHARE_DIRECT_PUT_PENDING,
+                            &dispatch_id,
+                            &now,
                         )
                     })?
                     .is_some()
@@ -8751,21 +9372,38 @@ async fn org_sweep_pending_with_policy(
                 }
             }
             Ok(DirectOrgUpdateResolution::Conflict) => {
-                let (Some(doc_id), Some(content_sha256), Some(expected_owner), Some(predecessor),
-                    Some(access), Some(dispatch_id)) = (
+                let (
+                    Some(doc_id),
+                    Some(content_sha256),
+                    Some(expected_owner),
+                    Some(predecessor),
+                    Some(access),
+                    Some(dispatch_id),
+                ) = (
                     row.doc_id.as_deref(),
                     row.content_sha256.as_deref(),
                     row.expected_owner_user_id.as_deref(),
                     row.item_id.as_deref(),
                     crate::share::org_dto::OrgItemAccess::parse(&row.access),
                     state.db.org_share_dispatch_id(&row.id)?,
-                ) else {
+                )
+                else {
                     continue;
                 };
                 let _ = policy.commit(|| {
                     conflict_direct_org_update_intent(
-                        state, &row.id, doc_id, access, expected_actor, expected_owner,
-                        predecessor, row.rev, row.generation, content_sha256, &dispatch_id, &now,
+                        state,
+                        &row.id,
+                        doc_id,
+                        access,
+                        expected_actor,
+                        expected_owner,
+                        predecessor,
+                        row.rev,
+                        row.generation,
+                        content_sha256,
+                        &dispatch_id,
+                        &now,
                     )
                 })?;
             }
@@ -8880,8 +9518,11 @@ async fn org_sweep_pending_with_policy(
             if matches!(
                 row.last_error.as_deref(),
                 Some(ORG_SHARE_ERR_TOO_LARGE | ORG_SHARE_ERR_EDIT_CONFLICT)
-                    | Some(ORG_SHARE_PUBLISH_REJECTED | "recovery_witness_missing"
-                        | ORG_SHARE_PROJECTION_PENDING)
+                    | Some(
+                        ORG_SHARE_PUBLISH_REJECTED
+                            | "recovery_witness_missing"
+                            | ORG_SHARE_PROJECTION_PENDING
+                    )
             ) {
                 continue;
             }
@@ -9112,6 +9753,24 @@ async fn org_sync_one_now_with_app(
     org_id: &str,
     app: Option<AppHandle>,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    org_sync_one_now_with_app_and_policy(state, org_id, app, OrgWorkPolicy::manual()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn org_sync_one_now_with_pre_task_reader(
+    state: &AppState,
+    org_id: &str,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    let _mutation = state.org_share_mutation_lock.lock().await;
+    org_sync_one_now_with_app_and_policy(state, org_id, None, OrgWorkPolicy::pre_task_reader()).await
+}
+
+async fn org_sync_one_now_with_app_and_policy(
+    state: &AppState,
+    org_id: &str,
+    app: Option<AppHandle>,
+    policy: OrgWorkPolicy,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
     let mut report = crate::storage::models::OrgSyncReport::default();
     let org = resolve_org(state, org_id)?;
     let base = share_base_url(state)?;
@@ -9129,7 +9788,7 @@ async fn org_sync_one_now_with_app(
         &access,
         &org,
         &mut report,
-        OrgWorkPolicy::manual(),
+        policy,
         app,
     )
     .await?;
@@ -9189,7 +9848,17 @@ async fn org_sync_now_inner_with_policy(
     let index =
         ORG_SYNC_ROUND_ROBIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % orgs.len();
     let org = &orgs[index];
-    if let Err(e) = org_sync_one(state, &client, &access, org, &mut report, policy, app).await {
+    if let Err(e) = org_sync_one(
+        state,
+        &client,
+        &access,
+        org,
+        &mut report,
+        policy,
+        app,
+    )
+    .await
+    {
         if policy.is_current() {
             report
                 .errors
@@ -9389,12 +10058,10 @@ async fn org_sync_one(
             continue;
         }
         // OPEN (verify-before-trust: fails closed on wrong OCK / tampered cell / wrong AAD).
-        let env = match crate::share::org_envelope::open_org_envelope(
-            &ock,
-            &ciphertext,
-            &org.org_id,
-            &item_nonce,
-        ) {
+        let env = match policy
+            .reader
+            .open(&ock, &ciphertext, &org.org_id, &item_nonce)
+        {
             Ok(e) => e,
             Err(e) => {
                 // TERMINAL: this exact ciphertext will never open under this key/AAD (a tampered or
@@ -9465,189 +10132,198 @@ async fn org_sync_one(
         let org_id = org.org_id.clone();
         let background_epoch = policy.background_epoch;
         let app_for_apply = app;
-        let (tombstoned, ingested, fts_only) = crate::perf::run_heavy(
-            &state.heavy_inference,
-            move || -> Result<(u32, u32, bool), AppError> {
-                // Resolve once, inside the blocking closure: one immutable real model snapshot for
-                // every live item in this page. Missing model is honest FTS-only; init/forward errors
-                // still fail loud and never degrade to persisted stub vectors.
-                let embedder: Option<Box<dyn crate::embed::Embedder>> = match background_epoch {
-                    Some(epoch) => crate::embed::background_persistence_embedder(epoch).ok(),
-                    None => crate::embed::active_persistence_embedder_if_available(),
-                };
-                let mut fts_only = embedder.is_none();
-                let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
-                let mut tombstoned = 0u32;
-                let mut ingested = 0u32;
-                for action in actions {
-                    if !policy.is_current() {
-                        break;
-                    }
-                    match action {
-                        FeedAction::Tombstone { item_id, seq } => {
-                            let Some((applied, _evicted)) = policy.commit(|| {
-                                if let Some(handle) = app_for_apply.as_ref() {
-                                    let app_state = handle.state::<AppState>();
-                                    let mut outcome = (false, false);
-                                    commit_org_visibility_reduction(
-                                        app_state.inner(),
-                                        Some(handle),
-                                        || {
-                                            outcome = db.commit_org_feed_tombstone_outcome(
-                                                &org_id, &item_id, seq,
-                                            )?;
-                                            Ok(outcome.1)
-                                        },
-                                    )?;
-                                    Ok(outcome)
-                                } else {
-                                    db.commit_org_feed_tombstone_outcome(&org_id, &item_id, seq)
+        let (tombstoned, ingested, fts_only) =
+            crate::perf::run_heavy(
+                &state.heavy_inference,
+                move || -> Result<(u32, u32, bool), AppError> {
+                    // Resolve once, inside the blocking closure: one immutable real model snapshot for
+                    // every live item in this page. Missing model is honest FTS-only; init/forward errors
+                    // still fail loud and never degrade to persisted stub vectors.
+                    let embedder: Option<Box<dyn crate::embed::Embedder>> = match background_epoch {
+                        Some(epoch) => crate::embed::background_persistence_embedder(epoch).ok(),
+                        None => crate::embed::active_persistence_embedder_if_available(),
+                    };
+                    let mut fts_only = embedder.is_none();
+                    let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
+                    let mut tombstoned = 0u32;
+                    let mut ingested = 0u32;
+                    for action in actions {
+                        if !policy.is_current() {
+                            break;
+                        }
+                        match action {
+                            FeedAction::Tombstone { item_id, seq } => {
+                                let Some((applied, _evicted)) = policy.commit(|| {
+                                    if let Some(handle) = app_for_apply.as_ref() {
+                                        let app_state = handle.state::<AppState>();
+                                        let mut outcome = (false, false);
+                                        commit_org_visibility_reduction(
+                                            app_state.inner(),
+                                            Some(handle),
+                                            || {
+                                                outcome = db.commit_org_feed_tombstone_outcome(
+                                                    &org_id, &item_id, seq,
+                                                )?;
+                                                Ok(outcome.1)
+                                            },
+                                        )?;
+                                        Ok(outcome)
+                                    } else {
+                                        db.commit_org_feed_tombstone_outcome(&org_id, &item_id, seq)
+                                    }
+                                })?
+                                else {
+                                    break;
+                                };
+                                if applied {
+                                    tombstoned += 1;
                                 }
-                            })?
-                            else {
-                                break;
-                            };
-                            if applied {
-                                tombstoned += 1;
                             }
-                        }
-                        // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB
-                        // write), so it never stalls the feed — the good item behind it ingests on the SAME sync.
-                        FeedAction::SkipTerminal { seq } => {
-                            let Some(_applied) =
-                                policy.commit(|| db.commit_org_feed_terminal_skip(&org_id, seq))?
-                            else {
-                                break;
-                            };
-                        }
-                        FeedAction::Ingest {
-                            item_id,
-                            seq,
-                            rev,
-                            generation,
-                            env,
-                            attachments,
-                            sha,
-                            author_user_id,
-                            doc_id,
-                            access,
-                            document_owner_user_id,
-                            is_current,
-                        } => {
-                            let env = *env;
-                            let prepared = match crate::storage::Db::prepare_org_item_index(
-                                &env.title,
-                                &env.created_at,
-                                &env.markdown,
-                                embedder_ref,
-                            ) {
-                                Ok(prepared) => prepared,
-                                Err(AppError::Unavailable(_)) if background_epoch.is_none() => {
-                                    // A manual sync remains usable during capture, but never runs an
-                                    // unscoped model there. Preserve chunk/FTS ingestion only.
-                                    fts_only = true;
-                                    crate::storage::Db::prepare_org_item_index(
+                            // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB
+                            // write), so it never stalls the feed — the good item behind it ingests on the SAME sync.
+                            FeedAction::SkipTerminal { seq } => {
+                                let Some(_applied) = policy
+                                    .commit(|| db.commit_org_feed_terminal_skip(&org_id, seq))?
+                                else {
+                                    break;
+                                };
+                            }
+                            FeedAction::Ingest {
+                                item_id,
+                                seq,
+                                rev,
+                                generation,
+                                env,
+                                attachments,
+                                sha,
+                                author_user_id,
+                                doc_id,
+                                access,
+                                document_owner_user_id,
+                                is_current,
+                            } => {
+                                let env = *env;
+                                let prepared =
+                                    match crate::storage::Db::prepare_org_item_index_for_kind(
+                                        env.kind,
                                         &env.title,
                                         &env.created_at,
                                         &env.markdown,
-                                        None,
-                                    )?
-                                }
-                                Err(e) => return Err(e),
-                            };
-                            let author_ref = if author_user_id.is_empty() {
-                                None
-                            } else {
-                                Some(author_user_id.as_str())
-                            };
-                            let Some(applied) = policy.commit(|| {
-                                let commit = || {
-                                    db.commit_org_feed_item_with_metadata_and_attachments(
-                                        &item_id,
-                                        &org_id,
-                                        seq,
-                                        &env.author_hint,
-                                        &env.title,
-                                        &env.markdown,
-                                        &env.created_at,
-                                        rev,
-                                        generation,
-                                        &sha,
-                                        env.source_kind
-                                            .map(crate::share::org_envelope::OrgSourceKind::as_str),
-                                        author_ref,
-                                        &prepared,
-                                        doc_id.as_deref(),
-                                        access.as_str(),
-                                        document_owner_user_id.as_deref(),
-                                        is_current,
-                                        &attachments,
-                                    )
-                                };
-                                let outcome = if let Some(handle) = app_for_apply.as_ref() {
-                                    let app_state = handle.state::<AppState>();
-                                    commit_org_metadata_mutation(
-                                        app_state.inner(),
-                                        Some(handle),
-                                        commit,
-                                    )?
-                                } else {
-                                    commit()?
-                                };
-                                Ok(outcome.changed)
-                            })?
-                            else {
-                                break;
-                            };
-                            if applied {
-                                ingested += 1;
-                            }
-                        }
-                    }
-                }
-
-                // One bounded backlog repair under this page's SAME pinned real handle. Re-read the
-                // candidate after applying the page because the action loop may itself have filled it.
-                // Model work is outside the epoch closure; only the vector CAS transaction is gated.
-                if policy.is_current() {
-                    if let Some(embedder) = embedder_ref {
-                        if let Some(item_id) =
-                            db.org_items_needing_embed(&org_id, 1)?.into_iter().next()
-                        {
-                            if let Some(batch) = db.org_item_vector_batch(&item_id)? {
-                                match crate::storage::Db::prepare_org_vector_blobs(
-                                    &batch.texts,
-                                    embedder,
-                                ) {
-                                    Ok(vector_blobs) => {
-                                        if policy
-                                            .commit(|| {
-                                                db.commit_org_item_vectors_if_unchanged(
-                                                    &batch,
-                                                    &vector_blobs,
-                                                )
-                                            })?
-                                            .is_none()
+                                        embedder_ref,
+                                    ) {
+                                        Ok(prepared) => prepared,
+                                        Err(AppError::Unavailable(_))
+                                            if background_epoch.is_none() =>
                                         {
-                                            return Ok((tombstoned, ingested, fts_only));
+                                            // A manual sync remains usable during capture, but never runs an
+                                            // unscoped model there. Preserve chunk/FTS ingestion only.
+                                            fts_only = true;
+                                            crate::storage::Db::prepare_org_item_index_for_kind(
+                                                env.kind,
+                                                &env.title,
+                                                &env.created_at,
+                                                &env.markdown,
+                                                None,
+                                            )?
                                         }
-                                    }
-                                    Err(AppError::Unavailable(_)) if background_epoch.is_none() => {
-                                        // Manual sync stays usable during capture; the FTS index is
-                                        // already valid and this one vector repair remains queued.
-                                        fts_only = true;
-                                    }
-                                    Err(_) if !policy.is_current() => {}
-                                    Err(e) => return Err(e),
+                                        Err(e) => return Err(e),
+                                    };
+                                let author_ref = if author_user_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(author_user_id.as_str())
+                                };
+                                let Some(applied) = policy.commit(|| {
+                                    let commit = || {
+                                        db.commit_org_feed_item_with_metadata_and_attachments(
+                                            &item_id,
+                                            &org_id,
+                                            seq,
+                                            &env.author_hint,
+                                            &env.title,
+                                            &env.markdown,
+                                            &env.created_at,
+                                            rev,
+                                            generation,
+                                            &sha,
+                                            env.source_kind.map(
+                                                crate::share::org_envelope::OrgSourceKind::as_str,
+                                            ),
+                                            author_ref,
+                                            &prepared,
+                                            doc_id.as_deref(),
+                                            access.as_str(),
+                                            document_owner_user_id.as_deref(),
+                                            is_current,
+                                            &attachments,
+                                        )
+                                    };
+                                    let outcome = if let Some(handle) = app_for_apply.as_ref() {
+                                        let app_state = handle.state::<AppState>();
+                                        commit_org_metadata_mutation(
+                                            app_state.inner(),
+                                            Some(handle),
+                                            commit,
+                                        )?
+                                    } else {
+                                        commit()?
+                                    };
+                                    Ok(outcome.changed)
+                                })?
+                                else {
+                                    break;
+                                };
+                                if applied {
+                                    ingested += 1;
                                 }
                             }
                         }
                     }
-                }
-                Ok((tombstoned, ingested, fts_only))
-            },
-        )
-        .await?;
+
+                    // One bounded backlog repair under this page's SAME pinned real handle. Re-read the
+                    // candidate after applying the page because the action loop may itself have filled it.
+                    // Model work is outside the epoch closure; only the vector CAS transaction is gated.
+                    if policy.is_current() {
+                        if let Some(embedder) = embedder_ref {
+                            if let Some(item_id) =
+                                db.org_items_needing_embed(&org_id, 1)?.into_iter().next()
+                            {
+                                if let Some(batch) = db.org_item_vector_batch(&item_id)? {
+                                    match crate::storage::Db::prepare_org_vector_blobs(
+                                        &batch.texts,
+                                        embedder,
+                                    ) {
+                                        Ok(vector_blobs) => {
+                                            if policy
+                                                .commit(|| {
+                                                    db.commit_org_item_vectors_if_unchanged(
+                                                        &batch,
+                                                        &vector_blobs,
+                                                    )
+                                                })?
+                                                .is_none()
+                                            {
+                                                return Ok((tombstoned, ingested, fts_only));
+                                            }
+                                        }
+                                        Err(AppError::Unavailable(_))
+                                            if background_epoch.is_none() =>
+                                        {
+                                            // Manual sync stays usable during capture; the FTS index is
+                                            // already valid and this one vector repair remains queued.
+                                            fts_only = true;
+                                        }
+                                        Err(_) if !policy.is_current() => {}
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok((tombstoned, ingested, fts_only))
+                },
+            )
+            .await?;
         report.fts_only = fts_only;
         report.tombstoned += tombstoned;
         report.ingested += ingested;
@@ -10064,7 +10740,8 @@ async fn org_reconcile_one(
                         is_current,
                     } => {
                         let env = *env;
-                        let prepared = match crate::storage::Db::prepare_org_item_index(
+                        let prepared = match crate::storage::Db::prepare_org_item_index_for_kind(
+                            env.kind,
                             &env.title,
                             &env.created_at,
                             &env.markdown,
@@ -10076,7 +10753,8 @@ async fn org_reconcile_one(
                             // rather than stalling the walk. The normal embed backlog repair in the
                             // live pull fills the vectors in later.
                             Err(AppError::Unavailable(_)) => {
-                                crate::storage::Db::prepare_org_item_index(
+                                crate::storage::Db::prepare_org_item_index_for_kind(
+                                    env.kind,
                                     &env.title,
                                     &env.created_at,
                                     &env.markdown,
@@ -10291,17 +10969,10 @@ pub(crate) fn org_get_item_inner(
     // source before this ever renders; a second machine has no anchor, so this is what unlocks editing
     // there. Fail-closed: any missing piece (no stored author, no live session) ⇒ not editable.
     if let Some(ctx) = st.db.org_item_edit_ctx(&item_id)? {
-        if let Ok(me) = session_server_user_id(st) {
-            let org_owner = resolve_org(st, &ctx.org_id)
-                .map(|org| org.role == "owner")
-                .unwrap_or(false);
-            let document_owner = ctx.document_owner_user_id.as_deref() == Some(me.as_str());
-            let legacy_author = ctx.document_owner_user_id.is_none()
-                && ctx.author_user_id.as_deref() == Some(me.as_str());
-            detail.can_manage = document_owner || org_owner;
-            detail.can_edit = detail.can_manage || legacy_author || ctx.access == "edit";
-            detail.editable = detail.can_edit;
-        }
+        let (can_edit, can_manage) = org_item_permissions(st, &item_id)?;
+        detail.can_manage = can_manage;
+        detail.can_edit = can_edit;
+        detail.editable = can_edit;
         if let Some(doc_id) = ctx.doc_id.as_deref() {
             if crate::share::org_dto::parse_stable_uuid(&ctx.org_id).is_some()
                 && crate::share::org_dto::parse_stable_uuid(doc_id).is_some()
@@ -10311,6 +10982,26 @@ pub(crate) fn org_get_item_inner(
         }
     }
     Ok(Some(detail))
+}
+
+pub(crate) fn org_item_permissions(st: &AppState, item_id: &str) -> Result<(bool, bool), AppError> {
+    let Some(ctx) = st.db.org_item_edit_ctx(item_id)? else {
+        return Ok((false, false));
+    };
+    let Ok(me) = session_server_user_id(st) else {
+        return Ok((false, false));
+    };
+    let org_owner = resolve_org(st, &ctx.org_id)
+        .map(|org| org.role == "owner")
+        .unwrap_or(false);
+    let document_owner = ctx.document_owner_user_id.as_deref() == Some(me.as_str());
+    let legacy_author =
+        ctx.document_owner_user_id.is_none() && ctx.author_user_id.as_deref() == Some(me.as_str());
+    let can_manage = document_owner || org_owner;
+    Ok((
+        can_manage || legacy_author || ctx.access == "edit",
+        can_manage,
+    ))
 }
 
 #[tauri::command]
@@ -10357,9 +11048,10 @@ pub(crate) async fn org_set_item_access_inner(
             "only the document owner or organization owner can change access".into(),
         ));
     }
-    let expected_owner_user_id = ctx.document_owner_user_id.clone().ok_or_else(|| {
-        AppError::InvalidArg("stable shared document omitted its owner".into())
-    })?;
+    let expected_owner_user_id = ctx
+        .document_owner_user_id
+        .clone()
+        .ok_or_else(|| AppError::InvalidArg("stable shared document omitted its owner".into()))?;
     let doc_id = ctx.doc_id.ok_or_else(|| {
         AppError::InvalidArg("this legacy shared item has no permission resource".into())
     })?;
@@ -10435,7 +11127,10 @@ pub(crate) async fn org_set_item_access_inner(
                 .into_iter()
                 .find(|attempt| attempt.dispatch_id == dispatch_id)
                 .ok_or_else(|| AppError::Storage("org access attempt disappeared".into()))?;
-            if reconcile_pending_org_access_attempt(st, &attempt).await.unwrap_or(false) {
+            if reconcile_pending_org_access_attempt(st, &attempt)
+                .await
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
             return Err(error);
@@ -10525,7 +11220,7 @@ pub(crate) async fn org_update_own_item_inner(
     org_update_own_item_notifying(state, item_id, title, markdown, None).await
 }
 
-async fn org_update_own_item_notifying(
+pub(crate) async fn org_update_own_item_notifying(
     state: &AppState,
     item_id: &str,
     title: &str,
@@ -10566,10 +11261,24 @@ async fn org_update_own_item_notifying(
         }
     }
 
-    // (3) CLEAN + (4) SCRUB the edited body — same leak-safe transform + PII scrub the share/republish
-    // paths apply (scrub ON: fail-safe toward LESS egress; an edit must never DOWNGRADE scrubbing).
-    let cleaned = crate::share::envelope::clean_note_body(markdown);
-    let (final_md, _counts) = scrub_org_markdown(&cleaned);
+    // Task free text is scrubbed field-by-field so stable ids and JSON structure remain intact.
+    // Notes retain the leak-safe clean+scrub transform.
+    let is_task = ctx.source_kind.as_deref() == Some("task");
+    let (wire_title, final_md, _counts) = if is_task {
+        let task = crate::share::task_envelope::TaskEnvelope::from_json(markdown, &ctx.org_id)?;
+        if task.title.trim() != title.trim() {
+            return Err(AppError::InvalidArg(
+                "task title does not match its structured payload".into(),
+            ));
+        }
+        super::tasks::validate_task_org_refs(state, &task)?;
+        let (task, canonical, counts) = scrub_task_envelope_json(markdown, &ctx.org_id)?;
+        (task.title, canonical, counts)
+    } else {
+        let cleaned = crate::share::envelope::clean_note_body(markdown);
+        let (markdown, counts) = scrub_org_markdown(&cleaned);
+        (title.to_string(), markdown, counts)
+    };
     let (final_md, attachments) = attachment_bundle_for_markdown(
         state,
         &crate::storage::AttachmentOwner::OrgItem {
@@ -10577,6 +11286,9 @@ async fn org_update_own_item_notifying(
         },
         &final_md,
     )?;
+    if is_task {
+        crate::share::task_envelope::TaskEnvelope::from_json(&final_md, &ctx.org_id)?;
+    }
 
     // (4b) REFUSE AN EMPTY EDIT — sibling of `build_org_share_body`'s "refuse an empty share"
     // guard (2026-07-16): this is a SEPARATE org-publish path (edit-in-place on an already-shared
@@ -10605,6 +11317,7 @@ async fn org_update_own_item_notifying(
 
     let source_kind = match ctx.source_kind.as_deref() {
         Some("meeting") => crate::share::org_envelope::OrgSourceKind::Meeting,
+        Some("task") => crate::share::org_envelope::OrgSourceKind::Task,
         _ => crate::share::org_envelope::OrgSourceKind::Document,
     };
 
@@ -10612,8 +11325,12 @@ async fn org_update_own_item_notifying(
         AppError::InvalidArg("this shared document exhausted its revision range".into())
     })?;
     let env = crate::share::org_envelope::OrgEnvelope::new(
-        crate::share::org_envelope::OrgItemKind::Note,
-        title.to_string(),
+        if is_task {
+            crate::share::org_envelope::OrgItemKind::Task
+        } else {
+            crate::share::org_envelope::OrgItemKind::Note
+        },
+        wire_title,
         final_md,
         editor_hint,
         ctx.created_at.clone(),
@@ -10718,7 +11435,7 @@ async fn org_update_own_item_notifying(
                     &attempt,
                     &me,
                 )
-                    .await
+                .await
                 {
                     Ok(DirectOrgUpdateResolution::Exact(published)) => published,
                     Ok(DirectOrgUpdateResolution::Conflict) => {
@@ -10795,7 +11512,8 @@ async fn org_update_own_item_notifying(
     // copy is already live).
     let local_replica = prepare_incoming_attachment_bundle(&env.markdown, &env.attachments)
         .and_then(|(local_markdown, local_attachments)| {
-            crate::storage::Db::prepare_org_item_index(
+            crate::storage::Db::prepare_org_item_index_for_kind(
+                env.kind,
                 &env.title,
                 &env.created_at,
                 &local_markdown,
@@ -10813,9 +11531,11 @@ async fn org_update_own_item_notifying(
                                 row_id,
                                 dispatch_id,
                                 &org.org_id,
-                                published.doc_id.as_deref().ok_or_else(|| AppError::Storage(
-                                    "direct org update lost its document id".into(),
-                                ))?,
+                                published.doc_id.as_deref().ok_or_else(|| {
+                                    AppError::Storage(
+                                        "direct org update lost its document id".into(),
+                                    )
+                                })?,
                                 published.access.as_str(),
                                 new_rev,
                                 generation,
@@ -10834,9 +11554,9 @@ async fn org_update_own_item_notifying(
                                     title: &env.title,
                                     markdown: &local_markdown,
                                     created_at: &env.created_at,
-                                    source_kind: env.source_kind.map(
-                                        crate::share::org_envelope::OrgSourceKind::as_str,
-                                    ),
+                                    source_kind: env
+                                        .source_kind
+                                        .map(crate::share::org_envelope::OrgSourceKind::as_str),
                                     author_user_id: Some(me.as_str()),
                                     prepared: &prepared,
                                     attachments: &local_attachments,
@@ -10854,9 +11574,8 @@ async fn org_update_own_item_notifying(
                                 new_rev,
                                 generation,
                                 &content_sha,
-                                env.source_kind.map(
-                                    crate::share::org_envelope::OrgSourceKind::as_str,
-                                ),
+                                env.source_kind
+                                    .map(crate::share::org_envelope::OrgSourceKind::as_str),
                                 Some(me.as_str()),
                                 &prepared,
                                 Some(item_id),
@@ -10909,9 +11628,7 @@ async fn org_update_own_item_notifying(
                 item_id: item_id.to_string(),
             },
         )?;
-        delete_legacy_org_item(
-            state,&client,&access_token,&org.org_id,item_id,permit,
-        ).await?;
+        delete_legacy_org_item(state, &client, &access_token, &org.org_id, item_id, permit).await?;
     }
     Ok(published.item_id)
 }
@@ -10968,7 +11685,7 @@ pub(crate) async fn delete_org_item_as_author_inner(
     delete_org_item_as_author_notifying(state, item_id, None).await
 }
 
-async fn delete_org_item_as_author_notifying(
+pub(crate) async fn delete_org_item_as_author_notifying(
     state: &AppState,
     item_id: &str,
     app: Option<&AppHandle>,
@@ -11017,15 +11734,8 @@ async fn delete_org_item_as_author_notifying(
                 doc_id: doc_id.to_string(),
             },
         )?;
-        delete_stable_org_document(
-            state,
-            &client,
-            &access_token,
-            &org.org_id,
-            doc_id,
-            permit,
-        )
-        .await?;
+        delete_stable_org_document(state, &client, &access_token, &org.org_id, doc_id, permit)
+            .await?;
     } else {
         let permit = permit_simple_org_dispatch(
             state,
@@ -11036,9 +11746,7 @@ async fn delete_org_item_as_author_notifying(
                 item_id: item_id.to_string(),
             },
         )?;
-        delete_legacy_org_item(
-            state,&client,&access_token,&org.org_id,item_id,permit,
-        ).await?;
+        delete_legacy_org_item(state, &client, &access_token, &org.org_id, item_id, permit).await?;
     }
 
     // (3) ONLY NOW tombstone the local replica — the server confirmed gone, so dropping this
@@ -11049,7 +11757,9 @@ async fn delete_org_item_as_author_notifying(
         let _lifecycle = lifecycle_guard(state);
         let evicted = match ctx.doc_id.as_deref() {
             Some(doc_id) => state.db.terminalize_and_evict_org_document(
-                &org.org_id, doc_id, &chrono::Utc::now().to_rfc3339(),
+                &org.org_id,
+                doc_id,
+                &chrono::Utc::now().to_rfc3339(),
             )?,
             None => state.db.evict_org_item(item_id)?,
         };
