@@ -1179,6 +1179,45 @@ impl Db {
         // hides it from the folder tree (it IS the section, not a nested child). Exactly one row has
         // is_root=1 (see `ensure_notes_root`). Guarded/idempotent; every existing folder defaults to 0.
         Self::add_column_if_missing(&conn, "folders", "is_root", "INTEGER NOT NULL DEFAULT 0")?;
+        // WORKSPACE HIERARCHY (2026-08-22) — the CONTAINER LEVEL. A Project is a `folders` row with
+        // `level='project'` and `parent_id IS NULL`; a Folder is `level='folder'` under one. Reusing
+        // `folders` rather than a new table is the load-bearing decision of the hierarchy design:
+        // `commands/lock.rs::lock_folder_inner_with_visibility_notice` seals a container's notes,
+        // documents, attachments, transcript, timeline and audio with NO predicate on `folders.kind`,
+        // so a project row inherits the whole verified seal machinery — and because a project lock
+        // cascades by locking each child folder in its own right, every item's `folder_id` still
+        // points at a row whose `locked` bit is correct. That is why `visibility_clause`, all 47
+        // `*_visible` readers and every AAD binding (`aad_wrapped_ck`/`aad_content`/…, all of which
+        // bind `folder=<id>`) stay UNTOUCHED by the hierarchy. See
+        // `docs/superpowers/specs/2026-08-22-workspace-hierarchy-design.md` §2.
+        //
+        // `emoji`/`tint` mirror the columns `dashboards` already carries, so project identity reuses
+        // the existing visual vocabulary. `position` is new because `folders` has NO ordering column
+        // at all today (`list_folders` falls back to `created_at, name`).
+        //
+        // All four are additive + guarded, so migrate() stays idempotent and no existing row's
+        // `path`, `locked`, `wrapped_key` or any `*_blob` column is read or written. The DEFAULT
+        // 'folder' means every pre-existing row keeps behaving exactly as it does today until the
+        // separate `hierarchy_v1` data migration runs.
+        // The CHECK is the enforcement, not the comment: without it any string persists, and both the
+        // tree reader and every later consumer would have to defend against a `level` nobody defined.
+        // SQLite permits a CHECK on ADD COLUMN (unlike PRIMARY KEY/UNIQUE) and applies it to new
+        // writes only, so an existing row is never re-validated and the ALTER cannot fail on real data.
+        Self::add_column_if_missing(
+            &conn,
+            "folders",
+            "level",
+            "TEXT NOT NULL DEFAULT 'folder' CHECK (level IN ('project', 'folder'))",
+        )?;
+        Self::add_column_if_missing(&conn, "folders", "emoji", "TEXT")?;
+        Self::add_column_if_missing(&conn, "folders", "tint", "TEXT")?;
+        Self::add_column_if_missing(&conn, "folders", "position", "INTEGER NOT NULL DEFAULT 0")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_folders_level ON folders(level);
+             CREATE INDEX IF NOT EXISTS idx_folders_parent_position
+               ON folders(parent_id, position);",
+        )
+        .map_err(map_err)?;
         // Phase 2b — content-free egress audit log. One row per cloud provider call written by
         // `DbEgressSink`. The table carries ONLY counts, ids, labels, byte sizes, and token counts —
         // NEVER transcript, prompt, scrubbed values, API keys, or any meeting content (§8: no PII

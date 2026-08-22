@@ -2367,6 +2367,143 @@ pub struct DashboardTile {
     pub created_at: String,
 }
 
+// ── WORKSPACE HIERARCHY — Projects › Folders › items ─────────────────────────────────────────────
+//
+// A Project and a Folder are BOTH `folders` rows, discriminated by `folders.level`. That is the
+// load-bearing decision of the hierarchy design: the seal machinery in `commands/lock.rs` is
+// folder-id-keyed and carries no predicate on `folders.kind`, so a project row inherits it whole,
+// and a project lock cascades by locking each child folder in its own right — which is why
+// `visibility_clause`, every `*_visible` reader and every `folder=<id>` AAD binding are untouched.
+// See `docs/superpowers/specs/2026-08-22-workspace-hierarchy-design.md` §2.
+
+/// The four item kinds a container can hold.
+///
+/// A unit enum, so `rename_all = "camelCase"` is sufficient and there are no variant FIELDS to
+/// rename — the distinction that broke `TileData` (#566/#568), where `rename_all` renamed the
+/// variants while their snake_case fields reached the FE as `undefined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ItemKind {
+    Meeting,
+    Note,
+    Task,
+    Dashboard,
+}
+
+impl ItemKind {
+    /// The fixed presentation order of the type groups. An EMPTY group is omitted entirely rather
+    /// than rendered with a zero count, so this is an order, not a guarantee of presence.
+    pub const ORDER: [ItemKind; 4] = [
+        ItemKind::Meeting,
+        ItemKind::Note,
+        ItemKind::Task,
+        ItemKind::Dashboard,
+    ];
+}
+
+/// One `folders` row as the hierarchy reads it. Storage-internal: it carries `kind`/`is_root`, which
+/// the wire DTO does not need in full.
+#[derive(Debug, Clone)]
+pub struct ContainerRow {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    /// `"project"` or `"folder"`.
+    pub level: String,
+    pub emoji: Option<String>,
+    pub tint: Option<String>,
+    pub position: i64,
+    /// The row's own `locked` COLUMN — the disk truth, independent of the session unlock set.
+    pub locked: bool,
+    pub is_root: bool,
+    pub kind: String,
+}
+
+/// One row in a container's type group.
+///
+/// Deliberately a FLAT struct carrying its `kind` as a field rather than a data-carrying enum: the
+/// enum shape is exactly what shipped `started_at`/`duration_s`/`has_audio` against a camelCase FE,
+/// where every field read `undefined`, the tile threw while rendering and took the whole dashboard
+/// board down. A flat struct cannot have that bug, and the serialized-key test pins it anyway.
+///
+/// It carries NO on-disk path of any kind — see the `convertFileSrc` note on
+/// `crate::storage::workspace_store`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemRow {
+    pub kind: ItemKind,
+    pub id: String,
+    /// `None` for an untitled item; the FE supplies its own placeholder.
+    pub title: Option<String>,
+    /// Meetings only; `None` for every other kind.
+    pub duration_s: Option<i64>,
+    /// Newest-first sort key, normalised to epoch MILLISECONDS for every kind (meetings store
+    /// RFC3339 TEXT, authored notes store epoch-ms INTEGER).
+    pub sort_at: i64,
+}
+
+/// A container's items of ONE kind: the newest few plus the true total.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeGroup {
+    pub kind: ItemKind,
+    /// The container's FULL visible count for this kind — `items` is only the first page.
+    pub total: u32,
+    pub items: Vec<ItemRow>,
+}
+
+/// A container in the tree: a Project (with child folders) or a Folder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerNode {
+    pub id: String,
+    pub name: String,
+    /// `"project"` or `"folder"`.
+    pub level: String,
+    pub emoji: Option<String>,
+    pub tint: Option<String>,
+    /// Sealed (encrypted) on disk — the `folders.locked` column.
+    pub locked: bool,
+    /// Sealed AND session-unlocked (decrypted for this session only). Mirrors `FolderNode.unlocked`.
+    pub unlocked: bool,
+    /// The reserved always-open note root. It can never be sealed, so the FE disables its lock
+    /// affordance rather than offering an action that is refused.
+    pub is_root: bool,
+    /// Child folders (a Project's; empty for a Folder while sub-folders remain out of scope, but the
+    /// reader preserves and renders any depth that already exists in a user's database).
+    pub folders: Vec<ContainerNode>,
+    /// Per-kind groups in [`ItemKind::ORDER`]. An empty group is ABSENT. A sealed-and-not-unlocked
+    /// container carries NO groups at all — not even totals.
+    pub groups: Vec<TypeGroup>,
+}
+
+/// One page of a single container's items of a single kind.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemPage {
+    pub kind: ItemKind,
+    pub items: Vec<ItemRow>,
+    /// The full visible count, so the caller can render "N of M" and know when to stop paging.
+    pub total: u32,
+}
+
+/// A container resolved on its own, for a breadcrumb or header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerDto {
+    pub id: String,
+    pub name: String,
+    pub level: String,
+    pub emoji: Option<String>,
+    pub tint: Option<String>,
+    pub locked: bool,
+    pub unlocked: bool,
+    pub is_root: bool,
+    /// The owning project's id and name when this is a Folder; `None` for a Project.
+    pub parent_id: Option<String>,
+    pub parent_name: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
