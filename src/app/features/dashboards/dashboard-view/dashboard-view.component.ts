@@ -29,6 +29,7 @@ import {
   splitLeadingEmoji,
 } from "../../../services/dashboards.service";
 import { FoldersService } from "../../../services/folders.service";
+import { TaskStore } from "../../tasks/task.store";
 import {
   TilePaletteService,
   type TileChoice,
@@ -81,9 +82,11 @@ export class DashboardViewComponent {
   private readonly errors = inject(ErrorCopyService);
   private readonly folders = inject(FoldersService);
   private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly taskStore = inject(TaskStore);
   private removePrivacyInvalidator: (() => void) | null = null;
 
   constructor() {
+    void this.taskStore.init();
     this.removePrivacyInvalidator = this.privacyBarrier.registerInvalidator(
       () => this.invalidateAndRefresh(),
     );
@@ -127,7 +130,15 @@ export class DashboardViewComponent {
     }
     return ordered;
   });
-  readonly isEmpty = computed(() => this.tiles().length === 0);
+  readonly work = computed(() => {
+    const dashboardId = this.id();
+    return this.taskStore
+      .tasks()
+      .filter((task) =>
+        task.localRefs.some((ref) => ref.kind === "dashboard" && ref.refId === dashboardId),
+      );
+  });
+  readonly isEmpty = computed(() => this.tiles().length === 0 && this.work().length === 0);
   readonly projection = computed(() => projectDashboard(this.tiles()));
   readonly duplicates = computed<ReadonlyMap<string, string>>(() => {
     const seen = new Map<string, string>();
@@ -636,6 +647,10 @@ export class DashboardViewComponent {
   openAsk(): void {
     if (!this.privacyReady()) return;
     this.askOpen.set(true);
+  }
+
+  openWork(taskId: string): void {
+    void this.router.navigate(["/tasks", taskId]);
   }
 
   closeAsk(): void {
