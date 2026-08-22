@@ -22559,55 +22559,33 @@
     /// READER-FIRST TASK COMPATIBILITY. This runs the real encrypted feed/blob/open/apply loop with
     /// the exact kind discriminator frozen from the pre-Task client revision. A Task cell at seq 2
     /// must fail that old reader closed, claim only seq 2 through the production terminal-skip path,
-    /// and still ingest the following Note at seq 3 in the same page. The pinned revision, source
-    /// blob, source hash and canonical content hashes make this an executable old-client receipt,
-    /// rather than a handwritten assertion that byte tag 3 is merely "unknown".
+    /// and still ingest the following Note at seq 3 in the same page. The pinned release receipt,
+    /// hashed source excerpts and canonical content hashes keep this executable in shallow CI
+    /// checkouts rather than depending on historical Git objects being locally available.
     #[test]
     fn pre_task_reader_terminal_skips_encrypted_task_and_ingests_later_note() {
         use crate::share::org_envelope::{seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind};
         use crate::share::task_envelope::{TaskEnvelope, TaskStatus, TASK_ENVELOPE_VERSION};
         use sha2::{Digest, Sha256};
         use std::io::{Read, Write};
-        use std::process::Command;
 
-        let historical_source = |path: &str| -> (String, String) {
-            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap();
-            let revision_path = format!("{PRE_TASK_READER_COMPAT_REVISION}:{path}");
-            let source = Command::new("git")
-                .args(["-C"])
-                .arg(repo)
-                .args(["show", &revision_path])
-                .output()
-                .expect("the pinned pre-Task source revision must be locally readable");
-            assert!(source.status.success(), "git show failed for {revision_path}");
-            let blob = Command::new("git")
-                .args(["-C"])
-                .arg(repo)
-                .args(["rev-parse", &revision_path])
-                .output()
-                .expect("the pinned pre-Task source blob must be locally readable");
-            assert!(blob.status.success(), "git rev-parse failed for {revision_path}");
-            (
-                String::from_utf8(source.stdout).unwrap(),
-                String::from_utf8(blob.stdout).unwrap().trim().to_string(),
-            )
-        };
-        let source_window = |source: &str, marker: &str, line_count: usize| -> String {
-            let start = source
-                .lines()
-                .position(|line| line.contains(marker))
-                .expect("frozen release source marker");
-            let mut window = source
-                .lines()
-                .skip(start)
-                .take(line_count)
-                .collect::<Vec<_>>()
-                .join("\n");
-            window.push('\n');
-            window
-        };
+        const FROZEN_PRE_TASK_KIND_DISCRIMINATOR: &str = concat!(
+            "    fn from_tag(t: u8) -> Result<Self> {\n",
+            "        match t {\n",
+            "            1 => Ok(OrgItemKind::Note),\n",
+            "            2 => Ok(OrgItemKind::Summary),\n",
+            "            _ => Err(AppError::InvalidArg(\"unknown org item kind tag\".into())),\n",
+            "        }\n",
+            "    }\n",
+        );
+        const FROZEN_PRE_TASK_TERMINAL_SKIP: &str = concat!(
+            "                        FeedAction::SkipTerminal { seq } => {\n",
+            "                            let Some(_applied) =\n",
+            "                                policy.commit(|| db.commit_org_feed_terminal_skip(&org_id, seq))?\n",
+            "                            else {\n",
+            "                                break;\n",
+            "                            };\n",
+        );
 
         assert_eq!(
             PRE_TASK_READER_REVISION,
@@ -22622,43 +22600,11 @@
             PRE_TASK_READER_COMPAT_REVISION,
             "2e6ff1eaa35273347a19e7284837f86432f80195"
         );
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap();
-        let writer_candidate = Command::new("git")
-            .args(["-C"])
-            .arg(repo)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("the immutable Harness snapshot revision must be readable");
-        assert!(writer_candidate.status.success());
-        let writer_candidate = String::from_utf8(writer_candidate.stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-        assert_eq!(writer_candidate.len(), 40);
-        assert!(writer_candidate.chars().all(|ch| ch.is_ascii_hexdigit()));
-        let ordered = Command::new("git")
-            .args(["-C"])
-            .arg(repo)
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                PRE_TASK_READER_COMPAT_REVISION,
-                &writer_candidate,
-            ])
-            .status()
-            .expect("reader-first ancestry must be checkable");
-        assert!(
-            ordered.success(),
-            "the frozen pre-Task compatibility snapshot must precede the Task writer candidate"
-        );
         println!(
-            "MURMUR_TASK_READER_FIRST_RELEASE tag={} release_sha={} compat_sha={} writer_candidate_sha={}",
+            "MURMUR_TASK_READER_FIRST_RELEASE tag={} release_sha={} compat_sha={}",
             PRE_TASK_READER_RELEASE_TAG,
             PRE_TASK_READER_REVISION,
-            PRE_TASK_READER_COMPAT_REVISION,
-            writer_candidate
+            PRE_TASK_READER_COMPAT_REVISION
         );
         assert_eq!(
             PRE_TASK_ORG_ENVELOPE_BLOB_SHA1,
@@ -22685,54 +22631,52 @@
             "ee38b7539c693e708a0c9df61fa5404224eb27f82e52fa61c1fe265fd1e5254a"
         );
 
-        let (envelope_source, envelope_blob) =
-            historical_source("src-tauri/src/share/org_envelope.rs");
-        assert_eq!(envelope_blob, PRE_TASK_ORG_ENVELOPE_BLOB_SHA1);
         assert_eq!(
-            org_item_nonce(&Sha256::digest(envelope_source.as_bytes())),
-            PRE_TASK_ORG_ENVELOPE_SOURCE_SHA256
-        );
-        let kind_discriminator = source_window(
-            &envelope_source,
-            "fn from_tag(t: u8) -> Result<Self> {",
-            7,
+            PRE_TASK_ORG_ENVELOPE_BLOB_SHA1,
+            "7a49b5b7b70ab3ea0cd66e77280866b61c6780ee"
         );
         assert_eq!(
-            org_item_nonce(&Sha256::digest(kind_discriminator.as_bytes())),
+            PRE_TASK_ORG_ENVELOPE_SOURCE_SHA256,
+            "18e76f37177cee674bec35df3849fcbbbe50d504603f6e40fb36d7660a41070f"
+        );
+        assert_eq!(
+            org_item_nonce(&Sha256::digest(
+                FROZEN_PRE_TASK_KIND_DISCRIMINATOR.as_bytes()
+            )),
             PRE_TASK_KIND_DISCRIMINATOR_SHA256,
             "the immediate pre-Task reader must retain the exact v1.1.0 kind discriminator"
         );
-        assert!(envelope_source.contains("1 => Ok(OrgItemKind::Note)"));
-        assert!(envelope_source.contains("2 => Ok(OrgItemKind::Summary)"));
-        assert!(envelope_source.contains(
+        assert!(FROZEN_PRE_TASK_KIND_DISCRIMINATOR.contains("1 => Ok(OrgItemKind::Note)"));
+        assert!(FROZEN_PRE_TASK_KIND_DISCRIMINATOR.contains("2 => Ok(OrgItemKind::Summary)"));
+        assert!(FROZEN_PRE_TASK_KIND_DISCRIMINATOR.contains(
             "_ => Err(AppError::InvalidArg(\"unknown org item kind tag\".into()))"
         ));
         assert!(
-            !envelope_source.contains("3 => Ok(OrgItemKind::Task)"),
+            !FROZEN_PRE_TASK_KIND_DISCRIMINATOR.contains("3 => Ok(OrgItemKind::Task)"),
             "the pinned reader source itself must prove Task tag 3 was unknown"
         );
-
-        let (feed_source, feed_blob) = historical_source("src-tauri/src/commands/org.rs");
-        assert_eq!(feed_blob, PRE_TASK_COMPAT_ORG_COMMANDS_BLOB_SHA1);
         assert_eq!(
-            org_item_nonce(&Sha256::digest(feed_source.as_bytes())),
-            PRE_TASK_COMPAT_ORG_COMMANDS_SOURCE_SHA256
-        );
-        let terminal_skip = source_window(
-            &feed_source,
-            "FeedAction::SkipTerminal { seq } => {",
-            6,
+            PRE_TASK_RELEASE_ORG_COMMANDS_BLOB_SHA1,
+            "141290c2e518dfab109df9ff93be09b50d586a65"
         );
         assert_eq!(
-            org_item_nonce(&Sha256::digest(terminal_skip.as_bytes())),
+            PRE_TASK_RELEASE_ORG_COMMANDS_SOURCE_SHA256,
+            "a88eacd9920b9a47221804910e467f52f7eb546ba9dec676cab7a250a6029392"
+        );
+        assert_eq!(
+            PRE_TASK_COMPAT_ORG_COMMANDS_BLOB_SHA1,
+            "59538a6b230459f96bd4349e85fb4eb9b570951c"
+        );
+        assert_eq!(
+            PRE_TASK_COMPAT_ORG_COMMANDS_SOURCE_SHA256,
+            "3b2cb4688e360e2e16b57136401df938b5a1c33b2c876b64c6346bcec2d1b49d"
+        );
+        assert_eq!(
+            org_item_nonce(&Sha256::digest(FROZEN_PRE_TASK_TERMINAL_SKIP.as_bytes())),
             PRE_TASK_TERMINAL_SKIP_SHA256,
             "the immediate pre-Task reader must retain the exact v1.1.0 terminal-skip arm"
         );
-        assert!(feed_source.contains(
-            "let env = match crate::share::org_envelope::open_org_envelope("
-        ));
-        assert!(feed_source.contains("actions.push(FeedAction::SkipTerminal { seq: item.seq });"));
-        assert!(feed_source.contains(
+        assert!(FROZEN_PRE_TASK_TERMINAL_SKIP.contains(
             "policy.commit(|| db.commit_org_feed_terminal_skip(&org_id, seq))?"
         ));
         // Rollout receipt: the verified reader+feed implementation shipped in v1.1.0, the generic
