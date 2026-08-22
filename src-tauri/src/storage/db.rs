@@ -1218,6 +1218,9 @@ impl Db {
                ON folders(parent_id, position);",
         )
         .map_err(map_err)?;
+        // The one-time adoption of every existing container into a default project. Runs here,
+        // immediately after the columns it depends on exist, and before any content surface.
+        Self::migrate_hierarchy_v1(&conn)?;
         // Phase 2b — content-free egress audit log. One row per cloud provider call written by
         // `DbEgressSink`. The table carries ONLY counts, ids, labels, byte sizes, and token counts —
         // NEVER transcript, prompt, scrubbed values, API keys, or any meeting content (§8: no PII
