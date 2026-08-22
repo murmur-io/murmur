@@ -13037,7 +13037,27 @@
 
         let snapshot = DurableScopeSnapshot::Vault(capture_content_visibility_snapshot(&state));
         let initial_dependencies = state.db.visible_folder_ids(&HashSet::new()).unwrap();
-        assert_eq!(initial_dependencies, vec!["f-visible".to_string()]);
+        // Every database now carries a default project (the hierarchy migration), which is a real
+        // always-open container and so is legitimately part of the visible set. Subtract exactly
+        // THAT id rather than filtering by a name prefix, so both assertions stay CLOSED sets: any
+        // other id leaking into the visible set — another generated container, an org- or
+        // system-sourced one — must still fail here, at a gate assertion. Naming the id also avoids
+        // depending on where a UUID happens to sort relative to "f-visible".
+        let project_id: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT id FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let seeded = |ids: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = ids.iter().filter(|id| **id != project_id).cloned().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(seeded(&initial_dependencies), vec!["f-visible".to_string()]);
 
         state
             .unlocked_folders
@@ -13074,7 +13094,7 @@
                 .unwrap()
         };
         assert_eq!(
-            dependencies,
+            seeded(&dependencies),
             vec!["f-late".to_string(), "f-visible".to_string()]
         );
     }
@@ -30471,4 +30491,409 @@
             update_permit.authorize_update(host, org_id, doc_id, &substituted_update),
             Err(AppError::Storage(message)) if message == "org update dispatch permit mismatch"
         ));
+    }
+
+    /// Adoption does not change how a note container RENAMES — proven through the real rename entry
+    /// point, on the vault, rather than asserted from the composition rule.
+    ///
+    /// This is the hazard the whole migration design exists to avoid, so it is not enough to reason
+    /// that `rename_folder_inner` treats an empty parent path like no parent at all. A note container
+    /// whose stored path cannot be composed from any note root is adopted by the project, whose path
+    /// is the vault root; if that changed what a later rename does, the real directory would move
+    /// while `notes.exported_path` / `documents.exported_path` stayed behind — and a later seal would
+    /// then delete an `.md` at a path that no longer exists, leaving the plaintext inside a folder the
+    /// app reports as sealed. Both databases are renamed identically and compared.
+    #[test]
+    fn adoption_does_not_change_how_a_note_container_renames() {
+        fn rename_uncomposable(tag: &str, adopt: bool) -> (String, std::path::PathBuf) {
+            let vault = tmp_vault(tag);
+            let state = build_state_with_vault(tag, &vault);
+            // Model a pre-hierarchy database: opening one adopts it, so undo that first.
+            state
+                .db
+                .lock()
+                .execute(
+                    "DELETE FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+                    rusqlite::params![],
+                )
+                .unwrap();
+            // A note container stamped two levels under a root while its parent link stays NULL —
+            // the shape `create_note_folder_inner` produces and no root can compose.
+            state
+                .db
+                .insert_folder(&Folder {
+                    id: "c-deep".into(),
+                    name: "Deep".into(),
+                    path: "Notes/Mid/Deep".into(),
+                    parent_id: None,
+                    locked: false,
+                    created_at: "2026-08-22T09:00:00Z".into(),
+                })
+                .unwrap();
+            state
+                .db
+                .lock()
+                .execute(
+                    "UPDATE folders SET kind = 'note' WHERE id = 'c-deep'",
+                    rusqlite::params![],
+                )
+                .unwrap();
+            std::fs::create_dir_all(vault.join("Notes/Mid/Deep")).unwrap();
+
+            if adopt {
+                Db::migrate_hierarchy_v1(&state.db.lock()).unwrap();
+            }
+            rename_folder_inner(&state, "c-deep".into(), "Renamed".into()).unwrap();
+            let path: String = state
+                .db
+                .lock()
+                .query_row("SELECT path FROM folders WHERE id = 'c-deep'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (path, vault)
+        }
+
+        let (before, vault_before) = rename_uncomposable("rename-unadopted", false);
+        let (after, vault_after) = rename_uncomposable("rename-adopted", true);
+        assert_eq!(
+            before, after,
+            "adoption changed where a rename puts a note container's directory"
+        );
+        // And the directory really landed there in BOTH vaults — comparing two `exists()` calls would
+        // also pass if neither directory existed at all.
+        assert!(
+            vault_before.join(&before).is_dir(),
+            "the un-adopted rename did not create {before}"
+        );
+        assert!(
+            vault_after.join(&after).is_dir(),
+            "the adopted rename did not create {after}"
+        );
+        assert!(
+            !vault_before.join("Notes/Mid/Deep").exists(),
+            "the un-adopted rename left the old directory behind"
+        );
+        assert!(
+            !vault_after.join("Notes/Mid/Deep").exists(),
+            "the adopted rename left the old directory behind"
+        );
+    }
+
+    /// Sealing a project reaches its own items only, never the containers beneath it.
+    ///
+    /// The hierarchy gives containers parents for the first time, so this pins that a lock is still
+    /// exactly as wide as it was: per container, never recursive. (Making a project lock cascade to
+    /// its children is a later, deliberate step — this proves it does not happen by accident here.)
+    #[test]
+    fn sealing_a_project_reaches_its_own_items_only() {
+        let state = build_state("project-seal-scope");
+        // The database adopts on open, so the project already exists; give it a child and one item
+        // each, then seal the project.
+        let project: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT id FROM folders WHERE COALESCE(level, 'folder') = 'project' AND path = ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        make_child_folder(&state.db, "f-work", "Work", "Work", &project);
+        seed_meeting(&state.db, "m-project", "# project note", Some(&project));
+        seed_meeting(&state.db, "m-work", "# work note", Some("f-work"));
+
+        lock_folder_inner(&state, project.clone()).unwrap();
+
+        assert!(
+            !meeting_is_unlocked(&state, "m-project").unwrap(),
+            "the project's own item is sealed"
+        );
+        assert!(
+            meeting_is_unlocked(&state, "m-work").unwrap(),
+            "a container beneath it is untouched — a lock is per container, never recursive"
+        );
+    }
+
+    /// Renaming or deleting the workspace root is refused.
+    ///
+    /// The hierarchy gives the default project `path = ''`, and every folder command composes its
+    /// filesystem work from `folders.path`. `assert_in_vault` resolves an empty relative path to the
+    /// vault root — the property that lets the migration adopt every container without moving a file
+    /// — so without this refusal a rename would compose `fs::rename(<vault>, <vault>/<new name>)` and
+    /// move the user's ENTIRE vault. No shipped row had an empty path before, so the refusal ships
+    /// with the row that makes it reachable.
+    #[test]
+    fn the_workspace_root_cannot_be_renamed_or_deleted() {
+        let vault = tmp_vault("workspace-root-guard");
+        let state = build_state_with_vault("workspace-root-guard", &vault);
+        make_open_folder(&state.db, "f-work", "Work");
+        std::fs::create_dir_all(vault.join("Work")).unwrap();
+        Db::migrate_hierarchy_v1(&state.db.lock()).unwrap();
+
+        let project: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT id FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let err = rename_folder_inner(&state, project.clone(), "Renamed".into())
+            .expect_err("renaming the workspace root must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+        let err = delete_folder_inner(&state, project.clone())
+            .expect_err("deleting the workspace root must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+
+        // The vault is intact and the project row is unchanged.
+        assert!(vault.join("Work").is_dir(), "the vault was disturbed");
+        assert!(!vault.join("Renamed").exists());
+        let path: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "");
+
+        // An ordinary container still renames exactly as before.
+        rename_folder_inner(&state, "f-work".into(), "Ops".into()).unwrap();
+        assert!(vault.join("Ops").is_dir());
+    }
+
+    /// On an ADOPTED database the reserved note root still resolves and still cannot be sealed.
+    ///
+    /// Adoption gives that root a non-NULL parent for the first time. The invariant it exists to
+    /// protect — that creating a note always has a writable, never-sealed home — is checked here
+    /// through the real resolver and the real seal refusal, not through its flag.
+    #[test]
+    fn the_note_root_still_resolves_and_still_refuses_to_seal_after_adoption() {
+        let state = build_state("adopted-note-root");
+        // The real upgrade path: an existing user already HAS a note root, and adoption then gives it
+        // a parent. (A root created AFTER adoption keeps a NULL parent, because the completion guard
+        // short-circuits — containers created post-adoption get their parent from the creation call
+        // instead. Defaulting that parent to the workspace project belongs to the creation-guards
+        // step, which is where the tree first has a consumer.)
+        state
+            .db
+            .lock()
+            .execute(
+                "DELETE FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        let root_before = state.db.ensure_notes_root().unwrap();
+        Db::migrate_hierarchy_v1(&state.db.lock()).unwrap();
+
+        let parent: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                rusqlite::params![root_before],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            parent.is_some(),
+            "adoption gives the note root a parent — that is the new condition under test"
+        );
+
+        // The resolver still finds the SAME root rather than minting a second one.
+        let root_after = state.db.ensure_notes_root().unwrap();
+        assert_eq!(root_after, root_before, "a second note root was created");
+
+        // And sealing it is still refused, so note creation never dead-ends.
+        let err = lock_folder_inner(&state, root_after.clone())
+            .expect_err("the note root must still refuse to seal");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+    }
+
+    /// No shipped creation path can produce a container whose path is the vault root.
+    ///
+    /// The migration declines to adopt when the vault root is occupied, and the legacy-tree shim
+    /// hides project rows — so if a user COULD create a container there, they could put their own
+    /// database into the declined state. This drives BOTH shipped creation entry points rather than
+    /// their shared name sanitiser: a path that stopped calling the sanitiser, or gained its own
+    /// composition, would leave a sanitiser-only assertion green.
+    #[test]
+    fn no_creation_path_can_produce_a_vault_root_container() {
+        let vault = tmp_vault("no-empty-path");
+        let state = build_state_with_vault("no-empty-path", &vault);
+
+        for name in ["", "   ", "...", "/", "///", "\u{0}", ".", " . "] {
+            assert!(
+                create_folder_inner(&state, name.to_string(), None).is_err(),
+                "the meeting-side create accepted {name:?}"
+            );
+            assert!(
+                create_note_folder_inner(&state, name, None).is_err(),
+                "the note-side create accepted {name:?}"
+            );
+        }
+
+        // Controls: an ordinary name succeeds on both paths, and neither lands at the vault root.
+        let meeting_side = create_folder_inner(&state, "Work".into(), None).unwrap();
+        assert!(!meeting_side.path.is_empty());
+        let note_side = create_note_folder_inner(&state, "Research", None).unwrap();
+        assert!(!note_side.path.is_empty());
+
+        // And nothing in the database occupies the vault root except the project the migration made.
+        let at_root: Vec<String> = {
+            let conn = state.db.lock();
+            let mut stmt = conn
+                .prepare("SELECT COALESCE(level, 'folder') FROM folders WHERE path = ''")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(at_root, vec!["project".to_string()]);
+    }
+
+    /// Resolving the vault root BY PATH after adoption returns the project — stated, because it
+    /// returned nothing on every database before this change.
+    ///
+    /// It matters for the by-path resolvers: the auto-file classifier maps a model-chosen subfolder
+    /// name to a container this way. The name it can produce is sanitised, and the sanitiser refuses
+    /// anything empty, so the classifier cannot address the project — but that is now a property
+    /// worth asserting rather than assuming.
+    #[test]
+    fn the_vault_root_resolves_by_path_only_to_the_project() {
+        let state = build_state("vault-root-by-path");
+        let project: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT id FROM folders WHERE COALESCE(level, 'folder') = 'project' AND path = ''",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        assert!(project.is_some(), "the database is adopted");
+
+        let by_path = state.db.folder_by_path("").unwrap();
+        assert_eq!(
+            by_path.map(|f| f.id),
+            project,
+            "the empty path resolves to the workspace project and nothing else"
+        );
+        // The classifier's own vocabulary cannot name it.
+        assert!(crate::summarize::organize::sanitize_folder("").is_none());
+    }
+
+    /// A genuinely sealed container survives adoption gated, unlockable, and byte-identical.
+    ///
+    /// Comparing the `locked` and `wrapped_key` columns before and after only shows the migration did
+    /// not overwrite them. It cannot show that a REAL seal still opens afterwards, which is the
+    /// property that matters: the content is only recoverable through the key those columns describe.
+    /// So this seals through the ordinary lock path with real key material, migrates, checks the gate,
+    /// then permanently unseals and compares the markdown byte for byte.
+    #[test]
+    fn a_real_seal_survives_adoption_and_still_unseals_byte_identical() {
+        let state = build_state("sealed-through-adoption");
+        // Model a pre-hierarchy database, seal a container with content in it, THEN adopt.
+        state
+            .db
+            .lock()
+            .execute(
+                "DELETE FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        make_open_folder(&state.db, "f-legal", "Legal");
+        let markdown = "# Merger terms\n\nAcquire at 3.2x revenue.\n";
+        seed_meeting(&state.db, "m1", markdown, Some("f-legal"));
+
+        lock_folder_inner(&state, "f-legal".into()).unwrap();
+        assert!(!meeting_is_unlocked(&state, "m1").unwrap(), "sealed before adoption");
+
+        Db::migrate_hierarchy_v1(&state.db.lock()).unwrap();
+
+        // Adopted, and still sealed — the gate reads the per-row flag, which adoption never writes.
+        let parent: Option<String> = state
+            .db
+            .lock()
+            .query_row("SELECT parent_id FROM folders WHERE id = 'f-legal'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(parent.is_some(), "it was adopted");
+        assert!(!meeting_is_unlocked(&state, "m1").unwrap(), "still sealed after adoption");
+
+        // And the real key still opens it, returning exactly what went in.
+        remove_lock_inner(&state, "f-legal".to_string()).unwrap();
+        assert!(meeting_is_unlocked(&state, "m1").unwrap());
+        let restored = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .expect("the note is back");
+        assert_eq!(
+            restored.markdown, markdown,
+            "content did not survive seal -> adopt -> unseal byte-identical"
+        );
+    }
+
+    /// The vault-root refusal covers a DECLINED-ADOPTION occupant too, not only the created project.
+    ///
+    /// The hazard is the path, not the row: every folder command composes its filesystem work from
+    /// `folders.path`, and an empty one resolves to the vault root — so renaming it means "move the
+    /// vault into a subdirectory of itself" and deleting it targets the vault directory, whichever row
+    /// happens to sit there. Narrowing the refusal to the migration's own project would leave both
+    /// operations reachable on exactly the database where the migration declined to adopt BECAUSE
+    /// such a container was present.
+    #[test]
+    fn the_vault_root_refusal_covers_a_declined_adoption_occupant() {
+        let vault = tmp_vault("declined-occupant");
+        let state = build_state_with_vault("declined-occupant", &vault);
+        state
+            .db
+            .lock()
+            .execute(
+                "DELETE FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        // A container occupying the vault root, the shape only an import or a manual edit produces.
+        make_open_folder(&state.db, "f-root", "");
+        make_open_folder(&state.db, "f-work", "Work");
+        std::fs::create_dir_all(vault.join("Work")).unwrap();
+
+        Db::migrate_hierarchy_v1(&state.db.lock()).unwrap();
+        assert!(
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM folders WHERE COALESCE(level,'folder') = 'project')",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap()
+                == 0,
+            "adoption declined, which is the state under test"
+        );
+
+        // The occupant is NOT the project, and is still refused.
+        let err = rename_folder_inner(&state, "f-root".into(), "Renamed".into())
+            .expect_err("renaming a vault-root container must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+        let err = delete_folder_inner(&state, "f-root".into())
+            .expect_err("deleting a vault-root container must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+
+        // The vault is intact: nothing moved, nothing removed.
+        assert!(vault.join("Work").is_dir());
+        assert!(!vault.join("Renamed").exists());
+        assert!(vault.is_dir());
+
+        // And an ordinary container on the same database still renames.
+        rename_folder_inner(&state, "f-work".into(), "Ops".into()).unwrap();
+        assert!(vault.join("Ops").is_dir());
     }
