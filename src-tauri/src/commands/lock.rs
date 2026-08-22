@@ -43,6 +43,11 @@ pub async fn lock_folder(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
+    if folder_id == crate::storage::tasks_store::TASK_FOLDER_ID {
+        return Err(AppError::InvalidArg(
+            "the task folder cannot be locked".into(),
+        ));
+    }
     let _org_mutation = state.org_share_mutation_lock.lock().await;
     let closure_created = state.db.begin_org_folder_closure(&folder_id)?;
     if state.db.folder_has_active_remote_share(&folder_id)? {
@@ -87,6 +92,11 @@ pub async fn lock_folder_allow_remote_access(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), AppError> {
+    if folder_id == crate::storage::tasks_store::TASK_FOLDER_ID {
+        return Err(AppError::InvalidArg(
+            "the task folder cannot be locked".into(),
+        ));
+    }
     let _org_mutation = state.org_share_mutation_lock.lock().await;
     if state.db.org_folder_closure_exists(&folder_id)? {
         return Err(AppError::Unavailable(
@@ -765,6 +775,10 @@ pub async fn unlock_folder(
                 .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
             g.insert(folder_id.clone());
         }
+        // External vault files are readable outside the lifecycle mutex. Publish them only after
+        // the folder is admitted to the session unlock set, so every attachment byte read goes
+        // through the ordinary owner gate and no pre-admission plaintext can escape to disk.
+        reexport_notes_in_folder(&state, &folder_id);
         tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
 
         // Return the refreshed node. This folder was just added to the unlock set above, so its
@@ -1138,7 +1152,6 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
 
-    let vault = vault_path(state);
     let notes = state.db.notes_in_folder(&folder_id)?;
 
     // Step 1: restore EVERY provider row's plaintext from ITS OWN blob (or keep the in-memory
@@ -1162,75 +1175,6 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     // folder-open commit that clears the other recovery ciphertexts.
     unseal_attachments_in_folder(state, &folder_id, &ck, false)?;
 
-    // Step 2: per meeting, re-export ONE `.md` (the latest provider's note — matching how the rest
-    // of the app treats "the note" for a meeting). KEEP every sealed blob until the final atomic
-    // folder-open commit; clearing them here used to make a crash irreversibly leave a nominally
-    // locked folder with plaintext and no recovery ciphertext.
-    let mut seen = std::collections::HashSet::new();
-    for n in &notes {
-        if !seen.insert(n.meeting_id.clone()) {
-            continue;
-        }
-        let Some(vault) = vault.as_deref() else {
-            continue;
-        };
-        let latest = match state.db.get_latest_note_for_meeting(&n.meeting_id)? {
-            Some(l) => l,
-            None => continue,
-        };
-        let meeting = state.db.get_meeting(&n.meeting_id)?;
-        let (title, date) = match meeting {
-            Some(m) => (
-                m.title.clone().unwrap_or_else(|| "Untitled".into()),
-                m.started_at.clone(),
-            ),
-            None => ("Untitled".to_string(), chrono::Utc::now().to_rfc3339()),
-        };
-        let sub = if folder.path.is_empty() {
-            None
-        } else {
-            Some(folder.path.as_str())
-        };
-        let exported_markdown =
-            match render_markdown_with_attachments_for_export_under_lifecycle_authorized(
-                state,
-                &crate::storage::AttachmentOwner::Meeting {
-                    meeting_id: latest.meeting_id.clone(),
-                    provider_id: latest.provider_id.clone(),
-                },
-                &latest.markdown,
-                std::path::Path::new(vault),
-            ) {
-                Ok(markdown) => markdown,
-                Err(e) => {
-                    tracing::warn!(target: "export", error = %e, "meeting image re-export after unlock failed");
-                    continue;
-                }
-            };
-        if let Ok(path) = crate::export::write_note(
-            std::path::Path::new(vault),
-            sub,
-            &title,
-            &date,
-            &exported_markdown,
-        ) {
-            state.db.set_note_exported_path(
-                &n.meeting_id,
-                &latest.provider_id,
-                &path.to_string_lossy(),
-            )?;
-            // Export-collision guard: the pre-lock baseline is stale (the `.md` was deleted on
-            // seal) — re-stamp it FRESH from the markdown this re-export just wrote. A file that
-            // already existed at the target with different content was collision-suffixed by
-            // `write_note`, never overwritten, so the file at `path` equals `latest.markdown`.
-            state.db.set_note_exported_hash(
-                &n.meeting_id,
-                &latest.provider_id,
-                Some(&crate::export::note_content_hash(&exported_markdown)),
-            )?;
-        }
-    }
-
     // Phase 0.5 — permanently restore the TRANSCRIPT + TIMELINE plaintext (clear *_blob columns)
     // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio. The
     // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
@@ -1250,6 +1194,69 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.remove(&folder_id);
     }
+
+    // Only after the durable `locked=0` commit may readable vault files be recreated. Both meeting
+    // and authored-note attachment renderers now pass through the ordinary open-folder gate.
+    if let Some(vault) = vault_path(state) {
+        let mut seen = std::collections::HashSet::new();
+        for n in &notes {
+            if !seen.insert(n.meeting_id.clone()) {
+                continue;
+            }
+            let latest = match state.db.get_latest_note_for_meeting(&n.meeting_id)? {
+                Some(latest) => latest,
+                None => continue,
+            };
+            let meeting = state.db.get_meeting(&n.meeting_id)?;
+            let (title, date) = match meeting {
+                Some(meeting) => (
+                    meeting.title.clone().unwrap_or_else(|| "Untitled".into()),
+                    meeting.started_at.clone(),
+                ),
+                None => ("Untitled".to_string(), chrono::Utc::now().to_rfc3339()),
+            };
+            let sub = if folder.path.is_empty() {
+                None
+            } else {
+                Some(folder.path.as_str())
+            };
+            let exported_markdown =
+                match render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+                    state,
+                    &crate::storage::AttachmentOwner::Meeting {
+                        meeting_id: latest.meeting_id.clone(),
+                        provider_id: latest.provider_id.clone(),
+                    },
+                    &latest.markdown,
+                    std::path::Path::new(&vault),
+                ) {
+                    Ok(markdown) => markdown,
+                    Err(error) => {
+                        tracing::warn!(target: "export", error = %error, "meeting image re-export after permanent unlock failed");
+                        continue;
+                    }
+                };
+            if let Ok(path) = crate::export::write_note(
+                std::path::Path::new(&vault),
+                sub,
+                &title,
+                &date,
+                &exported_markdown,
+            ) {
+                state.db.set_note_exported_path(
+                    &n.meeting_id,
+                    &latest.provider_id,
+                    &path.to_string_lossy(),
+                )?;
+                state.db.set_note_exported_hash(
+                    &n.meeting_id,
+                    &latest.provider_id,
+                    Some(&crate::export::note_content_hash(&exported_markdown)),
+                )?;
+            }
+        }
+    }
+    reexport_notes_in_folder(state, &folder_id);
 
     // Only now is plaintext the canonical at-rest form. Retiring a redundant ciphertext before
     // `locked=0` would create a crash window where startup still treats the folder as sealed but
@@ -1307,13 +1314,11 @@ pub async fn discard_unrecoverable_folder_lock(
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
     let _org_mutation = state.org_share_mutation_lock.lock().await;
-    let node = discard_unrecoverable_folder_lock_with_enumeration(
-        state.inner(),
-        folder_id,
-        None,
-        || emit_ask_history_invalidated_fail_closed(&app),
-    )
-    .await?;
+    let node =
+        discard_unrecoverable_folder_lock_with_enumeration(state.inner(), folder_id, None, || {
+            emit_ask_history_invalidated_fail_closed(&app)
+        })
+        .await?;
     // The discard purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(node)
@@ -1513,13 +1518,11 @@ pub async fn discard_unrecoverable_meeting_lock(
     if !folder.locked {
         return Ok(None);
     }
-    let node = discard_unrecoverable_folder_lock_with_enumeration(
-        state.inner(),
-        folder_id,
-        None,
-        || emit_ask_history_invalidated_fail_closed(&app),
-    )
-    .await?;
+    let node =
+        discard_unrecoverable_folder_lock_with_enumeration(state.inner(), folder_id, None, || {
+            emit_ask_history_invalidated_fail_closed(&app)
+        })
+        .await?;
     // The discard purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(Some(node))
