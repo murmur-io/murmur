@@ -21,6 +21,7 @@ pub(crate) mod reminder_store;
 pub(crate) mod seal_store;
 pub(crate) mod settings_store;
 pub mod usage;
+pub(crate) mod workspace_store;
 
 pub use db::*;
 pub use attachment_store::*;

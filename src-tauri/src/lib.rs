@@ -470,6 +470,10 @@ pub fn run() {
             commands::download_ner_model,
             commands::toggle_bar,
             commands::list_folders,
+            // Workspace hierarchy (Projects › Folders › items) — read-only.
+            commands::list_workspace_tree,
+            commands::list_container_items,
+            commands::get_container,
             commands::create_folder,
             commands::rename_folder,
             commands::delete_folder,
