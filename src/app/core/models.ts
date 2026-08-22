@@ -2560,7 +2560,7 @@ export interface NoteDoc {
 }
 
 /** Owner namespace used by the gated note-attachment commands. */
-export type NoteAttachmentOwnerKind = "note" | "meeting" | "org";
+export type NoteAttachmentOwnerKind = "note" | "task" | "meeting" | "org";
 
 /**
  * One locally-stored image attachment. The DTO deliberately contains no original
@@ -2963,6 +2963,67 @@ export interface OrgShareEntry {
 
 /** Per-document Shared Brain access for active organization members. */
 export type OrgAccess = "view" | "edit";
+
+// ── Org Tasks ──────────────────────────────────────────────────────────────
+
+export type TaskStatus = "todo" | "inProgress" | "done";
+
+export interface TaskSubtask {
+  id: string;
+  title: string;
+  done: boolean;
+}
+
+/** An encrypted reference to another stable document in the SAME org. */
+export interface TaskOrgRef {
+  orgId: string;
+  docId: string;
+}
+
+/** A verified image token whose bytes ride the outer encrypted OrgEnvelope. */
+export interface TaskImageRef {
+  reference: string;
+  alt: string;
+}
+
+/** Device-private pointer: this never enters TaskEnvelope or leaves this Mac. */
+export interface TaskLocalRef {
+  kind: "note" | "meeting" | "dashboard";
+  refId: string;
+}
+
+export interface TaskDraft {
+  orgId: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  dueAt: string | null;
+  assigneeUserId: string | null;
+  subtasks: TaskSubtask[];
+  orgRefs: TaskOrgRef[];
+  images: TaskImageRef[];
+  access: OrgAccess;
+}
+
+/** One SQLCipher-canonical task projection from the shared org feed. */
+export interface OrgTask extends TaskDraft {
+  id: string;
+  docId: string;
+  itemId: string;
+  sourceDocumentId: string | null;
+  version: number;
+  createdAt: string;
+  canEdit: boolean;
+  canManage: boolean;
+  localRefs: TaskLocalRef[];
+  updatedAt: string;
+}
+
+/** Privacy-minimal assignee option; no full member email crosses this surface. */
+export interface TaskAssignee {
+  userId: string;
+  label: string;
+}
 
 /**
  * One org a meeting is ACTIVELY shared into (`meetingOrgShares`) — drives the "Shared with
@@ -3435,4 +3496,6 @@ export interface ResolvedTile extends DashboardTile {
 /** One board with every tile resolved. */
 export interface DashboardDetail extends Dashboard {
   tiles: ResolvedTile[];
+  /** Device-private Task refs, intentionally excluded from board Ask. */
+  work: OrgTask[];
 }

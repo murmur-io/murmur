@@ -144,11 +144,8 @@ fn migrate_rolls_back_every_earlier_step_when_a_late_attachment_step_fails() {
     );
     assert_eq!(
         db.lock()
-            .query_row(
-                "SELECT sentinel FROM note_attachments",
-                [],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row("SELECT sentinel FROM note_attachments", [], |row| row
+                .get::<_, String>(0),)
             .unwrap(),
         "keep-me",
         "the pre-existing obstruction must remain untouched"
@@ -691,6 +688,644 @@ fn seed_org_state(db: &Db, org_id: &str) {
     .unwrap();
 }
 
+fn seed_task_dashboard(db: &Db, id: &str) {
+    db.insert_dashboard(id, "Task board", None, None, "2026-08-21T09:00:00Z")
+        .unwrap();
+}
+
+/// Org Tasks share the encrypted feed/cursor but remain a separate SQLCipher projection: they must
+/// never leak into the generic Org Brain/Ask readers, and a tombstone must remove the Task row plus
+/// its device-private refs in the same transaction.
+#[test]
+fn task_projection_is_stable_context_gated_task_free_for_ask_and_tombstone_atomic() {
+    let db = mem_db();
+    let org_id = STABLE_ORG_ID;
+    let doc_id = STABLE_DOC_ID;
+    let item_id = "22222222-2222-4222-8222-222222222222";
+    seed_org_state(&db, org_id);
+    let envelope = crate::share::task_envelope::TaskEnvelope {
+        version: crate::share::task_envelope::TASK_ENVELOPE_VERSION,
+        org_id: org_id.to_string(),
+        title: "Ship the nebula task view".into(),
+        description: "This text must never enter Ask retrieval".into(),
+        status: crate::share::task_envelope::TaskStatus::InProgress,
+        due_at: Some("2026-08-23T09:00:00Z".into()),
+        assignee_user_id: None,
+        created_at: "2026-08-21T09:00:00Z".into(),
+        subtasks: vec![],
+        org_refs: vec![],
+        images: vec![],
+    };
+    let json = envelope.to_canonical_json(org_id).unwrap();
+    let prepared =
+        Db::prepare_org_item_index(&envelope.title, &envelope.created_at, &json, None).unwrap();
+    db.commit_local_org_replica_with_metadata(
+        item_id,
+        org_id,
+        7,
+        "owner",
+        &envelope.title,
+        &json,
+        &envelope.created_at,
+        1,
+        1,
+        &sha32(42),
+        Some("task"),
+        Some("owner"),
+        &prepared,
+        None,
+        Some(doc_id),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+
+    let tasks = db.list_org_tasks(None).unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].id, format!("{org_id}:{doc_id}"));
+    assert_eq!(tasks[0].envelope_json, json);
+    assert!(db.visible_org_task_ref(org_id, doc_id).unwrap());
+    assert!(!db
+        .visible_org_task_ref(org_id, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        .unwrap());
+    assert!(!db
+        .visible_org_task_ref("99999999-9999-4999-8999-999999999999", doc_id,)
+        .unwrap());
+
+    let note_doc_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    db.upsert_org_item(
+        "note-ref-target",
+        org_id,
+        8,
+        "owner",
+        "A note, not a Task",
+        "note body",
+        "2026-08-21T09:00:00Z",
+        1,
+        1,
+        &sha32(43),
+        Some("document"),
+        Some("owner"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("note-ref-target", Some(note_doc_id), "edit", Some("owner"))
+        .unwrap();
+    assert!(
+        !db.visible_org_task_ref(org_id, note_doc_id).unwrap(),
+        "a live Note document is not a valid Task reference"
+    );
+    assert!(db.get_org_item(item_id).unwrap().is_none());
+    assert!(db.list_org_items(org_id).unwrap().is_empty());
+    assert!(db
+        .search_org_chunks_fts("nebula task view", 10)
+        .unwrap()
+        .is_empty());
+    let task_chunk_count: i64 = db
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM org_chunks WHERE item_id=?1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(task_chunk_count, 0);
+    assert_eq!(db.count_org_items(org_id).unwrap(), 0);
+    assert!(db.org_item_vector_batch(item_id).unwrap().is_none());
+    assert!(db
+        .resolve_wikilink(&envelope.title, &std::collections::HashSet::new())
+        .unwrap()
+        .is_none());
+    assert!(db
+        .org_link_target_visible(&format!("{org_id}:{doc_id}"))
+        .unwrap()
+        .is_none());
+    assert!(db
+        .org_link_doc_id_for_item_visible(item_id)
+        .unwrap()
+        .is_none());
+
+    seed_task_dashboard(&db, "board-1");
+    db.replace_task_local_refs(
+        &tasks[0].id,
+        &[crate::storage::tasks_store::TaskLocalRefRow {
+            kind: "dashboard".into(),
+            ref_id: "board-1".into(),
+            position: 0,
+        }],
+    )
+    .unwrap();
+    assert_eq!(db.dashboard_task_rows("board-1").unwrap().len(), 1);
+    assert!(db
+        .replace_task_local_refs(
+            &tasks[0].id,
+            &[crate::storage::tasks_store::TaskLocalRefRow {
+                kind: "note".into(),
+                ref_id: "missing-note".into(),
+                position: 0,
+            }],
+        )
+        .is_err());
+    assert_eq!(
+        db.task_local_refs(&tasks[0].id).unwrap(),
+        vec![crate::storage::tasks_store::TaskLocalRefRow {
+            kind: "dashboard".into(),
+            ref_id: "board-1".into(),
+            position: 0,
+        }],
+        "invalid replacement must preserve the previous local references atomically"
+    );
+    assert!(db.delete_dashboard("board-1").unwrap());
+    assert!(
+        db.task_local_refs(&tasks[0].id).unwrap().is_empty(),
+        "a deleted local target must never remain visible through Task detail"
+    );
+    db.replace_task_local_refs(&tasks[0].id, &[]).unwrap();
+    seed_task_dashboard(&db, "board-1");
+    db.replace_task_local_refs(
+        &tasks[0].id,
+        &[crate::storage::tasks_store::TaskLocalRefRow {
+            kind: "dashboard".into(),
+            ref_id: "board-1".into(),
+            position: 0,
+        }],
+    )
+    .unwrap();
+
+    db.set_org_context_enabled(org_id, false).unwrap();
+    assert!(!db.visible_org_task_ref(org_id, doc_id).unwrap());
+    assert!(db.list_org_tasks(None).unwrap().is_empty());
+    assert!(db.dashboard_task_rows("board-1").unwrap().is_empty());
+    assert!(db.replace_task_local_refs(&tasks[0].id, &[]).is_err());
+    assert_eq!(db.task_local_refs(&tasks[0].id).unwrap().len(), 1);
+    db.set_org_context_enabled(org_id, true).unwrap();
+
+    assert!(db.evict_org_item(item_id).unwrap());
+    assert!(!db.visible_org_task_ref(org_id, doc_id).unwrap());
+    assert!(db
+        .get_org_task(&format!("{org_id}:{doc_id}"))
+        .unwrap()
+        .is_none());
+    assert!(db
+        .task_local_refs(&format!("{org_id}:{doc_id}"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn incoming_task_org_refs_are_deferred_and_only_live_task_targets_are_exposed() {
+    use crate::share::task_envelope::{
+        TaskEnvelope, TaskOrgRef, TaskStatus, TASK_ENVELOPE_VERSION,
+    };
+
+    let db = mem_db();
+    let org_id = STABLE_ORG_ID;
+    let source_doc_id = STABLE_DOC_ID;
+    let note_doc_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let missing_doc_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let future_task_doc_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    seed_org_state(&db, org_id);
+
+    db.upsert_org_item(
+        "note-org-ref-target",
+        org_id,
+        1,
+        "owner",
+        "A Note target",
+        "not a Task",
+        "2026-08-21T09:00:00Z",
+        1,
+        1,
+        &sha32(51),
+        Some("document"),
+        Some("owner"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata(
+        "note-org-ref-target",
+        Some(note_doc_id),
+        "edit",
+        Some("owner"),
+    )
+    .unwrap();
+
+    let source = TaskEnvelope {
+        version: TASK_ENVELOPE_VERSION,
+        org_id: org_id.into(),
+        title: "Source Task".into(),
+        description: String::new(),
+        status: TaskStatus::Todo,
+        due_at: None,
+        assignee_user_id: None,
+        created_at: "2026-08-21T09:00:00Z".into(),
+        subtasks: vec![],
+        org_refs: vec![
+            TaskOrgRef {
+                org_id: org_id.into(),
+                doc_id: note_doc_id.into(),
+            },
+            TaskOrgRef {
+                org_id: org_id.into(),
+                doc_id: missing_doc_id.into(),
+            },
+            TaskOrgRef {
+                org_id: org_id.into(),
+                doc_id: future_task_doc_id.into(),
+            },
+        ],
+        images: vec![],
+    };
+    let source_json = source.to_canonical_json(org_id).unwrap();
+    let source_prepared = Db::prepare_org_item_index_for_kind(
+        crate::share::org_envelope::OrgItemKind::Task,
+        &source.title,
+        &source.created_at,
+        &source_json,
+        None,
+    )
+    .unwrap();
+    db.commit_local_org_replica_with_metadata(
+        "source-task-item",
+        org_id,
+        2,
+        "owner",
+        &source.title,
+        &source_json,
+        &source.created_at,
+        1,
+        1,
+        &sha32(52),
+        Some("task"),
+        Some("owner"),
+        &source_prepared,
+        None,
+        Some(source_doc_id),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    let source_task_id = format!("{org_id}:{source_doc_id}");
+    assert!(db.visible_task_org_refs(&source_task_id).unwrap().is_empty());
+
+    let target = TaskEnvelope {
+        org_id: org_id.into(),
+        title: "Later Task".into(),
+        org_refs: vec![],
+        ..source.clone()
+    };
+    let target_json = target.to_canonical_json(org_id).unwrap();
+    let target_prepared = Db::prepare_org_item_index_for_kind(
+        crate::share::org_envelope::OrgItemKind::Task,
+        &target.title,
+        &target.created_at,
+        &target_json,
+        None,
+    )
+    .unwrap();
+    db.commit_local_org_replica_with_metadata(
+        "future-task-item",
+        org_id,
+        3,
+        "owner",
+        &target.title,
+        &target_json,
+        &target.created_at,
+        1,
+        1,
+        &sha32(53),
+        Some("task"),
+        Some("owner"),
+        &target_prepared,
+        None,
+        Some(future_task_doc_id),
+        "edit",
+        Some("owner"),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        db.visible_task_org_refs(&source_task_id).unwrap(),
+        vec![TaskOrgRef {
+            org_id: org_id.into(),
+            doc_id: future_task_doc_id.into(),
+        }],
+        "feed order may defer a real Task target, but Note and nonexistent docs stay hidden"
+    );
+
+    assert!(db.evict_org_item("future-task-item").unwrap());
+    assert!(db.visible_task_org_refs(&source_task_id).unwrap().is_empty());
+}
+
+#[test]
+fn task_and_dashboard_lists_are_bounded_with_total_ordering() {
+    use crate::storage::tasks_store::{DASHBOARD_TASK_LIMIT, TASK_LIST_LIMIT};
+
+    let db = mem_db();
+    let org_id = STABLE_ORG_ID;
+    seed_org_state(&db, org_id);
+    seed_task_dashboard(&db, "board-bounded");
+    let envelope = crate::share::task_envelope::TaskEnvelope {
+        version: crate::share::task_envelope::TASK_ENVELOPE_VERSION,
+        org_id: org_id.to_string(),
+        title: "Bounded task".into(),
+        description: String::new(),
+        status: crate::share::task_envelope::TaskStatus::Todo,
+        due_at: None,
+        assignee_user_id: None,
+        created_at: "2026-08-21T09:00:00Z".into(),
+        subtasks: vec![],
+        org_refs: vec![],
+        images: vec![],
+    };
+    let json = envelope.to_canonical_json(org_id).unwrap();
+    let count = TASK_LIST_LIMIT + 17;
+    let mut conn = db.lock();
+    let tx = conn.transaction().unwrap();
+    for index in 0..count {
+        let task_id = format!("task-{index:04}");
+        tx.execute(
+            "INSERT INTO org_tasks
+               (id,org_id,doc_id,item_id,source_document_id,envelope_json,status,due_at,
+                assignee_user_id,access,author_user_id,owner_user_id,rev,generation,seq,updated_at)
+             VALUES(?1,?2,?3,?4,NULL,?5,'todo',NULL,NULL,'edit','author','owner',1,1,?6,?7)",
+            rusqlite::params![
+                task_id,
+                org_id,
+                format!("doc-{index:04}"),
+                format!("item-{index:04}"),
+                json,
+                index,
+                "2026-08-21T09:00:00Z",
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO task_local_refs(task_id,kind,ref_id,position)
+             VALUES(?1,'dashboard','board-bounded',?2)",
+            rusqlite::params![task_id, count - index],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+
+    let tasks = db.list_org_tasks(Some(org_id)).unwrap();
+    assert_eq!(tasks.len(), TASK_LIST_LIMIT as usize);
+    assert_eq!(tasks.first().unwrap().id, "task-0000");
+    assert_eq!(
+        tasks.last().unwrap().id,
+        format!("task-{:04}", TASK_LIST_LIMIT - 1)
+    );
+
+    let dashboard = db.dashboard_task_rows("board-bounded").unwrap();
+    assert_eq!(dashboard.len(), DASHBOARD_TASK_LIMIT as usize);
+    assert_eq!(
+        dashboard.first().unwrap().id,
+        format!("task-{:04}", count - 1)
+    );
+    assert_eq!(
+        dashboard.last().unwrap().id,
+        format!("task-{:04}", count - DASHBOARD_TASK_LIMIT)
+    );
+}
+
+#[test]
+fn task_feed_sequence_is_single_claim_and_tombstone_cannot_resurrect() {
+    let db = mem_db();
+    let org_id = STABLE_ORG_ID;
+    let doc_id = STABLE_DOC_ID;
+    let item_id = "22222222-2222-4222-8222-222222222222";
+    seed_org_state(&db, org_id);
+    let envelope = crate::share::task_envelope::TaskEnvelope {
+        version: crate::share::task_envelope::TASK_ENVELOPE_VERSION,
+        org_id: org_id.to_string(),
+        title: "One claim".into(),
+        description: "Never resurrect".into(),
+        status: crate::share::task_envelope::TaskStatus::Todo,
+        due_at: None,
+        assignee_user_id: None,
+        created_at: "2026-08-21T09:00:00Z".into(),
+        subtasks: vec![],
+        org_refs: vec![],
+        images: vec![],
+    };
+    let json = envelope.to_canonical_json(org_id).unwrap();
+    let prepared = Db::prepare_org_item_index_for_kind(
+        crate::share::org_envelope::OrgItemKind::Task,
+        &envelope.title,
+        &envelope.created_at,
+        &json,
+        None,
+    )
+    .unwrap();
+    let commit = || {
+        db.commit_org_feed_item_with_metadata(
+            item_id,
+            org_id,
+            1,
+            "author",
+            &envelope.title,
+            &json,
+            &envelope.created_at,
+            1,
+            1,
+            &sha32(9),
+            Some("task"),
+            Some("author"),
+            &prepared,
+            Some(doc_id),
+            "edit",
+            Some("owner"),
+            true,
+        )
+        .unwrap()
+    };
+
+    assert!(commit().changed);
+    assert_eq!(db.org_last_seq_for(org_id).unwrap(), 1);
+    assert_eq!(db.list_org_tasks(Some(org_id)).unwrap().len(), 1);
+    assert!(
+        !commit().changed,
+        "the same feed sequence is never claimed twice"
+    );
+
+    assert!(db.commit_org_feed_tombstone(org_id, item_id, 2).unwrap());
+    assert_eq!(db.org_last_seq_for(org_id).unwrap(), 2);
+    assert!(db.list_org_tasks(Some(org_id)).unwrap().is_empty());
+    assert!(
+        !commit().changed,
+        "a stale live replay cannot move the cursor or resurrect Task data"
+    );
+    assert_eq!(db.org_last_seq_for(org_id).unwrap(), 2);
+    assert!(db.list_org_tasks(Some(org_id)).unwrap().is_empty());
+    assert!(db.org_replica_state(item_id).unwrap().unwrap().tombstoned);
+}
+
+#[test]
+fn task_membership_withdrawal_purges_detail_list_dashboard_and_local_refs_atomically() {
+    let db = mem_db();
+    let org_id = STABLE_ORG_ID;
+    let doc_id = STABLE_DOC_ID;
+    let item_id = "33333333-3333-4333-8333-333333333333";
+    seed_org_state(&db, org_id);
+    seed_task_dashboard(&db, "board-withdrawn");
+    let envelope = crate::share::task_envelope::TaskEnvelope {
+        version: crate::share::task_envelope::TASK_ENVELOPE_VERSION,
+        org_id: org_id.to_string(),
+        title: "Withdraw membership".into(),
+        description: "Purged plaintext".into(),
+        status: crate::share::task_envelope::TaskStatus::InProgress,
+        due_at: None,
+        assignee_user_id: None,
+        created_at: "2026-08-21T09:00:00Z".into(),
+        subtasks: vec![],
+        org_refs: vec![],
+        images: vec![],
+    };
+    let json = envelope.to_canonical_json(org_id).unwrap();
+    let prepared = Db::prepare_org_item_index_for_kind(
+        crate::share::org_envelope::OrgItemKind::Task,
+        &envelope.title,
+        &envelope.created_at,
+        &json,
+        None,
+    )
+    .unwrap();
+    assert!(
+        db.commit_org_feed_item_with_metadata(
+            item_id,
+            org_id,
+            1,
+            "author",
+            &envelope.title,
+            &json,
+            &envelope.created_at,
+            1,
+            1,
+            &sha32(11),
+            Some("task"),
+            Some("author"),
+            &prepared,
+            Some(doc_id),
+            "view",
+            Some("owner"),
+            true,
+        )
+        .unwrap()
+        .changed
+    );
+    let task_id = format!("{org_id}:{doc_id}");
+    db.replace_task_local_refs(
+        &task_id,
+        &[crate::storage::tasks_store::TaskLocalRefRow {
+            kind: "dashboard".into(),
+            ref_id: "board-withdrawn".into(),
+            position: 0,
+        }],
+    )
+    .unwrap();
+    assert_eq!(db.dashboard_task_rows("board-withdrawn").unwrap().len(), 1);
+
+    assert!(db.delete_org_state(org_id).unwrap());
+    assert!(!db.visible_org_task_for_item(item_id).unwrap());
+    assert!(db.list_org_tasks(Some(org_id)).unwrap().is_empty());
+    assert!(db.get_org_task(&task_id).unwrap().is_none());
+    assert!(db
+        .dashboard_task_rows("board-withdrawn")
+        .unwrap()
+        .is_empty());
+    assert!(db.task_local_refs(&task_id).unwrap().is_empty());
+    let plaintext_rows: i64 = db
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM org_tasks WHERE org_id=?1",
+            [org_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(plaintext_rows, 0);
+}
+
+#[test]
+fn task_source_commit_marks_republish_dirty_atomically() {
+    let db = mem_db();
+    let source_id = "55555555-5555-4555-8555-555555555555";
+    db.create_task_source(source_id, "Task A", r#"{"title":"Task A"}"#, 1)
+        .unwrap();
+    assert!(db
+        .list_folders()
+        .unwrap()
+        .iter()
+        .all(|folder| folder.id != crate::storage::tasks_store::TASK_FOLDER_ID));
+    let unlocked = std::collections::HashSet::new();
+    assert!(db.get_document(source_id).unwrap().is_none());
+    assert!(db
+        .get_document_if_visible(source_id, &unlocked)
+        .unwrap()
+        .is_none());
+    assert!(db
+        .documents_in_folder(crate::storage::tasks_store::TASK_FOLDER_ID)
+        .unwrap()
+        .is_empty());
+    assert!(!db
+        .visible_document_ids(&unlocked)
+        .unwrap()
+        .contains(&source_id.to_string()));
+    assert!(db.delete_document(source_id).is_err());
+    assert!(db.task_source(source_id).unwrap().is_some());
+    assert!(db
+        .lock()
+        .execute(
+            "UPDATE folders SET name='Visible Tasks' WHERE id=?1",
+            [crate::storage::tasks_store::TASK_FOLDER_ID],
+        )
+        .is_err());
+    db.insert_org_share(
+        "task-share",
+        STABLE_ORG_ID,
+        None,
+        Some(source_id),
+        "task",
+        Some("Task A"),
+        1,
+        1,
+        &sha32(1),
+        "2026-08-21T00:00:00Z",
+    )
+    .unwrap();
+    db.set_org_share_uploaded("task-share", "task-item", "2026-08-21T00:00:01Z")
+        .unwrap();
+
+    let before = db.org_share_source_counters("task-share").unwrap();
+    assert!(db
+        .update_task_source(source_id, "Task B", r#"{"title":"Task B"}"#, 2)
+        .unwrap());
+    let committed = db.org_share_source_counters("task-share").unwrap();
+    assert_eq!(committed, (before.0 + 1, before.1 + 1));
+
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER fail_task_dirty BEFORE UPDATE OF republish_dirty ON org_shares
+               BEGIN SELECT RAISE(ABORT, 'fail task dirty'); END;",
+        )
+        .unwrap();
+    assert!(db
+        .update_task_source(source_id, "Task C", r#"{"title":"Task C"}"#, 3)
+        .is_err());
+    let (title, payload, updated_at) = db.task_source(source_id).unwrap().unwrap();
+    assert_eq!(
+        (title.as_str(), payload.as_str(), updated_at),
+        ("Task B", r#"{"title":"Task B"}"#, 1)
+    );
+    assert_eq!(
+        db.org_share_source_counters("task-share").unwrap(),
+        committed
+    );
+}
+
 #[test]
 fn republish_projection_is_full_witness_monotonic_and_purges_all_older_plaintext() {
     let db = mem_db();
@@ -760,8 +1395,8 @@ fn republish_projection_is_full_witness_monotonic_and_purges_all_older_plaintext
         prepared: &prepared,
         attachments: &[],
     };
-    assert!(db
-        .commit_org_republish_projection_if_current(
+    assert!(
+        db.commit_org_republish_projection_if_current(
             "share-projection",
             "dispatch-r3",
             STABLE_ORG_ID,
@@ -778,7 +1413,8 @@ fn republish_projection_is_full_witness_monotonic_and_purges_all_older_plaintext
             &projection,
         )
         .unwrap()
-        .changed);
+        .changed
+    );
     for old in ["head-r1", "head-r2"] {
         let (tombstoned, title, markdown): (i64, String, String) = db
             .lock()
@@ -788,23 +1424,54 @@ fn republish_projection_is_full_witness_monotonic_and_purges_all_older_plaintext
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((tombstoned, title, markdown), (1, String::new(), String::new()));
+        assert_eq!(
+            (tombstoned, title, markdown),
+            (1, String::new(), String::new())
+        );
     }
 
     let newer = Db::prepare_org_item_index("head-r4", "t", "newer", None).unwrap();
     db.commit_local_org_replica_with_metadata(
-        "head-r4", STABLE_ORG_ID, 4, "owner", "head-r4", "newer", "t", 4, 1,
-        &sha32(4), None, Some("owner"), &newer, None, Some(STABLE_DOC_ID), "edit",
-        Some("owner"), true,
+        "head-r4",
+        STABLE_ORG_ID,
+        4,
+        "owner",
+        "head-r4",
+        "newer",
+        "t",
+        4,
+        1,
+        &sha32(4),
+        None,
+        Some("owner"),
+        &newer,
+        None,
+        Some(STABLE_DOC_ID),
+        "edit",
+        Some("owner"),
+        true,
     )
     .unwrap();
-    assert!(!db
-        .commit_org_republish_projection_if_current(
-            "share-projection", "dispatch-r3", STABLE_ORG_ID, STABLE_DOC_ID, "edit", 3, 1,
-            &sha32(3), "owner", "owner", None, None, false, &projection,
+    assert!(
+        !db.commit_org_republish_projection_if_current(
+            "share-projection",
+            "dispatch-r3",
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            3,
+            1,
+            &sha32(3),
+            "owner",
+            "owner",
+            None,
+            None,
+            false,
+            &projection,
         )
         .unwrap()
-        .changed);
+        .changed
+    );
     assert_eq!(
         db.current_org_document_status(STABLE_ORG_ID, STABLE_DOC_ID)
             .unwrap()
@@ -818,8 +1485,19 @@ fn republish_projection_is_full_witness_monotonic_and_purges_all_older_plaintext
 fn republish_projection_repairs_same_seq_attachment_bundle_before_clearing_journal() {
     let db = mem_db();
     seed_org_state(&db, STABLE_ORG_ID);
-    db.insert_org_share("share-repair", STABLE_ORG_ID, None, Some("source"), "note",
-        Some("Title"), 2, 1, &sha32(2), "t").unwrap();
+    db.insert_org_share(
+        "share-repair",
+        STABLE_ORG_ID,
+        None,
+        Some("source"),
+        "note",
+        Some("Title"),
+        2,
+        1,
+        &sha32(2),
+        "t",
+    )
+    .unwrap();
     db.lock().execute(
         "UPDATE org_shares SET state='failed',last_error='projection_pending',item_id='head-r2',
           doc_id=?2,access='edit',dispatch_id='dispatch-r2',expected_actor_user_id='owner',
@@ -827,47 +1505,131 @@ fn republish_projection_repairs_same_seq_attachment_bundle_before_clearing_journ
         rusqlite::params!["share-repair",STABLE_DOC_ID],
     ).unwrap();
     let prepared = Db::prepare_org_item_index("Title", "t", "body", None).unwrap();
-    db.upsert_org_item("head-r2", STABLE_ORG_ID, 2, "owner", "Title", "body", "t",
-        2, 1, &sha32(2), None, Some("owner"), None).unwrap();
-    db.set_org_item_document_metadata("head-r2", Some(STABLE_DOC_ID), "edit", Some("owner")).unwrap();
-    db.replace_org_item_attachment_bundle("head-r2", &[crate::storage::IncomingAttachment {
-        id: "stale".into(), mime_type: "image/png".into(), extension: "png".into(),
-        width: 1, height: 1, sha256: [1;32], data: vec![1],
-    }]).unwrap();
-    db.lock().execute("UPDATE org_items SET projection_sha256=NULL WHERE item_id='head-r2'", []).unwrap();
+    db.upsert_org_item(
+        "head-r2",
+        STABLE_ORG_ID,
+        2,
+        "owner",
+        "Title",
+        "body",
+        "t",
+        2,
+        1,
+        &sha32(2),
+        None,
+        Some("owner"),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("head-r2", Some(STABLE_DOC_ID), "edit", Some("owner"))
+        .unwrap();
+    db.replace_org_item_attachment_bundle(
+        "head-r2",
+        &[crate::storage::IncomingAttachment {
+            id: "stale".into(),
+            mime_type: "image/png".into(),
+            extension: "png".into(),
+            width: 1,
+            height: 1,
+            sha256: [1; 32],
+            data: vec![1],
+        }],
+    )
+    .unwrap();
+    db.lock()
+        .execute(
+            "UPDATE org_items SET projection_sha256=NULL WHERE item_id='head-r2'",
+            [],
+        )
+        .unwrap();
     let exact = crate::storage::IncomingAttachment {
-        id: "exact".into(), mime_type: "image/png".into(), extension: "png".into(),
-        width: 2, height: 2, sha256: [2;32], data: vec![2,2],
+        id: "exact".into(),
+        mime_type: "image/png".into(),
+        extension: "png".into(),
+        width: 2,
+        height: 2,
+        sha256: [2; 32],
+        data: vec![2, 2],
     };
     let exact_attachments = vec![exact];
     let projection = crate::storage::org_store::OrgRepublishProjection {
-        item_id: "head-r2", seq: 2, author_hint: "owner", title: "Title", markdown: "body",
-        created_at: "t", source_kind: None, author_user_id: Some("owner"), prepared: &prepared,
+        item_id: "head-r2",
+        seq: 2,
+        author_hint: "owner",
+        title: "Title",
+        markdown: "body",
+        created_at: "t",
+        source_kind: None,
+        author_user_id: Some("owner"),
+        prepared: &prepared,
         attachments: &exact_attachments,
     };
-    assert!(db.commit_org_republish_projection_if_current(
-        "share-repair","dispatch-r2",STABLE_ORG_ID,STABLE_DOC_ID,"edit",2,1,&sha32(2),
-        "owner","owner",Some("head-r2"),Some("projection_pending"),false,&projection,
-    ).unwrap().changed);
+    assert!(
+        db.commit_org_republish_projection_if_current(
+            "share-repair",
+            "dispatch-r2",
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            2,
+            1,
+            &sha32(2),
+            "owner",
+            "owner",
+            Some("head-r2"),
+            Some("projection_pending"),
+            false,
+            &projection,
+        )
+        .unwrap()
+        .changed
+    );
     let conn = db.lock();
-    assert_eq!(conn.query_row("SELECT group_concat(id) FROM note_attachments WHERE org_item_id='head-r2'", [], |r| r.get::<_,String>(0)).unwrap(), "exact");
-    assert!(conn.query_row("SELECT projection_sha256=?2 FROM org_items WHERE item_id=?1",
-        rusqlite::params!["head-r2",sha32(2)], |r| r.get::<_,bool>(0)).unwrap());
-    assert_eq!(conn.query_row("SELECT state FROM org_shares WHERE id='share-repair'", [], |r| r.get::<_,String>(0)).unwrap(), "uploaded");
+    assert_eq!(
+        conn.query_row(
+            "SELECT group_concat(id) FROM note_attachments WHERE org_item_id='head-r2'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "exact"
+    );
+    assert!(conn
+        .query_row(
+            "SELECT projection_sha256=?2 FROM org_items WHERE item_id=?1",
+            rusqlite::params!["head-r2", sha32(2)],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM org_shares WHERE id='share-repair'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "uploaded"
+    );
 }
 
 #[test]
 fn org_source_counters_are_atomic_row_local_and_debounce_only_invalidates() {
     let db = mem_db();
     seed_folder(&db, "f-source", "Source");
-    db.insert_note(
-        "n-source", "f-source", "source", "Title", "A", 1,
-    )
-    .unwrap();
+    db.insert_note("n-source", "f-source", "source", "Title", "A", 1)
+        .unwrap();
     for id in ["share-a", "share-b"] {
         db.insert_org_share(
-            id, STABLE_ORG_ID, None, Some("n-source"), "note", Some("Title"), 1, 1,
-            &sha32(1), "2026-08-13T00:00:00Z",
+            id,
+            STABLE_ORG_ID,
+            None,
+            Some("n-source"),
+            "note",
+            Some("Title"),
+            1,
+            1,
+            &sha32(1),
+            "2026-08-13T00:00:00Z",
         )
         .unwrap();
         db.set_org_share_uploaded(id, &format!("item-{id}"), "t")
@@ -893,60 +1655,121 @@ fn org_source_counters_are_atomic_row_local_and_debounce_only_invalidates() {
     assert!(db
         .update_note_row("n-source", "Title", "must-roll-back", 4)
         .is_err());
-    assert_eq!(db.get_note_row("n-source").unwrap().unwrap().text, "committed");
+    assert_eq!(
+        db.get_note_row("n-source").unwrap().unwrap().text,
+        "committed"
+    );
 }
 
 #[test]
 fn attachment_updates_advance_old_and_new_source_witnesses_atomically() {
     let db = mem_db();
     seed_folder(&db, "f-attachment-update", "Attachment update");
-    db.insert_note("n-attachment-old", "f-attachment-update", "source", "Old", "body", 1).unwrap();
-    db.insert_note("n-attachment-new", "f-attachment-update", "source", "New", "body", 1).unwrap();
-    db.lock().execute(
-        "INSERT INTO note_attachments
+    db.insert_note(
+        "n-attachment-old",
+        "f-attachment-update",
+        "source",
+        "Old",
+        "body",
+        1,
+    )
+    .unwrap();
+    db.insert_note(
+        "n-attachment-new",
+        "f-attachment-update",
+        "source",
+        "New",
+        "body",
+        1,
+    )
+    .unwrap();
+    db.lock()
+        .execute(
+            "INSERT INTO note_attachments
            (id,document_id,mime_type,extension,byte_len,width,height,sha256,data,created_at)
          VALUES('attachment-update','n-attachment-old','image/png','png',1,1,1,?1,?2,1)",
-        rusqlite::params![sha32(1), vec![1_u8]],
-    ).unwrap();
+            rusqlite::params![sha32(1), vec![1_u8]],
+        )
+        .unwrap();
 
     for (share_id, document_id) in [
         ("share-attachment-old", "n-attachment-old"),
         ("share-attachment-new", "n-attachment-new"),
     ] {
         db.insert_org_share(
-            share_id, STABLE_ORG_ID, None, Some(document_id), "note", Some("Title"),
-            1, 1, &sha32(1), "t",
-        ).unwrap();
-        db.set_org_share_uploaded(share_id, &format!("item-{share_id}"), "t").unwrap();
+            share_id,
+            STABLE_ORG_ID,
+            None,
+            Some(document_id),
+            "note",
+            Some("Title"),
+            1,
+            1,
+            &sha32(1),
+            "t",
+        )
+        .unwrap();
+        db.set_org_share_uploaded(share_id, &format!("item-{share_id}"), "t")
+            .unwrap();
     }
 
-    db.lock().execute(
-        "UPDATE note_attachments SET data=?2,sha256=?3,byte_len=2 WHERE id=?1",
-        rusqlite::params!["attachment-update", vec![2_u8, 2], sha32(2)],
-    ).unwrap();
-    assert_eq!(db.org_share_source_counters("share-attachment-old").unwrap(), (1, 1));
-    assert_eq!(db.org_share_source_counters("share-attachment-new").unwrap(), (0, 0));
+    db.lock()
+        .execute(
+            "UPDATE note_attachments SET data=?2,sha256=?3,byte_len=2 WHERE id=?1",
+            rusqlite::params!["attachment-update", vec![2_u8, 2], sha32(2)],
+        )
+        .unwrap();
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-old")
+            .unwrap(),
+        (1, 1)
+    );
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-new")
+            .unwrap(),
+        (0, 0)
+    );
 
     db.lock().execute(
         "UPDATE note_attachments SET document_id='n-attachment-new' WHERE id='attachment-update'",
         [],
     ).unwrap();
-    assert_eq!(db.org_share_source_counters("share-attachment-old").unwrap(), (2, 2));
-    assert_eq!(db.org_share_source_counters("share-attachment-new").unwrap(), (1, 1));
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-old")
+            .unwrap(),
+        (2, 2)
+    );
+    assert_eq!(
+        db.org_share_source_counters("share-attachment-new")
+            .unwrap(),
+        (1, 1)
+    );
 
-    db.lock().execute_batch(
-        "CREATE TRIGGER fail_attachment_source_witness
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER fail_attachment_source_witness
            BEFORE UPDATE OF source_version ON org_shares
            WHEN NEW.id='share-attachment-new'
            BEGIN SELECT RAISE(ABORT, 'fail attachment witness'); END;",
-    ).unwrap();
-    assert!(db.lock().execute(
-        "UPDATE note_attachments SET mime_type='image/jpeg' WHERE id='attachment-update'", [],
-    ).is_err());
-    assert_eq!(db.lock().query_row(
-        "SELECT mime_type FROM note_attachments WHERE id='attachment-update'", [],
-        |row| row.get::<_, String>(0),
-    ).unwrap(), "image/png");
+        )
+        .unwrap();
+    assert!(db
+        .lock()
+        .execute(
+            "UPDATE note_attachments SET mime_type='image/jpeg' WHERE id='attachment-update'",
+            [],
+        )
+        .is_err());
+    assert_eq!(
+        db.lock()
+            .query_row(
+                "SELECT mime_type FROM note_attachments WHERE id='attachment-update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "image/png"
+    );
 }
 
 /// RED before UUID admission: malformed stable identities advanced the feed cursor and persisted a
@@ -1698,45 +2521,69 @@ fn locked_manual_marker_cleanup_verifies_seal_before_atomic_replacement() {
     let marker = crate::enrich::apply_link_markers(
         "left prose",
         &[crate::enrich::ContextHit {
-            source: "note".into(), detail: "[[Right]]".into(), url: None,
+            source: "note".into(),
+            detail: "[[Right]]".into(),
+            url: None,
         }],
     );
     let stripped = crate::enrich::strip_managed_links_block(&marker);
     db.set_document_text("marker-left", &marker).unwrap();
-    db.set_note_doc_exported_path("marker-left", Some("/vault/marker-left.md")).unwrap();
-    db.lock().execute_batch(
-        "UPDATE folders SET locked=1 WHERE id='f-marker-seal';
+    db.set_note_doc_exported_path("marker-left", Some("/vault/marker-left.md"))
+        .unwrap();
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET locked=1 WHERE id='f-marker-seal';
          UPDATE documents SET text_blob=X'01' WHERE id='marker-left';",
-    ).unwrap();
-    db.upsert_manual_link("note", "marker-left", "note", "marker-right").unwrap();
+        )
+        .unwrap();
+    db.upsert_manual_link("note", "marker-left", "note", "marker-right")
+        .unwrap();
 
     let edge = crate::storage::models::ManualLinkEdge {
-        src_kind: "note".into(), src_id: "marker-left".into(),
-        dst_kind: "note".into(), dst_id: "marker-right".into(),
+        src_kind: "note".into(),
+        src_id: "marker-left".into(),
+        dst_kind: "note".into(),
+        dst_id: "marker-right".into(),
     };
     let content_key = zeroize::Zeroizing::new([7_u8; 32]);
     let aad = b"murmur:document:v1|folder=f-marker-seal|document=marker-left|type=document";
     let blob = crate::crypto::encrypt(&content_key, stripped.as_bytes(), aad).unwrap();
     let invalid = crate::storage::links::PreparedManualMarkerSeal {
-        note_id: "marker-left".into(), folder_id: "f-marker-seal".into(),
-        stripped_text: stripped.clone(), text_blob: blob.clone(),
+        note_id: "marker-left".into(),
+        folder_id: "f-marker-seal".into(),
+        stripped_text: stripped.clone(),
+        text_blob: blob.clone(),
         content_key: zeroize::Zeroizing::new([8_u8; 32]),
     };
-    assert!(db.delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &[invalid]).is_err());
-    assert_eq!(db.get_note_row("marker-left").unwrap().unwrap().text, marker);
+    assert!(db
+        .delete_manual_links_with_marker_seals(std::slice::from_ref(&edge), &[invalid])
+        .is_err());
+    assert_eq!(
+        db.get_note_row("marker-left").unwrap().unwrap().text,
+        marker
+    );
     assert_eq!(link_count(&db, "note", "marker-left", "manual"), 1);
     assert!(db.pending_lock_marker_export_cleanup().unwrap().is_empty());
 
     let valid = crate::storage::links::PreparedManualMarkerSeal {
-        note_id: "marker-left".into(), folder_id: "f-marker-seal".into(),
-        stripped_text: stripped.clone(), text_blob: blob,
+        note_id: "marker-left".into(),
+        folder_id: "f-marker-seal".into(),
+        stripped_text: stripped.clone(),
+        text_blob: blob,
         content_key: content_key.clone(),
     };
-    assert!(db.delete_manual_links_with_marker_seals(&[edge], &[valid]).unwrap());
+    assert!(db
+        .delete_manual_links_with_marker_seals(&[edge], &[valid])
+        .unwrap());
     let stored = db.get_note_row("marker-left").unwrap().unwrap();
-    let stored_blob: Vec<u8> = db.lock().query_row(
-        "SELECT text_blob FROM documents WHERE id='marker-left'", [], |row| row.get(0),
-    ).unwrap();
+    let stored_blob: Vec<u8> = db
+        .lock()
+        .query_row(
+            "SELECT text_blob FROM documents WHERE id='marker-left'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         stored.text.is_empty(),
         "a locked note must not retain plaintext beside its verified ciphertext"
@@ -1871,89 +2718,256 @@ fn org_access_attempts_are_exact_transactional_cas_across_failures_and_accounts(
     let actor = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
     let other_actor = "d645c7e3-13d2-4d3d-b367-4bf9603c2678";
     db.upsert_org_item(
-        "access-head", STABLE_ORG_ID, 1, actor, "Shared", "body",
-        "2026-08-12T00:00:00Z", 1, 1, &sha32(1), None, Some(actor), None,
-    ).unwrap();
-    db.set_org_item_document_metadata("access-head", Some(STABLE_DOC_ID), "edit", Some(actor)).unwrap();
+        "access-head",
+        STABLE_ORG_ID,
+        1,
+        actor,
+        "Shared",
+        "body",
+        "2026-08-12T00:00:00Z",
+        1,
+        1,
+        &sha32(1),
+        None,
+        Some(actor),
+        None,
+    )
+    .unwrap();
+    db.set_org_item_document_metadata("access-head", Some(STABLE_DOC_ID), "edit", Some(actor))
+        .unwrap();
     db.repair_org_reconcile_metadata(
-        "access-head", STABLE_ORG_ID, 1, Some(STABLE_DOC_ID), "edit", Some(actor), true,
-    ).unwrap();
+        "access-head",
+        STABLE_ORG_ID,
+        1,
+        Some(STABLE_DOC_ID),
+        "edit",
+        Some(actor),
+        true,
+    )
+    .unwrap();
     db.insert_org_share(
-        "access-share", STABLE_ORG_ID, None, Some("access-source"), "note", Some("Shared"),
-        1, 1, &sha32(1), "2026-08-12T00:00:00Z",
-    ).unwrap();
-    db.set_org_share_uploaded("access-share", "access-head", "2026-08-12T00:00:01Z").unwrap();
-    db.set_org_share_document_metadata("access-share", STABLE_DOC_ID, "edit").unwrap();
+        "access-share",
+        STABLE_ORG_ID,
+        None,
+        Some("access-source"),
+        "note",
+        Some("Shared"),
+        1,
+        1,
+        &sha32(1),
+        "2026-08-12T00:00:00Z",
+    )
+    .unwrap();
+    db.set_org_share_uploaded("access-share", "access-head", "2026-08-12T00:00:01Z")
+        .unwrap();
+    db.set_org_share_document_metadata("access-share", STABLE_DOC_ID, "edit")
+        .unwrap();
 
     let dispatch_1 = "11111111-2222-4333-8444-555555555555";
-    assert!(db.persist_org_access_attempt_if_current(
-        1, "relay.example", dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID,
-        "edit", "view", actor, actor, "2026-08-12T00:00:02Z",
-    ).unwrap());
+    assert!(db
+        .persist_org_access_attempt_if_current(
+            1,
+            "relay.example",
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+            "2026-08-12T00:00:02Z",
+        )
+        .unwrap());
     assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
-    assert_eq!(db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
-    assert!(!db.persist_org_access_attempt_if_current(
-        2, "relay.example", dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID,
-        "edit", "view", actor, actor, "2026-08-12T00:00:03Z",
-    ).unwrap());
-    assert_eq!(db.count_share_egress_by_kind("org_share_access").unwrap(), 1);
-    assert!(!db.apply_org_access_attempt_if_current(
-        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", other_actor, actor,
-    ).unwrap());
-    assert!(!db.apply_org_access_attempt_if_current(
-        dispatch_1, STABLE_ORG_ID, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-        "edit", "view", actor, actor,
-    ).unwrap());
-    db.lock().execute_batch(
-        "CREATE TRIGGER abort_access_projection BEFORE UPDATE OF access ON org_items
+    assert_eq!(
+        db.count_share_egress_by_kind("org_share_access").unwrap(),
+        1
+    );
+    assert!(!db
+        .persist_org_access_attempt_if_current(
+            2,
+            "relay.example",
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+            "2026-08-12T00:00:03Z",
+        )
+        .unwrap());
+    assert_eq!(
+        db.count_share_egress_by_kind("org_share_access").unwrap(),
+        1
+    );
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            other_actor,
+            actor,
+        )
+        .unwrap());
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .unwrap());
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER abort_access_projection BEFORE UPDATE OF access ON org_items
          BEGIN SELECT RAISE(ABORT, 'access projection fault'); END;",
-    ).unwrap();
-    assert!(db.apply_org_access_attempt_if_current(
-        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", actor, actor,
-    ).is_err());
+        )
+        .unwrap();
+    assert!(db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .is_err());
     assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
-    assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "edit");
-    assert_eq!(db.get_org_share("access-share").unwrap().unwrap().access, "edit");
-    db.lock().execute_batch("DROP TRIGGER abort_access_projection;").unwrap();
-    assert!(db.apply_org_access_attempt_if_current(
-        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", actor, actor,
-    ).unwrap());
-    assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "view");
-    assert_eq!(db.get_org_share("access-share").unwrap().unwrap().access, "view");
+    assert_eq!(
+        db.get_org_item("access-head").unwrap().unwrap().access,
+        "edit"
+    );
+    assert_eq!(
+        db.get_org_share("access-share").unwrap().unwrap().access,
+        "edit"
+    );
+    db.lock()
+        .execute_batch("DROP TRIGGER abort_access_projection;")
+        .unwrap();
+    assert!(db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .unwrap());
+    assert_eq!(
+        db.get_org_item("access-head").unwrap().unwrap().access,
+        "view"
+    );
+    assert_eq!(
+        db.get_org_share("access-share").unwrap().unwrap().access,
+        "view"
+    );
     assert!(db.pending_org_access_attempts().unwrap().is_empty());
-    assert!(!db.apply_org_access_attempt_if_current(
-        dispatch_1, STABLE_ORG_ID, STABLE_DOC_ID, "edit", "view", actor, actor,
-    ).unwrap());
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_1,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "edit",
+            "view",
+            actor,
+            actor,
+        )
+        .unwrap());
 
     let dispatch_2 = "22222222-3333-4444-8555-666666666666";
-    assert!(db.persist_org_access_attempt_if_current(
-        3, "relay.example", dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID,
-        "view", "edit", actor, actor, "2026-08-12T00:00:04Z",
-    ).unwrap());
-    assert!(!db.fail_org_access_attempt_if_current(
-        dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", other_actor, actor,
-    ).unwrap());
-    assert!(db.fail_org_access_attempt_if_current(
-        dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", actor, actor,
-    ).unwrap());
+    assert!(db
+        .persist_org_access_attempt_if_current(
+            3,
+            "relay.example",
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+            "2026-08-12T00:00:04Z",
+        )
+        .unwrap());
+    assert!(!db
+        .fail_org_access_attempt_if_current(
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            other_actor,
+            actor,
+        )
+        .unwrap());
+    assert!(db
+        .fail_org_access_attempt_if_current(
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+        )
+        .unwrap());
     assert!(db.pending_org_access_attempts().unwrap().is_empty());
 
     let dispatch_3 = "33333333-4444-4555-8666-777777777777";
-    assert!(db.persist_org_access_attempt_if_current(
-        4, "relay.example", dispatch_3, STABLE_ORG_ID, STABLE_DOC_ID,
-        "view", "edit", actor, actor, "2026-08-12T00:00:05Z",
-    ).unwrap());
-    assert!(!db.apply_org_access_attempt_if_current(
-        dispatch_2, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", actor, actor,
-    ).unwrap());
+    assert!(db
+        .persist_org_access_attempt_if_current(
+            4,
+            "relay.example",
+            dispatch_3,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+            "2026-08-12T00:00:05Z",
+        )
+        .unwrap());
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_2,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+        )
+        .unwrap());
     db.lock().execute(
         "UPDATE org_shares SET state='failed',last_error='direct_put_pending' WHERE id='access-share'",
         [],
     ).unwrap();
-    assert!(!db.apply_org_access_attempt_if_current(
-        dispatch_3, STABLE_ORG_ID, STABLE_DOC_ID, "view", "edit", actor, actor,
-    ).unwrap());
-    assert_eq!(db.get_org_item("access-head").unwrap().unwrap().access, "view");
+    assert!(!db
+        .apply_org_access_attempt_if_current(
+            dispatch_3,
+            STABLE_ORG_ID,
+            STABLE_DOC_ID,
+            "view",
+            "edit",
+            actor,
+            actor,
+        )
+        .unwrap());
+    assert_eq!(
+        db.get_org_item("access-head").unwrap().unwrap().access,
+        "view"
+    );
     assert_eq!(db.pending_org_access_attempts().unwrap().len(), 1);
 }
 
@@ -3359,44 +4373,138 @@ fn org_feed_attachment_collision_rolls_back_item_cursor_and_completeness_witness
     let org_id = "33333333-3333-4333-8333-333333333333";
     seed_org_state(&db, org_id);
     db.upsert_org_item(
-        "other", org_id, 1, "owner", "Other", "body", "t", 1, 1,
-        &sha32(1), None, Some("owner"), None,
-    ).unwrap();
+        "other",
+        org_id,
+        1,
+        "owner",
+        "Other",
+        "body",
+        "t",
+        1,
+        1,
+        &sha32(1),
+        None,
+        Some("owner"),
+        None,
+    )
+    .unwrap();
     db.replace_org_item_attachment_bundle(
         "other",
         &[crate::storage::IncomingAttachment {
-            id: "collision".into(), mime_type: "image/png".into(), extension: "png".into(),
-            width: 1, height: 1, sha256: [2; 32], data: vec![2],
+            id: "collision".into(),
+            mime_type: "image/png".into(),
+            extension: "png".into(),
+            width: 1,
+            height: 1,
+            sha256: [2; 32],
+            data: vec![2],
         }],
-    ).unwrap();
+    )
+    .unwrap();
     let prepared = Db::prepare_org_item_index("Target", "t", "private target", None).unwrap();
     let attachment = crate::storage::IncomingAttachment {
-        id: "collision".into(), mime_type: "image/png".into(), extension: "png".into(),
-        width: 1, height: 1, sha256: [3; 32], data: vec![3],
+        id: "collision".into(),
+        mime_type: "image/png".into(),
+        extension: "png".into(),
+        width: 1,
+        height: 1,
+        sha256: [3; 32],
+        data: vec![3],
     };
     let failed = db.commit_org_feed_item_with_metadata_and_attachments(
-        "target", org_id, 2, "owner", "Target", "private target", "t", 1, 1,
-        &sha32(4), None, Some("owner"), &prepared, Some("11111111-1111-4111-8111-111111111111"),
-        "view", Some("owner"), true, &[attachment],
+        "target",
+        org_id,
+        2,
+        "owner",
+        "Target",
+        "private target",
+        "t",
+        1,
+        1,
+        &sha32(4),
+        None,
+        Some("owner"),
+        &prepared,
+        Some("11111111-1111-4111-8111-111111111111"),
+        "view",
+        Some("owner"),
+        true,
+        &[attachment],
     );
     assert!(failed.is_err());
     let conn = db.lock();
-    assert_eq!(conn.query_row("SELECT last_seq FROM org_state WHERE org_id=?1", [org_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM org_items WHERE item_id='target'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(
+        conn.query_row(
+            "SELECT last_seq FROM org_state WHERE org_id=?1",
+            [org_id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM org_items WHERE item_id='target'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
     drop(conn);
-    db.lock().execute("DELETE FROM note_attachments WHERE id='collision'", []).unwrap();
+    db.lock()
+        .execute("DELETE FROM note_attachments WHERE id='collision'", [])
+        .unwrap();
     let repaired = crate::storage::IncomingAttachment {
-        id: "target-image".into(), mime_type: "image/png".into(), extension: "png".into(),
-        width: 1, height: 1, sha256: [3; 32], data: vec![3],
+        id: "target-image".into(),
+        mime_type: "image/png".into(),
+        extension: "png".into(),
+        width: 1,
+        height: 1,
+        sha256: [3; 32],
+        data: vec![3],
     };
-    assert!(db.commit_org_feed_item_with_metadata_and_attachments(
-        "target", org_id, 2, "owner", "Target", "private target", "t", 1, 1,
-        &sha32(4), None, Some("owner"), &prepared, Some("11111111-1111-4111-8111-111111111111"),
-        "view", Some("owner"), true, &[repaired],
-    ).unwrap().changed);
+    assert!(
+        db.commit_org_feed_item_with_metadata_and_attachments(
+            "target",
+            org_id,
+            2,
+            "owner",
+            "Target",
+            "private target",
+            "t",
+            1,
+            1,
+            &sha32(4),
+            None,
+            Some("owner"),
+            &prepared,
+            Some("11111111-1111-4111-8111-111111111111"),
+            "view",
+            Some("owner"),
+            true,
+            &[repaired],
+        )
+        .unwrap()
+        .changed
+    );
     let conn = db.lock();
-    assert!(conn.query_row("SELECT projection_sha256=?2 FROM org_items WHERE item_id=?1", rusqlite::params!["target",sha32(4)], |r| r.get::<_, bool>(0)).unwrap());
-    assert_eq!(conn.query_row("SELECT COUNT(*) FROM note_attachments WHERE org_item_id='target'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert!(conn
+        .query_row(
+            "SELECT projection_sha256=?2 FROM org_items WHERE item_id=?1",
+            rusqlite::params!["target", sha32(4)],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM note_attachments WHERE org_item_id='target'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -3406,29 +4514,68 @@ fn org_feed_atomically_closes_projection_pending_and_preserves_newer_source_dirt
     let doc_id = "22222222-2222-4222-8222-222222222222";
     seed_org_state(&db, org_id);
     db.insert_org_share(
-        "share-a", org_id, None, Some("source-b"), "note", Some("B"), 2, 1,
-        &sha32(4), "2026-08-13T00:00:00Z",
-    ).unwrap();
-    db.set_org_share_document_metadata("share-a", doc_id, "view").unwrap();
+        "share-a",
+        org_id,
+        None,
+        Some("source-b"),
+        "note",
+        Some("B"),
+        2,
+        1,
+        &sha32(4),
+        "2026-08-13T00:00:00Z",
+    )
+    .unwrap();
+    db.set_org_share_document_metadata("share-a", doc_id, "view")
+        .unwrap();
     {
         let conn = db.lock();
         conn.execute(
             "UPDATE org_shares SET state='failed',last_error='projection_pending',
               item_id='item-a',dispatch_id='dispatch-a',expected_actor_user_id='actor',
-              expected_owner_user_id='owner',republish_dirty=1 WHERE id='share-a'", [],
-        ).unwrap();
+              expected_owner_user_id='owner',republish_dirty=1 WHERE id='share-a'",
+            [],
+        )
+        .unwrap();
     }
     let prepared = Db::prepare_org_item_index("A", "t", "remote A", None).unwrap();
-    let outcome = db.commit_org_feed_item_with_metadata_and_attachments(
-        "item-a", org_id, 2, "actor", "A", "remote A", "t", 2, 1, &sha32(4),
-        None, Some("actor"), &prepared, Some(doc_id), "view", Some("owner"), true, &[],
-    ).unwrap();
+    let outcome = db
+        .commit_org_feed_item_with_metadata_and_attachments(
+            "item-a",
+            org_id,
+            2,
+            "actor",
+            "A",
+            "remote A",
+            "t",
+            2,
+            1,
+            &sha32(4),
+            None,
+            Some("actor"),
+            &prepared,
+            Some(doc_id),
+            "view",
+            Some("owner"),
+            true,
+            &[],
+        )
+        .unwrap();
     assert!(outcome.changed);
     let row = db.get_org_share("share-a").unwrap().unwrap();
     assert_eq!(row.state, "uploaded");
     assert_eq!(row.last_error, None);
-    assert_eq!(row.republish_dirty, 1, "newer source B remains queued after A closes");
-    assert_eq!(db.org_replica_state("item-a").unwrap().unwrap().projection_sha256, Some(sha32(4)));
+    assert_eq!(
+        row.republish_dirty, 1,
+        "newer source B remains queued after A closes"
+    );
+    assert_eq!(
+        db.org_replica_state("item-a")
+            .unwrap()
+            .unwrap()
+            .projection_sha256,
+        Some(sha32(4))
+    );
 }
 
 #[test]
@@ -3437,15 +4584,33 @@ fn org_feed_tombstone_closes_projection_pending_journals_without_resurrection() 
     let org_id = "11111111-1111-4111-8111-111111111111";
     seed_org_state(&db, org_id);
     for (id, source) in [("anchored", Some("source")), ("journal", None)] {
-        db.insert_org_share(id, org_id, None, source, "note", Some("T"), 2, 1,
-            &sha32(5), "2026-08-13T00:00:00Z").unwrap();
+        db.insert_org_share(
+            id,
+            org_id,
+            None,
+            source,
+            "note",
+            Some("T"),
+            2,
+            1,
+            &sha32(5),
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
         db.lock().execute(
             "UPDATE org_shares SET state='failed',last_error='projection_pending',item_id='item-a'
               WHERE id=?1", [id],
         ).unwrap();
     }
     assert!(db.commit_org_feed_tombstone(org_id, "item-a", 1).unwrap());
-    assert_eq!(db.get_org_share("anchored").unwrap().unwrap().last_error.as_deref(), Some("org_edit_conflict"));
+    assert_eq!(
+        db.get_org_share("anchored")
+            .unwrap()
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("org_edit_conflict")
+    );
     assert!(db.get_org_share("journal").unwrap().is_none());
 }
 
@@ -3456,31 +4621,69 @@ fn confirmed_document_delete_terminalizes_sibling_anchors_and_plaintext_in_one_t
     let doc_id = "22222222-2222-4222-8222-222222222222";
     seed_org_state(&db, org_id);
     for (index, item) in ["item-1", "item-2"].into_iter().enumerate() {
-        db.insert_org_share(item, org_id, None, Some(item), "note", Some("T"),
-            (index + 1) as u32, 1, &sha32(index as u8), "2026-08-13T00:00:00Z").unwrap();
-        db.set_org_share_uploaded(item, item, "2026-08-13T00:00:01Z").unwrap();
-        db.set_org_share_document_metadata(item, doc_id, "view").unwrap();
-        db.upsert_org_item(item, org_id, (index + 1) as u64, "owner", "T", "secret",
-            "t", (index + 1) as u32, 1, &sha32(index as u8), None, Some("owner"), None).unwrap();
-        db.set_org_item_document_metadata(item, Some(doc_id), "view", Some("owner")).unwrap();
+        db.insert_org_share(
+            item,
+            org_id,
+            None,
+            Some(item),
+            "note",
+            Some("T"),
+            (index + 1) as u32,
+            1,
+            &sha32(index as u8),
+            "2026-08-13T00:00:00Z",
+        )
+        .unwrap();
+        db.set_org_share_uploaded(item, item, "2026-08-13T00:00:01Z")
+            .unwrap();
+        db.set_org_share_document_metadata(item, doc_id, "view")
+            .unwrap();
+        db.upsert_org_item(
+            item,
+            org_id,
+            (index + 1) as u64,
+            "owner",
+            "T",
+            "secret",
+            "t",
+            (index + 1) as u32,
+            1,
+            &sha32(index as u8),
+            None,
+            Some("owner"),
+            None,
+        )
+        .unwrap();
+        db.set_org_item_document_metadata(item, Some(doc_id), "view", Some("owner"))
+            .unwrap();
     }
     let endpoint = format!("{org_id}:{doc_id}");
-    db.lock().execute(
-        "INSERT INTO links
+    db.lock()
+        .execute(
+            "INSERT INTO links
            (src_kind,src_id,dst_kind,dst_id,edge_type,created_at)
          VALUES('org',?1,'note','local-note','manual',1)",
-        [&endpoint],
-    ).unwrap();
-    assert!(db.terminalize_and_evict_org_document(org_id, doc_id, "2026-08-13T00:00:02Z").unwrap());
+            [&endpoint],
+        )
+        .unwrap();
+    assert!(db
+        .terminalize_and_evict_org_document(org_id, doc_id, "2026-08-13T00:00:02Z")
+        .unwrap());
     for id in ["item-1", "item-2"] {
         assert_eq!(db.get_org_share(id).unwrap().unwrap().state, "revoked");
         let item = db.get_org_item(id).unwrap();
         assert!(item.is_none(), "tombstoned plaintext is not readable");
     }
-    assert_eq!(db.lock().query_row(
-        "SELECT COUNT(*) FROM links WHERE src_kind='org' AND src_id=?1", [&endpoint],
-        |row| row.get::<_, i64>(0),
-    ).unwrap(), 0);
+    assert_eq!(
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE src_kind='org' AND src_id=?1",
+                [&endpoint],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -4639,20 +5842,57 @@ fn duplicate_uploaded_org_shares_returns_only_the_extras() {
 #[test]
 fn known_uploaded_share_is_keeper_ahead_of_older_ambiguous_null_item() {
     let db = mem_db();
-    db.insert_org_share("ambiguous", "org-1", None, Some("d1"), "note", Some("T"),
-        1, 1, &sha32(1), "2026-07-11T00:00:00Z").unwrap();
-    db.set_org_share_failed("ambiguous", "initial_post_pending", "2026-07-11T00:00:01Z").unwrap();
-    db.insert_org_share("live", "org-1", None, Some("d1"), "note", Some("T"),
-        1, 1, &sha32(2), "2026-07-11T00:01:00Z").unwrap();
-    db.set_org_share_uploaded("live", "item-live", "2026-07-11T00:01:01Z").unwrap();
-    let rows = db.uploaded_org_shares_for_source_in_org("org-1", None, Some("d1")).unwrap();
+    db.insert_org_share(
+        "ambiguous",
+        "org-1",
+        None,
+        Some("d1"),
+        "note",
+        Some("T"),
+        1,
+        1,
+        &sha32(1),
+        "2026-07-11T00:00:00Z",
+    )
+    .unwrap();
+    db.set_org_share_failed("ambiguous", "initial_post_pending", "2026-07-11T00:00:01Z")
+        .unwrap();
+    db.insert_org_share(
+        "live",
+        "org-1",
+        None,
+        Some("d1"),
+        "note",
+        Some("T"),
+        1,
+        1,
+        &sha32(2),
+        "2026-07-11T00:01:00Z",
+    )
+    .unwrap();
+    db.set_org_share_uploaded("live", "item-live", "2026-07-11T00:01:01Z")
+        .unwrap();
+    let rows = db
+        .uploaded_org_shares_for_source_in_org("org-1", None, Some("d1"))
+        .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].id, "live");
     assert_eq!(rows[1].id, "ambiguous");
-    assert!(!db.acquire_new_org_share_for_source(
-        "third", "org-1", None, Some("d1"), "note", Some("T"), 1, 1,
-        &sha32(3), true, "2026-07-11T00:02:00Z",
-    ).unwrap());
+    assert!(!db
+        .acquire_new_org_share_for_source(
+            "third",
+            "org-1",
+            None,
+            Some("d1"),
+            "note",
+            Some("T"),
+            1,
+            1,
+            &sha32(3),
+            true,
+            "2026-07-11T00:02:00Z",
+        )
+        .unwrap());
 }
 
 #[test]
@@ -4677,15 +5917,17 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
     )
     .unwrap();
     db.begin_org_folder_closure("closing-folder").unwrap();
-    assert!(db
-        .insert_outbound_note_share(
+    assert!(
+        db.insert_outbound_note_share(
             "blocked-link",
             "closing-doc",
             "link",
             1,
             "2026-08-14T00:00:01Z",
         )
-        .is_err(), "folder closure must reject link/user share admission too");
+        .is_err(),
+        "folder closure must reject link/user share admission too"
+    );
     assert!(db
         .insert_org_share(
             "blocked-folder",
@@ -4714,33 +5956,42 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
         "t",
     )
     .unwrap();
-    db.begin_org_source_closure("document", "closing-doc").unwrap();
-    assert!(db
-        .insert_outbound_note_share(
+    db.begin_org_source_closure("document", "closing-doc")
+        .unwrap();
+    assert!(
+        db.insert_outbound_note_share(
             "blocked-source-link",
             "closing-doc",
             "link",
             1,
             "2026-08-14T00:00:02Z",
         )
-        .is_err(), "source closure must reject link/user share admission too");
-    assert!(db
-        .lock()
-        .execute(
-            "UPDATE documents SET text='edited while closing' WHERE id='closing-doc'",
-            [],
-        )
-        .is_err(), "a destructive closure must freeze the source during remote revoke");
+        .is_err(),
+        "source closure must reject link/user share admission too"
+    );
+    assert!(
+        db.lock()
+            .execute(
+                "UPDATE documents SET text='edited while closing' WHERE id='closing-doc'",
+                [],
+            )
+            .is_err(),
+        "a destructive closure must freeze the source during remote revoke"
+    );
     for sql in [
         "UPDATE documents SET name='renamed.md' WHERE id='closing-doc'",
         "UPDATE documents SET kind='note' WHERE id='closing-doc'",
     ] {
-        assert!(db.lock().execute(sql, []).is_err(), "every envelope identity field is frozen");
+        assert!(
+            db.lock().execute(sql, []).is_err(),
+            "every envelope identity field is frozen"
+        );
     }
     assert!(db
         .reset_org_share_for_retry("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
         .is_err());
-    db.clear_org_source_closure("document", "closing-doc").unwrap();
+    db.clear_org_source_closure("document", "closing-doc")
+        .unwrap();
     db.reset_org_share_for_retry("share", Some("T2"), 1, 1, &sha32(2), true, "t2")
         .unwrap();
 }
@@ -4749,118 +6000,245 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
 fn meeting_source_closure_blocks_provider_insert_delete_and_title_changes() {
     let db = mem_db();
     db.insert_folder(&Folder {
-        id: "meeting-close-folder".into(), name: "Closing".into(), path: "Closing".into(),
-        parent_id: None, locked: false, created_at: "2026-08-14T00:00:00Z".into(),
-    }).unwrap();
+        id: "meeting-close-folder".into(),
+        name: "Closing".into(),
+        path: "Closing".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-08-14T00:00:00Z".into(),
+    })
+    .unwrap();
     db.insert_meeting(&Meeting {
-        id: "meeting-close".into(), started_at: "t".into(), ended_at: None,
-        title: Some("Before".into()), duration_s: 0, audio_path: None,
-        status: MeetingStatus::Summarized, folder_id: Some("meeting-close-folder".into()),
-    }).unwrap();
+        id: "meeting-close".into(),
+        started_at: "t".into(),
+        ended_at: None,
+        title: Some("Before".into()),
+        duration_s: 0,
+        audio_path: None,
+        status: MeetingStatus::Summarized,
+        folder_id: Some("meeting-close-folder".into()),
+    })
+    .unwrap();
     db.upsert_note(&NoteRecord {
-        meeting_id: "meeting-close".into(), provider_id: "provider-a".into(),
-        markdown: "body".into(), created_at: "t".into(), exported_path: None,
-        model_requested: None, model_served: None, gateway_host: None,
-    }).unwrap();
-    db.begin_org_source_closure("meeting", "meeting-close").unwrap();
+        meeting_id: "meeting-close".into(),
+        provider_id: "provider-a".into(),
+        markdown: "body".into(),
+        created_at: "t".into(),
+        exported_path: None,
+        model_requested: None,
+        model_served: None,
+        gateway_host: None,
+    })
+    .unwrap();
+    db.begin_org_source_closure("meeting", "meeting-close")
+        .unwrap();
 
-    assert!(db.upsert_note(&NoteRecord {
-        meeting_id: "meeting-close".into(), provider_id: "provider-b".into(),
-        markdown: "other".into(), created_at: "t2".into(), exported_path: None,
-        model_requested: None, model_served: None, gateway_host: None,
-    }).is_err());
-    assert!(db.lock().execute(
-        "DELETE FROM notes WHERE meeting_id='meeting-close' AND provider_id='provider-a'", [],
-    ).is_err());
-    assert!(db.lock().execute(
-        "UPDATE meetings SET title='After' WHERE id='meeting-close'", [],
-    ).is_err());
+    assert!(db
+        .upsert_note(&NoteRecord {
+            meeting_id: "meeting-close".into(),
+            provider_id: "provider-b".into(),
+            markdown: "other".into(),
+            created_at: "t2".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .is_err());
+    assert!(db
+        .lock()
+        .execute(
+            "DELETE FROM notes WHERE meeting_id='meeting-close' AND provider_id='provider-a'",
+            [],
+        )
+        .is_err());
+    assert!(db
+        .lock()
+        .execute(
+            "UPDATE meetings SET title='After' WHERE id='meeting-close'",
+            [],
+        )
+        .is_err());
 
     db.delete_meeting("meeting-close").unwrap();
-    let exists: i64 = db.lock().query_row(
-        "SELECT EXISTS(SELECT 1 FROM meetings WHERE id='meeting-close')", [],
-        |row| row.get(0),
-    ).unwrap();
+    let exists: i64 = db
+        .lock()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM meetings WHERE id='meeting-close')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(exists, 0);
-    let phase: String = db.lock().query_row(
-        "SELECT phase FROM org_share_closures
-          WHERE scope_kind='meeting' AND scope_id='meeting-close'", [],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(phase, "closed", "meeting cascade and barrier completion commit together");
+    let phase: String = db
+        .lock()
+        .query_row(
+            "SELECT phase FROM org_share_closures
+          WHERE scope_kind='meeting' AND scope_id='meeting-close'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        phase, "closed",
+        "meeting cascade and barrier completion commit together"
+    );
 }
 
 #[test]
 fn source_closure_blocks_manual_attachment_mutation_but_allows_authorized_parent_cascade() {
     let db = mem_db();
     db.insert_folder(&Folder {
-        id: "attachment-folder".into(), name: "Attachments".into(), path: "Attachments".into(),
-        parent_id: None, locked: false, created_at: "2026-08-14T00:00:00Z".into(),
-    }).unwrap();
-    db.insert_document("attachment-doc", "attachment-folder", "note.md", "body", "note", 1).unwrap();
-    let owner = crate::storage::AttachmentOwner::Document { document_id: "attachment-doc".into() };
+        id: "attachment-folder".into(),
+        name: "Attachments".into(),
+        path: "Attachments".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-08-14T00:00:00Z".into(),
+    })
+    .unwrap();
+    db.insert_document(
+        "attachment-doc",
+        "attachment-folder",
+        "note.md",
+        "body",
+        "note",
+        1,
+    )
+    .unwrap();
+    let owner = crate::storage::AttachmentOwner::Document {
+        document_id: "attachment-doc".into(),
+    };
     let hash = [3u8; 32];
     db.insert_attachment(&crate::storage::NewAttachment {
-        id: "attachment-one", owner: &owner, mime_type: "image/png", extension: "png",
-        width: 1, height: 1, sha256: &hash, byte_len: 1, data: &[1], data_blob: None,
+        id: "attachment-one",
+        owner: &owner,
+        mime_type: "image/png",
+        extension: "png",
+        width: 1,
+        height: 1,
+        sha256: &hash,
+        byte_len: 1,
+        data: &[1],
+        data_blob: None,
         created_at: 1,
-    }).unwrap();
-    db.begin_org_source_closure("document", "attachment-doc").unwrap();
+    })
+    .unwrap();
+    db.begin_org_source_closure("document", "attachment-doc")
+        .unwrap();
     assert!(db.delete_attachment(&owner, "attachment-one").is_err());
     db.delete_document("attachment-doc").unwrap();
     assert!(db.list_attachments(&owner).unwrap().is_empty());
-    let phase: String = db.lock().query_row(
-        "SELECT phase FROM org_share_closures
-          WHERE scope_kind='document' AND scope_id='attachment-doc'", [], |row| row.get(0),
-    ).unwrap();
-    assert_eq!(phase, "closed", "parent cascade and barrier completion commit together");
+    let phase: String = db
+        .lock()
+        .query_row(
+            "SELECT phase FROM org_share_closures
+          WHERE scope_kind='document' AND scope_id='attachment-doc'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        phase, "closed",
+        "parent cascade and barrier completion commit together"
+    );
 }
 
 #[test]
 fn source_delete_with_attachment_rolls_back_until_every_share_is_terminal() {
     let db = mem_db();
     db.insert_folder(&Folder {
-        id: "atomic-delete-folder".into(), name: "Atomic".into(), path: "Atomic".into(),
-        parent_id: None, locked: false, created_at: "2026-08-14T00:00:00Z".into(),
-    }).unwrap();
-    db.insert_document("atomic-delete-doc", "atomic-delete-folder", "note.md", "body", "note", 1).unwrap();
-    let owner = crate::storage::AttachmentOwner::Document { document_id: "atomic-delete-doc".into() };
+        id: "atomic-delete-folder".into(),
+        name: "Atomic".into(),
+        path: "Atomic".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-08-14T00:00:00Z".into(),
+    })
+    .unwrap();
+    db.insert_document(
+        "atomic-delete-doc",
+        "atomic-delete-folder",
+        "note.md",
+        "body",
+        "note",
+        1,
+    )
+    .unwrap();
+    let owner = crate::storage::AttachmentOwner::Document {
+        document_id: "atomic-delete-doc".into(),
+    };
     db.insert_attachment(&crate::storage::NewAttachment {
-        id: "atomic-image", owner: &owner, mime_type: "image/png", extension: "png",
-        width: 1, height: 1, sha256: &[7; 32], byte_len: 1, data: &[7], data_blob: None,
+        id: "atomic-image",
+        owner: &owner,
+        mime_type: "image/png",
+        extension: "png",
+        width: 1,
+        height: 1,
+        sha256: &[7; 32],
+        byte_len: 1,
+        data: &[7],
+        data_blob: None,
         created_at: 1,
-    }).unwrap();
+    })
+    .unwrap();
     db.insert_outbound_share_attempt(
-        "atomic-share", None, Some("atomic-delete-doc"), "link", 1,
-        "c534b6d2-02c1-4c2c-a256-3af8592b1567", "t",
-    ).unwrap();
-    db.begin_org_source_closure("document", "atomic-delete-doc").unwrap();
+        "atomic-share",
+        None,
+        Some("atomic-delete-doc"),
+        "link",
+        1,
+        "c534b6d2-02c1-4c2c-a256-3af8592b1567",
+        "t",
+    )
+    .unwrap();
+    db.begin_org_source_closure("document", "atomic-delete-doc")
+        .unwrap();
 
     assert!(db.delete_document("atomic-delete-doc").is_err());
-    let exists: i64 = db.lock().query_row(
-        "SELECT EXISTS(SELECT 1 FROM documents WHERE id='atomic-delete-doc')", [],
-        |row| row.get(0),
-    ).unwrap();
+    let exists: i64 = db
+        .lock()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE id='atomic-delete-doc')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(exists, 1);
     assert_eq!(db.list_attachments(&owner).unwrap().len(), 1);
-    let phase: String = db.lock().query_row(
-        "SELECT phase FROM org_share_closures
-          WHERE scope_kind='document' AND scope_id='atomic-delete-doc'", [], |row| row.get(0),
-    ).unwrap();
+    let phase: String = db
+        .lock()
+        .query_row(
+            "SELECT phase FROM org_share_closures
+          WHERE scope_kind='document' AND scope_id='atomic-delete-doc'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(phase, "closing");
 
-    db.set_outbound_share_state("atomic-share", "revoked").unwrap();
+    db.set_outbound_share_state("atomic-share", "revoked")
+        .unwrap();
     db.delete_document("atomic-delete-doc").unwrap();
-    let exists: i64 = db.lock().query_row(
-        "SELECT EXISTS(SELECT 1 FROM documents WHERE id='atomic-delete-doc')", [],
-        |row| row.get(0),
-    ).unwrap();
+    let exists: i64 = db
+        .lock()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE id='atomic-delete-doc')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(exists, 0);
     assert!(db.list_attachments(&owner).unwrap().is_empty());
-    let phase: String = db.lock().query_row(
-        "SELECT phase FROM org_share_closures
-          WHERE scope_kind='document' AND scope_id='atomic-delete-doc'", [], |row| row.get(0),
-    ).unwrap();
+    let phase: String = db
+        .lock()
+        .query_row(
+            "SELECT phase FROM org_share_closures
+          WHERE scope_kind='document' AND scope_id='atomic-delete-doc'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(phase, "closed");
 }
 
@@ -4899,10 +6277,20 @@ fn cancel_pending_org_shares_scopes_to_org_and_source() {
     db.set_org_share_failed("f", "boom", "2026-07-11T00:02:30Z")
         .unwrap();
     db.insert_org_share(
-        "too-large","org-1",None,Some("d1"),"note",Some("T"),1,1,&sha32(8),
+        "too-large",
+        "org-1",
+        None,
+        Some("d1"),
+        "note",
+        Some("T"),
+        1,
+        1,
+        &sha32(8),
         "2026-07-11T00:02:35Z",
-    ).unwrap();
-    db.set_org_share_failed("too-large","too_large","2026-07-11T00:02:36Z").unwrap();
+    )
+    .unwrap();
+    db.set_org_share_failed("too-large", "too_large", "2026-07-11T00:02:36Z")
+        .unwrap();
     // Ambiguous stable-document attempts carry durable recovery witnesses and must never be
     // collapsed as ordinary pending duplicates, even when they share this exact local source.
     for (id, reason, byte) in [
@@ -4980,23 +6368,27 @@ fn cancel_pending_org_shares_scopes_to_org_and_source() {
             "2026-07-11T01:00:00Z",
         )
         .unwrap();
-    assert_eq!(n,2,"only authenticated-absence and exact pre-dispatch failures cancel");
-    assert_eq!(db.get_org_share("q").unwrap().unwrap().state,"queued");
-    assert_eq!(db.get_org_share("f").unwrap().unwrap().state,"failed");
-    assert_eq!(db.get_org_share("too-large").unwrap().unwrap().state,"revoked");
-    for id in [
-        "direct",
-        "republish-put",
-        "edit-conflict",
-        "initial",
-    ] {
+    assert_eq!(
+        n, 2,
+        "only authenticated-absence and exact pre-dispatch failures cancel"
+    );
+    assert_eq!(db.get_org_share("q").unwrap().unwrap().state, "queued");
+    assert_eq!(db.get_org_share("f").unwrap().unwrap().state, "failed");
+    assert_eq!(
+        db.get_org_share("too-large").unwrap().unwrap().state,
+        "revoked"
+    );
+    for id in ["direct", "republish-put", "edit-conflict", "initial"] {
         assert_eq!(
             db.get_org_share(id).unwrap().unwrap().state,
             "failed",
             "an ambiguous recovery witness is preserved"
         );
     }
-    assert_eq!(db.get_org_share("replayable").unwrap().unwrap().state,"revoked");
+    assert_eq!(
+        db.get_org_share("replayable").unwrap().unwrap().state,
+        "revoked"
+    );
     assert_eq!(
         db.get_org_share("u").unwrap().unwrap().state,
         "uploaded",
@@ -5112,29 +6504,29 @@ fn reusable_org_share_null_and_ambiguous_error_guards_are_fail_closed() {
     ));
 
     let (id, reason, byte) = ("edit-conflict", "org_edit_conflict", 9u8);
-        insert(id, id, byte);
-        db.set_org_share_failed(id, reason, "2026-07-11T00:01:00Z")
-            .unwrap();
-        assert!(db
-            .find_reusable_org_share("org-1", None, Some(id))
-            .unwrap()
-            .is_none());
-        assert!(matches!(
-            db.reset_org_share_for_retry(
-                id,
-                Some("T"),
-                1,
-                1,
-                &sha32(byte),
-                true,
-                "2026-07-11T00:02:00Z",
-            ),
-            Err(crate::error::AppError::Unavailable(_))
-        ));
-        assert_eq!(
-            db.get_org_share(id).unwrap().unwrap().last_error.as_deref(),
-            Some(reason)
-        );
+    insert(id, id, byte);
+    db.set_org_share_failed(id, reason, "2026-07-11T00:01:00Z")
+        .unwrap();
+    assert!(db
+        .find_reusable_org_share("org-1", None, Some(id))
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.reset_org_share_for_retry(
+            id,
+            Some("T"),
+            1,
+            1,
+            &sha32(byte),
+            true,
+            "2026-07-11T00:02:00Z",
+        ),
+        Err(crate::error::AppError::Unavailable(_))
+    ));
+    assert_eq!(
+        db.get_org_share(id).unwrap().unwrap().last_error.as_deref(),
+        Some(reason)
+    );
 
     insert("replay", "replay-source", 4);
     db.set_org_share_failed("replay", "initial_post_replayable", "2026-07-11T00:01:00Z")

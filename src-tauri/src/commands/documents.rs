@@ -483,6 +483,14 @@ async fn delete_document_inner_notifying(
             "unlock this folder to delete a document",
         )));
     }
+    // `documents(kind='task')` is a hidden crash-recovery source for the dedicated Task lifecycle.
+    // Refuse it BEFORE installing a closure or sending a remote revoke: the storage-layer delete
+    // guard alone is too late because this command performs irreversible network work first.
+    if state.db.get_document(id)?.is_none() {
+        return Err(AppError::InvalidArg(
+            "task sources must be deleted through the task lifecycle".into(),
+        ));
+    }
     let _org_mutation = state.org_share_mutation_lock.lock().await;
     state.db.begin_org_source_closure("document", id)?;
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact source

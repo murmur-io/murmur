@@ -508,7 +508,9 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, path, parent_id, locked, created_at
-                   FROM folders ORDER BY created_at, name",
+                   FROM folders
+                  WHERE COALESCE(kind, 'meeting') != 'task'
+                  ORDER BY created_at, name",
             )
             .map_err(map_err)?;
         let rows = stmt.query_map([], row_to_folder).map_err(map_err)?;
@@ -525,7 +527,10 @@ impl Db {
     pub fn folder_kinds(&self) -> Result<std::collections::HashMap<String, String>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT id, COALESCE(kind, 'meeting') FROM folders")
+            .prepare(
+                "SELECT id, COALESCE(kind, 'meeting') FROM folders
+                  WHERE COALESCE(kind, 'meeting') != 'task'",
+            )
             .map_err(map_err)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))

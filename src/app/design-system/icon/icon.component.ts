@@ -6,6 +6,7 @@ export type ShellIcon =
   | "meetings"
   | "notes"
   | "reminders"
+  | "tasks"
   | "dashboards"
   | "analytics"
   | "graph"
