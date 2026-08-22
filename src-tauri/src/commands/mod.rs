@@ -247,6 +247,14 @@ pub use documents_commands::*;
 mod folders_commands;
 pub use folders_commands::*;
 
+// WORKSPACE HIERARCHY command surface (Projects › Folders › items — the container forest the new
+// sidebar renders, plus its paged item reader). READ-ONLY: no seal, no key, no write. Bound as
+// `workspace_commands` (via `#[path]`) to mirror the sibling modules and avoid colliding with
+// `crate::storage::workspace_store` or any future `workspace` name (E0255).
+#[path = "workspace.rs"]
+mod workspace_commands;
+pub use workspace_commands::*;
+
 // LINKS command surface (the note↔meeting↔document link engine surface — a GATED domain: `list_links`
 // gates BOTH endpoints, `accept_link`/`dismiss_link` gate + refuse behind a lock, `link_items`/
 // `unlink_items` gate both endpoints before any write, `list_link_candidates`/`resolve_wikilink` route
@@ -11659,6 +11667,11 @@ pub(crate) fn session_server_user_id(state: &AppState) -> Result<String, AppErro
 #[cfg(test)]
 #[path = "tests/lock_read_gate_tests.rs"]
 mod lock_read_gate_tests;
+
+// ── Workspace hierarchy read surface: the container forest, its per-kind groups, and the gate ─────
+#[cfg(test)]
+#[path = "tests/workspace_tree_tests.rs"]
+mod workspace_tree_tests;
 
 // ── BLK-1 lifecycle-race + BLK-2 move-into-locked + BLK-3/BLK-4 config tests ──────────────────────
 #[cfg(test)]
