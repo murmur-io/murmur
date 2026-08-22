@@ -87,6 +87,9 @@ pub struct DashboardDetailDto {
     #[serde(flatten)]
     pub dashboard: Dashboard,
     pub tiles: Vec<ResolvedTileDto>,
+    /// Device-private task references resolved from SQLCipher at read time. Tasks never enter the
+    /// dashboard Ask corpus; this is a separate Work projection for navigation and execution.
+    pub work: Vec<super::tasks::TaskDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,13 +635,34 @@ pub fn get_dashboard(state: State<'_, AppState>, id: String) -> Result<Response,
             Ok(ResolvedTileDto { tile, data })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
+    let work = dashboard_work_inner(state.inner(), &id)?;
     let payload = Some(DashboardDetailDto {
         dashboard,
         tiles: resolved,
+        work,
     });
     serde_json::to_string(&payload)
         .map(Response::new)
         .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
+}
+
+pub(crate) fn dashboard_work_inner(
+    state: &AppState,
+    dashboard_id: &str,
+) -> Result<Vec<super::tasks::TaskDto>, AppError> {
+    let task_org_ids = state.db.dashboard_task_org_ids(dashboard_id)?;
+    if task_org_ids.is_empty() || super::session_server_user_id(state).is_err() {
+        return Ok(Vec::new());
+    }
+    for org_id in task_org_ids {
+        super::tasks::require_task_read_context(state, &org_id)?;
+    }
+    state
+        .db
+        .dashboard_task_rows(dashboard_id)?
+        .into_iter()
+        .map(|row| super::tasks::task_dto(state, row))
+        .collect()
 }
 
 /// Could this tile's payload NOT be fully resolved for the current session?
@@ -1814,8 +1838,7 @@ pub(crate) fn resolve_tile(
                 ask_dispatch_generation,
                 match &preflight.answer {
                     LivingAnswerCacheState::Valid {
-                        context_generation,
-                        ..
+                        context_generation, ..
                     } => *context_generation,
                     LivingAnswerCacheState::Empty | LivingAnswerCacheState::Malformed => -1,
                 },

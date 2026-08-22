@@ -64,6 +64,27 @@ export const routes: Routes = [
           ),
       },
       {
+        path: "tasks",
+        loadComponent: () =>
+          import("./features/tasks/task-view/task-view.component").then(
+            (m) => m.TaskViewComponent,
+          ),
+      },
+      {
+        path: "tasks/new",
+        loadComponent: () =>
+          import("./features/tasks/task-view/task-view.component").then(
+            (m) => m.TaskViewComponent,
+          ),
+      },
+      {
+        path: "tasks/:id",
+        loadComponent: () =>
+          import("./features/tasks/task-view/task-view.component").then(
+            (m) => m.TaskViewComponent,
+          ),
+      },
+      {
         // Dashboards — the boards LIST. Deliberately NOT in
         // `TabRouteReuseStrategy`'s scope: a list route must be destroyed and
         // recreated so it always refetches, and its rows live in the root

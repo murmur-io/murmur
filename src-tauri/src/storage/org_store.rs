@@ -136,27 +136,32 @@ impl Db {
             "INSERT INTO org_share_closures(scope_kind,scope_id,phase,created_at)
              VALUES(?1,?2,'closing',?3)
              ON CONFLICT(scope_kind,scope_id) DO NOTHING",
-            rusqlite::params![source_kind,source_id,chrono::Utc::now().to_rfc3339()],
-        ).map_err(map_err)?;
+            rusqlite::params![source_kind, source_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
     pub(crate) fn begin_org_folder_closure(&self, folder_id: &str) -> Result<bool> {
         let conn = self.lock();
-        let changed = conn.execute(
-            "INSERT INTO org_share_closures(scope_kind,scope_id,phase,created_at)
+        let changed = conn
+            .execute(
+                "INSERT INTO org_share_closures(scope_kind,scope_id,phase,created_at)
              VALUES('folder',?1,'closing',?2)
              ON CONFLICT(scope_kind,scope_id) DO NOTHING",
-            rusqlite::params![folder_id,chrono::Utc::now().to_rfc3339()],
-        ).map_err(map_err)?;
+                rusqlite::params![folder_id, chrono::Utc::now().to_rfc3339()],
+            )
+            .map_err(map_err)?;
         Ok(changed == 1)
     }
 
     pub(crate) fn clear_org_folder_closure(&self, folder_id: &str) -> Result<()> {
-        self.lock().execute(
-            "DELETE FROM org_share_closures WHERE scope_kind='folder' AND scope_id=?1",
-            [folder_id],
-        ).map_err(map_err)?;
+        self.lock()
+            .execute(
+                "DELETE FROM org_share_closures WHERE scope_kind='folder' AND scope_id=?1",
+                [folder_id],
+            )
+            .map_err(map_err)?;
         Ok(())
     }
 
@@ -181,11 +186,13 @@ impl Db {
     }
 
     pub(crate) fn complete_org_closure(&self, scope_kind: &str, scope_id: &str) -> Result<()> {
-        self.lock().execute(
-            "UPDATE org_share_closures SET phase='closed'
+        self.lock()
+            .execute(
+                "UPDATE org_share_closures SET phase='closed'
               WHERE scope_kind=?1 AND scope_id=?2",
-            rusqlite::params![scope_kind,scope_id],
-        ).map_err(map_err)?;
+                rusqlite::params![scope_kind, scope_id],
+            )
+            .map_err(map_err)?;
         Ok(())
     }
 
@@ -636,14 +643,7 @@ impl Db {
         if !admissible {
             return Ok(false);
         }
-        insert_share_egress_dispatch_tx(
-            &tx,
-            ts,
-            host,
-            "org_share_access",
-            0,
-            dispatch_id,
-        )?;
+        insert_share_egress_dispatch_tx(&tx, ts, host, "org_share_access", 0, dispatch_id)?;
         tx.execute(
             "INSERT INTO org_access_attempts
               (dispatch_id,org_id,doc_id,old_access,new_access,actor_user_id,owner_user_id,state,created_at)
@@ -969,17 +969,22 @@ impl Db {
             return Ok(Vec::new());
         }
         let conn = self.lock();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {} FROM org_shares
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
               WHERE state != 'revoked'
                 AND ((?1 IS NOT NULL AND meeting_id=?1)
                   OR (?2 IS NOT NULL AND document_id=?2))
               ORDER BY created_at ASC,id ASC",
-            Self::ORG_SHARE_COLS,
-        )).map_err(map_err)?;
-        let rows = stmt.query_map(
-            rusqlite::params![meeting_id,document_id],Self::map_org_share,
-        ).map_err(map_err)?;
+                Self::ORG_SHARE_COLS,
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![meeting_id, document_id],
+                Self::map_org_share,
+            )
+            .map_err(map_err)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(map_err)?);
@@ -1134,22 +1139,44 @@ impl Db {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn acquire_new_org_share_for_source(
-        &self, id: &str, org_id: &str, meeting_id: Option<&str>, document_id: Option<&str>,
-        kind: &str, title: Option<&str>, rev: u32, generation: u32,
-        content_sha256: &[u8], scrub: bool, now: &str,
+        &self,
+        id: &str,
+        org_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+        kind: &str,
+        title: Option<&str>,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        scrub: bool,
+        now: &str,
     ) -> Result<bool> {
         let conn = self.lock();
-        let changed = conn.execute(
-            "INSERT INTO org_shares
+        let changed = conn
+            .execute(
+                "INSERT INTO org_shares
               (id,org_id,meeting_id,document_id,kind,title,rev,generation,content_sha256,
                scrub,state,created_at,updated_at)
              SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11,?11
               WHERE NOT EXISTS(SELECT 1 FROM org_shares
                 WHERE org_id=?2 AND meeting_id IS ?3 AND document_id IS ?4
                   AND state!='revoked')",
-            rusqlite::params![id, org_id, meeting_id, document_id, kind, title, rev as i64,
-                generation as i64, content_sha256, scrub as i64, now],
-        ).map_err(map_err)?;
+                rusqlite::params![
+                    id,
+                    org_id,
+                    meeting_id,
+                    document_id,
+                    kind,
+                    title,
+                    rev as i64,
+                    generation as i64,
+                    content_sha256,
+                    scrub as i64,
+                    now
+                ],
+            )
+            .map_err(map_err)?;
         Ok(changed == 1)
     }
 
@@ -1237,7 +1264,10 @@ impl Db {
         .map_err(map_err)
     }
 
-    pub(crate) fn complete_source_less_projection_if_present(&self, share_id: &str) -> Result<bool> {
+    pub(crate) fn complete_source_less_projection_if_present(
+        &self,
+        share_id: &str,
+    ) -> Result<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         let changed = tx.execute(
@@ -1265,16 +1295,20 @@ impl Db {
         require_stable_uuid(doc_id, "invalid org document id")?;
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        let item_ids: Vec<String> = {
-            let mut stmt = tx.prepare(
+        let item_ids: Vec<String> =
+            {
+                let mut stmt = tx.prepare(
                 "SELECT item_id FROM org_items WHERE org_id=?1 AND doc_id=?2 AND tombstoned=0",
             ).map_err(map_err)?;
-            let rows = stmt.query_map(rusqlite::params![org_id,doc_id], |row| row.get(0))
-                .map_err(map_err)?;
-            let mut ids = Vec::new();
-            for row in rows { ids.push(row.map_err(map_err)?); }
-            ids
-        };
+                let rows = stmt
+                    .query_map(rusqlite::params![org_id, doc_id], |row| row.get(0))
+                    .map_err(map_err)?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    ids.push(row.map_err(map_err)?);
+                }
+                ids
+            };
         let mut evicted = false;
         for item_id in item_ids {
             evicted |= Self::tombstone_org_item_tx(&tx, &item_id)?;
@@ -1284,12 +1318,14 @@ impl Db {
             "UPDATE org_shares SET state='revoked', last_error=NULL, item_id=NULL,
                     dispatch_id=NULL, updated_at=?3
               WHERE org_id=?1 AND doc_id=?2 AND state!='revoked'",
-            rusqlite::params![org_id,doc_id,updated_at],
-        ).map_err(map_err)?;
+            rusqlite::params![org_id, doc_id, updated_at],
+        )
+        .map_err(map_err)?;
         tx.execute(
             "DELETE FROM org_access_attempts WHERE org_id=?1 AND doc_id=?2",
-            rusqlite::params![org_id,doc_id],
-        ).map_err(map_err)?;
+            rusqlite::params![org_id, doc_id],
+        )
+        .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
         Ok(evicted)
     }
@@ -1302,9 +1338,11 @@ impl Db {
         let (kind, id) = match (meeting_id, document_id) {
             (Some(id), None) => ("meeting", id),
             (None, Some(id)) => ("document", id),
-            _ => return Err(crate::error::AppError::InvalidArg(
-                "exactly one org share source is required".into(),
-            )),
+            _ => {
+                return Err(crate::error::AppError::InvalidArg(
+                    "exactly one org share source is required".into(),
+                ))
+            }
         };
         let conn = self.lock();
         conn.query_row(
@@ -1612,7 +1650,14 @@ impl Db {
         author_user_id: Option<&str>,
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
-        let prepared = Self::prepare_org_item_index(title, created_at, markdown, embedder)?;
+        let prepared = if source_kind == Some("task") {
+            PreparedOrgItemIndex {
+                chunks: Vec::new(),
+                vector_blobs: None,
+            }
+        } else {
+            Self::prepare_org_item_index(title, created_at, markdown, embedder)?
+        };
 
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
@@ -1654,6 +1699,25 @@ impl Db {
             chunks,
             vector_blobs,
         })
+    }
+
+    /// Tasks deliberately never enter Brain/Ask retrieval. They retain an `org_items` lineage row
+    /// for permissions and stable-document recovery, but their structured JSON receives no chunks,
+    /// FTS rows, or embeddings.
+    pub(crate) fn prepare_org_item_index_for_kind(
+        kind: crate::share::org_envelope::OrgItemKind,
+        title: &str,
+        created_at: &str,
+        markdown: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<PreparedOrgItemIndex> {
+        if kind == crate::share::org_envelope::OrgItemKind::Task {
+            return Ok(PreparedOrgItemIndex {
+                chunks: Vec::new(),
+                vector_blobs: None,
+            });
+        }
+        Self::prepare_org_item_index(title, created_at, markdown, embedder)
     }
 
     /// Embed + quantize outside the SQLite transaction / background commit lease. The vec0 write
@@ -1839,6 +1903,21 @@ impl Db {
         }
         let current_reduced =
             Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+        if source_kind == Some("task") {
+            Self::upsert_org_task_projection_tx(
+                &tx,
+                item_id,
+                org_id,
+                doc_id,
+                markdown,
+                access,
+                author_user_id,
+                document_owner_user_id,
+                rev,
+                generation,
+                seq,
+            )?;
+        }
 
         let superseded_evicted = match superseded_item_id.filter(|old| *old != item_id) {
             Some(old_item_id) => Self::tombstone_org_item_tx(&tx, old_item_id)?,
@@ -2028,6 +2107,21 @@ impl Db {
         )?;
         let current_reduced =
             Self::set_org_item_current_tx(&tx, projection.item_id, org_id, Some(doc_id), true)?;
+        if projection.source_kind == Some("task") {
+            Self::upsert_org_task_projection_tx(
+                &tx,
+                projection.item_id,
+                org_id,
+                Some(doc_id),
+                projection.markdown,
+                access,
+                projection.author_user_id,
+                Some(document_owner_user_id),
+                rev,
+                generation,
+                projection.seq,
+            )?;
+        }
 
         let older_ids: Vec<String> = {
             let mut stmt = tx
@@ -2072,7 +2166,8 @@ impl Db {
                 document_owner_user_id, chrono::Utc::now().to_rfc3339(),
                 expected_pending_reason, expected_predecessor_item_id],
         ).map_err(map_err)?;
-        let still_uploaded: bool = tx.query_row(
+        let still_uploaded: bool = tx
+            .query_row(
                 "SELECT EXISTS(SELECT 1 FROM org_shares WHERE id=?1 AND state='uploaded'
                   AND last_error IS NULL AND item_id=?2 AND doc_id=?3 AND access=?4 AND rev=?5
                   AND generation=?6 AND content_sha256=?7 AND dispatch_id=?8
@@ -2189,19 +2284,47 @@ impl Db {
         is_current: bool,
     ) -> Result<OrgMetadataCommitOutcome> {
         self.commit_org_feed_item_with_metadata_and_attachments(
-            item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
-            content_sha256, source_kind, author_user_id, prepared, doc_id, access,
-            document_owner_user_id, is_current, &[],
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+            doc_id,
+            access,
+            document_owner_user_id,
+            is_current,
+            &[],
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_org_feed_item_with_metadata_and_attachments(
-        &self, item_id: &str, org_id: &str, seq: u64, author_hint: &str, title: &str,
-        markdown: &str, created_at: &str, rev: u32, generation: u32,
-        content_sha256: &[u8], source_kind: Option<&str>, author_user_id: Option<&str>,
-        prepared: &PreparedOrgItemIndex, doc_id: Option<&str>, access: &str,
-        document_owner_user_id: Option<&str>, is_current: bool,
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+        is_current: bool,
         attachments: &[crate::storage::IncomingAttachment],
     ) -> Result<OrgMetadataCommitOutcome> {
         if let Some(doc_id) = doc_id {
@@ -2234,37 +2357,52 @@ impl Db {
                 // The cursor may have committed before the authenticated attachment bundle in a
                 // legacy build. Repair the whole projection below without moving the cursor.
             } else {
-            if doc_id.is_some() || document_owner_user_id.is_some() || access != "view" {
-                Self::set_org_item_document_metadata_tx(
+                if doc_id.is_some() || document_owner_user_id.is_some() || access != "view" {
+                    Self::set_org_item_document_metadata_tx(
+                        &tx,
+                        item_id,
+                        doc_id,
+                        access,
+                        document_owner_user_id,
+                    )?;
+                }
+                let visibility_reduced =
+                    Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+                if source_kind == Some("task") {
+                    Self::upsert_org_task_projection_tx(
+                        &tx,
+                        item_id,
+                        org_id,
+                        doc_id,
+                        markdown,
+                        access,
+                        author_user_id,
+                        document_owner_user_id,
+                        rev,
+                        generation,
+                        seq,
+                    )?;
+                }
+                Self::close_projection_pending_for_item_tx(
                     &tx,
                     item_id,
+                    org_id,
                     doc_id,
                     access,
+                    rev,
+                    generation,
+                    content_sha256,
+                    author_user_id,
                     document_owner_user_id,
                 )?;
-            }
-            let visibility_reduced =
-                Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
-            Self::close_projection_pending_for_item_tx(
-                &tx,
-                item_id,
-                org_id,
-                doc_id,
-                access,
-                rev,
-                generation,
-                content_sha256,
-                author_user_id,
-                document_owner_user_id,
-            )?;
-            if visibility_reduced {
-                Self::purge_all_ask_conversations_tx(&tx)?;
-            }
-            tx.commit().map_err(map_err)?;
-            return Ok(OrgMetadataCommitOutcome {
-                changed: false,
-                visibility_reduced,
-            });
+                if visibility_reduced {
+                    Self::purge_all_ask_conversations_tx(&tx)?;
+                }
+                tx.commit().map_err(map_err)?;
+                return Ok(OrgMetadataCommitOutcome {
+                    changed: false,
+                    visibility_reduced,
+                });
             }
         }
         // Tombstones are permanent for an append-only item id. Even a malformed/malicious later live
@@ -2310,6 +2448,21 @@ impl Db {
         }
         let visibility_reduced =
             Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+        if source_kind == Some("task") {
+            Self::upsert_org_task_projection_tx(
+                &tx,
+                item_id,
+                org_id,
+                doc_id,
+                markdown,
+                access,
+                author_user_id,
+                document_owner_user_id,
+                rev,
+                generation,
+                seq,
+            )?;
+        }
         Self::close_projection_pending_for_item_tx(
             &tx,
             item_id,
@@ -2413,8 +2566,11 @@ impl Db {
         attachments: &[crate::storage::IncomingAttachment],
         content_sha256: &[u8],
     ) -> Result<()> {
-        tx.execute("DELETE FROM note_attachments WHERE org_item_id=?1", [item_id])
-            .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM note_attachments WHERE org_item_id=?1",
+            [item_id],
+        )
+        .map_err(map_err)?;
         let created_at = chrono::Utc::now().timestamp_millis();
         for attachment in attachments {
             tx.execute(
@@ -2422,18 +2578,29 @@ impl Db {
                   (id,document_id,meeting_id,provider_id,org_item_id,mime_type,extension,
                    byte_len,width,height,sha256,data,data_blob,exported_path,created_at)
                  VALUES(?1,NULL,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL,?10)",
-                rusqlite::params![attachment.id, item_id, attachment.mime_type,
-                    attachment.extension, i64::try_from(attachment.data.len()).map_err(|_| {
+                rusqlite::params![
+                    attachment.id,
+                    item_id,
+                    attachment.mime_type,
+                    attachment.extension,
+                    i64::try_from(attachment.data.len()).map_err(|_| {
                         crate::error::AppError::InvalidArg("image is too large".into())
-                    })?, i64::from(attachment.width), i64::from(attachment.height),
-                    attachment.sha256.as_slice(), attachment.data, created_at],
-            ).map_err(map_err)?;
+                    })?,
+                    i64::from(attachment.width),
+                    i64::from(attachment.height),
+                    attachment.sha256.as_slice(),
+                    attachment.data,
+                    created_at
+                ],
+            )
+            .map_err(map_err)?;
         }
         tx.execute(
             "UPDATE org_items SET projection_sha256=?2
               WHERE item_id=?1 AND tombstoned=0",
             rusqlite::params![item_id, content_sha256],
-        ).map_err(map_err)?;
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -2538,13 +2705,15 @@ impl Db {
             "UPDATE org_shares SET last_error='org_edit_conflict',updated_at=?2
               WHERE state='failed' AND last_error='projection_pending' AND item_id=?1 AND org_id=?3
                 AND (meeting_id IS NOT NULL OR document_id IS NOT NULL)",
-            rusqlite::params![item_id,now,org_id],
-        ).map_err(map_err)?;
+            rusqlite::params![item_id, now, org_id],
+        )
+        .map_err(map_err)?;
         tx.execute(
             "DELETE FROM org_shares WHERE state='failed' AND last_error='projection_pending'
               AND item_id=?1 AND org_id=?2 AND meeting_id IS NULL AND document_id IS NULL",
-            rusqlite::params![item_id,org_id],
-        ).map_err(map_err)?;
+            rusqlite::params![item_id, org_id],
+        )
+        .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
         Ok((true, evicted))
     }
@@ -2646,6 +2815,7 @@ impl Db {
         // image BLOBs of a revoked item survived forever. Purged inside the same transaction as the
         // text so no reader can ever observe one half of the eviction.
         Self::purge_org_item_attachments_tx(tx, item_id)?;
+        Self::delete_org_task_projection_tx(tx, item_id)?;
         tx.execute(
             "UPDATE org_items SET tombstoned = 1, markdown = '', title = '',
                  projection_sha256 = NULL WHERE item_id = ?1",
@@ -2732,6 +2902,14 @@ impl Db {
             rusqlite::params![org_id],
         )
         .map_err(map_err)?;
+        // Task plaintext and its device-private references live in their own projection rather than
+        // `org_chunks`. Purge them in this same membership-withdrawal transaction; the refs follow
+        // through `ON DELETE CASCADE`, so list/detail/Dashboard Work cannot retain a stale copy.
+        tx.execute(
+            "DELETE FROM org_tasks WHERE org_id = ?1",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
         // Finally the item headers (the decrypted markdown/title replica).
         let items = tx
             .execute(
@@ -2787,6 +2965,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.tombstoned = 0
+                    AND COALESCE(oi.source_kind, '') != 'task'
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND (?1 IS NULL OR oi.item_id > ?1)
                     AND EXISTS (SELECT 1 FROM org_chunks oc WHERE oc.item_id = oi.item_id)
@@ -2853,6 +3032,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.tombstoned = 0
+                    AND COALESCE(oi.source_kind, '') != 'task'
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND (?1 IS NULL OR oi.item_id > ?1)
                     AND EXISTS (
@@ -2925,6 +3105,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.item_id = ?1 AND oi.tombstoned = 0
+                    AND COALESCE(oi.source_kind, '') != 'task'
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)",
                 rusqlite::params![item_id],
                 |r| {
@@ -2999,6 +3180,7 @@ impl Db {
             .query_row(
                 "SELECT seq, rev, generation, content_sha256
                    FROM org_items WHERE item_id = ?1 AND tombstoned = 0
+                    AND COALESCE(source_kind, '') != 'task'
                     AND (doc_id IS NULL OR is_current = 1)",
                 rusqlite::params![batch.item_id],
                 |r| {
@@ -3259,19 +3441,47 @@ impl Db {
         is_current: bool,
     ) -> Result<OrgMetadataCommitOutcome> {
         self.commit_org_reconcile_item_with_metadata_and_attachments(
-            item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
-            content_sha256, source_kind, author_user_id, prepared, doc_id, access,
-            document_owner_user_id, is_current, &[],
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+            doc_id,
+            access,
+            document_owner_user_id,
+            is_current,
+            &[],
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_org_reconcile_item_with_metadata_and_attachments(
-        &self, item_id: &str, org_id: &str, seq: u64, author_hint: &str, title: &str,
-        markdown: &str, created_at: &str, rev: u32, generation: u32,
-        content_sha256: &[u8], source_kind: Option<&str>, author_user_id: Option<&str>,
-        prepared: &PreparedOrgItemIndex, doc_id: Option<&str>, access: &str,
-        document_owner_user_id: Option<&str>, is_current: bool,
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+        doc_id: Option<&str>,
+        access: &str,
+        document_owner_user_id: Option<&str>,
+        is_current: bool,
         attachments: &[crate::storage::IncomingAttachment],
     ) -> Result<OrgMetadataCommitOutcome> {
         if let Some(doc_id) = doc_id {
@@ -3326,6 +3536,21 @@ impl Db {
         )?;
         let visibility_reduced =
             Self::set_org_item_current_tx(&tx, item_id, org_id, doc_id, is_current)?;
+        if source_kind == Some("task") {
+            Self::upsert_org_task_projection_tx(
+                &tx,
+                item_id,
+                org_id,
+                doc_id,
+                markdown,
+                access,
+                author_user_id,
+                document_owner_user_id,
+                rev,
+                generation,
+                seq,
+            )?;
+        }
         Self::close_projection_pending_for_item_tx(
             &tx,
             item_id,
@@ -3460,6 +3685,7 @@ impl Db {
                JOIN org_items oi ON oi.item_id = oc.item_id
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.tombstoned = 0 AND os.context_enabled = 1
+                AND COALESCE(oi.source_kind, '') != 'task'
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)
               ORDER BY knn.distance ASC, oi.item_id ASC";
         let blob = crate::embed::vec_to_int8_blob(query_vec);
@@ -3521,6 +3747,7 @@ impl Db {
                JOIN org_items oi ON oi.item_id = oc.item_id
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND COALESCE(oi.source_kind, '') != 'task'
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)
               ORDER BY rank ASC, oi.item_id ASC
               LIMIT ?2";
@@ -3592,6 +3819,7 @@ impl Db {
                       WHERE fts_org_chunks MATCH ?
                         AND oi.tombstoned = 0
                         AND os.context_enabled = 1
+                        AND COALESCE(oi.source_kind, '') != 'task'
                         AND (oi.doc_id IS NULL OR oi.is_current = 1)
                       ORDER BY rank ASC, oi.item_id ASC
                       LIMIT ?"
@@ -3661,6 +3889,7 @@ impl Db {
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND COALESCE(oi.source_kind, '') != 'task'
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)",
             rusqlite::params![item_id],
             |r| {
@@ -4053,6 +4282,7 @@ impl Db {
                 "SELECT item_id, doc_id, title, author_hint, created_at, seq, source_kind
                    FROM org_items
                   WHERE org_id = ?1 AND tombstoned = 0
+                    AND COALESCE(source_kind, '') != 'task'
                     AND (doc_id IS NULL OR is_current = 1)
                   ORDER BY seq DESC
                   LIMIT 500",
@@ -4098,6 +4328,7 @@ impl Db {
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND COALESCE(oi.source_kind, '') != 'task'
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)",
             rusqlite::params![org_id],
             |r| r.get::<_, i64>(0),
@@ -4137,6 +4368,7 @@ impl Db {
                    JOIN org_items oi ON oi.item_id = oc.item_id
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.org_id = ?1 AND oi.tombstoned = 0
+                    AND COALESCE(oi.source_kind, '') != 'task'
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND NOT EXISTS (SELECT 1 FROM org_vec_chunks v WHERE v.chunk_id = oc.id)
                   LIMIT ?2",
