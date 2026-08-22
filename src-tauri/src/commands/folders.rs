@@ -82,6 +82,41 @@ pub(crate) fn flatten_projects_for_legacy_tree(
         .collect()
 }
 
+/// Refuse any path-composing operation on a container whose path IS the vault root.
+///
+/// The hierarchy migration gives the default project `path = ''` — the first row in the app's
+/// history whose path is the vault root. Without a refusal, a rename would compose
+/// `fs::rename(<vault>, <vault>/<new name>)` and MOVE THE USER'S ENTIRE VAULT, and a delete would
+/// target the vault directory itself.
+///
+/// `assert_in_vault` deliberately RESOLVES an empty relative path to the vault root — a documented
+/// behaviour with its own test — so the refusal has to happen before a container reaches it. The
+/// complete set of call sites is enumerated below rather than left to each future author to
+/// rediscover; anything added later that composes filesystem work from a container it resolved by id
+/// belongs on that list.
+///
+/// The complete set of places that compose filesystem work from a resolved container's OWN path,
+/// and what each does with the vault-root row:
+///   - `rename_folder_inner` (the subtree `fs::rename`, and `reexport_notes_under_subtree` beneath
+///     it) — refused here, before anything is touched;
+///   - `delete_folder_inner` (`fs::remove_dir`) — refused here;
+///   - `move_note_folder_inner`'s `src`/`dst` — unreachable: it resolves through
+///     `Db::note_folder_by_id`, which excludes any container whose path is the vault root. That
+///     holds however such a row arrived — this migration only ever creates a meeting-kind project
+///     there, but an import could produce a note-kind one, and the resolver refuses both.
+///   - `write_note_to_vault` — takes a NOTE container's path, which is rooted under the note root
+///     and falls back to `"Notes"`, so it is never empty;
+///   - `remove_lock_inner`'s re-export and `move_note_file` — both already map an empty path to
+///     `None`, which correctly means "the vault root" for a note that belongs nowhere else.
+fn refuse_vault_root_container(folder: &Folder) -> Result<(), AppError> {
+    if folder.path.is_empty() {
+        return Err(AppError::InvalidArg(
+            "the workspace root cannot be renamed or deleted".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Assemble `FolderNode` roots (parent_id == None) and recurse children. Sealed-but-session-
 /// unlocked folders carry `unlocked = true`.
 pub(crate) fn build_folder_tree(
@@ -131,6 +166,16 @@ pub fn create_folder(
     name: String,
     parent_id: Option<String>,
 ) -> Result<Folder, AppError> {
+    create_folder_inner(state.inner(), name, parent_id)
+}
+
+/// Inner of [`create_folder`] taking `&AppState`, so the real creation path can be exercised by a
+/// test rather than approximated by calling its name sanitiser directly.
+pub(crate) fn create_folder_inner(
+    state: &AppState,
+    name: String,
+    parent_id: Option<String>,
+) -> Result<Folder, AppError> {
     let clean = crate::summarize::organize::sanitize_folder(&name)
         .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
 
@@ -156,7 +201,7 @@ pub fn create_folder(
 
     // Create the vault subdirectory (best-effort but surfaced): only when a vault is configured.
     // D5: canonicalize + assert the composed dir stays inside the vault root before any mkdir.
-    if let Some(vault) = vault_path(&state) {
+    if let Some(vault) = vault_path(state) {
         let vault_root = std::path::Path::new(&vault);
         let dir = assert_in_vault(vault_root, std::path::Path::new(&rel_path))?;
         std::fs::create_dir_all(&dir)
@@ -223,6 +268,7 @@ pub(crate) fn rename_folder_inner(
         .db
         .folder_by_id(&folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    refuse_vault_root_container(&folder)?;
     ensure_folder_subtree_unlocked(state, &folder_id)?;
     let old_path = folder.path.clone();
 
@@ -415,6 +461,7 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
         .db
         .folder_by_id(&folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    refuse_vault_root_container(&folder)?;
 
     // Refuse a non-empty SUBTREE — never orphan child folders by dangling their parent_id.
     if !state.db.child_folders(&folder_id)?.is_empty() {

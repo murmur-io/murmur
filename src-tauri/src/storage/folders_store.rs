@@ -23,6 +23,10 @@ use crate::error::{AppError, Result};
 use crate::storage::db::{map_err, visibility_clause, Db, RawDocument};
 use crate::storage::models::{Folder, NoteFolder, PropertySchemaField};
 
+/// The name a default project takes when no vault directory is configured to name it after.
+/// Neutral on purpose: it is an ordinary container the user can rename like any other.
+pub(crate) const DEFAULT_PROJECT_NAME: &str = "Workspace";
+
 pub(crate) type MeetingNoteExportRow = (String, String, String, Option<String>);
 pub(crate) type NoteFolderCatalogRow = (NoteFolder, i64, Vec<PropertySchemaField>);
 
@@ -441,11 +445,20 @@ impl Db {
 
     /// A note-folder by id (`kind='note'` enforced), or `None`. Used to gate note-folder ops so a
     /// meeting-folder id can't be driven through a note-folder command.
+    /// A note folder by id.
+    ///
+    /// Excludes any container whose path is the VAULT ROOT. Note folders live under the note root, so
+    /// one at the vault root is not a note folder in any useful sense — and this is the resolution
+    /// point `move_note_folder_inner` goes through before composing `src`/`dst` from a container's own
+    /// path. An empty path resolves to the vault directory itself, so allowing it here would let that
+    /// move relocate the user's whole vault. Refusing at the resolver closes it for every caller of
+    /// this method at once, whatever shape the row arrived in (this migration creates a meeting-kind
+    /// project there, but an import could produce a note-kind one).
     pub fn note_folder_by_id(&self, id: &str) -> Result<Option<NoteFolder>> {
         let conn = self.lock();
         conn.query_row(
             "SELECT id, name, path, parent_id, locked, kind, COALESCE(is_root, 0)
-               FROM folders WHERE id = ?1 AND kind = 'note'",
+               FROM folders WHERE id = ?1 AND kind = 'note' AND path <> ''",
             rusqlite::params![id],
             row_to_note_folder,
         )
@@ -541,6 +554,263 @@ impl Db {
             out.insert(id, kind);
         }
         Ok(out)
+    }
+
+    /// One-time adoption of every existing container into a default PROJECT.
+    ///
+    /// # Why this moves nothing on disk
+    ///
+    /// `folders.path` is a real Obsidian directory and the UNIQUE key `folder_by_path` resolves;
+    /// three columns hold absolute paths derived from it (`notes.exported_path`,
+    /// `documents.exported_path`, the attachment replicas). Re-rooting every container under a
+    /// project would mean moving the user's actual vault directories AND rewriting every stored
+    /// absolute path, across two systems with no shared transaction — and a stale `exported_path`
+    /// means `lock_folder` deletes nothing and the real plaintext survives inside a folder the app
+    /// reports as sealed (the NOTES-2 leak, already paid for). A locked subtree cannot be moved at
+    /// all (`ensure_folder_subtree_unlocked` refuses), so such a migration could not even complete.
+    ///
+    /// The default project therefore takes the vault ROOT as its path — the empty string.
+    /// `create_folder` composes a child path as `parent.path + '/' + name` only when the parent path
+    /// is non-empty, and `assert_in_vault` resolves an empty relative path to the vault root, so
+    /// **every existing container keeps its path byte-identical** and nothing is created, moved or
+    /// removed on disk. `path` being UNIQUE is exactly right: only one row may be the vault root.
+    ///
+    /// # Why the guard is "no project exists" rather than a flag
+    ///
+    /// A flag records that the migration RAN; the check below records that its RESULT is present. If
+    /// a user later deletes their last project, a flag would leave every container orphaned with no
+    /// parent and no project, and they would vanish from the tree with nothing to repair them. This
+    /// form self-heals, and it is equally idempotent: with any project present it is a no-op. It is
+    /// also what lets the migration DECLINE to adopt (below) and simply retry on the next launch.
+    ///
+    /// # What it never touches
+    ///
+    /// No `path`, no `locked`, no `wrapped_key`, no `*_blob`, and no system container — not written,
+    /// not read. A database with sealed containers migrates with no key and no biometric prompt. The
+    /// whole adoption inherits `Db::migrate`'s transaction, so a crash leaves a database either
+    /// wholly adopted or untouched.
+    pub(crate) fn migrate_hierarchy_v1(conn: &rusqlite::Connection) -> Result<()> {
+        // Same exclusion the adoption itself uses: a machine-owned container is never adopted, so it
+        // must not count as an orphan either — otherwise its mere presence would make every database
+        // look incomplete forever.
+        const NOT_SYSTEM: &str = "COALESCE(kind, 'meeting') IN ('meeting', 'note')
+             AND COALESCE(path, '') <> '.murmur'
+             AND COALESCE(path, '') NOT LIKE '.murmur/%'";
+        // Completion is recognised from the FULL result, not from a fragment of it: a meeting-kind
+        // container at project level occupying the vault root, AND no eligible container still
+        // sitting outside it. The shape alone is not enough — an import or a manual edit can produce
+        // exactly that row while leaving other containers unadopted, and treating it as done would
+        // report a database complete while its containers stayed orphaned, on this launch and every
+        // later one.
+        //
+        // A partial result cannot come from this function: the adoption below runs inside its own
+        // savepoint. So a project WITH orphans beside it is an occupant, and takes the same decline
+        // path as any other occupant — no writes, and a later launch retries once the vault root is
+        // free. Since `path` is UNIQUE, requiring `path = ''` bounds the project half to one row.
+        let project_at_root: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM folders
+                    WHERE COALESCE(level, 'folder') = 'project'
+                      AND path = ''
+                      AND COALESCE(kind, 'meeting') = 'meeting')",
+                [],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        let orphans_remain: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM folders
+                        WHERE parent_id IS NULL AND path <> '' AND {NOT_SYSTEM})"
+                ),
+                [],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if project_at_root && !orphans_remain {
+            return Ok(());
+        }
+        conn.execute_batch("SAVEPOINT hierarchy_v1")
+            .map_err(map_err)?;
+        let outcome = Self::adopt_containers_into_default_project(conn);
+        match &outcome {
+            Ok(()) => conn.execute_batch("RELEASE hierarchy_v1"),
+            // Roll the whole adoption back, then release the savepoint so the enclosing migration
+            // transaction is left exactly as it was found.
+            Err(_) => conn.execute_batch("ROLLBACK TO hierarchy_v1; RELEASE hierarchy_v1"),
+        }
+        .map_err(map_err)?;
+        outcome
+    }
+
+    /// The adoption itself, always called inside [`Db::migrate_hierarchy_v1`]'s savepoint.
+    fn adopt_containers_into_default_project(conn: &rusqlite::Connection) -> Result<()> {
+        // A SAVEPOINT, not a transaction: `Db::migrate` already runs every step inside one, so a
+        // nested BEGIN would simply fail — but the adoption below is four separate writes, and its
+        // completion guard is RESULT-based, so a failure after the project row exists and before the
+        // re-parent passes would leave containers orphaned AND make every later launch short-circuit
+        // at the guard with nothing to repair them. Owning the boundary here makes "either wholly
+        // adopted or untouched" a property of this function rather than an inherited assumption.
+
+        // Every statement below carries this. A system container must be neither adopted, nor
+        // re-parented, nor re-levelled, nor even READ — the reserved container is guarded by
+        // RAISE(ABORT) triggers and this runs inside `migrate()`, before any content surface, so a
+        // write against it is not untidiness but a failure to START the app.
+        //
+        // `COALESCE(path, '')` because `path NOT LIKE …` evaluates to NULL for a NULL path, which
+        // would silently drop such a row from adoption with no statement of intent; and the prefix
+        // guard covers the reserved directory ITSELF as well as its descendants.
+        const NOT_SYSTEM: &str = "COALESCE(kind, 'meeting') IN ('meeting', 'note')
+             AND COALESCE(path, '') <> '.murmur'
+             AND COALESCE(path, '') NOT LIKE '.murmur/%'";
+
+        // ── the vault-root slot ──────────────────────────────────────────────────────────────────
+        //
+        // Exactly one row may hold `path = ''` (UNIQUE), so if something already occupies it, either
+        // that row becomes the project or there is no project this run.
+        // ── the vault-root slot ─────────────────────────────────────────────────────────────────
+        //
+        // Exactly one row may hold `path = ''` (UNIQUE), so if anything already occupies it there is
+        // nowhere to put the project. This DECLINES rather than promoting the occupant, and rather
+        // than aborting.
+        //
+        // Not promoting is the point. Promotion looked harmless — it is a user's own container, and
+        // the level does not affect gating — but it produced a row that is a project AND carries the
+        // occupant's kind and contents, and two things then followed from that. The legacy-tree shim
+        // hides project rows, so a promoted container and everything filed in it would vanish from
+        // the shipped sidebar, which is exactly what the compatibility shim exists to prevent. And a
+        // promoted note-kind row is a note folder at the vault root, which the note-folder move
+        // resolves and would then compose filesystem work from — against the vault root itself.
+        // Declining removes both, and keeps every project this migration produces a freshly created
+        // meeting-kind row, which is what the rest of the safety argument assumes.
+        //
+        // Aborting is not an option either: this runs inside `migrate()`, before any content surface,
+        // so an abort is a failure to START the app. Declining completes: the legacy shim keeps the
+        // shipped sidebar rendering exactly what it renders today, and because completion is
+        // recognised from the RESULT rather than a flag, a later launch adopts as soon as the slot is
+        // free.
+        //
+        // `path = ''` exactly, never `COALESCE(path, '')`: a UNIQUE index does not de-duplicate NULLs,
+        // so a NULL-path row could coexist with a genuine one and be picked by the planner.
+        //
+        // No shipped creation path can produce a container at the vault root — the single name
+        // sanitiser both container kinds use refuses everything that reduces to an empty component —
+        // so this branch is defensive against an import or a manual edit, not a supported flow. See
+        // `no_creation_path_can_produce_a_vault_root_container`.
+        let occupied: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM folders WHERE path = '')",
+                [],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if occupied {
+            tracing::warn!(
+                target: "storage",
+                "the vault root is already occupied; leaving the hierarchy un-adopted"
+            );
+            return Ok(());
+        }
+
+        // Named after the vault directory when one is configured; on a fresh database none is, and a
+        // neutral name is used. The user can rename it like any container.
+        let vault: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'vault_path'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let name = vault
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .and_then(|v| std::path::Path::new(v).file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_PROJECT_NAME.to_string());
+        let project_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO folders
+               (id, name, path, parent_id, locked, wrapped_key, created_at, kind, level)
+             VALUES (?1, ?2, '', NULL, 0, NULL, ?3, 'meeting', 'project')",
+            rusqlite::params![project_id, name, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(map_err)?;
+
+        // ── note containers go under the note root their PATH is actually stamped under ──────────
+        //
+        // `create_note_folder_inner` stamps every note container's path under a note root while
+        // leaving its parent link NULL, so the parent tree and the path tree disagree for every one
+        // of them today. `rename_folder_inner` recomposes a container's path from its CURRENT
+        // parent, so adopting them straight into the project would make the next rename silently
+        // relocate the real vault directory — leaving `exported_path` stale, which is the named
+        // sealed-content leak: the seal deletes the plaintext `.md` at the recorded path, so it
+        // deletes nothing and the real file survives inside a sealed folder.
+        //
+        // Choosing the root by `is_root` alone is not enough. `ensure_notes_root` deliberately
+        // creates a SEPARATE root when the existing one is locked (its "Inbox N" fallback), so a real
+        // database can hold more than one — and picking the wrong one produces exactly the broken
+        // composition described above. So each container is matched to the root whose path composes
+        // ITS path: `container.path == root.path || '/' || container.name`. A container that matches
+        // no root keeps a NULL parent here and is adopted by the project pass below, which is the
+        // safe fallback — its composition is no more broken than it already is today with a NULL
+        // parent, and no vault directory moves either way.
+        const NOTE_ROOT_MATCH: &str = "SELECT r.id FROM folders r
+              WHERE COALESCE(r.is_root, 0) = 1
+                AND COALESCE(r.kind, 'meeting') = 'note'
+                AND COALESCE(r.path, '') <> ''
+                AND COALESCE(r.kind, 'meeting') IN ('meeting', 'note')
+                AND COALESCE(r.path, '') <> '.murmur'
+                AND COALESCE(r.path, '') NOT LIKE '.murmur/%'
+                AND folders.path = r.path || '/' || folders.name
+              ORDER BY r.path, r.id
+              LIMIT 1";
+        conn.execute(
+            &format!(
+                "UPDATE folders
+                    SET parent_id = ({NOTE_ROOT_MATCH})
+                  WHERE parent_id IS NULL
+                    AND id <> ?1
+                    AND COALESCE(is_root, 0) = 0
+                    AND COALESCE(kind, 'meeting') = 'note'
+                    AND {NOT_SYSTEM}
+                    AND EXISTS ({NOTE_ROOT_MATCH})"
+            ),
+            rusqlite::params![project_id],
+        )
+        .map_err(map_err)?;
+
+        // ── everything else that was a root becomes a child of the project ───────────────────────
+        //
+        // Including the note root itself, and any note container the composition match above
+        // declined. Containers that already had a parent keep it: existing depth is preserved.
+        conn.execute(
+            &format!(
+                "UPDATE folders SET parent_id = ?1
+                  WHERE parent_id IS NULL AND id <> ?1 AND {NOT_SYSTEM}"
+            ),
+            rusqlite::params![project_id],
+        )
+        .map_err(map_err)?;
+
+        // Every non-project container states its level explicitly, so the tree never has to infer one
+        // from a NULL parent. Carries the same exclusion as the two statements above: a system row is
+        // inert here only by accident today (its level coalesces out of the predicate), and any future
+        // import that stamped a non-'folder' level on it would turn this into a write against a
+        // trigger-guarded row during startup.
+        conn.execute(
+            &format!(
+                "UPDATE folders SET level = 'folder'
+                  WHERE id <> ?1 AND COALESCE(level, 'folder') <> 'folder' AND {NOT_SYSTEM}"
+            ),
+            rusqlite::params![project_id],
+        )
+        .map_err(map_err)?;
+
+        Ok(())
     }
 
     /// Every folder's hierarchy LEVEL (`"project"` or `"folder"`), keyed by id.
