@@ -149,6 +149,7 @@ fn link_endpoint_sealed_at_rest_tx(
                       JOIN org_state os ON os.org_id = oi.org_id
                      WHERE oi.org_id = ?1 AND oi.doc_id = ?2
                         AND oi.tombstoned = 0 AND oi.is_current = 1
+                        AND COALESCE(oi.source_kind, '') != 'task'
                         AND os.context_enabled = 1
                       LIMIT 1",
                     rusqlite::params![org_id, doc_id],
@@ -423,6 +424,7 @@ impl Db {
                        FROM org_items oi
                        JOIN org_state os ON os.org_id = oi.org_id
                       WHERE oi.tombstoned = 0
+                        AND COALESCE(oi.source_kind, '') != 'task'
                         AND os.context_enabled = 1
                         AND ((oi.doc_id IS NOT NULL AND oi.is_current = 1)
                              OR oi.doc_id IS NULL)
@@ -1395,15 +1397,21 @@ impl Db {
                 )
                 .optional()
                 .map_err(map_err),
-            crate::links::LinkKind::Note | crate::links::LinkKind::Document => tx
-                .query_row(
+            crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
+                let expected_kind = match kind {
+                    crate::links::LinkKind::Note => "note",
+                    crate::links::LinkKind::Document => "document",
+                    crate::links::LinkKind::Meeting | crate::links::LinkKind::Org => unreachable!(),
+                };
+                tx.query_row(
                     "SELECT COALESCE(NULLIF(TRIM(title), ''), name)
-                       FROM documents WHERE id = ?1",
-                    rusqlite::params![id],
+                       FROM documents WHERE id = ?1 AND kind = ?2",
+                    rusqlite::params![id, expected_kind],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(map_err),
+                .map_err(map_err)
+            }
             crate::links::LinkKind::Org => {
                 let Some((org_id, doc_id)) = parse_org_link_id(id) else {
                     return Ok(None);
@@ -1414,6 +1422,7 @@ impl Db {
                        JOIN org_state os ON os.org_id = oi.org_id
                       WHERE oi.org_id = ?1 AND oi.doc_id = ?2
                         AND oi.tombstoned = 0 AND oi.is_current = 1
+                        AND COALESCE(oi.source_kind, '') != 'task'
                         AND os.context_enabled = 1
                       LIMIT 1",
                     rusqlite::params![org_id, doc_id],
@@ -2612,7 +2621,7 @@ impl Db {
                    FROM knn_doc kd JOIN doc_chunks dc ON dc.id = kd.chunk_id
                    JOIN documents d ON d.id = dc.document_id
                    JOIN folders f ON f.id = d.folder_id
-                   WHERE {vis_doc}
+                   WHERE d.kind IN ('note','document') AND {vis_doc}
                    {self_doc_pred}
              ),
              best(kind, id, distance) AS (
@@ -3207,6 +3216,7 @@ impl Db {
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.org_id = ?1 AND oi.doc_id = ?2
                 AND oi.tombstoned = 0 AND oi.is_current = 1 AND os.context_enabled = 1
+                AND COALESCE(oi.source_kind, '') != 'task'
               LIMIT 1",
             rusqlite::params![org_id, doc_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -3226,6 +3236,7 @@ impl Db {
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
+                AND COALESCE(oi.source_kind, '') != 'task'
                 AND oi.doc_id IS NOT NULL AND oi.is_current = 1
               LIMIT 1",
                 rusqlite::params![item_id],

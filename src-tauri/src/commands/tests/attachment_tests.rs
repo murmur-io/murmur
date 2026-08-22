@@ -202,6 +202,247 @@ fn incoming_png(bytes: &[u8], width: u32, height: u32) -> crate::storage::Incomi
     }
 }
 
+fn seed_source_backed_task_attachment_owner(
+    state: &AppState,
+    tag: &str,
+    access: &str,
+) -> (String, String) {
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let doc_id = format!("aaaaaaaa-aaaa-4aaa-8aaa-{tag:0>12}");
+    let source_id = format!("bbbbbbbb-bbbb-4bbb-8bbb-{tag:0>12}");
+    let item_id = format!("cccccccc-cccc-4ccc-8ccc-{tag:0>12}");
+    let share_id = format!("dddddddd-dddd-4ddd-8ddd-{tag:0>12}");
+    state
+        .db
+        .upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.into(),
+            name: "Acme".into(),
+            role: "member".into(),
+            joined_at: "2026-08-21T00:00:00Z".into(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+    *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+        account_id: "viewer@example.com".into(),
+        email: "viewer@example.com".into(),
+        server_user_id: Some("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee".into()),
+        device_id: "device-task-image".into(),
+        mk: Zeroizing::new([7u8; 32]),
+        generation: 1,
+        access_token: "access".into(),
+        access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+        refresh_token: "refresh".into(),
+    });
+    let envelope = crate::share::task_envelope::TaskEnvelope {
+        version: crate::share::task_envelope::TASK_ENVELOPE_VERSION,
+        org_id: org_id.into(),
+        title: "Task image permissions".into(),
+        description: "Source-backed task".into(),
+        status: crate::share::task_envelope::TaskStatus::Todo,
+        due_at: None,
+        assignee_user_id: None,
+        created_at: "2026-08-21T00:00:00Z".into(),
+        subtasks: vec![],
+        org_refs: vec![],
+        images: vec![],
+    };
+    let json = envelope.to_canonical_json(org_id).unwrap();
+    state
+        .db
+        .create_task_source(&source_id, &envelope.title, &json, 1)
+        .unwrap();
+    state
+        .db
+        .insert_org_share(
+            &share_id,
+            org_id,
+            None,
+            Some(&source_id),
+            "task",
+            Some(&envelope.title),
+            1,
+            1,
+            &[4; 32],
+            "2026-08-21T00:00:00Z",
+        )
+        .unwrap();
+    state
+        .db
+        .lock()
+        .execute(
+            "UPDATE org_shares SET doc_id=?2 WHERE id=?1",
+            rusqlite::params![share_id, doc_id],
+        )
+        .unwrap();
+    state
+        .db
+        .set_org_share_uploaded(&share_id, &item_id, "2026-08-21T00:00:01Z")
+        .unwrap();
+    let prepared = Db::prepare_org_item_index_for_kind(
+        crate::share::org_envelope::OrgItemKind::Task,
+        &envelope.title,
+        &envelope.created_at,
+        &json,
+        None,
+    )
+    .unwrap();
+    state
+        .db
+        .commit_local_org_replica_with_metadata(
+            &item_id,
+            org_id,
+            1,
+            "owner",
+            &envelope.title,
+            &json,
+            &envelope.created_at,
+            1,
+            1,
+            &[4; 32],
+            Some("task"),
+            Some("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            &prepared,
+            None,
+            Some(&doc_id),
+            access,
+            Some("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            true,
+        )
+        .unwrap();
+    (source_id, item_id)
+}
+
+#[test]
+fn source_backed_task_images_require_the_live_task_can_edit_permission() {
+    let state = build_state("task-image-permission", None);
+    let (source_id, item_id) =
+        seed_source_backed_task_attachment_owner(&state, "000000000001", "view");
+    let bytes = webp(48, 32);
+
+    assert!(matches!(
+        add_note_attachment_inner(
+            &state,
+            "task",
+            &source_id,
+            "clipboard.webp",
+            "image/webp",
+            &base64url(&bytes),
+        ),
+        Err(AppError::Auth(_))
+    ));
+    assert!(state
+        .db
+        .list_attachments(&AttachmentOwner::Document {
+            document_id: source_id.clone(),
+        })
+        .unwrap()
+        .is_empty());
+
+    state
+        .db
+        .set_org_item_document_metadata(
+            &item_id,
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-000000000001"),
+            "edit",
+            Some("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+        )
+        .unwrap();
+    let added = add_webp(&state, "task", &source_id, &bytes);
+    delete_note_attachment_inner(&state, "task", &source_id, &added.id)
+        .expect("editable source-backed task may delete its image");
+    assert!(state
+        .db
+        .list_attachments(&AttachmentOwner::Document {
+            document_id: source_id,
+        })
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn task_image_bytes_require_live_session_membership_and_context() {
+    let state = build_state("task-image-live-read-gate", None);
+    let org_id = "11111111-1111-4111-8111-111111111111";
+    let (source_id, item_id) =
+        seed_source_backed_task_attachment_owner(&state, "000000000002", "edit");
+    let bytes = webp(40, 24);
+    let added = add_webp(&state, "task", &source_id, &bytes);
+
+    assert_eq!(
+        list_note_attachments_inner(&state, "task", &source_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        list_note_attachments_inner(&state, "org", &item_id)
+            .unwrap()
+            .len(),
+        0,
+        "the projected item has its own attachment namespace"
+    );
+
+    let session = state.account_session.lock().unwrap().take();
+    assert!(list_note_attachments_inner(&state, "task", &source_id).is_err());
+    let source_row = state
+        .db
+        .list_attachments(&AttachmentOwner::Document {
+            document_id: source_id.clone(),
+        })
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == added.id)
+        .unwrap();
+    assert!(plaintext_attachment_data(&state, &source_row).is_err());
+    let render_root = temp_vault("task-image-render-gate");
+    let markdown = format!("![task](murmur-attachment://{})", added.id);
+    assert!(
+        render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            &state,
+            &AttachmentOwner::Document {
+                document_id: source_id.clone(),
+            },
+            &markdown,
+            &render_root,
+        )
+        .is_err()
+    );
+
+    *state.account_session.lock().unwrap() = session;
+    state.db.set_org_context_enabled(org_id, false).unwrap();
+    assert!(list_note_attachments_inner(&state, "task", &source_id).is_err());
+    assert!(
+        render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            &state,
+            &AttachmentOwner::Document {
+                document_id: source_id.clone(),
+            },
+            &markdown,
+            &render_root,
+        )
+        .is_err()
+    );
+
+    state.db.set_org_context_enabled(org_id, true).unwrap();
+    state.db.delete_org_state(org_id).unwrap();
+    assert!(list_note_attachments_inner(&state, "task", &source_id).is_err());
+    assert!(
+        render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            &state,
+            &AttachmentOwner::Document {
+                document_id: source_id,
+            },
+            &markdown,
+            &render_root,
+        )
+        .is_err()
+    );
+    let _ = std::fs::remove_dir_all(render_root);
+}
+
 fn meeting_folder(db: &Db, id: &str) {
     db.insert_folder(&Folder {
         id: id.to_string(),
@@ -294,13 +535,50 @@ fn attachment_export_lock_gate_and_round_trip_are_byte_identical() {
     assert!(sealed.data.is_empty());
     assert!(sealed.data_blob.is_some());
 
+    assert!(matches!(
+        render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            &state, &owner, &markdown, &vault
+        ),
+        Err(AppError::Locked(_))
+    ));
+
     let ck = cache_kek_and_folder_ck(&state, &folder.id);
+    let unseal_root = temp_vault("lock-cycle-authorized-unseal");
+    assert!(matches!(
+        render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            &state,
+            &owner,
+            &markdown,
+            &unseal_root,
+        ),
+        Err(AppError::Locked(_))
+    ));
+    assert!(
+        !unseal_root.join("Murmur Attachments").exists(),
+        "no plaintext asset directory may exist before session unlock admission"
+    );
     unseal_attachments_in_folder(&state, &folder.id, &ck, false).expect("session restore");
     state
         .unlocked_folders
         .lock()
         .expect("unlock set")
         .insert(folder.id.clone());
+    let unsealed_markdown = render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+        &state,
+        &owner,
+        &markdown,
+        &unseal_root,
+    )
+    .expect("session-admitted folder may re-export the image");
+    assert!(unsealed_markdown.contains("![[Murmur Attachments/"));
+    let unsealed_asset = state.db.list_attachments(&owner).expect("unseal row")[0]
+        .exported_path
+        .clone()
+        .expect("session-admitted transition records the re-exported image");
+    assert_eq!(
+        std::fs::read(unsealed_asset).expect("read session-authorized image"),
+        bytes
+    );
     let listed = list_note_attachments_inner(&state, "note", &note_id).expect("gated list");
     assert_eq!(listed.len(), 1);
     assert_eq!(
@@ -318,6 +596,7 @@ fn attachment_export_lock_gate_and_round_trip_are_byte_identical() {
         .data
         .is_empty());
     let _ = std::fs::remove_dir_all(vault);
+    let _ = std::fs::remove_dir_all(unseal_root);
 }
 
 #[test]
@@ -442,6 +721,7 @@ fn relock_all_revokes_visibility_before_reporting_an_edited_attachment_export() 
         .lock()
         .expect("unlock set")
         .insert(folder.id.clone());
+    reexport_notes_in_folder(&state, &folder.id);
 
     let owner = AttachmentOwner::Document {
         document_id: note_id.clone(),
@@ -1021,7 +1301,10 @@ fn locked_folder_png_attachment_seals_and_round_trips_byte_identical() {
 
     lock_folder_inner(&state, folder.id.clone()).expect("lock folder");
     let sealed = &state.db.list_attachments(&owner).expect("sealed row")[0];
-    assert!(sealed.data.is_empty(), "plaintext blanked after verified seal");
+    assert!(
+        sealed.data.is_empty(),
+        "plaintext blanked after verified seal"
+    );
     assert!(sealed.data_blob.is_some(), "recoverable seal retained");
 
     let ck = cache_kek_and_folder_ck(&state, &folder.id);

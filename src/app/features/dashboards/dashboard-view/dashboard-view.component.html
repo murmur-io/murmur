@@ -138,6 +138,32 @@
         (openSource)="openSource($event)"
         (refreshAnswer)="refreshLivingAnswer($event)"
       />
+      @if (work().length > 0) {
+        <section class="work" aria-labelledby="dashboard-work-heading">
+          <header>
+            <div>
+              <span class="eyebrow">This Mac only</span>
+              <h2 id="dashboard-work-heading">Work</h2>
+            </div>
+            <span>{{ work().length }}</span>
+          </header>
+          <div class="work-list">
+            @for (task of work(); track task.id) {
+              <button type="button" class="work-row" (click)="openWork(task.id)">
+                <span class="work-state" [attr.data-status]="task.status"></span>
+                <span>
+                  <strong>{{ task.title }}</strong>
+                  <small>
+                    {{ task.status === "inProgress" ? "In progress" : task.status === "done" ? "Done" : "To do" }}
+                    @if (task.dueAt) { · {{ task.dueAt.slice(0, 10) }} }
+                  </small>
+                </span>
+                <span aria-hidden="true">→</span>
+              </button>
+            }
+          </div>
+        </section>
+      }
     </main>
 
     @if (askOpen()) {

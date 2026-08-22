@@ -63,6 +63,21 @@ pub(crate) fn attachment_aad(
 fn gate_attachment_owner(state: &AppState, owner: &AttachmentOwner) -> Result<(), AppError> {
     match owner {
         AttachmentOwner::Document { document_id } => {
+            if state.db.is_task_source(document_id)? {
+                let org_id = state
+                    .db
+                    .org_task_org_for_source(document_id)?
+                    .ok_or_else(|| AppError::Auth("no visible live task for this image".into()))?;
+                super::tasks::require_task_read_context(state, &org_id)?;
+                if state
+                    .db
+                    .visible_org_task_item_for_source(document_id)?
+                    .is_none()
+                {
+                    return Err(AppError::Auth("no visible live task for this image".into()));
+                }
+                return Ok(());
+            }
             // Resolve only the non-content folder anchor before the read gate. `NoteRow` contains
             // title, Markdown and the exported path; loading it here would surface plaintext from a
             // logically locked row whose interrupted seal cleanup had not blanked those columns yet.
@@ -84,8 +99,17 @@ fn gate_attachment_owner(state: &AppState, owner: &AttachmentOwner) -> Result<()
             }
         }
         AttachmentOwner::OrgItem { item_id } => {
+            if let Some(org_id) = state.db.org_task_org_for_item(item_id)? {
+                super::tasks::require_task_read_context(state, &org_id)?;
+                if !state.db.visible_org_task_for_item(item_id)? {
+                    return Err(AppError::Auth("no visible live task for this image".into()));
+                }
+                return Ok(());
+            }
             // The org store applies both live-item and per-instance context gates in SQL.
-            if state.db.get_org_item(item_id)?.is_none() {
+            if state.db.get_org_item(item_id)?.is_none()
+                && !state.db.visible_org_task_for_item(item_id)?
+            {
                 return Err(AppError::InvalidArg(
                     "no visible live org item for this image".into(),
                 ));
@@ -95,7 +119,54 @@ fn gate_attachment_owner(state: &AppState, owner: &AttachmentOwner) -> Result<()
     Ok(())
 }
 
+fn require_editable_task_attachment_owner(
+    state: &AppState,
+    owner_kind: &str,
+    owner_id: &str,
+) -> Result<(), AppError> {
+    let item_id = match owner_kind {
+        "org" => {
+            let ctx = state.db.org_item_edit_ctx(owner_id)?;
+            if ctx.as_ref().and_then(|ctx| ctx.source_kind.as_deref()) != Some("task") {
+                return Err(AppError::Auth(
+                    "only editable shared tasks accept local image changes".into(),
+                ));
+            }
+            Some(owner_id.to_string())
+        }
+        "task" => state.db.visible_org_task_item_for_source(owner_id)?,
+        _ => return Ok(()),
+    };
+    let Some(item_id) = item_id else {
+        return Err(AppError::Auth(
+            "only editable shared tasks accept local image changes".into(),
+        ));
+    };
+    let org_id = state
+        .db
+        .org_task_org_for_item(&item_id)?
+        .ok_or_else(|| AppError::Auth("no visible live task for this image".into()))?;
+    super::tasks::require_task_read_context(state, &org_id)?;
+    let (can_edit, _) = org_item_permissions(state, &item_id)?;
+    if !can_edit {
+        return Err(AppError::Auth(
+            "only editable shared tasks accept local image changes".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn plaintext_attachment_data(
+    state: &AppState,
+    row: &AttachmentRecord,
+) -> Result<Vec<u8>, AppError> {
+    // Central byte gate: callers may resolve/list an attachment through different surfaces, but no
+    // one may obtain plaintext after Task membership/session/context invalidation.
+    gate_attachment_owner(state, &row.owner)?;
+    plaintext_attachment_data_after_owner_gate(state, row)
+}
+
+fn plaintext_attachment_data_after_owner_gate(
     state: &AppState,
     row: &AttachmentRecord,
 ) -> Result<Vec<u8>, AppError> {
@@ -184,11 +255,7 @@ pub(crate) fn add_note_attachment_inner(
             "encoded image exceeds the size limit".into(),
         ));
     }
-    if owner_kind == "org" {
-        return Err(AppError::InvalidArg(
-            "org images are materialized only by verified share ingest".into(),
-        ));
-    }
+    require_editable_task_attachment_owner(state, owner_kind, owner_id)?;
     let owner = state.db.resolve_attachment_owner(owner_kind, owner_id)?;
     gate_attachment_owner(state, &owner)?;
     let data = decode_base64(data_base64)?;
@@ -294,11 +361,7 @@ pub(crate) fn delete_note_attachment_inner(
     attachment_id: &str,
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
-    if owner_kind == "org" {
-        return Err(AppError::InvalidArg(
-            "org images are removed with their org item".into(),
-        ));
-    }
+    require_editable_task_attachment_owner(state, owner_kind, owner_id)?;
     let owner = state.db.resolve_attachment_owner(owner_kind, owner_id)?;
     gate_attachment_owner(state, &owner)?;
     let row = state
@@ -331,6 +394,54 @@ pub fn attachment_bundle_for_owner(
         .iter()
         .map(|row| {
             let data = plaintext_attachment_data(state, row)?;
+            Ok(AttachmentBundleItem {
+                id: row.id.clone(),
+                mime_type: row.mime_type.clone(),
+                extension: row.extension.clone(),
+                width: row.width,
+                height: row.height,
+                sha256: row.sha256,
+                data,
+            })
+        })
+        .collect()
+}
+
+/// Initial/republish Task egress has already authenticated the actor and resolved the exact target
+/// org, but the first publish has no `org_tasks` projection yet. This narrowly-authorized seam binds
+/// that org witness to a real hidden Task source before reading any image bytes; user-facing reads
+/// must continue through [`attachment_bundle_for_owner`] and its live projection gate.
+pub(crate) fn attachment_bundle_for_task_source_authorized(
+    state: &AppState,
+    owner: &AttachmentOwner,
+    org_id: &str,
+    referenced_ids: &HashSet<String>,
+) -> Result<Vec<AttachmentBundleItem>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    super::tasks::require_task_read_context(state, org_id)?;
+    let AttachmentOwner::Document { document_id } = owner else {
+        return Err(AppError::Auth(
+            "task publish attachment owner is not a task source".into(),
+        ));
+    };
+    if !state.db.is_task_source(document_id)? {
+        return Err(AppError::Auth(
+            "task publish attachment owner is not a task source".into(),
+        ));
+    }
+    if let Some(projected_org_id) = state.db.org_task_org_for_source(document_id)? {
+        if projected_org_id != org_id {
+            return Err(AppError::Auth(
+                "task publish attachment org witness mismatch".into(),
+            ));
+        }
+    }
+    state
+        .db
+        .list_referenced_attachments(owner, referenced_ids)?
+        .iter()
+        .map(|row| {
+            let data = plaintext_attachment_data_after_owner_gate(state, row)?;
             Ok(AttachmentBundleItem {
                 id: row.id.clone(),
                 mime_type: row.mime_type.clone(),
@@ -983,7 +1094,15 @@ pub(crate) fn render_markdown_with_attachments_for_export(
         return Ok(markdown.to_string());
     }
     gate_attachment_owner(state, owner)?;
-    render_markdown_with_attachment_markers(state, owner, markdown, vault_root, markers, true)
+    render_markdown_with_attachment_markers(
+        state,
+        owner,
+        markdown,
+        vault_root,
+        markers,
+        true,
+        AttachmentRenderAuthorization::OwnerGate,
+    )
 }
 
 /// Explicit "Save Markdown…" export. Its image copies are user-owned, just like the selected
@@ -1020,11 +1139,19 @@ pub(crate) fn render_markdown_with_attachments_for_user_export_under_lifecycle_a
         return Ok(markdown.to_string());
     }
     gate_attachment_owner(state, owner)?;
-    render_markdown_with_attachment_markers(state, owner, markdown, export_root, markers, false)
+    render_markdown_with_attachment_markers(
+        state,
+        owner,
+        markdown,
+        export_root,
+        markers,
+        false,
+        AttachmentRenderAuthorization::OwnerGate,
+    )
 }
 
-/// Lock-transition variant. Its caller has already authenticated and decrypted the governing CK;
-/// it exists so the unseal path does not pretend a not-yet-published session gate is authorization.
+/// Ordinary under-lifecycle variant. Holding the lifecycle mutex is not read authorization, so the
+/// renderer still goes through the central attachment-owner gate.
 pub(crate) fn render_markdown_with_attachments_for_export_under_lifecycle_authorized(
     state: &AppState,
     owner: &AttachmentOwner,
@@ -1035,7 +1162,19 @@ pub(crate) fn render_markdown_with_attachments_for_export_under_lifecycle_author
     if markers.is_empty() {
         return Ok(markdown.to_string());
     }
-    render_markdown_with_attachment_markers(state, owner, markdown, vault_root, markers, true)
+    render_markdown_with_attachment_markers(
+        state,
+        owner,
+        markdown,
+        vault_root,
+        markers,
+        true,
+        AttachmentRenderAuthorization::OwnerGate,
+    )
+}
+
+enum AttachmentRenderAuthorization {
+    OwnerGate,
 }
 
 fn render_markdown_with_attachment_markers(
@@ -1045,12 +1184,15 @@ fn render_markdown_with_attachment_markers(
     vault_root: &std::path::Path,
     markers: Vec<AttachmentMarker>,
     tracked: bool,
+    authorization: AttachmentRenderAuthorization,
 ) -> Result<String, AppError> {
     let ids: HashSet<String> = markers.iter().map(|marker| marker.id.clone()).collect();
     let rows = state.db.list_referenced_attachments(owner, &ids)?;
     let mut names = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        let data = plaintext_attachment_data(state, &row)?;
+        let data = match authorization {
+            AttachmentRenderAuthorization::OwnerGate => plaintext_attachment_data(state, &row)?,
+        };
         let name = if tracked {
             ensure_attachment_exported(state, &row, &data, vault_root)?
         } else {
@@ -1524,9 +1666,7 @@ fn reject_png_metadata(data: &[u8]) -> Result<(), AppError> {
         return Err(AppError::InvalidArg("PNG is missing its IEND chunk".into()));
     }
     if offset != data.len() {
-        return Err(AppError::InvalidArg(
-            "trailing bytes after PNG IEND".into(),
-        ));
+        return Err(AppError::InvalidArg("trailing bytes after PNG IEND".into()));
     }
     Ok(())
 }
