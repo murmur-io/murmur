@@ -22,6 +22,17 @@ fn fresh_db(label: &str) -> (Db, std::path::PathBuf) {
     let path = crate::storage::db::unique_temp_path(&format!("murmur-workspace-{label}"), "sqlite");
     let _ = std::fs::remove_file(&path);
     let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    // Opening a database ADOPTS it: the hierarchy migration creates a default project at the vault
+    // root. Undo that here so each test states the exact container shape it is about — otherwise a
+    // test that builds its own project at the vault root collides with the automatic one on the
+    // UNIQUE path, and every fixture would have to work around a row it never asked for. The
+    // migration itself is exercised on purpose by the tests at the end of this file.
+    db.lock()
+        .execute(
+            "DELETE FROM folders WHERE COALESCE(level, 'folder') = 'project'",
+            rusqlite::params![],
+        )
+        .unwrap();
     (db, path)
 }
 
@@ -1078,6 +1089,937 @@ fn the_legacy_folder_tree_is_unchanged_on_a_pre_migration_database() {
         serde_json::to_string(&after).unwrap(),
         "the legacy folder tree changed on a pre-migration database"
     );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── the hierarchy migration ──────────────────────────────────────────────────────────────────────
+//
+// `migrate()` adopts a database the moment it is opened, so a PRE-migration state is modelled by
+// removing the project it created and then driving `migrate_hierarchy_v1` directly. That is the same
+// entry point `migrate()` calls, so these exercise the real migration rather than a re-statement.
+
+/// A database in the shape it had before the hierarchy existed: containers, no project. Identical to
+/// [`fresh_db`], named separately so the migration tests read as what they are.
+fn pre_migration_db(label: &str) -> (Db, std::path::PathBuf) {
+    fresh_db(label)
+}
+
+fn run_migration(db: &Db) {
+    Db::migrate_hierarchy_v1(&db.lock()).unwrap();
+}
+
+/// (id, path, parent_id, level, locked, wrapped_key) — the columns a migration must be able to
+/// prove it did or did not change.
+type FolderRow = (String, String, Option<String>, String, i64, Option<Vec<u8>>);
+
+fn folder_rows(db: &Db) -> Vec<FolderRow> {
+    let conn = db.lock();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, path, parent_id, COALESCE(level, 'folder'), locked, wrapped_key
+               FROM folders ORDER BY id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// Every existing container is adopted, and note containers land under the note root so that path
+/// composition agrees with what is already on disk.
+#[test]
+fn the_migration_adopts_every_existing_container() {
+    let (db, path) = pre_migration_db("adopt");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    container(&db, "f-notes", "Notes", "Notes", None, "folder");
+    container(&db, "f-research", "Research", "Notes/Research", None, "folder");
+    // `execute` runs only the FIRST statement of a batch — use `execute_batch` for both.
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET kind = 'note' WHERE id IN ('f-notes', 'f-research');
+             UPDATE folders SET is_root = 1 WHERE id = 'f-notes';",
+        )
+        .unwrap();
+
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    let project = containers
+        .iter()
+        .find(|c| c.level == "project")
+        .expect("a default project exists");
+    assert!(project.parent_id.is_none());
+
+    let by_id = |id: &str| containers.iter().find(|c| c.id == id).unwrap().clone();
+    assert_eq!(by_id("f-work").parent_id.as_deref(), Some(project.id.as_str()));
+    assert_eq!(by_id("f-notes").parent_id.as_deref(), Some(project.id.as_str()));
+    assert_eq!(
+        by_id("f-research").parent_id.as_deref(),
+        Some("f-notes"),
+        "a note container is adopted under the note root, so parent.path + name == its own path"
+    );
+    assert!(by_id("f-notes").is_root, "the note root keeps its flag");
+    for id in ["f-work", "f-notes", "f-research"] {
+        assert_eq!(by_id(id).level, "folder");
+    }
+
+    // And the tree now renders as a single forest rooted at the project.
+    let forest = tree(&db, &HashSet::new());
+    assert_eq!(forest.len(), 1);
+    assert_eq!(forest[0].id, project.id);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The migration moves nothing on disk: no `path` and no `exported_path` changes.
+///
+/// This is the property the whole design exists to preserve. `folders.path` is a real vault
+/// directory and `notes.exported_path` is where `lock_folder` goes to delete a plaintext `.md`; a
+/// rewritten path with an unmoved file (or the reverse) is the NOTES-2 sealed-content leak.
+#[test]
+fn the_migration_moves_no_path_and_no_export() {
+    let (db, path) = pre_migration_db("no-move");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    container(&db, "f-pl", "Sprzedaż", "Sprzedaż", None, "folder");
+    meeting_in(&db, "m1", "Standup", "2026-08-20T09:00:00Z", Some("f-work"));
+    db.lock()
+        .execute(
+            "UPDATE notes SET exported_path = '/vault/Work/Standup.md' WHERE meeting_id = 'm1'",
+            rusqlite::params![],
+        )
+        .unwrap();
+    note_in(&db, "d1", "Oferta", "f-pl", 1_700_000_000_000);
+    db.lock()
+        .execute(
+            "UPDATE documents SET exported_path = '/vault/Sprzedaż/Oferta.md' WHERE id = 'd1'",
+            rusqlite::params![],
+        )
+        .unwrap();
+
+    let paths_before: Vec<(String, String)> = folder_rows(&db)
+        .into_iter()
+        .map(|(id, p, _, _, _, _)| (id, p))
+        .collect();
+    let exports_before: Vec<String> = {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT exported_path FROM notes WHERE exported_path IS NOT NULL
+                 UNION ALL
+                 SELECT exported_path FROM documents WHERE exported_path IS NOT NULL",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        let mut v: Vec<String> = rows.map(|r| r.unwrap()).collect();
+        v.sort();
+        v
+    };
+
+    run_migration(&db);
+
+    let paths_after: Vec<(String, String)> = folder_rows(&db)
+        .into_iter()
+        .filter(|(_, _, _, level, _, _)| level != "project")
+        .map(|(id, p, _, _, _, _)| (id, p))
+        .collect();
+    assert_eq!(
+        paths_before, paths_after,
+        "a container path changed — the vault directory it names did not"
+    );
+
+    let exports_after: Vec<String> = {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT exported_path FROM notes WHERE exported_path IS NOT NULL
+                 UNION ALL
+                 SELECT exported_path FROM documents WHERE exported_path IS NOT NULL",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        let mut v: Vec<String> = rows.map(|r| r.unwrap()).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        exports_before, exports_after,
+        "an exported .md path changed — the seal would delete nothing there"
+    );
+
+    // The project itself sits at the vault root, which is what makes all of the above possible.
+    let project = db
+        .list_containers()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.level == "project")
+        .unwrap();
+    let project_path: String = db
+        .lock()
+        .query_row(
+            "SELECT path FROM folders WHERE id = ?1",
+            rusqlite::params![project.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(project_path, "", "the default project IS the vault root");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Running it again changes nothing — including after a full re-open, which is how it runs for real.
+#[test]
+fn the_migration_is_idempotent() {
+    let (db, path) = pre_migration_db("idempotent-migration");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    container(&db, "f-notes", "Notes", "Notes", None, "folder");
+    db.lock()
+        .execute(
+            "UPDATE folders SET kind = 'note', is_root = 1 WHERE id = 'f-notes'",
+            rusqlite::params![],
+        )
+        .unwrap();
+
+    run_migration(&db);
+    let once = folder_rows(&db);
+    run_migration(&db);
+    assert_eq!(once, folder_rows(&db), "a second run changed a row");
+
+    // Re-opening runs the whole of migrate() again on an adopted database.
+    drop(db);
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    assert_eq!(once, folder_rows(&db), "re-opening changed a row");
+    assert_eq!(
+        db.list_containers()
+            .unwrap()
+            .iter()
+            .filter(|c| c.level == "project")
+            .count(),
+        1,
+        "a second project was created"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A system container is not adopted, not re-parented, and not read.
+///
+/// This is a launch-safety property, not tidiness: an in-flight feature owns a container whose row
+/// and children are guarded by RAISE(ABORT) triggers, and this migration runs before any content
+/// surface comes up — so a blanket re-parent would be a failure to START the app.
+#[test]
+fn the_migration_leaves_a_system_container_alone() {
+    let (db, path) = pre_migration_db("system-untouched");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    container(&db, "sys", "tasks", ".murmur/tasks", None, "folder");
+    db.lock()
+        .execute(
+            "UPDATE folders SET kind = 'task' WHERE id = 'sys'",
+            rusqlite::params![],
+        )
+        .unwrap();
+
+    run_migration(&db);
+
+    let (parent, level): (Option<String>, String) = db
+        .lock()
+        .query_row(
+            "SELECT parent_id, COALESCE(level, 'folder') FROM folders WHERE id = 'sys'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(parent.is_none(), "the system container was re-parented");
+    assert_eq!(level, "folder", "the system container was re-levelled");
+    assert!(db.list_containers().unwrap().iter().all(|c| c.id != "sys"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The migration never WRITES a container's sealed flag or wrapped key.
+///
+/// This is the narrow column-level claim; that a real seal still opens after adoption — the property
+/// that actually matters, since the content is only recoverable through the key those columns
+/// describe — is proven separately by
+/// `lifecycle_tests::a_real_seal_survives_adoption_and_still_unseals_byte_identical`, which seals
+/// through the ordinary lock path with real key material and unseals afterwards.
+#[test]
+fn the_migration_touches_no_lock_state() {
+    let (db, path) = pre_migration_db("sealed-migration");
+    container(&db, "f-locked", "Legal", "Legal", None, "folder");
+    seal(&db, "f-locked");
+    db.lock()
+        .execute(
+            "UPDATE folders SET wrapped_key = X'DEADBEEF' WHERE id = 'f-locked'",
+            rusqlite::params![],
+        )
+        .unwrap();
+
+    let before: (i64, Option<Vec<u8>>) = db
+        .lock()
+        .query_row(
+            "SELECT locked, wrapped_key FROM folders WHERE id = 'f-locked'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    run_migration(&db);
+
+    let after: (i64, Option<Vec<u8>>) = db
+        .lock()
+        .query_row(
+            "SELECT locked, wrapped_key FROM folders WHERE id = 'f-locked'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(before, after, "the migration touched a sealed container's key");
+    assert_eq!(before.0, 1);
+
+    // It is adopted like any other container, and still reports itself sealed.
+    let sealed = db
+        .list_containers()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == "f-locked")
+        .unwrap();
+    assert!(sealed.parent_id.is_some());
+    assert!(sealed.locked);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The default project is named after the vault directory when one is configured.
+#[test]
+fn the_default_project_takes_the_vault_directory_name() {
+    let (db, path) = pre_migration_db("vault-name");
+    db.lock()
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('vault_path', '/Users/x/Obsidian/Second Brain')",
+            rusqlite::params![],
+        )
+        .unwrap();
+
+    run_migration(&db);
+
+    let project = db
+        .list_containers()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.level == "project")
+        .unwrap();
+    assert_eq!(project.name, "Second Brain");
+
+    // With no vault configured, a neutral name is used instead.
+    let (db2, path2) = pre_migration_db("neutral-name");
+    run_migration(&db2);
+    let project = db2
+        .list_containers()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.level == "project")
+        .unwrap();
+    assert_eq!(project.name, "Workspace");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&path2);
+}
+
+/// Anything already occupying the vault root leaves the database un-adopted — nothing is promoted.
+///
+/// The slot is UNIQUE, so an occupant cannot be moved aside, and promoting it would produce a row
+/// that is a project AND carries a user's contents. Two things follow from that, and both are why
+/// this declines instead: the legacy shim hides project rows, so a promoted container and everything
+/// filed inside it would vanish from the shipped sidebar; and a promoted note-kind row would be a
+/// note folder at the vault root, which the note-folder move resolves and would then compose
+/// filesystem work from — against the vault root itself.
+#[test]
+fn an_occupied_vault_root_declines_adoption() {
+    // Including the shapes that most resemble the migration's own result: a project-level row at the
+    // vault root, of each kind — the meeting-kind one being exactly what a completed adoption looks
+    // like, minus the adoption. Only the exact shape this migration produces — a MEETING-kind
+    // project there — may be read as "already adopted"; anything else is an occupant and declines,
+    // because accepting it would both skip the occupancy check and, for the note kind, leave a note
+    // folder whose path is the vault root.
+    for (label, prepare) in [
+        ("plain", 0u8),
+        ("sealed", 1u8),
+        ("note-kind", 2u8),
+        ("note-kind project", 3u8),
+        ("meeting-kind project", 4u8),
+    ] {
+        let (db, path) = pre_migration_db(&format!("occupied-{label}"));
+        container(&db, "f-root", "Everything", "", None, "folder");
+        container(&db, "f-work", "Work", "Work", None, "folder");
+        meeting_in(&db, "m1", "Root standup", "2026-08-20T09:00:00Z", Some("f-root"));
+        if prepare == 1 {
+            seal(&db, "f-root");
+        } else if prepare == 2 {
+            db.lock()
+                .execute(
+                    "UPDATE folders SET kind = 'note' WHERE id = 'f-root'",
+                    rusqlite::params![],
+                )
+                .unwrap();
+        } else if prepare == 3 {
+            db.lock()
+                .execute(
+                    "UPDATE folders SET kind = 'note', level = 'project' WHERE id = 'f-root'",
+                    rusqlite::params![],
+                )
+                .unwrap();
+        } else if prepare == 4 {
+            // The shape that most resembles a completed adoption. It is NOT one: `f-work` is still
+            // outside. Recognising the shape alone would report this database done and leave that
+            // container orphaned on this launch and every later one.
+            db.lock()
+                .execute(
+                    "UPDATE folders SET level = 'project' WHERE id = 'f-root'",
+                    rusqlite::params![],
+                )
+                .unwrap();
+        }
+
+        // What the shipped sidebar shows, captured BEFORE the migration runs.
+        let shipped_forest = |db: &Db| -> String {
+            let folders = db.list_folders().unwrap();
+            let levels = db.folder_levels().unwrap();
+            let counts = db.count_notes_per_folder(&HashSet::new()).unwrap();
+            let kinds = db.folder_kinds().unwrap();
+            serde_json::to_string(&build_folder_tree(
+                &flatten_projects_for_legacy_tree(folders, &levels),
+                &counts,
+                &HashSet::new(),
+                &kinds,
+            ))
+            .unwrap()
+        };
+        let before = folder_rows(&db);
+        let forest_before = shipped_forest(&db);
+
+        run_migration(&db);
+
+        assert_eq!(
+            before,
+            folder_rows(&db),
+            "{label}: an occupied vault root must leave every row untouched"
+        );
+        // And the shipped sidebar renders exactly what it rendered before — which is the whole reason
+        // for declining rather than adopting the occupant. (Compared before-vs-after, not shimmed-vs-
+        // unshimmed: hiding a project-level row is what the shim is FOR, so on a database that already
+        // contains one those two differ by design and always have.)
+        assert_eq!(
+            forest_before,
+            shipped_forest(&db),
+            "{label}: the shipped sidebar changed"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Containers that already had a parent keep it — existing depth is preserved, never flattened.
+#[test]
+fn the_migration_preserves_existing_nesting() {
+    let (db, path) = pre_migration_db("preserve-depth");
+    container(&db, "f-parent", "Work", "Work", None, "folder");
+    container(&db, "f-child", "Q3", "Work/Q3", Some("f-parent"), "folder");
+
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    let project = containers.iter().find(|c| c.level == "project").unwrap();
+    assert_eq!(
+        containers
+            .iter()
+            .find(|c| c.id == "f-child")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("f-parent"),
+        "an already-nested container was re-parented"
+    );
+    assert_eq!(
+        containers
+            .iter()
+            .find(|c| c.id == "f-parent")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some(project.id.as_str())
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── the review round that produced these ─────────────────────────────────────────────────────────
+//
+// Every test below exists because an independent review found the corresponding path unproven. Two
+// of them cover failure modes that would not have been leaks but LAUNCH FAILURES: this migration
+// runs inside `migrate()`, before any content surface, so a write against a trigger-guarded row
+// aborts startup. They therefore install a real `RAISE(ABORT)` trigger and prove the absence of the
+// write, rather than inspecting the row afterwards and inferring it.
+
+/// Arm a row so that ANY write to it aborts, exactly as the reserved container's own triggers do.
+fn forbid_writes_to(db: &Db, id: &str) {
+    db.lock()
+        .execute_batch(&format!(
+            "CREATE TRIGGER guard_update_{id} BEFORE UPDATE ON folders WHEN OLD.id = '{id}'
+               BEGIN SELECT RAISE(ABORT, 'protected container written'); END;
+             CREATE TRIGGER guard_child_{id} BEFORE UPDATE ON folders WHEN NEW.parent_id = '{id}'
+               BEGIN SELECT RAISE(ABORT, 'protected container given a child'); END;",
+            id = id.replace('-', "_")
+        ))
+        .unwrap_or_else(|e| panic!("could not arm the guard: {e}"));
+}
+
+/// THE shim oracle, on an ADOPTED database.
+///
+/// Part 1's shim exists so the shipped sidebar keeps rendering the old forest AFTER adoption, and
+/// until now every test in this file un-adopted its database first — so the one shape the shim is
+/// for was the one shape nothing covered. Both of its failure modes are live: keying roots off a
+/// NULL parent would make the sidebar lose every folder (or surface the project as a root), and
+/// note-kind containers reachable through the new parent edges would re-enter the Meetings tree,
+/// which filters them at the top level ONLY. That leak shipped once already.
+#[test]
+fn the_legacy_folder_tree_is_unchanged_on_an_adopted_database() {
+    let path = crate::storage::db::unique_temp_path("murmur-workspace-adopted-shim", "sqlite");
+    let _ = std::fs::remove_file(&path);
+    // NOT `fresh_db`: this one keeps the project the migration creates.
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    container(&db, "f-notes", "Notes", "Notes", None, "folder");
+    container(&db, "f-research", "Research", "Notes/Research", None, "folder");
+    container(&db, "f-child", "Q3", "Work/Q3", Some("f-work"), "folder");
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET kind = 'note' WHERE id IN ('f-notes', 'f-research');
+             UPDATE folders SET is_root = 1 WHERE id = 'f-notes';",
+        )
+        .unwrap();
+    // Re-open so the migration adopts the containers seeded above.
+    drop(db);
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    assert_eq!(
+        db.list_containers()
+            .unwrap()
+            .iter()
+            .filter(|c| c.level == "project")
+            .count(),
+        1,
+        "the database is adopted"
+    );
+
+    let folders = db.list_folders().unwrap();
+    let levels = db.folder_levels().unwrap();
+    let flattened = flatten_projects_for_legacy_tree(folders, &levels);
+    let counts = db.count_notes_per_folder(&HashSet::new()).unwrap();
+    let kinds = db.folder_kinds().unwrap();
+    let legacy = build_folder_tree(&flattened, &counts, &HashSet::new(), &kinds);
+
+    let roots: Vec<&str> = legacy.iter().map(|n| n.id.as_str()).collect();
+    // (a) the project is not among the roots, and (b) every former root is still a root.
+    assert!(
+        !roots.iter().any(|id| db
+            .list_containers()
+            .unwrap()
+            .iter()
+            .any(|c| c.level == "project" && c.id == *id)),
+        "the project surfaced as a legacy root: {roots:?}"
+    );
+    assert!(roots.contains(&"f-work"), "a former root vanished: {roots:?}");
+    assert!(roots.contains(&"f-notes"), "a former root vanished: {roots:?}");
+    assert!(
+        roots.contains(&"f-research"),
+        "a note container adopted under the note root must still be a legacy ROOT, or the shipped \
+         Meetings tree — which filters note kinds at the top level only — would swallow it: {roots:?}"
+    );
+    // (c) real nesting is still nested, and the note kinds are still filterable where the shipped
+    //     Meetings tree looks: the top level.
+    let work = legacy.iter().find(|n| n.id == "f-work").unwrap();
+    assert_eq!(work.children.len(), 1);
+    assert_eq!(work.children[0].id, "f-child");
+    let meeting_forest: Vec<&str> = legacy
+        .iter()
+        .filter(|n| n.kind != "note")
+        .map(|n| n.id.as_str())
+        .collect();
+    assert_eq!(
+        meeting_forest,
+        vec!["f-work"],
+        "a note-kind container re-entered the Meetings tree: {meeting_forest:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// With SEVERAL note roots, each note container is adopted under the one its own path is stamped
+/// under.
+///
+/// `ensure_notes_root` deliberately creates a separate root when the existing one is locked (its
+/// "Inbox N" fallback), so a real database can hold more than one. Picking the wrong one breaks
+/// `parent.path + name == path`, and the next rename then recomposes from that wrong parent and
+/// relocates the real vault directory while `exported_path` stays behind — the sealed-content leak,
+/// because the seal deletes the plaintext at the recorded path and so deletes nothing.
+#[test]
+fn a_note_container_is_adopted_under_the_root_its_path_is_stamped_under() {
+    let (db, path) = pre_migration_db("two-note-roots");
+    container(&db, "r-notes", "Notes", "Notes", None, "folder");
+    container(&db, "r-inbox", "Inbox 2", "Inbox 2", None, "folder");
+    container(&db, "c-under-notes", "Research", "Notes/Research", None, "folder");
+    container(&db, "c-under-inbox", "Drafts", "Inbox 2/Drafts", None, "folder");
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET kind = 'note';
+             UPDATE folders SET is_root = 1 WHERE id IN ('r-notes', 'r-inbox');",
+        )
+        .unwrap();
+
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    let parent_of = |id: &str| {
+        containers
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .parent_id
+            .clone()
+    };
+    assert_eq!(parent_of("c-under-notes").as_deref(), Some("r-notes"));
+    assert_eq!(parent_of("c-under-inbox").as_deref(), Some("r-inbox"));
+
+    // And composition holds for both, which is the property the whole rule exists to protect.
+    for (child, root, name) in [
+        ("c-under-notes", "Notes", "Research"),
+        ("c-under-inbox", "Inbox 2", "Drafts"),
+    ] {
+        let stored: String = db
+            .lock()
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                rusqlite::params![child],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, format!("{root}/{name}"));
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A note container whose path cannot be composed from any root is left to the project, with its
+/// path untouched — never silently re-homed under a root that would misdescribe it.
+#[test]
+fn a_note_container_with_an_uncomposable_path_is_not_re_homed() {
+    let (db, path) = pre_migration_db("uncomposable");
+    container(&db, "r-notes", "Notes", "Notes", None, "folder");
+    // Two levels deep: `parent.path + '/' + name` would compose to "Notes/Deep", not its real path.
+    container(&db, "c-deep", "Deep", "Notes/Mid/Deep", None, "folder");
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET kind = 'note';
+             UPDATE folders SET is_root = 1 WHERE id = 'r-notes';",
+        )
+        .unwrap();
+
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    let project = containers.iter().find(|c| c.level == "project").unwrap();
+    let deep = containers.iter().find(|c| c.id == "c-deep").unwrap();
+    assert_eq!(
+        deep.parent_id.as_deref(),
+        Some(project.id.as_str()),
+        "an uncomposable container belongs to the project, not to a root that misdescribes it"
+    );
+    let stored: String = db
+        .lock()
+        .query_row("SELECT path FROM folders WHERE id = 'c-deep'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(stored, "Notes/Mid/Deep", "its path is untouched either way");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A protected container flagged as a note root is never chosen as an adoption parent.
+///
+/// Proven by the trigger, not by inspection: giving it a child would ABORT inside `migrate()`, which
+/// is a failure to start the app.
+#[test]
+fn a_protected_container_is_never_chosen_as_a_note_root() {
+    let (db, path) = pre_migration_db("protected-root");
+    container(&db, "sys", "tasks", ".murmur/tasks", None, "folder");
+    container(&db, "r-notes", "Notes", "Notes", None, "folder");
+    container(&db, "c-note", "Research", "Notes/Research", None, "folder");
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET kind = 'note' WHERE id IN ('r-notes', 'c-note');
+             UPDATE folders SET kind = 'task', is_root = 1 WHERE id = 'sys';
+             UPDATE folders SET is_root = 1 WHERE id = 'r-notes';",
+        )
+        .unwrap();
+    forbid_writes_to(&db, "sys");
+
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    assert_eq!(
+        containers
+            .iter()
+            .find(|c| c.id == "c-note")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("r-notes"),
+        "the real note root, not the protected row"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A protected container occupying the vault root leaves the database un-adopted rather than
+/// aborting startup — and is neither read nor written.
+#[test]
+fn a_protected_container_at_the_vault_root_declines_adoption() {
+    let (db, path) = pre_migration_db("protected-vault-root");
+    container(&db, "sys", "root", "", None, "folder");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    db.lock()
+        .execute(
+            "UPDATE folders SET kind = 'task' WHERE id = 'sys'",
+            rusqlite::params![],
+        )
+        .unwrap();
+    forbid_writes_to(&db, "sys");
+
+    // Must not abort: the whole migration runs before any content surface.
+    run_migration(&db);
+
+    assert!(
+        db.list_containers()
+            .unwrap()
+            .iter()
+            .all(|c| c.level != "project"),
+        "the database is left un-adopted, and will retry on the next launch"
+    );
+    let work_parent: Option<String> = db
+        .lock()
+        .query_row("SELECT parent_id FROM folders WHERE id = 'f-work'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(work_parent.is_none(), "nothing was adopted");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A protected container is left byte-identical even when its level is not the default.
+///
+/// The level-normalisation statement was inert for such a row only by accident — its level
+/// coalesced out of the predicate. A future import stamping a non-default level would have turned it
+/// into a write against a trigger-guarded row during startup.
+#[test]
+fn a_protected_container_with_an_unexpected_level_is_left_byte_identical() {
+    let (db, path) = pre_migration_db("protected-level");
+    container(&db, "sys", "tasks", ".murmur/tasks", None, "project");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    db.lock()
+        .execute(
+            "UPDATE folders SET kind = 'task' WHERE id = 'sys'",
+            rusqlite::params![],
+        )
+        .unwrap();
+    let before: (Option<String>, String, String) = db
+        .lock()
+        .query_row(
+            "SELECT parent_id, COALESCE(level, 'folder'), path FROM folders WHERE id = 'sys'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    forbid_writes_to(&db, "sys");
+
+    // The system row already carries level='project'. The adoption guard must not mistake that for a
+    // completed migration — otherwise the database would never be adopted, on this launch or any
+    // later one — so this asserts the real containers were adopted as well as that the row is intact.
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    let project = containers
+        .iter()
+        .find(|c| c.level == "project")
+        .expect("a system row at project level must not masquerade as the adoption result");
+    assert_eq!(
+        containers.iter().find(|c| c.id == "f-work").unwrap().parent_id.as_deref(),
+        Some(project.id.as_str()),
+        "the user container was adopted"
+    );
+
+    let after: (Option<String>, String, String) = db
+        .lock()
+        .query_row(
+            "SELECT parent_id, COALESCE(level, 'folder'), path FROM folders WHERE id = 'sys'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(before, after, "a protected container was modified");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The reserved prefix excludes the reserved DIRECTORY itself, not only its descendants.
+#[test]
+fn the_reserved_prefix_root_itself_is_excluded() {
+    let (db, path) = pre_migration_db("reserved-root");
+    // A user KIND at exactly the reserved path: only the path guard can exclude it.
+    container(&db, "reserved", "murmur", ".murmur", None, "folder");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    forbid_writes_to(&db, "reserved");
+
+    run_migration(&db);
+
+    let parent: Option<String> = db
+        .lock()
+        .query_row(
+            "SELECT parent_id FROM folders WHERE id = 'reserved'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(parent.is_none(), "the reserved directory itself was adopted");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The adoption is one atomic unit: a failure part-way leaves the database byte-identical.
+///
+/// It matters more than usual because the completion guard is RESULT-based. A partial run that left
+/// the project row behind would short-circuit that guard on every later launch, with orphaned
+/// containers and nothing to repair them — so atomicity here is what makes "retry on the next
+/// launch" true rather than aspirational.
+#[test]
+fn a_failed_adoption_leaves_the_database_untouched() {
+    let (db, path) = pre_migration_db("atomic-adoption");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+    container(&db, "f-legal", "Legal", "Legal", None, "folder");
+    let before = folder_rows(&db);
+
+    // Abort the moment anything is given a parent — i.e. after the project row has been inserted.
+    db.lock()
+        .execute_batch(
+            "CREATE TRIGGER abort_adoption BEFORE UPDATE ON folders
+               WHEN NEW.parent_id IS NOT NULL AND OLD.parent_id IS NULL
+               BEGIN SELECT RAISE(ABORT, 'injected mid-adoption failure'); END;",
+        )
+        .unwrap();
+
+    let err = Db::migrate_hierarchy_v1(&db.lock()).expect_err("the injected failure propagates");
+    assert!(matches!(err, AppError::Storage(_)), "unexpected error: {err:?}");
+
+    db.lock()
+        .execute_batch("DROP TRIGGER abort_adoption")
+        .unwrap();
+    assert_eq!(
+        before,
+        folder_rows(&db),
+        "a partial adoption survived: the project row would then satisfy the completion guard \
+         forever while its containers stayed orphaned"
+    );
+    // And the next attempt, with the failure removed, adopts cleanly.
+    run_migration(&db);
+    let containers = db.list_containers().unwrap();
+    let project = containers.iter().find(|c| c.level == "project").unwrap();
+    assert_eq!(
+        containers
+            .iter()
+            .find(|c| c.id == "f-work")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some(project.id.as_str())
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A user project at some OTHER path does not satisfy the completion guard.
+///
+/// The guard recognises the exact result this migration produces — a user container occupying the
+/// vault root. Accepting any project-level row would let a database that was never adopted
+/// short-circuit forever, leaving every former root orphaned.
+#[test]
+fn a_project_away_from_the_vault_root_does_not_count_as_adopted() {
+    let (db, path) = pre_migration_db("stray-project");
+    container(&db, "p-stray", "Elsewhere", "Elsewhere", None, "project");
+    container(&db, "f-work", "Work", "Work", None, "folder");
+
+    run_migration(&db);
+
+    let containers = db.list_containers().unwrap();
+    let root_project = containers
+        .iter()
+        .find(|c| c.level == "project" && c.id != "p-stray")
+        .expect("a stray project must not stand in for the adoption result");
+    assert_eq!(
+        containers
+            .iter()
+            .find(|c| c.id == "f-work")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some(root_project.id.as_str()),
+        "the real containers were adopted"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A container at the vault root is not resolvable as a NOTE folder, whatever shape it arrived in.
+///
+/// This is what makes the note-folder move unreachable for such a row unconditionally, rather than
+/// only for the container this migration creates: the move composes `src`/`dst` from a container's
+/// own path, and an empty path is the vault directory itself, so resolving one there would let the
+/// move relocate the user's whole vault.
+#[test]
+fn a_vault_root_container_is_not_a_note_folder() {
+    let (db, path) = pre_migration_db("root-not-note-folder");
+    container(&db, "f-root", "Everything", "", None, "folder");
+    container(&db, "f-notes", "Notes", "Notes", None, "folder");
+    db.lock()
+        .execute_batch(
+            "UPDATE folders SET kind = 'note' WHERE id IN ('f-root', 'f-notes');
+             UPDATE folders SET is_root = 1 WHERE id = 'f-notes';",
+        )
+        .unwrap();
+
+    assert!(
+        db.note_folder_by_id("f-root").unwrap().is_none(),
+        "a note-kind container at the vault root must not resolve as a note folder"
+    );
+    // A project-level one is refused for the same reason, and an ordinary note folder still resolves.
+    db.lock()
+        .execute(
+            "UPDATE folders SET level = 'project' WHERE id = 'f-root'",
+            rusqlite::params![],
+        )
+        .unwrap();
+    assert!(db.note_folder_by_id("f-root").unwrap().is_none());
+    assert!(db.note_folder_by_id("f-notes").unwrap().is_some());
 
     let _ = std::fs::remove_file(&path);
 }
