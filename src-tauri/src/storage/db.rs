@@ -996,6 +996,10 @@ impl Db {
         // deliberately separate from note_chunks so the load-bearing meeting-gating joins stay
         // untouched. Additive + guarded so migrate() stays idempotent.
         Self::migrate_documents(&conn)?;
+        // Org Tasks — structured org-only projections plus device-private references. Task source
+        // documents use `kind='task'` in a hidden always-open folder, so they stay out of Notes and
+        // the vault while reusing the crash-safe stable-document share state machine.
+        Self::migrate_tasks(&conn)?;
         conn.execute_batch(
             "CREATE TRIGGER IF NOT EXISTS org_shares_closure_insert_guard
              BEFORE INSERT ON org_shares
@@ -4815,7 +4819,8 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, kind, created_at FROM documents
-                   WHERE folder_id = ?1 ORDER BY created_at DESC, name",
+                   WHERE folder_id = ?1 AND kind IN ('note','document')
+                   ORDER BY created_at DESC, name",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -5028,7 +5033,8 @@ impl Db {
     pub fn get_document(&self, id: &str) -> Result<Option<(String, String, String)>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT folder_id, name, text FROM documents WHERE id = ?1",
+            "SELECT folder_id, name, text FROM documents
+              WHERE id = ?1 AND kind IN ('note','document')",
             rusqlite::params![id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -5042,7 +5048,8 @@ impl Db {
     /// predicate, so a document in a sealed-and-not-session-unlocked folder resolves to `None` — a
     /// FULL None, never a masked partial (so the tool's "No data for document" sentinel is
     /// indistinguishable from a never-existed id). Reads BOTH `kind='note'` and `kind='document'`
-    /// (NOT kind-restricted). The body is the plaintext `documents.text`; while a folder is sealed
+    /// (and explicitly excludes internal `kind='task'` source journals). The body is the plaintext
+    /// `documents.text`; while a folder is sealed
     /// that column is blanked and the row is invisible here anyway, so no sealed
     /// ciphertext-behind-a-blank leaks. The JOIN is INNER (not LEFT) — matching the doc-search
     /// readers — because `documents.folder_id` is `NOT NULL` with a `folders(id)` FK, so every
@@ -5059,7 +5066,7 @@ impl Db {
             "SELECT d.id, d.folder_id, d.kind, d.name, d.title, COALESCE(d.text, ''), d.created_at, d.updated_at
                FROM documents d
                JOIN folders f ON f.id = d.folder_id
-              WHERE d.id = ?1 AND {visible}"
+              WHERE d.id = ?1 AND d.kind IN ('note','document') AND {visible}"
         );
         conn.query_row(&sql, rusqlite::params![id], |r| {
             let raw: String = r.get(5)?;
@@ -5143,6 +5150,19 @@ impl Db {
     pub fn delete_document(&self, id: &str) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let is_task = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM documents WHERE id=?1 AND kind='task')",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_err)?
+            != 0;
+        if is_task {
+            return Err(AppError::InvalidArg(
+                "task sources must be deleted through the task lifecycle".into(),
+            ));
+        }
         let has_share_closure = Self::source_closure_ready_for_delete_tx(&tx, "document", id)?;
         Self::purge_doc_chunks_tx(&tx, &[id.to_string()])?;
         // Brain v3 PR-3: purge every `links` row whose SRC OR DST is this deleted document/note in the
@@ -5650,7 +5670,7 @@ impl Db {
                JOIN doc_chunks dc ON dc.id = knn.chunk_id
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE {visible}
+              WHERE d.kind IN ('note','document') AND {visible}
               ORDER BY knn.distance ASC, d.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -5709,7 +5729,8 @@ impl Db {
                JOIN doc_chunks dc ON dc.id = fts_doc_chunks.rowid
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE fts_doc_chunks MATCH ?1 AND {visible}
+              WHERE fts_doc_chunks MATCH ?1
+                AND d.kind IN ('note','document') AND {visible}
               ORDER BY bm25(fts_doc_chunks) ASC, d.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -5774,7 +5795,8 @@ impl Db {
                FROM doc_chunks p
                JOIN documents d ON d.id = p.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE p.id = ?1 AND p.document_id = ?2 AND p.level = 1 AND {visible}"
+              WHERE p.id = ?1 AND p.document_id = ?2 AND p.level = 1
+                AND d.kind IN ('note','document') AND {visible}"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let mut out: Vec<DocChunkHit> = Vec::new();
@@ -5848,7 +5870,8 @@ impl Db {
                FROM doc_chunks dc
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE dc.document_id = ?1 AND dc.level IN (1, 2) AND {visible}
+              WHERE dc.document_id = ?1 AND dc.level IN (1, 2)
+                AND d.kind IN ('note','document') AND {visible}
               ORDER BY dc.chunk_index ASC
               LIMIT ?2"
         );
@@ -5984,7 +6007,7 @@ impl Db {
         let sql = format!(
             "SELECT d.id FROM documents d
                JOIN folders f ON f.id = d.folder_id
-              WHERE {visible}
+              WHERE d.kind IN ('note','document') AND {visible}
               ORDER BY d.created_at ASC, d.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;

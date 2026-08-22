@@ -250,6 +250,19 @@ impl Db {
                     .map(|document_id| AttachmentOwner::Document { document_id })
                     .ok_or_else(|| AppError::InvalidArg(format!("no note {owner_id}")))
             }
+            "task" => {
+                let exists = conn
+                    .query_row(
+                        "SELECT id FROM documents WHERE id = ?1 AND kind = 'task'",
+                        rusqlite::params![owner_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?;
+                exists
+                    .map(|document_id| AttachmentOwner::Document { document_id })
+                    .ok_or_else(|| AppError::InvalidArg(format!("no task source {owner_id}")))
+            }
             "meeting" => {
                 let provider_id = conn
                     .query_row(
@@ -282,7 +295,7 @@ impl Db {
                     .ok_or_else(|| AppError::InvalidArg(format!("no live org item {owner_id}")))
             }
             _ => Err(AppError::InvalidArg(
-                "ownerKind must be note, meeting, or org".into(),
+                "ownerKind must be note, task, meeting, or org".into(),
             )),
         }
     }
@@ -292,7 +305,7 @@ impl Db {
         match owner {
             AttachmentOwner::Document { document_id } => conn
                 .query_row(
-                    "SELECT folder_id FROM documents WHERE id = ?1 AND kind = 'note'",
+                    "SELECT folder_id FROM documents WHERE id = ?1 AND kind IN ('note','task')",
                     rusqlite::params![document_id],
                     |r| r.get::<_, String>(0),
                 )
