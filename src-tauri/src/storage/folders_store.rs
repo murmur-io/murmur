@@ -543,6 +543,27 @@ impl Db {
         Ok(out)
     }
 
+    /// Every folder's hierarchy LEVEL (`"project"` or `"folder"`), keyed by id.
+    ///
+    /// The twin of [`Db::folder_kinds`], and used the same way: `build_folder_tree` folds it in
+    /// rather than widening the `Folder` struct, which would force every struct-literal construction
+    /// in the crate (and every test fixture) to change for a field only the tree needs.
+    pub fn folder_levels(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, COALESCE(level, 'folder') FROM folders")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_err)?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (id, level) = r.map_err(map_err)?;
+            out.insert(id, level);
+        }
+        Ok(out)
+    }
+
     pub fn folder_by_id(&self, id: &str) -> Result<Option<Folder>> {
         let conn = self.lock();
         conn.query_row(
