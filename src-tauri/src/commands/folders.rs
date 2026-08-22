@@ -103,6 +103,10 @@ pub fn create_folder(
     let clean = crate::summarize::organize::sanitize_folder(&name)
         .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
 
+    if parent_id.as_deref() == Some(crate::storage::tasks_store::TASK_FOLDER_ID) {
+        return Err(AppError::InvalidArg("the task folder is internal".into()));
+    }
+
     // Resolve the parent's vault-relative path (if any) and compose the child path.
     let parent_path = match parent_id.as_deref() {
         Some(pid) => {
@@ -173,6 +177,9 @@ pub(crate) fn rename_folder_inner(
     folder_id: String,
     new_name: String,
 ) -> Result<Folder, AppError> {
+    if folder_id == crate::storage::tasks_store::TASK_FOLDER_ID {
+        return Err(AppError::InvalidArg("the task folder is internal".into()));
+    }
     // BLK-1: serialize with the rest of the lock state machine. A rename never decrypts, but it
     // rewrites `path` columns that the seal/unseal lifecycle keys vault FS ops off — hold the guard
     // so it can't interleave with a concurrent lock/unlock/remove that also rewrites paths.
@@ -370,6 +377,9 @@ pub async fn delete_folder(
 /// Inner of [`delete_folder`] taking `&AppState` (so tests can drive it without a `tauri::State`).
 /// See the command doc for the fail-closed rules.
 pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result<(), AppError> {
+    if folder_id == crate::storage::tasks_store::TASK_FOLDER_ID {
+        return Err(AppError::InvalidArg("the task folder is internal".into()));
+    }
     let folder = state
         .db
         .folder_by_id(&folder_id)?
