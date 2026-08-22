@@ -48,7 +48,38 @@ pub fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderNode>, AppEr
     // contribute to note_count (see count_notes_per_folder doc + .claude/rules/lock-model.md).
     let counts = state.db.count_notes_per_folder(&unlocked)?;
     let kinds = state.db.folder_kinds()?;
+    let levels = state.db.folder_levels()?;
+    let folders = flatten_projects_for_legacy_tree(folders, &levels);
     Ok(build_folder_tree(&folders, &counts, &unlocked, &kinds))
+}
+
+/// Present the folder forest to LEGACY consumers exactly as it looked before the workspace
+/// hierarchy existed: project rows are removed and their children are re-rooted.
+///
+/// The hierarchy migration gives every former root folder a project parent. Without this, the
+/// shipped sidebar would render one root — the project — with every folder beneath it, and
+/// `MeetingsSidebarTreeComponent` filters note-kind folders at the TOP LEVEL ONLY
+/// (`folders.tree().filter(n => n.kind !== "note")`), so every note folder would leak straight into
+/// the Meetings tree. That is verbatim the folder leak already fixed once on 2026-07-14.
+///
+/// Keeping this transform out of `build_folder_tree` (rather than teaching it about levels) means
+/// the tree builder, its signature and its existing test stay byte-identical, and the shim is one
+/// obvious function for the frontend cutover to delete.
+pub(crate) fn flatten_projects_for_legacy_tree(
+    folders: Vec<Folder>,
+    levels: &std::collections::HashMap<String, String>,
+) -> Vec<Folder> {
+    let is_project = |id: &str| levels.get(id).map(String::as_str) == Some("project");
+    folders
+        .into_iter()
+        .filter(|f| !is_project(&f.id))
+        .map(|mut f| {
+            if f.parent_id.as_deref().is_some_and(is_project) {
+                f.parent_id = None;
+            }
+            f
+        })
+        .collect()
 }
 
 /// Assemble `FolderNode` roots (parent_id == None) and recurse children. Sealed-but-session-
