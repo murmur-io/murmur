@@ -151,6 +151,10 @@ import type {
   RemindersSnapshot,
   RemindersUpdatedPayload,
   ReminderView,
+  OrgTask,
+  TaskDraft,
+  TaskLocalRef,
+  TaskAssignee,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -665,6 +669,36 @@ export class IpcService {
    */
   orgRefresh(): Promise<void> {
     return invoke<void>("org_refresh");
+  }
+
+  // ── Org Tasks ───────────────────────────────────────────────────────────
+
+  listTasks(orgId?: string): Promise<OrgTask[]> {
+    return invoke<OrgTask[]>("list_tasks", { orgId });
+  }
+
+  getTask(id: string): Promise<OrgTask | null> {
+    return invoke<OrgTask | null>("get_task", { id });
+  }
+
+  createTask(draft: TaskDraft): Promise<OrgTask> {
+    return invoke<OrgTask>("create_task", { draft });
+  }
+
+  updateTask(id: string, draft: TaskDraft): Promise<OrgTask> {
+    return invoke<OrgTask>("update_task", { id, draft });
+  }
+
+  deleteTask(id: string): Promise<void> {
+    return invoke<void>("delete_task", { id });
+  }
+
+  setTaskLocalRefs(id: string, refs: TaskLocalRef[]): Promise<TaskLocalRef[]> {
+    return invoke<TaskLocalRef[]>("set_task_local_refs", { id, refs });
+  }
+
+  taskListAssignees(orgId: string): Promise<TaskAssignee[]> {
+    return invoke<TaskAssignee[]>("task_list_assignees", { orgId });
   }
 
   /**
