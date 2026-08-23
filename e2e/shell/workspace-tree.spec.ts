@@ -60,7 +60,7 @@ const FOREST = [
   },
   {
     id: "p-private",
-    name: "Prywatne",
+    name: "Private",
     level: "project",
     emoji: null,
     tint: null,
@@ -77,39 +77,39 @@ const FOREST = [
 async function openWorkspace(page: Page): Promise<void> {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
   await page.goto("/");
-  const section = page.getByRole("button", { name: /Projekty/i }).first();
+  const section = page.getByRole("button", { name: /Projects/i }).first();
   await expect(section).toBeVisible();
 }
 
 test("renders projects, their folders and collapsible type groups", async ({ page }) => {
   await openWorkspace(page);
 
-  const tree = page.getByRole("tree", { name: "Hierarchia obszaru roboczego" });
+  const tree = page.getByRole("tree", { name: "Workspace" });
   await expect(tree).toBeVisible();
 
   await expect(page.getByRole("treeitem", { name: /Acme/ })).toBeVisible();
-  await expect(page.getByRole("treeitem", { name: /Prywatne/ })).toBeVisible();
+  await expect(page.getByRole("treeitem", { name: /Private/ })).toBeVisible();
 
   // A collapsed project shows no groups.
-  await expect(page.getByRole("treeitem", { name: /Spotkania/ })).toHaveCount(0);
+  await expect(page.getByRole("treeitem", { name: /Meetings/ })).toHaveCount(0);
 
   await page.getByRole("button", { name: "Expand Acme" }).click();
 
   // The group header carries the container's FULL count, not the page size.
-  const meetings = page.getByRole("treeitem", { name: /Spotkania/ });
+  const meetings = page.getByRole("treeitem", { name: /Meetings/ });
   await expect(meetings).toBeVisible();
   await expect(meetings).toContainText("10");
 
   // Items appear only once their group is expanded.
   await expect(page.getByRole("treeitem", { name: /Standup/ })).toHaveCount(0);
-  await page.getByRole("button", { name: "Expand Spotkania" }).click();
+  await page.getByRole("button", { name: "Expand Meetings" }).click();
   await expect(page.getByRole("treeitem", { name: /Standup/ })).toBeVisible();
 
   // An untitled item renders a placeholder rather than an empty row.
-  await expect(page.getByRole("treeitem", { name: /Bez tytułu/ })).toBeVisible();
+  await expect(page.getByRole("treeitem", { name: /Untitled/ })).toBeVisible();
 
   // Ten total, two shown → the pager appears and names the remainder.
-  await expect(page.getByRole("treeitem", { name: /Zobacz wszystkie \(10\)/ })).toBeVisible();
+  await expect(page.getByRole("treeitem", { name: /See all \(10\)/ })).toBeVisible();
 
   // A child folder is rendered under its project, with its own groups.
   await expect(page.getByRole("treeitem", { name: /Q3/ })).toBeVisible();
@@ -118,7 +118,7 @@ test("renders projects, their folders and collapsible type groups", async ({ pag
 test("a sealed project discloses nothing about what it holds", async ({ page }) => {
   await openWorkspace(page);
 
-  const sealed = page.getByRole("treeitem", { name: /Prywatne/ });
+  const sealed = page.getByRole("treeitem", { name: /Private/ });
   await expect(sealed).toBeVisible();
 
   // No counts: the backend refused to describe the contents, so the tree must
@@ -127,5 +127,5 @@ test("a sealed project discloses nothing about what it holds", async ({ page }) 
 
   // And no disclosure control, because there is nothing to disclose. Offering
   // one that expands to emptiness would read as "this project is empty".
-  await expect(page.getByRole("button", { name: "Expand Prywatne" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Expand Private" })).toHaveCount(0);
 });
