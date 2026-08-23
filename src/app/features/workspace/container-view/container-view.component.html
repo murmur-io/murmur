@@ -7,7 +7,7 @@
       {{ node.name }}
     </h1>
     <p class="kind">
-      {{ node.level === "project" ? "Projekt" : "Folder" }}
+      {{ node.level === "project" ? "Project" : "Folder" }}
     </p>
   </header>
 
@@ -17,17 +17,17 @@
          holds. Saying "empty" here would be a claim about contents nobody is
          entitled to read. -->
     <div class="state-card">
-      <p><strong>Ten kontener jest zablokowany</strong></p>
-      <p>Odblokuj go, żeby zobaczyć, co zawiera.</p>
+      <p><strong>This container is locked</strong></p>
+      <p>Unlock it to see what it holds.</p>
     </div>
   } @else if (error(); as message) {
     <div class="state-card">
       <p>{{ message }}</p>
     </div>
   } @else if (isEmpty() && loading()) {
-    <p class="state">Wczytywanie…</p>
+    <p class="state">Loading…</p>
   } @else if (isEmpty()) {
-    <p class="state">Ten kontener jest pusty.</p>
+    <p class="state">This container is empty.</p>
   } @else {
     @for (page of pages(); track page.kind) {
       @if (page.total > 0) {
@@ -50,7 +50,7 @@
           </ul>
           @if (page.items.length < page.total) {
             <button type="button" class="btn btn-ghost more" (click)="loadMore(page)">
-              Pokaż więcej ({{ page.total - page.items.length }})
+              Show more ({{ page.total - page.items.length }})
             </button>
           }
         </section>
@@ -58,7 +58,7 @@
     }
   }
 } @else if (loading()) {
-  <p class="state">Wczytywanie…</p>
+  <p class="state">Loading…</p>
 } @else {
-  <p class="state">Nie znaleziono tego kontenera.</p>
+  <p class="state">That container was not found.</p>
 }

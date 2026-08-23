@@ -18,6 +18,9 @@ import {
   type TreeRowIcon,
 } from "../../../design-system/tree-row/tree-row.component";
 import type { ContainerNode, ItemKind, ItemRow, TypeGroup } from "../../../core/models";
+import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
+import { FoldersService } from "../../../services/folders.service";
+import { NotesService } from "../../../services/notes.service";
 import { WorkspaceService } from "../workspace.service";
 
 /** A flattened tree line, so one `@for` renders the whole forest. */
@@ -36,10 +39,10 @@ export interface TreeLine {
 
 /** Polish labels for the four kinds, in the order the backend emits them. */
 const KIND_LABEL: Record<ItemKind, string> = {
-  meeting: "Spotkania",
-  note: "Notatki",
-  task: "Zadania",
-  dashboard: "Dashboardy",
+  meeting: "Meetings",
+  note: "Notes",
+  task: "Tasks",
+  dashboard: "Dashboards",
 };
 
 /**
@@ -80,6 +83,9 @@ export class WorkspaceTreeComponent {
   private readonly router = inject(Router);
   protected readonly workspace = inject(WorkspaceService);
   private readonly drag = inject(NoteDragService);
+  private readonly folders = inject(FoldersService);
+  private readonly lockFlow = inject(FolderLockFlowService);
+  private readonly notes = inject(NotesService);
 
   /** Whether this section owns the current route (drives selection styling). */
   readonly sectionActive = input(false);
@@ -89,7 +95,7 @@ export class WorkspaceTreeComponent {
    *
    * The section header's toggle also reloads, but it cannot be the only trigger:
    * the section is EXPANDED by default, so on a fresh profile the tree renders
-   * without anyone having toggled anything and would sit on "Brak projektów"
+   * without anyone having toggled anything and would sit on "No projects yet"
    * forever — indistinguishable from a workspace that really has none. This
    * component only exists while the section is open, so construction is exactly
    * "the tree became visible".
@@ -177,11 +183,11 @@ export class WorkspaceTreeComponent {
 
   protected itemTitle(item: ItemRow): string {
     const title = item.title?.trim();
-    return title ? title : "Bez tytułu";
+    return title ? title : "Untitled";
   }
 
   protected seeAllLabel(group: TypeGroup): string {
-    return `Zobacz wszystkie (${group.total})`;
+    return `See all (${group.total})`;
   }
 
   /** A container with no groups and no folders has nothing to disclose. */
@@ -205,7 +211,17 @@ export class WorkspaceTreeComponent {
     this.workspace.toggleGroup(container.id, group.kind);
   }
 
+  /**
+   * Open a container's own view — and select it on the two per-type lists as well.
+   *
+   * Only the removed note tree ever called `selectFolder`, so without this the Notes and
+   * Meetings lists lost the ability to be filtered to a folder at all: the filter survived,
+   * with nothing left able to set it. Selecting here keeps those surfaces coherent with the
+   * hierarchy instead of quietly stranding a feature.
+   */
   protected openContainer(container: ContainerNode): void {
+    void this.notes.selectFolder(container.id);
+    this.folders.selectFolder(container.id);
     void this.router.navigate(["/container", container.id]);
   }
 
@@ -305,12 +321,82 @@ export class WorkspaceTreeComponent {
   }
 
   protected async newNote(container: ContainerNode): Promise<void> {
-    const id = await this.workspace.createNote(container.id, "Nowa notatka");
+    const id = await this.workspace.createNote(container.id, "New note");
     await this.router.navigate(["/notes", id]);
   }
 
   protected async newFolder(container: ContainerNode): Promise<void> {
-    await this.workspace.createFolder(container.id, "Nowy folder");
+    await this.workspace.createFolder(container.id, "New folder");
+  }
+
+  /**
+   * Lock, unlock, rename and delete — the per-container actions the two per-type trees
+   * carried before this one replaced them.
+   *
+   * They are not decoration. Locking a folder from the sidebar is how a user makes a
+   * folder private at all, and removing the trees that offered it would have taken the
+   * feature away rather than moved it. They live behind the same `…` a ClickUp row uses,
+   * beside the `+`, so creating and managing stay visibly different actions.
+   */
+  /// Locking goes through the lock FLOW, never `FoldersService.lock` directly.
+  ///
+  /// The flow is what checks for live shares first and puts the lock×shares dialog in front
+  /// of the seal. Calling the service straight through looked equivalent and silently
+  /// removed that gate — a folder shared with someone would have been sealed without ever
+  /// asking, which is the case the dialog exists for.
+  protected async lock(container: ContainerNode): Promise<void> {
+    if (this.lockFlow.busy()) {
+      return;
+    }
+    await this.lockFlow.requestLock(container.id, container.name, async () => {
+      await this.refreshAfterLockChange();
+    });
+  }
+
+  /**
+   * Refresh everything the TWO trees used to refresh between them.
+   *
+   * This one replaced both, so it inherited both their obligations. Reloading only its own
+   * forest left the Notes and Meetings surfaces — and the caches that scrub themselves when
+   * a folder's lock state changes — reading stale rows, which for a LOCK means plaintext
+   * still on screen after the folder holding it was sealed.
+   */
+  private async refreshAfterLockChange(): Promise<void> {
+    await Promise.allSettled([
+      this.workspace.reload(),
+      this.notes.loadFolders(),
+      this.notes.loadNotes(null),
+      this.folders.load(),
+    ]);
+  }
+
+  protected async unlock(container: ContainerNode): Promise<void> {
+    await this.folders.unlock(container.id);
+    await this.refreshAfterLockChange();
+  }
+
+  protected async relock(container: ContainerNode): Promise<void> {
+    await this.folders.relock(container.id);
+    await this.refreshAfterLockChange();
+  }
+
+  protected async rename(container: ContainerNode): Promise<void> {
+    const name = window.prompt("Rename folder", container.name)?.trim();
+    if (!name || name === container.name) {
+      return;
+    }
+    await this.folders.rename(container.id, name);
+    await this.workspace.reload();
+  }
+
+  protected async remove(container: ContainerNode): Promise<void> {
+    await this.folders.delete(container.id);
+    await this.workspace.reload();
+  }
+
+  /** The reserved note root can never be sealed, so it is never offered a lock. */
+  protected canLock(container: ContainerNode): boolean {
+    return !container.isRoot && !container.locked;
   }
 
   protected openGroup(container: ContainerNode, group: TypeGroup): void {

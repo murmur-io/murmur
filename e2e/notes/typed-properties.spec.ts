@@ -199,13 +199,17 @@ test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async 
   await expect(page.locator(".notes-content")).toBeVisible();
 
   // Select the locked "Work" folder (nf2).
-  await page
-    .locator("app-notes-sidebar-tree mur-tree-row .row-label", { hasText: "Work" })
-    .first()
-    .click();
+  // Opening a folder now lands on ITS OWN view — the hierarchy replaced the per-type trees,
+  // and only they ever set the Notes list's folder filter. So the property under test moved
+  // with the destination: a sealed container must present itself as locked and disclose
+  // nothing about what it holds, rather than showing a view of its contents.
+  await page.getByRole("button", { name: "Expand Workspace" }).click();
+  await page.getByRole("button", { name: "Work", exact: true }).click();
 
-  // The lock gate shows; the Saved Views bar is hidden while the folder is sealed.
-  await expect(page.locator(".lock-gate")).toBeVisible();
+  await expect(page).toHaveURL(/\/container\/nf2$/);
+  await expect(page.getByText("This container is locked")).toBeVisible();
+  // No view controls and no counts: the backend refuses to describe a sealed container, and
+  // "0" would be a claim about contents nobody is entitled to read.
   await expect(page.locator("app-notes-view-switcher")).toHaveCount(0);
 
   expect(consoleErrors).toEqual([]);
