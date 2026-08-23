@@ -112,6 +112,32 @@
               </button>
             </mur-row-menu>
           }
+          <mur-row-menu
+            class="row-actions"
+            [label]="'Actions for ' + line.container.name"
+          >
+            @if (canLock(line.container)) {
+              <button type="button" role="menuitem" (click)="lock(line.container)">
+                Lock folder
+              </button>
+            }
+            @if (line.container.locked && !line.container.unlocked) {
+              <button type="button" role="menuitem" (click)="unlock(line.container)">
+                Unlock for this session
+              </button>
+            }
+            @if (line.container.locked && line.container.unlocked) {
+              <button type="button" role="menuitem" (click)="relock(line.container)">
+                Lock again
+              </button>
+            }
+            <button type="button" role="menuitem" (click)="rename(line.container)">
+              Rename
+            </button>
+            <button type="button" role="menuitem" (click)="remove(line.container)">
+              Delete folder
+            </button>
+          </mur-row-menu>
           @if (line.container.locked && line.container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's
                  spare width and truncated "Prywatne" to "P…". The state still

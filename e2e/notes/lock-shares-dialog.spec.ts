@@ -44,7 +44,11 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
     await expect(page.locator(".notes-content")).toBeVisible();
 
     // The open "Notes" folder has a Lock control on its row.
-    const lockBtn = page.getByRole("button", { name: "Lock folder" }).first();
+    // The affordance moved into the container row's actions menu when the one hierarchy
+    // replaced the two per-type trees; the gate it must run is unchanged.
+    await page.getByRole("button", { name: "Expand Workspace" }).click();
+    await page.getByRole("button", { name: "Actions for Notes" }).click();
+    const lockBtn = page.getByRole("menuitem", { name: "Lock folder" });
     await expect(lockBtn).toBeVisible();
     await lockBtn.click();
 
