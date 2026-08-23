@@ -85,6 +85,17 @@ export const routes: Routes = [
           ),
       },
       {
+        // Everything one container holds, paged per kind — where the sidebar tree'''s
+        // container rows and its "Zobacz wszystkie" land. Without this route both
+        // fell through the catch-all to /record, so clicking a project silently
+        // opened the recorder.
+        path: "container/:id",
+        loadComponent: () =>
+          import(
+            "./features/workspace/container-view/container-view.component"
+          ).then((m) => m.ContainerViewComponent),
+      },
+      {
         // Dashboards — the boards LIST. Deliberately NOT in
         // `TabRouteReuseStrategy`'s scope: a list route must be destroyed and
         // recreated so it always refetches, and its rows live in the root
