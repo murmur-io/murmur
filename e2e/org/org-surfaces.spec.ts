@@ -250,8 +250,11 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     const project = page.getByRole("treeitem").first();
     await expect(project).toBeVisible({ timeout: 10_000 });
     await page.getByRole("button", { name: /^Expand / }).first().click();
-    await page.getByRole("button", { name: /^Actions for / }).last().click();
-    await page.getByRole("menuitem", { name: "Lock folder" }).click();
+    // Focus, not a pointer — see the note in lock-shares-dialog.spec.ts.
+    await page.getByRole("button", { name: /^Actions for / }).last().focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("menuitem", { name: "Lock folder" }).focus();
+    await page.keyboard.press("Enter");
 
     // The blocking dialog appears with the three choices. The host has no size
     // (position:fixed content), so assert on the inner dialog.
