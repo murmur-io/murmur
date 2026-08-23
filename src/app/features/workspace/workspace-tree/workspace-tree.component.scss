@@ -18,6 +18,14 @@
   display: flex;
   flex-direction: column;
   gap: 1px;
+  /* The rail scrolls vertically; a row wider than it would put its trailing control
+     outside the scroll box, where a click lands on the rail instead of the button. */
+  min-width: 0;
+}
+
+mur-tree-row {
+  max-width: 100%;
+  overflow: hidden;
 }
 
 .line {
