@@ -6,8 +6,22 @@ import {
   output,
 } from "@angular/core";
 
-/** The leading glyph a tree row can show. */
-export type TreeRowIcon = "folder" | "locked";
+/**
+ * The leading glyph a tree row can show.
+ *
+ * The four item kinds were added with the workspace hierarchy, where a single
+ * tree renders containers AND the items inside them. Before that every row in
+ * both trees was a folder, so two variants were enough; a meeting and a note
+ * sharing the folder glyph in one list makes the list unreadable.
+ */
+export type TreeRowIcon =
+  | "folder"
+  | "locked"
+  | "project"
+  | "meeting"
+  | "note"
+  | "task"
+  | "dashboard";
 
 /**
  * Design System — <mur-tree-row>: THE folder-tree row (extracted 2026-07-12,
@@ -68,6 +82,12 @@ export class MurTreeRowComponent {
   readonly selected = input(false);
   /** The leading glyph — `"locked"` for a sealed folder, `"folder"` otherwise. */
   readonly icon = input<TreeRowIcon>("folder");
+  /**
+   * A user-chosen emoji that REPLACES the glyph (workspace projects can carry
+   * one). It stands in the icon's slot rather than beside it, so a row with an
+   * emoji and a row without still align.
+   */
+  readonly emoji = input<string | null>(null);
   /** Optional trailing count chip (e.g. notes-in-folder); null hides it. */
   readonly count = input<number | null>(null);
   /**

@@ -1,0 +1,87 @@
+:host {
+  display: block;
+}
+
+.tree-state,
+.tree-error {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.tree-error {
+  color: var(--text-secondary);
+}
+
+.tree {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.line {
+  display: flex;
+  align-items: center;
+}
+
+/* A project reads as the top of its own group: slightly stronger label, and a
+   little breathing room above so consecutive projects do not run together. */
+.line--project {
+  font-weight: 600;
+
+  &:not(:first-child) {
+    margin-top: var(--space-1);
+  }
+}
+
+/* A type-group header is chrome ABOUT the items below it, so it sits quieter
+   than both the container above and the items it introduces. */
+.line--group {
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+  letter-spacing: 0.02em;
+}
+
+.line--item {
+  color: var(--text-secondary);
+}
+
+/* Session-unlocked is a PRIVACY state, so it carries the accent the rest of the
+   chrome deliberately avoids — it is the one thing here worth interrupting for.
+   One glyph, not a word: it must not compete with the name for width. */
+.unlocked-mark {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-left: var(--space-1);
+  color: var(--accent);
+}
+
+.see-all {
+  appearance: none;
+  border: 0;
+  background: none;
+  width: 100%;
+  text-align: left;
+  padding-block: var(--space-1);
+  padding-right: var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+
+  &:hover {
+    background: var(--surface-hover);
+    color: var(--text-primary);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+}
