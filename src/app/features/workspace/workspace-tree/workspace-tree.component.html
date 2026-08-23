@@ -77,6 +77,20 @@
           (toggleExpand)="toggleContainer(line.container)"
           (activate)="openContainer(line.container)"
         >
+          @if (canCreateIn(line.container)) {
+            <mur-row-menu
+              class="row-add"
+              icon="add"
+              [label]="'Dodaj do ' + line.container.name"
+            >
+              <button type="button" role="menuitem" (click)="newNote(line.container)">
+                Nowa notatka
+              </button>
+              <button type="button" role="menuitem" (click)="newFolder(line.container)">
+                Nowy folder
+              </button>
+            </mur-row-menu>
+          }
           @if (line.container.locked && line.container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's
                  spare width and truncated "Prywatne" to "P…". The state still

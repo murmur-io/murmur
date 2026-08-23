@@ -7,6 +7,7 @@ import {
 } from "@angular/core";
 import { Router } from "@angular/router";
 
+import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
 import {
   MurTreeRowComponent,
   type TreeRowIcon,
@@ -66,7 +67,7 @@ const KIND_ROUTE: Record<ItemKind, string> = {
 @Component({
   selector: "app-workspace-tree",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurTreeRowComponent],
+  imports: [MurRowMenuComponent, MurTreeRowComponent],
   templateUrl: "./workspace-tree.component.html",
   styleUrl: "./workspace-tree.component.scss",
 })
@@ -204,6 +205,24 @@ export class WorkspaceTreeComponent {
 
   protected openItem(item: ItemRow): void {
     void this.router.navigate([KIND_ROUTE[item.kind], item.id]);
+  }
+
+  /**
+   * A container that is sealed and not unlocked for this session cannot take a new
+   * child: there is no key to seal it with, so the backend refuses. Hiding the
+   * affordance is better than offering one that always errors.
+   */
+  protected canCreateIn(container: ContainerNode): boolean {
+    return !(container.locked && !container.unlocked);
+  }
+
+  protected async newNote(container: ContainerNode): Promise<void> {
+    const id = await this.workspace.createNote(container.id, "Nowa notatka");
+    await this.router.navigate(["/notes", id]);
+  }
+
+  protected async newFolder(container: ContainerNode): Promise<void> {
+    await this.workspace.createFolder(container.id, "Nowy folder");
   }
 
   protected openGroup(container: ContainerNode, group: TypeGroup): void {
