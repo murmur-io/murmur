@@ -7,7 +7,7 @@ import {
   output,
   signal,
 } from "@angular/core";
-import { NoteDragService } from "./note-drag.service";
+import { NoteDragService, type DraggableKind } from "./note-drag.service";
 
 /**
  * Makes its host a DROP TARGET for a meeting being dragged from the Library list
@@ -48,6 +48,16 @@ export class FolderDropDirective {
 
   /** Emits the dragged meeting id when a note is dropped onto this target. */
   readonly dropNote = output<string>();
+
+  /**
+   * The same drop, carrying WHAT was dropped.
+   *
+   * A separate output rather than a wider `dropNote`, because every existing
+   * consumer asks only for the id and a meeting is all they can receive. The
+   * workspace tree can receive either kind, and the two move through different
+   * commands — so it needs the half `dropNote` cannot express.
+   */
+  readonly dropItem = output<{ id: string; kind: DraggableKind }>();
 
   /** True while a valid note is hovering directly over this target. */
   private readonly _over = signal(false);
@@ -95,11 +105,15 @@ export class FolderDropDirective {
     const id =
       event.dataTransfer?.getData(NoteDragService.MIME) ||
       this.drag.draggingId();
+    // Read the kind BEFORE ending the drag — `end()` clears it, and a consumer
+    // asking afterwards would always see a meeting.
+    const kind = this.drag.draggingKind() ?? "meeting";
     this.drag.end();
     if (!id) {
       return;
     }
     event.preventDefault();
     this.dropNote.emit(id);
+    this.dropItem.emit({ id, kind });
   }
 }

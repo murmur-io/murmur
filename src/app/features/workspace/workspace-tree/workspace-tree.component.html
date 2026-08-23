@@ -24,6 +24,9 @@
           [label]="itemTitle(item)"
           [depth]="line.depth"
           [icon]="kindIcon(item.kind)"
+          [attr.draggable]="draggableKind(item) ? true : null"
+          (dragstart)="onDragStart($event, item)"
+          (dragend)="onDragEnd()"
           (activate)="openItem(item)"
         />
       } @else if (line.seeAll) {
@@ -74,6 +77,9 @@
           [emoji]="line.container.emoji"
           [expandable]="containerExpandable(line.container)"
           [expanded]="isContainerExpanded(line.container)"
+          appFolderDrop
+          [dropFolderId]="line.container.id"
+          (dropItem)="onDropItem(line.container, $event)"
           (toggleExpand)="toggleContainer(line.container)"
           (activate)="openContainer(line.container)"
         >

@@ -8,6 +8,11 @@ import {
 import { Router } from "@angular/router";
 
 import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
+import { FolderDropDirective } from "../../folders/folder-drop.directive";
+import {
+  NoteDragService,
+  type DraggableKind,
+} from "../../folders/note-drag.service";
 import {
   MurTreeRowComponent,
   type TreeRowIcon,
@@ -67,13 +72,14 @@ const KIND_ROUTE: Record<ItemKind, string> = {
 @Component({
   selector: "app-workspace-tree",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurRowMenuComponent, MurTreeRowComponent],
+  imports: [FolderDropDirective, MurRowMenuComponent, MurTreeRowComponent],
   templateUrl: "./workspace-tree.component.html",
   styleUrl: "./workspace-tree.component.scss",
 })
 export class WorkspaceTreeComponent {
   private readonly router = inject(Router);
   protected readonly workspace = inject(WorkspaceService);
+  private readonly drag = inject(NoteDragService);
 
   /** Whether this section owns the current route (drives selection styling). */
   readonly sectionActive = input(false);
@@ -214,6 +220,53 @@ export class WorkspaceTreeComponent {
    */
   protected canCreateIn(container: ContainerNode): boolean {
     return !(container.locked && !container.unlocked);
+  }
+
+  /**
+   * Only meetings and notes can be dragged: neither a task nor a dashboard has a
+   * container anchor yet, so a drop would have nowhere to file it. A row that
+   * cannot be dropped anywhere must not look draggable.
+   */
+  protected draggableKind(item: ItemRow): DraggableKind | null {
+    return item.kind === "meeting" || item.kind === "note" ? item.kind : null;
+  }
+
+  protected onDragStart(event: DragEvent, item: ItemRow): void {
+    const kind = this.draggableKind(item);
+    if (!kind) {
+      return;
+    }
+    this.drag.begin(item.id, kind);
+    event.dataTransfer?.setData(NoteDragService.MIME, item.id);
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+    }
+  }
+
+  protected onDragEnd(): void {
+    this.drag.end();
+  }
+
+  /**
+   * A sealed, not-session-unlocked container is refused by every mover, so it is
+   * not a drop target. Arming one would invite a drop that can only fail.
+   */
+  protected canDropInto(container: ContainerNode): boolean {
+    return !(container.locked && !container.unlocked);
+  }
+
+  protected async onDropItem(
+    container: ContainerNode,
+    payload: { id: string; kind: DraggableKind },
+  ): Promise<void> {
+    // The refusal lives HERE, not in the binding below it. `dropFolderId` is data
+    // the directive hands back to its consumer; it does not gate the drop, so
+    // passing null there looked like a guard while the handler went on using the
+    // container id regardless — and a sealed destination accepted the move.
+    if (!this.canDropInto(container)) {
+      return;
+    }
+    await this.workspace.moveItem(payload.kind, payload.id, container.id);
   }
 
   protected async newNote(container: ContainerNode): Promise<void> {
