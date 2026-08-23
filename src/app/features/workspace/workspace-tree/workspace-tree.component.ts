@@ -255,6 +255,41 @@ export class WorkspaceTreeComponent {
     return !(container.locked && !container.unlocked);
   }
 
+  /**
+   * Every container an item could be moved INTO — the keyboard's equivalent of a drag.
+   *
+   * Drag and drop is a pointer gesture with no keyboard form of its own, so shipping
+   * it alone would make filing an item impossible without a mouse. The same rules
+   * apply as to a drop: a sealed, not-session-unlocked container is refused by every
+   * mover, so it is not offered here either.
+   */
+  protected readonly moveTargets = computed<ContainerNode[]>(() => {
+    const out: ContainerNode[] = [];
+    const walk = (container: ContainerNode): void => {
+      if (this.canDropInto(container)) {
+        out.push(container);
+      }
+      container.folders.forEach(walk);
+    };
+    this.workspace.forest().forEach(walk);
+    return out;
+  });
+
+  /** The container an item currently sits in, so the menu can leave it out. */
+  protected moveTargetsFor(item: ItemRow, current: ContainerNode): ContainerNode[] {
+    return this.draggableKind(item)
+      ? this.moveTargets().filter((target) => target.id !== current.id)
+      : [];
+  }
+
+  protected async moveItemTo(item: ItemRow, target: ContainerNode): Promise<void> {
+    const kind = this.draggableKind(item);
+    if (!kind) {
+      return;
+    }
+    await this.workspace.moveItem(kind, item.id, target.id);
+  }
+
   protected async onDropItem(
     container: ContainerNode,
     payload: { id: string; kind: DraggableKind },

@@ -28,7 +28,22 @@
           (dragstart)="onDragStart($event, item)"
           (dragend)="onDragEnd()"
           (activate)="openItem(item)"
-        />
+        >
+          @if (moveTargetsFor(item, line.container); as targets) {
+            @if (targets.length > 0) {
+              <!-- The keyboard's form of the drag above. Dragging is a pointer gesture
+                   with no keyboard equivalent of its own, so without this an item could
+                   only be filed with a mouse. -->
+              <mur-row-menu class="row-add" [label]="'Przenieś ' + itemTitle(item)">
+                @for (target of targets; track target.id) {
+                  <button type="button" role="menuitem" (click)="moveItemTo(item, target)">
+                    {{ target.name }}
+                  </button>
+                }
+              </mur-row-menu>
+            }
+          }
+        </mur-tree-row>
       } @else if (line.seeAll) {
         <button
           type="button"
