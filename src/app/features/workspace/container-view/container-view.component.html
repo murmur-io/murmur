@@ -1,0 +1,64 @@
+@if (container(); as node) {
+  <header class="head">
+    <h1 class="title">
+      @if (node.emoji; as emoji) {
+        <span class="title-emoji" aria-hidden="true">{{ emoji }}</span>
+      }
+      {{ node.name }}
+    </h1>
+    <p class="kind">
+      {{ node.level === "project" ? "Projekt" : "Folder" }}
+    </p>
+  </header>
+
+  @if (sealed()) {
+    <!-- Not an empty state and not an error: the container is sealed and not
+         unlocked for this session, so the backend REFUSES to describe what it
+         holds. Saying "empty" here would be a claim about contents nobody is
+         entitled to read. -->
+    <div class="state-card">
+      <p><strong>Ten kontener jest zablokowany</strong></p>
+      <p>Odblokuj go, żeby zobaczyć, co zawiera.</p>
+    </div>
+  } @else if (error(); as message) {
+    <div class="state-card">
+      <p>{{ message }}</p>
+    </div>
+  } @else if (isEmpty() && loading()) {
+    <p class="state">Wczytywanie…</p>
+  } @else if (isEmpty()) {
+    <p class="state">Ten kontener jest pusty.</p>
+  } @else {
+    @for (page of pages(); track page.kind) {
+      @if (page.total > 0) {
+        <section class="group">
+          <h2 class="group-title">
+            {{ kindLabel(page.kind) }}
+            <span class="count">{{ page.total }}</span>
+          </h2>
+          <ul class="items">
+            @for (item of page.items; track item.id) {
+              <li>
+                <button type="button" class="item" (click)="openItem(item)">
+                  <span class="item-title">{{ itemTitle(item) }}</span>
+                  @if (duration(item); as length) {
+                    <span class="item-meta">{{ length }}</span>
+                  }
+                </button>
+              </li>
+            }
+          </ul>
+          @if (page.items.length < page.total) {
+            <button type="button" class="btn btn-ghost more" (click)="loadMore(page)">
+              Pokaż więcej ({{ page.total - page.items.length }})
+            </button>
+          }
+        </section>
+      }
+    }
+  }
+} @else if (loading()) {
+  <p class="state">Wczytywanie…</p>
+} @else {
+  <p class="state">Nie znaleziono tego kontenera.</p>
+}

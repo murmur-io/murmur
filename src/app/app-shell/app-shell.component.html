@@ -76,6 +76,32 @@
           @if (!group.collapsible || insightsExpanded() || railMode()) {
             @for (item of group.items; track item.path) {
               @if (item.path === "/notes" && !railMode()) {
+                <!-- PROJEKTY — the one workspace hierarchy: Projects › Folders ›
+                     collapsible per-type groups (Meetings, Notes, Tasks,
+                     Dashboards). A folder holds every kind at once, which the two
+                     per-type trees below could not express at all: they are keyed
+                     on `folders.kind`, so one container can only ever appear in
+                     one of them.
+
+                     Those two sections stay for now on purpose. Their headers own
+                     affordances this tree has not taken over yet — the "+" that
+                     creates a folder inline, and the vault-root drop target — and
+                     removing them before porting those would leave both silently
+                     doing nothing, which looks identical to working. They go in
+                     the step that adds this tree's own create menu and drag &
+                     drop. -->
+                <mur-sidebar-section
+                  routePath="/notes"
+                  icon="notes"
+                  label="Projekty"
+                  [expanded]="workspaceTreeOpen()"
+                  (toggleExpanded)="toggleWorkspaceTree()"
+                  (headerSelect)="onNotesHeaderSelect()"
+                >
+                  <app-workspace-tree [sectionActive]="isNotesRoute()" />
+                </mur-sidebar-section>
+              }
+              @if (item.path === "/notes" && !railMode()) {
                 <!-- Notes: the shared expandable-section shell (header + "All
                      notes" root row) — consolidated 2026-07-12 out of a
                      duplicated inline block that kept drifting from Meetings'
