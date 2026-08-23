@@ -37,6 +37,75 @@ use super::*;
 /// Atomicity: each note's blob is verified decryptable BEFORE we blank/delete; a crash after the
 /// DB write but before the `.md` delete leaves a stale plaintext `.md` (reconcilable) — never
 /// lost content.
+/// TWO-LEVEL LOCK — seal `folder_id` AND every container inside it, deepest first.
+///
+/// Before containers could nest, every lockable thing was a leaf, and sealing exactly one folder
+/// was exactly right. The moment a project can hold folders, that same behaviour means a user
+/// locks a project, watches it render locked, and every note in every folder underneath is still
+/// sitting in the database in plaintext — reachable through the tree, through search, through MCP.
+/// The UI says sealed and the bytes say otherwise, which is the worst combination available,
+/// because it is precisely when the user stops being careful.
+///
+/// Each container seals under its OWN content key, through the ordinary per-container path, so
+/// every guard, epoch bump and verify-before-destroy that path owns applies to all of them — and
+/// the per-container key separation that lets a single folder be unlocked on its own is untouched.
+/// One MCP revocation, held by the caller, covers the whole cascade.
+///
+/// A container that is ALREADY sealed is skipped rather than re-sealed: locking a project with one
+/// folder already locked is an ordinary thing to do, and re-minting that folder's key would orphan
+/// the ciphertext already written under the old one.
+fn lock_container_subtree(
+    state: &AppState,
+    folder_id: &str,
+    allow_live_remote_shares: bool,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
+    for id in container_subtree_deepest_first(state, folder_id)? {
+        if id == folder_id {
+            continue; // the target is sealed last, below, so its notice fires once at the end.
+        }
+        if state
+            .db
+            .folder_by_id(&id)?
+            .is_some_and(|folder| folder.locked)
+        {
+            continue;
+        }
+        lock_folder_inner_with_visibility_notice_policy(
+            state,
+            id,
+            allow_live_remote_shares,
+            || {},
+        )?;
+    }
+    lock_folder_inner_with_visibility_notice_policy(
+        state,
+        folder_id.to_string(),
+        allow_live_remote_shares,
+        visibility_revoked,
+    )
+}
+
+/// Every container in `folder_id`'s subtree, DEEPEST FIRST, with the folder itself last.
+///
+/// The order is the whole point. Locking is not atomic across containers — each seals under its
+/// own content key, in its own pass — so a failure part-way through leaves some sealed and some
+/// not, and the ORDER decides which. Deepest-first can only ever leave an OUTER container still
+/// open around sealed children: an over-lock the user can see and retry. Parent-first would leave
+/// a container marked locked with a child still holding plaintext inside it, which is the exact
+/// shape of a leak: the UI says sealed, the bytes say otherwise.
+fn container_subtree_deepest_first(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut out = Vec::new();
+    for child in state.db.child_folders(folder_id)? {
+        out.extend(container_subtree_deepest_first(state, &child.id)?);
+    }
+    out.push(folder_id.to_string());
+    Ok(out)
+}
+
 #[tauri::command]
 pub async fn lock_folder(
     app: AppHandle,
@@ -49,15 +118,25 @@ pub async fn lock_folder(
         ));
     }
     let _org_mutation = state.org_share_mutation_lock.lock().await;
-    let closure_created = state.db.begin_org_folder_closure(&folder_id)?;
-    if state.db.folder_has_active_remote_share(&folder_id)? {
-        if closure_created {
-            state.db.clear_org_folder_closure(&folder_id)?;
+    // PRE-FLIGHT the whole subtree before anything seals. A container can hold containers now, so
+    // locking one seals everything inside it (see `lock_container_subtree`) — and this refusal is
+    // a property the caller can fix and would want to fix before any container changed state.
+    // Discovering it half-way through would leave a partial lock for a reason knowable up front.
+    for id in container_subtree_deepest_first(state.inner(), &folder_id)? {
+        if state.db.folder_has_active_remote_share(&id)? {
+            return Err(AppError::Unavailable(if id == folder_id {
+                "revoke this folder's shares before locking it".into()
+            } else {
+                let name = state
+                    .db
+                    .folder_by_id(&id)?
+                    .map(|f| f.name)
+                    .unwrap_or_else(|| id.clone());
+                format!("revoke the shares on {name} before locking this project")
+            }));
         }
-        return Err(AppError::Unavailable(
-            "revoke this folder's shares before locking it".into(),
-        ));
     }
+    let closure_created = state.db.begin_org_folder_closure(&folder_id)?;
     // Initial sealing revokes content just as a session relock does. Shut down every registered
     // MCP content socket BEFORE waiting on the lifecycle mutex, otherwise a slow reader can keep
     // receiving a pre-lock payload after the command has made the folder private.
@@ -186,9 +265,9 @@ fn lock_folder_with_visibility_revocation_and_notice_policy(
     allow_live_remote_shares: bool,
     visibility_revoked: impl FnOnce(),
 ) -> Result<(), AppError> {
-    let result = lock_folder_inner_with_visibility_notice_policy(
+    let result = lock_container_subtree(
         state,
-        folder_id.to_string(),
+        folder_id,
         allow_live_remote_shares,
         visibility_revoked,
     );
@@ -860,7 +939,126 @@ pub async fn unlock_folder(
     })
     .await?;
     state.db.clear_org_folder_closure(&folder_id)?;
+
+    // TWO-LEVEL UNLOCK — the other half of the cascading lock. Locking a project seals every
+    // container beneath it, so unlocking one has to open them again, or the two actions are
+    // asymmetric in the way users actually notice: one click sealed six folders, and six clicks
+    // are needed to get them back.
+    //
+    // Each descendant is opened with its OWN content key, unwrapped from the master KEK the
+    // restore above has now cached — so this costs no second Touch ID prompt, and the per-container
+    // key separation that makes a single-folder unlock possible is untouched.
+    //
+    // Best-effort per descendant: a container that cannot be opened is logged and skipped rather
+    // than failing the unlock that already succeeded. The failure direction matters — a descendant
+    // left sealed stays unreadable, which is the safe side, and the user can retry it alone.
+    let descendants: Vec<String> = container_subtree_deepest_first(state.inner(), &folder_id)?
+        .into_iter()
+        .filter(|id| *id != folder_id)
+        .collect();
+    for id in descendants {
+        let Some(child) = state.db.folder_by_id(&id)? else {
+            continue;
+        };
+        if !child.locked || folder_is_unlocked(state.inner(), &id)? {
+            continue;
+        }
+        if let Err(error) = unlock_container_with_cached_kek(&app, state.inner(), &id).await {
+            tracing::warn!(
+                target: "lock",
+                folder = %id,
+                error = %error,
+                "unlock_folder: a descendant container stayed sealed"
+            );
+        }
+    }
+
     Ok(restored)
+}
+
+/// Session-unlock ONE already-sealed container using the master KEK cached by an earlier unlock.
+///
+/// The cascading unlock's per-descendant step. It deliberately does NOT contain the biometric
+/// release, the candidate-recovery ladder, or the org-closure bookkeeping: those belong to the
+/// container the user actually asked for, ran once there, and their result — the cached KEK — is
+/// what makes this cheap. With no cached KEK there is nothing to do here, and saying so is better
+/// than quietly prompting for Touch ID once per folder in a subtree.
+async fn unlock_container_with_cached_kek(
+    app: &AppHandle,
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    let kek: Zeroizing<[u8; 32]> = {
+        let guard = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        guard
+            .clone()
+            .ok_or_else(|| AppError::Auth("no cached master key for the cascading unlock".into()))?
+    };
+    let wrapped = state
+        .db
+        .folder_wrapped_key(folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
+        &kek,
+        &wrapped,
+        &aad_wrapped_ck(folder_id),
+    )?);
+    let ck: Zeroizing<[u8; 32]> = Zeroizing::new(
+        ck_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
+    );
+
+    let heavy_inference = state.heavy_inference.clone();
+    let app_for_restore = app.clone();
+    let folder_id_owned = folder_id.to_string();
+    crate::perf::run_heavy(&heavy_inference, move || -> Result<(), AppError> {
+        let state = app_for_restore.state::<AppState>();
+        let folder_id = folder_id_owned;
+        // Same lifecycle guard as the primary restore, for the same reason: this mutates plaintext
+        // columns, and a concurrent relock must not blank them mid-restore.
+        let _lifecycle = lifecycle_guard(&state);
+
+        for n in &state.db.notes_in_folder(&folder_id)? {
+            let Some(blob) = &n.content_blob else {
+                continue;
+            };
+            let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
+            let markdown = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad)?)
+                .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
+            state
+                .db
+                .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
+        }
+
+        let meeting_embedder = crate::embed::active_persistence_embedder_if_available();
+        unseal_folder_extras(&state, &folder_id, &ck, meeting_embedder.as_deref())?;
+
+        {
+            let mut g = state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+            g.insert(folder_id.clone());
+        }
+        reexport_notes_in_folder(&state, &folder_id);
+        let unlocked = {
+            state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+                .clone()
+        };
+        rederive_links_for_folder(&state, &folder_id, &unlocked);
+        tracing::info!(target: "lock", folder = %folder_id, "cascading unlock: container opened");
+        Ok(())
+    })
+    .await?;
+    Ok(())
 }
 
 /// Re-seal a session-unlocked folder for the rest of this session: re-blank the plaintext

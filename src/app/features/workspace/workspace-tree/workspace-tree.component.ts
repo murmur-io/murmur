@@ -399,6 +399,33 @@ export class WorkspaceTreeComponent {
     return !container.isRoot && !container.locked;
   }
 
+  /**
+   * What locking this container will actually do.
+   *
+   * Locking cascades: a container holding containers seals every one of them, because a project
+   * that rendered locked while the folders inside it stayed readable would be a label, not a
+   * lock. The menu has to say so — "Lock folder" on a project with six folders under it describes
+   * a much smaller action than the one about to happen, and a user who finds out afterwards has
+   * been surprised by a security control, which is the worst place to be surprised.
+   */
+  protected lockLabel(container: ContainerNode): string {
+    const nested = container.folders.length;
+    if (nested === 0) {
+      return "Lock folder";
+    }
+    return nested === 1
+      ? "Lock project and the folder inside it"
+      : `Lock project and the ${nested} folders inside it`;
+  }
+
+  /** The unlock half of {@link lockLabel} — it cascades too. */
+  protected unlockLabel(container: ContainerNode): string {
+    const nested = container.folders.length;
+    return nested === 0
+      ? "Unlock for this session"
+      : "Unlock this project and its folders for this session";
+  }
+
   protected openGroup(container: ContainerNode, group: TypeGroup): void {
     void this.router.navigate(["/container", container.id], {
       queryParams: { kind: group.kind },
