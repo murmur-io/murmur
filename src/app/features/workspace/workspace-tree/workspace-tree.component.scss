@@ -85,3 +85,17 @@
     outline-offset: -2px;
   }
 }
+
+/* The create affordance is revealed by hover or keyboard focus, so a resting tree
+   stays quiet — the same reveal the other trees use for their action clusters.
+   `:focus-within` is what keeps it reachable without a pointer. */
+.row-add {
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+mur-tree-row:hover .row-add,
+mur-tree-row:focus-within .row-add {
+  opacity: 1;
+}

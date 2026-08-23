@@ -6,9 +6,14 @@
   [attr.aria-haspopup]="true"
   [attr.aria-expanded]="isOpen()"
   [attr.aria-label]="label()"
-  title="Actions"
+  [title]="label()"
   (click)="toggle()"
 >
+  @if (icon() === "add") {
+    <svg viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
+      <path d="M8 3.6v8.8M3.6 8h8.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+    </svg>
+  } @else {
   <!-- The app's existing settings/gear glyph (mirrors <mur-icon icon="settings">
        — a real toothed cog, not the old ⋯ kebab). -->
   <svg viewBox="0 0 24 24" width="15" height="15" fill="none" aria-hidden="true">
@@ -21,6 +26,7 @@
       stroke-linejoin="round"
     />
   </svg>
+  }
 </button>
 
 @if (isOpen()) {
