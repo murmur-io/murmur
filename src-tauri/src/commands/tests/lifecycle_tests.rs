@@ -2905,6 +2905,109 @@
         db.set_meeting_folder(mid, folder_id).unwrap();
     }
 
+    /// An open container nested inside another — the shape the hierarchy made possible and the
+    /// lock had never seen.
+    /// Locking a PROJECT seals the folders inside it. This is the leak the hierarchy created.
+    ///
+    /// Before containers could nest, every lockable thing was a leaf and `lock_folder` sealing
+    /// exactly one folder was exactly right. The moment a project can hold folders, that same
+    /// behaviour means a user locks a project, watches it render locked, and every note in every
+    /// folder underneath is still sitting in the database in plaintext — reachable through the
+    /// tree, through search, through MCP. The UI says sealed; the bytes say otherwise, which is
+    /// the worst possible combination because the user stops being careful.
+    ///
+    /// RED contract: remove the descendant loop from `lock_folder` and the child's note is still
+    /// plaintext, and still visible, after the project is locked.
+    #[test]
+    fn locking_a_project_seals_the_folders_inside_it() {
+        let vault = tmp_vault("project-cascade");
+        let state = build_state_with_vault("project-cascade", &vault);
+        make_open_folder(&state.db, "p-acme", "Acme");
+        make_open_child_folder(&state.db, "f-weekly", "Acme/Weekly", "p-acme");
+        std::fs::create_dir_all(vault.join("Acme/Weekly")).unwrap();
+
+        seed_meeting(&state.db, "m-top", "Board notes", Some("p-acme"));
+        seed_meeting(&state.db, "m-deep", "Layoff plan", Some("f-weekly"));
+
+        // The test entry onto the SAME path both lock commands take. The cascade lives in
+        // `lock_container_subtree`, below the async command's org/MCP bookkeeping and above the
+        // single-container `lock_folder_inner`, precisely so one call covers every entry point
+        // and can still be driven from here.
+        let revocation = crate::mcp::begin_visibility_revocation_for_gate(
+            None,
+            crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+        );
+        crate::commands::lock_folder_with_visibility_revocation(&state, "p-acme", revocation)
+            .unwrap();
+
+        // BOTH containers are durably sealed.
+        assert!(
+            state.db.folder_by_id("p-acme").unwrap().unwrap().locked,
+            "the project itself was not sealed"
+        );
+        assert!(
+            state.db.folder_by_id("f-weekly").unwrap().unwrap().locked,
+            "a folder inside the locked project stayed open"
+        );
+
+        // And the child's note is not readable — neither in its row nor through the gate.
+        let markdown: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COALESCE(markdown, '') FROM notes WHERE meeting_id = 'm-deep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            markdown, "",
+            "a note inside a folder inside a locked project stayed in plaintext"
+        );
+        let nothing_unlocked = std::collections::HashSet::new();
+        assert!(
+            state
+                .db
+                .get_note_if_visible("m-deep", &nothing_unlocked)
+                .unwrap()
+                .is_none(),
+            "the gated reader still returns a note from inside a locked project"
+        );
+    }
+
+    /// The cascade is DEEPEST-FIRST, so a failure can only over-lock, never under-lock.
+    ///
+    /// Locking is not atomic across containers. Whichever order the cascade takes decides what a
+    /// part-way failure leaves behind: deepest-first leaves an open container around sealed
+    /// children, which is visible and retryable; parent-first leaves a container marked locked
+    /// with plaintext inside it, which is a leak wearing a lock's clothes.
+    #[test]
+    fn the_lock_cascade_visits_the_deepest_container_first() {
+        let state = build_state("cascade-order");
+        make_open_folder(&state.db, "p-root", "Root");
+        make_open_child_folder(&state.db, "f-mid", "Root/Mid", "p-root");
+        make_open_child_folder(&state.db, "f-leaf", "Root/Mid/Leaf", "f-mid");
+
+        let order = container_subtree_deepest_first(&state, "p-root").unwrap();
+        assert_eq!(
+            order,
+            vec!["f-leaf".to_string(), "f-mid".to_string(), "p-root".to_string()],
+            "the cascade must reach a container only after everything inside it"
+        );
+    }
+
+    fn make_open_child_folder(db: &Db, id: &str, path: &str, parent_id: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            path: path.to_string(),
+            parent_id: Some(parent_id.to_string()),
+            locked: false,
+            created_at: "2026-06-27T08:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
     fn make_open_folder(db: &Db, id: &str, path: &str) {
         db.insert_folder(&Folder {
             id: id.to_string(),
