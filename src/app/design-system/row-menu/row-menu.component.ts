@@ -63,6 +63,14 @@ export class MurRowMenuComponent {
 
   /** Accessible name for the trigger + panel (e.g. "Actions for Product"). */
   readonly label = input.required<string>();
+  /**
+   * Which glyph the trigger shows. `"actions"` is the gear that opens a menu ABOUT
+   * the row; `"add"` is the plus that opens a menu of things to CREATE in it. Same
+   * panel, same dismissal, same opacity — only the affordance differs, and giving
+   * the second its own component would be two implementations of one dropdown
+   * drifting apart, which is exactly what this component was extracted to stop.
+   */
+  readonly icon = input<"actions" | "add">("actions");
   /** Disables the trigger (mirrors a row's `busy` guard). */
   readonly disabled = input(false);
 
