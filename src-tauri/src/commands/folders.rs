@@ -590,6 +590,27 @@ fn reexport_notes_under_subtree(state: &AppState, folder_id: &str) -> Result<(),
         )?;
     }
 
+    // AUTHORED notes live in a different table with their own `exported_path`, and this walk
+    // used to skip them entirely — so after a rename every one of them named a file that had
+    // just been moved. The seal removes plaintext BY RECORDED PATH ONLY
+    // (`note_exported_path_rows_in_folder` → `remove_note_export_if_unchanged`), with no
+    // directory sweep behind it, so it removed nothing and the real `.md` stayed readable
+    // inside a sealed folder. That is the 2026-07-11 NOTES-2 leak, on the path that never
+    // called its fix.
+    //
+    // Rebuilt from basename + the folder's new directory, exactly like the meeting notes
+    // above, which stays correct under `/var` vs `/private/var` canonicalisation drift in the
+    // stored absolute path.
+    for (document_id, old) in state.db.note_exported_path_rows_in_folder(folder_id)? {
+        let Some(name) = std::path::Path::new(&old).file_name() else {
+            continue;
+        };
+        let new_path = new_dir.join(name);
+        state
+            .db
+            .set_note_doc_exported_path(&document_id, Some(&new_path.to_string_lossy()))?;
+    }
+
     // Recurse into descendant folders (their dirs moved with the same single `fs::rename`).
     for child in state.db.child_folders(folder_id)? {
         reexport_notes_under_subtree(state, &child.id)?;
@@ -772,7 +793,17 @@ fn reparent_authored_notes_to_default(state: &AppState, folder_id: &str) -> Resu
     if note_ids.is_empty() {
         return Ok(());
     }
-    let default_id = state.db.ensure_default_note_folder()?;
+    // The RESERVED note root — the one `lock_folder` refuses to seal — not
+    // `ensure_default_note_folder`, which returns whatever row holds the path "Notes",
+    // creating it if absent and returning it EVEN WHEN IT IS SEALED. On a database where the
+    // user has locked a container at that path, resolving through it filed these notes into a
+    // sealed container and exported their plaintext into its directory: unsealed content
+    // inside a sealed tree, which the at-rest re-blank sweep never visits because it keys off
+    // the container being marked locked.
+    //
+    // Orphaned notes belong in the always-open home for unfiled notes, which is exactly what
+    // the reserved root is for.
+    let default_id = state.db.ensure_notes_root()?;
     if default_id == folder_id {
         // Deleting the default note-folder while it still holds authored notes: reparenting to
         // itself is a no-op and the row-delete would then destroy them. Fail closed.
@@ -786,8 +817,10 @@ fn reparent_authored_notes_to_default(state: &AppState, folder_id: &str) -> Resu
         .note_folder_by_id(&default_id)?
         .ok_or_else(|| AppError::Storage("default note-folder missing after ensure".into()))?;
     for id in &note_ids {
-        // Reassign the row to the default note-folder (the gate/seal anchor). The default folder is
-        // OPEN (root "Notes" is never locked), so a plain reassign is correct — no reseal needed.
+        // Reassign the row to the reserved note root (the gate/seal anchor). That root is
+        // structurally open — `lock_folder` refuses to seal an `is_root` container — so a plain
+        // reassign is correct and no reseal is needed. This used to say the same thing about
+        // "the default folder", which was a claim about a resolver that did not honour it.
         state.db.set_note_doc_folder(id, &default_id)?;
         // Move the plaintext `.md` into the default folder's vault subdir + re-point exported_path.
         if let Some(row) = state.db.get_note_row(id)? {
