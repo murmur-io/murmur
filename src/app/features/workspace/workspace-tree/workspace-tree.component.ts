@@ -36,10 +36,14 @@ const KIND_LABEL: Record<ItemKind, string> = {
   dashboard: "Dashboardy",
 };
 
-/** Where activating an item navigates. */
+/**
+ * Where activating an item navigates. These MUST name real entries in
+ * `app.routes.ts`: an unmatched path hits the router'''s catch-all and redirects to
+ * /record, so a wrong one here does not fail — it silently opens the recorder.
+ */
 const KIND_ROUTE: Record<ItemKind, string> = {
   meeting: "/meeting",
-  note: "/note",
+  note: "/notes",
   task: "/tasks",
   dashboard: "/dashboards",
 };
