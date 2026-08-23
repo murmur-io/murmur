@@ -660,11 +660,21 @@ impl Db {
                 self.set_folder_is_root(&f.id)?;
                 Ok(f.id)
             }
+            // Resolved before either insert, and passed in, so the root is created already inside
+            // the project rather than parented by a second write that can fail on its own. Its PATH
+            // is unchanged either way, because the workspace project occupies the vault root.
             Some(_locked) => {
-                let path = self.first_free_note_root_path()?;
-                self.insert_note_root(&path)
+                // The free path is chosen INSIDE the insert's savepoint, not here. Choosing it
+                // out here and passing it in leaves a window: another writer can claim that
+                // path with an ordinary container — possibly a SEALED one — and the insert
+                // would then hand back a row that is not the root and cannot be one.
+                let project = self.workspace_project_id()?;
+                self.insert_free_note_root(project.as_deref())
             }
-            None => self.insert_note_root("Notes"),
+            None => {
+                let project = self.workspace_project_id()?;
+                self.insert_note_root("Notes", project.as_deref())
+            }
         }
     }
 
@@ -694,14 +704,23 @@ impl Db {
     }
 
     /// The first free "Inbox"-style path for a separate note-root (when the legacy "Notes" is locked).
-    fn first_free_note_root_path(&self) -> Result<String> {
+    /// The chooser, run against a connection the caller already holds — so the choice and
+    /// the write happen inside one savepoint instead of racing between two locks.
+    fn first_free_note_root_path_in(conn: &rusqlite::Connection) -> Result<String> {
         for n in 0..1000 {
             let path = if n == 0 {
                 "Inbox".to_string()
             } else {
                 format!("Inbox {}", n + 1)
             };
-            if self.folder_by_path(&path)?.is_none() {
+            let taken: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM folders WHERE path = ?1)",
+                    rusqlite::params![path],
+                    |r| Ok(r.get::<_, i64>(0)? != 0),
+                )
+                .map_err(map_err)?;
+            if !taken {
                 return Ok(path);
             }
         }
@@ -710,15 +729,57 @@ impl Db {
         ))
     }
 
+
     /// Insert a fresh reserved note-root at `path` (name = `path`, `is_root=1`, unlocked, no parent).
     /// `INSERT OR IGNORE` on the UNIQUE path guards a race, then reads the id back.
-    fn insert_note_root(&self, path: &str) -> Result<String> {
+    /// Insert the reserved note root at `path`, parented into `parent_id`, as ONE unit.
+    ///
+    /// The parenting is not a follow-up write. The tree renders from the projects down, so a root
+    /// that exists without a parent is a root nobody can reach — and it holds every unfiled note. A
+    /// failure between the two writes would leave exactly that, permanently: `ensure_notes_root`
+    /// short-circuits on the row it finds, so no later launch would go back and repair it.
+    /// Insert the reserved note root at the first free `Inbox`-style path, choosing that
+    /// path inside the same savepoint that writes it.
+    fn insert_free_note_root(&self, parent_id: Option<&str>) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let conn = self.lock();
+        conn.execute_batch("SAVEPOINT note_root_insert")
+            .map_err(map_err)?;
+        let outcome = Self::first_free_note_root_path_in(&conn)
+            .and_then(|path| Self::insert_note_root_in(&conn, &id, &path, parent_id));
+        match &outcome {
+            Ok(_) => conn.execute_batch("RELEASE note_root_insert"),
+            Err(_) => conn.execute_batch("ROLLBACK TO note_root_insert; RELEASE note_root_insert"),
+        }
+        .map_err(map_err)?;
+        outcome
+    }
+
+    fn insert_note_root(&self, path: &str, parent_id: Option<&str>) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = self.lock();
+        conn.execute_batch("SAVEPOINT note_root_insert")
+            .map_err(map_err)?;
+        let outcome = Self::insert_note_root_in(&conn, &id, path, parent_id);
+        match &outcome {
+            Ok(_) => conn.execute_batch("RELEASE note_root_insert"),
+            Err(_) => conn.execute_batch("ROLLBACK TO note_root_insert; RELEASE note_root_insert"),
+        }
+        .map_err(map_err)?;
+        outcome
+    }
+
+    /// The body of [`Db::insert_note_root`], always called inside its savepoint.
+    fn insert_note_root_in(
+        conn: &rusqlite::Connection,
+        id: &str,
+        path: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
         conn.execute(
             "INSERT OR IGNORE INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind, is_root)
-             VALUES (?1, ?2, ?2, NULL, 0, NULL, ?3, 'note', 1)",
-            rusqlite::params![id, path, chrono::Utc::now().to_rfc3339()],
+             VALUES (?1, ?2, ?2, ?4, 0, NULL, ?3, 'note', 1)",
+            rusqlite::params![id, path, chrono::Utc::now().to_rfc3339(), parent_id],
         )
         .map_err(map_err)?;
         // Ensure is_root=1 even if a same-path row pre-existed (the OR IGNORE kept the old one). The
@@ -730,12 +791,30 @@ impl Db {
             rusqlite::params![path],
         )
         .map_err(map_err)?;
+        // A same-path row may have pre-existed (the OR IGNORE kept it), and it can be the parentless
+        // root a pre-hierarchy build created. Adopt it here for the same reason the insert carries a
+        // parent: unreachable is indistinguishable from lost.
+        if let Some(project) = parent_id {
+            conn.execute(
+                "UPDATE folders SET parent_id = ?2 WHERE path = ?1 AND parent_id IS NULL",
+                rusqlite::params![path, project],
+            )
+            .map_err(map_err)?;
+        }
+        // Read back the row that IS the root, not merely the row sitting at this path. The
+        // `is_root` update above deliberately refuses a locked row, so a container that
+        // claimed the path in between would leave this returning a non-root — and every
+        // caller treats what comes back as the always-open home for unfiled notes.
         conn.query_row(
-            "SELECT id FROM folders WHERE path = ?1",
+            "SELECT id FROM folders WHERE path = ?1 AND COALESCE(is_root, 0) = 1",
             rusqlite::params![path],
             |r| r.get::<_, String>(0),
         )
-        .map_err(map_err)
+        .optional()
+        .map_err(map_err)?
+        .ok_or_else(|| {
+            AppError::Storage("could not establish the reserved notes root".into())
+        })
     }
 
     pub fn upsert_note(&self, note: &NoteRecord) -> Result<()> {

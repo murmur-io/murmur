@@ -1087,38 +1087,65 @@ pub(crate) fn create_note_folder_inner(
     let clean = crate::summarize::organize::sanitize_folder(name)
         .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
 
-    // Resolve the parent's path. A None parent roots under the default "Notes" folder so every note
-    // folder is namespaced under "Notes/…" (can't collide with a meeting path; vault export lands
-    // under <vault>/Notes/…). A Some parent MUST be a note-folder.
-    let parent_path = match parent_id {
-        Some(pid) => {
-            let parent = state
-                .db
-                .note_folder_by_id(pid)?
-                .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {pid}")))?;
-            parent.path
-        }
-        None => {
-            // Ensure the root "Notes" folder exists and nest under it.
-            state.db.ensure_default_note_folder()?;
-            "Notes".to_string()
-        }
+    // Resolve the parent FIRST, then gate it, then compose the path from THAT container. These three
+    // used to be decided separately, and they agreed only on a database where nothing was sealed:
+    //
+    //   - the seal was checked only for an EXPLICIT parent, so a defaulted one was never checked;
+    //   - the path was composed from the literal "Notes", and the parent link came from
+    //     `ensure_default_note_folder`, which returns whatever row holds the "Notes" path — creating
+    //     it if absent, and returning it EVEN WHEN IT IS SEALED. So on a database where the user has
+    //     locked "Notes", both the link and the directory landed inside a sealed container while the
+    //     child itself was open: plaintext into a sealed tree, which is precisely what this step
+    //     exists to prevent.
+    //
+    // `ensure_notes_root` is the resolver that cannot do that. It returns the RESERVED note root —
+    // the one `lock_folder` refuses to seal — and when "Notes" is already taken by a locked container
+    // it puts that root somewhere else ("Inbox N") rather than handing back the locked row.
+    let parent_id_owned: String = match parent_id {
+        Some(pid) => pid.to_string(),
+        None => state.db.ensure_notes_root()?,
     };
-    let rel_path = format!("{parent_path}/{clean}");
+    let parent = state
+        .db
+        .note_folder_by_id(&parent_id_owned)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {parent_id_owned}")))?;
+    // One gate for both, so an explicit and a defaulted parent cannot be governed by different rules.
+    let parent_seal = container_parent_seal(state, &parent_id_owned)?;
+    // An empty parent path is the vault root (the workspace project's own path), so
+    // composing blindly would yield "/Name". The meeting-side create already has
+    // this branch; the two must agree, because a path is what the seal keys its
+    // vault work off.
+    let parent_path = parent.path;
+    let rel_path = if parent_path.is_empty() {
+        clean.clone()
+    } else {
+        format!("{parent_path}/{clean}")
+    };
 
     // Create the vault subdirectory (only when a vault is configured); assert it stays in-vault.
-    if let Some(vault) = vault_path(state) {
-        let vault_root = std::path::Path::new(&vault);
-        let dir = assert_in_vault(vault_root, std::path::Path::new(&rel_path))?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| AppError::Export(format!("create note folder dir failed: {e}")))?;
-    }
+    // The path is VALIDATED here and the directory is created at the very end, only
+    // once the container is durably in the state it will be observed in.
+    //
+    // Creating it first is what made the undo hard: a failed seal then had to remove
+    // a directory the seal itself may have written into, `remove_dir` is non-recursive
+    // so it fails on any residue, and removing recursively would risk deleting
+    // something that was never ours. Ordering it last removes the whole question —
+    // there is nothing to undo, because nothing was made. A row without a directory is
+    // recoverable (the export path creates one on demand); plaintext inside a sealed
+    // tree is not.
+    let dir: Option<std::path::PathBuf> = match vault_path(state) {
+        Some(vault) => Some(assert_in_vault(
+            std::path::Path::new(&vault),
+            std::path::Path::new(&rel_path),
+        )?),
+        None => None,
+    };
 
     let folder = NoteFolder {
         id: uuid::Uuid::new_v4().to_string(),
         name: clean,
         path: rel_path,
-        parent_id: parent_id.map(|s| s.to_string()),
+        parent_id: Some(parent_id_owned.clone()),
         locked: false,
         // A freshly created folder is never sealed, so never session-unlocked.
         unlocked: false,
@@ -1126,9 +1153,21 @@ pub(crate) fn create_note_folder_inner(
         is_root: false,
         kind: "note".into(),
     };
-    state
-        .db
-        .insert_note_folder(&folder, &chrono::Utc::now().to_rfc3339())?;
+    let now = chrono::Utc::now().to_rfc3339();
+    if matches!(parent_seal, ParentSeal::SealChild) {
+        // Born sealed in one statement — see the meeting-side create for why this is not
+        // "insert, then lock": the window between those two writes is the state this guard
+        // exists to prevent, and no undo can close it.
+        let wrapped = wrapped_key_for_new_sealed_container(state, &folder.id)?;
+        state.db.insert_sealed_note_folder(&folder, &now, &wrapped)?;
+        create_container_dir_or_undo(state, &folder.id, dir.as_deref())?;
+        return Ok(NoteFolder {
+            locked: true,
+            ..folder
+        });
+    }
+    state.db.insert_note_folder(&folder, &now)?;
+    create_container_dir_or_undo(state, &folder.id, dir.as_deref())?;
     Ok(folder)
 }
 
@@ -1177,6 +1216,24 @@ pub async fn move_note_folder(
     move_note_folder_inner(state.inner(), &id, parent_id.as_deref())
 }
 
+/// Refuse a move whose subtree contains ANY sealed container, session-unlocked or not.
+///
+/// Asks by PATH PREFIX, which is the same question the move's own rewrite asks. Walking
+/// parent links instead would disagree with the operation it guards on exactly the rows
+/// this step repairs — a shipped note container has a correct path and a NULL parent
+/// link — so a locked descendant would be invisible here and moved anyway. One query
+/// also has no depth to bound and no cycle to loop on.
+fn refuse_sealed_subtree(state: &AppState, path: &str) -> Result<(), AppError> {
+    if state.db.subtree_has_sealed_container(path)? {
+        return Err(AppError::Locked(
+            "this folder, or one inside it, is locked — remove the lock, move it, then lock \
+             it again"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Inner of [`move_note_folder`] taking `&AppState`.
 pub(crate) fn move_note_folder_inner(
     state: &AppState,
@@ -1188,28 +1245,68 @@ pub(crate) fn move_note_folder_inner(
         .db
         .note_folder_by_id(id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no note folder {id}")))?;
-    // New parent must be a note-folder (or None = a root note-folder under "Notes").
-    let parent_path = match parent_id {
-        Some(pid) => {
-            if pid == id {
-                return Err(AppError::InvalidArg(
-                    "a folder cannot be its own parent".into(),
-                ));
-            }
-            state
-                .db
-                .note_folder_by_id(pid)?
-                .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {pid}")))?
-                .path
-        }
-        None => {
-            state.db.ensure_default_note_folder()?;
-            "Notes".to_string()
-        }
+    // A move rewrites the `path` columns the seal keys its vault work off and physically
+    // relocates the directory, so the whole moved subtree must be OPEN — not merely
+    // session-unlocked. `ensure_folder_subtree_unlocked` accepts a sealed container that
+    // is unlocked for this session, which is right for a rename (the bytes stay where the
+    // seal can find them) but not here: a sealed container's vault directory holds
+    // ciphertext and blanked exports, and moving it re-points every recorded path while
+    // its blobs stay bound to keys and rows the move does not touch.
+    // The vault root is not movable, and it must be refused BEFORE the sealed-subtree
+    // question: an empty path makes the prefix "/%", which matches nothing, so the guard
+    // below would see an empty subtree and wave the move through. `rename_folder_inner`
+    // refuses the same container for the same reason — it is the one row whose path IS the
+    // vault, so composing filesystem work from it targets the vault itself.
+    if folder.path.is_empty() {
+        return Err(AppError::InvalidArg(
+            "this container is the workspace root and cannot be moved".into(),
+        ));
+    }
+    refuse_sealed_subtree(state, &folder.path)?;
+    if parent_id == Some(id) {
+        return Err(AppError::InvalidArg(
+            "a folder cannot be its own parent".into(),
+        ));
+    }
+    // Resolve the destination FIRST — explicit, or the reserved note root — then gate it, then
+    // compose the path from THAT container. Identical to the creation path, and for the same reason:
+    // deciding the three separately let them name different containers, and a defaulted destination
+    // was never gated at all. `ensure_notes_root` is the resolver that cannot hand back a sealed row.
+    let target_id: String = match parent_id {
+        Some(pid) => pid.to_string(),
+        None => state.db.ensure_notes_root()?,
     };
-    let new_path = format!("{parent_path}/{}", folder.name);
-    if new_path == folder.path {
-        return Ok(()); // no-op reparent.
+    let target = state
+        .db
+        .note_folder_by_id(&target_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {target_id}")))?;
+    // The destination's seal binds this container exactly as it binds a new one.
+    match container_parent_seal(state, &target_id)? {
+        ParentSeal::Open => {}
+        ParentSeal::SealChild => {
+            return Err(AppError::Locked(
+                "moving a folder into a sealed folder is not supported — remove the lock, move, \
+                 then lock again"
+                    .into(),
+            ))
+        }
+    }
+    // Same branch as both creates: an empty parent path is the vault root, so
+    // composing blindly would yield "/Name". All three writers compose alike, because
+    // a path is what the seal keys its vault work off.
+    let parent_path = target.path;
+    let new_path = if parent_path.is_empty() {
+        folder.name.clone()
+    } else {
+        format!("{parent_path}/{}", folder.name)
+    };
+    // A no-op ONLY when the destination already holds this container in both senses.
+    // Comparing paths alone let a re-parent silently do nothing on exactly the rows
+    // this step exists to repair: every note container a shipped build created has a
+    // correct path and a NULL parent link, so moving one to the container its path
+    // already names matched here and returned before writing the link.
+    if new_path == folder.path && folder.parent_id.as_deref() == Some(target_id.as_str()) {
+        return Ok(());
     }
     // A note-folder cannot move under its own descendant (would orphan the subtree). Descendants
     // have a path prefixed by this folder's path + "/".
@@ -1219,7 +1316,9 @@ pub(crate) fn move_note_folder_inner(
         ));
     }
     // Move the vault directory (best-effort) + rewrite this folder's + descendants' paths in the DB.
-    reparent_note_folder_paths(state, id, &folder.path, &new_path, parent_id)?;
+    // The RESOLVED destination, not the caller's argument: a defaulted move used to pass None
+    // straight through and blank the parent link, leaving a container the tree cannot reach.
+    reparent_note_folder_paths(state, id, &folder.path, &new_path, Some(&target_id))?;
     Ok(())
 }
 

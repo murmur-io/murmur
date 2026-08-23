@@ -497,6 +497,41 @@ impl Db {
     }
 
     /// Insert a folder row. `path` is the vault-relative folder path (UNIQUE).
+    /// Insert a container that is SEALED from its first instant.
+    ///
+    /// One statement, so there is no moment at which the row exists unsealed. Creating it
+    /// open and locking it afterwards is two writes with a window between them, and that
+    /// window is the exact state the creation guard exists to prevent: an open container
+    /// inside a sealed one. No undo can close it — an undo that itself fails leaves the row
+    /// behind — so it is not opened.
+    pub(crate) fn insert_sealed_folder(&self, f: &Folder, wrapped_key: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+            rusqlite::params![f.id, f.name, f.path, f.parent_id, wrapped_key, f.created_at, "meeting"],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The note-kind twin of [`Db::insert_sealed_folder`].
+    pub(crate) fn insert_sealed_note_folder(
+        &self,
+        f: &NoteFolder,
+        created_at: &str,
+        wrapped_key: &[u8],
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 'note')",
+            rusqlite::params![f.id, f.name, f.path, f.parent_id, wrapped_key, created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     pub fn insert_folder(&self, f: &Folder) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -811,6 +846,110 @@ impl Db {
         .map_err(map_err)?;
 
         Ok(())
+    }
+
+    /// Remove a container row that was created moments ago and must not survive.
+    ///
+    /// Deliberately NOT `delete_folder`: that one carries the whole user-facing delete contract —
+    /// refuse a non-empty subtree, unseal a sealed folder first, reparent authored notes. This is the
+    /// undo half of "create, then seal", where the row is empty because nothing has had the chance to
+    /// reference it. Leaving it behind is what would be dangerous: an OPEN container inside a sealed
+    /// one, which the at-rest re-blank sweep will never visit because that sweep keys off containers
+    /// marked locked.
+    ///
+    /// "Nothing references it" is ENFORCED here rather than left to the call site — for the
+    /// three tables that can name a container within this window. Nothing else can: the row
+    /// is seconds old and has never been returned to a caller, so no attachment, share or
+    /// meeting row can name it yet. The guard is a backstop against the call site being
+    /// reused later, NOT a complete referential check; a future caller outside the
+    /// create-then-seal window must extend it rather than assume it. Deleting a
+    /// container that anything still points at would orphan those rows out from under
+    /// `visibility_clause`, which resolves their visibility through the folder — turning a tidy-up
+    /// into exactly the unreachable-content failure the rest of this change exists to prevent. A
+    /// referenced row is left alone and the caller is told, because refusing to delete is always the
+    /// safe direction.
+    pub(crate) fn delete_freshly_created_folder(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        let removed = conn
+            .execute(
+                "DELETE FROM folders
+                  WHERE id = ?1
+                    AND NOT EXISTS (SELECT 1 FROM folders WHERE parent_id = ?1)
+                    AND NOT EXISTS (SELECT 1 FROM notes WHERE folder_id = ?1)
+                    AND NOT EXISTS (SELECT 1 FROM documents WHERE folder_id = ?1)",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        if removed == 0 {
+            return Err(AppError::Storage(
+                "refusing to remove a container that something still references".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Is any container at `path`, or beneath it, sealed?
+    ///
+    /// By PATH PREFIX, deliberately — the same rule the re-parent's own rewrite uses
+    /// (`reparent_note_folder_paths` matches `path LIKE '<old>/%'`). A guard that
+    /// enumerated by parent link instead would disagree with the operation it guards on
+    /// exactly the rows this step exists to repair: every note container a shipped
+    /// build created has a correct path and a NULL parent link, so a locked descendant
+    /// would be invisible to the guard and still moved by the rewrite.
+    pub(crate) fn subtree_has_sealed_container(&self, path: &str) -> Result<bool> {
+        let conn = self.lock();
+        let like = format!(
+            "{}/%",
+            path.replace('!', "!!").replace('%', "!%").replace('_', "!_")
+        );
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM folders
+                  WHERE locked = 1 AND (path = ?1 OR path LIKE ?2 ESCAPE '!'))",
+            rusqlite::params![path, like],
+            |r| Ok(r.get::<_, i64>(0)? != 0),
+        )
+        .map_err(map_err)
+    }
+
+    /// The container a creation with NO explicit parent belongs to: the project at the vault root.
+    ///
+    /// Before the hierarchy, a container created with no parent was a root and the sidebar showed
+    /// it. The tree now renders from the projects down, so such a container has no place in it and
+    /// simply does not appear — which is why every creation path resolves this instead of leaving a
+    /// NULL parent. Because the project's path IS the vault root, composing a child path from it
+    /// yields exactly the path that container gets today.
+    ///
+    /// `None` only on a database the adoption declined (a machine-owned container occupies the vault
+    /// root).
+    ///
+    /// Nothing constrains the table to ONE project at the vault root — `path` is unique, so a second
+    /// one cannot exist today, but that is a property of a column rather than a stated invariant of
+    /// this predicate. The ordering makes the answer deterministic regardless: the oldest row wins,
+    /// so every caller and every later launch resolve the same project even if the shape ever
+    /// changes.
+    ///
+    /// Callers do NOT share one response to that, and the difference is deliberate.
+    /// `require_workspace_project` (the two creates) refuses, because a container created without a
+    /// project is invisible in a tree rendered from the projects down — and so is everything the
+    /// user then puts in it. `ensure_notes_root` passes the `None` through instead, because the
+    /// reserved note root must exist either way: refusing there would make an un-adopted database
+    /// unable to hold an unfiled note at all, which is worse than a root that is momentarily
+    /// unparented and gets adopted by the next migration run.
+    pub fn workspace_project_id(&self) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id FROM folders
+              WHERE COALESCE(level, 'folder') = 'project'
+                AND path = ''
+                AND COALESCE(kind, 'meeting') IN ('meeting', 'note')
+              ORDER BY created_at ASC, id ASC
+              LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
     }
 
     /// Every folder's hierarchy LEVEL (`"project"` or `"folder"`), keyed by id.
