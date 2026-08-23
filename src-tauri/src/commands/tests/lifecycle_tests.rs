@@ -7315,10 +7315,33 @@
         // A note folder — `create_note_folder_inner` stamps `kind='note'`.
         let nf = create_note_folder_inner(&state, "Ideas", None).unwrap();
 
-        let folders = state.db.list_folders().unwrap();
+        // The tree is built exactly as `list_folders` builds it — INCLUDING the legacy-tree shim.
+        // Without that, this oracle would guard a pipeline nobody renders: the note root is adopted
+        // into the workspace project, so a raw forest reaches the note container through the project
+        // node, while the sidebar never sees a project at all. Running the real transform is also what
+        // makes the shim itself load-bearing here — delete it and this test goes red, which is the
+        // point, because deleting it is what would reinstate the 2026-07-14 leak.
         let unlocked = std::collections::HashSet::new();
         let counts = state.db.count_notes_per_folder(&unlocked).unwrap();
         let kinds = state.db.folder_kinds().unwrap();
+        let levels = state.db.folder_levels().unwrap();
+        let raw = state.db.list_folders().unwrap();
+        // Control, so this guard cannot quietly go vacuous: in the RAW forest the note root really is
+        // parented into a project. That is what makes filtering the top level insufficient on its own,
+        // and therefore what the shim below is for. If this ever stops holding, the assertion at the
+        // bottom would still pass while proving nothing, so fail here instead.
+        let root_of_note = raw
+            .iter()
+            .find(|f| Some(f.id.as_str()) == nf.parent_id.as_deref())
+            .expect("the note container has a parent row");
+        assert_eq!(
+            levels
+                .get(root_of_note.parent_id.as_deref().unwrap_or(""))
+                .map(String::as_str),
+            Some("project"),
+            "the note subtree is expected to hang off a project in the raw forest"
+        );
+        let folders = flatten_projects_for_legacy_tree(raw, &levels);
         let tree = build_folder_tree(&folders, &counts, &unlocked, &kinds);
 
         let meeting_node = tree
@@ -7326,22 +7349,37 @@
             .find(|n| n.id == "mf1")
             .expect("meeting folder present in the tree");
         assert_eq!(meeting_node.kind, "meeting");
-        let note_node = tree
-            .iter()
-            .find(|n| n.id == nf.id)
-            .expect("note folder present in the tree");
+
+        // A note container is now nested under the note root — its parent link follows its path, which
+        // is where the hierarchy needs it. So the leak this test guards is checked over the WHOLE
+        // forest rather than only its top level: whichever depth the note container sits at, it must
+        // not be reachable from anything the Meetings sidebar renders.
+        fn find<'a>(nodes: &'a [FolderNode], id: &str) -> Option<&'a FolderNode> {
+            for n in nodes {
+                if n.id == id {
+                    return Some(n);
+                }
+                if let Some(hit) = find(&n.children, id) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        let note_node = find(&tree, &nf.id).expect("note folder present in the tree");
         assert_eq!(
             note_node.kind, "note",
             "the note folder must be tagged so the Meetings tree can filter it out"
         );
 
-        // The Meetings sidebar renders `kind != "note"`: only the meeting folder survives, the note
-        // folder never appears there.
+        // The Meetings sidebar renders `kind != "note"` at the top level. The note container must not
+        // appear there, nor beneath anything that does.
         let meetings_only: Vec<_> = tree.iter().filter(|n| n.kind != "note").collect();
         assert!(meetings_only.iter().any(|n| n.id == "mf1"));
         assert!(
-            !meetings_only.iter().any(|n| n.id == nf.id),
-            "a note folder must NEVER render in the Meetings tree"
+            meetings_only
+                .iter()
+                .all(|n| find(std::slice::from_ref(*n), &nf.id).is_none()),
+            "a note folder must NEVER be reachable from the Meetings tree, at any depth"
         );
     }
 
@@ -30896,4 +30934,680 @@
         // And an ordinary container on the same database still renames.
         rename_folder_inner(&state, "f-work".into(), "Ops".into()).unwrap();
         assert!(vault.join("Ops").is_dir());
+    }
+
+    // ── container-creation guards ───────────────────────────────────────────────────────────────
+    //
+    // Before the hierarchy, the shipped UI only ever created containers at the root, so none of the
+    // three writers asked what a parent's seal meant for its child — and a child created under a
+    // sealed parent was itself OPEN while its vault directory sat inside the sealed parent's. Under
+    // Projects › Folders that is the ordinary way a folder is made.
+
+    /// Session-unlock a sealed container, the way a successful Touch ID unlock leaves it.
+    /// Put a folder in the state a real session-unlock leaves it in.
+    ///
+    /// Membership of the unlocked set is only half of it: `unlock_folder` also CACHES the
+    /// master KEK it released, and that cache is what lets later work in the same session
+    /// proceed without another Touch ID. A fixture that set only the membership described a
+    /// state the app never produces — session-unlocked with no key — and any code that
+    /// depends on the key being there would look broken against it.
+    fn mark_session_unlocked(state: &AppState, folder_id: &str) {
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(folder_id.to_string());
+        let mut kek = state.master_kek.lock().unwrap();
+        if kek.is_none() {
+            *kek = Some(zeroize::Zeroizing::new(
+                crate::secrets::master_kek_with_policy("test", true).unwrap(),
+            ));
+        }
+    }
+
+    /// Creating inside a sealed, NOT session-unlocked container is refused — and nothing is created,
+    /// on disk or in the database.
+    ///
+    /// There is no key to seal the child with, so the alternatives would be to leave plaintext inside
+    /// a sealed tree or to prompt for authorisation from a path the user did not initiate.
+    #[test]
+    fn creating_inside_a_sealed_container_is_refused() {
+        let vault = tmp_vault("create-in-sealed");
+        let state = build_state_with_vault("create-in-sealed", &vault);
+        make_open_folder(&state.db, "f-legal", "Legal");
+        std::fs::create_dir_all(vault.join("Legal")).unwrap();
+        lock_folder_inner(&state, "f-legal".into()).unwrap();
+
+        let err = create_folder_inner(&state, "Q3".into(), Some("f-legal".into()))
+            .expect_err("the meeting-side create must refuse a sealed parent");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        // The note side resolves its parent through the note-folder namespace, so give it one.
+        make_open_folder(&state.db, "f-notes-parent", "Notes/Team");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-notes-parent'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        lock_folder_inner(&state, "f-notes-parent".into()).unwrap();
+        let err = create_note_folder_inner(&state, "Drafts", Some("f-notes-parent"))
+            .expect_err("the note-side create must refuse a sealed parent");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        // Nothing landed: no row, and no directory inside the sealed parents.
+        let children: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE parent_id IN ('f-legal', 'f-notes-parent')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 0, "a container was created inside a sealed one");
+        assert!(!vault.join("Legal/Q3").exists(), "a directory was created inside a sealed tree");
+        assert!(
+            !vault.join("Notes/Team/Drafts").exists(),
+            "a note-side directory was created inside a sealed tree"
+        );
+    }
+
+    /// Creating inside a sealed but SESSION-UNLOCKED container succeeds, and the child is already
+    /// sealed when the call returns.
+    ///
+    /// The key is available for this session, which is the only reason the caller may proceed at all,
+    /// so no extra authorisation is required and none is asked for.
+    #[test]
+    fn a_container_created_inside_an_unlocked_sealed_parent_is_born_sealed() {
+        let vault = tmp_vault("create-in-unlocked");
+        let state = build_state_with_vault("create-in-unlocked", &vault);
+        make_open_folder(&state.db, "f-legal", "Legal");
+        std::fs::create_dir_all(vault.join("Legal")).unwrap();
+        lock_folder_inner(&state, "f-legal".into()).unwrap();
+        mark_session_unlocked(&state, "f-legal");
+
+        let child = create_folder_inner(&state, "Q3".into(), Some("f-legal".into())).unwrap();
+        let locked: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT locked FROM folders WHERE id = ?1",
+                rusqlite::params![child.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(locked, 1, "the child must be sealed by the time creation returns");
+        // Sealed through the ordinary path means it has a real wrapped key, not just a flag.
+        let wrapped: Option<Vec<u8>> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT wrapped_key FROM folders WHERE id = ?1",
+                rusqlite::params![child.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(wrapped.is_some(), "no content key was minted for the child");
+    }
+
+    /// Re-parenting a note container into a sealed, not-unlocked container is refused.
+    #[test]
+    fn moving_a_container_into_a_sealed_container_is_refused() {
+        let vault = tmp_vault("move-into-sealed");
+        let state = build_state_with_vault("move-into-sealed", &vault);
+        let movable = create_note_folder_inner(&state, "Drafts", None).unwrap();
+        make_open_folder(&state.db, "f-target", "Notes/Sealed");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-target'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        lock_folder_inner(&state, "f-target".into()).unwrap();
+
+        let err = move_note_folder_inner(&state, &movable.id, Some("f-target"))
+            .expect_err("moving into a sealed container must be refused");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        // The exemption's SECOND case, which the creates treat differently: a sealed
+        // destination that IS session-unlocked is still refused here. The two creates seal
+        // an empty new container; a move relocates an existing subtree whose content is
+        // cached by renderers and visible over MCP, and sealing that needs the revocation
+        // machinery the project-lock cascade builds. Without this the refusal would read as
+        // "not implemented yet" rather than a decision.
+        mark_session_unlocked(&state, "f-target");
+        let err = move_note_folder_inner(&state, &movable.id, Some("f-target"))
+            .expect_err("a session-unlocked sealed destination is refused too");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        // And the mover itself is untouched.
+        let parent: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                rusqlite::params![movable.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(parent.as_deref(), Some("f-target"));
+    }
+
+    /// A creation with no explicit parent lands in the workspace project, and its path is exactly
+    /// what a root container receives today.
+    ///
+    /// The tree renders from the projects down, so a container left parentless would exist and be
+    /// unreachable — taking every note inside it with it.
+    #[test]
+    fn a_parentless_creation_lands_in_the_workspace_project() {
+        let vault = tmp_vault("parentless-creation");
+        let state = build_state_with_vault("parentless-creation", &vault);
+        let project = state.db.workspace_project_id().unwrap().expect("adopted");
+
+        let meeting_side = create_folder_inner(&state, "Work".into(), None).unwrap();
+        assert_eq!(meeting_side.parent_id.as_deref(), Some(project.as_str()));
+        assert_eq!(
+            meeting_side.path, "Work",
+            "the workspace project is the vault root, so the path is unchanged"
+        );
+
+        let note_side = create_note_folder_inner(&state, "Research", None).unwrap();
+        assert!(note_side.parent_id.is_some(), "a note container is never parentless either");
+        assert_eq!(note_side.path, "Notes/Research", "its path is unchanged too");
+
+        // Both are reachable from the project in the workspace tree.
+        let unlocked = std::collections::HashSet::new();
+        let forest = workspace_tree_inner(&state.db, &unlocked).unwrap();
+        let ids: Vec<&str> = forest[0].folders.iter().map(|f| f.id.as_str()).collect();
+        assert!(
+            ids.contains(&meeting_side.id.as_str()),
+            "meeting-side container unreachable: {ids:?}"
+        );
+    }
+
+    /// A container that cannot be given a key is not created at all.
+    ///
+    /// No injection: this is the real condition. The born-sealed path uses the KEK cached by
+    /// the parent's own unlock and never prompts — "Lock all" zeroizes that cache, and a
+    /// creation is not an operation the user authorised a Touch ID for. So the honest answer
+    /// is to refuse, and the oracle is that refusing leaves NOTHING behind.
+    ///
+    /// There is no partially-created state to hunt any more. The row is written already
+    /// sealed, in one statement, and the vault directory is made after it — so a failure
+    /// before that insert has nothing to undo, which is why this test can assert absence
+    /// rather than cleanup.
+    #[test]
+    fn a_container_that_cannot_be_sealed_is_not_created() {
+        let vault = tmp_vault("no-key-no-container");
+        let state = build_state_with_vault("no-key-no-container", &vault);
+        make_open_folder(&state.db, "f-legal", "Legal");
+        std::fs::create_dir_all(vault.join("Legal")).unwrap();
+        lock_folder_inner(&state, "f-legal".into()).unwrap();
+        mark_session_unlocked(&state, "f-legal");
+
+        // The parent stays session-unlocked while the KEK cache is gone — exactly what a
+        // "Lock all" leaves behind for a folder the session set still names.
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = create_folder_inner(&state, "Q3".into(), Some("f-legal".into()))
+            .expect_err("a container with no key must not be created");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        make_open_folder(&state.db, "f-notes-parent", "Notes/Team");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-notes-parent'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join("Notes/Team")).unwrap();
+        lock_folder_inner(&state, "f-notes-parent".into()).unwrap();
+        mark_session_unlocked(&state, "f-notes-parent");
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = create_note_folder_inner(&state, "Drafts", Some("f-notes-parent"))
+            .expect_err("the note-side create must refuse too");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        let children: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE parent_id IN ('f-legal', 'f-notes-parent')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 0, "a container survived inside a sealed one");
+        assert!(
+            !vault.join("Legal/Q3").exists(),
+            "a directory survived inside a sealed tree"
+        );
+        assert!(
+            !vault.join("Notes/Team/Drafts").exists(),
+            "a note-side directory survived inside a sealed tree"
+        );
+    }
+
+    /// Both writers report the state the database actually holds, not the one built before sealing.
+    ///
+    /// The value returned is what the frontend renders and what a caller chains onto. Reporting a
+    /// freshly born-sealed container as open is how a caller comes to export plaintext into it.
+    #[test]
+    fn a_born_sealed_container_reports_itself_locked_on_both_writers() {
+        let vault = tmp_vault("born-sealed-dto");
+        let state = build_state_with_vault("born-sealed-dto", &vault);
+        make_open_folder(&state.db, "f-legal", "Legal");
+        std::fs::create_dir_all(vault.join("Legal")).unwrap();
+        lock_folder_inner(&state, "f-legal".into()).unwrap();
+        mark_session_unlocked(&state, "f-legal");
+
+        let child = create_folder_inner(&state, "Q3".into(), Some("f-legal".into())).unwrap();
+        assert!(child.locked, "the meeting-side create reported an open container");
+
+        make_open_folder(&state.db, "f-notes-parent", "Notes/Team");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-notes-parent'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join("Notes/Team")).unwrap();
+        lock_folder_inner(&state, "f-notes-parent".into()).unwrap();
+        mark_session_unlocked(&state, "f-notes-parent");
+
+        let note_child =
+            create_note_folder_inner(&state, "Drafts", Some("f-notes-parent")).unwrap();
+        assert!(note_child.locked, "the note-side create reported an open container");
+    }
+
+    /// When "Notes" is occupied by a LOCKED container, a defaulted creation goes to the reserved
+    /// root instead — and its path, its parent link and its directory all name that same container.
+    ///
+    /// This is the case the three separate decisions used to disagree on. The path came from the
+    /// literal "Notes" and the parent from `ensure_default_note_folder`, which returns whatever row
+    /// holds that path EVEN WHEN IT IS SEALED — so the child was created open, inside a sealed tree,
+    /// with no gate having looked at it.
+    #[test]
+    fn a_defaulted_creation_never_lands_in_a_locked_notes_container() {
+        let vault = tmp_vault("notes-occupied");
+        let state = build_state_with_vault("notes-occupied", &vault);
+        make_open_folder(&state.db, "f-notes-taken", "Notes");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-notes-taken'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join("Notes")).unwrap();
+        lock_folder_inner(&state, "f-notes-taken".into()).unwrap();
+
+        let child = create_note_folder_inner(&state, "Drafts", None).unwrap();
+
+        assert!(
+            !child.path.starts_with("Notes/"),
+            "the child was placed inside the locked container: {}",
+            child.path
+        );
+        assert!(!child.locked, "the reserved root is always open, so its children are too");
+
+        // The parent link names the reserved root, and the root's own path is the one the child was
+        // composed from — the three agree.
+        let root_id = child.parent_id.clone().expect("a defaulted creation is never parentless");
+        let (root_path, is_root, root_locked): (String, i64, i64) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT path, COALESCE(is_root, 0), locked FROM folders WHERE id = ?1",
+                rusqlite::params![root_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(is_root, 1, "the parent must be the reserved note root");
+        assert_eq!(root_locked, 0, "the reserved note root is never sealed");
+        assert_eq!(
+            child.path,
+            format!("{root_path}/Drafts"),
+            "the path was composed from a different container than the parent link names"
+        );
+        assert!(
+            vault.join(&child.path).is_dir(),
+            "no directory at the recorded path: {}",
+            child.path
+        );
+        assert!(
+            !vault.join("Notes/Drafts").exists(),
+            "a plaintext directory was created inside the sealed container"
+        );
+
+        // And that root is inside the project, so the notes it holds stay reachable.
+        let root_parent: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                rusqlite::params![root_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            root_parent,
+            state.db.workspace_project_id().unwrap(),
+            "the relocated note root must still be adopted"
+        );
+    }
+
+    /// Moving a container to "no parent" resolves the same reserved root the creates do, gates it,
+    /// and writes it — it never blanks the parent link and never targets a locked "Notes".
+    ///
+    /// The move is the third writer, and it had both halves of the create's defect: the destination
+    /// path came from the literal "Notes" while `ensure_default_note_folder` decided the link, and the
+    /// seal check ran only for an explicit destination. It also passed the caller's `None` straight
+    /// into the re-parent, which blanks `parent_id` — leaving a container the tree cannot reach.
+    #[test]
+    fn moving_a_container_to_no_parent_lands_in_the_reserved_root() {
+        let vault = tmp_vault("move-to-default");
+        let state = build_state_with_vault("move-to-default", &vault);
+
+        // "Notes" is occupied by a LOCKED container, so the reserved root is elsewhere.
+        make_open_folder(&state.db, "f-notes-taken", "Notes");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-notes-taken'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join("Notes")).unwrap();
+        lock_folder_inner(&state, "f-notes-taken".into()).unwrap();
+
+        let root_id = state.db.ensure_notes_root().unwrap();
+        let root_path: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                rusqlite::params![root_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // A container nested one level down, then moved back out to "no parent".
+        let outer = create_note_folder_inner(&state, "Outer", None).unwrap();
+        let inner = create_note_folder_inner(&state, "Inner", Some(&outer.id)).unwrap();
+        move_note_folder_inner(&state, &inner.id, None).unwrap();
+
+        let (path, parent): (String, Option<String>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT path, parent_id FROM folders WHERE id = ?1",
+                rusqlite::params![inner.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            parent.as_deref(),
+            Some(root_id.as_str()),
+            "a defaulted move must write the resolved root, not blank the link"
+        );
+        assert_eq!(
+            path,
+            format!("{root_path}/Inner"),
+            "the path must name the container the link points at"
+        );
+        assert!(
+            !path.starts_with("Notes/"),
+            "the container was moved into the locked container: {path}"
+        );
+        assert!(vault.join(&path).is_dir(), "no directory at the recorded path: {path}");
+        assert!(
+            !vault.join("Notes/Inner").exists(),
+            "a plaintext directory was created inside the sealed container"
+        );
+    }
+
+    /// A move is refused when the SOURCE is sealed — including a sealed DESCENDANT that
+    /// the source's parent links do not reach.
+    ///
+    /// The guard has to ask the question the move's own rewrite asks. That rewrite matches
+    /// by path prefix; a parent-link walk would disagree with it on exactly the rows this
+    /// step repairs, because every note container a shipped build created carries a correct
+    /// path and a NULL parent link. So a locked descendant would be invisible to the guard
+    /// and moved anyway — its `path` rewritten while its blobs and key stay behind.
+    #[test]
+    fn moving_a_container_with_a_sealed_descendant_is_refused() {
+        let vault = tmp_vault("move-sealed-source");
+        let state = build_state_with_vault("move-sealed-source", &vault);
+
+        // (a) the container itself is sealed.
+        make_open_folder(&state.db, "f-self", "Notes/Self");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-self'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join("Notes/Self")).unwrap();
+        lock_folder_inner(&state, "f-self".into()).unwrap();
+
+        let err = move_note_folder_inner(&state, "f-self", None)
+            .expect_err("a sealed container must not be moved");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        // (b) an OPEN container holding a sealed descendant, linked ONLY by path — the shape
+        // every shipped note container is in.
+        let outer = create_note_folder_inner(&state, "Outer", None).unwrap();
+        make_open_folder(&state.db, "f-inner", &format!("{}/Inner", outer.path));
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note', parent_id = NULL WHERE id = 'f-inner'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join(format!("{}/Inner", outer.path))).unwrap();
+        lock_folder_inner(&state, "f-inner".into()).unwrap();
+
+        // Control: the descendant really is invisible to a parent-link walk, or this oracle
+        // would pass for the wrong reason.
+        assert!(
+            state.db.child_folders(&outer.id).unwrap().is_empty(),
+            "the fixture must reproduce the NULL-parent shape it exists to cover"
+        );
+
+        let before: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                rusqlite::params![outer.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let err = move_note_folder_inner(&state, &outer.id, Some("f-self"))
+            .expect_err("a sealed descendant must refuse the move");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        let after: String = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?1",
+                rusqlite::params![outer.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after, "a refused move must not rewrite any path");
+    }
+
+    /// A container whose vault directory cannot be made does not survive as a row.
+    ///
+    /// The directory is created LAST, so this is the one remaining step that can fail after
+    /// the row is durable — and a row without the directory its path names is a container the
+    /// user was told was not created. `create_dir_all` fails here for a real reason: a plain
+    /// FILE already occupies the path, which is what a vault synced from elsewhere can leave.
+    #[test]
+    fn a_container_whose_directory_cannot_be_made_leaves_no_row() {
+        let vault = tmp_vault("dir-fails-undo");
+        let state = build_state_with_vault("dir-fails-undo", &vault);
+        let project = state.db.workspace_project_id().unwrap().expect("adopted");
+
+        // A regular file where the container's directory would go.
+        std::fs::write(vault.join("Q3"), b"not a directory").unwrap();
+
+        let err = create_folder_inner(&state, "Q3".into(), None)
+            .expect_err("a container whose directory cannot be made must not be created");
+        assert!(matches!(err, AppError::Export(_)), "got {err:?}");
+
+        let rows: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE parent_id = ?1 AND name = 'Q3'",
+                rusqlite::params![project],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "a container survived without the directory its path names");
+
+        // The pre-existing file is untouched: it was never ours to remove.
+        assert_eq!(
+            std::fs::read(vault.join("Q3")).unwrap(),
+            b"not a directory",
+            "the undo took something the failed creation never made"
+        );
+    }
+
+    /// A failed creation removes every directory it created — and nothing else.
+    ///
+    /// `create_dir_all` makes components until one breaks, so the cleanup has to remove more
+    /// than the leaf. Two ways to get that wrong, both of which this fixture reproduces:
+    ///
+    ///   - inferring what to remove by walking upward over anything EMPTY takes the user's own
+    ///     empty directory, and — since emptiness never stops the walk — eventually the vault;
+    ///   - stopping at the first component that will not remove strands everything above it,
+    ///     because the deepest recorded component is usually the one that was never created.
+    ///
+    /// So the failure is placed DEEP, beneath components that do get created, next to a
+    /// directory the user already had.
+    #[test]
+    fn a_failed_creation_removes_only_what_it_created() {
+        let vault = tmp_vault("cleanup-floor");
+        let state = build_state_with_vault("cleanup-floor", &vault);
+        let project = state.db.workspace_project_id().unwrap().unwrap();
+
+        // The user's own empty directory, on the path the creation will travel.
+        let mine = vault.join("Mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        make_child_folder(&state.db, "f-mine", "Mine", "Mine", &project);
+
+        // A container two levels down whose directories do NOT exist yet, with a FILE where the
+        // last one would go — so `create_dir_all` creates the middle and then fails.
+        make_child_folder(&state.db, "f-mid", "Mid", "Mine/Mid", "f-mine");
+        std::fs::create_dir_all(mine.join("Mid")).unwrap();
+        std::fs::remove_dir(mine.join("Mid")).unwrap();
+        std::fs::write(mine.join("blocker"), b"x").unwrap();
+
+        // Compose a path whose LAST component collides with that file.
+        make_child_folder(&state.db, "f-blocked", "blocker", "Mine/blocker", "f-mine");
+        let err = create_folder_inner(&state, "Deep".into(), Some("f-blocked".into()))
+            .expect_err("the fixture must fail, or this oracle proves nothing");
+        assert!(matches!(err, AppError::Export(_)), "got {err:?}");
+
+        assert!(vault.is_dir(), "the cleanup removed the vault directory");
+        assert!(mine.is_dir(), "the cleanup removed a directory it did not create");
+        assert!(
+            mine.join("blocker").is_file(),
+            "the cleanup removed a file it did not create"
+        );
+    }
+
+    /// A note root created AFTER adoption is inside the project, not beside it.
+    #[test]
+    fn a_note_root_created_after_adoption_is_inside_the_project() {
+        let state = build_state("late-note-root");
+        let project = state.db.workspace_project_id().unwrap().expect("adopted");
+        let root = state.db.ensure_notes_root().unwrap();
+        let parent: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                rusqlite::params![root],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent.as_deref(),
+            Some(project.as_str()),
+            "unfiled notes would be unreachable in the tree otherwise"
+        );
+    }
+
+    /// Filing a meeting that has no note row is refused instead of silently affecting nothing.
+    ///
+    /// A meeting's container lives on its note rows, so one still recording — or whose summarize
+    /// failed — has nothing to carry the assignment, and the write matches zero rows.
+    #[test]
+    fn filing_a_meeting_with_no_note_is_refused_and_several_provider_rows_move_together() {
+        let state = build_state("file-without-note");
+        make_open_folder(&state.db, "f-work", "Work");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-raw".into(),
+                started_at: "2026-08-21T09:00:00Z".into(),
+                ended_at: None,
+                title: Some("Recording in progress".into()),
+                duration_s: 1,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let err = move_note_inner_impl(&state, "m-raw".into(), Some("f-work".into()))
+            .expect_err("filing a meeting with no note must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+
+        // A meeting WITH several provider rows still moves as one unit.
+        seed_meeting(&state.db, "m-two", "# claude", None);
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-two".into(),
+                provider_id: "ollama".into(),
+                markdown: "# ollama".into(),
+                created_at: "2026-08-21T09:05:00Z".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        move_note_inner_impl(&state, "m-two".into(), Some("f-work".into())).unwrap();
+        let stragglers: i64 = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM notes
+                   WHERE meeting_id = 'm-two' AND folder_id IS NOT 'f-work'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stragglers, 0, "a provider row was left behind in a stale container");
     }
