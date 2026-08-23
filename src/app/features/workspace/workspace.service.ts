@@ -61,6 +61,11 @@ export class WorkspaceService {
     }
   }
 
+  /** One container's own metadata (never its contents); `null` when unknown. */
+  getContainer(id: string): Promise<ContainerNode | null> {
+    return this.ipc.getContainer(id);
+  }
+
   /** One page of a container's items of one kind — what "see all" pages through. */
   listItems(
     containerId: string | null,
