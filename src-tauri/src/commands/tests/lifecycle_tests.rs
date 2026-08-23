@@ -31538,6 +31538,134 @@
         );
     }
 
+    /// Deleting a folder must not move its authored notes into a LOCKED container.
+    ///
+    /// `reparent_authored_notes_to_default` USED TO resolve its destination with
+    /// `ensure_default_note_folder`, whose comment asserted the result was safe: "the default
+    /// folder is OPEN (root Notes is never locked), so a plain reassign is correct". That is
+    /// not what the resolver does — it returns whatever row holds the path "Notes", creating
+    /// it if absent and returning it REGARDLESS of `locked`, and it never consults `is_root`.
+    ///
+    /// So on a database where the user has locked a container at "Notes", deleting any note
+    /// folder reassigns its notes there and exports their plaintext into its directory:
+    /// unsealed content inside a sealed tree, which the at-rest re-blank sweep never visits
+    /// because it keys off the container being marked locked.
+    #[test]
+    fn deleting_a_folder_never_files_its_notes_into_a_locked_container() {
+        let vault = tmp_vault("delete-into-locked");
+        let state = build_state_with_vault("delete-into-locked", &vault);
+
+        // The user's own locked container sitting on the "Notes" path.
+        make_open_folder(&state.db, "f-notes-taken", "Notes");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE folders SET kind = 'note' WHERE id = 'f-notes-taken'",
+                rusqlite::params![],
+            )
+            .unwrap();
+        std::fs::create_dir_all(vault.join("Notes")).unwrap();
+        lock_folder_inner(&state, "f-notes-taken".into()).unwrap();
+
+        // A note folder holding one authored note with a real exported .md.
+        let doomed = create_note_folder_inner(&state, "Drafts", None).unwrap();
+        let note = create_note_inner(&state, Some(&doomed.id), "Roadmap").unwrap();
+        update_note_doc_inner(&state, &note, "Roadmap", "# Roadmap\nShip Q3.").unwrap();
+
+        delete_folder_inner(&state, doomed.id.clone()).unwrap();
+
+        let landed: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT folder_id FROM documents WHERE id = ?1",
+                rusqlite::params![note],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Not merely "somewhere else": the RESERVED root, which is the always-open home for
+        // unfiled notes and the only destination that cannot later be sealed out from under
+        // them. Asserting only "not the locked one" would accept any folder at all.
+        let root = state.db.ensure_notes_root().unwrap();
+        assert_eq!(
+            landed.as_deref(),
+            Some(root.as_str()),
+            "an orphaned note must land in the reserved note root"
+        );
+        assert!(
+            !vault.join("Notes/Roadmap.md").exists(),
+            "plaintext was exported into a sealed container's directory"
+        );
+    }
+
+    /// Renaming a note container must not strand its authored notes' `.md` outside the seal.
+    ///
+    /// The rename physically moves the vault subtree, so every recorded export path under it
+    /// is stale the moment it returns. Meeting notes are re-derived by
+    /// `reexport_notes_under_subtree`; authored notes live in `documents.exported_path`, which
+    /// nothing on that path rewrites. The seal then removes plaintext BY RECORDED PATH ONLY
+    /// (`note_exported_path_rows_in_folder` → `remove_note_export_if_unchanged`) with no
+    /// directory sweep to catch what it missed — so the note the user just sealed stays
+    /// readable on disk under its new name.
+    ///
+    /// This is the 2026-07-11 NOTES-2 leak reappearing on the path that never called its fix.
+    #[test]
+    fn renaming_a_note_container_still_seals_its_authored_notes_md() {
+        let vault = tmp_vault("rename-then-seal");
+        let state = build_state_with_vault("rename-then-seal", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Roadmap", "# Roadmap\nShip Q3.").unwrap();
+
+        let before = get_note_inner(&state, &id)
+            .unwrap()
+            .exported_path
+            .expect("note exported to vault");
+        assert!(std::path::Path::new(&before).exists());
+
+        rename_folder_inner(&state, fid.clone(), "Plans".into()).unwrap();
+        assert!(
+            !std::path::Path::new(&before).exists(),
+            "control: the rename must actually move the file, or this oracle proves nothing"
+        );
+
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Nothing readable may survive anywhere under the vault.
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    out.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut survivors = Vec::new();
+        walk(&vault, &mut survivors);
+        assert!(
+            survivors.is_empty(),
+            "plaintext survived the seal after a rename: {survivors:?}"
+        );
+
+        // And the RECORDED path is cleared. An empty vault with a stale path still pointing at
+        // a file is the state a later relock would chase and miss; the disk and the row have to
+        // agree that nothing is exported.
+        assert!(
+            state
+                .db
+                .note_exported_path_rows_in_folder(&fid)
+                .unwrap()
+                .is_empty(),
+            "exported_path survived the seal"
+        );
+    }
+
     /// A note root created AFTER adoption is inside the project, not beside it.
     #[test]
     fn a_note_root_created_after_adoption_is_inside_the_project() {
