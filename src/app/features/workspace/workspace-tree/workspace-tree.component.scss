@@ -86,16 +86,25 @@
   }
 }
 
-/* The create affordance is revealed by hover or keyboard focus, so a resting tree
-   stays quiet — the same reveal the other trees use for their action clusters.
-   `:focus-within` is what keeps it reachable without a pointer. */
+/* Row affordances are MUTED at rest, not hidden.
+
+   They were `opacity: 0` until hover, matching the other trees' action clusters. That is
+   wrong here for a specific reason: one of these controls is the keyboard's only route to
+   filing an item, built precisely so the tree can be reorganised without a mouse — and
+   putting it behind a pointer gesture takes back what it was added to give. It also makes
+   the control's interactivity depend on a hover state that automation and touch input
+   deliver unreliably.
+
+   So they stay laid out and clickable at all times, and only their emphasis changes. */
 .row-add {
   margin-left: auto;
-  opacity: 0;
+  opacity: 0.45;
   transition: opacity var(--transition-fast);
 }
 
 mur-tree-row:hover .row-add,
-mur-tree-row:focus-within .row-add {
+mur-tree-row:focus-within .row-add,
+.row-add:hover,
+.row-add:focus-within {
   opacity: 1;
 }
