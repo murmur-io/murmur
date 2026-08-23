@@ -7905,6 +7905,20 @@ fn move_note_inner_impl(
     }
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
 
+    // The only production caller of this path is the user-initiated `move_note` command (the
+    // recording pipeline files a meeting by writing its note row directly, never through here),
+    // so the refusal surfaces to the person who asked for it and reaches nothing automated.
+    //
+    // A meeting's container lives on its NOTE rows — `meetings` has no folder column — so a meeting
+    // that has produced no note yet (still recording, or a failed summarize) has nothing to carry the
+    // assignment. The write would match zero rows and report success. Refuse instead, and say why:
+    // such a meeting stays where it is until it has a note, which is the state it is already in.
+    if folder_id.is_some() && note.is_none() {
+        return Err(AppError::InvalidArg(
+            "this meeting has no note yet — it can be filed once processing finishes".into(),
+        ));
+    }
+
     // A MEETING may only be filed under a MEETING folder — never a note folder
     // (the folder namespaces are disjoint; filing a meeting into the Notes
     // namespace is the folder-leak's mirror). The FE meeting move-menu already
@@ -10525,6 +10539,61 @@ fn folder_is_unlocked(state: &AppState, folder_id: &str) -> Result<bool, AppErro
         .lock()
         .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
     Ok(unlocked.contains(folder_id))
+}
+
+// ── CONTAINER-CREATION GATE ──────────────────────────────────────────────────────────────────────
+//
+// Placing a container under another has to answer one question: what does the parent's seal mean for
+// the child? Before the hierarchy this barely arose — the shipped UI only ever created containers at
+// the root — so none of the three writers asked it, and a child created under a sealed parent was
+// itself OPEN while its vault directory sat inside the sealed parent's directory. A plaintext `.md`
+// could then be exported into a sealed tree with nothing to notice: the at-rest re-blank sweep keys
+// off folder ids that are themselves marked locked, and the child is not one of them.
+//
+// Under Projects › Folders that is the ordinary way a folder is made, so the answer lives in ONE
+// place that every writer consults. Two writers that disagree about this is how the gap survives.
+
+/// What a parent's seal requires of a container being created inside it.
+pub(crate) enum ParentSeal {
+    /// The parent is open — create normally.
+    Open,
+    /// The parent is sealed AND session-unlocked, so its key is already available: create, then seal
+    /// the child before returning. No additional user authorisation is needed and none is asked for.
+    SealChild,
+}
+
+/// Decide what creating inside `parent_id` requires, or refuse.
+///
+/// Reads the IMMEDIATE parent only, which is a BOUND on this gate rather than a proof that no
+/// such state exists. It stops every open container this change can create beneath a sealed one;
+/// it does not speak for rows a shipped build already left, or for a lock applied to an ancestor
+/// while a descendant was open. Locks are per-container today, so the ancestor case has no way to
+/// arise from the lock commands either — but that is the lock model's property, not this gate's.
+/// **Part 5 changes
+/// that** — a project lock seals a whole subtree, and this gate must then consider the nearest
+/// SEALED ANCESTOR rather than the link parent, because the child's directory is composed from an
+/// ancestor path and can land inside a sealed tree without its own parent being sealed.
+///
+/// Refuses a sealed-and-NOT-session-unlocked parent with [`AppError::Locked`]: there is no key to
+/// seal the child with, so the only alternatives would be to leave plaintext inside a sealed tree or
+/// to prompt for authorisation from a code path the user did not initiate.
+pub(crate) fn container_parent_seal(
+    state: &AppState,
+    parent_id: &str,
+) -> Result<ParentSeal, AppError> {
+    let parent = state
+        .db
+        .folder_by_id(parent_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no parent folder {parent_id}")))?;
+    if !parent.locked {
+        return Ok(ParentSeal::Open);
+    }
+    if folder_is_unlocked(state, parent_id)? {
+        return Ok(ParentSeal::SealChild);
+    }
+    Err(AppError::Locked(
+        "unlock this folder before creating something inside it".into(),
+    ))
 }
 
 // ── SEAL-ON-WRITE (2026-07-10 lock-audit F1) ─────────────────────────────────────────────────────

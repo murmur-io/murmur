@@ -82,6 +82,23 @@ pub(crate) fn flatten_projects_for_legacy_tree(
         .collect()
 }
 
+/// The workspace project a parentless creation belongs to, or an error.
+///
+/// `Db::workspace_project_id` returns an Option because a database can genuinely
+/// lack one — before the hierarchy migration, or if it failed. Treating that as
+/// "then create without a parent" reintroduces exactly what the parent is for: the
+/// tree renders from the projects down, so a container with no project above it is
+/// invisible, and so is everything the user puts in it. Refusing is recoverable;
+/// an unreachable container full of notes is not.
+pub(crate) fn require_workspace_project(state: &AppState) -> Result<String, AppError> {
+    state.db.workspace_project_id()?.ok_or_else(|| {
+        AppError::Storage(
+            "this workspace has no default project yet — restart Murmur to finish setting it up"
+                .into(),
+        )
+    })
+}
+
 /// Refuse any path-composing operation on a container whose path IS the vault root.
 ///
 /// The hierarchy migration gives the default project `path = ''` — the first row in the app's
@@ -183,6 +200,29 @@ pub(crate) fn create_folder_inner(
         return Err(AppError::InvalidArg("the task folder is internal".into()));
     }
 
+    // A creation with no explicit parent belongs to the workspace project. The tree renders from the
+    // projects down, so a container left parentless would exist and be unreachable. The project
+    // occupies the vault root, so the composed path below is byte-identical to what a root container
+    // receives today.
+    let parent_id = match parent_id {
+        Some(pid) => Some(pid),
+        // Fail closed. A database with no workspace project is one the hierarchy
+        // migration never finished on, and creating here anyway would produce the
+        // unreachable container — invisible in a tree rendered from the projects
+        // down, with everything the user puts in it.
+        None => Some(require_workspace_project(state)?),
+    };
+    // What the parent's seal requires of this child — refuses a sealed parent whose key is not
+    // available this session. Resolved BEFORE anything is written or created on disk.
+    // The parent is resolved unconditionally above, so the gate is too. An `Option` here
+    // would only be a leftover from when a creation could genuinely have no parent.
+    let parent_seal = container_parent_seal(
+        state,
+        parent_id
+            .as_deref()
+            .expect("a creation always resolves a parent"),
+    )?;
+
     // Resolve the parent's vault-relative path (if any) and compose the child path.
     let parent_path = match parent_id.as_deref() {
         Some(pid) => {
@@ -201,12 +241,23 @@ pub(crate) fn create_folder_inner(
 
     // Create the vault subdirectory (best-effort but surfaced): only when a vault is configured.
     // D5: canonicalize + assert the composed dir stays inside the vault root before any mkdir.
-    if let Some(vault) = vault_path(state) {
-        let vault_root = std::path::Path::new(&vault);
-        let dir = assert_in_vault(vault_root, std::path::Path::new(&rel_path))?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| AppError::Export(format!("create folder dir failed: {e}")))?;
-    }
+    // The path is VALIDATED here and the directory is created at the very end, only
+    // once the container is durably in the state it will be observed in.
+    //
+    // Creating it first is what made the undo hard: a failed seal then had to remove
+    // a directory that the seal itself may have written into, `remove_dir` is
+    // non-recursive so it fails on any residue, and removing recursively would risk
+    // deleting something that was never ours. Ordering it last removes the whole
+    // question — there is nothing to undo, because nothing was made. A row without a
+    // directory is recoverable (the export path creates one on demand); plaintext
+    // inside a sealed tree is not.
+    let dir: Option<std::path::PathBuf> = match vault_path(state) {
+        Some(vault) => Some(assert_in_vault(
+            std::path::Path::new(&vault),
+            std::path::Path::new(&rel_path),
+        )?),
+        None => None,
+    };
 
     let folder = Folder {
         id: uuid::Uuid::new_v4().to_string(),
@@ -216,8 +267,129 @@ pub(crate) fn create_folder_inner(
         locked: false,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+    if matches!(parent_seal, ParentSeal::SealChild) {
+        // BORN sealed, in one statement. The parent is sealed and its key is available for
+        // this session, which is the only reason the caller may proceed at all — so the
+        // child's own key is minted and wrapped BEFORE the row exists, and the row is
+        // written already locked.
+        //
+        // This is deliberately not "insert, then run the ordinary lock path". That is two
+        // writes with a window between them, and the window IS the state this guard exists
+        // to prevent: an open container inside a sealed one, with the caller told the
+        // creation failed. No undo closes it — an undo that itself fails leaves the row
+        // behind — so the window is not opened. What the ordinary path would add here is
+        // nothing: its remaining work enumerates notes, documents, attachments and audio,
+        // and a container that did not exist a moment ago has none.
+        let wrapped = wrapped_key_for_new_sealed_container(state, &folder.id)?;
+        state.db.insert_sealed_folder(&folder, &wrapped)?;
+        create_container_dir_or_undo(state, &folder.id, dir.as_deref())?;
+        // Report what the database now holds, not the value built before sealing.
+        return Ok(Folder {
+            locked: true,
+            ..folder
+        });
+    }
     state.db.insert_folder(&folder)?;
+    create_container_dir_or_undo(state, &folder.id, dir.as_deref())?;
     Ok(folder)
+}
+
+/// The components of `dir` that do NOT exist yet, shallowest first, bounded by `floor`.
+///
+/// Recorded BEFORE `create_dir_all` runs, because afterwards there is no way to tell what it
+/// made from what was already there. An earlier version inferred it — remove every empty
+/// ancestor — and that was wrong twice over: an empty directory on this path may well have
+/// existed before the call (a user's own empty folder), and emptiness is not a stopping rule,
+/// so on a vault holding nothing else the walk climbed to the vault itself.
+fn components_to_create(dir: &std::path::Path, floor: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = dir;
+    while current != floor && current.starts_with(floor) {
+        if current.exists() {
+            break;
+        }
+        missing.push(current.to_path_buf());
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    missing.reverse();
+    missing
+}
+
+/// Remove exactly the directories this call created, deepest first.
+///
+/// A component that is ABSENT is not a failure — `create_dir_all` stops at the one that broke,
+/// so the deepest recorded component is usually the one that was never made, and treating that
+/// as a reason to stop would strand every component above it. Anything else that refuses to be
+/// removed does stop the walk, and correctly: a non-recursive `remove_dir` fails on a directory
+/// that now holds something, and a directory that holds something is no longer only ours.
+///
+/// Best-effort within that: what survives is an empty directory no row addresses, so no export
+/// and no path composition can reach it.
+fn remove_created_dirs(created: &[std::path::PathBuf]) {
+    for path in created.iter().rev() {
+        match std::fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// Materialise a container's vault directory, once the container itself is settled — and
+/// remove the row if that fails.
+///
+/// The directory is created last so a failed SEAL has nothing on disk to undo. That trade
+/// is only sound if the last step is itself undoable: `create_dir_all` fails on an
+/// existing regular file at the path, a permissions change, or a full disk, and returning
+/// then would leave a container the user was told was not created. Which half fails
+/// changes nothing about what the caller was promised.
+pub(crate) fn create_container_dir_or_undo(
+    state: &AppState,
+    folder_id: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    let vault = vault_path(state);
+    let floor = vault.as_deref().map(std::path::Path::new);
+    // What this call is ABOUT to create, recorded while the answer is still knowable.
+    let created = floor
+        .map(|floor| components_to_create(dir, floor))
+        .unwrap_or_default();
+    let Err(create_error) = std::fs::create_dir_all(dir) else {
+        return Ok(());
+    };
+    let create_error = AppError::Export(format!("create folder dir failed: {create_error}"));
+    remove_created_dirs(&created);
+    // If the container was born sealed, its wrapped content key is a COLUMN on the row being
+    // deleted, so removing the row disposes of it — there is no separate key store to clean
+    // up. Nothing was added to the session unlock set either: the born-sealed path writes the
+    // row and nothing else, and never touches that set.
+    //
+    // A database and a filesystem cannot be made atomic with each other, so this removal is
+    // best-effort and says so when it fails. What that leaves is not the hazard this step
+    // addresses: a row that survives is either SEALED — in which case it is exactly as
+    // protected as any other sealed container — or OPEN beneath an OPEN parent, which is an
+    // ordinary empty folder. Neither is an open container inside a sealed one, which is the
+    // state the ordering above makes unreachable.
+    match state.db.delete_freshly_created_folder(folder_id) {
+        Ok(()) => Err(create_error),
+        Err(undo_error) => {
+            tracing::error!(
+                target: "storage",
+                error = %undo_error,
+                "could not remove a container whose directory could not be created"
+            );
+            Err(AppError::Storage(format!(
+                "a container was created but its folder could not be made, and removing the \
+                 container failed ({undo_error})"
+            )))
+        }
+    }
 }
 
 /// Rename a folder: change its display `name` (and the matching vault subdirectory + every governed
