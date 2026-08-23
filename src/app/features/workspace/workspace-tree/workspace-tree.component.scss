@@ -104,15 +104,24 @@ mur-tree-row {
    deliver unreliably.
 
    So they stay laid out and clickable at all times, and only their emphasis changes. */
-.row-add {
+.row-add,
+.row-actions {
   margin-left: auto;
   opacity: 0.45;
   transition: opacity var(--transition-fast);
 }
 
+.row-actions {
+  margin-left: 0;
+}
+
 mur-tree-row:hover .row-add,
 mur-tree-row:focus-within .row-add,
+mur-tree-row:hover .row-actions,
+mur-tree-row:focus-within .row-actions,
 .row-add:hover,
-.row-add:focus-within {
+.row-add:focus-within,
+.row-actions:hover,
+.row-actions:focus-within {
   opacity: 1;
 }

@@ -209,6 +209,34 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
 
   test("Lock×shares dialog blocks locking a shared folder", async ({ page }) => {
     await mockTauri(page, {
+      // The ONE tree needs a folder to offer a lock on; the demo default has no hierarchy.
+      list_workspace_tree: () => [
+        {
+          id: "p-root",
+          name: "Workspace",
+          level: "project",
+          emoji: null,
+          tint: null,
+          locked: false,
+          unlocked: false,
+          isRoot: false,
+          folders: [
+            {
+              id: "f-shared",
+              name: "Shared work",
+              level: "folder",
+              emoji: null,
+              tint: null,
+              locked: false,
+              unlocked: false,
+              isRoot: false,
+              folders: [],
+              groups: [],
+            },
+          ],
+          groups: [],
+        },
+      ],
       folder_active_shares: () => ({
         links: 1,
         users: 0,
@@ -216,13 +244,14 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
       }),
     });
     await page.goto("/library");
-    // Wait for the folder tree, then trigger a lock on the first open folder row.
-    await expect(page.locator("app-folder-row").first()).toBeVisible({
-      timeout: 10_000,
-    });
-    // The lock affordance is the .lock-toggle on an open folder row.
-    const lockBtn = page.locator("app-folder-row .lock-toggle").first();
-    await lockBtn.click();
+    // The lock affordance moved into the container row's actions menu when the one hierarchy
+    // replaced the two per-type trees. The gate it must run is unchanged: probe shares FIRST,
+    // and put this dialog in front of the seal.
+    const project = page.getByRole("treeitem").first();
+    await expect(project).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("button", { name: /^Expand / }).first().click();
+    await page.getByRole("button", { name: /^Actions for / }).last().click();
+    await page.getByRole("menuitem", { name: "Lock folder" }).click();
 
     // The blocking dialog appears with the three choices. The host has no size
     // (position:fixed content), so assert on the inner dialog.
