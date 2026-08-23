@@ -2,6 +2,7 @@ import { Injectable, computed, inject, signal } from "@angular/core";
 
 import { IpcService } from "../../core/ipc.service";
 import type { ContainerNode, ItemKind, ItemPage } from "../../core/models";
+import type { DraggableKind } from "../folders/note-drag.service";
 
 /** Storage keys for the two persisted expansion sets. */
 const EXPANDED_CONTAINERS_KEY = "murmur.workspace.expandedContainers";
@@ -93,6 +94,24 @@ export class WorkspaceService {
   /** Create a folder inside a container, then refresh the tree so it appears. */
   async createFolder(containerId: string, name: string): Promise<void> {
     await this.ipc.createFolder(name, containerId);
+    await this.reload();
+  }
+
+  /**
+   * Move an item into a container.
+   *
+   * Dispatches to the EXISTING per-kind movers rather than reimplementing the
+   * transition. Those carry what matters and must not be bypassed: an open target
+   * moves the vault `.md`; a target that is sealed and session-unlocked seals the
+   * item on arrival so plaintext never lands inside a sealed container; a target
+   * that is sealed and not unlocked is refused.
+   */
+  async moveItem(kind: DraggableKind, id: string, containerId: string): Promise<void> {
+    if (kind === "meeting") {
+      await this.ipc.moveNote(id, containerId);
+    } else {
+      await this.ipc.moveNoteDoc(id, containerId);
+    }
     await this.reload();
   }
 
