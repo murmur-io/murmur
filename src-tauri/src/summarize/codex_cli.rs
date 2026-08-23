@@ -53,8 +53,17 @@ const SUPPORTED_CODEX_MAJOR: u64 = 0;
 const SUPPORTED_CODEX_MINOR: u64 = 146;
 #[cfg(not(test))]
 const CODEX_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+// Tests keep a SHORT budget so a wedged probe fails fast, but 2s encoded an assumption
+// that a process spawn is quick — and that is false inside a sandbox. The boundary cases
+// below spawn `sandbox-exec`, and running the suite under another Seatbelt profile (which
+// the agent harness does for every check) nests one inside the other, where the spawn alone
+// can exceed 2s. A correct implementation then failed the gate, and the failure looked
+// exactly like a broken network boundary.
+//
+// 8s still fails fast against the 30s wedge these tests use, while leaving room for a spawn
+// that is slow rather than stuck.
 #[cfg(test)]
-const CODEX_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const RECOVERY_DIR_PREFIX: &str = "murmur-codex-recovery-";
 const MAX_RECOVERY_DIRS: usize = 3;
 const MAX_RECOVERY_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
@@ -3419,6 +3428,11 @@ mod tests {
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
         let provider = CodexCliProvider::with_binary(fake_codex.to_string_lossy().into_owned());
 
+        // Derived, not restated: spelling the budget into the expected text meant tuning the
+        // constant broke this assertion for a reason that had nothing to do with the
+        // behaviour it covers.
+        let expected_timeout_phrase =
+            format!("timed out after {}s", CODEX_VERSION_PROBE_TIMEOUT.as_secs());
         let started = Instant::now();
         let availability = provider
             .availability_from(Some(&auth_home), Some(&root), None)
@@ -3428,8 +3442,8 @@ mod tests {
         assert!(
             matches!(
                 availability,
-                Availability::Unavailable { reason }
-                    if reason.contains("timed out after 2s")
+                Availability::Unavailable { ref reason }
+                    if reason.contains(&expected_timeout_phrase)
             ),
             "a wedged version probe must fail as a short readiness check"
         );
