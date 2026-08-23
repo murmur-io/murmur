@@ -134,3 +134,10 @@
     transition: none;
   }
 }
+
+/* A project's emoji stands IN the icon slot, so an emoji row and a glyph row
+   start their label at the same x. */
+.row-emoji {
+  font-size: 0.95rem;
+  line-height: 1;
+}

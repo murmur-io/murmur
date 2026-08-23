@@ -3499,3 +3499,62 @@ export interface DashboardDetail extends Dashboard {
   /** Device-private Task refs, intentionally excluded from board Ask. */
   work: OrgTask[];
 }
+
+// ── WORKSPACE HIERARCHY (Projects › Folders › typed item groups) ─────────────
+// Mirrors `src-tauri/src/storage/models.rs`. Every field name below is the
+// SERIALIZED name the backend emits (its DTOs carry `rename_all = "camelCase"`),
+// not a name chosen here — a hand-written interface that disagrees with the wire
+// is the #566/#568 failure, where every field read `undefined` and the renderer
+// took the view down with it.
+
+/** The four kinds of item a container can hold, in render order. */
+export type ItemKind = "meeting" | "note" | "task" | "dashboard";
+
+/** One row inside a container's type group. Carries NO on-disk path, by design. */
+export interface ItemRow {
+  kind: ItemKind;
+  id: string;
+  /** `null` for an untitled item — the FE supplies its own placeholder. */
+  title: string | null;
+  /** Meetings only; `null` for every other kind. */
+  durationS: number | null;
+  /** Newest-first sort key, epoch MILLISECONDS for every kind. */
+  sortAt: number;
+}
+
+/** One container's items of one kind: the first page, plus the full visible count. */
+export interface TypeGroup {
+  kind: ItemKind;
+  /** The FULL visible count for this kind — `items` is only the first page. */
+  total: number;
+  items: ItemRow[];
+}
+
+/**
+ * A container in the workspace tree: a Project (with child folders) or a Folder.
+ *
+ * A sealed-and-not-session-unlocked container carries NO groups at all — not even
+ * totals — so the tree renders it collapsed and count-free rather than empty.
+ */
+export interface ContainerNode {
+  id: string;
+  name: string;
+  level: "project" | "folder";
+  emoji: string | null;
+  tint: string | null;
+  /** Sealed on disk (the `folders.locked` column). */
+  locked: boolean;
+  /** Sealed AND session-unlocked (decrypted for this session only). */
+  unlocked: boolean;
+  /** The reserved always-open note root — it can never be sealed. */
+  isRoot: boolean;
+  folders: ContainerNode[];
+  groups: TypeGroup[];
+}
+
+/** One page of a single container's items of a single kind. */
+export interface ItemPage {
+  kind: ItemKind;
+  items: ItemRow[];
+  total: number;
+}

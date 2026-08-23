@@ -34,6 +34,8 @@ import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-p
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { MeetingsSidebarTreeComponent } from "../features/folders/meetings-sidebar-tree/meetings-sidebar-tree.component";
 import { NotesSidebarTreeComponent } from "../features/notes/notes-sidebar-tree/notes-sidebar-tree.component";
+import { WorkspaceService } from "../features/workspace/workspace.service";
+import { WorkspaceTreeComponent } from "../features/workspace/workspace-tree/workspace-tree.component";
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { ChromeService } from "../services/chrome.service";
@@ -64,6 +66,9 @@ const NOTES_TREE_KEY = "murmur-sidebar-notes-tree";
  * sidebar work, 2026-07-12).
  */
 const MEETINGS_TREE_KEY = "murmur-sidebar-meetings-tree";
+
+/** Persisted expansion of the workspace hierarchy section. */
+const WORKSPACE_TREE_KEY = "murmur-sidebar-workspace-tree";
 
 /** A primary navigation destination. `icon` selects the inline SVG. */
 interface NavItem {
@@ -173,6 +178,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     MurTabStripComponent,
     MeetingsSidebarTreeComponent,
     NotesSidebarTreeComponent,
+    WorkspaceTreeComponent,
     MurSidebarSectionComponent,
     LockSharesDialogComponent,
     DocumentPreviewComponent,
@@ -329,6 +335,15 @@ export class AppShellComponent {
    */
   private readonly _meetingsTreeOpen = signal(this.readStoredMeetingsTreeOpen());
   readonly meetingsTreeOpen = this._meetingsTreeOpen.asReadonly();
+
+  /**
+   * Persisted "Projekty" (workspace hierarchy) preference — default EXPANDED,
+   * matching the two per-type trees it will eventually replace.
+   */
+  private readonly _workspaceTreeOpen = signal(this.readStoredWorkspaceTreeOpen());
+  readonly workspaceTreeOpen = this._workspaceTreeOpen.asReadonly();
+
+  private readonly workspace = inject(WorkspaceService);
 
   /**
    * References to the two FOLDER-TREE-BODY components — resolve to
@@ -514,6 +529,25 @@ export class AppShellComponent {
    * removed as a redundant layer). Clears the note-folder filter; the
    * header's own routerLink handles the `/notes` navigation.
    */
+  /**
+   * Expand/collapse the workspace hierarchy, loading it when it opens.
+   *
+   * The forest lives in a root service, so a return visit renders the cached
+   * tree immediately while this reload replaces it underneath.
+   */
+  toggleWorkspaceTree(): void {
+    const next = !this._workspaceTreeOpen();
+    this._workspaceTreeOpen.set(next);
+    try {
+      localStorage.setItem(WORKSPACE_TREE_KEY, next ? "1" : "0");
+    } catch {
+      // A remembered expansion is a convenience; losing it must not break the nav.
+    }
+    if (next) {
+      void this.workspace.reload();
+    }
+  }
+
   onNotesHeaderSelect(): void {
     void this.notesService.selectFolder(null);
   }
@@ -692,6 +726,15 @@ export class AppShellComponent {
   private readStoredMeetingsTreeOpen(): boolean {
     try {
       return localStorage.getItem(MEETINGS_TREE_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  }
+
+  /** Read the persisted workspace-tree preference; default EXPANDED. */
+  private readStoredWorkspaceTreeOpen(): boolean {
+    try {
+      return localStorage.getItem(WORKSPACE_TREE_KEY) !== "0";
     } catch {
       return true;
     }
