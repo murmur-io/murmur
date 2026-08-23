@@ -76,6 +76,26 @@ export class WorkspaceService {
     return this.ipc.listContainerItems(containerId, kind, offset, limit);
   }
 
+  /**
+   * Create a note inside a container and return its id.
+   *
+   * Only NOTES and FOLDERS can be created into a container today. Dashboards have
+   * no container anchor yet and tasks are org-scoped, so offering either here would
+   * create something that does not land where the user asked — worse than not
+   * offering it. They arrive with their backend halves.
+   */
+  async createNote(containerId: string, title: string): Promise<string> {
+    const id = await this.ipc.createNote(containerId, title);
+    await this.reload();
+    return id;
+  }
+
+  /** Create a folder inside a container, then refresh the tree so it appears. */
+  async createFolder(containerId: string, name: string): Promise<void> {
+    await this.ipc.createFolder(name, containerId);
+    await this.reload();
+  }
+
   // ── expansion state, persisted per container and per type group ────────────
 
   isContainerExpanded(id: string): boolean {
