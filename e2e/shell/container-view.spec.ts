@@ -75,7 +75,7 @@ test("a container row opens that container, not the recorder", async ({ page }) 
   await expect(page.getByRole("heading", { name: /Acme/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /Standup/ })).toBeVisible();
   // The kind with no items renders no section at all, rather than an empty one.
-  await expect(page.getByRole("heading", { name: "Zadania" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Tasks" })).toHaveCount(0);
 });
 
 test("a note row opens the note route that actually exists", async ({ page }) => {
@@ -102,7 +102,7 @@ test("a note row opens the note route that actually exists", async ({ page }) =>
   await page.goto("/");
 
   await page.getByRole("button", { name: "Expand Acme" }).click();
-  await page.getByRole("button", { name: "Expand Notatki" }).click();
+  await page.getByRole("button", { name: "Expand Notes" }).click();
   await page.getByRole("button", { name: "Plan", exact: true }).click();
 
   // `/note/:id` does not exist; `/notes/:id` does. The wrong one silently lands

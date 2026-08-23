@@ -38,11 +38,13 @@ test("notes home renders the sidebar tree + the note table (incl. masked locked 
   // The sidebar's Notes section: the HEADER is the "all items" affordance
   // (the separate "All notes" root row was removed 2026-07-12 as a redundant
   // layer) + the tree lists both note folders directly.
+  // ONE hierarchy now, so the section is Projects and the folders hang under a project
+  // rather than under a per-type header.
   await expect(
-    page.locator("mur-sidebar-section .nav-row-link", { hasText: "Notes" }),
+    page.locator("mur-sidebar-section .nav-row-link", { hasText: "Projects" }),
   ).toBeVisible();
-  const treeNames = page.locator("app-notes-sidebar-tree mur-tree-row .row-label");
-  await expect(treeNames.filter({ hasText: "Work" })).toBeVisible();
+  await page.getByRole("button", { name: "Expand Workspace" }).click();
+  await expect(page.getByRole("button", { name: "Work", exact: true })).toBeVisible();
 
   // The table renders (thead + the visible note row + its tag pill).
   await expect(page.locator(".mur-table thead th", { hasText: "Title" })).toBeVisible();
