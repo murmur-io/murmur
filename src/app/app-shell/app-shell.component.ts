@@ -2,12 +2,10 @@ import {
   ChangeDetectionStrategy,
   Component,
   Injector,
-  afterNextRender,
   computed,
   effect,
   inject,
   signal,
-  viewChild,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import {
@@ -33,8 +31,6 @@ import { MurTabStripComponent } from "../design-system/tab-strip/tab-strip.compo
 import { DocumentPreviewComponent } from "../features/brain/document-preview/document-preview.component";
 import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-palette.component";
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
-import { MeetingsSidebarTreeComponent } from "../features/folders/meetings-sidebar-tree/meetings-sidebar-tree.component";
-import { NotesSidebarTreeComponent } from "../features/notes/notes-sidebar-tree/notes-sidebar-tree.component";
 import { WorkspaceService } from "../features/workspace/workspace.service";
 import { WorkspaceTreeComponent } from "../features/workspace/workspace-tree/workspace-tree.component";
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
@@ -177,8 +173,6 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     MurQuickSearchComponent,
     MurSidebarComponent,
     MurTabStripComponent,
-    MeetingsSidebarTreeComponent,
-    NotesSidebarTreeComponent,
     WorkspaceTreeComponent,
     MurSidebarSectionComponent,
     LockSharesDialogComponent,
@@ -358,17 +352,6 @@ export class AppShellComponent {
   private readonly workspace = inject(WorkspaceService);
 
   /**
-   * References to the two FOLDER-TREE-BODY components — resolve to
-   * `undefined` while their section is collapsed (each only renders inside
-   * `<mur-sidebar-section>`'s own `@if (expanded())`, projected as content).
-   * The section header's compact "+" icon forwards into
-   * {@link newNoteFolder}/{@link newMeetingFolder}; the header's vault-root
-   * drop target forwards into {@link onMeetingsHeaderDrop}.
-   */
-  private readonly notesSidebarTree = viewChild(NotesSidebarTreeComponent);
-  private readonly meetingsSidebarTree = viewChild(MeetingsSidebarTreeComponent);
-
-  /**
    * Whether the Insights group renders expanded: the stored preference, OR
    * forced open while the CURRENT route lives inside it (the active pill must
    * never be hidden by a collapsed group).
@@ -505,37 +488,6 @@ export class AppShellComponent {
   }
 
   /**
-   * The "Notes" section header's compact "+" icon — opens the note-folder
-   * tree's inline "New folder" field. Expands the tree first if it's
-   * collapsed (the tree component only exists in the DOM while open, so
-   * {@link notesSidebarTree} resolves to `undefined` until then) —
-   * `afterNextRender` defers the forward to AFTER that `@if` flips and the
-   * component actually mounts.
-   */
-  newNoteFolder(): void {
-    if (this.notesTreeOpen()) {
-      this.notesSidebarTree()?.startCreateFolder();
-      return;
-    }
-    this._notesTreeOpen.set(true);
-    afterNextRender(() => this.notesSidebarTree()?.startCreateFolder(), {
-      injector: this.injector,
-    });
-  }
-
-  /** The "Meetings" section header's compact "+" icon — mirrors {@link newNoteFolder}. */
-  newMeetingFolder(): void {
-    if (this.meetingsTreeOpen()) {
-      this.meetingsSidebarTree()?.openCreateFolder();
-      return;
-    }
-    this._meetingsTreeOpen.set(true);
-    afterNextRender(() => this.meetingsSidebarTree()?.openCreateFolder(), {
-      injector: this.injector,
-    });
-  }
-
-  /**
    * The "Notes" section HEADER was clicked (2026-07-12: the header IS the
    * "all items" affordance now — the separate "All notes" root row was
    * removed as a redundant layer). Clears the note-folder filter; the
@@ -614,32 +566,6 @@ export class AppShellComponent {
   /** The "Meetings" section header was clicked — mirrors {@link onNotesHeaderSelect}. */
   onMeetingsHeaderSelect(): void {
     this.folders.selectFolder(null);
-  }
-
-  /**
-   * A note was dropped onto the Meetings section HEADER (the vault-root drop
-   * target moved onto the header when the "All meetings" root row was
-   * removed, 2026-07-12) — forwards into
-   * `MeetingsSidebarTreeComponent.onDropNote` (which owns the toast +
-   * folder-name lookup) the same way the "+" forwarding does. Unlike the
-   * "+", the header renders even while the tree is COLLAPSED — expand it
-   * first in that case so the tree-body component exists to run the move
-   * (and so the user sees where the note landed).
-   */
-  onMeetingsHeaderDrop(meetingId: string): void {
-    if (this.meetingsTreeOpen()) {
-      void this.meetingsSidebarTree()?.onDropNote({ meetingId, folderId: null });
-      return;
-    }
-    this._meetingsTreeOpen.set(true);
-    afterNextRender(
-      () =>
-        void this.meetingsSidebarTree()?.onDropNote({
-          meetingId,
-          folderId: null,
-        }),
-      { injector: this.injector },
-    );
   }
 
   /** Open the ⌘K spotlight. */
