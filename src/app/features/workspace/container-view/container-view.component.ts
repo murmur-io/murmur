@@ -17,10 +17,10 @@ import { WorkspaceService } from "../workspace.service";
 const KINDS: readonly ItemKind[] = ["meeting", "note", "task", "dashboard"];
 
 const KIND_LABEL: Record<ItemKind, string> = {
-  meeting: "Spotkania",
-  note: "Notatki",
-  task: "Zadania",
-  dashboard: "Dashboardy",
+  meeting: "Meetings",
+  note: "Notes",
+  task: "Tasks",
+  dashboard: "Dashboards",
 };
 
 /** Where opening an item goes. These MUST match `app.routes.ts`. */
@@ -42,7 +42,7 @@ interface KindPage {
 
 /**
  * Everything one container holds, paged per kind — where the sidebar's
- * "Zobacz wszystkie" lands.
+ * "See all" lands.
  *
  * The sidebar shows the first few items of each kind; this is the rest. Without
  * it the tree's own navigation had nowhere to go: `/container/:id` fell through
@@ -147,7 +147,7 @@ export class ContainerViewComponent {
 
   protected itemTitle(item: ItemRow): string {
     const title = item.title?.trim();
-    return title ? title : "Bez tytułu";
+    return title ? title : "Untitled";
   }
 
   /** `null` for anything that is not a meeting, so the template renders nothing. */
@@ -189,5 +189,5 @@ function messageOf(error: unknown): string {
   if (error && typeof error === "object" && "message" in error) {
     return String((error as { message: unknown }).message);
   }
-  return "Nie udało się wczytać zawartości";
+  return "Could not load the contents";
 }

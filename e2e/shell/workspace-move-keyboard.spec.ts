@@ -25,7 +25,7 @@ const FOREST = [
   },
   {
     id: "p-target",
-    name: "Docelowy",
+    name: "Target",
     level: "project",
     emoji: null,
     tint: null,
@@ -37,7 +37,7 @@ const FOREST = [
   },
   {
     id: "p-sealed",
-    name: "Klienci",
+    name: "Clients",
     level: "project",
     emoji: null,
     tint: null,
@@ -62,9 +62,9 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await expect(page.getByRole("tree", { name: "Hierarchia obszaru roboczego" })).toBeVisible();
+  await expect(page.getByRole("tree", { name: "Workspace" })).toBeVisible();
   await page.getByRole("button", { name: "Expand Acme" }).click();
-  await page.getByRole("button", { name: "Expand Spotkania" }).click();
+  await page.getByRole("button", { name: "Expand Meetings" }).click();
 }
 
 /**
@@ -79,9 +79,9 @@ async function open(page: Page): Promise<void> {
 test("an item can be filed without a pointer", async ({ page }) => {
   await open(page);
 
-  await page.getByRole("button", { name: "Przenieś Standup" }).focus();
+  await page.getByRole("button", { name: "Move Standup" }).focus();
   await page.keyboard.press("Enter");
-  await page.getByRole("menuitem", { name: "Docelowy" }).focus();
+  await page.getByRole("menuitem", { name: "Target" }).focus();
   await page.keyboard.press("Enter");
 
   const moves = await page.evaluate(
@@ -93,13 +93,13 @@ test("an item can be filed without a pointer", async ({ page }) => {
 test("the move menu offers neither a sealed container nor the current one", async ({ page }) => {
   await open(page);
 
-  await page.getByRole("button", { name: "Przenieś Standup" }).focus();
+  await page.getByRole("button", { name: "Move Standup" }).focus();
   await page.keyboard.press("Enter");
 
   // Every mover refuses a sealed, not-unlocked destination, so offering it would only
   // produce an error the user cannot act on.
-  await expect(page.getByRole("menuitem", { name: "Klienci" })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: "Clients" })).toHaveCount(0);
   // And moving something to where it already is is not a move.
   await expect(page.getByRole("menuitem", { name: "Acme" })).toHaveCount(0);
-  await expect(page.getByRole("menuitem", { name: "Docelowy" })).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Target" })).toBeVisible();
 });

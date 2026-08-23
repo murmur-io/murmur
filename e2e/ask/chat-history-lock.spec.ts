@@ -6,6 +6,42 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
   page,
 }) => {
   await mockTauri(page, {
+    // No shares on this folder, so the lock flow seals directly instead of opening its
+    // lock×shares dialog. The flow probes this FIRST and fails closed, so leaving it to the
+    // demo default put a dialog in front of the behaviour under test.
+    folder_active_shares: () => ({ links: 0, users: 0, org: [] }),
+    list_workspace_tree: () => {
+      const locked = Boolean(
+        (window as unknown as { __historyNoteLocked?: boolean }).__historyNoteLocked,
+      );
+      return [
+        {
+          id: "p-root",
+          name: "Workspace",
+          level: "project",
+          emoji: null,
+          tint: null,
+          locked: false,
+          unlocked: false,
+          isRoot: false,
+          folders: [
+            {
+              id: "nf-history",
+              name: "History note folder",
+              level: "folder",
+              emoji: null,
+              tint: null,
+              locked,
+              unlocked: false,
+              isRoot: false,
+              folders: [],
+              groups: [],
+            },
+          ],
+          groups: [],
+        },
+      ];
+    },
     list_link_candidates: () => [
       { kind: "note", id: "n-secret", title: "Sensitive source" },
     ],
@@ -33,6 +69,10 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
           window as unknown as { __historyNoteLocked?: boolean }
         ).__historyNoteLocked = true;
       }
+      // The real lock emits this — `emit_ask_history_invalidated_fail_closed` runs on every
+      // lock-authority transition — and it is what scrubs mounted Ask plaintext. A mock that
+      // stays silent describes a lock that does not do what a lock does.
+      (globalThis as any).__demoEmit?.("murmur://ask-history-invalidated", null);
       return null;
     },
   });
@@ -52,7 +92,16 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
     page.getByText("Sensitive Ask message", { exact: true }),
   ).toBeVisible();
 
-  const lock = page.getByRole("button", { name: "Lock folder" }).first();
+  // Locking now lives in the container row's actions menu — the one hierarchy replaced the
+  // two per-type trees that each carried a bare lock toggle. The behaviour under test is
+  // what locking DOES, so the spec follows the affordance rather than pinning its old place.
+  // The folder lives INSIDE the project, so the project has to be expanded before its row
+  // exists at all — and the menu must be the FOLDER's, not the project's, which is what a
+  // `.first()` would have picked.
+  await page.getByRole("button", { name: "Expand Workspace" }).click();
+  await page.getByRole("button", { name: "Actions for History note folder" }).focus();
+  await page.keyboard.press("Enter");
+  const lock = page.getByRole("menuitem", { name: "Lock folder" });
   await expect(lock).toBeAttached();
   await lock.click({ force: true });
 
@@ -68,6 +117,42 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
   page,
 }) => {
   await mockTauri(page, {
+    // No shares on this folder, so the lock flow seals directly instead of opening its
+    // lock×shares dialog. The flow probes this FIRST and fails closed, so leaving it to the
+    // demo default put a dialog in front of the behaviour under test.
+    folder_active_shares: () => ({ links: 0, users: 0, org: [] }),
+    list_workspace_tree: () => {
+      const locked = Boolean(
+        (window as unknown as { __historyMeetingLocked?: boolean }).__historyMeetingLocked,
+      );
+      return [
+        {
+          id: "p-root",
+          name: "Workspace",
+          level: "project",
+          emoji: null,
+          tint: null,
+          locked: false,
+          unlocked: false,
+          isRoot: false,
+          folders: [
+            {
+              id: "f-history",
+              name: "History meeting folder",
+              level: "folder",
+              emoji: null,
+              tint: null,
+              locked,
+              unlocked: false,
+              isRoot: false,
+              folders: [],
+              groups: [],
+            },
+          ],
+          groups: [],
+        },
+      ];
+    },
     list_folders: () => {
       const locked = Boolean(
         (window as unknown as { __historyMeetingLocked?: boolean })
@@ -91,6 +176,7 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
           window as unknown as { __historyMeetingLocked?: boolean }
         ).__historyMeetingLocked = true;
       }
+      (globalThis as any).__demoEmit?.("murmur://ask-history-invalidated", null);
       return null;
     },
   });
@@ -101,7 +187,13 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
     page.getByText("Meeting-derived secret", { exact: true }),
   ).toBeVisible();
 
-  const lock = page.locator("app-folder-row .lock-toggle").first();
+  // The folder lives INSIDE the project, so the project has to be expanded before its row
+  // exists at all — and the menu must be the FOLDER's, not the project's, which is what a
+  // `.first()` would have picked.
+  await page.getByRole("button", { name: "Expand Workspace" }).click();
+  await page.getByRole("button", { name: "Actions for History meeting folder" }).focus();
+  await page.keyboard.press("Enter");
+  const lock = page.getByRole("menuitem", { name: "Lock folder" });
   await expect(lock).toBeAttached();
   await lock.click({ force: true });
   await expect(

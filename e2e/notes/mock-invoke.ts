@@ -38,6 +38,63 @@ export async function mockNotes(
     }),
 
     // --- folders (one open, one locked) ---
+    // The ONE sidebar tree, carrying the same two folders `list_note_folders` describes.
+    // The hierarchy replaced the two per-type trees, so a Notes spec that drives the sidebar
+    // now drives this — and a fixture that fed only the old reader would render an empty
+    // sidebar beside a populated page, which is not a state the app can be in.
+    list_workspace_tree: () => [
+      {
+        id: "p-root",
+        name: "Workspace",
+        level: "project",
+        emoji: null,
+        tint: null,
+        locked: false,
+        unlocked: false,
+        isRoot: false,
+        folders: [
+          {
+            id: "nf1",
+            name: "Notes",
+            level: "folder",
+            emoji: null,
+            tint: null,
+            locked: false,
+            unlocked: false,
+            // An ORDINARY folder, not the reserved root: the reserved root can never be
+            // sealed, and marking it so would quietly remove the lock affordance the notes
+            // specs exercise.
+            isRoot: false,
+            folders: [],
+            groups: [],
+          },
+          {
+            id: "nf2",
+            name: "Work",
+            level: "folder",
+            emoji: null,
+            tint: null,
+            locked: true,
+            unlocked: false,
+            isRoot: false,
+            folders: [],
+            groups: [],
+          },
+        ],
+        groups: [],
+      },
+    ],
+    folder_active_shares: () => ({ links: 0, users: 0, org: [] }),
+
+    // The container view a tree row opens. A sealed container reports itself locked and is
+    // never asked for its items — the backend refuses that read, and asking would surface an
+    // error where a deliberate refusal belongs.
+    get_container: (args: { id: string }) =>
+      args.id === "nf2"
+        ? { id: "nf2", name: "Work", level: "folder", emoji: null, tint: null, locked: true, unlocked: false, isRoot: false, folders: [], groups: [] }
+        : { id: args.id, name: "Notes", level: "folder", emoji: null, tint: null, locked: false, unlocked: false, isRoot: false, folders: [], groups: [] },
+    list_container_items: (args: { kind: string }) => ({ kind: args.kind, total: 0, items: [] }),
+
     list_note_folders: () => [
       { id: "nf1", name: "Notes", path: "Notes", parentId: null, locked: false, kind: "note" },
       { id: "nf2", name: "Work", path: "Notes/Work", parentId: null, locked: true, kind: "note" },
