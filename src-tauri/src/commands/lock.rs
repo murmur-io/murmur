@@ -86,6 +86,28 @@ fn lock_container_subtree(
     )
 }
 
+/// Open an org-share closure over EVERY container about to be sealed, returning the ones this
+/// call created (so a failure clears exactly those and never someone else's).
+///
+/// The closure marker is what `move_note` / `move_note_doc` consult to refuse filing anything into
+/// a folder that is closing. The single-folder lock always took one for its target, and the reason
+/// is a race: between the moment sealing starts and the moment `locked = 1` is published, the
+/// folder looks OPEN to every other writer. A concurrent move landing in that window puts plaintext
+/// into a folder whose seal has already walked past it.
+///
+/// A cascade multiplies that window by the size of the subtree, so every container in it needs the
+/// same marker — a descendant sealed without one is exactly the hole the target has been protected
+/// from all along.
+fn open_subtree_closures(state: &AppState, subtree: &[String]) -> Result<Vec<String>, AppError> {
+    let mut created = Vec::new();
+    for id in subtree {
+        if state.db.begin_org_folder_closure(id)? {
+            created.push(id.clone());
+        }
+    }
+    Ok(created)
+}
+
 /// Every container in `folder_id`'s subtree, DEEPEST FIRST, with the folder itself last.
 ///
 /// The order is the whole point. Locking is not atomic across containers — each seals under its
@@ -122,21 +144,23 @@ pub async fn lock_folder(
     // locking one seals everything inside it (see `lock_container_subtree`) — and this refusal is
     // a property the caller can fix and would want to fix before any container changed state.
     // Discovering it half-way through would leave a partial lock for a reason knowable up front.
-    for id in container_subtree_deepest_first(state.inner(), &folder_id)? {
-        if state.db.folder_has_active_remote_share(&id)? {
-            return Err(AppError::Unavailable(if id == folder_id {
+    let subtree = container_subtree_deepest_first(state.inner(), &folder_id)?;
+    for id in &subtree {
+        if state.db.folder_has_active_remote_share(id)? {
+            return Err(AppError::Unavailable(if id == &folder_id {
                 "revoke this folder's shares before locking it".into()
             } else {
                 let name = state
                     .db
-                    .folder_by_id(&id)?
+                    .folder_by_id(id)?
                     .map(|f| f.name)
                     .unwrap_or_else(|| id.clone());
                 format!("revoke the shares on {name} before locking this project")
             }));
         }
     }
-    let closure_created = state.db.begin_org_folder_closure(&folder_id)?;
+    // EVERY container in the subtree, not just the target — see `open_subtree_closures`.
+    let closures_created = open_subtree_closures(state.inner(), &subtree)?;
     // Initial sealing revokes content just as a session relock does. Shut down every registered
     // MCP content socket BEFORE waiting on the lifecycle mutex, otherwise a slow reader can keep
     // receiving a pre-lock payload after the command has made the folder private.
@@ -151,12 +175,14 @@ pub async fn lock_folder(
         || emit_reminder_visibility_invalidated_fail_closed(&app),
     );
     if let Err(error) = result {
-        if closure_created {
-            state.db.clear_org_folder_closure(&folder_id)?;
+        for id in &closures_created {
+            state.db.clear_org_folder_closure(id)?;
         }
         return Err(error);
     }
-    state.db.complete_org_closure("folder", &folder_id)?;
+    for id in &subtree {
+        state.db.complete_org_closure("folder", id)?;
+    }
     // The seal purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
@@ -177,10 +203,23 @@ pub async fn lock_folder_allow_remote_access(
         ));
     }
     let _org_mutation = state.org_share_mutation_lock.lock().await;
-    if state.db.org_folder_closure_exists(&folder_id)? {
-        return Err(AppError::Unavailable(
-            "this folder is already closing for verified share revocation".into(),
-        ));
+    // The WHOLE subtree, because this command now seals the whole subtree. A descendant already
+    // mid-revocation is the same race the target's check exists to refuse, and the cascade would
+    // otherwise walk straight into it. This command deliberately opens NO closure of its own — it
+    // keeps remote copies readable by design — so refusing is the only move available here.
+    for id in container_subtree_deepest_first(state.inner(), &folder_id)? {
+        if state.db.org_folder_closure_exists(&id)? {
+            return Err(AppError::Unavailable(if id == folder_id {
+                "this folder is already closing for verified share revocation".into()
+            } else {
+                let name = state
+                    .db
+                    .folder_by_id(&id)?
+                    .map(|f| f.name)
+                    .unwrap_or_else(|| id.clone());
+                format!("{name} is already closing for verified share revocation")
+            }));
+        }
     }
     let mcp_revocation = crate::mcp::begin_visibility_revocation(
         &app,
