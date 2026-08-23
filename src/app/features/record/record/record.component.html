@@ -197,6 +197,10 @@
        and the facts this note supersedes at the TOP, beside the "Saved ✓ in Murmur"
        strip — not buried below a full-height note. Gated on stage = done. ─────────── -->
   @if (store.stage() === "done") {
+    <!-- A meeting is the one kind that cannot be created INTO a container: it
+         creates itself when recording stops. The placement decision therefore
+         happens here or not at all. -->
+    <app-recording-placement [meetingId]="store.meetingId()" />
     <app-brain-reveal-card [active]="!!store.lastNote()" />
     <app-re-truth-card
       [active]="!!store.lastNote()"
