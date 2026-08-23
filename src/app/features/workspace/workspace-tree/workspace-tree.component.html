@@ -118,12 +118,12 @@
           >
             @if (canLock(line.container)) {
               <button type="button" role="menuitem" (click)="lock(line.container)">
-                Lock folder
+                {{ lockLabel(line.container) }}
               </button>
             }
             @if (line.container.locked && !line.container.unlocked) {
               <button type="button" role="menuitem" (click)="unlock(line.container)">
-                Unlock for this session
+                {{ unlockLabel(line.container) }}
               </button>
             }
             @if (line.container.locked && line.container.unlocked) {
