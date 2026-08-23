@@ -2975,6 +2975,51 @@
         );
     }
 
+    /// EVERY container the cascade will seal gets an org-share closure, not just the target.
+    ///
+    /// The closure marker is what `move_note` / `move_note_doc` consult to refuse filing anything
+    /// into a folder that is closing, and it exists because of a race: between the moment sealing
+    /// starts and the moment `locked = 1` is published, the folder still looks OPEN to every other
+    /// writer. A concurrent move landing in that window puts plaintext into a folder whose seal has
+    /// already walked past it.
+    ///
+    /// The single-folder lock always took one for its target. A cascade multiplies that window by
+    /// the size of the subtree, so a descendant sealed without a marker is exactly the hole the
+    /// target has been protected from all along — and it is invisible afterwards, because by the
+    /// time anyone looks, `locked = 1` is published and the folder looks correctly sealed.
+    ///
+    /// RED contract: take the closure for `folder_id` alone and the descendant assertion fails.
+    #[test]
+    fn the_lock_cascade_opens_a_closure_for_every_container_it_will_seal() {
+        let state = build_state("cascade-closures");
+        make_open_folder(&state.db, "p-root", "Root");
+        make_open_child_folder(&state.db, "f-mid", "Root/Mid", "p-root");
+        make_open_child_folder(&state.db, "f-leaf", "Root/Mid/Leaf", "f-mid");
+
+        let subtree = container_subtree_deepest_first(&state, "p-root").unwrap();
+        let created = open_subtree_closures(&state, &subtree).unwrap();
+
+        for id in ["p-root", "f-mid", "f-leaf"] {
+            assert!(
+                state.db.org_folder_closure_exists(id).unwrap(),
+                "{id} was left open to concurrent moves while the cascade sealed it"
+            );
+        }
+        assert_eq!(
+            created.len(),
+            3,
+            "every closure this call opened must be reported, so a failure clears exactly those"
+        );
+
+        // Re-opening reports NOTHING as newly created, so a retry cannot clear a marker some other
+        // caller is relying on.
+        let second = open_subtree_closures(&state, &subtree).unwrap();
+        assert!(
+            second.is_empty(),
+            "a second open must claim nothing it did not create"
+        );
+    }
+
     /// The cascade is DEEPEST-FIRST, so a failure can only over-lock, never under-lock.
     ///
     /// Locking is not atomic across containers. Whichever order the cascade takes decides what a
