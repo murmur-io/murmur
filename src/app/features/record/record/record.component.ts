@@ -18,6 +18,7 @@ import { MicMuteToggleComponent } from "../mic-mute-toggle/mic-mute-toggle.compo
 import { MeetingConversationComponent } from "../meeting-conversation/meeting-conversation.component";
 import { BrainRevealCardComponent } from "../brain-reveal-card/brain-reveal-card.component";
 import { ReTruthCardComponent } from "../re-truth-card/re-truth-card.component";
+import { RecordingPlacementComponent } from "../recording-placement/recording-placement.component";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import {
@@ -58,6 +59,7 @@ type LiveCaptionsState =
     MicMuteToggleComponent,
     MeetingConversationComponent,
     BrainRevealCardComponent,
+    RecordingPlacementComponent,
     ReTruthCardComponent,
   ],
   host: { "(document:keydown)": "onKey($event)" },
