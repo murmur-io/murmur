@@ -36,10 +36,10 @@ export interface TreeLine {
 
 /** Polish labels for the four kinds, in the order the backend emits them. */
 const KIND_LABEL: Record<ItemKind, string> = {
-  meeting: "Spotkania",
-  note: "Notatki",
-  task: "Zadania",
-  dashboard: "Dashboardy",
+  meeting: "Meetings",
+  note: "Notes",
+  task: "Tasks",
+  dashboard: "Dashboards",
 };
 
 /**
@@ -89,7 +89,7 @@ export class WorkspaceTreeComponent {
    *
    * The section header's toggle also reloads, but it cannot be the only trigger:
    * the section is EXPANDED by default, so on a fresh profile the tree renders
-   * without anyone having toggled anything and would sit on "Brak projektów"
+   * without anyone having toggled anything and would sit on "No projects yet"
    * forever — indistinguishable from a workspace that really has none. This
    * component only exists while the section is open, so construction is exactly
    * "the tree became visible".
@@ -177,11 +177,11 @@ export class WorkspaceTreeComponent {
 
   protected itemTitle(item: ItemRow): string {
     const title = item.title?.trim();
-    return title ? title : "Bez tytułu";
+    return title ? title : "Untitled";
   }
 
   protected seeAllLabel(group: TypeGroup): string {
-    return `Zobacz wszystkie (${group.total})`;
+    return `See all (${group.total})`;
   }
 
   /** A container with no groups and no folders has nothing to disclose. */
@@ -305,12 +305,12 @@ export class WorkspaceTreeComponent {
   }
 
   protected async newNote(container: ContainerNode): Promise<void> {
-    const id = await this.workspace.createNote(container.id, "Nowa notatka");
+    const id = await this.workspace.createNote(container.id, "New note");
     await this.router.navigate(["/notes", id]);
   }
 
   protected async newFolder(container: ContainerNode): Promise<void> {
-    await this.workspace.createFolder(container.id, "Nowy folder");
+    await this.workspace.createFolder(container.id, "New folder");
   }
 
   protected openGroup(container: ContainerNode, group: TypeGroup): void {

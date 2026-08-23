@@ -75,71 +75,7 @@
           }
           @if (!group.collapsible || insightsExpanded() || railMode()) {
             @for (item of group.items; track item.path) {
-              @if (item.path === "/notes" && !railMode()) {
-                <!-- PROJEKTY — the one workspace hierarchy: Projects › Folders ›
-                     collapsible per-type groups (Meetings, Notes, Tasks,
-                     Dashboards). A folder holds every kind at once, which the two
-                     per-type trees below could not express at all: they are keyed
-                     on `folders.kind`, so one container can only ever appear in
-                     one of them.
-
-                     Those two sections stay for now on purpose. Their headers own
-                     affordances this tree has not taken over yet — the "+" that
-                     creates a folder inline, and the vault-root drop target — and
-                     removing them before porting those would leave both silently
-                     doing nothing, which looks identical to working. They go in
-                     the step that adds this tree's own create menu and drag &
-                     drop. -->
-                <mur-sidebar-section
-                  routePath="/notes"
-                  icon="notes"
-                  label="Projekty"
-                  [expanded]="workspaceTreeOpen()"
-                  (toggleExpanded)="toggleWorkspaceTree()"
-                  (headerSelect)="onNotesHeaderSelect()"
-                >
-                  <app-workspace-tree [sectionActive]="isNotesRoute()" />
-                </mur-sidebar-section>
-              }
-              @if (item.path === "/notes" && !railMode()) {
-                <!-- Notes: the shared expandable-section shell (header + "All
-                     notes" root row) — consolidated 2026-07-12 out of a
-                     duplicated inline block that kept drifting from Meetings'
-                     equivalent (padding/icon-size/selected-pill fixes needed
-                     re-applying twice). The main sidebar is ALWAYS visible
-                     now, so Notes' folders live here instead of a separate
-                     local rail. -->
-                <mur-sidebar-section
-                  routePath="/notes"
-                  icon="notes"
-                  label="Notes"
-                  addFolderLabel="New note folder"
-                  [expanded]="notesTreeOpen()"
-                  (toggleExpanded)="toggleNotesTree()"
-                  (addFolder)="newNoteFolder()"
-                  (headerSelect)="onNotesHeaderSelect()"
-                >
-                  <app-notes-sidebar-tree [sectionActive]="isNotesRoute()" />
-                </mur-sidebar-section>
-              } @else if (item.path === "/library" && !railMode()) {
-                <!-- Meetings: the SAME shared shell as Notes (mirrors it
-                     exactly — see the comment there). -->
-                <mur-sidebar-section
-                  routePath="/library"
-                  icon="meetings"
-                  label="Meetings"
-                  addFolderLabel="New meeting folder"
-                  [expanded]="meetingsTreeOpen()"
-                  [enableHeaderDrop]="true"
-                  (toggleExpanded)="toggleMeetingsTree()"
-                  (addFolder)="newMeetingFolder()"
-                  (headerSelect)="onMeetingsHeaderSelect()"
-                  (headerDropNote)="onMeetingsHeaderDrop($event)"
-                >
-                  <app-meetings-sidebar-tree [sectionActive]="isMeetingsRoute()" />
-                </mur-sidebar-section>
-              } @else {
-                <a
+              <a
                   [routerLink]="item.path"
                   routerLinkActive="active"
                   [attr.aria-label]="item.label"
@@ -150,10 +86,39 @@
                   @if (item.path === "/reminders" && reminderCount() > 0) {
                     <span class="count nav-reminder-count">{{ reminderCount() }}</span>
                   }
-                </a>
-              }
+              </a>
             }
           }
+        }
+        @if (!railMode()) {
+          <!-- THE hierarchy, rendered ONCE and BELOW the destinations above it.
+               That order is ClickUp's: fixed places you can go (Home, Inbox, Docs,
+               Dashboards, Everything) sit above, and the Spaces tree — the thing that
+               answers "where does my work live" — occupies the body underneath.
+               Sandwiching the tree between destinations, which is where it landed when
+               it replaced one of them, made it read as a peer of "Tasks" rather than as
+               the place everything lives.
+
+               It replaces the two per-type trees that used to sit here. Each was keyed
+               on `folders.kind`, so a container appeared in one of them or the other,
+               never both — a folder holding meetings AND notes could not be expressed
+               at all, and "where does this live" had two answers to reconcile. The
+               per-type LISTS remain, as destinations, because "show me everything of
+               this kind" is a different question from "where does this live". -->
+          <mur-sidebar-section
+            routePath="/notes"
+            icon="notes"
+            label="Projects"
+            addFolderLabel="New folder"
+            [expanded]="workspaceTreeOpen()"
+            [enableHeaderDrop]="true"
+            (toggleExpanded)="toggleWorkspaceTree()"
+            (addFolder)="newWorkspaceFolder()"
+            (headerSelect)="onWorkspaceHeaderSelect()"
+            (headerDropNote)="onWorkspaceHeaderDrop($event)"
+          >
+            <app-workspace-tree [sectionActive]="isWorkspaceRoute()" />
+          </mur-sidebar-section>
         }
       </nav>
 

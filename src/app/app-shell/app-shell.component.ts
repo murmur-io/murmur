@@ -18,6 +18,7 @@ import {
   RouterOutlet,
 } from "@angular/router";
 import { filter, map } from "rxjs";
+import { IpcService } from "../core/ipc.service";
 import { isDrilldownRoute } from "../core/nav-history.service";
 import { TabsService } from "../core/tabs.service";
 import {
@@ -219,6 +220,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
 })
 export class AppShellComponent {
   private readonly folders = inject(FoldersService);
+  private readonly ipcService = inject(IpcService);
   private readonly notesService = inject(NotesService);
   private readonly toast = inject(ToastService);
   private readonly router = inject(Router);
@@ -309,6 +311,16 @@ export class AppShellComponent {
   readonly isMeetingsRoute = computed(() => {
     const path = this.currentUrl().split(/[?#]/)[0];
     return path === "/library" || path.startsWith("/library/") || path.startsWith("/meeting/");
+  });
+
+  /**
+   * True wherever the workspace tree's own selection is meaningful — every surface it
+   * renders rows for, plus the container view its rows open. One tree covering both
+   * namespaces cannot take its active state from just one of them.
+   */
+  readonly isWorkspaceRoute = computed(() => {
+    const path = this.currentUrl().split(/[?#]/)[0];
+    return this.isNotesRoute() || this.isMeetingsRoute() || path.startsWith("/container/");
   });
 
   /** Primary destinations (Settings lives in the chrome footer / pill end). */
@@ -546,6 +558,53 @@ export class AppShellComponent {
     if (next) {
       void this.workspace.reload();
     }
+  }
+
+  /**
+   * The section header's "+" — a new folder at the top of the hierarchy.
+   *
+   * ClickUp's equivalent creates a Space here. Ours cannot yet: a project is a container
+   * at the vault root and no command mints one, so this creates a folder inside the
+   * workspace project instead and says so. Offering "New project" and quietly making a
+   * folder would be worse than naming what it does.
+   */
+  newWorkspaceFolder(): void {
+    void this.createFolderAtTop();
+  }
+
+  private async createFolderAtTop(): Promise<void> {
+    if (!this.workspaceTreeOpen()) {
+      this.toggleWorkspaceTree();
+    }
+    const project = this.workspace.forest()[0];
+    if (!project) {
+      return;
+    }
+    await this.workspace.createFolder(project.id, "New folder");
+  }
+
+  /**
+   * The workspace section HEADER was clicked — it is the "everything" affordance, so it
+   * clears the folder filter on both list surfaces the tree feeds. Clearing only one of
+   * them would leave the other filtered to a folder the user has just navigated away from.
+   */
+  onWorkspaceHeaderSelect(): void {
+    void this.notesService.selectFolder(null);
+    this.folders.selectFolder(null);
+  }
+
+  /**
+   * A meeting dropped on the workspace HEADER files it at the vault root — the target the
+   * Meetings section used to own. Its tree body no longer exists to forward into, so the
+   * move runs here and the hierarchy reloads.
+   */
+  onWorkspaceHeaderDrop(meetingId: string): void {
+    void this.fileMeetingAtRoot(meetingId);
+  }
+
+  private async fileMeetingAtRoot(meetingId: string): Promise<void> {
+    await this.ipcService.moveNote(meetingId, null);
+    await this.workspace.reload();
   }
 
   onNotesHeaderSelect(): void {

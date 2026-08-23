@@ -3,16 +3,16 @@
      shows the previous tree while the (still unconditional) reload replaces it
      underneath. Gating on loading() alone is the 2026-07-12 "reload flash". -->
 @if (forestEmpty() && loading()) {
-  <p class="tree-state">Wczytywanie hierarchii…</p>
+  <p class="tree-state">Loading workspace…</p>
 } @else if (forestEmpty()) {
-  <p class="tree-state">Brak projektów</p>
+  <p class="tree-state">No projects yet</p>
 } @else {
   @if (error(); as message) {
     <!-- A failed refresh keeps the cached tree and says so, rather than
          blanking a view the user is navigating. -->
     <p class="tree-error" role="status">{{ message }}</p>
   }
-  <div class="tree" role="tree" [attr.aria-label]="'Hierarchia obszaru roboczego'">
+  <div class="tree" role="tree" [attr.aria-label]="'Workspace'">
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
@@ -34,7 +34,7 @@
               <!-- The keyboard's form of the drag above. Dragging is a pointer gesture
                    with no keyboard equivalent of its own, so without this an item could
                    only be filed with a mouse. -->
-              <mur-row-menu class="row-add" [label]="'Przenieś ' + itemTitle(item)">
+              <mur-row-menu class="row-add" [label]="'Move ' + itemTitle(item)">
                 @for (target of targets; track target.id) {
                   <button type="button" role="menuitem" (click)="moveItemTo(item, target)">
                     {{ target.name }}
@@ -102,13 +102,13 @@
             <mur-row-menu
               class="row-add"
               icon="add"
-              [label]="'Dodaj do ' + line.container.name"
+              [label]="'Add to ' + line.container.name"
             >
               <button type="button" role="menuitem" (click)="newNote(line.container)">
-                Nowa notatka
+                New note
               </button>
               <button type="button" role="menuitem" (click)="newFolder(line.container)">
-                Nowy folder
+                New folder
               </button>
             </mur-row-menu>
           }
@@ -121,8 +121,8 @@
             <span
               class="unlocked-mark"
               role="img"
-              aria-label="Odblokowane na czas tej sesji"
-              title="Odblokowane na czas tej sesji"
+              aria-label="Unlocked for this session"
+              title="Unlocked for this session"
             >
               <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
                 <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
