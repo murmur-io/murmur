@@ -1461,7 +1461,7 @@ pub(crate) fn begin_visibility_revocation(
     begin_visibility_revocation_for_gate(gate, entrypoint)
 }
 
-fn begin_visibility_revocation_for_gate(
+pub(crate) fn begin_visibility_revocation_for_gate(
     gate: Option<Arc<McpResponseGate>>,
     _entrypoint: VisibilityRevokingEntrypoint,
 ) -> VisibilityRevocation {
