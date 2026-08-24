@@ -1567,6 +1567,33 @@ impl Db {
             "dashboard_context_generation",
             "INTEGER",
         )?;
+
+        // A dashboard's container, and the blobs its seal writes. Added HERE, after the
+        // dashboards DDL above, because `add_column_if_missing` inspects a table that must
+        // already exist — placing them with the `folders` columns made the very first launch
+        // fail with "no such table: dashboards", which is a refusal to START, not a bad column.
+        //
+        // `folder_id` is NULLABLE on purpose: every board that exists today is unfiled, and
+        // unfiled is a normal state for a board rather than a defect to repair. It is also the
+        // board's LOCK anchor — before it, a board had no folder, so no lock could cover it.
+        //
+        // The blobs hold what the seal takes: the title names the thing, and a tile's `ref_id`
+        // plus `config` say which meeting or note the board is built from, which is exactly
+        // what a locked folder exists to stop disclosing.
+        Self::add_column_if_missing(conn, "dashboards", "folder_id", "TEXT")?;
+        // A task's LOCAL placement. Nullable because placement is optional and because every task
+        // that predates the hierarchy has none.
+        //
+        // LOCAL-ONLY, and that is load-bearing: an `org_tasks` row is the SQLCipher projection of
+        // an E2EE envelope, and the bytes that egress are `envelope_json`, built from
+        // `TaskEnvelope`. This column is not a field of that struct and no code path copies it in,
+        // so a user's private folder structure — which is exactly the kind of thing a shared task
+        // must not carry to an org — cannot leave the device. Adding it to `TaskEnvelope` would
+        // silently make it egress; do not.
+        Self::add_column_if_missing(conn, "org_tasks", "container_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "dashboards", "title_blob", "BLOB")?;
+        Self::add_column_if_missing(conn, "dashboard_tiles", "config_blob", "BLOB")?;
+
         Self::add_column_if_missing(
             conn,
             "ask_conversations",
@@ -6816,6 +6843,45 @@ impl Db {
         // to non-authored documents — authored notes were reparented out above (and refused if not).
         tx.execute(
             "DELETE FROM documents WHERE folder_id = ?1 AND kind != 'note'",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        // BOARDS: demote to unfiled in the SAME transaction, exactly as authored notes are
+        // reparented above. A board left pointing at a deleted folder is invisible in the tree
+        // (its `LEFT JOIN folders` yields no row, so neither the unfiled branch nor the visible
+        // branch holds) while still appearing in the flat list — a row the user can open but
+        // cannot find, outside any future lock.
+        //
+        // Refuse first if a board here still holds CIPHERTEXT. The command layer removes the lock
+        // before deleting, so by this point boards should be plaintext; a blob surviving means the
+        // unseal did not run, and demoting would strand a board whose content key is about to be
+        // discarded with the folder. Losing content is worse than refusing a delete.
+        let sealed_boards: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM dashboards d
+                  WHERE d.folder_id = ?1
+                    AND (d.title_blob IS NOT NULL
+                         OR EXISTS(SELECT 1 FROM dashboard_tiles t
+                                    WHERE t.dashboard_id = d.id AND t.config_blob IS NOT NULL))",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        if sealed_boards > 0 {
+            return Err(AppError::Storage(format!(
+                "refusing to delete folder {id}: {sealed_boards} board(s) still hold sealed \
+                 content — remove the lock first (never strand a sealed board)"
+            )));
+        }
+        tx.execute(
+            "UPDATE dashboards SET folder_id = NULL WHERE folder_id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        // TASKS: same demotion, same reason — a task pointing at a deleted container is a row the
+        // tree cannot show and the user cannot find. Unfiled, it is back in the Tasks view.
+        tx.execute(
+            "UPDATE org_tasks SET container_id = NULL WHERE container_id = ?1",
             rusqlite::params![id],
         )
         .map_err(map_err)?;
