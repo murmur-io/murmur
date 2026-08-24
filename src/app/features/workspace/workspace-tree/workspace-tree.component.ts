@@ -4,6 +4,7 @@ import {
   computed,
   inject,
   input,
+  signal,
 } from "@angular/core";
 import { Router } from "@angular/router";
 
@@ -17,7 +18,17 @@ import {
   MurTreeRowComponent,
   type TreeRowIcon,
 } from "../../../design-system/tree-row/tree-row.component";
-import type { ContainerNode, ItemKind, ItemRow, TypeGroup } from "../../../core/models";
+import type {
+  ContainerNode,
+  ItemKind,
+  ItemRow,
+  OrganizeMove,
+  OrganizePlan,
+  TypeGroup,
+} from "../../../core/models";
+import { IpcService } from "../../../core/ipc.service";
+import { OrganizeSheetComponent } from "../../notes/organize-sheet/organize-sheet.component";
+import { ToastService } from "../../../services/toast.service";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
@@ -37,7 +48,7 @@ export interface TreeLine {
   seeAll?: boolean;
 }
 
-/** Polish labels for the four kinds, in the order the backend emits them. */
+/** Group headings for the four kinds, in the order the backend emits them. */
 const KIND_LABEL: Record<ItemKind, string> = {
   meeting: "Meetings",
   note: "Notes",
@@ -75,12 +86,19 @@ const KIND_ROUTE: Record<ItemKind, string> = {
 @Component({
   selector: "app-workspace-tree",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FolderDropDirective, MurRowMenuComponent, MurTreeRowComponent],
+  imports: [
+    FolderDropDirective,
+    MurRowMenuComponent,
+    MurTreeRowComponent,
+    OrganizeSheetComponent,
+  ],
   templateUrl: "./workspace-tree.component.html",
   styleUrl: "./workspace-tree.component.scss",
 })
 export class WorkspaceTreeComponent {
   private readonly router = inject(Router);
+  private readonly ipc = inject(IpcService);
+  private readonly toast = inject(ToastService);
   protected readonly workspace = inject(WorkspaceService);
   private readonly drag = inject(NoteDragService);
   private readonly folders = inject(FoldersService);
@@ -420,6 +438,74 @@ export class WorkspaceTreeComponent {
   /** The reserved note root can never be sealed, so it is never offered a lock. */
   protected canLock(container: ContainerNode): boolean {
     return !container.isRoot && !container.locked;
+  }
+
+  // ── AI organize, per container ────────────────────────────────────────────
+  //
+  // The planner and the review sheet already existed; they were reachable only
+  // from the Notes home header, scoped to whichever note-folder happened to be
+  // active. That is the wrong place for them now: the thing a user wants to
+  // tidy is a PROJECT or a FOLDER, and the hierarchy is where those are named.
+  //
+  // Two-step and non-destructive, unchanged: `plan_organize_notes` PROPOSES,
+  // the sheet lets the user drop individual moves, and nothing moves until
+  // `apply_organize_plan`. An AI that silently re-filed a vault would be a
+  // feature nobody could trust twice.
+
+  /** The proposed plan; `null` means the sheet is closed. */
+  protected readonly organizePlan = signal<OrganizePlan | null>(null);
+  /** True while the plan is being fetched (the menu entry says so). */
+  protected readonly organizePlanning = signal(false);
+  /** True while the apply is in flight (the sheet's own spinner). */
+  protected readonly organizeApplying = signal(false);
+
+  /**
+   * A sealed container cannot be organized, and the reason is the planner's:
+   * it reads titles and body excerpts to classify them, and those reads are
+   * gated. Offering the action would produce an empty plan and look broken.
+   */
+  protected canOrganize(container: ContainerNode): boolean {
+    return !container.locked || container.unlocked;
+  }
+
+  protected async organize(container: ContainerNode): Promise<void> {
+    if (this.organizePlanning() || this.organizePlan()) {
+      return;
+    }
+    this.organizePlanning.set(true);
+    try {
+      const plan = await this.ipc.planOrganizeNotes(container.id);
+      if (plan.moves.length === 0) {
+        this.toast.info(`Nothing to re-file in ${container.name}.`);
+        return;
+      }
+      this.organizePlan.set(plan);
+    } catch {
+      this.toast.danger("Couldn't plan an auto-organize. Please try again.");
+    } finally {
+      this.organizePlanning.set(false);
+    }
+  }
+
+  protected async applyOrganize(moves: OrganizeMove[]): Promise<void> {
+    if (moves.length === 0) {
+      this.closeOrganize();
+      return;
+    }
+    this.organizeApplying.set(true);
+    try {
+      await this.ipc.applyOrganizePlan({ moves });
+      await this.workspace.reload();
+      this.closeOrganize();
+    } catch {
+      this.toast.danger("Couldn't apply the plan. Nothing was moved.");
+    } finally {
+      this.organizeApplying.set(false);
+    }
+  }
+
+  protected closeOrganize(): void {
+    this.organizePlan.set(null);
   }
 
   protected openGroup(container: ContainerNode, group: TypeGroup): void {
