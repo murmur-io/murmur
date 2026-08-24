@@ -98,7 +98,10 @@ fn lock_container_subtree(
 /// A cascade multiplies that window by the size of the subtree, so every container in it needs the
 /// same marker — a descendant sealed without one is exactly the hole the target has been protected
 /// from all along.
-fn open_subtree_closures(state: &AppState, subtree: &[String]) -> Result<Vec<String>, AppError> {
+pub(crate) fn open_subtree_closures(
+    state: &AppState,
+    subtree: &[String],
+) -> Result<Vec<String>, AppError> {
     let mut created = Vec::new();
     for id in subtree {
         if state.db.begin_org_folder_closure(id)? {
@@ -116,7 +119,7 @@ fn open_subtree_closures(state: &AppState, subtree: &[String]) -> Result<Vec<Str
 /// open around sealed children: an over-lock the user can see and retry. Parent-first would leave
 /// a container marked locked with a child still holding plaintext inside it, which is the exact
 /// shape of a leak: the UI says sealed, the bytes say otherwise.
-fn container_subtree_deepest_first(
+pub(crate) fn container_subtree_deepest_first(
     state: &AppState,
     folder_id: &str,
 ) -> Result<Vec<String>, AppError> {
