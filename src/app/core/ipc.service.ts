@@ -3050,6 +3050,53 @@ export class IpcService {
   }
 
   /**
+   * Create a dashboard, optionally INSIDE a container.
+   *
+   * `folderId` is the board's container anchor and its LOCK anchor: a board with no folder
+   * cannot be sealed, because there is no folder whose key would seal it. The backend refuses a
+   * container that is sealed and not session-unlocked, for the same reason it refuses filing a
+   * note there — a board created inside a sealed tree would be born readable.
+   */
+  createDashboardIn(
+    title: string,
+    folderId: string | null,
+    emoji?: string | null,
+    tint?: string | null,
+  ): Promise<Dashboard> {
+    return invoke<Dashboard>("create_dashboard", {
+      title,
+      emoji: emoji ?? null,
+      tint: tint ?? null,
+      folderId,
+    });
+  }
+
+  /**
+   * File a task into a local container, or unfile it with `containerId: null`.
+   *
+   * Placement is LOCAL and never egresses — it is not part of the task envelope that reaches an
+   * org, so a user's private folder structure stays on the device. Sealing a container unfiles
+   * the tasks in it, because a task's content lives in the org's E2EE store and a folder key
+   * cannot seal it; leaving one inside would mean the lock said sealed while the task stayed as
+   * readable as before.
+   */
+  setTaskContainer(id: string, containerId: string | null): Promise<void> {
+    return invoke<void>("set_task_container", { id, containerId });
+  }
+
+  /**
+   * Re-file a dashboard into a container, or unfile it with `folderId: null`.
+   *
+   * Refused at BOTH ends when sealed, for different reasons: a sealed TARGET would receive the
+   * board in plaintext inside a tree the user believes is unreadable, and a sealed SOURCE holds
+   * that board as ciphertext bound to its current container — moving the row without unsealing
+   * first would carry blobs somewhere no key can open them.
+   */
+  moveDashboardToContainer(id: string, folderId: string | null): Promise<void> {
+    return invoke<void>("move_dashboard_to_container", { id, folderId });
+  }
+
+  /**
    * ESCAPE HATCH for a folder whose master key is genuinely unrecoverable: the backend FIRST
    * proves no key can unwrap it (else it refuses with a "key was found — unlock normally" error),
    * then discards ONLY that folder's UNRECOVERABLE sealed contents (never-sealed readable content is

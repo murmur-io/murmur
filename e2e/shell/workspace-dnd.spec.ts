@@ -25,7 +25,14 @@ const FOREST = [
         kind: "task",
         total: 1,
         items: [
-          { kind: "task", id: "t-1", title: "Zadanie", durationS: null, sortAt: 1 },
+          { kind: "task", id: "t-1", title: "Ship the thing", durationS: null, sortAt: 1 },
+        ],
+      },
+      {
+        kind: "dashboard",
+        total: 1,
+        items: [
+          { kind: "dashboard", id: "d-1", title: "Q3 board", durationS: null, sortAt: 0 },
         ],
       },
     ],
@@ -64,8 +71,23 @@ async function open(page: Page): Promise<void> {
     page,
     {
       move_note: (args: unknown) => {
-        (globalThis as unknown as { __moves: unknown[] }).__moves ??= [];
-        (globalThis as unknown as { __moves: unknown[] }).__moves.push(args);
+        const w = globalThis as unknown as { __moves?: unknown[] };
+        (w.__moves ??= []).push({ cmd: "move_note", args });
+        return null;
+      },
+      move_note_doc: (args: unknown) => {
+        const w = globalThis as unknown as { __moves?: unknown[] };
+        (w.__moves ??= []).push({ cmd: "move_note_doc", args });
+        return null;
+      },
+      move_dashboard_to_container: (args: unknown) => {
+        const w = globalThis as unknown as { __moves?: unknown[] };
+        (w.__moves ??= []).push({ cmd: "move_dashboard_to_container", args });
+        return null;
+      },
+      set_task_container: (args: unknown) => {
+        const w = globalThis as unknown as { __moves?: unknown[] };
+        (w.__moves ??= []).push({ cmd: "set_task_container", args });
         return null;
       },
     },
@@ -77,20 +99,62 @@ async function open(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Expand Meetings" }).click();
 }
 
-test("a meeting is draggable and a task is not", async ({ page }) => {
+test("every kind the tree renders is draggable", async ({ page }) => {
   await open(page);
 
-  const meeting = page.getByRole("treeitem", { name: /Standup/ });
-  await expect(meeting).toHaveAttribute("draggable", "true");
-
-  // Neither a task nor a dashboard has a container anchor yet, so a drop would have
-  // nowhere to file it — and a row that cannot be dropped anywhere must not look
-  // draggable.
-  await page.getByRole("button", { name: "Expand Tasks" }).click();
-  await expect(page.getByRole("treeitem", { name: /Zadanie/ })).not.toHaveAttribute(
+  // This test used to assert the OPPOSITE for tasks and dashboards, and was right to: neither
+  // had a container anchor, so a drag would have been a gesture with nothing behind it. Both
+  // gained a backend mover, and a row a user can see under a project is a row they will try to
+  // drag out of it.
+  await expect(page.getByRole("treeitem", { name: /Standup/ })).toHaveAttribute(
     "draggable",
     "true",
   );
+
+  await page.getByRole("button", { name: "Expand Tasks" }).click();
+  await expect(page.getByRole("treeitem", { name: /Ship the thing/ })).toHaveAttribute(
+    "draggable",
+    "true",
+  );
+
+  await page.getByRole("button", { name: "Expand Dashboards" }).click();
+  await expect(page.getByRole("treeitem", { name: /Q3 board/ })).toHaveAttribute(
+    "draggable",
+    "true",
+  );
+});
+
+test("each kind is filed through its OWN backend mover", async ({ page }) => {
+  await open(page);
+
+  // The four kinds do NOT share a command, and the id alone cannot say which one to call — a
+  // single mover for all of them would file a board through the note path and lose it. Each
+  // drag is checked for the command AND its argument shape, against the real invoke path.
+  await page
+    .getByRole("treeitem", { name: /Standup/ })
+    .dragTo(page.getByRole("treeitem", { name: /Target/ }));
+
+  await page.getByRole("button", { name: "Expand Dashboards" }).click();
+  await page
+    .getByRole("treeitem", { name: /Q3 board/ })
+    .dragTo(page.getByRole("treeitem", { name: /Target/ }));
+
+  await page.getByRole("button", { name: "Expand Tasks" }).click();
+  await page
+    .getByRole("treeitem", { name: /Ship the thing/ })
+    .dragTo(page.getByRole("treeitem", { name: /Target/ }));
+
+  const moves = await page.evaluate(
+    () => (globalThis as unknown as { __moves?: unknown[] }).__moves ?? [],
+  );
+  expect(moves).toEqual([
+    { cmd: "move_note", args: { meetingId: "m-1", folderId: "p-target" } },
+    {
+      cmd: "move_dashboard_to_container",
+      args: { id: "d-1", folderId: "p-target" },
+    },
+    { cmd: "set_task_container", args: { id: "t-1", containerId: "p-target" } },
+  ]);
 });
 
 test("dropping a meeting on a container files it there", async ({ page }) => {
@@ -106,7 +170,9 @@ test("dropping a meeting on a container files it there", async ({ page }) => {
   const moves = await page.evaluate(
     () => (globalThis as unknown as { __moves?: unknown[] }).__moves ?? [],
   );
-  expect(moves).toEqual([{ meetingId: "m-1", folderId: "p-target" }]);
+  expect(moves).toEqual([
+    { cmd: "move_note", args: { meetingId: "m-1", folderId: "p-target" } },
+  ]);
 });
 
 test("a sealed container is not a drop target", async ({ page }) => {
