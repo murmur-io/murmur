@@ -360,15 +360,49 @@ fn iso_to_epoch_secs(iso: &str) -> Option<i64> {
 
 // ── board CRUD ─────────────────────────────────────────────────────────────────────────────────
 
-/// Every board with its layout metadata. No gated read happens here — a summary carries only the
-/// user's own chrome (title/emoji/tint) plus tile kinds, never a source's title.
+/// Every board with its layout metadata — GATED.
+///
+/// The doc here used to say no gated read happens, because a summary carries only the user's own
+/// chrome. That was true while a board could not live in a folder: with no container there was no
+/// lock that could cover it. Now that a board can be filed, its own title is content — "Q3 layoffs"
+/// names the thing whether or not a single tile is readable — so a board whose container is sealed
+/// and not session-unlocked comes back masked.
 #[tauri::command]
 pub fn list_dashboards(state: State<'_, AppState>) -> Result<Vec<DashboardSummaryDto>, AppError> {
-    let boards = state.db.list_dashboards()?;
+    list_dashboards_inner(state.inner())
+}
+
+/// Body of [`list_dashboards`], taking `&AppState`.
+///
+/// Split out because the sealed-board masking below lives HERE, at the command layer, and a gate
+/// no test can reach is a gate whose tests end up aimed one layer down — which is exactly what
+/// happened: the first round asserted on `Db::list_dashboards_visible`, which masks the row, and
+/// stayed green while the tile count and kinds assembled here still shipped.
+pub(crate) fn list_dashboards_inner(
+    state: &AppState,
+) -> Result<Vec<DashboardSummaryDto>, AppError> {
+    // Hold the lifecycle guard across the gate AND the tile read, for the same reason
+    // `get_dashboard` does: a relock landing between the two would judge tiles against a
+    // snapshot that is already stale.
+    let _lifecycle = super::lifecycle_guard(state);
+    let unlocked = crate::commands::unlocked_snapshot(state)?;
+    let boards = state.db.list_dashboards_visible(&unlocked)?;
     let kinds = state.db.dashboard_tile_kinds()?;
     let out = boards
         .into_iter()
         .map(|d| {
+            // A sealed board discloses NO tiles — not their kinds and not their number.
+            // `list_dashboards_visible` masks the row, but the summary is assembled from a
+            // SEPARATE ungated read, so masking the row alone still shipped "this locked board
+            // is built from three meetings and a note". Tile shape is exactly the kind of
+            // structural fact a lock exists to withhold.
+            if d.locked {
+                return DashboardSummaryDto {
+                    tile_count: 0,
+                    tile_kinds: Vec::new(),
+                    dashboard: d,
+                };
+            }
             let tile_kinds: Vec<TilePreviewDto> = kinds
                 .iter()
                 .filter(|(board_id, _, _)| board_id == &d.id)
@@ -393,6 +427,7 @@ pub fn create_dashboard(
     title: String,
     emoji: Option<String>,
     tint: Option<String>,
+    folder_id: Option<String>,
 ) -> Result<Dashboard, AppError> {
     let _lifecycle = super::lifecycle_guard(state.inner());
     if state.db.dashboard_count()? >= MAX_DASHBOARDS {
@@ -403,11 +438,30 @@ pub fn create_dashboard(
     let title = clean_title(&title, "title")?;
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
-    state.db.insert_dashboard(
+    // A board created INTO a sealed container would be born readable inside a sealed tree —
+    // the same hazard the container-creation guard closes for folders. The seal is per
+    // container and runs on lock, so refuse rather than create something the existing lock
+    // will not cover.
+    if let Some(folder) = folder_id.as_deref() {
+        // EXISTENCE first. `folder_is_unlocked` answers "is this folder sealed", and an id that
+        // names nothing is not sealed — so the guard passed and the board was inserted with a
+        // dangling `folder_id`: invisible in the tree (the LEFT JOIN finds no row) and outside
+        // any future lock, which is precisely the state the container anchor exists to prevent.
+        if state.db.folder_by_id(folder)?.is_none() {
+            return Err(AppError::InvalidArg(format!("no such container: {folder}")));
+        }
+        if !crate::commands::folder_is_unlocked(state.inner(), folder)? {
+            return Err(AppError::Locked(
+                "unlock this folder before creating a dashboard in it".into(),
+            ));
+        }
+    }
+    state.db.insert_dashboard_in_folder(
         &id,
         &title,
         clean_emoji(emoji).as_deref(),
         clean_tint(tint).as_deref(),
+        folder_id.as_deref(),
         &now,
     )?;
     state
@@ -425,13 +479,33 @@ pub fn update_dashboard(
     tint: Option<String>,
     pinned: Option<bool>,
 ) -> Result<Dashboard, AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
+    update_dashboard_inner(
+        state.inner(),
+        &id,
+        title.as_deref(),
+        emoji,
+        tint,
+        pinned,
+    )
+}
+
+pub(crate) fn update_dashboard_inner(
+    state: &AppState,
+    id: &str,
+    title: Option<&str>,
+    emoji: Option<String>,
+    tint: Option<String>,
+    pinned: Option<bool>,
+) -> Result<Dashboard, AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    require_board_writable(state, id)?;
+    let title = title.map(str::to_string);
     let title = match title {
         Some(t) => Some(clean_title(&t, "title")?),
         None => None,
     };
     let found = state.db.update_dashboard(
-        &id,
+        id,
         title.as_deref(),
         clean_emoji(emoji).as_deref(),
         clean_tint(tint).as_deref(),
@@ -443,20 +517,40 @@ pub fn update_dashboard(
     }
     state
         .db
-        .get_dashboard(&id)?
+        .get_dashboard(id)?
         .ok_or_else(|| AppError::Storage("dashboard vanished after update".into()))
 }
 
 #[tauri::command]
 pub fn delete_dashboard(state: State<'_, AppState>, id: String) -> Result<bool, AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
-    state.db.delete_dashboard(&id)
+    delete_dashboard_inner(state.inner(), &id)
+}
+
+pub(crate) fn delete_dashboard_inner(state: &AppState, id: &str) -> Result<bool, AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    // Deleting is a write like any other, and it is the one that cannot be undone: a sealed
+    // board's plaintext lives only in its blobs, and the row carries the pointer to them.
+    require_board_writable(state, id)?;
+    state.db.delete_dashboard(id)
 }
 
 #[tauri::command]
 pub fn reorder_dashboards(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
-    state.db.reorder_dashboards(&ids)
+    reorder_dashboards_inner(state.inner(), &ids)
+}
+
+pub(crate) fn reorder_dashboards_inner(
+    state: &AppState,
+    ids: &[String],
+) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    // Ordering is board-level position, not content, so this refuses only if the CALLER named a
+    // board it may not touch — a sealed board must not be draggable into a new position by a
+    // caller that cannot see it.
+    for id in ids {
+        require_board_writable(state, id)?;
+    }
+    state.db.reorder_dashboards(ids)
 }
 
 // ── tile CRUD ──────────────────────────────────────────────────────────────────────────────────
@@ -471,7 +565,20 @@ pub fn add_dashboard_tile(
     span: Option<i64>,
     config: Option<String>,
 ) -> Result<(), AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
+    add_dashboard_tile_inner(state.inner(), dashboard_id, kind, ref_id, title, span, config)
+}
+
+pub(crate) fn add_dashboard_tile_inner(
+    state: &AppState,
+    dashboard_id: String,
+    kind: String,
+    ref_id: Option<String>,
+    title: Option<String>,
+    span: Option<i64>,
+    config: Option<String>,
+) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    require_board_writable(state, &dashboard_id)?;
     if !TILE_KINDS.contains(&kind.as_str()) {
         return Err(AppError::InvalidArg(format!("unknown tile kind: {kind}")));
     }
@@ -499,7 +606,7 @@ pub fn add_dashboard_tile(
     }
     let mut question_provenance = None;
     let config = if kind == "living_answer" {
-        let unlocked = super::unlocked_snapshot(state.inner())?;
+        let unlocked = super::unlocked_snapshot(state)?;
         let readable = readable_folder_ids(&state.db, &unlocked)?;
         let encoded = sanitize_living_answer_config_for_add(config.as_deref(), &readable)?;
         let question = parse_config(Some(&encoded)).question.unwrap_or_default();
@@ -551,7 +658,18 @@ pub fn update_dashboard_tile(
     span: Option<i64>,
     config: Option<String>,
 ) -> Result<(), AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
+    update_dashboard_tile_inner(state.inner(), id, title, span, config)
+}
+
+pub(crate) fn update_dashboard_tile_inner(
+    state: &AppState,
+    id: String,
+    title: Option<String>,
+    span: Option<i64>,
+    config: Option<String>,
+) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    require_tile_writable(state, &id)?;
     let Some((dashboard_id, existing_kind)) = state.db.dashboard_tile_metadata(&id)? else {
         return Err(AppError::InvalidArg(format!("no tile with id {id}")));
     };
@@ -583,7 +701,15 @@ pub fn update_dashboard_tile(
 
 #[tauri::command]
 pub fn delete_dashboard_tile(state: State<'_, AppState>, id: String) -> Result<bool, AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
+    delete_dashboard_tile_inner(state.inner(), id)
+}
+
+pub(crate) fn delete_dashboard_tile_inner(
+    state: &AppState,
+    id: String,
+) -> Result<bool, AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    require_tile_writable(state, &id)?;
     let board = state
         .db
         .dashboard_tile_metadata(&id)?
@@ -601,28 +727,160 @@ pub fn reorder_dashboard_tiles(
     dashboard_id: String,
     tile_ids: Vec<String>,
 ) -> Result<(), AppError> {
-    let _lifecycle = super::lifecycle_guard(state.inner());
+    reorder_dashboard_tiles_inner(state.inner(), dashboard_id, tile_ids)
+}
+
+pub(crate) fn reorder_dashboard_tiles_inner(
+    state: &AppState,
+    dashboard_id: String,
+    tile_ids: Vec<String>,
+) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    require_board_writable(state, &dashboard_id)?;
     state.db.reorder_dashboard_tiles(&dashboard_id, &tile_ids)?;
     state.db.touch_dashboard(&dashboard_id, &now_iso())
 }
 
 // ── the board, resolved ────────────────────────────────────────────────────────────────────────
 
+/// Refuse any WRITE against a board whose container is sealed and not session-unlocked.
+///
+/// Before this change a board could not live in a folder at all, so no dashboard mutation needed a
+/// lock gate and none had one — the reads were the whole surface. Giving boards a container made
+/// every one of those writes a way to put user content inside a sealed tree: a renamed board, a
+/// new tile, a reordered layout. Each would be written in PLAINTEXT into a folder the user has
+/// been told is unreadable, and the seal has already run, so nothing would come back to encrypt
+/// it. The next unseal would then overwrite it from the stored blob, so the write is also lost.
+///
+/// A board with no container is unaffected: there is no folder whose key would seal it, so there
+/// is nothing to be inside of.
+fn require_board_writable(state: &AppState, dashboard_id: &str) -> Result<(), AppError> {
+    let Some(board) = state.db.get_dashboard(dashboard_id)? else {
+        return Ok(()); // absent board — the caller's own not-found path reports it.
+    };
+    let Some(folder) = board.folder_id.as_deref() else {
+        return Ok(());
+    };
+    if !crate::commands::folder_is_unlocked(state, folder)? {
+        return Err(AppError::Locked(
+            "unlock this board's container before changing it".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The tile twin of [`require_board_writable`], resolving the tile's board first.
+fn require_tile_writable(state: &AppState, tile_id: &str) -> Result<(), AppError> {
+    let Some((dashboard_id, _kind)) = state.db.dashboard_tile_metadata(tile_id)? else {
+        return Ok(()); // absent tile — the caller reports not-found.
+    };
+    require_board_writable(state, &dashboard_id)
+}
+
+/// Move a board into a container, or unfile it with `folderId: null`.
+///
+/// Both ends are gated, and they refuse for different reasons.
+///
+/// The TARGET must be unlocked, because a board arriving in a sealed container would land in
+/// plaintext inside a tree the user has been told is unreadable — the same hazard
+/// `create_dashboard` refuses, and the reason `move_note` refuses a sealed destination it has no
+/// key for.
+///
+/// The SOURCE must be unlocked too, and that one is easy to miss: a board sitting in a sealed
+/// container has its title and tiles in ciphertext, bound by `aad_document` to THAT container's
+/// id. Moving the row without unsealing it would carry blobs into a container whose key cannot
+/// open them and whose unseal enumerates them — content that can never be recovered. Unlock the
+/// source first and the ordinary session-unlock has already restored the plaintext, so the move
+/// is a plain re-parent.
+#[tauri::command]
+pub fn move_dashboard_to_container(
+    state: State<'_, AppState>,
+    id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
+    move_dashboard_to_container_inner(state.inner(), &id, folder_id.as_deref())
+}
+
+/// Body of [`move_dashboard_to_container`], taking `&AppState` so the two refusals above can be
+/// driven directly. A gate whose only caller needs a Tauri `State` is a gate no test can bind.
+pub(crate) fn move_dashboard_to_container_inner(
+    state: &AppState,
+    id: &str,
+    folder_id: Option<&str>,
+) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state);
+    let unlocked = super::unlocked_snapshot(state)?;
+    let Some(board) = state.db.get_dashboard_visible(id, &unlocked)? else {
+        return Err(AppError::InvalidArg(format!("no such dashboard: {id}")));
+    };
+    if board.locked {
+        return Err(AppError::Locked(
+            "unlock this board's container before moving it".into(),
+        ));
+    }
+    if let Some(folder) = folder_id {
+        if state.db.folder_by_id(folder)?.is_none() {
+            return Err(AppError::InvalidArg(format!("no such container: {folder}")));
+        }
+        if !crate::commands::folder_is_unlocked(state, folder)? {
+            return Err(AppError::Locked(
+                "unlock this container before moving a dashboard into it".into(),
+            ));
+        }
+    }
+    if !state.db.set_dashboard_folder(id, folder_id)? {
+        return Err(AppError::InvalidArg(format!("no such dashboard: {id}")));
+    }
+    Ok(())
+}
+
 /// One board with every tile resolved through the gated readers.
 #[tauri::command]
 pub fn get_dashboard(state: State<'_, AppState>, id: String) -> Result<Response, AppError> {
+    let payload = get_dashboard_inner(state.inner(), &id)?;
+    serde_json::to_string(&payload)
+        .map(Response::new)
+        .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
+}
+
+/// Body of [`get_dashboard`], returning the DTO rather than its serialization.
+///
+/// Split for the same reason as [`list_dashboards_inner`]: the sealed-board gate below is a
+/// command-layer decision, and a gate reachable only through a `Response` string is one whose
+/// tests end up asserting on the storage layer instead — where the masking it performs does not
+/// live.
+pub(crate) fn get_dashboard_inner(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<DashboardDetailDto>, AppError> {
     // TOCTOU: hold the lock lifecycle guard across the gate AND every tile read, exactly like
     // `commands/meetings.rs::get_meeting_detail`. Without it a relock landing between the
     // `unlocked_snapshot` below and a later tile's read would resolve that tile against a stale
     // "unlocked" view and return content from a folder that is sealed by the time it ships.
-    let _lifecycle = super::lifecycle_guard(state.inner());
-    let Some(dashboard) = state.db.get_dashboard(&id)? else {
-        return serde_json::to_string(&Option::<DashboardDetailDto>::None)
-            .map(Response::new)
-            .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()));
+    let _lifecycle = super::lifecycle_guard(state);
+    let unlocked_for_board = super::unlocked_snapshot(state)?;
+    let Some(dashboard) = state.db.get_dashboard_visible(id, &unlocked_for_board)? else {
+        return Ok(None);
     };
-    let tiles = state.db.list_dashboard_tile_structures(&id)?;
-    let unlocked = super::unlocked_snapshot(state.inner())?;
+    // A sealed board returns its MASKED row and NO tiles at all.
+    //
+    // Masking the row alone was not enough, and `list_dashboards` was changed in this same diff
+    // for exactly this reason: the tile columns are blank at rest, but the tile ROWS still exist,
+    // so resolving them shipped one entry per tile — the count, and each tile's span and position.
+    // "This locked board is built from three things, laid out like this" is a fact about sealed
+    // content, and shape is one of the easier things to recognise a board by.
+    if dashboard.locked {
+        return Ok(Some(DashboardDetailDto {
+            dashboard,
+            tiles: Vec::new(),
+            // The Work projection goes too. It is the board's task references, so it discloses
+            // both how many there are and which tasks a sealed board is about — the same class of
+            // fact as the tile shape, reached by a different field.
+            work: Vec::new(),
+        }));
+    }
+    let tiles = state.db.list_dashboard_tile_structures(id)?;
+    let unlocked = super::unlocked_snapshot(state)?;
     let resolved = tiles
         .into_iter()
         .map(|tile| {
@@ -635,15 +893,12 @@ pub fn get_dashboard(state: State<'_, AppState>, id: String) -> Result<Response,
             Ok(ResolvedTileDto { tile, data })
         })
         .collect::<Result<Vec<_>, AppError>>()?;
-    let work = dashboard_work_inner(state.inner(), &id)?;
-    let payload = Some(DashboardDetailDto {
+    let work = dashboard_work_inner(state, id)?;
+    Ok(Some(DashboardDetailDto {
         dashboard,
         tiles: resolved,
         work,
-    });
-    serde_json::to_string(&payload)
-        .map(Response::new)
-        .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
+    }))
 }
 
 pub(crate) fn dashboard_work_inner(
@@ -720,14 +975,38 @@ pub(crate) fn redact_tile_chrome(mut tile: DashboardTile, data: &TileData) -> Da
 /// dashboard Ask resolves material and derived context together through `dashboard_composite_context`.
 #[tauri::command]
 pub fn get_dashboard_sources(state: State<'_, AppState>, id: String) -> Result<Response, AppError> {
-    // Same TOCTOU discipline as `get_dashboard`: gate and read under one lifecycle guard.
-    let _lifecycle = super::lifecycle_guard(state.inner());
-    let tiles = state.db.list_dashboard_tile_structures(&id)?;
-    let unlocked = super::unlocked_snapshot(state.inner())?;
-    let payload = dashboard_sources_inner(&state.db, tiles, &unlocked)?;
+    let payload = get_dashboard_sources_inner(state.inner(), &id)?;
     serde_json::to_string(&payload)
         .map(Response::new)
         .map_err(|_| AppError::Unavailable("dashboard response encoding failed".into()))
+}
+
+/// Body of [`get_dashboard_sources`], returning the list rather than its serialization.
+///
+/// Split for the same reason as its siblings: the board-level gate below is the thing worth
+/// testing, and a gate reachable only through a `Response` string is one whose test ends up
+/// aimed at the resolver instead — which withholds source CONTENT, not the list.
+pub(crate) fn get_dashboard_sources_inner(
+    state: &AppState,
+    id: &str,
+) -> Result<Vec<SourceRef>, AppError> {
+    // Same TOCTOU discipline as `get_dashboard`: gate and read under one lifecycle guard.
+    let _lifecycle = super::lifecycle_guard(state);
+    let unlocked = super::unlocked_snapshot(state)?;
+    // And the same BOARD-level gate. Each source below is resolved through the visibility set, so
+    // no individual source leaks — but the LIST itself is a fact about a sealed board: how many
+    // things it is built from, and that it is built from anything at all. `get_dashboard` was
+    // given this early return in the same diff; a second read path that skipped it would be the
+    // hole the first one closed.
+    let sealed = state
+        .db
+        .get_dashboard_visible(id, &unlocked)?
+        .is_some_and(|board| board.locked);
+    if sealed {
+        return Ok(Vec::new());
+    }
+    let tiles = state.db.list_dashboard_tile_structures(id)?;
+    dashboard_sources_inner(&state.db, tiles, &unlocked)
 }
 
 /// The header the board brief is packed under. Instructional on purpose: without
