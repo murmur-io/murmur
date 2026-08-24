@@ -261,8 +261,26 @@ export class WorkspaceTreeComponent {
    * container anchor yet, so a drop would have nowhere to file it. A row that
    * cannot be dropped anywhere must not look draggable.
    */
+  /**
+   * Every kind the tree renders is draggable, because every one now has a mover behind it.
+   *
+   * This used to admit only meetings and notes — correctly, at the time: a dashboard had no
+   * container to move between and a task had no local placement at all, so a drag would have
+   * been a gesture with nothing to do. Both gained a backend half, and a row a user can see
+   * under a project is a row they will try to drag out of it. `ItemKind` and `DraggableKind` are
+   * kept as separate types on purpose: they agree today, and the day a kind is renderable but
+   * not movable, this function is where that is said.
+   */
   protected draggableKind(item: ItemRow): DraggableKind | null {
-    return item.kind === "meeting" || item.kind === "note" ? item.kind : null;
+    switch (item.kind) {
+      case "meeting":
+      case "note":
+      case "dashboard":
+      case "task":
+        return item.kind;
+      default:
+        return null;
+    }
   }
 
   protected onDragStart(event: DragEvent, item: ItemRow): void {
@@ -345,6 +363,11 @@ export class WorkspaceTreeComponent {
 
   protected async newFolder(container: ContainerNode): Promise<void> {
     await this.workspace.createFolder(container.id, "New folder");
+  }
+
+  protected async newDashboard(container: ContainerNode): Promise<void> {
+    const id = await this.workspace.createDashboard(container.id, "New dashboard");
+    await this.router.navigate(["/dashboards", id]);
   }
 
   /**
