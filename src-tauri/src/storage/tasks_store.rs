@@ -4,6 +4,8 @@
 //! stores only an origin device's editable source payload so the existing stable org-document CAS
 //! machinery can recover and republish it. `task_local_refs` never egresses.
 
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, Transaction};
 
 use crate::error::{AppError, Result};
@@ -164,6 +166,94 @@ impl Db {
         .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// File a task into a local container, or clear its placement with `None`.
+    ///
+    /// Returns false when no task carries that id, so the caller can refuse rather than report a
+    /// success that moved nothing.
+    pub(crate) fn set_task_container(&self, task_id: &str, container_id: Option<&str>) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE org_tasks SET container_id = ?2 WHERE id = ?1",
+                rusqlite::params![task_id, container_id],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    /// Unfile every task in a container, returning how many moved.
+    ///
+    /// Called when the container is SEALED. A task's content lives in an org's E2EE store, so a
+    /// container's content key cannot seal it — which means a task left inside a sealed container
+    /// would stay exactly as readable as before while the user was told the container was locked.
+    /// That is the one outcome the lock model must never produce, so the task leaves the container
+    /// instead. Nothing is lost: the task is intact and unfiled, precisely where it was before
+    /// anyone filed it, and it is still listed in the Tasks view.
+    pub(crate) fn unfile_tasks_in_container(&self, container_id: &str) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE org_tasks SET container_id = NULL WHERE container_id = ?1",
+                rusqlite::params![container_id],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
+    /// The container a task is filed in, or `None` when it is unfiled. TESTS ONLY.
+    ///
+    /// RAW: no visibility predicate. An earlier version of this comment justified that by saying
+    /// the seal and relock paths use it — they do not; they use
+    /// [`Db::unfile_tasks_in_container`], which needs no per-task read at all.
+    ///
+    /// It survives because the unfiling tests need it and CANNOT use the gated variant. They
+    /// assert that a task is no longer filed after a container is sealed, and
+    /// `task_container_visible` returns `None` for a sealed container whether the task is filed
+    /// there or not — so asserting `None` through it would pass on a relock that unfiled nothing.
+    /// The raw read is what makes that assertion mean something.
+    #[cfg(test)]
+    pub(crate) fn task_container(&self, task_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT container_id FROM org_tasks WHERE id = ?1",
+            rusqlite::params![task_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
+    }
+
+    /// The container a task is filed in, as the FE may see it.
+    ///
+    /// A sealed-and-not-unlocked container yields `None`. "Which sealed container is this item
+    /// in" is a disclosure this diff already decided to withhold elsewhere: `mask_board` drops
+    /// `folder_id` for exactly this reason, because keeping it lets a caller group items by
+    /// sealed folder and count them. Tasks are normally unfiled by both the seal and the relock,
+    /// so the window is narrow — but "narrow" is not the same as closed, and two readers in one
+    /// change should not take opposite positions on the same fact.
+    pub(crate) fn task_container_visible(
+        &self,
+        task_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        let visible = crate::storage::visibility_clause("f", unlocked);
+        let conn = self.lock();
+        conn.query_row(
+            &format!(
+                "SELECT t.container_id
+                   FROM org_tasks t
+                   LEFT JOIN folders f ON f.id = t.container_id
+                  WHERE t.id = ?1 AND (t.container_id IS NULL OR {visible})"
+            ),
+            rusqlite::params![task_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
     }
 
     pub fn task_source(&self, source_id: &str) -> Result<Option<(String, String, i64)>> {

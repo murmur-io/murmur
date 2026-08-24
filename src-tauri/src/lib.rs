@@ -321,6 +321,8 @@ pub fn run() {
             commands::revoke_shares_for_folder,
             commands::list_tasks,
             commands::get_task,
+            commands::set_task_container,
+            commands::move_dashboard_to_container,
             commands::create_task,
             commands::update_task,
             commands::delete_task,

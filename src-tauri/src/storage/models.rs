@@ -2342,8 +2342,15 @@ pub struct Dashboard {
     pub tint: Option<String>,
     pub pinned: bool,
     pub position: i64,
+    /// The container this board is filed in; `None` means unfiled, which every board that
+    /// predates the hierarchy is. It is also the board's LOCK anchor: a board with no folder
+    /// cannot be sealed, because there is no folder whose key would seal it.
+    pub folder_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// True when this board's folder is sealed and NOT unlocked for this session. The title
+    /// and tiles are then masked rather than returned — see `Db::list_dashboards_visible`.
+    pub locked: bool,
 }
 
 /// One tile on a board — a pointer plus its layout, never content.
