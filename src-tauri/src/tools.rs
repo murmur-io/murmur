@@ -102,9 +102,7 @@ pub enum AssistantScope {
 }
 
 impl AssistantScope {
-    /// One hierarchy line: indent, name, id, lock state, and the per-kind counts.
-
-/// Is `tool` reachable at THIS scope? The tiered gate, applied on top of the per-surface flags
+    /// Is `tool` reachable at THIS scope? The tiered gate, applied on top of the per-surface flags
     /// (`has_app`/`note_drafts`/`allow_writes`) in [`GatedToolExecutor::specs`]. The vault READ tools
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
@@ -187,7 +185,16 @@ impl AssistantScope {
 /// Counts come from the container's own type groups, which the gated reader has already emptied
 /// for a sealed container — so a locked project reports `locked` and nothing else, rather than
 /// disclosing how much is inside it.
-fn render_container_line(out: &mut String, node: &crate::storage::models::ContainerNode, depth: usize) {
+/// One hierarchy line: indent, name, id, lock state, and the per-kind counts.
+///
+/// Counts come from the container's own type groups, which the gated reader has already emptied
+/// for a sealed container — so a locked project reports `locked` and nothing else, rather than
+/// disclosing how much is inside it.
+fn render_container_line(
+    out: &mut String,
+    node: &crate::storage::models::ContainerNode,
+    depth: usize,
+) {
     let indent = "  ".repeat(depth);
     let state = if node.locked && !node.unlocked {
         " · locked"
