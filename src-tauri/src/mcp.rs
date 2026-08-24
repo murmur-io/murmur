@@ -1671,6 +1671,11 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "list_workspace_hierarchy",
+            "description": "The WORKSPACE HIERARCHY: every visible project, the folders inside it, and how many meetings / notes / tasks / dashboards each holds. This is where things LIVE, which is a different fact from what they say — a meeting in 'Acme / Weekly' and one in 'Personal' mean different things. Call it to ground a question about a project or a client in the container the user actually keeps it in, and to get the exact container id other tools accept. A sealed-and-not-session-unlocked container appears by name but reports no counts and no contents.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "list_dashboards",
             "description": "List the user's DASHBOARDS — boards they composed BY HAND out of meetings, notes, documents, people and derived views (drift lanes, promise ledgers, pulses). Returns title + id + tile kinds only, no content. A board is the user's own declaration of what belongs together, so it is better scope than a search guess: check here first for questions about a project, deal or topic they track.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -1838,6 +1843,7 @@ fn dispatch_tool(
                 .clamp(1, 100) as usize,
         },
         "list_note_folders" => ToolCall::ListNoteFolders,
+        "list_workspace_hierarchy" => ToolCall::ListWorkspaceHierarchy,
         "list_dashboards" => ToolCall::ListDashboards,
         "get_dashboard" => ToolCall::GetDashboard {
             dashboard_id: args
@@ -2080,10 +2086,18 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seventeen_tools() {
+    fn tools_list_has_eighteen_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        // Eighteen since `list_workspace_hierarchy` joined. The count is deliberately pinned: the
+        // MCP catalogue is the loopback surface's whole contract, and a tool arriving or leaving
+        // it unnoticed is precisely what this guard exists to make impossible. It did its job
+        // here — the new tool was added and this test failed until the number was reconsidered.
+        assert_eq!(tools.len(), 18);
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_workspace_hierarchy"),
+            "the hierarchy must be discoverable over local MCP"
+        );
         assert!(
             tools.iter().any(|t| t["name"] == "list_dashboards")
                 && tools.iter().any(|t| t["name"] == "get_dashboard"),
@@ -4589,6 +4603,112 @@ mod tests {
                 && unlocked_list.contains("compensation:select"),
             "session-unlocked folder must become discoverable: {unlocked_list}"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The hierarchy tool names a sealed container but discloses NOTHING inside it.
+    ///
+    /// A container's existence is not the secret — a lock the user cannot see is worse than one
+    /// they can, and hiding the row entirely would make a locked project look deleted. What must
+    /// not escape is what is INSIDE: the titles, and the counts that say how much there is.
+    ///
+    /// The tool reads the same gated assembly the sidebar does, which already empties a sealed
+    /// container's type groups. This pins that dependency: if the reader ever started reporting
+    /// totals for a sealed container, the sidebar would look no different and this is the only
+    /// place that would notice.
+    #[test]
+    fn workspace_hierarchy_names_a_sealed_container_but_never_its_contents() {
+        let p = crate::storage::db::unique_temp_path("murmur-mcp-hierarchy", "db");
+        let db = Db::open_with_key(&p, TEST_DEK).unwrap();
+
+        // Under the ADOPTED project, not beside it. A fresh database is never projectless — the
+        // hierarchy migration adopts pre-existing folders into a default "Workspace" project —
+        // and a folder with no parent is not part of the forest the tree renders. Getting this
+        // wrong made the first run of this test assert against a vault it had not actually built.
+        let project = db.workspace_project_id().unwrap().expect("a project is adopted");
+        db.insert_folder(&crate::storage::models::Folder {
+            id: "p-open".into(),
+            name: "Acme".into(),
+            path: "Acme".into(),
+            parent_id: Some(project.clone()),
+            locked: false,
+            created_at: "2026-08-23T10:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_folder(&crate::storage::models::Folder {
+            id: "p-secret".into(),
+            name: "Layoffs Q3".into(),
+            path: "Layoffs Q3".into(),
+            parent_id: Some(project),
+            locked: true,
+            created_at: "2026-08-23T10:00:00Z".into(),
+        })
+        .unwrap();
+
+        // One meeting in each, so a leak would have something concrete to leak.
+        for (mid, title, folder) in [
+            ("m-open", "Standup", "p-open"),
+            ("m-secret", "Severance list", "p-secret"),
+        ] {
+            db.insert_meeting(&crate::storage::models::Meeting {
+                id: mid.into(),
+                started_at: "2026-08-23T09:00:00Z".into(),
+                ended_at: None,
+                title: Some(title.into()),
+                duration_s: 600,
+                audio_path: None,
+                status: crate::storage::models::MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+            db.upsert_note(&crate::storage::models::NoteRecord {
+                meeting_id: mid.into(),
+                provider_id: "claude_code".into(),
+                markdown: "body".into(),
+                created_at: "2026-08-23T09:05:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+            db.set_meeting_folder(mid, Some(folder)).unwrap();
+        }
+
+        let listed =
+            dispatch_tool(&db, "list_workspace_hierarchy", &json!({}), &HashSet::new()).unwrap();
+
+        // The open container reports itself AND what it holds.
+        assert!(
+            listed.contains("Acme") && listed.contains("id:p-open"),
+            "a visible container must be discoverable: {listed}"
+        );
+        assert!(
+            listed.contains("meeting:1"),
+            "an open container must report its counts: {listed}"
+        );
+
+        // The sealed one reports itself, and that it is locked, and nothing else.
+        assert!(
+            listed.contains("Layoffs Q3") && listed.contains("locked"),
+            "a sealed container must still be visible as locked: {listed}"
+        );
+        assert!(
+            !listed.contains("Severance list"),
+            "a sealed container disclosed a title: {listed}"
+        );
+
+        // The COUNT is the subtle half: "meeting:1" beside a locked project tells a reader there
+        // is exactly one meeting in there, which is a fact about sealed content.
+        let sealed_line = listed
+            .lines()
+            .find(|line| line.contains("Layoffs Q3"))
+            .expect("the sealed container must appear");
+        assert!(
+            sealed_line.contains("empty"),
+            "a sealed container disclosed how much it holds: {sealed_line}"
+        );
+
         let _ = std::fs::remove_file(&p);
     }
 

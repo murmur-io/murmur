@@ -102,7 +102,9 @@ pub enum AssistantScope {
 }
 
 impl AssistantScope {
-    /// Is `tool` reachable at THIS scope? The tiered gate, applied on top of the per-surface flags
+    /// One hierarchy line: indent, name, id, lock state, and the per-kind counts.
+
+/// Is `tool` reachable at THIS scope? The tiered gate, applied on top of the per-surface flags
     /// (`has_app`/`note_drafts`/`allow_writes`) in [`GatedToolExecutor::specs`]. The vault READ tools
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
@@ -114,7 +116,10 @@ impl AssistantScope {
         // scope. They can be dispatched only by the loopback MCP mapper into `execute_tool`.
         if matches!(
             tool,
-            "list_entities" | "list_note_folders" | "knowledge_diff"
+            "list_entities"
+                | "list_note_folders"
+                | "list_workspace_hierarchy"
+                | "knowledge_diff"
         ) {
             return false;
         }
@@ -176,6 +181,36 @@ impl AssistantScope {
             AssistantScope::Full | AssistantScope::DurableAsk => true,
         }
     }
+}
+
+///
+/// Counts come from the container's own type groups, which the gated reader has already emptied
+/// for a sealed container — so a locked project reports `locked` and nothing else, rather than
+/// disclosing how much is inside it.
+fn render_container_line(out: &mut String, node: &crate::storage::models::ContainerNode, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let state = if node.locked && !node.unlocked {
+        " · locked"
+    } else if node.locked {
+        " · locked (unlocked this session)"
+    } else {
+        ""
+    };
+    let counts = node
+        .groups
+        .iter()
+        .filter(|group| group.total > 0)
+        .map(|group| format!("{:?}:{}", group.kind, group.total).to_lowercase())
+        .collect::<Vec<_>>();
+    let counts = if counts.is_empty() {
+        "empty".to_string()
+    } else {
+        counts.join(",")
+    };
+    out.push_str(&format!(
+        "{indent}- {} · {} · id:{} · {counts}{state}\n",
+        node.name, node.level, node.id
+    ));
 }
 
 /// A single read-only tool INVOCATION. This enum holds the read-only calls the brain can run
@@ -275,6 +310,21 @@ pub enum ToolCall {
     /// Local-MCP-only discovery of visible note folders, visible row counts, and typed columns.
     /// Intentionally absent from [`tool_specs`] and [`GatedToolExecutor`].
     ListNoteFolders,
+    /// Local-MCP-only view of the WORKSPACE HIERARCHY — every visible project, the folders inside
+    /// it, and how many items of each kind each one holds.
+    ///
+    /// This is what makes the brain aware of where things LIVE, rather than only what they say. A
+    /// meeting in "Acme / Weekly" and a meeting in "Personal" are different facts about the same
+    /// vault, and until now nothing on any tool surface could tell them apart.
+    ///
+    /// Local-MCP-only, and deliberately so: it is the same class of data as [`Self::ListNoteFolders`]
+    /// — a user's private folder NAMES, which are frequently the most sensitive strings in a vault
+    /// ("Layoffs Q3", a client's name, a diagnosis). Those names have never been allowed into a
+    /// cloud-capable assistant scope, and adding a second door for them would be a new cloud egress
+    /// wearing a feature's clothes. It carries no note or transcript CONTENT, and every row it
+    /// reports comes from the same gated reader the sidebar uses, so a sealed container contributes
+    /// its existence and nothing else.
+    ListWorkspaceHierarchy,
     /// The user's DASHBOARDS — boards they composed by hand. Metadata only (title, tile count,
     /// tile kinds): no board reads a source here, so this carries no gated content and is safe at
     /// every scope. It exists so an agent can DISCOVER the boards before scoping to one.
@@ -1220,6 +1270,25 @@ pub fn execute_tool(
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))
+        }
+        ToolCall::ListWorkspaceHierarchy => {
+            // The SAME gated assembly the sidebar reads — not a second query with its own idea of
+            // what is visible. A sealed-and-not-unlocked container still appears (its existence is
+            // not the secret; a lock the user cannot see is worse than one they can) but its type
+            // groups come back empty from that reader, so it contributes no titles and no counts.
+            let forest = crate::commands::workspace_tree_inner(db, unlocked)
+                .map_err(|e| AppError::Storage(format!("workspace hierarchy read failed: {e}")))?;
+            if forest.is_empty() {
+                return Ok("No visible projects.".to_string());
+            }
+            let mut out = String::new();
+            for project in &forest {
+                render_container_line(&mut out, project, 0);
+                for folder in &project.folders {
+                    render_container_line(&mut out, folder, 1);
+                }
+            }
+            Ok(out.trim_end().to_string())
         }
         ToolCall::KnowledgeDiff { entity, from, to } => {
             // EGRESS-FREE + GATED: resolve the entity through the SAME gated resolver as the dossier
@@ -7679,7 +7748,12 @@ mod tests {
                 && !names.contains("knowledge_diff"),
             "local MCP helpers must never become agent/cloud prompt input"
         );
-        for tool in ["list_entities", "list_note_folders", "knowledge_diff"] {
+        for tool in [
+            "list_entities",
+            "list_note_folders",
+            "list_workspace_hierarchy",
+            "knowledge_diff",
+        ] {
             for scope in [
                 AssistantScope::CurrentMeeting,
                 AssistantScope::Vault,
@@ -7730,6 +7804,18 @@ mod tests {
                 "the local-only ToolCall variant must remain executable on the loopback seam"
             );
         }
+
+        // The hierarchy tool is checked separately because an empty vault is NOT projectless: the
+        // hierarchy migration adopts every pre-existing folder into a default "Workspace"
+        // project, so there is always at least one, and its id is a fresh uuid. An exact-string
+        // expectation like the ones above is therefore unwritable — what matters here is the same
+        // property they assert, that the variant still EXECUTES on the loopback seam.
+        let hierarchy =
+            execute_tool(&ToolCall::ListWorkspaceHierarchy, &db, &nothing, &cfg).unwrap();
+        assert!(
+            hierarchy.contains(" · project · "),
+            "the hierarchy variant must remain executable on the loopback seam: {hierarchy}"
+        );
 
         // Exercise BOTH ToolExecutor entry points (`specs` and `run`) across every scope and both
         // surface gates. `run` must return the exact allowlist refusal, never either successful
