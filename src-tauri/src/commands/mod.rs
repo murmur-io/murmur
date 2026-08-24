@@ -9175,6 +9175,16 @@ fn permanent_unseal_audio(
 /// `lock_folder`'s note seal: each blob is verified-decryptable BEFORE the plaintext is blanked /
 /// the plaintext WAV is removed — content (transcript / audio) is never lost.
 pub(crate) fn seal_folder_extras(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    seal_dashboards_in_folder(db, folder_id, ck)?;
+    // TASKS LEAVE. A task's content lives in an org's E2EE store, so this folder's content key
+    // cannot seal it — and a task left inside would stay exactly as readable as it was while the
+    // user was told the folder is locked. Unfiling is the only outcome that keeps the lock's
+    // promise literally true, and it loses nothing: the task is intact, unfiled, and still in the
+    // Tasks view — the state it was in before anyone filed it.
+    let unfiled = db.unfile_tasks_in_container(folder_id)?;
+    if unfiled > 0 {
+        tracing::info!(target: "lock", folder_id, unfiled, "unfiled tasks on seal");
+    }
     let meeting_ids = db.meeting_ids_in_folder(folder_id)?;
     for mid in &meeting_ids {
         seal_meeting_extras(db, folder_id, mid, ck)?;
@@ -9692,6 +9702,126 @@ fn unseal_meeting_extras(
     Ok(())
 }
 
+/// Seal every board filed in this folder: its title, and each tile's pointer + config.
+///
+/// A board is content twice over. Its title names the thing — "Q3 layoffs" is a disclosure on its
+/// own — and its tiles say which meeting or note it is built from, which is precisely what a locked
+/// folder exists to stop revealing. A container that could hold a board but never sealed one would
+/// be a lock with a hole in it.
+///
+/// Verify-before-destroy throughout, exactly as the note and document seals do: encrypt, decrypt the
+/// ciphertext back, compare byte-for-byte, and only then blank the plaintext.
+fn seal_dashboards_in_folder(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    for board in db.dashboards_in_folder(folder_id)? {
+        // Title, emoji AND tint, as one payload. The read path masks all three with the
+        // rationale that "an emoji and an accent are weak signals, but they are still signals
+        // about a thing the user asked to be unreadable" — and the seal used to cover only the
+        // title, so those two sat in plaintext at rest. That is the gap the lock exists to close:
+        // the promise is that a sealed folder is unreadable EVEN WITH THE DATABASE OPEN, and a
+        // reader going straight to the row got the emoji and the accent every time. Masking on
+        // read while leaving the columns at rest is protection against the app, not against an
+        // attacker.
+        // Whatever this condition covers, `Db::folder_has_plaintext_dashboards` must cover
+        // too — it is the predicate the keyless relock refusal uses to decide whether anything
+        // is still readable, and the two drifting apart is a silent leak, not a failed check.
+        let cosmetics = serde_json::json!({
+            "title": board.title,
+            "emoji": board.emoji,
+            "tint": board.tint,
+        })
+        .to_string();
+        if !board.title.is_empty() || board.emoji.is_some() || board.tint.is_some() {
+            let aad = aad_document(folder_id, &board.id);
+            let blob = crate::crypto::encrypt(ck, cosmetics.as_bytes(), &aad)?;
+            if crate::crypto::decrypt(ck, &blob, &aad)? != cosmetics.as_bytes() {
+                return Err(AppError::Storage(
+                    "dashboard title seal verification failed (blob mismatch)".into(),
+                ));
+            }
+            db.seal_dashboard_title(&board.id, &blob)?;
+        }
+        for (tile_id, payload) in db.dashboard_tile_payloads(&board.id)? {
+            let aad = aad_document(folder_id, &tile_id);
+            let blob = crate::crypto::encrypt(ck, payload.as_bytes(), &aad)?;
+            if crate::crypto::decrypt(ck, &blob, &aad)? != payload.as_bytes() {
+                return Err(AppError::Storage(
+                    "dashboard tile seal verification failed (blob mismatch)".into(),
+                ));
+            }
+            db.seal_dashboard_tile(&tile_id, &blob)?;
+        }
+    }
+    Ok(())
+}
+
+/// Restore every sealed board in this folder — the mirror of [`seal_dashboards_in_folder`].
+///
+/// A seal that cannot be undone is content loss, so this runs on both the session unlock and the
+/// permanent one. It is idempotent: a board with no title blob is one that was never sealed (or was
+/// already restored), and skipping it lets an interrupted unseal be retried without harm.
+fn unseal_dashboards_in_folder(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    for (board_id, title_blob, tiles) in db.sealed_dashboard_blobs(folder_id)? {
+        // The title and the tiles are restored INDEPENDENTLY. An earlier version skipped the
+        // whole board when its title blob was absent, which is a real shape — a board titled
+        // "" is never title-sealed — and it meant every sealed tile under such a board stayed
+        // blanked forever. That is content loss, not a missed cosmetic.
+        let cosmetics = match &title_blob {
+            Some(blob) => {
+                let bytes = crate::crypto::decrypt(ck, blob, &aad_document(folder_id, &board_id))?;
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    AppError::Storage("sealed dashboard title is not UTF-8".into())
+                })?;
+                let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+                    AppError::Storage("sealed dashboard cosmetics are not valid JSON".into())
+                })?;
+                let field = |name: &str| {
+                    parsed
+                        .get(name)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                };
+                Some((
+                    field("title").unwrap_or_default(),
+                    field("emoji"),
+                    field("tint"),
+                ))
+            }
+            None => None,
+        };
+        let mut restored = Vec::with_capacity(tiles.len());
+        for (tile_id, blob) in tiles {
+            let bytes = crate::crypto::decrypt(ck, &blob, &aad_document(folder_id, &tile_id))?;
+            let payload = String::from_utf8(bytes).map_err(|_| {
+                AppError::Storage("sealed dashboard tile payload is not UTF-8".into())
+            })?;
+            let parsed: serde_json::Value = serde_json::from_str(&payload).map_err(|_| {
+                AppError::Storage("sealed dashboard tile payload is not valid JSON".into())
+            })?;
+            // `None` for a JSON null, so a column that was NULL comes back NULL. There is no
+            // older-payload case to defend against: `config_blob` and the `kind` field of this
+            // payload were introduced together, so every blob that exists carries the key.
+            let field = |name: &str| {
+                parsed
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            };
+            restored.push(crate::storage::dashboards_store::RestoredTile {
+                id: tile_id,
+                title: field("title"),
+                ref_id: field("refId"),
+                config: field("config"),
+                kind: field("kind"),
+            });
+        }
+        if cosmetics.is_none() && restored.is_empty() {
+            continue;
+        }
+        db.unseal_dashboard(&board_id, cosmetics.as_ref(), &restored)?;
+    }
+    Ok(())
+}
+
 /// `meeting_embedder` is the model-gated embedder for the MEETING re-index, resolved by the CALLER
 /// (`embed_model_present().then(active_embedder)`) and passed in — `Some(real e5)` re-indexes the
 /// folder's meetings, `None` (model absent) writes nothing (never a stub vector). It is injected
@@ -9740,6 +9870,13 @@ pub(crate) fn unseal_folder_extras(
     // BEFORE this call). The caller supplies the model-gated `meeting_embedder` — never a stub
     // vector; mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
     reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
+
+    // Boards LAST, deliberately. This used to run first, which made one undecryptable board blob
+    // abort the whole unlock before a single meeting, note, document or audio file was restored —
+    // a board is the least load-bearing kind in the folder, and it was gating access to every
+    // other one. Running it last keeps the failure loud (the unlock still errors, nothing is
+    // silently skipped) while everything that CAN be restored already has been.
+    unseal_dashboards_in_folder(&state.db, folder_id, ck)?;
 
     Ok(())
 }
@@ -10269,6 +10406,14 @@ fn reblank_folder_extras_after_verification(
         None
     };
     let seal_ck = verified_ck.or(resolved_ck.as_deref());
+    // Boards, on the same terms as every other kind. A relock destroys the session plaintext of
+    // a folder that is already durably locked; a kind the re-blank does not enumerate is a kind
+    // whose plaintext SURVIVES that relock, readable in an open database. Seal and unseal
+    // covering dashboards while this one did not would have made the very first relock after a
+    // session-unlock leave a board's title and its tiles in the clear.
+    // Boards are handled AFTER the loop below, deliberately — see the note there. Returning the
+    // keyless refusal here first would have made a keyless relock blank NOTHING, when before this
+    // diff it still blanked every segment.
     for mid in state.db.meeting_ids_in_folder(folder_id)? {
         for s in state.db.raw_segments(&mid)? {
             if s.text_blob.is_some() && !s.text.is_empty() {
@@ -10363,6 +10508,40 @@ fn reblank_folder_extras_after_verification(
         state.db.set_note_doc_exported_path(&doc_id, None)?;
     }
     reblank_attachments_in_folder(state, folder_id)?;
+
+    // TASKS LEAVE HERE TOO. `seal_folder_extras` unfiles them on the initial lock, but that is not
+    // the only way a task gets into a sealed container: a folder that is durably locked and
+    // SESSION-unlocked passes `folder_is_unlocked`, so `set_task_container` accepts it, and the
+    // user can file a task into it. The relock then runs THIS function — which knew nothing about
+    // tasks — and the task stayed inside a container reported as locked, which is exactly the
+    // state the unfiling exists to prevent. Sealing and relocking are two doors into the same
+    // room; fixing one of them is not fixing it.
+    let unfiled = state.db.unfile_tasks_in_container(folder_id)?;
+    if unfiled > 0 {
+        tracing::info!(target: "lock", folder_id, unfiled, "unfiled tasks on relock");
+    }
+
+    // BOARDS LAST, and the position is the point. Every re-blank above works WITHOUT a content
+    // key, because each row still holds its own ciphertext to fall back on. A board does not: the
+    // unlock cleared `title_blob` / `config_blob`, so it must be re-encrypted to be blanked at all.
+    //
+    // So the keyless case can only be REFUSED, never skipped — skipping would report the folder
+    // locked while its boards stayed readable, which is the leak this whole function exists to
+    // prevent. Refusing EARLY, though, was its own regression: it returned before the segment and
+    // document re-blanks, which need no key, so a keyless relock went from blanking everything it
+    // could to blanking nothing at all. Doing the key-free work first and reporting the gap last
+    // keeps both properties — nothing recoverable is skipped, and nothing unsealed is quietly left
+    // readable.
+    match seal_ck {
+        Some(ck) => seal_dashboards_in_folder(&state.db, folder_id, ck)?,
+        None => {
+            if state.db.folder_has_plaintext_dashboards(folder_id)? {
+                return Err(AppError::Locked(
+                    "cannot relock: no content key available to reseal this folder's boards".into(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -10480,6 +10659,15 @@ pub(crate) fn unseal_folder_extras_permanent(
     // again. Mirrors the document re-embed above and the meeting half of `reindex_embeddings_inner`.
     let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
     reindex_meetings_after_unseal(state, &meeting_ids, meeting_embedder);
+
+    // Boards LAST here too. The session path was changed to run them last so one undecryptable
+    // board blob could not abort an unlock before a single meeting, note, document or audio file
+    // was restored — and this path is where that matters MORE, not less: a permanent unlock is the
+    // one the user runs to get their content back for good, and aborting it early leaves the
+    // folder half-restored with the lock still on. Fixing only the session path and leaving the
+    // permanent one running boards first would have been a fix that looked complete and covered
+    // the less important half.
+    unseal_dashboards_in_folder(&state.db, folder_id, ck)?;
 
     Ok(sealed_audio_to_retire)
 }
