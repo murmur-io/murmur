@@ -138,6 +138,17 @@
                 Lock again
               </button>
             }
+            @if (canOrganize(line.container)) {
+              <button
+                type="button"
+                role="menuitem"
+                [disabled]="organizePlanning()"
+                (click)="organize(line.container)"
+                data-testid="organize-container"
+              >
+                {{ organizePlanning() ? "Reading this folder…" : "Organize with AI" }}
+              </button>
+            }
             <button type="button" role="menuitem" (click)="rename(line.container)">
               Rename
             </button>
@@ -167,4 +178,16 @@
       }
     }
   </div>
+}
+
+<!-- The auto-organize review sheet — ONE instance for the whole tree, not one per row: it is a
+     modal, only one container is ever being organized, and a per-row instance would build a
+     dialog for every container in the vault. Its own opaque overlay (T3). -->
+@if (organizePlan()) {
+  <app-organize-sheet
+    [plan]="organizePlan()"
+    [busy]="organizeApplying()"
+    (apply)="applyOrganize($event)"
+    (cancelled)="closeOrganize()"
+  />
 }
