@@ -367,23 +367,90 @@ fn visible_items_sql(kind: ItemKind, unlocked: &HashSet<String>, scope: ItemScop
                 ),
             }
         }
-        // SEAMS — filled by later steps of the hierarchy program. Tasks are org-scoped E2EE
-        // documents today (`org_tasks`, gated on org membership) with no local container anchor, and
-        // dashboards gain `folder_id` + a real seal in their own step. Until then both legs are
-        // empty, and the "hide an empty type group" rule keeps them out of the UI entirely.
+        ItemKind::Task => {
+            // A task appears in the tree ONLY once it has been filed. `container_id` is the local
+            // anchor, and the Inbox leg is deliberately empty rather than "every task with no
+            // container": the top-level Tasks view is org-scoped and gated on org read context
+            // (`commands::tasks::list_tasks`), and mirroring every unfiled org task into the
+            // hierarchy would be a SECOND, ungated route to the same rows. Filing is an explicit
+            // local act; nothing is hidden by requiring it, because the unfiled tasks are exactly
+            // where they always were.
+            //
+            // The title comes from the decrypted envelope via `json_extract` — the same string the
+            // Tasks view shows, read from the projection this device already holds in the clear
+            // inside its SQLCipher database.
+            let visible = visibility_clause("f", unlocked);
+            let scope_sql = match scope {
+                ItemScope::All => "t.container_id IS NOT NULL",
+                ItemScope::Container => "t.container_id = ?1",
+                // Unfiled tasks belong to the Tasks view, not the tree — see above.
+                ItemScope::Inbox => "1 = 0",
+            };
+            ItemQuery {
+                binds_container: matches!(scope, ItemScope::Container),
+                // The ORG gate is joined here, in SQL, exactly as `search_org_chunks_knn` /
+                // `get_org_item` / `count_org_items` do it: an org row must EXIST locally (the
+                // membership record) and have `context_enabled = 1`. Filing a task locally cannot
+                // be allowed to outlive membership in the org that owns it — a leaver, a revoked
+                // seat, or a device where the user turned that org's context off must all stop
+                // this leg dead, and the folder's `visibility_clause` says nothing about any of
+                // them.
+                //
+                // The comment on the Inbox arm above already spelled out why this matters: the
+                // Tasks view "gates on session and org read context; mirroring every unfiled org
+                // task into the hierarchy would be a SECOND, ungated route to the same rows".
+                // Without the join, the Container arm was that second route — the reasoning was
+                // written and then contradicted one branch later.
+                //
+                // `INNER JOIN`, deliberately: a task whose org row is absent has no membership
+                // this device can attest, so it must vanish rather than default to visible.
+                //
+                // The `org_items` join is the repo's own idiom for "live, current head" — the same
+                // `tombstoned = 0 AND is_current = 1` pair `dashboard_task_rows` and the Task
+                // reference resolvers use. Membership alone was not enough: a task DELETED in the
+                // org, or superseded by a newer revision, still had its `org_tasks` row and would
+                // have kept rendering its old title under the container it was filed in, long
+                // after it stopped existing for everyone else.
+                sql: format!(
+                    "SELECT t.container_id AS container_id, t.id AS item_id,
+                            json_extract(t.envelope_json, '$.title') AS title,
+                            NULL AS duration_s, t.updated_at AS sort_text, NULL AS sort_ms
+                       FROM org_tasks t
+                       JOIN org_state os ON os.org_id = t.org_id AND os.context_enabled = 1
+                       JOIN org_items i
+                         ON i.item_id = t.item_id AND i.tombstoned = 0 AND i.is_current = 1
+                       LEFT JOIN folders f ON f.id = t.container_id
+                      WHERE {scope_sql} AND t.container_id IS NOT NULL AND {visible}"
+                ),
+            }
+        }
+        // SEAM — dashboards gained `folder_id` + a real seal in their own step; this comment marks
+        // where a future kind would join.
         //
         // An always-false select rather than an absent arm on purpose: the wrappers stay
         // kind-agnostic, the column projection is pinned for the future implementation, and a caller
-        // asking for a task page gets a truthful empty page instead of an error. `binds_container`
-        // is FALSE for every scope precisely because this arm ignores the scope — see [`ItemQuery`].
-        ItemKind::Task | ItemKind::Dashboard => {
-            let _ = (unlocked, scope);
+        // asking for such a page gets a truthful empty page instead of an error. `binds_container`
+        // is FALSE for every scope precisely because such an arm ignores the scope — see [`ItemQuery`].
+        ItemKind::Dashboard => {
+            // Boards now carry a container, so this leg reads real rows — through the SAME
+            // visibility clause every other kind uses rather than a second rule of its own.
+            // `updated_at` is the sort key: a board has no single moment it happened, and the
+            // last time it changed is the closest thing to one.
+            let visible = visibility_clause("f", unlocked);
+            let scope_sql = match scope {
+                ItemScope::All => "1 = 1",
+                ItemScope::Container => "d.folder_id = ?1",
+                ItemScope::Inbox => "d.folder_id IS NULL",
+            };
             ItemQuery {
-                binds_container: false,
-                sql: "SELECT NULL AS container_id, '' AS item_id, NULL AS title,
-                             NULL AS duration_s, NULL AS sort_text, NULL AS sort_ms
-                        FROM folders WHERE 1 = 0"
-                    .to_string(),
+                binds_container: matches!(scope, ItemScope::Container),
+                sql: format!(
+                    "SELECT d.folder_id AS container_id, d.id AS item_id, d.title AS title,
+                            NULL AS duration_s, d.updated_at AS sort_text, NULL AS sort_ms
+                       FROM dashboards d
+                       LEFT JOIN folders f ON f.id = d.folder_id
+                      WHERE {scope_sql} AND (d.folder_id IS NULL OR {visible})"
+                ),
             }
         }
     }
