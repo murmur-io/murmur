@@ -18,11 +18,14 @@
 //! The methods below are an inherent-impl split of [`crate::storage::db::Db`] across files, the
 //! same pattern the other `*_store.rs` modules use.
 
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, Row, Transaction};
 
 use crate::error::{AppError, Result};
 use crate::storage::db::{map_err, Db};
 use crate::storage::models::{Dashboard, DashboardTile};
+use crate::storage::visibility_clause;
 
 /// Tile kinds Murmur knows how to render. Anything else is refused at the command layer, so a
 /// malformed row can never reach the renderer as an unhandled variant.
@@ -63,9 +66,39 @@ fn row_to_dashboard(row: &Row<'_>) -> rusqlite::Result<Dashboard> {
         tint: row.get(3)?,
         pinned: row.get::<_, i64>(4)? != 0,
         position: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        folder_id: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        // The raw mapper never claims a board is locked: it has not consulted the session
+        // unlock set and cannot. Only the GATED readers set this, so a caller that skips them
+        // gets `false` — which is why they are the only ones that may return a board at all.
+        locked: false,
     })
+}
+
+/// Blank a board that is sealed and not unlocked for this session.
+///
+/// Title, emoji and tint all go: an emoji and an accent are weak signals, but they are still
+/// signals about a thing the user asked to be unreadable.
+/// Blank a board the caller has already decided is sealed-and-not-unlocked.
+///
+/// The ONE masking rule, so the row-at-a-time reader and the SQL-side list reader cannot drift
+/// into masking different fields.
+fn mask_board(board: Dashboard) -> Dashboard {
+    Dashboard {
+        title: "🔒 Locked".to_string(),
+        emoji: None,
+        tint: None,
+        locked: true,
+        // The CONTAINER goes too. Keeping it let a caller group masked boards by folder and count
+        // how many a sealed container holds — the exact fact the tree leg withholds on purpose
+        // (`every_dashboard_read_sink_withholds_a_sealed_board` asserts `total == 0` there). Two
+        // readers changed in one diff cannot take opposite positions on the same disclosure; the
+        // board's own row is the weaker one, because nothing downstream needs a sealed board's
+        // container to render it as locked.
+        folder_id: None,
+        ..board
+    }
 }
 
 fn row_to_tile(row: &Row<'_>) -> rusqlite::Result<DashboardTile> {
@@ -82,7 +115,30 @@ fn row_to_tile(row: &Row<'_>) -> rusqlite::Result<DashboardTile> {
     })
 }
 
-const DASHBOARD_COLS: &str = "id, title, emoji, tint, pinned, position, created_at, updated_at";
+/// A tile's plaintext, recovered from its sealed payload.
+///
+/// Every field is `Option` so a column that was NULL before the seal is NULL after the unseal.
+/// Collapsing NULL to "" would make the round-trip lossy in a way no equality check on the
+/// visible text would catch.
+#[derive(Debug, Clone)]
+pub(crate) struct RestoredTile {
+    pub id: String,
+    pub title: Option<String>,
+    pub ref_id: Option<String>,
+    pub config: Option<String>,
+    pub kind: Option<String>,
+}
+
+/// One sealed board's ciphertext: its title blob (absent when the board was never sealed) and a
+/// blob per tile that has one. The unseal's whole input.
+pub(crate) type SealedDashboardBlobs = (String, Option<Vec<u8>>, Vec<(String, Vec<u8>)>);
+
+const DASHBOARD_COLS: &str =
+    "id, title, emoji, tint, pinned, position, folder_id, created_at, updated_at";
+/// The same columns, qualified — required by any read that JOINs `folders`, which brings a second
+/// `id` (and a `locked`) into scope and makes the bare list ambiguous.
+const DASHBOARD_COLS_D: &str = "d.id, d.title, d.emoji, d.tint, d.pinned, d.position, d.folder_id,
+     d.created_at, d.updated_at";
 const TILE_COLS: &str = "id, dashboard_id, kind, ref_id, title, span, position, config, created_at";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +196,307 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every board, with a SEALED board's title and cosmetics masked.
+    ///
+    /// A board filed in a container inherits that container's lock, and its title is content:
+    /// "Q3 layoffs" names the thing whether or not the tiles are readable. The ungated
+    /// `list_dashboards` returned every title unconditionally, which was correct only while a
+    /// board could not live in a folder at all.
+    ///
+    /// Masked rather than omitted, for the reason the meeting detail is masked rather than
+    /// omitted: a user who locked a folder should still see that the board exists and can be
+    /// unlocked, not wonder whether it was deleted.
+    pub fn list_dashboards_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<Dashboard>> {
+        // ONE statement on ONE connection, and the sealed-ness rule is the SHARED
+        // `visibility_clause` every other reader uses. The first version took two separate
+        // `self.lock()`s — rows, then a hand-rolled `SELECT id FROM folders WHERE locked = 1` —
+        // which is two defects at once: a relock landing between them yields plaintext rows
+        // judged against a stale sealed set, and any predicate `visibility_clause` grows beyond
+        // `locked = 1` would silently not apply here.
+        let visible = visibility_clause("f", unlocked);
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DASHBOARD_COLS_D},
+                        CASE WHEN d.folder_id IS NULL OR {visible} THEN 0 ELSE 1 END AS sealed
+                   FROM dashboards d
+                   LEFT JOIN folders f ON f.id = d.folder_id
+                  ORDER BY d.pinned DESC, d.position ASC, d.updated_at DESC"
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let board = row_to_dashboard(r)?;
+                let sealed: i64 = r.get("sealed")?;
+                Ok(if sealed == 1 { mask_board(board) } else { board })
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// One board, masked on the same terms as [`Db::list_dashboards_visible`].
+    pub fn get_dashboard_visible(
+        &self,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<Dashboard>> {
+        let visible = visibility_clause("f", unlocked);
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DASHBOARD_COLS_D},
+                        CASE WHEN d.folder_id IS NULL OR {visible} THEN 0 ELSE 1 END AS sealed
+                   FROM dashboards d
+                   LEFT JOIN folders f ON f.id = d.folder_id
+                  WHERE d.id = ?1"
+            ))
+            .map_err(map_err)?;
+        let board = stmt
+            .query_row(rusqlite::params![id], |r| {
+                let board = row_to_dashboard(r)?;
+                let sealed: i64 = r.get("sealed")?;
+                Ok(if sealed == 1 { mask_board(board) } else { board })
+            })
+            .optional()
+            .map_err(map_err)?;
+        Ok(board)
+    }
+
+    /// Re-file a board into a container, or unfile it with `None`.
+    ///
+    ///
+    /// Returns false when no board carries that id, so the caller refuses rather than reporting a
+    /// success that moved nothing.
+    pub(crate) fn set_dashboard_folder(&self, id: &str, folder_id: Option<&str>) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE dashboards SET folder_id = ?2 WHERE id = ?1",
+                rusqlite::params![id, folder_id],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
+    }
+
+    /// True when any board in this folder still holds PLAINTEXT.
+    ///
+    /// Asked by the at-rest re-blank when no content key could be resolved: skipping the seal
+    /// silently would report the folder locked while its boards stayed readable, so the re-blank
+    /// refuses instead.
+    ///
+    /// THIS PREDICATE MUST MATCH THE SEAL'S, and an earlier revision of it did not. The seal asks
+    /// `!board.title.is_empty() || board.emoji.is_some() || board.tint.is_some()`; this one asked
+    /// about the title alone. A board with an empty title, an emoji or a tint, and no plaintext
+    /// tiles therefore answered "nothing to seal" — so a keyless relock SUCCEEDED and left the
+    /// emoji and the accent readable in a folder it had just reported as locked. The gap opened
+    /// the moment the seal was widened to cover the two cosmetic columns and this half was not:
+    /// one side of a paired invariant moved. `seal_dashboards_in_folder` names this function as
+    /// its twin, and any future column that becomes sealable has to arrive in both.
+    pub(crate) fn folder_has_plaintext_dashboards(&self, folder_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let found: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM dashboards d
+                     WHERE d.folder_id = ?1
+                       AND (COALESCE(d.title, '') <> ''
+                            OR d.emoji IS NOT NULL
+                            OR d.tint IS NOT NULL
+                            OR EXISTS(SELECT 1 FROM dashboard_tiles t
+                                       WHERE t.dashboard_id = d.id AND t.config_blob IS NULL)))",
+                rusqlite::params![folder_id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(found == 1)
+    }
+
+
+    /// Every board filed in a folder — the seal's enumeration.
+    pub(crate) fn dashboards_in_folder(&self, folder_id: &str) -> Result<Vec<Dashboard>> {
+        let conn = self.lock();
+        let sql = format!("SELECT {DASHBOARD_COLS} FROM dashboards WHERE folder_id = ?1");
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], row_to_dashboard)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// `(tile id, sealable payload)` for one board — the seal's per-tile enumeration.
+    ///
+    /// Only tiles that still hold PLAINTEXT — `config_blob IS NULL` — are returned, and that
+    /// predicate is load-bearing rather than an optimisation. `seal_dashboards_in_folder` runs
+    /// again on every relock of an already-sealed folder, and an already-sealed tile's columns
+    /// are blank by construction; without this filter that second pass would encrypt three empty
+    /// strings and overwrite the good ciphertext with them, destroying the tile's content on the
+    /// first relock and leaving nothing to recover. The title half is covered by its own
+    /// `!board.title.is_empty()` guard, which is the same predicate spelled differently.
+    ///
+    /// The payload is the tile's `title`, `ref_id` and `config` together, encoded as one JSON
+    /// object so a single blob restores all three. Sealing only `config` left the other two in
+    /// plaintext, and both are disclosures: `title` is a COPY of the source meeting's or note's
+    /// title, and `ref_id` names which one the board is built from. A lock that hid the board's
+    /// own name while leaving "Standup" and its meeting id readable would be a lock with a hole
+    /// exactly where someone would look.
+    pub(crate) fn dashboard_tile_payloads(
+        &self,
+        dashboard_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, ref_id, config, kind
+                   FROM dashboard_tiles WHERE dashboard_id = ?1 AND config_blob IS NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![dashboard_id], |r| {
+                // The columns go in as `Option<String>`, NOT coalesced to "". A tile whose
+                // `ref_id` was NULL and came back as "" is not a byte-identical restore — it is
+                // a silent type change that any `IS NULL` predicate downstream then reads
+                // differently. JSON null round-trips; the empty string does not stand in for it.
+                let payload = serde_json::json!({
+                    "title": r.get::<_, Option<String>>(1)?,
+                    "refId": r.get::<_, Option<String>>(2)?,
+                    "config": r.get::<_, Option<String>>(3)?,
+                    "kind": r.get::<_, Option<String>>(4)?,
+                })
+                .to_string();
+                Ok((r.get::<_, String>(0)?, payload))
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Store the sealed title and blank the plaintext — called only after the caller has proved
+    /// the blob decrypts back byte-identical.
+    pub(crate) fn seal_dashboard_title(&self, id: &str, blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        // `emoji` and `tint` go with the title, because the blob now carries all three. The read
+        // path masked them from the start on the grounds that they are "still signals about a
+        // thing the user asked to be unreadable" — and leaving the COLUMNS populated made that
+        // masking protection against the app rather than against anyone reading the database,
+        // which is the threat the seal is for.
+        conn.execute(
+            "UPDATE dashboards SET title = '', emoji = NULL, tint = NULL, title_blob = ?2
+              WHERE id = ?1",
+            rusqlite::params![id, blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The tile twin of [`Db::seal_dashboard_title`]: blanks title, ref, config and kind.
+    ///
+    /// `kind` goes with them because "this locked board contains three MEETING tiles" is a
+    /// disclosure about a thing the user asked to be unreadable. `span` and `position` stay:
+    /// they are the grid geometry, carry no reference to any content, and keeping them means an
+    /// unsealed board comes back in the layout it had rather than collapsed to a default.
+    pub(crate) fn seal_dashboard_tile(&self, id: &str, blob: &[u8]) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE dashboard_tiles
+                SET title = '', ref_id = '', config = '', kind = '', config_blob = ?2
+              WHERE id = ?1",
+            rusqlite::params![id, blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Restore a sealed board: decrypt its cosmetics and every tile payload back into place.
+    ///
+    /// The mirror of the seal, and the reason the seal is allowed to blank anything. Runs under
+    /// the same CK and CLEARS the blob — the earlier version of this sentence claimed the opposite
+    /// ("leaves the blob in place so an interrupted unseal can be retried"), which was not what
+    /// the SQL did and not what the rest of the system assumes. `folder_has_plaintext_dashboards`
+    /// and the keyless-relock refusal in `reblank_folder_extras_after_verification` both depend on
+    /// the blob being gone after an unlock: that absence is precisely why a board, unlike a
+    /// transcript segment, cannot be re-blanked without a key. A comment asserting the reverse on
+    /// a crypto-destructive path is worse than no comment, because it is the thing a later reader
+    /// trusts instead of the code.
+    pub(crate) fn unseal_dashboard(
+        &self,
+        id: &str,
+        cosmetics: Option<&(String, Option<String>, Option<String>)>,
+        tiles: &[RestoredTile],
+    ) -> Result<()> {
+        let conn = self.lock();
+        // `None` means this board was never cosmetics-sealed (one with no title, emoji or tint is
+        // not), so those columns are already correct and must be left alone — writing over them
+        // would make the unseal destroy what the seal deliberately did not take.
+        if let Some((title, emoji, tint)) = cosmetics {
+            conn.execute(
+                "UPDATE dashboards SET title = ?2, emoji = ?3, tint = ?4, title_blob = NULL
+                  WHERE id = ?1",
+                rusqlite::params![id, title, emoji, tint],
+            )
+            .map_err(map_err)?;
+        }
+        for tile in tiles {
+            // Plain `?5`, NOT `COALESCE(?5, kind)`. An earlier revision coalesced, reasoning
+            // about a blob written before `kind` joined the payload — but `title_blob` and
+            // `config_blob` are introduced in the same change that added `kind` to it, so no such
+            // blob can exist. Worse, the seal blanks `kind` to '', so the fallback value would
+            // always have been that empty string rather than anything worth keeping, and the
+            // coalesce silently broke the NULL-round-trips-as-NULL property every other column
+            // here holds.
+            conn.execute(
+                "UPDATE dashboard_tiles
+                    SET title = ?2, ref_id = ?3, config = ?4, kind = ?5, config_blob = NULL
+                  WHERE id = ?1",
+                rusqlite::params![tile.id, tile.title, tile.ref_id, tile.config, tile.kind],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// The sealed title blob and every sealed tile blob for one board — the unseal's source.
+    pub(crate) fn sealed_dashboard_blobs(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<SealedDashboardBlobs>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, title_blob FROM dashboards WHERE folder_id = ?1")
+            .map_err(map_err)?;
+        let boards = stmt
+            .query_map(rusqlite::params![folder_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        drop(stmt);
+
+        let mut out = Vec::new();
+        for (board_id, title_blob) in boards {
+            let mut tile_stmt = conn
+                .prepare(
+                    "SELECT id, config_blob FROM dashboard_tiles
+                      WHERE dashboard_id = ?1 AND config_blob IS NOT NULL",
+                )
+                .map_err(map_err)?;
+            let tiles = tile_stmt
+                .query_map(rusqlite::params![board_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(map_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?;
+            out.push((board_id, title_blob, tiles));
+        }
+        Ok(out)
+    }
+
     pub fn get_dashboard(&self, id: &str) -> Result<Option<Dashboard>> {
         let conn = self.lock();
         let sql = format!("SELECT {DASHBOARD_COLS} FROM dashboards WHERE id = ?1");
@@ -188,12 +545,27 @@ impl Db {
     }
 
     /// Insert a board. `position` is appended after the current maximum so a new board lands last.
+    /// Insert an UNFILED board — the shape every caller had before containers existed, kept so
+    /// forty-five call sites do not have to say "no folder" to mean what they already meant.
     pub fn insert_dashboard(
         &self,
         id: &str,
         title: &str,
         emoji: Option<&str>,
         tint: Option<&str>,
+        now: &str,
+    ) -> Result<()> {
+        self.insert_dashboard_in_folder(id, title, emoji, tint, None, now)
+    }
+
+    /// Insert a board, optionally FILED in a container.
+    pub fn insert_dashboard_in_folder(
+        &self,
+        id: &str,
+        title: &str,
+        emoji: Option<&str>,
+        tint: Option<&str>,
+        folder_id: Option<&str>,
         now: &str,
     ) -> Result<()> {
         let mut conn = self.lock();
@@ -206,9 +578,10 @@ impl Db {
             )
             .map_err(map_err)?;
         tx.execute(
-            "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?6)",
-            rusqlite::params![id, title, emoji, tint, next, now],
+            "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                     created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?7, ?6, ?6)",
+            rusqlite::params![id, title, emoji, tint, next, now, folder_id],
         )
         .map_err(map_err)?;
         advance_context_generation(&tx, id, true)?;

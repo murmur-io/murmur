@@ -606,3 +606,38 @@ fn a_note_tile_ships_updated_at_as_camel_case() {
         "the FE reads `updatedAt`: {json}"
     );
 }
+
+/// The board ROW own wire shape — `folderId` and `locked`, not `folder_id`.
+///
+/// The tile oracle above covers `TileData`; the `Dashboard` row is a separate type with its own
+/// attribute, and it is the one the sidebar reads to decide where a board is filed and whether to
+/// draw it locked. A snake_case `folder_id` would resolve to `undefined` in the FE, which reads as
+/// "unfiled" — a sealed board would then be rendered at the top level with a title the masking
+/// already blanked. The `locked` flag has the same failure mode in reverse. Asserted against the
+/// REAL serializer, because a hand-written fixture cannot disagree with the FE.
+#[test]
+fn a_dashboard_row_ships_folder_id_and_locked_as_camel_case() {
+    let row = crate::storage::models::Dashboard {
+        id: "d-1".into(),
+        title: "Q3".into(),
+        emoji: None,
+        tint: None,
+        pinned: false,
+        position: 0,
+        folder_id: Some("f-1".into()),
+        created_at: "2026-08-23T10:00:00Z".into(),
+        updated_at: "2026-08-23T10:00:00Z".into(),
+        locked: true,
+    };
+    let value = serde_json::to_value(&row).unwrap();
+    let object = value.as_object().expect("a board row serializes to an object");
+
+    assert_eq!(object.get("folderId").and_then(|v| v.as_str()), Some("f-1"));
+    assert_eq!(object.get("locked").and_then(|v| v.as_bool()), Some(true));
+    for key in object.keys() {
+        assert!(
+            !key.contains('_'),
+            "board row key `{key}` is snake_case on the wire while the FE reads camelCase"
+        );
+    }
+}

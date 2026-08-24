@@ -47,6 +47,13 @@ pub struct TaskDto {
     pub can_edit: bool,
     pub can_manage: bool,
     pub local_refs: Vec<TaskLocalRefDto>,
+    /// The LOCAL container this task is filed in, or `None` when it is unfiled.
+    ///
+    /// Local-only, and it stays that way: it is read from `org_tasks.container_id`, which is not a
+    /// field of [`TaskEnvelope`] and so is not part of the bytes that reach an org. The DTO is what
+    /// this device renders, not what it publishes — `#[serde(flatten)] envelope` is the published
+    /// half, and this field sits outside it.
+    pub container_id: Option<String>,
     pub updated_at: String,
 }
 
@@ -111,6 +118,7 @@ pub(crate) fn task_dto(state: &AppState, row: OrgTaskRow) -> Result<TaskDto, App
     let mut envelope = TaskEnvelope::from_json(&row.envelope_json, &row.org_id)?;
     envelope.org_refs = state.db.visible_task_org_refs(&row.id)?;
     let (can_edit, can_manage) = org_item_permissions(state, &row.item_id)?;
+    let row_id_for_container = row.id.clone();
     let local_refs = state
         .db
         .task_local_refs(&row.id)?
@@ -130,6 +138,9 @@ pub(crate) fn task_dto(state: &AppState, row: OrgTaskRow) -> Result<TaskDto, App
         can_edit,
         can_manage,
         local_refs,
+        container_id: state
+            .db
+            .task_container_visible(&row_id_for_container, &super::unlocked_snapshot(state)?)?,
         updated_at: row.updated_at,
     })
 }
@@ -163,6 +174,7 @@ mod tests {
             can_edit: true,
             can_manage: true,
             local_refs: Vec::new(),
+            container_id: None,
             updated_at: "2026-08-22T09:00:00Z".into(),
         };
 
@@ -171,6 +183,56 @@ mod tests {
             json.matches("\"orgId\":").count(),
             1,
             "TaskDto must expose the envelope organization without duplicate JSON keys"
+        );
+    }
+
+    /// The task's LOCAL placement reaches the FE, and reaches it as `containerId`.
+    ///
+    /// A placement the UI cannot read back is not a feature — the sidebar has to know which
+    /// container a task is filed in to draw it there, and a snake_case key would resolve to
+    /// `undefined` and read as "unfiled". Asserted against the real serializer, because the
+    /// hand-written e2e fixtures are typed against the FE's own interface and so cannot disagree
+    /// with it (`.claude/rules/angular-zoneless.md` T6).
+    #[test]
+    fn task_dto_ships_container_id_as_camel_case() {
+        let org_id = "11111111-1111-4111-8111-111111111111";
+        let dto = TaskDto {
+            id: format!("{org_id}:22222222-2222-4222-8222-222222222222"),
+            doc_id: "22222222-2222-4222-8222-222222222222".into(),
+            item_id: "33333333-3333-4333-8333-333333333333".into(),
+            source_document_id: None,
+            envelope: TaskEnvelope {
+                version: TASK_ENVELOPE_VERSION,
+                org_id: org_id.into(),
+                title: "Task".into(),
+                description: String::new(),
+                status: TaskStatus::Todo,
+                due_at: None,
+                assignee_user_id: None,
+                created_at: "2026-08-22T09:00:00Z".into(),
+                subtasks: Vec::new(),
+                org_refs: Vec::new(),
+                images: Vec::new(),
+            },
+            access: "edit".into(),
+            can_edit: true,
+            can_manage: true,
+            local_refs: Vec::new(),
+            container_id: Some("f-weekly".into()),
+            updated_at: "2026-08-22T09:00:00Z".into(),
+        };
+
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            value.get("containerId").and_then(|v| v.as_str()),
+            Some("f-weekly"),
+            "the task's container must reach the FE as camelCase `containerId`"
+        );
+        // And it must NOT have leaked into the envelope half, which is the part that egresses.
+        let envelope_json = serde_json::to_string(&dto.envelope).unwrap();
+        assert!(
+            !envelope_json.contains("f-weekly"),
+            "a task's local container must never appear in the envelope that reaches the org"
         );
     }
 }
@@ -481,4 +543,45 @@ pub(crate) async fn validate_task_assignee(
             "task assignee is not an active member of this organization".into(),
         ))
     }
+}
+
+/// File a task into a local container, or unfile it with `containerId: null`.
+///
+/// Placement is LOCAL and never egresses: it is stored in `org_tasks.container_id`, which is not a
+/// field of `TaskEnvelope` and is therefore not part of the bytes that reach an org. A user's
+/// private folder structure stays on the device.
+///
+/// The container must exist and must not be sealed. Both refusals matter for different reasons: an
+/// id that names nothing would file the task into a container the tree cannot show, and a sealed
+/// container cannot hold a task at all — `seal_folder_extras` unfiles the tasks it finds, because
+/// an org-owned task is not sealable by a folder key and must never sit inside a container the
+/// user has been told is locked.
+#[tauri::command]
+pub fn set_task_container(
+    state: State<'_, AppState>,
+    id: String,
+    container_id: Option<String>,
+) -> Result<(), AppError> {
+    let _lifecycle = super::lifecycle_guard(state.inner());
+    // Read authorization first: the caller must be allowed to see this task at all before being
+    // allowed to move it. `load_task_row_for_read` is the same gate `get_task` uses.
+    let Some(_row) = load_task_row_for_read(state.inner(), &id)? else {
+        return Err(AppError::InvalidArg(format!("no such task: {id}")));
+    };
+    if let Some(container) = container_id.as_deref() {
+        if state.db.folder_by_id(container)?.is_none() {
+            return Err(AppError::InvalidArg(format!(
+                "no such container: {container}"
+            )));
+        }
+        if !crate::commands::folder_is_unlocked(state.inner(), container)? {
+            return Err(AppError::Locked(
+                "unlock this container before filing a task into it".into(),
+            ));
+        }
+    }
+    if !state.db.set_task_container(&id, container_id.as_deref())? {
+        return Err(AppError::InvalidArg(format!("no such task: {id}")));
+    }
+    Ok(())
 }
