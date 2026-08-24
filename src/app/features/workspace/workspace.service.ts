@@ -80,10 +80,11 @@ export class WorkspaceService {
   /**
    * Create a note inside a container and return its id.
    *
-   * Only NOTES and FOLDERS can be created into a container today. Dashboards have
-   * no container anchor yet and tasks are org-scoped, so offering either here would
-   * create something that does not land where the user asked — worse than not
-   * offering it. They arrive with their backend halves.
+   * Notes, folders and dashboards can be created into a container. Tasks cannot, and that is
+   * not an oversight: a task belongs to an ORGANIZATION, so creating one needs an org and an
+   * assignee that a container cannot supply. A task reaches a container by being FILED into one
+   * afterwards ({@link fileTask}), which is the same shape a meeting uses and for the same
+   * reason — the thing exists first, the placement is a second, separate decision.
    */
   async createNote(containerId: string, title: string): Promise<string> {
     const id = await this.ipc.createNote(containerId, title);
@@ -97,6 +98,19 @@ export class WorkspaceService {
     await this.reload();
   }
 
+  /** Create a dashboard inside a container and return its id. */
+  async createDashboard(containerId: string, title: string): Promise<string> {
+    const board = await this.ipc.createDashboardIn(title, containerId);
+    await this.reload();
+    return board.id;
+  }
+
+  /** File an existing task into a container (or unfile it with `null`). */
+  async fileTask(taskId: string, containerId: string | null): Promise<void> {
+    await this.ipc.setTaskContainer(taskId, containerId);
+    await this.reload();
+  }
+
   /**
    * Move an item into a container.
    *
@@ -107,10 +121,18 @@ export class WorkspaceService {
    * that is sealed and not unlocked is refused.
    */
   async moveItem(kind: DraggableKind, id: string, containerId: string): Promise<void> {
-    if (kind === "meeting") {
-      await this.ipc.moveNote(id, containerId);
-    } else {
-      await this.ipc.moveNoteDoc(id, containerId);
+    switch (kind) {
+      case "meeting":
+        await this.ipc.moveNote(id, containerId);
+        break;
+      case "dashboard":
+        await this.ipc.moveDashboardToContainer(id, containerId);
+        break;
+      case "task":
+        await this.ipc.setTaskContainer(id, containerId);
+        break;
+      default:
+        await this.ipc.moveNoteDoc(id, containerId);
     }
     await this.reload();
   }
