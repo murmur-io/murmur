@@ -2905,6 +2905,1469 @@
         db.set_meeting_folder(mid, folder_id).unwrap();
     }
 
+    /// One `org_tasks` row, minimal but real: the workspace leg reads its title out of
+    /// `envelope_json` with `json_extract`, so the envelope has to be genuine JSON with a
+    /// `title` — a stub string would make the leg return NULL and the test vacuous.
+    fn insert_fixture_task(db: &Db, id: &str, title: &str) {
+        insert_fixture_task_for_org(db, id, title, "org-1", true)
+    }
+
+    /// The same fixture with the org membership spelled out, so a test can withdraw it.
+    ///
+    /// `context_enabled` is the per-device org read toggle the tree leg joins on. A task is org
+    /// content: filing it into a local folder cannot be allowed to outlive membership in the org
+    /// that owns it, and this parameter is how that gets tested rather than assumed.
+    fn insert_fixture_task_for_org(
+        db: &Db,
+        id: &str,
+        title: &str,
+        org_id: &str,
+        context_enabled: bool,
+    ) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.into(),
+            name: "Acme".into(),
+            role: "member".into(),
+            joined_at: "2026-08-23T09:00:00Z".into(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled,
+        })
+        .unwrap();
+        insert_fixture_task_row_with_head(db, id, title, org_id, true, false)
+    }
+
+    /// The `org_tasks` row plus its LIVE item head — but no membership. Used to prove the
+    /// membership join gates independently of the tombstone join.
+    fn insert_fixture_task_row(db: &Db, id: &str, title: &str, org_id: &str) {
+        insert_fixture_task_row_with_head(db, id, title, org_id, true, false)
+    }
+
+    /// The same, with the item head's liveness spelled out so a test can tombstone or supersede it.
+    fn insert_fixture_task_row_with_head(
+        db: &Db,
+        id: &str,
+        title: &str,
+        org_id: &str,
+        is_current: bool,
+        tombstoned: bool,
+    ) {
+        db.lock()
+            .execute(
+                "INSERT INTO org_items
+                   (item_id, org_id, seq, author_hint, title, markdown, created_at, rev,
+                    generation, content_sha256, is_current, tombstoned)
+                 VALUES (?1, ?2, 0, '', ?3, '', '2026-08-23T09:00:00Z', 1, 1, NULL, ?4, ?5)",
+                rusqlite::params![id, org_id, title, is_current as i64, tombstoned as i64],
+            )
+            .unwrap();
+        insert_fixture_task_only(db, id, title, org_id)
+    }
+
+    /// The bare `org_tasks` row, with no item head at all.
+    fn insert_fixture_task_only(db: &Db, id: &str, title: &str, org_id: &str) {
+        let envelope = serde_json::json!({
+            "version": 1,
+            "orgId": org_id,
+            "title": title,
+            "description": "",
+            "status": "todo",
+            "dueAt": null,
+            "assigneeUserId": null,
+            "createdAt": "2026-08-23T10:00:00Z",
+            "subtasks": [],
+            "orgRefs": [],
+            "images": [],
+        })
+        .to_string();
+        db.lock()
+            .execute(
+                "INSERT INTO org_tasks
+                   (id, org_id, doc_id, item_id, source_document_id, envelope_json, status,
+                    due_at, assignee_user_id, access, author_user_id, owner_user_id, rev,
+                    generation, seq, updated_at, container_id)
+                 VALUES (?1, ?3, ?1, ?1, NULL, ?2, 'todo', NULL, NULL, 'edit', NULL, NULL,
+                         1, 1, 0, '2026-08-23T10:00:00Z', NULL)",
+                rusqlite::params![id, envelope, org_id],
+            )
+            .unwrap();
+    }
+
+    /// A board in a sealed folder discloses nothing, and comes back byte-identical.
+    ///
+    /// A board is content twice over: its title names the thing — "Q3 layoffs" is a disclosure on
+    /// its own — and its tiles record which meeting or note it is built from, which is exactly
+    /// what a locked folder exists to stop revealing. Before boards could be filed at all, the
+    /// list reader returned every title unconditionally and was right to; the moment a board can
+    /// live in a container, that same reader is a leak.
+    ///
+    /// Round-trip, not just masking: a seal that cannot be undone is content loss.
+    #[test]
+    fn a_dashboard_in_a_sealed_folder_is_masked_and_restored_byte_identical() {
+        let vault = tmp_vault("dashboard-seal");
+        let state = build_state_with_vault("dashboard-seal", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-1', 'Q3 layoffs', '📊', 'indigo', 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-1', 'd-1', 'meeting', 'm-1', 'Standup', 1, 0, '{\"q\":\"headcount\"}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        let before_title: String = state
+            .db
+            .lock()
+            .query_row("SELECT title FROM dashboards WHERE id = 'd-1'", [], |r| r.get(0))
+            .unwrap();
+        let before_config: String = state
+            .db
+            .lock()
+            .query_row("SELECT config FROM dashboard_tiles WHERE id = 't-1'", [], |r| r.get(0))
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        // The plaintext is gone from the row, and the gated reader shows a locked board rather
+        // than omitting it — a user who sealed a folder should see that the board is still there.
+        let sealed_title: String = state
+            .db
+            .lock()
+            .query_row("SELECT title FROM dashboards WHERE id = 'd-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sealed_title, "", "the board's title survived the seal in plaintext");
+        // The tile's own TITLE and REF are content too: the title is a copy of the source
+        // meeting's title, and `ref_id` names which meeting the board is built from. Sealing
+        // only `config` left a lock with a hole exactly where someone would look.
+        let (sealed_tile_title, sealed_ref, sealed_config): (String, String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT title, ref_id, config FROM dashboard_tiles WHERE id = 't-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sealed_config, "", "a tile's config survived the seal in plaintext");
+        assert_eq!(sealed_tile_title, "", "a tile's title survived the seal in plaintext");
+        assert_eq!(sealed_ref, "", "a tile's source id survived the seal in plaintext");
+
+        let unlocked = std::collections::HashSet::new();
+        let listed = state.db.list_dashboards_visible(&unlocked).unwrap();
+        let board = listed.iter().find(|b| b.id == "d-1").expect("board still listed");
+        assert!(board.locked, "a sealed board must report itself locked");
+        assert_ne!(board.title, before_title, "a sealed board disclosed its title");
+        assert!(board.emoji.is_none(), "a sealed board disclosed its emoji");
+
+        // And it comes back exactly as it went in. Mirrors `unlock_folder`'s internals, the
+        // idiom every seal round-trip test in this file uses: KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec =
+            crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+        let after_title: String = state
+            .db
+            .lock()
+            .query_row("SELECT title FROM dashboards WHERE id = 'd-1'", [], |r| r.get(0))
+            .unwrap();
+        let (after_tile_title, after_ref, after_config): (String, String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT title, ref_id, config FROM dashboard_tiles WHERE id = 't-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after_title, before_title, "the board's title did not survive the seal");
+        assert_eq!(after_config, before_config, "a tile's config did not survive the seal");
+        assert_eq!(after_tile_title, "Standup", "a tile's title did not survive the seal");
+        assert_eq!(after_ref, "m-1", "a tile's source id did not survive the seal");
+    }
+
+    /// Sealing a folder that is ALREADY sealed must not overwrite the ciphertext it finds.
+    ///
+    /// This is the relock shape, and it is the one that loses content silently.
+    /// `reblank_folder_extras_after_verification` re-runs the seal over a folder whose rows are
+    /// already blank-plus-blob; a seal that does not skip those rows encrypts three empty strings
+    /// and writes the result over the good blob. Nothing errors, nothing looks wrong — the board
+    /// is already displaying as locked — and the content is gone at the next unlock, with no
+    /// second copy anywhere. RED before the `config_blob IS NULL` filter in
+    /// `Db::dashboard_tile_payloads`, GREEN after.
+    #[test]
+    fn resealing_an_already_sealed_folder_does_not_destroy_its_boards() {
+        let vault = tmp_vault("dashboard-reseal");
+        let state = build_state_with_vault("dashboard-reseal", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-4', 'Q3 layoffs', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-4', 'd-4', 'meeting', 'm-4', 'Standup', 1, 0, '{\"q\":\"heads\"}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+
+        // The relock: seal again over rows that are already sealed.
+        seal_dashboards_in_folder(&state.db, "f-secret", &ck).unwrap();
+
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+        let (title, tile_title, ref_id, config): (String, String, String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT d.title, t.title, t.ref_id, t.config
+                   FROM dashboards d JOIN dashboard_tiles t ON t.dashboard_id = d.id
+                  WHERE d.id = 'd-4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Q3 layoffs", "a relock destroyed the board's title");
+        assert_eq!(tile_title, "Standup", "a relock destroyed a tile's title");
+        assert_eq!(ref_id, "m-4", "a relock destroyed a tile's source id");
+        assert_eq!(config, "{\"q\":\"heads\"}", "a relock destroyed a tile's config");
+    }
+
+    /// A board whose title was never sealed still gets its TILES back.
+    ///
+    /// A board titled "" is not title-sealed — there is nothing to encrypt — and the unseal used
+    /// to skip such a board entirely, which left every sealed tile under it blanked forever.
+    /// Invisible from the board's own row: its title column looks exactly as it should.
+    #[test]
+    fn a_board_with_no_sealed_title_still_restores_its_tiles() {
+        let vault = tmp_vault("dashboard-untitled");
+        let state = build_state_with_vault("dashboard-untitled", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-2', '', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-2', 'd-2', 'meeting', 'm-9', 'Retro', 1, 0, '{}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+
+        let (title, ref_id): (String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT title, ref_id FROM dashboard_tiles WHERE id = 't-2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Retro", "a tile under an untitled board was never restored");
+        assert_eq!(ref_id, "m-9", "a tile's source id was never restored");
+    }
+
+    /// An unseal that cannot decrypt keeps the ciphertext. Verify BEFORE destroy, unseal side.
+    ///
+    /// The seal's own read-back check cannot be made to fail from a test — it decrypts what it
+    /// just encrypted under the same key and AAD — so the ordering is pinned where it IS
+    /// reachable: the unseal drops `title_blob`/`config_blob` only after every decrypt has
+    /// succeeded. Driven by moving a sealed board to a different folder, so the `aad_document`
+    /// binding no longer matches: the shape a mis-bound or corrupted blob has. Non-vacuous by
+    /// construction — the test asserts the failure actually happened before asserting survival.
+    #[test]
+    fn an_unseal_that_cannot_decrypt_does_not_drop_the_ciphertext() {
+        let vault = tmp_vault("dashboard-aad");
+        let state = build_state_with_vault("dashboard-aad", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        make_open_folder(&state.db, "f-other", "Other");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-5', 'Keep me', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let sealed_blob: Vec<u8> = state
+            .db
+            .lock()
+            .query_row("SELECT title_blob FROM dashboards WHERE id = 'd-5'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!sealed_blob.is_empty(), "the fixture must actually be sealed");
+
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+
+        // Re-file the sealed board, so its blob's AAD names a folder it no longer lives in.
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE dashboards SET folder_id = 'f-other' WHERE id = 'd-5'",
+                [],
+            )
+            .unwrap();
+
+        let err = unseal_dashboards_in_folder(&state.db, "f-other", &ck)
+            .expect_err("the mis-bound blob must fail to decrypt, or this oracle proves nothing");
+        // `AppError::Locked` is what a failed AES-GCM open is, and the variant matters: the FE
+        // must show a locked board, not a storage fault the user is invited to retry into.
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        let after_blob: Vec<u8> = state
+            .db
+            .lock()
+            .query_row("SELECT title_blob FROM dashboards WHERE id = 'd-5'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_blob, sealed_blob,
+            "a failed unseal dropped the only copy of the board's title"
+        );
+    }
+
+    /// EVERY changed read sink refuses a sealed board — the list, the detail, and the tree.
+    ///
+    /// Three sinks changed in this diff and each is gated separately, so each needs its own
+    /// negative: masking the list while `get_dashboard` still returns the row is not a lock, it
+    /// is a lock with one door open. The tree leg matters most of the three because it is the
+    /// one a sidebar walks without ever naming a board id.
+    #[test]
+    fn every_dashboard_read_sink_withholds_a_sealed_board() {
+        let vault = tmp_vault("dashboard-sinks");
+        let state = build_state_with_vault("dashboard-sinks", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-6', 'Q3 layoffs', '📊', 'indigo', 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-6', 'd-6', 'meeting', 'm-6', 'Standup', 1, 0, '{}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        // Unfiled control: a board outside any container stays fully readable, so a green run
+        // cannot come from a reader that withholds everything.
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-open', 'Roadmap', NULL, NULL, 0, 0, NULL, ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let nothing_unlocked = std::collections::HashSet::new();
+
+        // SINK 1 — the list.
+        let listed = state.db.list_dashboards_visible(&nothing_unlocked).unwrap();
+        let sealed = listed.iter().find(|b| b.id == "d-6").expect("still listed");
+        assert!(sealed.locked, "the list did not mark a sealed board locked");
+        assert_ne!(sealed.title, "Q3 layoffs", "the list disclosed a sealed title");
+        let open = listed.iter().find(|b| b.id == "d-open").expect("control listed");
+        assert_eq!(open.title, "Roadmap", "the control board was masked too");
+        assert!(!open.locked, "the control board was marked locked");
+
+        // SINK 2 — the detail read.
+        let detail = state
+            .db
+            .get_dashboard_visible("d-6", &nothing_unlocked)
+            .unwrap()
+            .expect("the row still exists");
+        assert!(detail.locked, "the detail read did not mark a sealed board locked");
+        assert_ne!(detail.title, "Q3 layoffs", "the detail read disclosed a sealed title");
+        assert!(detail.emoji.is_none(), "the detail read disclosed a sealed emoji");
+        let open_detail = state
+            .db
+            .get_dashboard_visible("d-open", &nothing_unlocked)
+            .unwrap()
+            .expect("the control row exists");
+        assert_eq!(open_detail.title, "Roadmap", "the control board was masked too");
+
+        // SINK 3 — the workspace tree leg.
+        let (rows, total) = state
+            .db
+            .container_items_page(
+                Some("f-secret"),
+                crate::storage::models::ItemKind::Dashboard,
+                0,
+                50,
+                &nothing_unlocked,
+            )
+            .unwrap();
+        assert!(
+            !rows.iter().any(|row| row.id == "d-6"),
+            "the tree listed a board from a sealed container"
+        );
+        assert_eq!(total, 0, "the tree disclosed the COUNT of a sealed container's boards");
+
+        // The Inbox leg still returns the unfiled control, so the assertion above cannot be
+        // passing on a leg that returns nothing for anyone.
+        let (inbox, _) = state
+            .db
+            .container_items_page(
+                None,
+                crate::storage::models::ItemKind::Dashboard,
+                0,
+                50,
+                &nothing_unlocked,
+            )
+            .unwrap();
+        assert!(
+            inbox.iter().any(|row| row.id == "d-open"),
+            "the Inbox leg withheld an unfiled board"
+        );
+
+        // And the sealed container's board DOES come back once the session unlocks it.
+        let unlocked: std::collections::HashSet<String> =
+            std::iter::once("f-secret".to_string()).collect();
+        let (rows, total) = state
+            .db
+            .container_items_page(
+                Some("f-secret"),
+                crate::storage::models::ItemKind::Dashboard,
+                0,
+                50,
+                &unlocked,
+            )
+            .unwrap();
+        assert!(
+            rows.iter().any(|row| row.id == "d-6"),
+            "the tree withheld a board from a session-unlocked container"
+        );
+        assert_eq!(total, 1, "the unlocked total is wrong");
+    }
+
+    /// The COMMAND-layer summary withholds a sealed board's tile count and kinds.
+    ///
+    /// This is the branch the previous round of tests missed, and the miss was instructive: they
+    /// asserted on `Db::list_dashboards_visible`, which masks the ROW. The tile count and kinds are
+    /// assembled one layer up, in `commands::list_dashboards`, from a SEPARATE ungated
+    /// `dashboard_tile_kinds()` read — so every assertion passed while "this locked board is built
+    /// from three meetings" still shipped. A test aimed at the wrong layer is not weaker evidence,
+    /// it is evidence for a different claim.
+    ///
+    /// RED contract: delete the `if d.locked` branch in `commands::list_dashboards` and the
+    /// tile_count assertion fails while every Db-layer test stays green.
+    #[test]
+    fn the_dashboard_summary_command_withholds_a_sealed_boards_tile_shape() {
+        let vault = tmp_vault("dashboard-summary-cmd");
+        let state = build_state_with_vault("dashboard-summary-cmd", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        make_open_folder(&state.db, "f-open", "Open");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        for (board, folder) in [("d-sealed", "f-secret"), ("d-open", "f-open")] {
+            state
+                .db
+                .lock()
+                .execute(
+                    "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                             created_at, updated_at)
+                     VALUES (?1, 'Q3 layoffs', NULL, NULL, 0, 0, ?2, ?3, ?3)",
+                    rusqlite::params![board, folder, now],
+                )
+                .unwrap();
+            for n in 0..3 {
+                state
+                    .db
+                    .lock()
+                    .execute(
+                        "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                                      position, config, created_at)
+                         VALUES (?1, ?2, 'meeting', 'm-1', 'Standup', 1, ?3, '{}', ?4)",
+                        rusqlite::params![format!("{board}-t{n}"), board, n, now],
+                    )
+                    .unwrap();
+            }
+        }
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        let summaries = crate::commands::dashboards::list_dashboards_inner(&state).unwrap();
+        let sealed = summaries
+            .iter()
+            .find(|s| s.dashboard.id == "d-sealed")
+            .expect("a sealed board is still listed");
+        assert!(sealed.dashboard.locked, "the sealed board must report itself locked");
+        assert_eq!(
+            sealed.tile_count, 0,
+            "the summary disclosed how many tiles a sealed board has"
+        );
+        assert!(
+            sealed.tile_kinds.is_empty(),
+            "the summary disclosed what a sealed board is built from"
+        );
+
+        // The CONTROL: an open board still reports its shape, so the assertions above cannot be
+        // passing on a reader that blanks everything.
+        let open = summaries
+            .iter()
+            .find(|s| s.dashboard.id == "d-open")
+            .expect("the open board is listed");
+        assert_eq!(open.tile_count, 3, "an open board must report its tiles");
+        assert_eq!(open.tile_kinds.len(), 3, "an open board must report its tile kinds");
+    }
+
+    /// The COMMAND-layer detail read returns a masked board with NO tiles and NO work.
+    ///
+    /// Same lesson as the summary: `get_dashboard_visible` masks the row, but the tile ROWS still
+    /// exist, so resolving them shipped the count and each tile's span and position. Shape is one
+    /// of the easier things to recognise a board by.
+    #[test]
+    fn the_dashboard_detail_command_returns_no_tiles_for_a_sealed_board() {
+        let vault = tmp_vault("dashboard-detail-cmd");
+        let state = build_state_with_vault("dashboard-detail-cmd", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-1', 'Q3 layoffs', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-1', 'd-1', 'meeting', 'm-1', 'Standup', 2, 5, '{}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        let detail = crate::commands::dashboards::get_dashboard_inner(&state, "d-1")
+            .unwrap()
+            .expect("the row still exists");
+        assert!(detail.dashboard.locked, "the detail read must mark it locked");
+        assert_ne!(detail.dashboard.title, "Q3 layoffs", "the title leaked");
+        assert!(detail.tiles.is_empty(), "a sealed board disclosed its tile shape");
+        assert!(detail.work.is_empty(), "a sealed board disclosed its task references");
+
+        // The positive CONTROL, which this test was missing: a reader that returned empty tiles
+        // for every board would have passed every assertion above. Its sibling summary test
+        // carries one and this one did not — an omission worth naming, because a negative without
+        // a control is the shape that lets a broken reader look like a working gate.
+        make_open_folder(&state.db, "f-open", "Open");
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-open', 'Roadmap', NULL, NULL, 0, 0, 'f-open', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-open', 'd-open', 'meeting', 'm-1', 'Standup', 1, 0, '{}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        let open = crate::commands::dashboards::get_dashboard_inner(&state, "d-open")
+            .unwrap()
+            .expect("the open board exists");
+        assert!(!open.dashboard.locked, "the control board must not read as locked");
+        assert_eq!(open.dashboard.title, "Roadmap", "the control board was masked");
+        assert_eq!(open.tiles.len(), 1, "the control board must return its tile");
+    }
+
+    /// Deleting a container demotes its BOARDS, and refuses while any still holds ciphertext.
+    ///
+    /// The demotion is what stops a board becoming a row the user can open but cannot find —
+    /// invisible in the tree because its `LEFT JOIN folders` yields nothing, yet still in the flat
+    /// list, and outside any future lock. The refusal is the other half: a board whose blobs
+    /// survive is one whose content key is about to be discarded with the folder.
+    #[test]
+    fn deleting_a_container_demotes_its_boards_and_refuses_sealed_ones() {
+        let vault = tmp_vault("dashboard-delete");
+        let state = build_state_with_vault("dashboard-delete", &vault);
+        make_open_folder(&state.db, "f-gone", "Gone");
+        make_open_folder(&state.db, "f-sealed", "Sealed");
+        std::fs::create_dir_all(vault.join("Sealed")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        for (board, folder) in [("d-plain", "f-gone"), ("d-sealed", "f-sealed")] {
+            state
+                .db
+                .lock()
+                .execute(
+                    "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                             created_at, updated_at)
+                     VALUES (?1, 'Board', NULL, NULL, 0, 0, ?2, ?3, ?3)",
+                    rusqlite::params![board, folder, now],
+                )
+                .unwrap();
+        }
+
+        // The open container's board is demoted, not stranded.
+        state.db.delete_folder("f-gone").unwrap();
+        assert_eq!(
+            state.db.get_dashboard("d-plain").unwrap().unwrap().folder_id,
+            None,
+            "a board was left pointing at a deleted container"
+        );
+
+        // The sealed container's board still holds ciphertext, so the delete is refused rather
+        // than stranding a board whose key is about to go away with the folder.
+        lock_folder_inner(&state, "f-sealed".into()).unwrap();
+        let err = state
+            .db
+            .delete_folder("f-sealed")
+            .expect_err("deleting a container with sealed boards must be refused");
+        assert!(matches!(err, AppError::Storage(_)), "got {err:?}");
+        assert_eq!(
+            state.db.get_dashboard("d-sealed").unwrap().unwrap().folder_id,
+            Some("f-sealed".to_string()),
+            "the refused delete still moved the board"
+        );
+    }
+
+    /// EVERY write against a board in a sealed container is refused.
+    ///
+    /// This is a whole category that had no gate, and the reason is worth keeping: before boards
+    /// could be filed, a dashboard could not be inside a locked folder, so no mutation NEEDED one
+    /// and none had one. Giving boards a container turned each of those writes into a way to put
+    /// plaintext into a sealed tree — a renamed board, a new tile, a reordered layout — after the
+    /// seal has already run and with nothing left to encrypt it. The next unseal then overwrites
+    /// the write from the stored blob, so the user loses the edit too.
+    ///
+    /// Enumerated rather than sampled on purpose: a gate applied to four of six mutations is not a
+    /// gate, and "the ones I remembered" is exactly how the category came to be missed.
+    ///
+    /// RED contract: drop any single `require_board_writable` / `require_tile_writable` call and
+    /// its line here fails.
+    #[test]
+    fn every_write_against_a_sealed_boards_container_is_refused() {
+        let vault = tmp_vault("dashboard-writes");
+        let state = build_state_with_vault("dashboard-writes", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-1', 'Q3 layoffs', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-1', 'd-1', 'meeting', 'm-1', 'Standup', 1, 0, '{}', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        // Board-level writes.
+        assert!(
+            matches!(
+                crate::commands::dashboards::update_dashboard_inner(
+                    &state, "d-1", Some("renamed"), None, None, None
+                ),
+                Err(AppError::Locked(_))
+            ),
+            "renaming a sealed board was allowed"
+        );
+        assert!(
+            matches!(
+                crate::commands::dashboards::delete_dashboard_inner(&state, "d-1"),
+                Err(AppError::Locked(_))
+            ),
+            "deleting a sealed board was allowed"
+        );
+        assert!(
+            matches!(
+                crate::commands::dashboards::reorder_dashboards_inner(&state, &["d-1".into()]),
+                Err(AppError::Locked(_))
+            ),
+            "reordering a sealed board was allowed"
+        );
+
+        // Tile-level writes.
+        assert!(
+            matches!(
+                crate::commands::dashboards::add_dashboard_tile_inner(
+                    &state,
+                    "d-1".into(),
+                    "meeting".into(),
+                    Some("m-9".into()),
+                    None,
+                    None,
+                    None,
+                ),
+                Err(AppError::Locked(_))
+            ),
+            "adding a tile to a sealed board was allowed"
+        );
+        assert!(
+            matches!(
+                crate::commands::dashboards::update_dashboard_tile_inner(
+                    &state,
+                    "t-1".into(),
+                    Some("new".into()),
+                    None,
+                    None,
+                ),
+                Err(AppError::Locked(_))
+            ),
+            "editing a sealed board's tile was allowed"
+        );
+        assert!(
+            matches!(
+                crate::commands::dashboards::delete_dashboard_tile_inner(&state, "t-1".into()),
+                Err(AppError::Locked(_))
+            ),
+            "deleting a sealed board's tile was allowed"
+        );
+        assert!(
+            matches!(
+                crate::commands::dashboards::reorder_dashboard_tiles_inner(
+                    &state,
+                    "d-1".into(),
+                    vec!["t-1".to_string()],
+                ),
+                Err(AppError::Locked(_))
+            ),
+            "reordering a sealed board's tiles was allowed"
+        );
+
+        // Nothing was written: the row still holds exactly what the seal left.
+        let (title, tile_title): (String, String) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT d.title, t.title FROM dashboards d
+                   JOIN dashboard_tiles t ON t.dashboard_id = d.id WHERE d.id = 'd-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "", "a refused write still touched the board");
+        assert_eq!(tile_title, "", "a refused write still touched the tile");
+
+        // The CONTROL: the same writes succeed on an UNFILED board, so these refusals are the
+        // container gate and not a reader that refuses everything.
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-free', 'Roadmap', NULL, NULL, 0, 0, NULL, ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        crate::commands::dashboards::update_dashboard_inner(
+            &state, "d-free", Some("Renamed"), None, None, None,
+        )
+        .expect("an unfiled board must still be editable");
+    }
+
+    /// A RELOCK unfiles tasks too, not just the initial seal.
+    ///
+    /// `seal_folder_extras` unfiles on the first lock, but that is not the only way in. A folder
+    /// that is durably locked and SESSION-unlocked passes `folder_is_unlocked`, so
+    /// `set_task_container` accepts it and the user can file a task into it. The relock then runs
+    /// `reblank_folder_extras_after_verification`, which knew nothing about tasks — leaving the
+    /// task inside a container reported as locked, which is the state unfiling exists to prevent.
+    ///
+    /// RED contract: remove `unfile_tasks_in_container` from the re-blank and the task is still
+    /// filed after the relock.
+    #[test]
+    fn a_relock_unfiles_a_task_filed_while_the_container_was_session_unlocked() {
+        let vault = tmp_vault("task-relock");
+        let state = build_state_with_vault("task-relock", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+        insert_fixture_task(&state.db, "task-1", "Ship the thing");
+
+        // Durably lock, then SESSION-unlock: the state in which the folder accepts new content.
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-secret".to_string());
+
+        state.db.set_task_container("task-1", Some("f-secret")).unwrap();
+        assert_eq!(
+            state.db.task_container("task-1").unwrap(),
+            Some("f-secret".to_string()),
+            "the fixture must start with the task filed"
+        );
+
+        reblank_folder_extras_after_verification(&state, "f-secret", Some(&ck)).unwrap();
+
+        assert_eq!(
+            state.db.task_container("task-1").unwrap(),
+            None,
+            "a relock left a task inside a container it reports as locked"
+        );
+    }
+
+    /// The keyless-relock predicate covers EVERYTHING the seal covers.
+    ///
+    /// These two are a pair: the seal decides what to encrypt, and
+    /// `Db::folder_has_plaintext_dashboards` decides whether a keyless relock may proceed without
+    /// encrypting anything. They must agree, and they stopped agreeing the moment the seal was
+    /// widened to cover `emoji`/`tint` and the predicate was not — one side of a paired invariant
+    /// moved on its own.
+    ///
+    /// The board below is the exact shape that fell through: EMPTY title, an emoji and a tint, no
+    /// tiles. The old predicate answered "nothing here is plaintext", so a keyless relock
+    /// succeeded and left both cosmetics readable in a folder it had just reported as locked.
+    ///
+    /// RED contract: drop `emoji IS NOT NULL OR tint IS NOT NULL` from the predicate and the
+    /// refusal below does not happen.
+    #[test]
+    fn the_keyless_relock_predicate_covers_every_column_the_seal_takes() {
+        let vault = tmp_vault("dashboard-cosmetics");
+        let state = build_state_with_vault("dashboard-cosmetics", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-cos', '', '📊', 'indigo', 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        // The predicate must see this board as still holding plaintext.
+        assert!(
+            state.db.folder_has_plaintext_dashboards("f-secret").unwrap(),
+            "a board with only cosmetics read as having nothing to seal"
+        );
+
+        // And the keyless relock must therefore refuse rather than report the folder locked.
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = reblank_folder_extras_after_verification(&state, "f-secret", None)
+            .expect_err("a keyless relock must refuse while cosmetics are readable");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        // And the seal ROUND-TRIPS them, so refusing is not hiding a loss.
+        seal_dashboards_in_folder(&state.db, "f-secret", &ck).unwrap();
+        let (title, emoji, tint): (String, Option<String>, Option<String>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT title, emoji, tint FROM dashboards WHERE id = 'd-cos'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "", "the title column must be blank at rest");
+        assert_eq!(emoji, None, "the emoji stayed readable at rest");
+        assert_eq!(tint, None, "the tint stayed readable at rest");
+
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+        let (emoji, tint): (Option<String>, Option<String>) = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT emoji, tint FROM dashboards WHERE id = 'd-cos'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(emoji.as_deref(), Some("📊"), "the emoji did not survive the seal");
+        assert_eq!(tint.as_deref(), Some("indigo"), "the tint did not survive the seal");
+    }
+
+    /// The board-SOURCES read withholds a sealed board's source list.
+    ///
+    /// SCOPE, stated because running the RED check showed this test does NOT capture the gate it
+    /// was written for: it passes with AND without the early return in
+    /// `get_dashboard_sources_inner`, and that was verified rather than assumed.
+    ///
+    /// The reason is that the seal blanks `ref_id` on every tile at rest, so the resolver already
+    /// returns nothing for a sealed board and the gate is defence-in-depth over an
+    /// already-blanked row. That is worth having — it does not depend on the seal having run, and
+    /// the row-masking gate beside it rests on the same argument — but it is not something this
+    /// test can prove, and a green test whose comment claims otherwise is worse than no test.
+    ///
+    /// What it DOES pin: the command returns an empty list for a sealed board and a non-empty one
+    /// for an open board, so a future change that made the sources path return content for a
+    /// sealed board — by reading tiles some other way, or before the seal — would fail here.
+    #[test]
+    fn the_dashboard_sources_command_withholds_a_sealed_boards_sources() {
+        let vault = tmp_vault("dashboard-sources");
+        let state = build_state_with_vault("dashboard-sources", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        make_open_folder(&state.db, "f-open", "Open");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        seed_meeting(&state.db, "m-src", "Body", Some("f-open"));
+        for (board, folder) in [("d-sealed", "f-secret"), ("d-open", "f-open")] {
+            state
+                .db
+                .lock()
+                .execute(
+                    "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                             created_at, updated_at)
+                     VALUES (?1, 'Board', NULL, NULL, 0, 0, ?2, ?3, ?3)",
+                    rusqlite::params![board, folder, now],
+                )
+                .unwrap();
+            state
+                .db
+                .lock()
+                .execute(
+                    "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                                  position, config, created_at)
+                     VALUES (?1, ?2, 'meeting', 'm-src', 'Standup', 1, 0, '{}', ?3)",
+                    rusqlite::params![format!("{board}-t"), board, now],
+                )
+                .unwrap();
+        }
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        let sealed =
+            crate::commands::dashboards::get_dashboard_sources_inner(&state, "d-sealed").unwrap();
+        assert!(
+            sealed.is_empty(),
+            "a sealed board disclosed its source list: {sealed:?}"
+        );
+
+        // The CONTROL: an open board still returns its sources, so a green run cannot come from a
+        // command that withholds everything.
+        let open =
+            crate::commands::dashboards::get_dashboard_sources_inner(&state, "d-open").unwrap();
+        assert!(
+            !open.is_empty(),
+            "the control board must return its sources"
+        );
+    }
+
+    /// A relock with no resolvable content key REFUSES rather than leaving boards readable.
+    ///
+    /// Every other kind the at-rest re-blank handles can be blanked without a key, because its
+    /// ciphertext is still in the row. A board's is not: `Db::unseal_dashboard` clears
+    /// `title_blob` on unlock, so an unlocked board must be re-encrypted to be blanked at all.
+    /// Skipping quietly — which is what `if let Some(ck)` did — reported the folder locked while
+    /// its boards stayed in plaintext. The refusal keeps the relock retryable.
+    #[test]
+    fn a_relock_without_a_key_refuses_instead_of_leaving_boards_readable() {
+        let vault = tmp_vault("dashboard-nokey");
+        let state = build_state_with_vault("dashboard-nokey", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-7', 'Q3 layoffs', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        // The folder is durably locked and session-unlocked: plaintext is present, and the
+        // re-blank is the thing that must take it away again.
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+        let plaintext: String = state
+            .db
+            .lock()
+            .query_row("SELECT title FROM dashboards WHERE id = 'd-7'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(plaintext, "Q3 layoffs", "the fixture must start from plaintext");
+
+        // No verified key, and no cached KEK to derive one from — the shape the guard is for.
+        *state.master_kek.lock().unwrap() = None;
+        let err = reblank_folder_extras_after_verification(&state, "f-secret", None)
+            .expect_err("a keyless relock must refuse while boards hold plaintext");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+
+        let after: String = state
+            .db
+            .lock()
+            .query_row("SELECT title FROM dashboards WHERE id = 'd-7'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, "Q3 layoffs", "the refusal must not have destroyed anything");
+    }
+
+    /// A tile column that was NULL comes back NULL, not "".
+    ///
+    /// The payload used to coalesce every column to a string, so the unseal wrote "" over what
+    /// had been NULL. Nothing visible changes — and every `IS NULL` predicate downstream now
+    /// answers differently for a row that merely went through a lock cycle.
+    #[test]
+    fn a_null_tile_column_survives_the_seal_as_null() {
+        let vault = tmp_vault("dashboard-null");
+        let state = build_state_with_vault("dashboard-null", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                         created_at, updated_at)
+                 VALUES ('d-8', 'Board', NULL, NULL, 0, 0, 'f-secret', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "INSERT INTO dashboard_tiles (id, dashboard_id, kind, ref_id, title, span,
+                                              position, config, created_at)
+                 VALUES ('t-8', 'd-8', 'meeting', NULL, 'Standup', 2, 3, NULL, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-secret").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-secret")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-secret", &ck, None).unwrap();
+
+        let (ref_kind, config_kind, kind, span, position): (String, String, String, i64, i64) =
+            state
+                .db
+                .lock()
+                .query_row(
+                    "SELECT typeof(ref_id), typeof(config), kind, span, position
+                       FROM dashboard_tiles WHERE id = 't-8'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+        assert_eq!(ref_kind, "null", "a NULL ref_id came back as a string");
+        assert_eq!(config_kind, "null", "a NULL config came back as a string");
+        assert_eq!(kind, "meeting", "the tile kind did not survive the seal");
+        // Geometry is deliberately never sealed — an unsealed board must come back in the
+        // layout it had, not collapsed to a default.
+        assert_eq!(span, 2, "the tile span was disturbed by the seal");
+        assert_eq!(position, 3, "the tile position was disturbed by the seal");
+    }
+
+    /// Moving a board refuses a sealed container at BOTH ends, for different reasons.
+    ///
+    /// A sealed TARGET would receive a board in plaintext inside a tree the user believes is
+    /// unreadable. A sealed SOURCE is the subtler one: that board's title and tiles are ciphertext
+    /// bound by `aad_document` to the container it currently lives in, so re-parenting the row
+    /// without unsealing first would carry blobs into a container whose key cannot open them and
+    /// whose unseal enumerates them — content nothing could recover afterwards.
+    ///
+    /// RED contract for each half separately: drop the target check and the move into `f-sealed`
+    /// succeeds; drop the `board.locked` check and the move OUT of a sealed container succeeds.
+    #[test]
+    fn moving_a_board_refuses_a_sealed_container_at_either_end() {
+        let vault = tmp_vault("dashboard-move");
+        let state = build_state_with_vault("dashboard-move", &vault);
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-sealed", "Sealed");
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Sealed")).unwrap();
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        let now = "2026-08-23T10:00:00Z";
+        for (board, folder) in [("d-open", "f-open"), ("d-inside", "f-secret")] {
+            state
+                .db
+                .lock()
+                .execute(
+                    "INSERT INTO dashboards (id, title, emoji, tint, pinned, position, folder_id,
+                                             created_at, updated_at)
+                     VALUES (?1, 'Board', NULL, NULL, 0, 0, ?2, ?3, ?3)",
+                    rusqlite::params![board, folder, now],
+                )
+                .unwrap();
+        }
+
+        lock_folder_inner(&state, "f-sealed".into()).unwrap();
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+
+        // TARGET sealed → refused, and the board has not moved.
+        let err = move_dashboard_to_container_inner(&state, "d-open", Some("f-sealed"))
+            .expect_err("a sealed container must not accept a board");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+        assert_eq!(
+            state.db.get_dashboard("d-open").unwrap().unwrap().folder_id,
+            Some("f-open".to_string()),
+            "the refused move still re-parented the board"
+        );
+
+        // SOURCE sealed → refused, and the board has not moved.
+        let err = move_dashboard_to_container_inner(&state, "d-inside", Some("f-open"))
+            .expect_err("a board in a sealed container must not be moved out of it");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+        assert_eq!(
+            state.db.get_dashboard("d-inside").unwrap().unwrap().folder_id,
+            Some("f-secret".to_string()),
+            "the refused move still re-parented the board"
+        );
+
+        // An id that names no container is refused too — otherwise a board lands with a dangling
+        // anchor: invisible in the tree, and outside any future lock.
+        let err = move_dashboard_to_container_inner(&state, "d-open", Some("f-nope"))
+            .expect_err("an unknown container must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+
+        // The CONTROL: open → open works, so the refusals above are not a reader that refuses
+        // everything.
+        make_open_folder(&state.db, "f-elsewhere", "Elsewhere");
+        move_dashboard_to_container_inner(&state, "d-open", Some("f-elsewhere")).unwrap();
+        assert_eq!(
+            state.db.get_dashboard("d-open").unwrap().unwrap().folder_id,
+            Some("f-elsewhere".to_string()),
+            "an open-to-open move did not land"
+        );
+    }
+
+    /// A filed task appears in its container's tree, and SEALING that container unfiles it.
+    ///
+    /// The lock model's promise is that a sealed container discloses nothing. A task's content
+    /// lives in an org's E2EE store, so a container's content key cannot seal it — which means a
+    /// task left inside a sealed container would stay exactly as readable as before while the user
+    /// was told the container was locked. Unfiling on seal is what makes the promise literally
+    /// true, and it loses nothing: the task is intact and back where it was before it was filed.
+    ///
+    /// RED contract: drop the `unfile_tasks_in_container` call from `seal_folder_extras` and the
+    /// task is still filed in a sealed container after the lock.
+    #[test]
+    fn sealing_a_container_unfiles_the_tasks_inside_it() {
+        let vault = tmp_vault("task-placement");
+        let state = build_state_with_vault("task-placement", &vault);
+        make_open_folder(&state.db, "f-secret", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+        insert_fixture_task(&state.db, "task-1", "Ship the thing");
+
+        // Filed: the tree shows it under that container.
+        assert!(
+            state.db.set_task_container("task-1", Some("f-secret")).unwrap(),
+            "the task should have been filed"
+        );
+        let nothing_unlocked = std::collections::HashSet::new();
+        let (rows, total) = state
+            .db
+            .container_items_page(
+                Some("f-secret"),
+                crate::storage::models::ItemKind::Task,
+                0,
+                50,
+                &nothing_unlocked,
+            )
+            .unwrap();
+        assert_eq!(total, 1, "a filed task did not appear in its container");
+        assert_eq!(rows[0].id, "task-1");
+        assert_eq!(
+            rows[0].title.as_deref(),
+            Some("Ship the thing"),
+            "the tree read the wrong title out of the envelope"
+        );
+
+        // Sealed: the task leaves the container rather than sitting inside a lock that cannot
+        // reach it.
+        lock_folder_inner(&state, "f-secret".into()).unwrap();
+        assert_eq!(
+            state.db.task_container("task-1").unwrap(),
+            None,
+            "a task survived the seal of the container it was filed in"
+        );
+        let (_, total) = state
+            .db
+            .container_items_page(
+                Some("f-secret"),
+                crate::storage::models::ItemKind::Task,
+                0,
+                50,
+                &nothing_unlocked,
+            )
+            .unwrap();
+        assert_eq!(total, 0, "a sealed container still lists a task");
+    }
+
+    /// An UNFILED task belongs to the Tasks view, not the tree's Inbox.
+    ///
+    /// The Inbox leg is empty on purpose. `commands::tasks::list_tasks` gates on session and org
+    /// read context; mirroring every unfiled org task into the hierarchy would be a second route
+    /// to the same rows that does not pass through that gate.
+    #[test]
+    fn an_unfiled_task_is_not_mirrored_into_the_tree_inbox() {
+        let state = build_state("task-inbox");
+        insert_fixture_task(&state.db, "task-2", "Unfiled work");
+
+        let (rows, total) = state
+            .db
+            .container_items_page(
+                None,
+                crate::storage::models::ItemKind::Task,
+                0,
+                50,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert!(rows.is_empty() && total == 0, "the Inbox mirrored an unfiled task");
+
+        // The control: once filed, the SAME row is reachable — so the assertion above cannot be
+        // passing on a leg that returns nothing for anyone.
+        make_open_folder(&state.db, "f-open", "Open");
+        state.db.set_task_container("task-2", Some("f-open")).unwrap();
+        let (rows, _) = state
+            .db
+            .container_items_page(
+                Some("f-open"),
+                crate::storage::models::ItemKind::Task,
+                0,
+                50,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "a filed task did not become reachable");
+    }
+
+    /// A filed task vanishes from the tree when its ORG is gone or switched off.
+    ///
+    /// This is the BLOCKER a reviewer found, and it was mine: the tree leg selected task titles
+    /// out of `org_tasks` with only the folder's `visibility_clause` — no membership predicate, no
+    /// context-enabled predicate. Filing a task locally then survived leaving the org, losing the
+    /// seat, or turning that org's context off on this device, and the title kept rendering.
+    ///
+    /// What makes it worth a test rather than a one-line fix is that the reasoning was already
+    /// written and then contradicted: the Inbox arm's own comment says mirroring org tasks into
+    /// the hierarchy "would be a SECOND, ungated route to the same rows" — and the Container arm
+    /// one branch later was exactly that route.
+    ///
+    /// RED contract: drop the `JOIN org_state ... context_enabled = 1` and both halves below
+    /// return the task.
+    #[test]
+    fn a_filed_task_needs_a_live_org_membership_to_appear_in_the_tree() {
+        let state = build_state("task-org-gate");
+        make_open_folder(&state.db, "f-open", "Open");
+        let nothing_unlocked = std::collections::HashSet::new();
+
+        // (a) org context DISABLED on this device.
+        insert_fixture_task_for_org(&state.db, "task-off", "Disabled org", "org-off", false);
+        state.db.set_task_container("task-off", Some("f-open")).unwrap();
+
+        // (b) NO local membership row at all — the shape after leaving an org.
+        insert_fixture_task_row(&state.db, "task-gone", "Former org", "org-gone");
+        state.db.set_task_container("task-gone", Some("f-open")).unwrap();
+
+        // (c) TOMBSTONED in the org — deleted for everyone else, but its `org_tasks` row
+        // survives locally, so without the item-head join its old title kept rendering under the
+        // container it was filed in.
+        insert_fixture_task_for_org(&state.db, "task-dead", "Deleted", "org-dead", true);
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_items SET tombstoned = 1 WHERE item_id = 'task-dead'",
+                [],
+            )
+            .unwrap();
+        state.db.set_task_container("task-dead", Some("f-open")).unwrap();
+
+        // (d) SUPERSEDED — not the current head any more.
+        insert_fixture_task_for_org(&state.db, "task-old", "Superseded", "org-old", true);
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_items SET is_current = 0 WHERE item_id = 'task-old'",
+                [],
+            )
+            .unwrap();
+        state.db.set_task_container("task-old", Some("f-open")).unwrap();
+
+        // (e) the CONTROL: a live membership, context on, live current head.
+        insert_fixture_task_for_org(&state.db, "task-live", "Live org", "org-live", true);
+        state.db.set_task_container("task-live", Some("f-open")).unwrap();
+
+        let (rows, total) = state
+            .db
+            .container_items_page(
+                Some("f-open"),
+                crate::storage::models::ItemKind::Task,
+                0,
+                50,
+                &nothing_unlocked,
+            )
+            .unwrap();
+
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"task-off"),
+            "a task from an org whose context is disabled was rendered: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"task-gone"),
+            "a task from an org this device is not a member of was rendered: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"task-dead"),
+            "a task tombstoned in its org was rendered: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"task-old"),
+            "a superseded task revision was rendered: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"task-live"),
+            "the control task must still appear, or this proves nothing: {ids:?}"
+        );
+        assert_eq!(total, 1, "the disclosed total counted ungated tasks: {total}");
+    }
+
+    /// Deleting a container unfiles its tasks instead of stranding them.
+    #[test]
+    fn deleting_a_container_unfiles_the_tasks_inside_it() {
+        let state = build_state("task-delete");
+        make_open_folder(&state.db, "f-gone", "Gone");
+        insert_fixture_task(&state.db, "task-3", "Orphan me");
+        state.db.set_task_container("task-3", Some("f-gone")).unwrap();
+
+        state.db.delete_folder("f-gone").unwrap();
+        assert_eq!(
+            state.db.task_container("task-3").unwrap(),
+            None,
+            "a task was left pointing at a deleted container"
+        );
+    }
+
     fn make_open_folder(db: &Db, id: &str, path: &str) {
         db.insert_folder(&Folder {
             id: id.to_string(),
