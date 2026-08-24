@@ -253,7 +253,12 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     // Focus, not a pointer — see the note in lock-shares-dialog.spec.ts.
     await page.getByRole("button", { name: /^Actions for / }).last().focus();
     await page.keyboard.press("Enter");
-    await page.getByRole("menuitem", { name: "Lock folder" }).focus();
+    // The lock entry names the CASCADE now: locking a container seals every container inside it,
+    // so a project holding folders says so rather than calling itself "Lock folder". This test is
+    // about the shares gate, not the wording, so it matches the affordance rather than one label —
+    // and the project is the case where the gate matters most, since the seal reaches its
+    // descendants too.
+    await page.getByRole("menuitem", { name: /^Lock (folder|project)/ }).focus();
     await page.keyboard.press("Enter");
 
     // The blocking dialog appears with the three choices. The host has no size
