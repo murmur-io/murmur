@@ -6,7 +6,16 @@ import { Injectable, computed, signal } from "@angular/core";
  * Tasks and dashboards are absent on purpose: neither has a container anchor yet,
  * so a drop would have nowhere to file it. They join when their backend halves do.
  */
-export type DraggableKind = "meeting" | "note";
+/**
+ * What can be dragged into a container.
+ *
+ * All four kinds the hierarchy renders, because a row a user can see under a project is a row
+ * they will try to drag out of it — and the three that silently ignored the gesture were the
+ * ones that had no mover behind them, not the ones that were meant to sit still. Each kind
+ * moves through its OWN backend command (see `WorkspaceService.moveItem`); the kind travels with
+ * the payload precisely because the id alone cannot say which one.
+ */
+export type DraggableKind = "meeting" | "note" | "dashboard" | "task";
 
 /** The in-flight drag: an id is not enough, because the two kinds move differently. */
 interface DragPayload {
