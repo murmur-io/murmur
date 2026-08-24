@@ -320,7 +320,24 @@ async fn kill_and_reap_external_cli(
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     match tokio::time::timeout(remaining, child.wait()).await {
         Ok(Ok(_)) => {
-            kill_and_prove_group_dead(group.pgid(), deadline).await?;
+            // A FRESH budget, not the remainder of the one `child.wait()` just spent. These are
+            // two different waits on two different things: reaping OUR direct child, and then
+            // proving the whole isolated group empty — which depends on the OS reaping
+            // grandchildren the CLI spawned and that our kill orphaned. `kill(-pgid, 0)` reports
+            // a zombie as alive, so the group can look occupied for a moment after every process
+            // in it is dead, and that moment is not ours to control.
+            //
+            // Sharing one deadline meant a slow child reap silently ate the group proof's entire
+            // budget: `child.wait()` taking 4.9s of 5s left the proof 100ms, it timed out, and
+            // the group was marked Unproven — permanently, since that marker is sticky. That is
+            // not a cosmetic failure. `perf::…` refuses recording admission while any group is
+            // unproven, so a teardown that merely ran late could leave a user unable to start
+            // recording until the app restarted.
+            kill_and_prove_group_dead(
+                group.pgid(),
+                tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT,
+            )
+            .await?;
             group.mark_proven_dead();
             Ok(())
         }
@@ -1289,6 +1306,78 @@ mod tests {
             Some("claude-opus-4-8".to_string()),
             "the --model override rides the shared seam: {args:?}"
         );
+    }
+
+    /// A timed-out child is torn down and leaves NO unproven process group.
+    ///
+    /// SCOPE, stated plainly because the name of this test used to overclaim: it is a smoke test
+    /// for the teardown path, NOT a regression test for the budget split below it. It passes both
+    /// with and without that change, and it was verified to do so rather than assumed.
+    ///
+    /// The reason is that the coupling cannot be driven from a test. Teardown does two different
+    /// waits — reaping OUR direct child, then proving the isolated group empty, which depends on
+    /// the OS reaping grandchildren our kill orphaned. Sharing one deadline means a slow child
+    /// reap eats the group proof's budget. But the kill is SIGKILL, which cannot be trapped or
+    /// delayed, so there is no way to make the first wait slow on demand and no way to reach the
+    /// failing branch deterministically. The fix (a fresh budget for the second wait) rests on
+    /// reading the code, not on a red test, and that is recorded here rather than papered over
+    /// with a green one that proves something else.
+    ///
+    /// What this test DOES pin, and what would have caught a real regression in it: a wedged child
+    /// with a grandchild is killed, reaped, and its group proven dead — so `has_unproven_process_group`
+    /// stays false. That marker is sticky and recording admission refuses while any group carries
+    /// it, so a teardown that stopped proving groups dead would silently cost the user the ability
+    /// to record until they restarted the app.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_child_leaves_no_unproven_process_group() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = crate::storage::db::unique_temp_path("murmur-teardown-budget", "sh");
+        let mut file = std::fs::File::create(&script).unwrap();
+        // A grandchild, so the group holds more than the direct child: that is the shape whose
+        // reaping the app does not control, and the reason the second wait exists at all.
+        writeln!(file, "#!/bin/sh").unwrap();
+        writeln!(file, "/bin/sleep 30 &").unwrap();
+        writeln!(file, "/bin/sleep 30").unwrap();
+        drop(file);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut command = Command::new(&script);
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        isolate_process_group(&mut command);
+        let child = command.spawn().unwrap();
+
+        let result = run_external_cli_child_with_timeout(
+            child,
+            b"",
+            "teardown budget probe",
+            Duration::from_millis(200),
+        )
+        .await;
+
+        // The probe itself must fail as a timeout — otherwise the fixture never reached the
+        // teardown path and this oracle proves nothing at all.
+        let Err(AppError::Summarize(reason)) = result else {
+            panic!("a wedged child must time out");
+        };
+        assert!(
+            reason.contains("timed out after"),
+            "the fixture must reach the timeout path: {reason}"
+        );
+        assert!(
+            !reason.contains("teardown failed"),
+            "teardown must complete inside its budget: {reason}"
+        );
+        assert!(
+            !has_unproven_process_group(),
+            "a timed-out child left an unproven process group"
+        );
+
+        let _ = std::fs::remove_file(script);
     }
 
     #[cfg(unix)]
