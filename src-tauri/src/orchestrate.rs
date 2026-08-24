@@ -232,6 +232,7 @@ fn tool_label(call: &ToolCall) -> &'static str {
         // labels keep the shared transport enum compile-safe without advertising either to a model.
         ToolCall::ListEntities { .. } => "Entities",
         ToolCall::ListNoteFolders => "Note folders",
+        ToolCall::ListWorkspaceHierarchy => "Workspace hierarchy",
         // Dashboards — the user's own composed boards. `ListDashboards` is metadata; `GetDashboard`
         // resolves each tile through the gated resolver, so it labels like any other vault read.
         ToolCall::ListDashboards => "Dashboards",
