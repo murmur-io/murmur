@@ -101,7 +101,7 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
   await page.getByRole("button", { name: "Expand Workspace" }).click();
   await page.getByRole("button", { name: "Actions for History note folder" }).focus();
   await page.keyboard.press("Enter");
-  const lock = page.getByRole("menuitem", { name: "Lock folder" });
+  const lock = page.getByRole("menuitem", { name: /^Lock (folder|project)/ });
   await expect(lock).toBeAttached();
   await lock.click({ force: true });
 
@@ -193,7 +193,7 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
   await page.getByRole("button", { name: "Expand Workspace" }).click();
   await page.getByRole("button", { name: "Actions for History meeting folder" }).focus();
   await page.keyboard.press("Enter");
-  const lock = page.getByRole("menuitem", { name: "Lock folder" });
+  const lock = page.getByRole("menuitem", { name: /^Lock (folder|project)/ });
   await expect(lock).toBeAttached();
   await lock.click({ force: true });
   await expect(

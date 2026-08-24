@@ -53,7 +53,7 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
     // lane. Keyboard activation is immune to whatever is painted on top.
     await page.getByRole("button", { name: "Actions for Notes" }).focus();
     await page.keyboard.press("Enter");
-    const lockBtn = page.getByRole("menuitem", { name: "Lock folder" });
+    const lockBtn = page.getByRole("menuitem", { name: /^Lock (folder|project)/ });
     await expect(lockBtn).toBeVisible();
     await lockBtn.click();
 
