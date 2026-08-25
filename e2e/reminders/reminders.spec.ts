@@ -40,8 +40,14 @@ test("Reminders: a live count cannot be lost or overwritten by a stale startup s
     target.__resolveReminderSummary?.({ dueInboxCount: 2 });
   });
 
-  const reminderNav = page.getByRole("link", { name: "Reminders" }).first();
-  await expect(reminderNav.locator(".nav-reminder-count")).toHaveText("4");
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("button", { name: "Browse", exact: true })
+    .click();
+  const reminderNav = page
+    .getByRole("complementary", { name: "Browse sidebar" })
+    .getByRole("link", { name: "Reminders" });
+  await expect(reminderNav.locator(".count")).toHaveText("4");
 });
 
 test("Reminders: a listener resolving after root teardown is immediately unregistered", async ({
@@ -224,9 +230,9 @@ test("Reminders: an event supersedes the first in-flight list snapshot", async (
   await expect(page.getByText("Stale first row 1")).toHaveCount(0);
   await expect(
     page
+      .getByRole("complementary", { name: "Browse sidebar" })
       .getByRole("link", { name: "Reminders" })
-      .first()
-      .locator(".nav-reminder-count"),
+      .locator(".count"),
   ).toHaveText("4");
 });
 
@@ -738,9 +744,9 @@ test("Reminders: a newer list count beats a delayed startup summary", async ({
   await page.goto("/reminders");
   await expect(page.getByText("Newest list row 1")).toBeVisible();
   const reminderCount = page
+    .getByRole("complementary", { name: "Browse sidebar" })
     .getByRole("link", { name: "Reminders" })
-    .first()
-    .locator(".nav-reminder-count");
+    .locator(".count");
   await expect(reminderCount).toHaveText("3");
 
   await page.evaluate(async () => {
@@ -2194,7 +2200,9 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
 
   await page.goto("/reminders");
 
-  const reminderNav = page.getByRole("link", { name: "Reminders" }).first();
+  const reminderNav = page
+    .getByRole("complementary", { name: "Browse sidebar" })
+    .getByRole("link", { name: "Reminders" });
   await expect(reminderNav).toBeVisible();
   await expect(reminderNav.locator(".count")).toHaveText("2");
   await expect(page.getByRole("heading", { name: "Reminders" })).toBeVisible();
@@ -2394,7 +2402,14 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
   ).toBe(true);
 
   // Routed authored-note context carries the note source into the same composer.
-  await page.getByRole("link", { name: "Notes" }).first().click();
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("button", { name: "Browse", exact: true })
+    .click();
+  await page
+    .getByRole("complementary", { name: "Browse sidebar" })
+    .getByRole("link", { name: "Notes", exact: true })
+    .click();
   await page
     .getByRole("button", { name: /Atlas — PRD v3/ })
     .first()
@@ -2463,7 +2478,7 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
     noteCard.getByText("Resolve the PRD open question"),
   ).toBeVisible();
   await page
-    .getByRole("button", { name: /Re-seal all 1 unlocked folder now/ })
+    .getByRole("button", { name: /Re-seal all 1 unlocked folders? now/ })
     .click();
   await expect(page.getByText("Resolve the PRD open question")).toHaveCount(0);
   await expect(noteCard).toHaveCount(0);

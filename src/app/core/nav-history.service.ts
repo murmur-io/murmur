@@ -7,27 +7,14 @@ import { filter, map, scan, startWith } from "rxjs";
 const DEFAULT_APP_ROUTE = "/record";
 
 /**
- * A "drill-down" is a route that HIDES the primary rail so the current flow
- * owns the window with its own back-affordance. The "← Murmur" back target
- * must be a NON-drill-down route, so both this service and app-shell's
- * rail-hide gate share this single predicate. Keep the two in lockstep — a
- * new drill-down route added here is also hidden in app-shell.
+ * A "drill-down" is a route with its own "← Murmur" back affordance. The
+ * persistent global rail remains visible; this predicate only decides which
+ * routes may become that Back button's target. A drill-down cannot target
+ * another drill-down, otherwise Back could bounce between nested flows.
  *
- * Notes (`/notes` home + `/notes/:id` editor, Stage 1, 2026-07-12) and
- * Meetings/meeting-detail (`/library`, `/meeting/:id`, Stage 2, same day) are
- * DELIBERATELY NOT drill-downs — Notion/Obsidian-style always-visible
- * sidebar: the primary rail now hosts BOTH folder trees directly
- * (`NotesSidebarTreeComponent`, `MeetingsSidebarTreeComponent`), so
- * `NotesHomeComponent`/`NoteEditorComponent`/`LibraryComponent` render as
- * normal in-flow content beside the sidebar, like `/record`, with no local
- * back-affordance (`DetailComponent`, `/meeting/:id`, never had one to begin
- * with — its own "← Meetings" is a plain in-page breadcrumb link, not the
- * rail-hiding drill-down chrome, so it needed no structural change here).
- *
- * `/settings` and the org-item viewer (`/org-item`, reached from an org card
- * inside Notes) are STILL drill-downs for now — each retains its own
- * "← Murmur" back button and hides the primary rail, until a later stage
- * folds them into the same model too.
+ * Settings and the org-item viewer retain local Back controls. Notes,
+ * meetings, tasks, dashboards, and their list views use normal shell
+ * navigation and therefore remain valid history targets.
  */
 export function isDrilldownRoute(url: string): boolean {
   return url.startsWith("/settings") || url.startsWith("/org-item");

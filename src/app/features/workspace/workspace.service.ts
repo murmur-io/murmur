@@ -4,9 +4,8 @@ import { IpcService } from "../../core/ipc.service";
 import type { ContainerNode, ItemKind, ItemPage } from "../../core/models";
 import type { DraggableKind } from "../folders/note-drag.service";
 
-/** Storage keys for the two persisted expansion sets. */
+/** Storage key for persisted container expansion. */
 const EXPANDED_CONTAINERS_KEY = "murmur.workspace.expandedContainers";
-const EXPANDED_GROUPS_KEY = "murmur.workspace.expandedGroups";
 
 /**
  * The workspace container forest, owned at the ROOT so it outlives the sidebar.
@@ -41,9 +40,6 @@ export class WorkspaceService {
 
   private readonly _expandedContainers = signal<ReadonlySet<string>>(
     readStoredSet(EXPANDED_CONTAINERS_KEY),
-  );
-  private readonly _expandedGroups = signal<ReadonlySet<string>>(
-    readStoredSet(EXPANDED_GROUPS_KEY),
   );
 
   /** Reload the whole forest. Safe to call repeatedly; the last write wins. */
@@ -149,24 +145,6 @@ export class WorkspaceService {
     );
   }
 
-  /**
-   * Type groups are keyed by container AND kind, so collapsing "Meetings" in one
-   * project leaves it open in another — the two are unrelated facts about
-   * unrelated containers.
-   */
-  isGroupExpanded(containerId: string, kind: ItemKind): boolean {
-    return this._expandedGroups().has(groupKey(containerId, kind));
-  }
-
-  toggleGroup(containerId: string, kind: ItemKind): void {
-    this._expandedGroups.set(
-      toggled(this._expandedGroups(), groupKey(containerId, kind), EXPANDED_GROUPS_KEY),
-    );
-  }
-}
-
-function groupKey(containerId: string, kind: ItemKind): string {
-  return `${containerId}:${kind}`;
 }
 
 function toggled(

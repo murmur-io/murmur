@@ -57,6 +57,7 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST, get_container: CONTAINER },
   );
   await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
 }
 
 /**
@@ -73,7 +74,9 @@ test("a container row opens that container, not the recorder", async ({ page }) 
 
   await expect(page).toHaveURL(/\/container\/p-acme$/);
   await expect(page.getByRole("heading", { name: /Acme/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Standup/ })).toBeVisible();
+  await expect(
+    page.locator(".app-main").getByRole("button", { name: /Standup/ }),
+  ).toBeVisible();
   // The kind with no items renders no section at all, rather than an empty one.
   await expect(page.getByRole("heading", { name: "Tasks" })).toHaveCount(0);
 });
@@ -100,9 +103,9 @@ test("a note row opens the note route that actually exists", async ({ page }) =>
     },
   );
   await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
 
   await page.getByRole("button", { name: "Expand Acme" }).click();
-  await page.getByRole("button", { name: "Expand Notes" }).click();
   await page.getByRole("button", { name: "Plan", exact: true }).click();
 
   // `/note/:id` does not exist; `/notes/:id` does. The wrong one silently lands

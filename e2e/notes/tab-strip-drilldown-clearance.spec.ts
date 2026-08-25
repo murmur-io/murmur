@@ -2,17 +2,11 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * Drill-down routes (/settings, /org-item) render NO sidebar/pill chrome, so
- * `mur-tab-strip` starts flush at the window's LEFT edge — exactly where the
- * overlay macOS traffic lights float (trafficLightPosition 32,30 → buttons
- * span ≈ x 32..84, vertically inside the 48px strip). The strip must reserve
- * left clearance there (`app-shell.drilldown` host class + the `:host-context`
- * rule in tab-strip.component.scss) while keeping its normal padding in
- * sidebar mode, where it sits right of the sidebar panel. Headless Playwright
- * has no real macOS window chrome, so this pins the CSS contract (the computed
- * clearance), not the OS pixels.
+ * Settings keeps the persistent global rail. The tab strip therefore retains
+ * its normal 24px inset instead of switching to a flush-left drill-down
+ * clearance, and the fixed settings surface must begin after the rail.
  */
-test("the tab strip clears the traffic-light zone on drill-down routes", async ({
+test("settings keeps normal tab-strip padding and clears the global rail", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -31,18 +25,29 @@ test("the tab strip clears the traffic-light zone on drill-down routes", async (
   await page.getByRole("button", { name: "My First Note" }).click();
   await expect(page.locator(".tab-strip .tab-item")).toHaveCount(1);
 
-  // Sidebar mode: the strip sits right of the sidebar panel — normal padding
-  // (--space-5 = 24px), no traffic lights anywhere near it.
+  // Browse mode uses the normal inset (--space-5 = 24px).
   const strip = page.locator(".tab-strip");
   await expect(strip).toHaveCSS("padding-left", "24px");
 
-  // Enter the Settings drill-down through the real sidebar affordance: the
-  // chrome unmounts, the strip now starts at the window edge → clearance on.
-  await page.getByRole("link", { name: "Settings", exact: true }).click();
+  const globalNavigation = page.getByRole("navigation", {
+    name: "Global navigation",
+  });
+  await globalNavigation
+    .getByRole("link", { name: "Settings", exact: true })
+    .click();
   await expect(page).toHaveURL(/\/settings/);
-  await expect(strip).toHaveCSS("padding-left", "96px");
+  await expect(globalNavigation).toBeVisible();
+  await expect(strip).toHaveCSS("padding-left", "24px");
 
-  // Leaving the drill-down restores the normal padding.
+  const [railBox, settingsBox] = await Promise.all([
+    globalNavigation.boundingBox(),
+    page.locator("app-settings .settings-shell").boundingBox(),
+  ]);
+  expect(railBox).not.toBeNull();
+  expect(settingsBox).not.toBeNull();
+  expect(settingsBox!.x).toBeGreaterThanOrEqual(railBox!.x + railBox!.width);
+
+  // Leaving Settings preserves the same shell-level inset.
   await page.getByRole("button", { name: "Back to Murmur" }).click();
   await expect(strip).toHaveCSS("padding-left", "24px");
 
