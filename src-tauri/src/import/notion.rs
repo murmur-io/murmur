@@ -22,10 +22,11 @@
 //! decompression budget (a per-level budget is the bug, not the guard) and are bounded by a depth
 //! cap.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+use super::{title_from_body_or_stem, ImportScan, ImportedPage, MAX_PAGES_PER_IMPORT};
 use crate::error::{AppError, Result};
 
 /// Decompressed-bytes ceiling for ONE scan/import of a Notion export, shared across every nesting
@@ -36,49 +37,9 @@ const MAX_EXPORT_DECOMPRESSED_BYTES: u64 = crate::extract::MAX_EXTRACT_DECOMPRES
 /// slack without letting a crafted archive recurse without bound.
 const MAX_ARCHIVE_DEPTH: usize = 3;
 
-/// Hard cap on pages accepted from one export. A workspace larger than this should be imported in
-/// parts — Tana caps at 1500 for the same reason. Refusing loudly beats a multi-hour silent run.
-pub(crate) const MAX_PAGES_PER_IMPORT: usize = 5_000;
-
-/// Longest title we keep. Notion itself truncates; we re-truncate on a char boundary so a
-/// pathological name cannot produce an absurd row or an unwritable filename.
-const MAX_TITLE_CHARS: usize = 200;
-
 /// Separator packing a non-page entry's declared size into its recorded path. A NUL can never occur
 /// in a real archive entry name, so the pairing is unambiguous.
 const SIZE_SEP: char = '\u{0}';
-
-/// One page recovered from an export, ready to become a note.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NotionPage {
-    /// The 32-hex Notion page id, when the filename carried one. `None` for a hand-made `.md`.
-    pub notion_id: Option<String>,
-    /// Display title: the first `# heading` when present, else the id-stripped filename.
-    pub title: String,
-    /// Ancestor titles, outermost first — the page tree, mirrored as folders on import.
-    pub parents: Vec<String>,
-    /// The page body, verbatim except for link rewriting applied later.
-    pub markdown: String,
-}
-
-/// What a scan found, WITHOUT writing anything. This is the dry-run contract the UI renders before
-/// the user commits to an import.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct NotionScan {
-    pub pages: Vec<NotionPage>,
-    /// Non-page files that ship alongside (images, PDFs, …) — counted, never imported in v1.
-    pub attachments: usize,
-    pub attachment_bytes: u64,
-    /// Database exports. `csv_all_duplicates` are the `…_all.csv` twins we deliberately ignore.
-    pub databases: usize,
-    pub csv_all_duplicates: usize,
-    /// Nested `Export-…-Part-N.zip` archives we descended into.
-    pub nested_archives: usize,
-    /// Titles that appear more than once — the caller disambiguates by folder path.
-    pub title_collisions: Vec<String>,
-    /// True when [`MAX_PAGES_PER_IMPORT`] cut the scan short.
-    pub truncated: bool,
-}
 
 /// Strip Notion's trailing 32-hex id from a file stem, returning the clean title and the id.
 ///
@@ -109,15 +70,6 @@ pub(crate) fn strip_notion_id(stem: &str) -> (String, Option<String>) {
     (stem.trim().to_string(), None)
 }
 
-/// Truncate to [`MAX_TITLE_CHARS`] on a char boundary.
-fn clamp_title(title: &str) -> String {
-    let trimmed = title.trim();
-    if trimmed.chars().count() <= MAX_TITLE_CHARS {
-        return trimmed.to_string();
-    }
-    trimmed.chars().take(MAX_TITLE_CHARS).collect()
-}
-
 /// Percent-decode a relative link target. Hand-rolled rather than pulling a crate for ~20 lines;
 /// an invalid escape is left verbatim (fail-open on the byte, never panic).
 fn percent_decode(s: &str) -> String {
@@ -138,26 +90,6 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The display title for a page: the first ATX `# ` heading when the body has one (Notion always
-/// writes it, and it is the FULL title — the filename is the truncated one), else the id-stripped
-/// stem.
-fn title_from_body_or_stem(markdown: &str, stem_title: &str) -> String {
-    for line in markdown.lines().take(10) {
-        if let Some(rest) = line.trim().strip_prefix("# ") {
-            let heading = rest.trim();
-            if !heading.is_empty() {
-                return clamp_title(heading);
-            }
-        }
-    }
-    let fallback = clamp_title(stem_title);
-    if fallback.is_empty() {
-        crate::storage::db::UNTITLED_TITLE.to_string()
-    } else {
-        fallback
-    }
 }
 
 /// Rewrite Notion's relative internal links to Obsidian `[[wikilinks]]`.
@@ -328,7 +260,7 @@ impl Budget {
 
 /// Scan a Notion export — either an unpacked DIRECTORY or a `.zip` — into a dry-run plan.
 /// Writes nothing, touches no state.
-pub(crate) fn scan_export(path: &Path) -> Result<NotionScan> {
+pub(crate) fn scan_export(path: &Path) -> Result<ImportScan> {
     let mut budget = Budget::new();
     let entries = if path.is_dir() {
         read_directory(path, &mut budget)?
@@ -441,9 +373,8 @@ fn is_markdown(path: &str) -> bool {
 }
 
 /// Turn raw entries into the dry-run plan: classify, build pages, detect title collisions.
-fn build_scan(entries: Vec<RawEntry>) -> NotionScan {
-    let mut scan = NotionScan::default();
-    let mut titles: BTreeMap<String, usize> = BTreeMap::new();
+fn build_scan(entries: Vec<RawEntry>) -> ImportScan {
+    let mut scan = ImportScan::default();
     for entry in entries {
         if let Some((path, size)) = entry.path.split_once(SIZE_SEP) {
             let size: u64 = size.parse().unwrap_or(0);
@@ -481,28 +412,22 @@ fn build_scan(entries: Vec<RawEntry>) -> NotionScan {
             .map(|s| strip_notion_id(s).0)
             .filter(|s| !s.is_empty())
             .collect();
-        *titles.entry(title.clone()).or_insert(0) += 1;
-        scan.pages.push(NotionPage {
-            notion_id,
+        scan.pages.push(ImportedPage {
+            external_id: notion_id,
             title,
             parents,
             markdown,
         });
     }
-    let collisions: BTreeSet<String> = titles
-        .into_iter()
-        .filter(|(_, n)| *n > 1)
-        .map(|(t, _)| t)
-        .collect();
-    scan.title_collisions = collisions.into_iter().collect();
+    scan.finish();
     scan
 }
 
 /// The id → title map used for link rewriting, built from every page in the scan.
-pub(crate) fn titles_by_id(pages: &[NotionPage]) -> HashMap<String, String> {
+pub(crate) fn titles_by_id(pages: &[ImportedPage]) -> HashMap<String, String> {
     pages
         .iter()
-        .filter_map(|p| p.notion_id.clone().map(|id| (id, p.title.clone())))
+        .filter_map(|p| p.external_id.clone().map(|id| (id, p.title.clone())))
         .collect()
 }
 

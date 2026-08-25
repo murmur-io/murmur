@@ -13,30 +13,48 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import { IpcService } from "../../../../core/ipc.service";
 import type {
+  ImportReport,
+  ImportScanReport,
+  ImportSourceId,
   NoteFolder,
-  NotionImportReport,
-  NotionScanReport,
 } from "../../../../core/models";
 import { MurBannerComponent } from "../../../../design-system/banner/banner.component";
 import { MurProgressComponent } from "../../../../design-system/progress/progress.component";
 import { MurToggleComponent } from "../../../../design-system/toggle/toggle.component";
 import { ToastService } from "../../../../services/toast.service";
 
-/** The import sources this section offers. One today; the shape is what makes adding more cheap. */
-type ImportSource = "notion";
+/** How a source is chosen: an archive file, a folder, or nothing at all. */
+type PickKind = "archive" | "folder" | "none";
 
-/** Where the Notion flow is: pick an export, review the plan, watch it run, read the report. */
+interface ImportSourceMeta {
+  readonly id: ImportSourceId;
+  readonly label: string;
+  readonly pick: PickKind;
+}
+
+/**
+ * The sources, in rail order. Adding a fourth is an entry here plus a Rust normalizer — the flow
+ * below is deliberately source-agnostic.
+ */
+const SOURCES: readonly ImportSourceMeta[] = [
+  { id: "notion", label: "Notion", pick: "archive" },
+  { id: "obsidian", label: "Obsidian", pick: "folder" },
+  { id: "apple-notes", label: "Apple Notes", pick: "none" },
+];
+
+/** Where the flow is: choose a source, review the plan, watch it run, read the report. */
 type Phase = "pick" | "planned" | "running" | "done";
 
 /**
- * Settings → Imports. A source list on the left, the selected source's flow on the right.
+ * Settings → Imports. A source rail on the left, the selected source's flow on the right.
  *
- * The Notion flow is deliberately a DRY RUN first: `scanNotionExport` writes nothing and returns
- * real counts, so the user confirms against what is actually in the archive rather than against a
- * promise. Every prior-art importer that skips this step has an issue tracker full of "it silently
- * did the wrong thing to my workspace".
+ * Every source is scanned as a DRY RUN first: the scan writes nothing and returns real counts, so
+ * the user confirms against what is actually there rather than against a promise. Every comparable
+ * importer that skips this step has an issue tracker full of "it silently did the wrong thing to my
+ * workspace".
  *
- * Zero egress: the export is a file already on this machine. Nothing here talks to Notion.
+ * Zero egress: a downloaded export, a local vault folder, or the Notes app over Apple events.
+ * Nothing here talks to a server.
  */
 @Component({
   selector: "app-settings-imports-section",
@@ -55,14 +73,17 @@ export class SettingsImportsSectionComponent {
   private readonly toast = inject(ToastService);
   private readonly destroyRef = inject(DestroyRef);
 
-  /** The selected source. A signal so adding a second one needs no restructuring. */
-  readonly source = signal<ImportSource>("notion");
+  readonly sources = SOURCES;
+  readonly sourceId = signal<ImportSourceId>("notion");
+  readonly source = computed(
+    () => SOURCES.find((s) => s.id === this.sourceId()) ?? SOURCES[0],
+  );
 
   readonly phase = signal<Phase>("pick");
-  readonly exportPath = signal<string | null>(null);
+  readonly sourcePath = signal<string | null>(null);
   readonly scanning = signal(false);
-  readonly plan = signal<NotionScanReport | null>(null);
-  readonly report = signal<NotionImportReport | null>(null);
+  readonly plan = signal<ImportScanReport | null>(null);
+  readonly report = signal<ImportReport | null>(null);
 
   /** Target folder id; `null` means the always-open Notes root. */
   readonly targetFolder = signal<string | null>(null);
@@ -83,13 +104,16 @@ export class SettingsImportsSectionComponent {
   readonly total = signal(0);
 
   /** The last path component, so the UI shows a name rather than a wall of path. */
-  readonly exportName = computed(() => {
-    const path = this.exportPath();
+  readonly sourceName = computed(() => {
+    const path = this.sourcePath();
     if (!path) {
       return "";
     }
     return path.split("/").filter(Boolean).pop() ?? path;
   });
+
+  /** Apple Notes has nothing to choose — the library is the source. */
+  readonly needsPick = computed(() => this.source().pick !== "none");
 
   readonly percent = computed(() => {
     const total = this.total();
@@ -148,28 +172,54 @@ export class SettingsImportsSectionComponent {
     });
   }
 
-  /** Choose the `.zip` Notion emailed you. */
+  /** Switch source, discarding a plan that belonged to the previous one. */
+  selectSource(id: ImportSourceId): void {
+    if (id === this.sourceId()) {
+      return;
+    }
+    this.sourceId.set(id);
+    this.sourcePath.set(null);
+    this.plan.set(null);
+    this.report.set(null);
+    this.phase.set("pick");
+  }
+
+  /** Choose an export archive (Notion). */
   async chooseArchive(): Promise<void> {
-    const chosen = await open({
+    await this.pick({
       directory: false,
       multiple: false,
-      filters: [{ name: "Notion export", extensions: ["zip"] }],
+      filters: [{ name: "Export archive", extensions: ["zip"] }],
     });
-    if (typeof chosen === "string") {
-      this.selectExport(chosen);
-    }
   }
 
-  /** Choose an already-unpacked export folder. */
+  /** Choose a folder — an unpacked Notion export, or an Obsidian vault. */
   async chooseFolder(): Promise<void> {
-    const chosen = await open({ directory: true, multiple: false });
-    if (typeof chosen === "string") {
-      this.selectExport(chosen);
+    await this.pick({ directory: true, multiple: false });
+  }
+
+  /**
+   * Open the native picker and take the result.
+   *
+   * The try/catch is not defensive noise: a rejected `open()` in a click handler produces an
+   * unhandled rejection and a button that visibly does NOTHING, which is indistinguishable from a
+   * dead control. Surfacing the reason is the difference between a bug report that can be acted on
+   * and "it doesn't work".
+   */
+  private async pick(options: Parameters<typeof open>[0]): Promise<void> {
+    try {
+      const chosen = await open(options);
+      // A cancelled dialog returns null — a normal outcome, not an error.
+      if (typeof chosen === "string") {
+        this.selectPath(chosen);
+      }
+    } catch (e) {
+      this.toast.danger(`Could not open the file picker: ${errorText(e)}`);
     }
   }
 
-  private selectExport(path: string): void {
-    this.exportPath.set(path);
+  private selectPath(path: string): void {
+    this.sourcePath.set(path);
     this.plan.set(null);
     this.report.set(null);
     this.phase.set("pick");
@@ -178,22 +228,19 @@ export class SettingsImportsSectionComponent {
 
   /** DRY RUN — writes nothing. */
   async scan(): Promise<void> {
-    const path = this.exportPath();
-    if (!path) {
+    if (this.needsPick() && !this.sourcePath()) {
       return;
     }
     this.scanning.set(true);
     try {
-      const plan = await this.ipc.scanNotionExport(path);
+      const plan = await this.ipc.scanImport(this.sourceId(), this.sourcePath());
       this.plan.set(plan);
       this.phase.set("planned");
       if (plan.pages === 0) {
-        this.toast.danger(
-          "No Notion pages found in there. Pick the export archive or the folder it unpacked to.",
-        );
+        this.toast.danger("Nothing to import was found there.");
       }
     } catch (e) {
-      this.toast.danger(`Could not read that export: ${errorText(e)}`);
+      this.toast.danger(`Could not read that source: ${errorText(e)}`);
       this.phase.set("pick");
     } finally {
       this.scanning.set(false);
@@ -201,8 +248,7 @@ export class SettingsImportsSectionComponent {
   }
 
   async runImport(): Promise<void> {
-    const path = this.exportPath();
-    if (!path || this.phase() === "running") {
+    if (this.phase() === "running") {
       return;
     }
     this.phase.set("running");
@@ -210,8 +256,9 @@ export class SettingsImportsSectionComponent {
     this.done.set(0);
     this.total.set(this.plan()?.pages ?? 0);
     try {
-      const report = await this.ipc.importNotionExport(
-        path,
+      const report = await this.ipc.runImport(
+        this.sourceId(),
+        this.sourcePath(),
         this.targetFolder(),
         this.mirrorHierarchy(),
       );
@@ -239,10 +286,10 @@ export class SettingsImportsSectionComponent {
   }
 
   async cancel(): Promise<void> {
-    await this.ipc.cancelNotionImport();
+    await this.ipc.cancelImport();
   }
 
-  /** Back to the start without losing the chosen export. */
+  /** Back to the start without losing the chosen source. */
   reset(): void {
     this.report.set(null);
     this.phase.set(this.plan() ? "planned" : "pick");

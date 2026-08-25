@@ -158,7 +158,7 @@ fn an_existing_wikilink_is_not_touched() {
 // ── directory scans ───────────────────────────────────────────────────────────
 
 /// Build a temp export directory from `(relative path, contents)` pairs and scan it.
-fn scan_entries(files: Vec<(&str, &str)>) -> NotionScan {
+fn scan_entries(files: Vec<(&str, &str)>) -> ImportScan {
     let root = std::env::temp_dir().join(format!("murmur-notion-{}", uuid::Uuid::new_v4()));
     for (rel, body) in &files {
         let path = root.join(rel);
@@ -235,7 +235,7 @@ fn zip_of(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
 }
 
 /// Write `bytes` to a temp `.zip` and scan it.
-fn scan_zip(bytes: Vec<u8>) -> Result<NotionScan> {
+fn scan_zip(bytes: Vec<u8>) -> Result<ImportScan> {
     let path = std::env::temp_dir().join(format!("murmur-notion-{}.zip", uuid::Uuid::new_v4()));
     std::fs::write(&path, bytes).expect("write zip");
     let out = scan_export(&path);
@@ -296,14 +296,14 @@ fn a_decompression_bomb_fails_closed() {
 #[test]
 fn titles_by_id_maps_only_pages_that_carried_an_id() {
     let pages = vec![
-        NotionPage {
-            notion_id: Some("abc123def4567890abcdef1234567890".into()),
+        ImportedPage {
+            external_id: Some("abc123def4567890abcdef1234567890".into()),
             title: "With id".into(),
             parents: vec![],
             markdown: String::new(),
         },
-        NotionPage {
-            notion_id: None,
+        ImportedPage {
+            external_id: None,
             title: "No id".into(),
             parents: vec![],
             markdown: String::new(),

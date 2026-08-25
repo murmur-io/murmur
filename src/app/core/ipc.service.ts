@@ -47,8 +47,9 @@ import type {
   DigestResult,
   BulkImportProgress,
   DocImportProgress,
-  NotionImportReport,
-  NotionScanReport,
+  ImportReport,
+  ImportScanReport,
+  ImportSourceId,
   DocumentInfo,
   DossierData,
   EchoSuppressedPayload,
@@ -3034,23 +3035,29 @@ export class IpcService {
   }
 
   /**
-   * DRY-RUN a Notion export (a `.zip` or an unpacked folder): report what an import would do
-   * WITHOUT writing anything. Zero egress - the file is already on this machine.
+   * DRY-RUN an import: report what it would do WITHOUT writing anything. `path` is the export
+   * archive/folder for Notion and Obsidian, and null for Apple Notes (the library IS the source).
+   * Zero egress - every source is already on this machine.
    */
-  scanNotionExport(path: string): Promise<NotionScanReport> {
-    return invoke<NotionScanReport>("scan_notion_export", { path });
+  scanImport(
+    source: ImportSourceId,
+    path: string | null,
+  ): Promise<ImportScanReport> {
+    return invoke<ImportScanReport>("scan_import", { source, path });
   }
 
   /**
-   * Import a Notion export into `folderId` (or the Notes root when null), optionally mirroring
-   * the page tree as nested note folders. Progress arrives on {@link onBulkImport}.
+   * Import into `folderId` (or the Notes root when null), optionally mirroring the source tree as
+   * nested note folders. Progress arrives on {@link onBulkImport}.
    */
-  importNotionExport(
-    path: string,
+  runImport(
+    source: ImportSourceId,
+    path: string | null,
     folderId: string | null,
     mirrorHierarchy: boolean,
-  ): Promise<NotionImportReport> {
-    return invoke<NotionImportReport>("import_notion_export", {
+  ): Promise<ImportReport> {
+    return invoke<ImportReport>("run_import", {
+      source,
       path,
       folderId,
       mirrorHierarchy,
@@ -3058,8 +3065,8 @@ export class IpcService {
   }
 
   /** Ask an in-flight import to stop after the current page. Already-written notes stay. */
-  cancelNotionImport(): Promise<void> {
-    return invoke<void>("cancel_notion_import");
+  cancelImport(): Promise<void> {
+    return invoke<void>("cancel_import");
   }
 
   /** Create a note-kind folder under an optional parent. Returns the new {@link NoteFolder}. */

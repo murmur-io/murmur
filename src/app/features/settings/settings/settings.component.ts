@@ -53,7 +53,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "organization", label: "Organization", keywords: "org team shared brain company workspace members invite colleague owner consent sync org brain shared knowledge base leave" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
-  { id: "imports", label: "Imports", keywords: "notion import migrate export zip markdown bring in move from another app evernote bear obsidian vault" },
+  { id: "imports", label: "Imports", keywords: "notion obsidian apple notes import migrate export zip markdown vault bring in move from another app switch migration" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
 ];
 
