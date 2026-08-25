@@ -55,6 +55,7 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
 ];
 
 const BROWSE_GROUPS = ["Work", "Intelligence", "Insights"] as const;
+const NARROW_SHELL_QUERY = "(max-width: 760px)";
 
 @Component({
   selector: "app-shell",
@@ -150,6 +151,11 @@ export class AppShellComponent {
     const firstSpace = this.workspace.forest()[0];
     return Boolean(firstSpace && (!firstSpace.locked || firstSpace.unlocked));
   });
+  readonly relockAllAriaLabel = computed(() => {
+    const count = this.unlockedCount();
+    const noun = count === 1 ? "folder" : "folders";
+    return `Re-seal all ${count} unlocked ${noun} now`;
+  });
 
   private readonly _syncTabsStripHeight = effect(() => {
     const height = this.tabs.tabs().length > 0 ? "48px" : "0px";
@@ -165,13 +171,17 @@ export class AppShellComponent {
       await this.workspace.reload();
     }
     const firstSpace = this.workspace.forest()[0];
-    if (firstSpace) {
+    const path = this.currentPath();
+    const fixedDrilldown =
+      path.startsWith("/settings") || path.startsWith("/org-item/");
+    const narrowViewport = window.matchMedia(NARROW_SHELL_QUERY).matches;
+    if ((fixedDrilldown || narrowViewport) && firstSpace) {
       this._contextOverride.set(null);
       await this.router.navigate(["/container", firstSpace.id]);
       return;
     }
     this._contextOverride.set("spaces");
-    if (this.currentPath().startsWith("/settings")) {
+    if (fixedDrilldown) {
       await this.router.navigate(["/record"]);
     }
   }

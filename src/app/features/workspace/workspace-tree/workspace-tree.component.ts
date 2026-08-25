@@ -143,7 +143,7 @@ export class WorkspaceTreeComponent {
 
   private pushContainer(out: TreeLine[], container: ContainerNode, depth: number): void {
     out.push({ key: `c:${container.id}`, depth, container });
-    if (!this.isContainerExpanded(container)) {
+    if (this.isSealed(container) || !this.isContainerExpanded(container)) {
       return;
     }
     const allItems = container.groups
@@ -220,14 +220,24 @@ export class WorkspaceTreeComponent {
 
   /** A container with no groups and no folders has nothing to disclose. */
   protected containerExpandable(container: ContainerNode): boolean {
-    return container.groups.length > 0 || container.folders.length > 0;
+    return (
+      !this.isSealed(container) &&
+      (container.groups.length > 0 || container.folders.length > 0)
+    );
   }
 
   protected isContainerExpanded(container: ContainerNode): boolean {
+    if (this.isSealed(container)) {
+      return false;
+    }
     return (
       this.workspace.isContainerExpanded(container.id) ||
       this.containerContainsCurrentSelection(container)
     );
+  }
+
+  protected isSealed(container: ContainerNode): boolean {
+    return container.locked && !container.unlocked;
   }
 
   private containerContainsCurrentSelection(container: ContainerNode): boolean {
@@ -488,6 +498,10 @@ export class WorkspaceTreeComponent {
 
   /** The unlock half of {@link lockLabel} — it cascades too. */
   protected unlockLabel(container: ContainerNode): string {
+    if (this.isSealed(container)) {
+      // A sealed row must not reveal whether the payload contains descendants.
+      return "Unlock for this session";
+    }
     const nested = container.folders.length;
     return nested === 0
       ? "Unlock for this session"
