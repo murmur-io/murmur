@@ -1,0 +1,7 @@
+# The grandchild teardown smoke owns a real macOS process group. Two hosted runs rejected its
+# group signal with EPERM while the same fixture passed on the same runner image in another run.
+# Keep every fail-closed production assertion intact and remove concurrent test scheduling as a
+# variable by reserving the whole nextest pool for this operating-system oracle.
+[[profile.default.overrides]]
+filter = 'package(murmur) & test(=summarize::claude_code::tests::a_timed_out_child_leaves_no_unproven_process_group)'
+threads-required = "num-test-threads"
