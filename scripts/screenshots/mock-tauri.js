@@ -940,6 +940,11 @@ scope to the GA-critical path only.
       case "meeting_org_shares": return [];
       case "org_live_shares_for_source": return [];
 
+      // Workspace's unfiled inbox expects a typed ItemPage, not the generic
+      // array fallback used by other `list_*` demo commands.
+      case "list_container_items":
+        return { kind: args.kind || "meeting", total: 0, items: [] };
+
       // ── Vault audit — weekly schedule + AI explain ──
       // Object-shaped (a bare `get_` name would fall through to the `[]`
       // fallback below — the FE expects an AuditSchedule, not an array).

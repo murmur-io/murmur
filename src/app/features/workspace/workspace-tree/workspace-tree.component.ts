@@ -115,14 +115,16 @@ export class WorkspaceTreeComponent {
    * refetch of its own; the header's toggle owns the deliberate refresh.
    */
   constructor() {
-    if (this.workspace.forestEmpty()) {
+    if (this.workspace.workspaceEmpty()) {
       void this.workspace.reload();
     }
   }
 
   protected readonly loading = this.workspace.loading;
   protected readonly error = this.workspace.error;
-  protected readonly forestEmpty = this.workspace.forestEmpty;
+  protected readonly workspaceEmpty = this.workspace.workspaceEmpty;
+  protected readonly unfiledRecordings = this.workspace.unfiledRecordings;
+  protected readonly unfiledExpanded = signal(true);
 
   /**
    * The whole forest as flat lines.
@@ -216,6 +218,14 @@ export class WorkspaceTreeComponent {
 
   protected viewAllLabel(total: number): string {
     return `View all (${total})`;
+  }
+
+  protected viewAllRecordingsLabel(total: number): string {
+    return `View all recordings (${total})`;
+  }
+
+  protected toggleUnfiled(): void {
+    this.unfiledExpanded.update((expanded) => !expanded);
   }
 
   /** A container with no groups and no folders has nothing to disclose. */
@@ -369,6 +379,11 @@ export class WorkspaceTreeComponent {
     return this.draggableKind(item)
       ? this.moveTargets().filter((target) => target.id !== current.id)
       : [];
+  }
+
+  /** Unfiled recordings have no current container to exclude. */
+  protected unfiledMoveTargets(item: ItemRow): ContainerNode[] {
+    return this.draggableKind(item) ? this.moveTargets() : [];
   }
 
   protected async moveItemTo(item: ItemRow, target: ContainerNode): Promise<void> {
@@ -578,5 +593,11 @@ export class WorkspaceTreeComponent {
 
   protected openAll(container: ContainerNode): void {
     this.openContainer(container);
+  }
+
+  protected openAllRecordings(): void {
+    void this.notes.selectFolder(null);
+    this.folders.selectFolder(null);
+    void this.router.navigate(["/library"]);
   }
 }
