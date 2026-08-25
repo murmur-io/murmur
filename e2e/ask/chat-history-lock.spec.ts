@@ -92,14 +92,29 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
     page.getByText("Sensitive Ask message", { exact: true }),
   ).toBeVisible();
 
-  // Locking now lives in the container row's actions menu — the one hierarchy replaced the
-  // two per-type trees that each carried a bare lock toggle. The behaviour under test is
-  // what locking DOES, so the spec follows the affordance rather than pinning its old place.
-  // The folder lives INSIDE the project, so the project has to be expanded before its row
-  // exists at all — and the menu must be the FOLDER's, not the project's, which is what a
-  // `.first()` would have picked.
-  await page.getByRole("button", { name: "Expand Workspace" }).click();
-  await page.getByRole("button", { name: "Actions for History note folder" }).focus();
+  // Open the hierarchy without leaving the mounted Ask route. The loaded
+  // conversation and its sensitive source must remain present until locking
+  // publishes the invalidation that scrubs them.
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("button", { name: "Spaces", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/ask$/);
+  await expect(page.locator("mur-chat-history")).toBeVisible();
+  await expect(
+    page.getByText("Sensitive Ask message", { exact: true }),
+  ).toBeVisible();
+
+  const spacesSidebar = page.getByRole("complementary", {
+    name: "Spaces sidebar",
+  });
+  await expect(spacesSidebar).toBeVisible();
+  await spacesSidebar
+    .getByRole("button", { name: "Expand Workspace" })
+    .click();
+  await spacesSidebar
+    .getByRole("button", { name: "Actions for History note folder" })
+    .focus();
   await page.keyboard.press("Enter");
   const lock = page.getByRole("menuitem", { name: /^Lock (folder|project)/ });
   await expect(lock).toBeAttached();
@@ -187,11 +202,27 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
     page.getByText("Meeting-derived secret", { exact: true }),
   ).toBeVisible();
 
-  // The folder lives INSIDE the project, so the project has to be expanded before its row
-  // exists at all — and the menu must be the FOLDER's, not the project's, which is what a
-  // `.first()` would have picked.
-  await page.getByRole("button", { name: "Expand Workspace" }).click();
-  await page.getByRole("button", { name: "Actions for History meeting folder" }).focus();
+  // Opening Spaces is contextual navigation: it must not unmount Ask or scrub
+  // the message before the actual lock transition occurs.
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("button", { name: "Spaces", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/ask$/);
+  await expect(
+    page.getByText("Meeting-derived secret", { exact: true }),
+  ).toBeVisible();
+
+  const spacesSidebar = page.getByRole("complementary", {
+    name: "Spaces sidebar",
+  });
+  await expect(spacesSidebar).toBeVisible();
+  await spacesSidebar
+    .getByRole("button", { name: "Expand Workspace" })
+    .click();
+  await spacesSidebar
+    .getByRole("button", { name: "Actions for History meeting folder" })
+    .focus();
   await page.keyboard.press("Enter");
   const lock = page.getByRole("menuitem", { name: /^Lock (folder|project)/ });
   await expect(lock).toBeAttached();
