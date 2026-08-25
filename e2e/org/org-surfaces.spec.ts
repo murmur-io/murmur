@@ -244,14 +244,33 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
       }),
     });
     await page.goto("/library");
-    // The lock affordance moved into the container row's actions menu when the one hierarchy
-    // replaced the two per-type trees. The gate it must run is unchanged: probe shares FIRST,
-    // and put this dialog in front of the seal.
-    const project = page.getByRole("treeitem").first();
+
+    await expect(page.locator("app-library .library")).toBeVisible();
+    await page
+      .getByRole("navigation", { name: "Global navigation" })
+      .getByRole("button", { name: "Spaces", exact: true })
+      .click();
+    await expect(page).toHaveURL(/\/library$/);
+    await expect(page.locator("app-library .library")).toBeVisible();
+
+    // The contextual tree exposes the lock menu without replacing the mounted
+    // meetings surface. The shares gate remains unchanged: probe first, then
+    // put the blocking dialog in front of the seal.
+    const spacesSidebar = page.getByRole("complementary", {
+      name: "Spaces sidebar",
+    });
+    await expect(spacesSidebar).toBeVisible();
+    const project = spacesSidebar.getByRole("treeitem").first();
     await expect(project).toBeVisible({ timeout: 10_000 });
-    await page.getByRole("button", { name: /^Expand / }).first().click();
+    await spacesSidebar
+      .getByRole("button", { name: /^Expand / })
+      .first()
+      .click();
     // Focus, not a pointer — see the note in lock-shares-dialog.spec.ts.
-    await page.getByRole("button", { name: /^Actions for / }).last().focus();
+    await spacesSidebar
+      .getByRole("button", { name: /^Actions for / })
+      .last()
+      .focus();
     await page.keyboard.press("Enter");
     // The lock entry names the CASCADE now: locking a container seals every container inside it,
     // so a project holding folders says so rather than calling itself "Lock folder". This test is
