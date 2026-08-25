@@ -5,12 +5,12 @@
    `app-shell.component.html`/`.scss` for the `.main-col` wrapper this sits
    in). `height: 48px` here MUST stay in sync with
    `app-shell.component.ts`'s `_syncTabsStripHeight` effect (`--tabs-strip-
-   height`), which every drill-down's fixed host reads for its own `top`
-   offset — a mismatch between this literal and that effect's `"48px"`
+   height`), which fixed child surfaces read for their own `top` offset — a
+   mismatch between this literal and that effect's `"48px"`
    re-opens the header-overlap bug this pass fixed.
 
    VISUAL LANGUAGE: the same `--shell-glass-*` / `--shell-active-*` chrome
-   `.pill-bar` and the sidebar's active nav item already use — but applied
+   the global and contextual rails already use — but applied
    PER TAB, never to the row container. `.tab-strip` is LAYOUT ONLY — no
    background, no border, no shadow, no blur of its own (fixed 2026-07-12,
    third pass: painting the glass recipe on the whole row left a visible
@@ -33,21 +33,6 @@
   overflow-x: auto;
 }
 
-/* Drill-down routes (/settings, /org-item — `app-shell.drilldown`, a host
-   binding mirroring `inDrilldown()`) render NO sidebar/pill chrome, so
-   `.main-col` — and with it this strip — starts flush at the window's LEFT
-   edge, exactly where the overlay macOS traffic lights float
-   (trafficLightPosition 32,30 in tauri.conf.json → the three buttons span
-   ≈ x 32..84, vertically inside this 48px row). Reserve left clearance so
-   the first tab never sits beneath them (same structural-constant family as
-   `.pill-bar`'s `100vw - 170px` and `.sidebar-drag`'s 48px in styles.css).
-   Every other chrome mode already clears the lights: the full sidebar and
-   the icon rail sit left of this strip, and pill mode pushes `.main-col`
-   84px down. */
-:host-context(app-shell.drilldown) .tab-strip {
-  padding-left: 96px;
-}
-
 .tab-item {
   display: flex;
   align-items: center;
@@ -64,7 +49,7 @@
 }
 
 .tab-item.active {
-  /* The SAME neutral "glass on glass" lift the sidebar/pill-bar give their
+  /* The SAME neutral "glass on glass" lift the shell rails give their
      active nav item — a lensing highlight, not an opaque flat fill. */
   background: var(--shell-active-bg);
   box-shadow: var(--shell-active-shadow);

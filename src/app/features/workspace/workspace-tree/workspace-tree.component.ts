@@ -24,7 +24,6 @@ import type {
   ItemRow,
   OrganizeMove,
   OrganizePlan,
-  TypeGroup,
 } from "../../../core/models";
 import { IpcService } from "../../../core/ipc.service";
 import { OrganizeSheetComponent } from "../../notes/organize-sheet/organize-sheet.component";
@@ -40,21 +39,15 @@ export interface TreeLine {
   key: string;
   depth: number;
   container: ContainerNode;
-  /** Present on a type-group header line and on an item line. */
-  group?: TypeGroup;
   /** Present only on an item line. */
   item?: ItemRow;
-  /** Present only on a "see all" line. */
+  /** Present only on the shared continuation line. */
   seeAll?: boolean;
+  /** Full visible item count across every kind in this container. */
+  total?: number;
 }
 
-/** Group headings for the four kinds, in the order the backend emits them. */
-const KIND_LABEL: Record<ItemKind, string> = {
-  meeting: "Meetings",
-  note: "Notes",
-  task: "Tasks",
-  dashboard: "Dashboards",
-};
+const MAX_VISIBLE_ITEMS = 8;
 
 /**
  * Where activating an item navigates. These MUST name real entries in
@@ -70,7 +63,7 @@ const KIND_ROUTE: Record<ItemKind, string> = {
 
 /**
  * The workspace tree: Projects at the top, each holding Folders, and both
- * holding collapsible per-type groups of Notes, Meetings, Tasks and Dashboards.
+ * holding one time-ordered stream of Notes, Meetings, Tasks and Dashboards.
  *
  * Replaces the two per-type sidebar trees (`app-meetings-sidebar-tree` and
  * `app-notes-sidebar-tree`), which rendered one namespace each and could not
@@ -105,8 +98,8 @@ export class WorkspaceTreeComponent {
   private readonly lockFlow = inject(FolderLockFlowService);
   private readonly notes = inject(NotesService);
 
-  /** Whether this section owns the current route (drives selection styling). */
-  readonly sectionActive = input(false);
+  /** Current route path, used to select a container or leaf row. */
+  readonly currentPath = input("");
 
   /**
    * Load the forest when this tree first appears.
@@ -150,35 +143,52 @@ export class WorkspaceTreeComponent {
 
   private pushContainer(out: TreeLine[], container: ContainerNode, depth: number): void {
     out.push({ key: `c:${container.id}`, depth, container });
-    if (!this.workspace.isContainerExpanded(container.id)) {
+    if (!this.isContainerExpanded(container)) {
       return;
     }
-    for (const group of container.groups) {
-      const groupKey = `g:${container.id}:${group.kind}`;
-      out.push({ key: groupKey, depth: depth + 1, container, group });
-      if (!this.workspace.isGroupExpanded(container.id, group.kind)) {
-        continue;
-      }
-      for (const item of group.items) {
-        out.push({
-          key: `i:${item.kind}:${item.id}`,
-          depth: depth + 2,
-          container,
-          group,
-          item,
-        });
-      }
-      if (group.total > group.items.length) {
-        out.push({ key: `s:${groupKey}`, depth: depth + 2, container, group, seeAll: true });
-      }
+    const allItems = container.groups
+      .flatMap((group) => group.items)
+      .sort((left, right) => right.sortAt - left.sortAt);
+    const newestItems = allItems.slice(0, MAX_VISIBLE_ITEMS);
+    const selectedItem = allItems.find((item) => this.isItemSelected(item));
+    const selectedIsNewest = selectedItem
+      ? newestItems.some(
+          (item) => item.kind === selectedItem.kind && item.id === selectedItem.id,
+        )
+      : false;
+    const items =
+      selectedItem && !selectedIsNewest
+        ? [
+            ...allItems
+              .filter(
+                (item) =>
+                  item.kind !== selectedItem.kind || item.id !== selectedItem.id,
+              )
+              .slice(0, MAX_VISIBLE_ITEMS - 1),
+            selectedItem,
+          ].sort((left, right) => right.sortAt - left.sortAt)
+        : newestItems;
+    for (const item of items) {
+      out.push({
+        key: `i:${item.kind}:${item.id}`,
+        depth: depth + 1,
+        container,
+        item,
+      });
+    }
+    const total = container.groups.reduce((sum, group) => sum + group.total, 0);
+    if (total > items.length) {
+      out.push({
+        key: `s:${container.id}`,
+        depth: depth + 1,
+        container,
+        seeAll: true,
+        total,
+      });
     }
     for (const child of container.folders) {
       this.pushContainer(out, child, depth + 1);
     }
-  }
-
-  protected kindLabel(kind: ItemKind): string {
-    return KIND_LABEL[kind];
   }
 
   /**
@@ -204,8 +214,8 @@ export class WorkspaceTreeComponent {
     return title ? title : "Untitled";
   }
 
-  protected seeAllLabel(group: TypeGroup): string {
-    return `See all (${group.total})`;
+  protected viewAllLabel(total: number): string {
+    return `View all (${total})`;
   }
 
   /** A container with no groups and no folders has nothing to disclose. */
@@ -214,19 +224,36 @@ export class WorkspaceTreeComponent {
   }
 
   protected isContainerExpanded(container: ContainerNode): boolean {
-    return this.workspace.isContainerExpanded(container.id);
+    return (
+      this.workspace.isContainerExpanded(container.id) ||
+      this.containerContainsCurrentSelection(container)
+    );
   }
 
-  protected isGroupExpanded(container: ContainerNode, group: TypeGroup): boolean {
-    return this.workspace.isGroupExpanded(container.id, group.kind);
+  private containerContainsCurrentSelection(container: ContainerNode): boolean {
+    if (
+      container.groups.some((group) =>
+        group.items.some((item) => this.isItemSelected(item)),
+      )
+    ) {
+      return true;
+    }
+    return container.folders.some((folder) =>
+      this.isContainerSelected(folder) ||
+      this.containerContainsCurrentSelection(folder),
+    );
   }
 
   protected toggleContainer(container: ContainerNode): void {
     this.workspace.toggleContainer(container.id);
   }
 
-  protected toggleGroup(container: ContainerNode, group: TypeGroup): void {
-    this.workspace.toggleGroup(container.id, group.kind);
+  protected isContainerSelected(container: ContainerNode): boolean {
+    return this.currentPath() === `/container/${container.id}`;
+  }
+
+  protected isItemSelected(item: ItemRow): boolean {
+    return this.currentPath() === `${KIND_ROUTE[item.kind]}/${item.id}`;
   }
 
   /**
@@ -376,8 +403,8 @@ export class WorkspaceTreeComponent {
    *
    * They are not decoration. Locking a folder from the sidebar is how a user makes a
    * folder private at all, and removing the trees that offered it would have taken the
-   * feature away rather than moved it. They live behind the same `…` a ClickUp row uses,
-   * beside the `+`, so creating and managing stay visibly different actions.
+   * feature away rather than moved it. Creation and management remain separate
+   * controls so their consequences are not conflated.
    */
   /// Locking goes through the lock FLOW, never `FoldersService.lock` directly.
   ///
@@ -535,9 +562,7 @@ export class WorkspaceTreeComponent {
     this.organizePlan.set(null);
   }
 
-  protected openGroup(container: ContainerNode, group: TypeGroup): void {
-    void this.router.navigate(["/container", container.id], {
-      queryParams: { kind: group.kind },
-    });
+  protected openAll(container: ContainerNode): void {
+    this.openContainer(container);
   }
 }

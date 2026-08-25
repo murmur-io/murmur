@@ -115,20 +115,20 @@ test("Analytics dashboard shows cached data instantly on a return visit, not a L
   // being tested). This is a plain SPA route swap to a route NOT covered by
   // `TabRouteReuseStrategy`, so `/analytics` and its children are genuinely
   // destroyed.
-  await page.getByRole("link", { name: "Meetings", exact: true }).click();
+  const browseSidebar = page.getByRole("complementary", {
+    name: "Browse sidebar",
+  });
+  await browseSidebar
+    .getByRole("link", { name: "Meetings", exact: true })
+    .click();
   await expect(page.getByText("Total meetings")).toBeHidden();
 
-  // Navigate BACK, again via the in-app link. The "Insights" sidebar
-  // section (which holds the Analytics link) auto-collapses once its route
-  // is no longer active, so expand it first.
-  const insightsToggle = page.getByRole("button", { name: "Expand Insights" });
-  if (await insightsToggle.isVisible()) {
-    await insightsToggle.click();
-  }
   // Navigate BACK — the cached numbers/threads/ledger must render INSTANTLY,
   // i.e. before the freshly-delayed IPC promises above have any chance to
   // resolve (they take 400ms; assert well inside that window).
-  await page.getByRole("link", { name: "Analytics", exact: true }).click();
+  await browseSidebar
+    .getByRole("link", { name: "Analytics", exact: true })
+    .click();
   await expect(page.getByText("Total meetings")).toBeVisible({
     timeout: 250,
   });

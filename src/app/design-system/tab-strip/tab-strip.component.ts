@@ -6,7 +6,7 @@ import { TabsService } from "../../core/tabs.service";
  * Browser-style tab strip for Murmur's open meeting/note "document" tabs.
  * Renders whenever {@link TabsService.tabs} is non-empty as a REAL in-flow
  * Apple Liquid Glass tab row — the same `--shell-glass-*`/`--shell-active-*`
- * chrome language `.pill-bar` and the sidebar's active nav item already use.
+ * chrome language the global and contextual rails already use.
  *
  * IN-FLOW, NOT FLOATING (fixed 2026-07-12 — was `position: fixed`, a
  * floating overlay that could never make the page underneath aware space
@@ -15,12 +15,10 @@ import { TabsService } from "../../core/tabs.service";
  * `AppShellComponent`'s `.main-col` flex column (see its template) — when
  * tabs are open it PUSHES `.app-main` down by its real rendered height via
  * normal box flow, and contributes zero height when empty (this `@if`).
- * The one remaining wrinkle — drill-down routes (library / notes home / note
- * editor / settings) render their OWN `position: fixed` full-window host,
- * which would paint over this strip regardless of DOM order — is solved on
- * THEIR side: they read `top: var(--tabs-strip-height, 0px)` (set on
- * `<html>` by `AppShellComponent`, driven by this same tab count) instead of
- * `inset: 0`, so they structurally leave this strip's real height uncovered.
+ * A child surface that escapes normal flow with a fixed host must read
+ * `top: var(--tabs-strip-height, 0px)` (set on `<html>` by
+ * `AppShellComponent`, driven by this same tab count), so it structurally
+ * leaves this strip's real height uncovered.
  *
  * Injects `TabsService`/`Router` directly (the same pattern `mur-quick-search`
  * uses) rather than threading inputs/outputs through `AppShellComponent` —
