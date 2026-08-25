@@ -57,25 +57,6 @@
             </div>
           </div>
 
-          <!-- Sidebar collapse behavior: the floating top pill bar (default)
-               or a slim icon-only rail docked at the left edge. -->
-          <div class="card appearance-card">
-            <div class="appearance-copy">
-              <h3>Sidebar</h3>
-              <p class="text-secondary">
-                What the sidebar becomes when you collapse it. <b>Top bar</b>
-                floats the navigation at the top of the window; <b>Icon
-                rail</b> keeps a slim icon column at the side.
-              </p>
-            </div>
-            <mur-segmented
-              [options]="collapseOptions"
-              [value]="collapseStyle()"
-              (valueChange)="setCollapseStyle($event)"
-              ariaLabel="Sidebar collapse behavior"
-            />
-          </div>
-
           <!-- Liquid Glass intensity — how translucent the chrome panels
                (sidebar / pill bar / rails) are. Applies live, auto-saved. -->
           <div class="card appearance-card">

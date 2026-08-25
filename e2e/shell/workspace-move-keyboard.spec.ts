@@ -62,9 +62,9 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await expect(page.getByRole("tree", { name: "Workspace" })).toBeVisible();
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
   await page.getByRole("button", { name: "Expand Acme" }).click();
-  await page.getByRole("button", { name: "Expand Meetings" }).click();
 }
 
 /**

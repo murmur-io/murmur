@@ -12,7 +12,7 @@
          blanking a view the user is navigating. -->
     <p class="tree-error" role="status">{{ message }}</p>
   }
-  <div class="tree" role="tree" [attr.aria-label]="'Workspace'">
+  <div class="tree" role="tree" aria-label="Spaces">
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
@@ -21,9 +21,11 @@
           class="line line--item"
           role="treeitem"
           [attr.aria-level]="line.depth + 1"
+          [attr.aria-selected]="isItemSelected(item)"
           [label]="itemTitle(item)"
           [depth]="line.depth"
           [icon]="kindIcon(item.kind)"
+          [selected]="isItemSelected(item)"
           [attr.draggable]="draggableKind(item) ? true : null"
           (dragstart)="onDragStart($event, item)"
           (dragend)="onDragEnd()"
@@ -54,27 +56,10 @@
           [style.padding-left]="
             'calc(' + line.depth + ' * var(--tree-indent) + 20px)'
           "
-          (click)="openGroup(line.container, line.group!)"
+          (click)="openAll(line.container)"
         >
-          {{ seeAllLabel(line.group!) }}
+          {{ viewAllLabel(line.total!) }}
         </button>
-      } @else if (line.group; as group) {
-        <!-- A TYPE-GROUP header: the count is the container's FULL visible total
-             for that kind, not the size of the first page below it. -->
-        <mur-tree-row
-          class="line line--group"
-          role="treeitem"
-          [attr.aria-level]="line.depth + 1"
-          [attr.aria-expanded]="isGroupExpanded(line.container, group)"
-          [label]="kindLabel(group.kind)"
-          [depth]="line.depth"
-          [icon]="kindIcon(group.kind)"
-          [count]="group.total"
-          [expandable]="group.total > 0"
-          [expanded]="isGroupExpanded(line.container, group)"
-          (toggleExpand)="toggleGroup(line.container, group)"
-          (activate)="toggleGroup(line.container, group)"
-        />
       } @else {
         <!-- A CONTAINER row: a Project or a Folder. A sealed-and-not-unlocked
              one carries no groups at all, so it is not expandable and shows no
@@ -84,12 +69,14 @@
           [class.line--project]="line.container.level === 'project'"
           role="treeitem"
           [attr.aria-level]="line.depth + 1"
+          [attr.aria-selected]="isContainerSelected(line.container)"
           [attr.aria-expanded]="containerExpandable(line.container) ? isContainerExpanded(line.container) : null"
           [attr.data-tint]="line.container.tint"
           [label]="line.container.name"
           [depth]="line.depth"
           [icon]="containerIcon(line.container)"
           [emoji]="line.container.emoji"
+          [selected]="isContainerSelected(line.container)"
           [expandable]="containerExpandable(line.container)"
           [expanded]="isContainerExpanded(line.container)"
           appFolderDrop
@@ -123,38 +110,39 @@
             class="row-actions"
             [label]="'Actions for ' + line.container.name"
           >
-            @if (canLock(line.container)) {
-              <button type="button" role="menuitem" (click)="lock(line.container)">
-                {{ lockLabel(line.container) }}
-              </button>
-            }
-            @if (line.container.locked && !line.container.unlocked) {
+            @if (isSealed(line.container)) {
               <button type="button" role="menuitem" (click)="unlock(line.container)">
                 {{ unlockLabel(line.container) }}
               </button>
-            }
-            @if (line.container.locked && line.container.unlocked) {
-              <button type="button" role="menuitem" (click)="relock(line.container)">
-                Lock again
+            } @else {
+              @if (canLock(line.container)) {
+                <button type="button" role="menuitem" (click)="lock(line.container)">
+                  {{ lockLabel(line.container) }}
+                </button>
+              }
+              @if (line.container.locked && line.container.unlocked) {
+                <button type="button" role="menuitem" (click)="relock(line.container)">
+                  Lock again
+                </button>
+              }
+              @if (canOrganize(line.container)) {
+                <button
+                  type="button"
+                  role="menuitem"
+                  [disabled]="organizePlanning()"
+                  (click)="organize(line.container)"
+                  data-testid="organize-container"
+                >
+                  {{ organizePlanning() ? "Reading this folder…" : "Organize with AI" }}
+                </button>
+              }
+              <button type="button" role="menuitem" (click)="rename(line.container)">
+                Rename
+              </button>
+              <button type="button" role="menuitem" (click)="remove(line.container)">
+                Delete folder
               </button>
             }
-            @if (canOrganize(line.container)) {
-              <button
-                type="button"
-                role="menuitem"
-                [disabled]="organizePlanning()"
-                (click)="organize(line.container)"
-                data-testid="organize-container"
-              >
-                {{ organizePlanning() ? "Reading this folder…" : "Organize with AI" }}
-              </button>
-            }
-            <button type="button" role="menuitem" (click)="rename(line.container)">
-              Rename
-            </button>
-            <button type="button" role="menuitem" (click)="remove(line.container)">
-              Delete folder
-            </button>
           </mur-row-menu>
           @if (line.container.locked && line.container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's

@@ -7,7 +7,6 @@ import { MurSliderComponent } from "../../../../design-system/slider/slider.comp
 import {
   ChromeService,
   type AccentId,
-  type SidebarCollapseStyle,
 } from "../../../../services/chrome.service";
 import { GlassService } from "../../../../services/glass.service";
 import { ThemeService, type ThemeMode } from "../../../../services/theme.service";
@@ -50,20 +49,6 @@ export class SettingsAppearanceSectionComponent {
   /** Apply + persist the glass level live as the slider moves (auto-saved). */
   setGlass(value: number): void {
     this.glass.setLevel(value);
-  }
-
-  /** The two sidebar-collapse behaviors, rendered by <mur-segmented>. */
-  readonly collapseOptions: readonly SegmentOption[] = [
-    { value: "bar", label: "Top bar", icon: "topbar" },
-    { value: "rail", label: "Icon rail", icon: "sidebar" },
-  ];
-
-  /** Current collapse behavior — drives the Sidebar control. */
-  readonly collapseStyle = this.chrome.collapseStyle;
-
-  /** Apply a collapse behavior immediately (persisted in the service). */
-  setCollapseStyle(style: string): void {
-    this.chrome.setCollapseStyle(style as SidebarCollapseStyle);
   }
 
   /** The accent swatches; each maps to an `--accent-option-*` token class. */
