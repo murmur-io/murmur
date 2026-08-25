@@ -287,6 +287,39 @@ pub fn emit_doc_import_done(app: &AppHandle, document_id: &str, truncated: bool)
     }
 }
 
+/// Progress for an in-flight BULK import (`import_notion_export`): one event per page written, so
+/// the Settings → Imports screen shows a real "k of N" bar instead of a frozen dialog on a
+/// thousand-page workspace. A stalled counter after the counting phase is the single most-reported
+/// bulk-import complaint in the prior art, so the denominator ticks per page, not per stage.
+/// Carries COUNTS ONLY — never a page title, a body, a filename or a path. NO PII.
+pub const EVENT_BULK_IMPORT: &str = "murmur://bulk-import";
+
+/// Payload for [`EVENT_BULK_IMPORT`]. `stage` is `"scanning"` | `"importing"` | `"linking"` |
+/// `"done"`; `done`/`total` are page counts within that stage. Deliberately carries no id and no
+/// title: a bulk import's ids are meaningful only in aggregate, and a title would be content.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkImportPayload {
+    /// "scanning" | "importing" | "linking" | "done"
+    pub stage: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Emit [`EVENT_BULK_IMPORT`] (best-effort; swallows the emit failure with a non-PII warn).
+pub fn emit_bulk_import(app: &AppHandle, stage: &str, done: usize, total: usize) {
+    if let Err(e) = app.emit(
+        EVENT_BULK_IMPORT,
+        BulkImportPayload {
+            stage: stage.to_string(),
+            done,
+            total,
+        },
+    ) {
+        tracing::warn!(target: "import", error = %e, stage, "emit bulk-import failed");
+    }
+}
+
 /// Progress for the semantic-search backfill (`reindex_embeddings`) over all visible meetings.
 /// Carries COUNTS ONLY — no meeting ids, titles, or content (NO PII).
 pub const EVENT_REINDEX: &str = "murmur://reindex-embeddings";

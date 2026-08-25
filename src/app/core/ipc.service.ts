@@ -45,7 +45,10 @@ import type {
   DashboardSummary,
   DashboardTint,
   DigestResult,
+  BulkImportProgress,
   DocImportProgress,
+  NotionImportReport,
+  NotionScanReport,
   DocumentInfo,
   DossierData,
   EchoSuppressedPayload,
@@ -189,6 +192,7 @@ export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
 export const EVENT_REINDEX = "murmur://reindex-embeddings";
 // Brain v3 PR-2 — extract→chunk→embed progress for an in-flight document import (counts + stage, NO PII).
 export const EVENT_DOC_IMPORT = "murmur://doc-import";
+export const EVENT_BULK_IMPORT = "murmur://bulk-import";
 // Phase D — on-device PERSON-name NER (redaction) model download progress stream.
 export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 // Recording-storage: an AUTO-prune freed ≥1 old recording's audio to stay under the cap.
@@ -3029,6 +3033,35 @@ export class IpcService {
     return invoke<NoteFolder[]>("list_note_folders");
   }
 
+  /**
+   * DRY-RUN a Notion export (a `.zip` or an unpacked folder): report what an import would do
+   * WITHOUT writing anything. Zero egress - the file is already on this machine.
+   */
+  scanNotionExport(path: string): Promise<NotionScanReport> {
+    return invoke<NotionScanReport>("scan_notion_export", { path });
+  }
+
+  /**
+   * Import a Notion export into `folderId` (or the Notes root when null), optionally mirroring
+   * the page tree as nested note folders. Progress arrives on {@link onBulkImport}.
+   */
+  importNotionExport(
+    path: string,
+    folderId: string | null,
+    mirrorHierarchy: boolean,
+  ): Promise<NotionImportReport> {
+    return invoke<NotionImportReport>("import_notion_export", {
+      path,
+      folderId,
+      mirrorHierarchy,
+    });
+  }
+
+  /** Ask an in-flight import to stop after the current page. Already-written notes stay. */
+  cancelNotionImport(): Promise<void> {
+    return invoke<void>("cancel_notion_import");
+  }
+
   /** Create a note-kind folder under an optional parent. Returns the new {@link NoteFolder}. */
   createNoteFolder(name: string, parentId: string | null): Promise<NoteFolder> {
     return invoke<NoteFolder>("create_note_folder", { name, parentId });
@@ -3343,6 +3376,11 @@ export class IpcService {
    */
   onDocImportProgress(cb: (p: DocImportProgress) => void): Promise<UnlistenFn> {
     return listen<DocImportProgress>(EVENT_DOC_IMPORT, (e) => cb(e.payload));
+  }
+
+  /** Fires with per-page progress for an in-flight bulk import (Settings -> Imports). */
+  onBulkImport(cb: (p: BulkImportProgress) => void): Promise<UnlistenFn> {
+    return listen<BulkImportProgress>(EVENT_BULK_IMPORT, (e) => cb(e.payload));
   }
 
   /** Fires with per-file progress for the in-flight PERSON-name NER model download. */
