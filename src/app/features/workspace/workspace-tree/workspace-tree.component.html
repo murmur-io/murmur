@@ -2,9 +2,9 @@
      on emptiness AND loading, so the first visit shows it and every return
      shows the previous tree while the (still unconditional) reload replaces it
      underneath. Gating on loading() alone is the 2026-07-12 "reload flash". -->
-@if (forestEmpty() && loading()) {
+@if (workspaceEmpty() && loading()) {
   <p class="tree-state">Loading workspace…</p>
-} @else if (forestEmpty()) {
+} @else if (workspaceEmpty()) {
   <p class="tree-state">No projects yet</p>
 } @else {
   @if (error(); as message) {
@@ -13,6 +13,70 @@
     <p class="tree-error" role="status">{{ message }}</p>
   }
   <div class="tree" role="tree" aria-label="Spaces">
+    @if (unfiledRecordings(); as inbox) {
+      @if (inbox.total > 0) {
+        <!-- `container_id = NULL` is an honest inbox, not a synthetic Space:
+             it has no lock/manage/create affordances and cannot accept drops. -->
+        <mur-tree-row
+          class="line line--unfiled"
+          role="treeitem"
+          aria-level="1"
+          [attr.aria-selected]="currentPath() === '/library'"
+          [attr.aria-expanded]="unfiledExpanded()"
+          label="Unfiled recordings"
+          [depth]="0"
+          icon="meeting"
+          [count]="inbox.total"
+          [selected]="currentPath() === '/library'"
+          [expandable]="true"
+          [expanded]="unfiledExpanded()"
+          (toggleExpand)="toggleUnfiled()"
+          (activate)="openAllRecordings()"
+        />
+        @if (unfiledExpanded()) {
+          @for (item of inbox.items; track item.id) {
+            <mur-tree-row
+              class="line line--item line--unfiled-item"
+              role="treeitem"
+              aria-level="2"
+              [attr.aria-selected]="isItemSelected(item)"
+              [label]="itemTitle(item)"
+              [depth]="1"
+              icon="meeting"
+              [selected]="isItemSelected(item)"
+              [attr.draggable]="true"
+              (dragstart)="onDragStart($event, item)"
+              (dragend)="onDragEnd()"
+              (activate)="openItem(item)"
+            >
+              @if (unfiledMoveTargets(item); as targets) {
+                @if (targets.length > 0) {
+                  <mur-row-menu class="row-add" [label]="'Move ' + itemTitle(item)">
+                    @for (target of targets; track target.id) {
+                      <button type="button" role="menuitem" (click)="moveItemTo(item, target)">
+                        {{ target.name }}
+                      </button>
+                    }
+                  </mur-row-menu>
+                }
+              }
+            </mur-tree-row>
+          }
+          @if (inbox.total > inbox.items.length) {
+            <button
+              type="button"
+              class="see-all see-all--unfiled"
+              role="treeitem"
+              aria-selected="false"
+              aria-level="2"
+              (click)="openAllRecordings()"
+            >
+              {{ viewAllRecordingsLabel(inbox.total) }}
+            </button>
+          }
+        }
+      }
+    }
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
