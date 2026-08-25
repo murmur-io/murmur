@@ -100,6 +100,21 @@
         >
           <mur-icon icon="search" />
         </button>
+        <button
+          type="button"
+          class="context-action brain-action"
+          [disabled]="workspaceOrganizeDisabled()"
+          [attr.aria-busy]="workspaceOrganizePlanning()"
+          (click)="planWorkspaceOrganization()"
+          aria-label="Organize unfiled recordings with Brain"
+          title="Organize unfiled recordings with Brain"
+        >
+          @if (workspaceOrganizePlanning()) {
+            <span class="context-spinner" aria-hidden="true"></span>
+          } @else {
+            <mur-icon icon="brain" />
+          }
+        </button>
         @if (canCreateWorkspaceFolder()) {
           <button
             type="button"
@@ -238,6 +253,15 @@
 />
 
 <app-reminder-composer />
+
+@if (workspaceOrganizePlan(); as plan) {
+  <app-workspace-organize-sheet
+    [plan]="plan"
+    [busy]="workspaceOrganizeApplying()"
+    (apply)="applyWorkspaceOrganization($event)"
+    (cancelled)="closeWorkspaceOrganization()"
+  />
+}
 
 @if (tilePalette.open()) {
   <app-tile-palette

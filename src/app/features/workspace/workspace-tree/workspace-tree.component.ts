@@ -548,7 +548,10 @@ export class WorkspaceTreeComponent {
    * gated. Offering the action would produce an empty plan and look broken.
    */
   protected canOrganize(container: ContainerNode): boolean {
-    return !container.locked || container.unlocked;
+    return (
+      (!container.locked || container.unlocked) &&
+      container.groups.some((group) => group.kind === "note" && group.total > 0)
+    );
   }
 
   protected async organize(container: ContainerNode): Promise<void> {

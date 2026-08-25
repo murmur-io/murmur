@@ -94,6 +94,9 @@ import type {
   NoteTemplateSection,
   OrgAccess,
   OrganizePlan,
+  WorkspaceOrganizeApplyResult,
+  WorkspaceOrganizeMove,
+  WorkspaceOrganizePlan,
   OrgFeedUpdatedPayload,
   OrgItemDetail,
   OrgItemHeader,
@@ -2982,6 +2985,21 @@ export class IpcService {
    */
   applyOrganizePlan(plan: OrganizePlan): Promise<void> {
     return invoke<void>("apply_organize_plan", { plan });
+  }
+
+  /** Propose where unfiled recordings belong. Nothing moves until apply. */
+  planWorkspaceOrganization(): Promise<WorkspaceOrganizePlan> {
+    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization");
+  }
+
+  /** Apply only the recording moves the user kept selected in the review sheet. */
+  applyWorkspaceOrganization(
+    moves: WorkspaceOrganizeMove[],
+  ): Promise<WorkspaceOrganizeApplyResult> {
+    return invoke<WorkspaceOrganizeApplyResult>(
+      "apply_workspace_organization",
+      { moves },
+    );
   }
 
   // ── Feature C — typed note front-matter properties (folder-level schema +

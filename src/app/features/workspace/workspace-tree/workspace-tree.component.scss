@@ -23,6 +23,12 @@
   min-width: 0;
 }
 
+/* The fixed header and independently scrolling tree meet at a hard seam. Snap
+   direct rows there so a stopped scroll never leaves half a row clipped. */
+.tree > * {
+  scroll-snap-align: start;
+}
+
 mur-tree-row {
   max-width: 100%;
   overflow: hidden;

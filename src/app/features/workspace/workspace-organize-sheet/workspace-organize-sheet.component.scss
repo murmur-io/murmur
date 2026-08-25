@@ -1,0 +1,174 @@
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+  background: var(--scrim);
+}
+
+/* Floating review surface: opaque by design so hierarchy rows never bleed through. */
+.sheet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+  max-width: 38rem;
+  max-height: calc(100dvh - 2 * var(--space-5));
+  padding: var(--space-5);
+  overflow: hidden;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.sheet:focus {
+  outline: none;
+}
+
+.sheet-head,
+.sheet-head-copy,
+.sheet-actions,
+.move-row {
+  display: flex;
+}
+
+.sheet-head {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.sheet-head-copy {
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.brain-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-md);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+h3 {
+  color: var(--text-primary);
+  font-size: 1.05rem;
+}
+
+h4 {
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.sheet-head p,
+.empty-state p,
+.skipped p {
+  margin-top: var(--space-1);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.select-all {
+  flex: none;
+}
+
+.sheet-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: var(--space-4);
+  overflow-y: auto;
+}
+
+.move-list,
+.skipped ul {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+}
+
+.move-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.move-row {
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  transition: opacity var(--transition-fast);
+}
+
+.move-row.is-excluded {
+  opacity: 0.5;
+}
+
+.move-toggle {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+
+.move-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.move-copy strong,
+.skipped strong {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.move-path {
+  color: var(--text-primary);
+  font-size: 0.82rem;
+}
+
+.move-reason,
+.skipped li span {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.skipped {
+  display: block;
+}
+
+.skipped li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-block: var(--space-2);
+}
+
+.sheet-actions {
+  flex: none;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}

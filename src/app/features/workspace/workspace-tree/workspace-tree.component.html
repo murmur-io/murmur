@@ -51,9 +51,17 @@
             >
               @if (unfiledMoveTargets(item); as targets) {
                 @if (targets.length > 0) {
-                  <mur-row-menu class="row-add" [label]="'Move ' + itemTitle(item)">
+                  <mur-row-menu
+                    class="row-add"
+                    [label]="'Move ' + itemTitle(item)"
+                  >
                     @for (target of targets; track target.id) {
-                      <button type="button" role="menuitem" (click)="moveItemTo(item, target)">
+                      <button
+                        type="button"
+                        class="menu-item"
+                        role="menuitem"
+                        (click)="moveItemTo(item, target)"
+                      >
                         {{ target.name }}
                       </button>
                     }
@@ -102,7 +110,12 @@
                    only be filed with a mouse. -->
               <mur-row-menu class="row-add" [label]="'Move ' + itemTitle(item)">
                 @for (target of targets; track target.id) {
-                  <button type="button" role="menuitem" (click)="moveItemTo(item, target)">
+                  <button
+                    type="button"
+                    class="menu-item"
+                    role="menuitem"
+                    (click)="moveItemTo(item, target)"
+                  >
                     {{ target.name }}
                   </button>
                 }
@@ -155,14 +168,25 @@
               icon="add"
               [label]="'Add to ' + line.container.name"
             >
-              <button type="button" role="menuitem" (click)="newNote(line.container)">
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                (click)="newNote(line.container)"
+              >
                 New note
               </button>
-              <button type="button" role="menuitem" (click)="newFolder(line.container)">
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                (click)="newFolder(line.container)"
+              >
                 New folder
               </button>
               <button
                 type="button"
+                class="menu-item"
                 role="menuitem"
                 (click)="newDashboard(line.container)"
               >
@@ -175,35 +199,65 @@
             [label]="'Actions for ' + line.container.name"
           >
             @if (isSealed(line.container)) {
-              <button type="button" role="menuitem" (click)="unlock(line.container)">
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                (click)="unlock(line.container)"
+              >
                 {{ unlockLabel(line.container) }}
               </button>
             } @else {
               @if (canLock(line.container)) {
-                <button type="button" role="menuitem" (click)="lock(line.container)">
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="lock(line.container)"
+                >
                   {{ lockLabel(line.container) }}
                 </button>
               }
               @if (line.container.locked && line.container.unlocked) {
-                <button type="button" role="menuitem" (click)="relock(line.container)">
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="relock(line.container)"
+                >
                   Lock again
                 </button>
               }
               @if (canOrganize(line.container)) {
                 <button
                   type="button"
+                  class="menu-item"
                   role="menuitem"
                   [disabled]="organizePlanning()"
                   (click)="organize(line.container)"
                   data-testid="organize-container"
                 >
-                  {{ organizePlanning() ? "Reading this folder…" : "Organize with AI" }}
+                  {{
+                    organizePlanning()
+                      ? "Reading this folder…"
+                      : "Organize notes with AI"
+                  }}
                 </button>
               }
-              <button type="button" role="menuitem" (click)="rename(line.container)">
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                (click)="rename(line.container)"
+              >
                 Rename
               </button>
-              <button type="button" role="menuitem" (click)="remove(line.container)">
+              <button
+                type="button"
+                class="menu-item menu-item-danger"
+                role="menuitem"
+                (click)="remove(line.container)"
+              >
                 Delete folder
               </button>
             }
