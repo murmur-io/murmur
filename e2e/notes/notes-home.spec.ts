@@ -2,17 +2,13 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * Notes home — a normal in-flow route beside the ALWAYS-VISIBLE main sidebar
- * (2026-07-12; was a [note-folder rail | note list] drill-down that hid the
- * primary sidebar). The note-folder tree now lives IN the main sidebar
- * (`NotesSidebarTreeComponent`, nested under "Notes" — `AppShellComponent`);
- * this test confirms BOTH render: the sidebar tree (folders + "All notes")
- * AND the content pane's TABLE (2026-07-12, replaces the card grid — incl.
- * the masked locked row + a tag pill + the "New note" control), with NO
- * console/page errors — the runtime check that catches NG0600 / ɵcmp /
+ * Notes home is an exact-list route: the persistent global rail chooses the
+ * product surface while the adjacent Browse panel owns list navigation. The
+ * content pane still renders the note table, including the sealed row, with
+ * no console/page errors — the runtime check that catches NG0600 / ɵcmp /
  * forwardRef regressions a green `ng build` misses.
  */
-test("notes home renders the sidebar tree + the note table (incl. masked locked row) with no console errors", async ({
+test("notes home renders Browse navigation + the note table (incl. masked locked row) with no console errors", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -29,22 +25,26 @@ test("notes home renders the sidebar tree + the note table (incl. masked locked 
   // The content pane proves the route resolved.
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // The ALWAYS-VISIBLE main sidebar renders too (Stage 1's whole point).
-  await expect(page.locator("mur-sidebar.app-sidebar")).toBeVisible();
+  const globalNavigation = page.getByRole("navigation", {
+    name: "Global navigation",
+  });
+  await expect(globalNavigation).toBeVisible();
+
+  const browseSidebar = page.getByRole("complementary", {
+    name: "Browse sidebar",
+  });
+  await expect(browseSidebar).toBeVisible();
+  await expect(
+    browseSidebar.getByRole("link", { name: "Notes", exact: true }),
+  ).toHaveClass(/active/);
 
   // The prominent "New note" action.
   await expect(page.locator(".new-note-btn")).toBeVisible();
 
-  // The sidebar's Notes section: the HEADER is the "all items" affordance
-  // (the separate "All notes" root row was removed 2026-07-12 as a redundant
-  // layer) + the tree lists both note folders directly.
-  // ONE hierarchy now, so the section is Projects and the folders hang under a project
-  // rather than under a per-type header.
-  await expect(
-    page.locator("mur-sidebar-section .nav-row-link", { hasText: "Projects" }),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Expand Workspace" }).click();
-  await expect(page.getByRole("button", { name: "Work", exact: true })).toBeVisible();
+  // Exact list routes do not mount the hierarchy panel or its former section
+  // wrapper. The hierarchy is reserved for Space and leaf routes.
+  await expect(page.locator("mur-sidebar.spaces-sidebar")).toHaveCount(0);
+  await expect(page.locator("mur-sidebar-section")).toHaveCount(0);
 
   // The table renders (thead + the visible note row + its tag pill).
   await expect(page.locator(".mur-table thead th", { hasText: "Title" })).toBeVisible();

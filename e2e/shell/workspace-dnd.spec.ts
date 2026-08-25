@@ -94,9 +94,9 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await expect(page.getByRole("tree", { name: "Workspace" })).toBeVisible();
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
   await page.getByRole("button", { name: "Expand Acme" }).click();
-  await page.getByRole("button", { name: "Expand Meetings" }).click();
 }
 
 test("every kind the tree renders is draggable", async ({ page }) => {
@@ -111,13 +111,11 @@ test("every kind the tree renders is draggable", async ({ page }) => {
     "true",
   );
 
-  await page.getByRole("button", { name: "Expand Tasks" }).click();
   await expect(page.getByRole("treeitem", { name: /Ship the thing/ })).toHaveAttribute(
     "draggable",
     "true",
   );
 
-  await page.getByRole("button", { name: "Expand Dashboards" }).click();
   await expect(page.getByRole("treeitem", { name: /Q3 board/ })).toHaveAttribute(
     "draggable",
     "true",
@@ -134,12 +132,10 @@ test("each kind is filed through its OWN backend mover", async ({ page }) => {
     .getByRole("treeitem", { name: /Standup/ })
     .dragTo(page.getByRole("treeitem", { name: /Target/ }));
 
-  await page.getByRole("button", { name: "Expand Dashboards" }).click();
   await page
     .getByRole("treeitem", { name: /Q3 board/ })
     .dragTo(page.getByRole("treeitem", { name: /Target/ }));
 
-  await page.getByRole("button", { name: "Expand Tasks" }).click();
   await page
     .getByRole("treeitem", { name: /Ship the thing/ })
     .dragTo(page.getByRole("treeitem", { name: /Target/ }));

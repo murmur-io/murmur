@@ -3,8 +3,8 @@ import { expect, test, type Page } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
- * The workspace hierarchy in the sidebar: Projects › Folders › collapsible
- * per-type groups.
+ * The workspace hierarchy in the contextual sidebar: Spaces › Folders ›
+ * mixed content rows.
  *
  * The forest below is written as the BACKEND serializes it (`ContainerNode` /
  * `TypeGroup` / `ItemRow` carry `rename_all = "camelCase"`), not as the
@@ -48,12 +48,35 @@ const FOREST = [
     groups: [
       {
         kind: "meeting",
-        // Ten in the container, two on the first page — so the group header must
-        // show 10 and a "see all" line must appear.
-        total: 10,
+        total: 5,
         items: [
-          { kind: "meeting", id: "m-standup", title: "Standup", durationS: 900, sortAt: 2 },
-          { kind: "meeting", id: "m-retro", title: null, durationS: 1800, sortAt: 1 },
+          { kind: "meeting", id: "m-standup", title: "Standup", durationS: 900, sortAt: 90 },
+          { kind: "meeting", id: "m-retro", title: null, durationS: 1800, sortAt: 40 },
+          { kind: "meeting", id: "m-old", title: "Old sync", durationS: 600, sortAt: 10 },
+        ],
+      },
+      {
+        kind: "note",
+        total: 3,
+        items: [
+          { kind: "note", id: "n-brief", title: "Launch brief", durationS: null, sortAt: 100 },
+          { kind: "note", id: "n-risks", title: "Risks", durationS: null, sortAt: 60 },
+        ],
+      },
+      {
+        kind: "task",
+        total: 2,
+        items: [
+          { kind: "task", id: "t-ship", title: "Ship release", durationS: null, sortAt: 80 },
+          { kind: "task", id: "t-copy", title: "Review copy", durationS: null, sortAt: 30 },
+        ],
+      },
+      {
+        kind: "dashboard",
+        total: 2,
+        items: [
+          { kind: "dashboard", id: "d-release", title: "Release dashboard", durationS: null, sortAt: 70 },
+          { kind: "dashboard", id: "d-metrics", title: "Metrics", durationS: null, sortAt: 50 },
         ],
       },
     ],
@@ -77,42 +100,74 @@ const FOREST = [
 async function openWorkspace(page: Page): Promise<void> {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
   await page.goto("/");
-  const section = page.getByRole("button", { name: /Projects/i }).first();
-  await expect(section).toBeVisible();
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
 }
 
-test("renders projects, their folders and collapsible type groups", async ({ page }) => {
+test("renders one flat mixed stream below each expanded container", async ({ page }) => {
   await openWorkspace(page);
 
-  const tree = page.getByRole("tree", { name: "Workspace" });
+  const tree = page.getByRole("tree", { name: "Spaces" });
   await expect(tree).toBeVisible();
 
   await expect(page.getByRole("treeitem", { name: /Acme/ })).toBeVisible();
   await expect(page.getByRole("treeitem", { name: /Private/ })).toBeVisible();
 
-  // A collapsed project shows no groups.
-  await expect(page.getByRole("treeitem", { name: /Meetings/ })).toHaveCount(0);
-
+  // A selected Space can still be collapsed by the user.
+  await expect(page.getByRole("treeitem", { name: /Launch brief/ })).toHaveCount(0);
   await page.getByRole("button", { name: "Expand Acme" }).click();
 
-  // The group header carries the container's FULL count, not the page size.
-  const meetings = page.getByRole("treeitem", { name: /Meetings/ });
-  await expect(meetings).toBeVisible();
-  await expect(meetings).toContainText("10");
-
-  // Items appear only once their group is expanded.
-  await expect(page.getByRole("treeitem", { name: /Standup/ })).toHaveCount(0);
-  await page.getByRole("button", { name: "Expand Meetings" }).click();
-  await expect(page.getByRole("treeitem", { name: /Standup/ })).toBeVisible();
+  // No synthetic kind headers: direct children are globally newest-first.
+  await expect(tree.locator(".line--group")).toHaveCount(0);
+  const mixedRows = tree.locator(".line--item");
+  await expect(mixedRows).toHaveCount(8);
+  await expect(mixedRows).toHaveText([
+    "Launch brief",
+    "Standup",
+    "Ship release",
+    "Release dashboard",
+    "Risks",
+    "Metrics",
+    "Untitled",
+    "Review copy",
+  ]);
+  for (const row of await mixedRows.all()) {
+    await expect(row).toHaveAttribute("aria-level", "2");
+  }
 
   // An untitled item renders a placeholder rather than an empty row.
   await expect(page.getByRole("treeitem", { name: /Untitled/ })).toBeVisible();
 
-  // Ten total, two shown → the pager appears and names the remainder.
-  await expect(page.getByRole("treeitem", { name: /See all \(10\)/ })).toBeVisible();
+  // All kinds share one total and one continuation row.
+  await expect(page.getByRole("treeitem", { name: /View all \(12\)/ })).toHaveCount(1);
 
   // A child folder is rendered under its project, with its own groups.
   await expect(page.getByRole("treeitem", { name: /Q3/ })).toBeVisible();
+});
+
+test("keeps an older selected leaf within the eight-row cap", async ({ page }) => {
+  await mockTauri(page, {}, { list_workspace_tree: FOREST });
+  await page.goto("/meeting/m-old");
+
+  const tree = page.getByRole("tree", { name: "Spaces" });
+  await expect(tree).toBeVisible();
+  const mixedRows = tree.locator(".line--item");
+  await expect(mixedRows).toHaveCount(8);
+  await expect(mixedRows).toHaveText([
+    "Launch brief",
+    "Standup",
+    "Ship release",
+    "Release dashboard",
+    "Risks",
+    "Metrics",
+    "Untitled",
+    "Old sync",
+  ]);
+  await expect(page.getByRole("treeitem", { name: "Old sync" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(page.getByRole("treeitem", { name: /View all \(12\)/ })).toHaveCount(1);
 });
 
 test("a sealed project discloses nothing about what it holds", async ({ page }) => {
