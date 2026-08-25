@@ -28,6 +28,15 @@ mur-tree-row {
   overflow: hidden;
 }
 
+/* The closed row keeps the width guard above. While either projected row menu
+   is open, its absolute panel must escape that clip and the whole row must sit
+   above later siblings so hit-testing reaches the menu, not the next tile. */
+mur-tree-row:has(mur-row-menu.is-open) {
+  position: relative;
+  z-index: 31;
+  overflow: visible;
+}
+
 .line {
   display: flex;
   align-items: center;
@@ -53,6 +62,14 @@ mur-tree-row {
 
 .line--item {
   color: var(--text-secondary);
+}
+
+.line--unfiled {
+  margin-bottom: var(--space-1);
+}
+
+.see-all--unfiled {
+  padding-left: calc(var(--tree-indent) + 20px);
 }
 
 /* Session-unlocked is a PRIVACY state, so it carries the accent the rest of the
