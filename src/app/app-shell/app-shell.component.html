@@ -67,7 +67,7 @@
     aria-label="New note"
     title="New note (⌘N)"
   >
-    <mur-icon icon="plus" />
+    <mur-icon icon="note-add" />
   </button>
   <a
     class="rail-item"
@@ -88,53 +88,58 @@
     role="complementary"
     aria-label="Spaces sidebar"
   >
-    <div class="context-header">
-      <h2>Spaces</h2>
-      <div class="context-actions">
-        <button
-          type="button"
-          class="context-action"
-          (click)="openSearch()"
-          aria-label="Search Spaces"
-          title="Search"
-        >
-          <mur-icon icon="search" />
-        </button>
-        <button
-          type="button"
-          class="context-action brain-action"
-          [disabled]="workspaceOrganizeDisabled()"
-          [attr.aria-busy]="workspaceOrganizePlanning()"
-          (click)="planWorkspaceOrganization()"
-          aria-label="Organize unfiled recordings with Brain"
-          title="Organize unfiled recordings with Brain"
-        >
-          @if (workspaceOrganizePlanning()) {
-            <span class="context-spinner" aria-hidden="true"></span>
-          } @else {
-            <mur-icon icon="brain" />
-          }
-        </button>
-        @if (canCreateWorkspaceFolder()) {
+    <div class="context-header spaces-header">
+      <div class="context-header-main">
+        <h2>Spaces</h2>
+        <div class="context-actions">
           <button
             type="button"
             class="context-action"
-            (click)="newWorkspaceFolder()"
-            aria-label="New folder in first Space"
-            title="New folder"
+            (click)="openSearch()"
+            aria-label="Search Spaces"
+            title="Search"
           >
-            <mur-icon icon="plus" />
+            <mur-icon icon="search" />
           </button>
-        }
+          @if (canCreateInWorkspace()) {
+            <button
+              type="button"
+              class="context-action context-action--label create-action"
+              (click)="openWorkspaceCreate()"
+              aria-label="Create in Spaces"
+              title="Create in Spaces"
+            >
+              <mur-icon icon="plus" />
+              <span>New</span>
+            </button>
+          }
+        </div>
       </div>
+      <button
+        type="button"
+        class="brain-action"
+        [disabled]="workspaceOrganizeDisabled()"
+        [attr.aria-busy]="workspaceOrganizePlanning()"
+        (click)="planWorkspaceOrganization()"
+        aria-label="Review filing moves with Brain"
+        title="Review filing moves with Brain"
+      >
+        @if (workspaceOrganizePlanning()) {
+          <span class="context-spinner" aria-hidden="true"></span>
+          <span>Planning filing suggestions…</span>
+        } @else {
+          <mur-icon icon="brain" />
+          <span>File recordings with Brain</span>
+        }
+      </button>
     </div>
 
     <div class="context-body">
       <app-workspace-tree [currentPath]="currentPath()" />
     </div>
 
-    @if (unlockedCount() > 0) {
-      <div class="context-footer">
+    <div class="context-footer">
+      @if (unlockedCount() > 0) {
         <button
           type="button"
           class="unlocked-pill"
@@ -146,8 +151,17 @@
           <span>{{ unlockedCount() }} unlocked</span>
           <span class="unlocked-action">Lock all</span>
         </button>
-      </div>
-    }
+      }
+      <button
+        type="button"
+        class="collapse-context"
+        (click)="collapseSpaces()"
+        aria-label="Collapse Spaces sidebar"
+      >
+        <mur-icon icon="sidebar" />
+        <span>Collapse sidebar</span>
+      </button>
+    </div>
   </mur-sidebar>
 } @else if (contextPanel() === "browse") {
   <mur-sidebar
@@ -260,6 +274,16 @@
     [busy]="workspaceOrganizeApplying()"
     (apply)="applyWorkspaceOrganization($event)"
     (cancelled)="closeWorkspaceOrganization()"
+  />
+}
+
+@if (workspaceCreateOpen()) {
+  <app-workspace-create-sheet
+    [targets]="workspaceDestinations()"
+    [busy]="workspaceCreateBusy()"
+    [error]="workspaceCreateError()"
+    (create)="createInWorkspace($event)"
+    (cancelled)="closeWorkspaceCreate()"
   />
 }
 

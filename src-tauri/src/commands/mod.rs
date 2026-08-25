@@ -2830,10 +2830,276 @@ fn conversion_transcript(segments: &[Segment], linked_context: &str) -> String {
     transcript
 }
 
+/// The exact container into which a converted companion belongs. A filed meeting keeps its
+/// container id; an unfiled meeting uses the reserved Notes root so authored notes remain backed by
+/// a real `folders` row. `locked` is rechecked again inside the write transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConversionDestination {
+    id: String,
+    locked: bool,
+}
+
+fn conversion_destination_under_lifecycle(
+    state: &AppState,
+    snapshot: &MeetingContentSnapshot,
+) -> Result<ConversionDestination, AppError> {
+    let id = match snapshot.folder_id.as_deref() {
+        Some(folder_id) => folder_id.to_string(),
+        None => state.db.ensure_notes_root()?,
+    };
+    let row = state
+        .db
+        .list_containers()?
+        .into_iter()
+        .find(|container| container.id == id)
+        .ok_or_else(|| {
+            AppError::InvalidArg(
+                "the meeting's container is unavailable; move the meeting and retry".into(),
+            )
+        })?;
+    if state.db.org_folder_closure_exists(&id)? {
+        return Err(AppError::Unavailable(
+            "the destination is closing or locked for sharing; retry after reopening it".into(),
+        ));
+    }
+    if row.locked && !folder_is_unlocked(state, &id)? {
+        return Err(AppError::Locked(
+            "unlock the meeting's container before converting it to a note".into(),
+        ));
+    }
+    Ok(ConversionDestination {
+        id,
+        locked: row.locked,
+    })
+}
+
+/// Re-authorize the existing companion's current protection domain while the conversion owns the
+/// lifecycle. This must run before reading note or attachment plaintext: a companion can outlive
+/// its original container becoming unavailable, reserved, closing, or sealed.
+fn reauthorize_conversion_source_under_lifecycle(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    // `list_containers` owns the canonical renderable/user-container predicate (kind plus
+    // machine-path exclusion). Reusing it avoids a second security definition drifting from the
+    // hierarchy and the destination gate.
+    let source = state
+        .db
+        .list_containers()?
+        .into_iter()
+        .find(|container| container.id == folder_id)
+        .ok_or_else(|| {
+            AppError::Unavailable(
+                "the companion note's source container is unavailable; reopen it and retry".into(),
+            )
+        })?;
+    if state.db.org_folder_closure_exists(folder_id)? {
+        return Err(AppError::Unavailable(
+            "the companion note's source container is closing or unavailable; retry after reopening it"
+                .into(),
+        ));
+    }
+    if source.locked && !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "unlock the companion note's source container before converting this meeting".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Remove every tracked plaintext projection before a conversion changes its owning protection
+/// domain. The complete note+attachment set is preflighted first, so an external edit refuses
+/// before any sibling export is removed. Canonical SQLCipher bytes remain untouched until the
+/// later atomic DB transaction.
+struct RemovedConversionExport {
+    path: std::path::PathBuf,
+    bytes: Zeroizing<Vec<u8>>,
+    permissions: std::fs::Permissions,
+}
+
+#[derive(Default)]
+struct RemovedConversionExports {
+    files: Vec<RemovedConversionExport>,
+}
+
+impl RemovedConversionExports {
+    fn capture_if_present(&mut self, path: &std::path::Path) -> Result<(), AppError> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AppError::Export(format!(
+                    "could not snapshot converted-note export before filing: {error}"
+                )))
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(AppError::Export(
+                "converted-note export is not a regular file".into(),
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(|error| {
+            AppError::Export(format!(
+                "could not snapshot converted-note export before filing: {error}"
+            ))
+        })?;
+        self.files.push(RemovedConversionExport {
+            path: path.to_path_buf(),
+            bytes: Zeroizing::new(bytes),
+            permissions: metadata.permissions(),
+        });
+        Ok(())
+    }
+
+    /// Restore only files that remain absent. `create_new` means an external file that appeared
+    /// after removal is never overwritten. Every captured path is attempted even if a sibling was
+    /// concurrently replaced, so one rollback conflict cannot strand the rest of the export set.
+    fn restore(&self) -> Result<(), AppError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut failures = Vec::new();
+        for removed in &self.files {
+            let restore_one = (|| -> Result<(), AppError> {
+                match std::fs::symlink_metadata(&removed.path) {
+                    Ok(metadata) => {
+                        if !metadata.file_type().is_file() {
+                            return Err(AppError::Export(format!(
+                                "refusing to follow a replaced conversion export at {}",
+                                removed.path.display()
+                            )));
+                        }
+                        let current = std::fs::read(&removed.path).map_err(|error| {
+                            AppError::Export(format!(
+                                "could not verify a concurrently restored conversion export: {error}"
+                            ))
+                        })?;
+                        if current.as_slice() == removed.bytes.as_slice() {
+                            return Ok(());
+                        }
+                        return Err(AppError::Export(format!(
+                            "refusing to overwrite a changed conversion export at {}",
+                            removed.path.display()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AppError::Export(format!(
+                            "could not inspect conversion export rollback target: {error}"
+                        )))
+                    }
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&removed.path)
+                    .map_err(|error| {
+                        AppError::Export(format!(
+                            "could not recreate conversion export during rollback: {error}"
+                        ))
+                    })?;
+                file.write_all(&removed.bytes).map_err(|error| {
+                    AppError::Export(format!(
+                        "could not write conversion export rollback: {error}"
+                    ))
+                })?;
+                file.set_permissions(removed.permissions.clone())
+                    .map_err(|error| {
+                        AppError::Export(format!(
+                            "could not restore conversion export permissions: {error}"
+                        ))
+                    })?;
+                file.sync_all().map_err(|error| {
+                    AppError::Export(format!(
+                        "could not sync conversion export rollback: {error}"
+                    ))
+                })?;
+                Ok(())
+            })();
+            if let Err(error) = restore_one {
+                failures.push(format!("{}: {error}", removed.path.display()));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Export(format!(
+                "one or more conversion exports could not be restored: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+}
+
+fn attachment_export_twin_path(
+    path: &std::path::Path,
+    attachment_id: &str,
+) -> std::path::PathBuf {
+    path.with_file_name(format!(".{attachment_id}.murmur.tmp"))
+}
+
+fn remove_converted_companion_exports_before_rehome(
+    state: &AppState,
+    row: &crate::storage::db::NoteRow,
+    attachments: &[crate::storage::AttachmentRecord],
+) -> Result<RemovedConversionExports, AppError> {
+    let expected = state.db.get_note_doc_exported_hash(&row.id)?;
+    if let Some(path) = row.exported_path.as_deref() {
+        verify_note_export_unchanged(
+            path,
+            expected.as_deref(),
+            "verify converted-note export before filing",
+        )?;
+    }
+    verify_attachment_exports(
+        attachments,
+        "could not verify an exported image before filing the converted note",
+    )?;
+    let mut removed = RemovedConversionExports::default();
+    if let Some(path) = row.exported_path.as_deref() {
+        removed.capture_if_present(std::path::Path::new(path))?;
+    }
+    for attachment in attachments {
+        let Some(path) = attachment.exported_path.as_deref() else {
+            continue;
+        };
+        let path = std::path::Path::new(path);
+        removed.capture_if_present(path)?;
+        removed.capture_if_present(&attachment_export_twin_path(path, &attachment.id))?;
+    }
+    if let Some(path) = row.exported_path.as_deref() {
+        if let Err(error) = remove_note_export_if_unchanged(
+            path,
+            expected.as_deref(),
+            "remove converted-note export before filing",
+        ) {
+            return match removed.restore() {
+                Ok(()) => Err(error),
+                Err(restore) => Err(AppError::Storage(format!(
+                    "{error}; conversion export rollback also failed: {restore}"
+                ))),
+            };
+        }
+    }
+    if let Err(error) = remove_attachment_exports_before_move(attachments) {
+        return match removed.restore() {
+            Ok(()) => Err(error),
+            Err(restore) => Err(AppError::Storage(format!(
+                "{error}; conversion export rollback also failed: {restore}"
+            ))),
+        };
+    }
+    Ok(removed)
+}
+
 /// Persist a completed conversion while holding the lock lifecycle across the source-snapshot
-/// recheck and the companion write. This closes the post-provider relock race: a stale generated
-/// result can neither create nor update a note. The companion remains the canonical authored-note
-/// row (`documents.meeting_id` + structured companion edge), and existing body text is preserved.
+/// recheck and the companion write. The production caller owns `org_share_mutation_lock` before
+/// entering this synchronous lifecycle interval (the repo-wide org-lock -> lifecycle-lock order).
+/// This closes the post-provider relock/move race: a stale generated result can neither create nor
+/// update a note. Existing body bytes outside Murmur's managed fence and the stable companion id are
+/// preserved, while content + exact destination + attachment protection + companion edge commit as
+/// one canonical transaction.
 fn persist_converted_companion_under_snapshot(
     state: &AppState,
     meeting_id: &str,
@@ -2860,43 +3126,149 @@ fn persist_converted_companion_under_snapshot_with(
     generated: &str,
     embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<CompanionAppendResult, AppError> {
+    persist_converted_companion_under_snapshot_with_attachment_verifier(
+        state,
+        meeting_id,
+        snapshot,
+        meeting_name,
+        generated,
+        embedder,
+        None,
+    )
+}
+
+type ConversionAttachmentSealVerifier =
+    dyn Fn(&[u8; 32], &[u8], &[u8]) -> Result<Vec<u8>, AppError>;
+
+/// Production persistence core with one injectable verification seam. Production always passes
+/// `None`, which decrypts the freshly-created attachment seal through `crypto::decrypt`; tests may
+/// substitute only that verification result to prove a mismatch aborts before exports or canonical
+/// rows are touched.
+fn persist_converted_companion_under_snapshot_with_attachment_verifier(
+    state: &AppState,
+    meeting_id: &str,
+    snapshot: &MeetingContentSnapshot,
+    meeting_name: &str,
+    generated: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+    attachment_seal_verifier: Option<&ConversionAttachmentSealVerifier>,
+) -> Result<CompanionAppendResult, AppError> {
     let lifecycle = lifecycle_guard(state);
     require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)?;
+    let destination = conversion_destination_under_lifecycle(state, snapshot)?;
     let meeting_wikilink = format!("[[{meeting_name}]]");
 
-    let (note_id, markdown, created) = if let Some(id) =
-        state.db.companion_note_for_meeting(meeting_id)?
-    {
+    let (note_id, markdown) = if let Some(id) = state.db.companion_note_for_meeting(meeting_id)? {
         let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&id)? else {
             return Err(AppError::Storage(
                 "the companion note disappeared during conversion".into(),
             ));
         };
-        if !folder_is_unlocked(state, &folder_id)? {
-            return Err(AppError::Locked(
-                "unlock the companion note's folder before converting this meeting".into(),
-            ));
-        }
+        reauthorize_conversion_source_under_lifecycle(state, &folder_id)?;
         let row = state
             .db
             .get_note_row(&id)?
             .ok_or_else(|| AppError::Storage("the companion note is unavailable".into()))?;
         let markdown = compose_converted_companion_markdown(&row.text, meeting_name, generated)?;
-        (id, markdown, false)
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: id.clone(),
+        };
+        validate_attachment_references_before_save(state, &owner, &markdown)?;
+        let attachments = state.db.list_attachments(&owner)?;
+        let mut attachment_plaintext = std::collections::HashMap::with_capacity(attachments.len());
+        for attachment in &attachments {
+            attachment_plaintext.insert(
+                attachment.id.clone(),
+                plaintext_attachment_data(state, attachment)?,
+            );
+        }
+
+        if state.db.source_has_active_remote_share(None, Some(&id))?
+            || state.db.folder_has_active_remote_share(&folder_id)?
+            || state.db.folder_has_active_remote_share(&destination.id)?
+        {
+            return Err(AppError::Unavailable(
+                "revoke active shares before filing this converted note".into(),
+            ));
+        }
+
+        let (text_blob, attachment_seals) = if destination.locked {
+            let text_blob = sealed_document_blob(state, &destination.id, &id, &markdown)?;
+            let ck = session_folder_ck(state, &destination.id)?;
+            let mut seals = std::collections::HashMap::with_capacity(attachments.len());
+            for attachment in &attachments {
+                let data = attachment_plaintext.get(&attachment.id).ok_or_else(|| {
+                    AppError::Storage("converted companion attachment plaintext is missing".into())
+                })?;
+                let aad = attachment_aad(&destination.id, &owner, &attachment.id);
+                let blob = crate::crypto::encrypt(&ck, data, &aad)?;
+                let verified = match attachment_seal_verifier {
+                    Some(verify) => verify(&ck, &blob, &aad)?,
+                    None => crate::crypto::decrypt(&ck, &blob, &aad)?,
+                };
+                if verified != *data {
+                    return Err(AppError::Storage(
+                        "converted companion attachment seal verification failed".into(),
+                    ));
+                }
+                seals.insert(attachment.id.clone(), blob);
+            }
+            (Some(text_blob), seals)
+        } else {
+            (None, std::collections::HashMap::new())
+        };
+
+        let removed_exports =
+            remove_converted_companion_exports_before_rehome(state, &row, &attachments)?;
+        if destination.locked {
+            bump_seal_epoch(state);
+        }
+        if let Err(error) = state.db.update_converted_companion_atomic(
+            &id,
+            &folder_id,
+            &destination.id,
+            destination.locked,
+            meeting_id,
+            meeting_name,
+            &markdown,
+            text_blob.as_deref(),
+            chrono::Utc::now().timestamp_millis(),
+            &attachment_plaintext,
+            &attachment_seals,
+        ) {
+            return match removed_exports.restore() {
+                Ok(()) => Err(error),
+                Err(restore) => Err(AppError::Storage(format!(
+                    "{error}; conversion export rollback also failed: {restore}"
+                ))),
+            };
+        }
+        // The atomic commit above is the terminal fallible canonical step. A locked target keeps
+        // attachment plaintext blank at rest; session readers recover it through
+        // `plaintext_attachment_data` from the already verified target-CK blob. Re-populating the
+        // cache here used to create a post-commit failure that reported conversion failure after
+        // the note had durably moved.
+        //
+        // No post-commit prune is required either: every old attachment export was removed while
+        // its retry path was still tracked, and the transaction NULLed every attachment path. The
+        // prune contract intentionally retains canonical attachment rows for editor undo, while the
+        // open-target vault projection below re-exports only markers present in the new Markdown.
+        (id, markdown)
     } else {
         // Compose/validate BEFORE birth. An empty or malformed provider response leaves no row.
         let markdown = compose_converted_companion_markdown("", meeting_name, generated)?;
-        let id = create_generated_root_companion_under_lifecycle_authorized(
+        let id = create_generated_companion_under_lifecycle_authorized(
             state,
             meeting_id,
             meeting_name,
             &markdown,
+            &destination,
         )?;
-        (id, markdown, true)
+        (id, markdown)
     };
-    if created {
-        // DB canonical state is already complete atomically. Vault export remains a derived,
-        // best-effort projection just like the ordinary note-update path.
+    if !destination.locked {
+        // DB canonical state is already complete atomically. Open-container vault export remains a
+        // derived, best-effort projection; a locked destination never produces plaintext `.md`.
         if let Err(error) = export_note_to_vault_under_lifecycle_authorized(state, &note_id) {
             tracing::warn!(
                 target: "notes",
@@ -2904,8 +3276,6 @@ fn persist_converted_companion_under_snapshot_with(
                 "converted note vault export failed (canonical DB note retained)"
             );
         }
-    } else {
-        update_note_doc_under_lifecycle_authorized(state, &note_id, meeting_name, &markdown)?;
     }
     drop(lifecycle);
 
@@ -2917,22 +3287,16 @@ fn persist_converted_companion_under_snapshot_with(
     })
 }
 
-/// Birth the conversion companion in the reserved always-open Notes root. Unlike ordinary note
-/// creation this path starts non-empty, but it cannot target a locked folder; consequently it does
-/// not broaden sealed-note birth semantics. Document content, `meeting_id`, and the required
-/// companion edge commit in one DB transaction.
-fn create_generated_root_companion_under_lifecycle_authorized(
+/// Birth the conversion companion in the meeting's exact destination. For a locked destination the
+/// non-empty body is encrypted and verified BEFORE the one atomic insert; no blob-less plaintext
+/// row and no vault export can exist behind the lock.
+fn create_generated_companion_under_lifecycle_authorized(
     state: &AppState,
     meeting_id: &str,
     title: &str,
     markdown: &str,
+    destination: &ConversionDestination,
 ) -> Result<String, AppError> {
-    let folder_id = state.db.ensure_notes_root()?;
-    if !folder_is_unlocked(state, &folder_id)? {
-        return Err(AppError::Locked(
-            "the Notes root is unexpectedly locked; the converted note was not created".into(),
-        ));
-    }
     let title = title.trim();
     let title = if title.is_empty() {
         crate::storage::db::UNTITLED_TITLE
@@ -2947,12 +3311,27 @@ fn create_generated_root_companion_under_lifecycle_authorized(
         },
         markdown,
     )?;
-    state.db.insert_companion_note_atomic(
+    if state.db.folder_has_active_remote_share(&destination.id)? {
+        return Err(AppError::Unavailable(
+            "revoke active shares before creating a converted note in this container".into(),
+        ));
+    }
+    let text_blob = if destination.locked {
+        Some(sealed_document_blob(state, &destination.id, &id, markdown)?)
+    } else {
+        None
+    };
+    if destination.locked {
+        bump_seal_epoch(state);
+    }
+    state.db.insert_converted_companion_atomic(
         &id,
-        &folder_id,
+        &destination.id,
+        destination.locked,
         &crate::export::sanitize_title(title),
         title,
         markdown,
+        text_blob.as_deref(),
         meeting_id,
         chrono::Utc::now().timestamp_millis(),
     )?;
@@ -2960,6 +3339,7 @@ fn create_generated_root_companion_under_lifecycle_authorized(
         target: "notes",
         note_id = %id,
         meeting_id = %meeting_id,
+        folder_id = %destination.id,
         "converted companion note created atomically"
     );
     Ok(id)
@@ -3106,8 +3486,11 @@ async fn convert_meeting_to_note_inner_with(
         }
         None => provider.summarize(&request).await?,
     };
-    require_current_meeting_content_snapshot(state, &meeting_id, &snapshot)?;
     let meeting_name = meeting_display_name(meeting.title.as_deref());
+    // Canonical order shared by every note move/share mutation: org mutation first, then the short
+    // non-reentrant lock lifecycle interval inside persistence. Provider work has already finished,
+    // so neither mutex is held across inference/network awaits.
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
     persist_converted_companion_under_snapshot(
         state,
         &meeting_id,
@@ -3748,9 +4131,10 @@ fn masked_note_doc(id: &str, folder_id: &str, created_at: i64, updated_at: Optio
     }
 }
 
-/// WP1 — write the note's markdown to `<vault>/<note-folder-path>/<title>.md` (note folders are
-/// rooted under `Notes/…`, so this lands under `<vault>/Notes/…`), record the path in
-/// `exported_path`. GATED (a sealed-not-unlocked note is never exported). Returns `Ok(None)` when no
+/// WP1 — write the note's markdown to `<vault>/<container-path>/<title>.md` and record the path in
+/// `exported_path`. Most authored notes live in note-kind containers, while a converted meeting
+/// companion intentionally shares its meeting container. GATED (a sealed-not-unlocked note is never
+/// exported). Returns `Ok(None)` when no
 /// vault is configured (a no-op, not an error, so the create/update save path never fails on it).
 /// Idempotent + atomic + collision-suffixed via `export::write_note`.
 fn export_note_to_vault(state: &AppState, id: &str) -> Result<Option<String>, AppError> {
@@ -3799,11 +4183,13 @@ fn write_note_to_vault(
         return Ok(None); // no vault → nothing to export (not an error).
     };
 
-    // Subfolder = the note-folder's vault-relative path (rooted under "Notes/…"). Assert it stays
+    // Subfolder = the owning user container's vault-relative path. Conversion companions can live
+    // beside their meeting in a meeting-kind container, so resolving only `note_folder_by_id`
+    // would silently fall back to `Notes` and break exact-container placement. Assert it stays
     // inside the vault (D5) before write_note creates the dir.
     let subfolder = state
         .db
-        .note_folder_by_id(&row.folder_id)?
+        .folder_by_id(&row.folder_id)?
         .map(|f| f.path)
         .unwrap_or_else(|| "Notes".to_string());
     let vault_root = std::path::Path::new(&vault);

@@ -127,6 +127,7 @@ fn workspace_dto_fields_are_camel_case_on_the_wire() {
     let node = ContainerNode {
         id: "p1".into(),
         name: "Acme".into(),
+        kind: "meeting".into(),
         level: "project".into(),
         emoji: Some("🗂".into()),
         tint: Some("#fff".into()),
@@ -980,8 +981,8 @@ fn the_tree_node_key_set_is_pinned_for_a_sealed_container() {
     assert_eq!(
         keys,
         vec![
-            "emoji", "folders", "groups", "id", "isRoot", "level", "locked", "name", "tint",
-            "unlocked",
+            "emoji", "folders", "groups", "id", "isRoot", "kind", "level", "locked", "name",
+            "tint", "unlocked",
         ],
         "ContainerNode gained a field: decide explicitly whether a SEALED container may disclose it"
     );

@@ -30,6 +30,11 @@ import { ReminderComposerComponent } from "../features/reminders/reminder-compos
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
 import { WorkspaceService } from "../features/workspace/workspace.service";
+import {
+  WorkspaceCreateSheetComponent,
+  type WorkspaceCreateRequest,
+} from "../features/workspace/workspace-create-sheet/workspace-create-sheet.component";
+import { workspaceDestinations } from "../features/workspace/workspace-destination";
 import { WorkspaceOrganizeSheetComponent } from "../features/workspace/workspace-organize-sheet/workspace-organize-sheet.component";
 import { WorkspaceTreeComponent } from "../features/workspace/workspace-tree/workspace-tree.component";
 import { DocumentPreviewService } from "../services/document-preview.service";
@@ -62,6 +67,7 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
 
 const BROWSE_GROUPS = ["Work", "Intelligence", "Insights"] as const;
 const NARROW_SHELL_QUERY = "(max-width: 760px)";
+const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
 
 @Component({
   selector: "app-shell",
@@ -74,6 +80,7 @@ const NARROW_SHELL_QUERY = "(max-width: 760px)";
     MurSidebarComponent,
     MurTabStripComponent,
     WorkspaceTreeComponent,
+    WorkspaceCreateSheetComponent,
     WorkspaceOrganizeSheetComponent,
     LockSharesDialogComponent,
     DocumentPreviewComponent,
@@ -115,6 +122,9 @@ export class AppShellComponent {
   readonly currentPath = computed(() => this.currentUrl().split(/[?#]/)[0]);
 
   private readonly _contextOverride = signal<ContextPanel | null>(null);
+  private readonly _spacesCollapsed = signal(
+    readStoredBoolean(SPACES_COLLAPSED_KEY, false),
+  );
 
   private readonly isSpaceLeafRoute = computed(() => {
     const path = this.currentPath();
@@ -141,7 +151,7 @@ export class AppShellComponent {
       return override;
     }
     if (this.isSpaceLeafRoute()) {
-      return "spaces";
+      return this._spacesCollapsed() ? "none" : "spaces";
     }
     if (this.isBrowseRoute()) {
       return "browse";
@@ -158,16 +168,21 @@ export class AppShellComponent {
   readonly workspaceOrganizePlanning = signal(false);
   readonly workspaceOrganizeApplying = signal(false);
   readonly workspaceOrganizePlan = signal<WorkspaceOrganizePlan | null>(null);
+  readonly workspaceCreateOpen = signal(false);
+  readonly workspaceCreateBusy = signal(false);
+  readonly workspaceCreateError = signal<string | null>(null);
+  readonly workspaceDestinations = computed(() =>
+    workspaceDestinations(this.workspace.forest()),
+  );
   readonly workspaceOrganizeDisabled = computed(
     () =>
       this.workspace.unfiledRecordings().total === 0 ||
       this.workspaceOrganizePlanning() ||
       this.workspaceOrganizeApplying(),
   );
-  readonly canCreateWorkspaceFolder = computed(() => {
-    const firstSpace = this.workspace.forest()[0];
-    return Boolean(firstSpace && (!firstSpace.locked || firstSpace.unlocked));
-  });
+  readonly canCreateInWorkspace = computed(
+    () => this.workspaceDestinations().length > 0,
+  );
   readonly relockAllAriaLabel = computed(() => {
     const count = this.unlockedCount();
     const noun = count === 1 ? "folder" : "folders";
@@ -192,6 +207,7 @@ export class AppShellComponent {
     const fixedDrilldown =
       path.startsWith("/settings") || path.startsWith("/org-item/");
     const narrowViewport = window.matchMedia(NARROW_SHELL_QUERY).matches;
+    this.setSpacesCollapsed(false);
     if ((fixedDrilldown || narrowViewport) && firstSpace) {
       this._contextOverride.set(null);
       await this.router.navigate(["/container", firstSpace.id]);
@@ -242,16 +258,71 @@ export class AppShellComponent {
     void this.router.navigate(["/notes/new"]);
   }
 
-  newWorkspaceFolder(): void {
-    void this.createFolderAtTop();
-  }
-
-  private async createFolderAtTop(): Promise<void> {
-    const project = this.workspace.forest()[0];
-    if (!project || (project.locked && !project.unlocked)) {
+  openWorkspaceCreate(): void {
+    if (!this.canCreateInWorkspace()) {
       return;
     }
-    await this.workspace.createFolder(project.id, "New folder");
+    this.workspaceCreateError.set(null);
+    this.workspaceCreateOpen.set(true);
+  }
+
+  closeWorkspaceCreate(): void {
+    if (this.workspaceCreateBusy()) {
+      return;
+    }
+    this.workspaceCreateOpen.set(false);
+    this.workspaceCreateError.set(null);
+  }
+
+  async createInWorkspace(request: WorkspaceCreateRequest): Promise<void> {
+    if (this.workspaceCreateBusy()) {
+      return;
+    }
+    this.workspaceCreateBusy.set(true);
+    this.workspaceCreateError.set(null);
+    try {
+      if (request.kind === "note") {
+        const id = await this.workspace.createNote(
+          request.target.container.id,
+          request.name,
+        );
+        this.workspaceCreateOpen.set(false);
+        await this.router.navigate(["/notes", id]);
+      } else if (request.kind === "dashboard") {
+        const id = await this.workspace.createDashboard(
+          request.target.container.id,
+          request.name,
+        );
+        this.workspaceCreateOpen.set(false);
+        await this.router.navigate(["/dashboards", id]);
+      } else {
+        const id = await this.workspace.createFolder(
+          request.target.container,
+          request.name,
+        );
+        this.workspaceCreateOpen.set(false);
+        await this.router.navigate(["/container", id]);
+      }
+      this.toast.success(
+        `Created ${request.name} in ${request.target.label}`,
+      );
+    } catch {
+      this.workspaceCreateError.set(
+        `Couldn’t create this ${request.kind} in ${request.target.label}.`,
+      );
+    } finally {
+      this.workspaceCreateBusy.set(false);
+    }
+  }
+
+  collapseSpaces(): void {
+    this.setSpacesCollapsed(true);
+    this._contextOverride.set("none");
+  }
+
+  private setSpacesCollapsed(collapsed: boolean): void {
+    this._spacesCollapsed.set(collapsed);
+    writeStoredBoolean(SPACES_COLLAPSED_KEY, collapsed);
   }
 
   async planWorkspaceOrganization(): Promise<void> {
@@ -261,7 +332,11 @@ export class AppShellComponent {
     this.workspaceOrganizePlanning.set(true);
     try {
       const plan = await this.ipc.planWorkspaceOrganization();
-      if (plan.moves.length === 0 && plan.skipped.length === 0) {
+      if (
+        plan.moves.length === 0 &&
+        (plan.review?.length ?? 0) === 0 &&
+        plan.skipped.length === 0
+      ) {
         this.toast.info("Brain found no unfiled recordings to organize.");
         return;
       }
@@ -372,5 +447,22 @@ export class AppShellComponent {
   runToastAction(toast: Toast): void {
     toast.action?.run();
     this.dismissToast(toast.id);
+  }
+}
+
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : raw === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredBoolean(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // Sidebar collapse is a convenience; storage failure must not break navigation.
   }
 }

@@ -9,6 +9,8 @@ import {
 import { Router } from "@angular/router";
 
 import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
+import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 import { FolderDropDirective } from "../../folders/folder-drop.directive";
 import {
   NoteDragService,
@@ -32,6 +34,15 @@ import { FolderLockFlowService } from "../../../services/folder-lock-flow.servic
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { WorkspaceService } from "../workspace.service";
+import {
+  workspaceDestinations,
+  type WorkspaceDestination,
+} from "../workspace-destination";
+import { WorkspaceMoveSheetComponent } from "../workspace-move-sheet/workspace-move-sheet.component";
+import {
+  WorkspaceManageSheetComponent,
+  type WorkspaceManageMode,
+} from "../workspace-manage-sheet/workspace-manage-sheet.component";
 
 /** A flattened tree line, so one `@for` renders the whole forest. */
 export interface TreeLine {
@@ -81,9 +92,13 @@ const KIND_ROUTE: Record<ItemKind, string> = {
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     FolderDropDirective,
+    MurIconComponent,
     MurRowMenuComponent,
     MurTreeRowComponent,
     OrganizeSheetComponent,
+    TeleportToBodyDirective,
+    WorkspaceManageSheetComponent,
+    WorkspaceMoveSheetComponent,
   ],
   templateUrl: "./workspace-tree.component.html",
   styleUrl: "./workspace-tree.component.scss",
@@ -124,7 +139,7 @@ export class WorkspaceTreeComponent {
   protected readonly error = this.workspace.error;
   protected readonly workspaceEmpty = this.workspace.workspaceEmpty;
   protected readonly unfiledRecordings = this.workspace.unfiledRecordings;
-  protected readonly unfiledExpanded = signal(true);
+  protected readonly unfiledExpanded = this.workspace.unfiledExpanded;
 
   /**
    * The whole forest as flat lines.
@@ -225,7 +240,7 @@ export class WorkspaceTreeComponent {
   }
 
   protected toggleUnfiled(): void {
-    this.unfiledExpanded.update((expanded) => !expanded);
+    this.workspace.toggleUnfiled();
   }
 
   /** A container with no groups and no folders has nothing to disclose. */
@@ -362,36 +377,107 @@ export class WorkspaceTreeComponent {
    * apply as to a drop: a sealed, not-session-unlocked container is refused by every
    * mover, so it is not offered here either.
    */
-  protected readonly moveTargets = computed<ContainerNode[]>(() => {
-    const out: ContainerNode[] = [];
-    const walk = (container: ContainerNode): void => {
-      if (this.canDropInto(container)) {
-        out.push(container);
-      }
-      container.folders.forEach(walk);
-    };
-    this.workspace.forest().forEach(walk);
-    return out;
-  });
+  protected readonly moveTargets = computed<WorkspaceDestination[]>(() =>
+    workspaceDestinations(this.workspace.forest()),
+  );
 
   /** The container an item currently sits in, so the menu can leave it out. */
-  protected moveTargetsFor(item: ItemRow, current: ContainerNode): ContainerNode[] {
-    return this.draggableKind(item)
-      ? this.moveTargets().filter((target) => target.id !== current.id)
+  protected moveTargetsFor(
+    item: ItemRow,
+    current: ContainerNode,
+  ): WorkspaceDestination[] {
+    const kind = this.draggableKind(item);
+    return kind
+      ? this.moveTargets().filter(
+          (target) =>
+            target.container.id !== current.id &&
+            this.canMoveKindInto(kind, target.container),
+        )
       : [];
   }
 
   /** Unfiled recordings have no current container to exclude. */
-  protected unfiledMoveTargets(item: ItemRow): ContainerNode[] {
-    return this.draggableKind(item) ? this.moveTargets() : [];
+  protected unfiledMoveTargets(item: ItemRow): WorkspaceDestination[] {
+    const kind = this.draggableKind(item);
+    return kind
+      ? this.moveTargets().filter((target) =>
+          this.canMoveKindInto(kind, target.container),
+        )
+      : [];
   }
 
-  protected async moveItemTo(item: ItemRow, target: ContainerNode): Promise<void> {
-    const kind = this.draggableKind(item);
-    if (!kind) {
+  protected readonly moveRequest = signal<{
+    item: ItemRow;
+    fromLabel: string;
+    targets: WorkspaceDestination[];
+  } | null>(null);
+  protected readonly moveBusy = signal(false);
+  protected readonly moveError = signal<string | null>(null);
+
+  protected openMove(
+    item: ItemRow,
+    from: ContainerNode | null,
+    targets: WorkspaceDestination[],
+  ): void {
+    if (targets.length === 0) {
       return;
     }
-    await this.workspace.moveItem(kind, item.id, target.id);
+    const fromLabel = from
+      ? this.moveTargets().find((target) => target.container.id === from.id)
+          ?.label ?? from.name
+      : "Unfiled recordings";
+    this.moveError.set(null);
+    this.moveRequest.set({ item, fromLabel, targets });
+  }
+
+  protected closeMove(): void {
+    if (!this.moveBusy()) {
+      this.moveRequest.set(null);
+      this.moveError.set(null);
+    }
+  }
+
+  protected async moveItemTo(target: WorkspaceDestination): Promise<void> {
+    const request = this.moveRequest();
+    const kind = request ? this.draggableKind(request.item) : null;
+    if (!request || !kind || this.moveBusy()) {
+      return;
+    }
+    this.moveBusy.set(true);
+    this.moveError.set(null);
+    try {
+      await this.workspace.moveItem(
+        kind,
+        request.item.id,
+        target.container.id,
+      );
+      this.moveRequest.set(null);
+      this.toast.success(
+        `Moved “${this.itemTitle(request.item)}” to ${target.label}`,
+      );
+    } catch {
+      const message = `Couldn’t move “${this.itemTitle(request.item)}” to ${target.label}.`;
+      this.moveError.set(message);
+      this.toast.danger(message);
+    } finally {
+      this.moveBusy.set(false);
+    }
+  }
+
+  private canMoveKindInto(
+    kind: DraggableKind,
+    container: ContainerNode,
+  ): boolean {
+    if (container.locked && !container.unlocked) {
+      return false;
+    }
+    if (kind === "meeting") {
+      return container.kind === "meeting";
+    }
+    if (kind === "note") {
+      return container.kind === "note";
+    }
+    return true;
   }
 
   protected async onDropItem(
@@ -402,24 +488,54 @@ export class WorkspaceTreeComponent {
     // the directive hands back to its consumer; it does not gate the drop, so
     // passing null there looked like a guard while the handler went on using the
     // container id regardless — and a sealed destination accepted the move.
-    if (!this.canDropInto(container)) {
+    if (
+      !this.canDropInto(container) ||
+      !this.canMoveKindInto(payload.kind, container)
+    ) {
       return;
     }
-    await this.workspace.moveItem(payload.kind, payload.id, container.id);
+    const targetLabel =
+      this.moveTargets().find((target) => target.container.id === container.id)
+        ?.label ?? container.name;
+    try {
+      await this.workspace.moveItem(payload.kind, payload.id, container.id);
+      this.toast.success(`Moved item to ${targetLabel}`);
+    } catch {
+      this.toast.danger(`Couldn’t move this item to ${targetLabel}.`);
+    }
   }
 
   protected async newNote(container: ContainerNode): Promise<void> {
-    const id = await this.workspace.createNote(container.id, "New note");
-    await this.router.navigate(["/notes", id]);
+    try {
+      const id = await this.workspace.createNote(container.id, "Untitled");
+      this.toast.success(`Created a note in ${container.name}`);
+      await this.router.navigate(["/notes", id]);
+    } catch {
+      this.toast.danger(`Couldn’t create a note in ${container.name}.`);
+    }
   }
 
   protected async newFolder(container: ContainerNode): Promise<void> {
-    await this.workspace.createFolder(container.id, "New folder");
+    try {
+      const id = await this.workspace.createFolder(container, "New folder");
+      this.toast.success(`Created a folder in ${container.name}`);
+      await this.router.navigate(["/container", id]);
+    } catch {
+      this.toast.danger(`Couldn’t create a folder in ${container.name}.`);
+    }
   }
 
   protected async newDashboard(container: ContainerNode): Promise<void> {
-    const id = await this.workspace.createDashboard(container.id, "New dashboard");
-    await this.router.navigate(["/dashboards", id]);
+    try {
+      const id = await this.workspace.createDashboard(
+        container.id,
+        "New dashboard",
+      );
+      this.toast.success(`Created a dashboard in ${container.name}`);
+      await this.router.navigate(["/dashboards", id]);
+    } catch {
+      this.toast.danger(`Couldn’t create a dashboard in ${container.name}.`);
+    }
   }
 
   /**
@@ -473,18 +589,113 @@ export class WorkspaceTreeComponent {
     await this.refreshAfterLockChange();
   }
 
-  protected async rename(container: ContainerNode): Promise<void> {
-    const name = window.prompt("Rename folder", container.name)?.trim();
-    if (!name || name === container.name) {
-      return;
-    }
-    await this.folders.rename(container.id, name);
-    await this.workspace.reload();
+  protected readonly manageRequest = signal<{
+    mode: WorkspaceManageMode;
+    container: ContainerNode;
+  } | null>(null);
+  protected readonly manageBusy = signal(false);
+  protected readonly manageError = signal<string | null>(null);
+
+  protected startRename(container: ContainerNode): void {
+    this.manageError.set(null);
+    this.manageRequest.set({ mode: "rename", container });
   }
 
-  protected async remove(container: ContainerNode): Promise<void> {
-    await this.folders.delete(container.id);
-    await this.workspace.reload();
+  protected startDelete(container: ContainerNode): void {
+    this.manageError.set(null);
+    this.manageRequest.set({ mode: "delete", container });
+  }
+
+  protected closeManage(): void {
+    if (!this.manageBusy()) {
+      this.manageRequest.set(null);
+      this.manageError.set(null);
+    }
+  }
+
+  protected async rename(name: string): Promise<void> {
+    const request = this.manageRequest();
+    if (!request || request.mode !== "rename" || this.manageBusy()) {
+      return;
+    }
+    this.manageBusy.set(true);
+    this.manageError.set(null);
+    try {
+      if (request.container.kind === "note") {
+        await this.ipc.renameNoteFolder(request.container.id, name);
+        await this.notes.loadFolders();
+      } else {
+        await this.folders.rename(request.container.id, name);
+      }
+      await this.workspace.reload();
+      this.manageRequest.set(null);
+      this.toast.success(
+        `Renamed ${this.containerNoun(request.container)} to “${name}”`,
+      );
+    } catch {
+      this.manageError.set(
+        `Couldn’t rename “${request.container.name}”. Please try again.`,
+      );
+    } finally {
+      this.manageBusy.set(false);
+    }
+  }
+
+  protected async remove(): Promise<void> {
+    const request = this.manageRequest();
+    if (!request || request.mode !== "delete" || this.manageBusy()) {
+      return;
+    }
+    this.manageBusy.set(true);
+    this.manageError.set(null);
+    try {
+      if (request.container.kind === "note") {
+        await this.ipc.deleteNoteFolder(request.container.id);
+        await this.notes.loadFolders();
+      } else {
+        await this.folders.delete(request.container.id);
+      }
+      await this.workspace.reload();
+      this.manageRequest.set(null);
+      this.toast.success(
+        `Deleted ${this.containerNoun(request.container)} “${request.container.name}”`,
+      );
+      if (this.isContainerSelected(request.container)) {
+        const first = this.workspace.forest()[0];
+        await this.router.navigate(
+          first ? ["/container", first.id] : ["/record"],
+        );
+      }
+    } catch {
+      this.manageError.set(
+        `Couldn’t delete “${request.container.name}”. It may still contain nested folders.`,
+      );
+    } finally {
+      this.manageBusy.set(false);
+    }
+  }
+
+  protected containerNoun(container: ContainerNode): "space" | "folder" {
+    return container.level === "project" ? "space" : "folder";
+  }
+
+  protected canCreateNote(container: ContainerNode): boolean {
+    return this.canCreateIn(container) && container.kind === "note";
+  }
+
+  protected canManage(container: ContainerNode): boolean {
+    return !container.isRoot;
+  }
+
+  /** Do not render an empty gear menu merely because a container row exists. */
+  protected canShowActions(container: ContainerNode): boolean {
+    return (
+      this.isSealed(container) ||
+      this.canLock(container) ||
+      (container.locked && container.unlocked) ||
+      this.canOrganize(container) ||
+      this.canManage(container)
+    );
   }
 
   /** The reserved note root can never be sealed, so it is never offered a lock. */
@@ -503,12 +714,13 @@ export class WorkspaceTreeComponent {
    */
   protected lockLabel(container: ContainerNode): string {
     const nested = container.folders.length;
+    const noun = container.level === "project" ? "Space" : "folder";
     if (nested === 0) {
-      return "Lock folder";
+      return `Lock ${noun}`;
     }
     return nested === 1
-      ? "Lock project and the folder inside it"
-      : `Lock project and the ${nested} folders inside it`;
+      ? `Lock ${noun} and the folder inside it`
+      : `Lock ${noun} and the ${nested} folders inside it`;
   }
 
   /** The unlock half of {@link lockLabel} — it cascades too. */
@@ -520,7 +732,7 @@ export class WorkspaceTreeComponent {
     const nested = container.folders.length;
     return nested === 0
       ? "Unlock for this session"
-      : "Unlock this project and its folders for this session";
+      : `Unlock this ${container.level === "project" ? "Space" : "folder"} and its folders for this session`;
   }
 
   // ── AI organize, per container ────────────────────────────────────────────

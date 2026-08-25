@@ -1,0 +1,129 @@
+<div
+  class="scrim"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Create in Spaces"
+  [attr.aria-busy]="busy()"
+  (click)="onScrimClick($event)"
+  (keydown.escape)="busy() ? null : cancelled.emit()"
+>
+  <section class="sheet">
+    <header class="sheet-head">
+      <span class="sheet-mark"><mur-icon icon="plus" /></span>
+      <div>
+        <h3>Create in Spaces</h3>
+        <p>Choose what to create and exactly where it belongs.</p>
+      </div>
+    </header>
+
+    <div class="kind-picker" aria-label="Item type">
+      <button
+        type="button"
+        [class.is-active]="kind() === 'note'"
+        [attr.aria-pressed]="kind() === 'note'"
+        [disabled]="busy()"
+        (click)="chooseKind('note')"
+      >
+        <mur-icon icon="notes" />
+        Note
+      </button>
+      <button
+        type="button"
+        [class.is-active]="kind() === 'folder'"
+        [attr.aria-pressed]="kind() === 'folder'"
+        [disabled]="busy()"
+        (click)="chooseKind('folder')"
+      >
+        <mur-icon icon="folder-add" />
+        Folder
+      </button>
+      <button
+        type="button"
+        [class.is-active]="kind() === 'dashboard'"
+        [attr.aria-pressed]="kind() === 'dashboard'"
+        [disabled]="busy()"
+        (click)="chooseKind('dashboard')"
+      >
+        <mur-icon icon="dashboards" />
+        Dashboard
+      </button>
+    </div>
+
+    <label class="field-label" for="workspace-create-name">Name</label>
+    <input
+      #nameInput
+      id="workspace-create-name"
+      class="name-field"
+      type="text"
+      [value]="name()"
+      [placeholder]="defaultName()"
+      [disabled]="busy()"
+      (input)="name.set(nameInput.value)"
+    />
+
+    <div class="destination-head">
+      <span>Destination</span>
+      <label class="destination-search">
+        <mur-icon icon="search" />
+        <input
+          #destinationSearch
+          type="search"
+          [value]="query()"
+          [disabled]="busy()"
+          (input)="query.set(destinationSearch.value)"
+          placeholder="Filter…"
+          aria-label="Filter destinations"
+        />
+      </label>
+    </div>
+
+    @if (error(); as message) {
+      <p class="create-error" role="alert">{{ message }}</p>
+    }
+
+    <div class="destination-list" aria-label="Destinations">
+      @for (target of filteredTargets(); track target.container.id) {
+        <button
+          type="button"
+          class="destination"
+          [class.is-selected]="selectedTargetId() === target.container.id"
+          [attr.aria-pressed]="selectedTargetId() === target.container.id"
+          [disabled]="busy()"
+          (click)="selectedTargetId.set(target.container.id)"
+        >
+          <mur-icon [icon]="target.container.level === 'project' ? 'spaces' : 'folder'" />
+          <span>
+            <strong>{{ target.label }}</strong>
+            <small>{{ target.container.level === "project" ? "Space" : "Folder" }}</small>
+          </span>
+          @if (selectedTargetId() === target.container.id) {
+            <span class="selected-mark" aria-hidden="true">✓</span>
+          }
+        </button>
+      } @empty {
+        <p class="empty-copy">
+          {{ kind() === "note" ? "No open note folder matches." : "No open destination matches." }}
+        </p>
+      }
+    </div>
+
+    <footer class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="busy()"
+        (click)="cancelled.emit()"
+      >
+        Cancel
+      </button>
+      <button
+        type="button"
+        class="btn btn-primary"
+        [disabled]="busy() || !selectedTarget()"
+        (click)="onCreate()"
+      >
+        {{ busy() ? "Creating…" : "Create " + kind() }}
+      </button>
+    </footer>
+  </section>
+</div>

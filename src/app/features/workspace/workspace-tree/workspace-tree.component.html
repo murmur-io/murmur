@@ -5,7 +5,7 @@
 @if (workspaceEmpty() && loading()) {
   <p class="tree-state">Loading workspace…</p>
 } @else if (workspaceEmpty()) {
-  <p class="tree-state">No projects yet</p>
+  <p class="tree-state">No Spaces yet</p>
 } @else {
   @if (error(); as message) {
     <!-- A failed refresh keeps the cached tree and says so, rather than
@@ -51,21 +51,15 @@
             >
               @if (unfiledMoveTargets(item); as targets) {
                 @if (targets.length > 0) {
-                  <mur-row-menu
-                    class="row-add"
-                    [label]="'Move ' + itemTitle(item)"
+                  <button
+                    type="button"
+                    class="row-move-trigger"
+                    [attr.aria-label]="'Move recording “' + itemTitle(item) + '”'"
+                    [title]="'Move recording “' + itemTitle(item) + '”'"
+                    (click)="$event.stopPropagation(); openMove(item, null, targets)"
                   >
-                    @for (target of targets; track target.id) {
-                      <button
-                        type="button"
-                        class="menu-item"
-                        role="menuitem"
-                        (click)="moveItemTo(item, target)"
-                      >
-                        {{ target.name }}
-                      </button>
-                    }
-                  </mur-row-menu>
+                    <mur-icon icon="move" />
+                  </button>
                 }
               }
             </mur-tree-row>
@@ -108,18 +102,15 @@
               <!-- The keyboard's form of the drag above. Dragging is a pointer gesture
                    with no keyboard equivalent of its own, so without this an item could
                    only be filed with a mouse. -->
-              <mur-row-menu class="row-add" [label]="'Move ' + itemTitle(item)">
-                @for (target of targets; track target.id) {
-                  <button
-                    type="button"
-                    class="menu-item"
-                    role="menuitem"
-                    (click)="moveItemTo(item, target)"
-                  >
-                    {{ target.name }}
-                  </button>
-                }
-              </mur-row-menu>
+              <button
+                type="button"
+                class="row-move-trigger"
+                [attr.aria-label]="'Move ' + item.kind + ' “' + itemTitle(item) + '”'"
+                [title]="'Move ' + item.kind + ' “' + itemTitle(item) + '”'"
+                (click)="$event.stopPropagation(); openMove(item, line.container, targets)"
+              >
+                <mur-icon icon="move" />
+              </button>
             }
           }
         </mur-tree-row>
@@ -168,20 +159,25 @@
               icon="add"
               [label]="'Add to ' + line.container.name"
             >
-              <button
-                type="button"
-                class="menu-item"
-                role="menuitem"
-                (click)="newNote(line.container)"
-              >
-                New note
-              </button>
+              <span class="menu-group-label">Create in {{ line.container.name }}</span>
+              @if (canCreateNote(line.container)) {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="newNote(line.container)"
+                >
+                  <mur-icon icon="note-add" />
+                  New note
+                </button>
+              }
               <button
                 type="button"
                 class="menu-item"
                 role="menuitem"
                 (click)="newFolder(line.container)"
               >
+                <mur-icon icon="folder-add" />
                 New folder
               </button>
               <button
@@ -190,14 +186,19 @@
                 role="menuitem"
                 (click)="newDashboard(line.container)"
               >
+                <mur-icon icon="dashboards" />
                 New dashboard
               </button>
             </mur-row-menu>
           }
-          <mur-row-menu
-            class="row-actions"
-            [label]="'Actions for ' + line.container.name"
-          >
+          @if (canShowActions(line.container)) {
+            <mur-row-menu
+              class="row-actions"
+              [label]="'Actions for ' + line.container.name"
+            >
+            <span class="menu-group-label">
+              {{ line.container.level === "project" ? "Space" : "Folder" }} actions
+            </span>
             @if (isSealed(line.container)) {
               <button
                 type="button"
@@ -205,6 +206,7 @@
                 role="menuitem"
                 (click)="unlock(line.container)"
               >
+                <mur-icon icon="unlock" />
                 {{ unlockLabel(line.container) }}
               </button>
             } @else {
@@ -215,6 +217,7 @@
                   role="menuitem"
                   (click)="lock(line.container)"
                 >
+                  <mur-icon icon="lock" />
                   {{ lockLabel(line.container) }}
                 </button>
               }
@@ -225,6 +228,7 @@
                   role="menuitem"
                   (click)="relock(line.container)"
                 >
+                  <mur-icon icon="lock" />
                   Lock again
                 </button>
               }
@@ -237,6 +241,7 @@
                   (click)="organize(line.container)"
                   data-testid="organize-container"
                 >
+                  <mur-icon icon="brain" />
                   {{
                     organizePlanning()
                       ? "Reading this folder…"
@@ -244,24 +249,29 @@
                   }}
                 </button>
               }
-              <button
-                type="button"
-                class="menu-item"
-                role="menuitem"
-                (click)="rename(line.container)"
-              >
-                Rename
-              </button>
-              <button
-                type="button"
-                class="menu-item menu-item-danger"
-                role="menuitem"
-                (click)="remove(line.container)"
-              >
-                Delete folder
-              </button>
+              @if (canManage(line.container)) {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="startRename(line.container)"
+                >
+                  <mur-icon icon="rename" />
+                  Rename {{ containerNoun(line.container) }}
+                </button>
+                <button
+                  type="button"
+                  class="menu-item menu-item-danger"
+                  role="menuitem"
+                  (click)="startDelete(line.container)"
+                >
+                  <mur-icon icon="trash" />
+                  Delete {{ containerNoun(line.container) }}
+                </button>
+              }
             }
-          </mur-row-menu>
+            </mur-row-menu>
+          }
           @if (line.container.locked && line.container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's
                  spare width and truncated "Prywatne" to "P…". The state still
@@ -290,10 +300,41 @@
      modal, only one container is ever being organized, and a per-row instance would build a
      dialog for every container in the vault. Its own opaque overlay (T3). -->
 @if (organizePlan()) {
-  <app-organize-sheet
-    [plan]="organizePlan()"
-    [busy]="organizeApplying()"
-    (apply)="applyOrganize($event)"
-    (cancelled)="closeOrganize()"
-  />
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-organize-sheet
+      [plan]="organizePlan()"
+      [busy]="organizeApplying()"
+      (apply)="applyOrganize($event)"
+      (cancelled)="closeOrganize()"
+    />
+  </div>
+}
+
+@if (moveRequest(); as request) {
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-workspace-move-sheet
+      [item]="request.item"
+      [fromLabel]="request.fromLabel"
+      [targets]="request.targets"
+      [busy]="moveBusy()"
+      [error]="moveError()"
+      (move)="moveItemTo($event)"
+      (cancelled)="closeMove()"
+    />
+  </div>
+}
+
+@if (manageRequest(); as request) {
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-workspace-manage-sheet
+      [mode]="request.mode"
+      [name]="request.container.name"
+      [noun]="containerNoun(request.container)"
+      [busy]="manageBusy()"
+      [error]="manageError()"
+      (renamed)="rename($event)"
+      (deleteConfirmed)="remove()"
+      (cancelled)="closeManage()"
+    />
+  </div>
 }
