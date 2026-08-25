@@ -125,9 +125,7 @@
           class="unlocked-pill"
           [disabled]="relockingAll()"
           (click)="relockAll()"
-          [attr.aria-label]="
-            'Re-seal all ' + unlockedCount() + ' unlocked folders now'
-          "
+          [attr.aria-label]="relockAllAriaLabel()"
         >
           <mur-icon icon="lock" />
           <span>{{ unlockedCount() }} unlocked</span>

@@ -184,3 +184,168 @@ test("a sealed project discloses nothing about what it holds", async ({ page }) 
   // one that expands to emptiness would read as "this project is empty".
   await expect(page.getByRole("button", { name: "Expand Private" })).toHaveCount(0);
 });
+
+test("treats a sealed container as an intrinsic leaf even when a stale payload includes content", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {},
+    {
+      list_workspace_tree: [
+        {
+          id: "p-sealed-stale",
+          name: "Private",
+          level: "project",
+          emoji: "🔒",
+          tint: "violet",
+          locked: true,
+          unlocked: false,
+          isRoot: false,
+          folders: [
+            {
+              id: "f-secret",
+              name: "Secret child",
+              level: "folder",
+              emoji: null,
+              tint: null,
+              locked: true,
+              unlocked: false,
+              isRoot: false,
+              folders: [],
+              groups: [],
+            },
+          ],
+          groups: [
+            {
+              kind: "note",
+              total: 1,
+              items: [
+                {
+                  kind: "note",
+                  id: "n-secret",
+                  title: "Secret launch title",
+                  durationS: null,
+                  sortAt: 1,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  );
+  await page.goto("/container/p-sealed-stale");
+
+  const sealed = page.getByRole("treeitem", { name: "Private" });
+  await expect(sealed).toBeVisible();
+  await expect(page.getByRole("button", { name: "Expand Private" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Add to Private" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Actions for Private" })).toHaveCount(1);
+  await page.getByRole("button", { name: "Actions for Private" }).click();
+  await expect(page.getByRole("menuitem", { name: "Unlock for this session" })).toBeVisible();
+  await expect(page.getByRole("menuitem")).toHaveCount(1);
+  await expect(page.getByText("Secret child", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Secret launch title", { exact: true })).toHaveCount(0);
+});
+
+test("scrubs cached hierarchy titles when relock succeeds even if every refresh rejects", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      list_workspace_tree: () => {
+        const target = window as unknown as { __workspaceTreeCalls?: number };
+        target.__workspaceTreeCalls = (target.__workspaceTreeCalls ?? 0) + 1;
+        if (target.__workspaceTreeCalls > 1) {
+          return Promise.reject(new Error("workspace refresh unavailable"));
+        }
+        return [
+          {
+            id: "p-private",
+            name: "Private",
+            level: "project",
+            emoji: null,
+            tint: null,
+            locked: true,
+            unlocked: true,
+            isRoot: false,
+            folders: [],
+            groups: [
+              {
+                kind: "note",
+                total: 1,
+                items: [
+                  {
+                    kind: "note",
+                    id: "n-secret",
+                    title: "Acquisition codename",
+                    durationS: null,
+                    sortAt: 1,
+                  },
+                ],
+              },
+              {
+                kind: "meeting",
+                total: 1,
+                items: [
+                  {
+                    kind: "meeting",
+                    id: "m-secret",
+                    title: "Board compensation",
+                    durationS: 600,
+                    sortAt: 2,
+                  },
+                ],
+              },
+            ],
+          },
+        ];
+      },
+      relock_all: () => {
+        (
+          window as unknown as {
+            __demoEmit: (event: string, payload: unknown) => void;
+          }
+        ).__demoEmit("murmur://reminder-visibility-invalidated", null);
+        return null;
+      },
+    },
+    {
+      list_folders: [
+        {
+          id: "p-private",
+          name: "Private",
+          path: "Private",
+          parentId: null,
+          noteCount: 2,
+          locked: true,
+          unlocked: true,
+          kind: "meeting",
+          children: [],
+        },
+      ],
+    },
+  );
+  await page.goto("/meeting/m-secret");
+
+  await expect(page.getByText("Board compensation", { exact: true })).toBeVisible();
+  await expect(page.getByText("Acquisition codename", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Re-seal all 1 unlocked folder now" }).click();
+
+  await expect(page.getByText("Board compensation", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Acquisition codename", { exact: true })).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __workspaceTreeCalls?: number })
+            .__workspaceTreeCalls ?? 0,
+      ),
+    )
+    .toBeGreaterThan(1);
+  await expect(page.getByText("Board compensation", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Acquisition codename", { exact: true })).toHaveCount(0);
+});

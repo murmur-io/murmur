@@ -1,5 +1,6 @@
-import { Injectable, computed, inject, signal } from "@angular/core";
+import { DestroyRef, Injectable, computed, inject, signal } from "@angular/core";
 
+import { AskHistoryPrivacyBarrierService } from "../../core/ask-history-privacy-barrier.service";
 import { IpcService } from "../../core/ipc.service";
 import type { ContainerNode, ItemKind, ItemPage } from "../../core/models";
 import type { DraggableKind } from "../folders/note-drag.service";
@@ -20,6 +21,8 @@ const EXPANDED_CONTAINERS_KEY = "murmur.workspace.expandedContainers";
 @Injectable({ providedIn: "root" })
 export class WorkspaceService {
   private readonly ipc = inject(IpcService);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly destroyRef = inject(DestroyRef);
 
   private readonly _forest = signal<ContainerNode[]>([]);
   /** Projects, each with its folders and per-kind item groups. */
@@ -42,20 +45,66 @@ export class WorkspaceService {
     readStoredSet(EXPANDED_CONTAINERS_KEY),
   );
 
+  /**
+   * Invalidates an older gated read when lock authority changes underneath it.
+   * Without this token, a pre-lock response can land after the synchronous scrub
+   * and restore titles that the renderer is no longer allowed to retain.
+   */
+  private loadGeneration = 0;
+
+  constructor() {
+    const unregister = this.privacyBarrier.registerInvalidator(() => {
+      this.scrubAndReload();
+    });
+    this.destroyRef.onDestroy(unregister);
+  }
+
   /** Reload the whole forest. Safe to call repeatedly; the last write wins. */
   async reload(): Promise<void> {
+    const generation = ++this.loadGeneration;
     this._loading.set(true);
     try {
+      // Tauri events are not replayed. Refuse content-bearing hierarchy reads
+      // until the shared privacy listeners have acknowledged registration.
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (generation !== this.loadGeneration) {
+        return;
+      }
+      if (!privacyReady) {
+        this._forest.set([]);
+        this._error.set("Workspace is unavailable securely right now");
+        return;
+      }
       const forest = await this.ipc.listWorkspaceTree();
+      if (generation !== this.loadGeneration) {
+        return;
+      }
       this._forest.set(forest);
       this._error.set(null);
     } catch (error) {
+      if (generation !== this.loadGeneration) {
+        return;
+      }
       // Keep whatever is cached: a failed refresh must not blank a tree the user
-      // is navigating. The message is surfaced, the rows are not thrown away.
+      // is navigating. A privacy transition clears that cache synchronously in
+      // `scrubAndReload`, so this fallback can retain only still-authorized rows.
       this._error.set(messageOf(error));
     } finally {
-      this._loading.set(false);
+      if (generation === this.loadGeneration) {
+        this._loading.set(false);
+      }
     }
+  }
+
+  /**
+   * Lock/move/delete authority changed. Drop every cached title synchronously,
+   * invalidate any pre-transition response, then repair from the canonical gated
+   * reader. If that refetch fails, the empty privacy-safe state remains visible.
+   */
+  private scrubAndReload(): void {
+    ++this.loadGeneration;
+    this._forest.set([]);
+    void this.reload();
   }
 
   /** One container's own metadata (never its contents); `null` when unknown. */

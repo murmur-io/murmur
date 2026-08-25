@@ -583,3 +583,10 @@ app-shell > .main-col {
   margin: 0;
   overflow: auto;
 }
+
+@media (max-width: 760px) {
+  .app-sidebar.spaces-sidebar,
+  .app-sidebar.browse-sidebar {
+    display: none;
+  }
+}
