@@ -28,6 +28,14 @@ export class WorkspaceService {
   /** Projects, each with its folders and per-kind item groups. */
   readonly forest = this._forest.asReadonly();
 
+  private readonly _unfiledRecordings = signal<ItemPage>({
+    kind: "meeting",
+    items: [],
+    total: 0,
+  });
+  /** Newest recordings that do not belong to any lockable container. */
+  readonly unfiledRecordings = this._unfiledRecordings.asReadonly();
+
   private readonly _loading = signal(false);
   readonly loading = this._loading.asReadonly();
 
@@ -40,6 +48,11 @@ export class WorkspaceService {
    * reload replaces them underneath.
    */
   readonly forestEmpty = computed(() => this._forest().length === 0);
+
+  /** Nothing the Spaces tree can currently render. */
+  readonly workspaceEmpty = computed(
+    () => this._forest().length === 0 && this._unfiledRecordings().total === 0,
+  );
 
   private readonly _expandedContainers = signal<ReadonlySet<string>>(
     readStoredSet(EXPANDED_CONTAINERS_KEY),
@@ -72,14 +85,19 @@ export class WorkspaceService {
       }
       if (!privacyReady) {
         this._forest.set([]);
+        this._unfiledRecordings.set({ kind: "meeting", items: [], total: 0 });
         this._error.set("Workspace is unavailable securely right now");
         return;
       }
-      const forest = await this.ipc.listWorkspaceTree();
+      const [forest, unfiledRecordings] = await Promise.all([
+        this.ipc.listWorkspaceTree(),
+        this.ipc.listContainerItems(null, "meeting", 0, 8),
+      ]);
       if (generation !== this.loadGeneration) {
         return;
       }
       this._forest.set(forest);
+      this._unfiledRecordings.set(unfiledRecordings);
       this._error.set(null);
     } catch (error) {
       if (generation !== this.loadGeneration) {
@@ -104,6 +122,7 @@ export class WorkspaceService {
   private scrubAndReload(): void {
     ++this.loadGeneration;
     this._forest.set([]);
+    this._unfiledRecordings.set({ kind: "meeting", items: [], total: 0 });
     void this.reload();
   }
 
