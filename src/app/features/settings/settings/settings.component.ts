@@ -25,6 +25,7 @@ import { SettingsAccountSectionComponent } from "../sections/settings-account-se
 import { SettingsOrganizationSectionComponent } from "../sections/settings-organization-section/settings-organization-section.component";
 import { SettingsPrivacySectionComponent } from "../sections/settings-privacy-section/settings-privacy-section.component";
 import { SettingsObsidianSectionComponent } from "../sections/settings-obsidian-section/settings-obsidian-section.component";
+import { SettingsImportsSectionComponent } from "../sections/settings-imports-section/settings-imports-section.component";
 import { SettingsAboutSectionComponent } from "../sections/settings-about-section/settings-about-section.component";
 
 /** One entry in the macOS-style Settings sidebar. `keywords` feeds the search box. */
@@ -52,6 +53,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "organization", label: "Organization", keywords: "org team shared brain company workspace members invite colleague owner consent sync org brain shared knowledge base leave" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
   { id: "obsidian", label: "Obsidian", keywords: "vault markdown notes companion export wikilinks" },
+  { id: "imports", label: "Imports", keywords: "notion import migrate export zip markdown bring in move from another app evernote bear obsidian vault" },
   { id: "about", label: "About", keywords: "about version update check for updates release changelog product info" },
 ];
 
@@ -69,7 +71,7 @@ const SETTINGS_GROUPS: readonly {
   { label: "Capture", ids: ["transcription", "audio", "storage"] },
   { label: "Intelligence", ids: ["notes", "ai", "connectors"] },
   { label: "Sharing", ids: ["account", "organization"] },
-  { label: "Privacy & Vault", ids: ["privacy", "obsidian"] },
+  { label: "Privacy & Vault", ids: ["privacy", "obsidian", "imports"] },
   { label: null, ids: ["about"] },
 ];
 
@@ -104,6 +106,7 @@ const SETTINGS_GROUPS: readonly {
     SettingsOrganizationSectionComponent,
     SettingsPrivacySectionComponent,
     SettingsObsidianSectionComponent,
+    SettingsImportsSectionComponent,
     SettingsAboutSectionComponent,
   ],
   templateUrl: "./settings.component.html",
