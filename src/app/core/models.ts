@@ -791,7 +791,7 @@ export interface BulkImportProgress {
  * The DRY-RUN plan for a Notion export: what an import WOULD do. Produced without writing
  * anything, so the user confirms against real numbers rather than a promise.
  */
-export interface NotionScanReport {
+export interface ImportScanReport {
   /** Pages that would be imported or updated. */
   pages: number;
   /** Of those, how many already exist here (they update in place, never duplicate). */
@@ -809,12 +809,20 @@ export interface NotionScanReport {
   titleCollisions: string[];
   /** A few titles for the preview, so the user can confirm this is the right export. */
   sampleTitles: string[];
-  /** The export exceeded the per-import page cap and the plan was cut short. */
+  /** The source exceeded the per-import page cap and the plan was cut short. */
   truncated: boolean;
+  /**
+   * The chosen Obsidian folder IS the vault Murmur exports to - importing it would read our own
+   * notes back in as copies of themselves.
+   */
+  isMurmurVault: boolean;
 }
 
+/** Where an import reads from. The value is the wire contract with the Rust side. */
+export type ImportSourceId = "notion" | "obsidian" | "apple-notes";
+
 /** What an import actually did. A partial run stays legible instead of silent. */
-export interface NotionImportReport {
+export interface ImportReport {
   imported: number;
   updated: number;
   skipped: number;

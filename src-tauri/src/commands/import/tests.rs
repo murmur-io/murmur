@@ -144,7 +144,7 @@ fn imports_pages_as_notes_and_resolves_the_cross_link() {
     let state = build_state("cross-link");
     let dir = export_dir("cross-link", &two_linked_pages());
 
-    let report = run_notion_import(None, &state, dir.to_str().expect("path"), None, false)
+    let report = run_import_inner(None, &state, ImportSource::Notion, Some(dir.to_str().expect("path")), None, false)
         .expect("import");
 
     assert_eq!(report.imported, 2, "both pages became notes");
@@ -171,11 +171,11 @@ fn stamps_provenance_so_the_page_can_be_recognized_later() {
     let state = build_state("provenance");
     let dir = export_dir("provenance", &two_linked_pages());
 
-    run_notion_import(None, &state, dir.to_str().expect("path"), None, false).expect("import");
+    run_import_inner(None, &state, ImportSource::Notion, Some(dir.to_str().expect("path")), None, false).expect("import");
 
     let found = state
         .db
-        .note_by_external_id(SOURCE_NOTION, "abc123def4567890abcdef1234567891")
+        .note_by_external_id(ImportSource::Notion.as_str(), "abc123def4567890abcdef1234567891")
         .expect("lookup");
     assert!(found.is_some(), "the Notion page id is stored as provenance");
     let _ = std::fs::remove_dir_all(&dir);
@@ -188,10 +188,10 @@ fn a_re_import_updates_in_place_instead_of_duplicating() {
     let dir = export_dir("reimport", &two_linked_pages());
     let path = dir.to_str().expect("path");
 
-    let first = run_notion_import(None, &state, path, None, false).expect("first import");
+    let first = run_import_inner(None, &state, ImportSource::Notion, Some(path), None, false).expect("first import");
     assert_eq!((first.imported, first.updated), (2, 0));
 
-    let second = run_notion_import(None, &state, path, None, false).expect("second import");
+    let second = run_import_inner(None, &state, ImportSource::Notion, Some(path), None, false).expect("second import");
     assert_eq!(
         (second.imported, second.updated),
         (0, 2),
@@ -213,10 +213,11 @@ fn refuses_a_sealed_and_not_session_unlocked_target_before_writing_anything() {
     let folder = locked_note_folder(&state, "Sealed", false);
     let dir = export_dir("sealed-refusal", &two_linked_pages());
 
-    let report = run_notion_import(
+    let report = run_import_inner(
         None,
         &state,
-        dir.to_str().expect("path"),
+        ImportSource::Notion,
+        Some(dir.to_str().expect("path")),
         Some(&folder),
         false,
     )
@@ -244,10 +245,11 @@ fn birth_seals_every_page_written_into_a_session_unlocked_locked_folder() {
     let folder = locked_note_folder(&state, "Private", true);
     let dir = export_dir("birth-seal", &two_linked_pages());
 
-    let report = run_notion_import(
+    let report = run_import_inner(
         None,
         &state,
-        dir.to_str().expect("path"),
+        ImportSource::Notion,
+        Some(dir.to_str().expect("path")),
         Some(&folder),
         false,
     )
@@ -279,7 +281,7 @@ fn mirrors_the_page_tree_into_note_folders_and_reuses_them_on_re_import() {
     let dir = export_dir("hierarchy", &files);
     let path = dir.to_str().expect("path");
 
-    let first = run_notion_import(None, &state, path, None, true).expect("import");
+    let first = run_import_inner(None, &state, ImportSource::Notion, Some(path), None, true).expect("import");
     assert_eq!(first.imported, 1);
     assert_eq!(first.folders_created, 2, "Workspace + Team");
 
@@ -293,7 +295,7 @@ fn mirrors_the_page_tree_into_note_folders_and_reuses_them_on_re_import() {
     assert!(names.iter().any(|n| n == "Workspace"), "got {names:?}");
     assert!(names.iter().any(|n| n == "Team"), "got {names:?}");
 
-    let second = run_notion_import(None, &state, path, None, true).expect("re-import");
+    let second = run_import_inner(None, &state, ImportSource::Notion, Some(path), None, true).expect("re-import");
     assert_eq!(
         second.folders_created, 0,
         "the second run reuses the folders it made"
@@ -307,7 +309,7 @@ fn mirrors_the_page_tree_into_note_folders_and_reuses_them_on_re_import() {
 fn dtos_cross_ipc_in_camel_case() {
     // rust-tauri §2b: a hand-written FE mock DEFINES a shape, it does not verify one. The only
     // honest check is on the producing side — assert the SERIALIZED key names.
-    let scan = NotionScanReport {
+    let scan = ImportScanReport {
         pages: 1,
         already_imported: 0,
         attachments: 2,
@@ -318,8 +320,9 @@ fn dtos_cross_ipc_in_camel_case() {
         title_collisions: vec![],
         sample_titles: vec![],
         truncated: false,
+        is_murmur_vault: false,
     };
-    let report = NotionImportReport {
+    let report = ImportReport {
         imported: 1,
         updated: 0,
         skipped: 0,
@@ -345,4 +348,100 @@ fn dtos_cross_ipc_in_camel_case() {
     let json = serde_json::to_value(&scan).expect("scan json");
     assert!(json.get("alreadyImported").is_some());
     assert!(json.get("attachmentBytes").is_some());
+}
+
+// ── Obsidian ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn imports_an_obsidian_vault_and_leaves_its_wikilinks_untouched() {
+    // A vault is already in the target format. The only correct transformation is none.
+    let state = build_state("obsidian");
+    let dir = export_dir(
+        "obsidian",
+        &[
+            ("Plan.md", "# Plan\n\nlinks to [[Other]] already\n"),
+            ("Area/Other.md", "# Other\n"),
+        ],
+    );
+
+    let report = run_import_inner(
+        None,
+        &state,
+        ImportSource::Obsidian,
+        Some(dir.to_str().expect("path")),
+        None,
+        false,
+    )
+    .expect("import");
+
+    assert_eq!(report.imported, 2);
+    assert_eq!(report.failed, 0, "failures: {:?}", report.failures);
+    let rows = imported_notes(&state);
+    let plan = rows
+        .iter()
+        .find(|r| title_of(r) == "Plan")
+        .expect("plan imported");
+    assert!(
+        plan.text.contains("[[Other]]"),
+        "the vault wikilink survives verbatim, got: {}",
+        plan.text
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_obsidian_re_import_matches_on_the_vault_path() {
+    // The vault has no per-note id, so the relative path is the identity. Re-import must update.
+    let state = build_state("obsidian-reimport");
+    let dir = export_dir("obsidian-reimport", &[("Area/Note.md", "# Note\n")]);
+    let path = dir.to_str().expect("path");
+
+    let first = run_import_inner(None, &state, ImportSource::Obsidian, Some(path), None, false)
+        .expect("first");
+    assert_eq!((first.imported, first.updated), (1, 0));
+
+    let second = run_import_inner(None, &state, ImportSource::Obsidian, Some(path), None, false)
+        .expect("second");
+    assert_eq!((second.imported, second.updated), (0, 1));
+    assert_eq!(imported_notes(&state).len(), 1, "no duplicate");
+
+    let found = state
+        .db
+        .note_by_external_id(ImportSource::Obsidian.as_str(), "Area/Note")
+        .expect("lookup");
+    assert!(found.is_some(), "identity is the vault-relative path");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sources_do_not_collide_on_the_same_external_id() {
+    // Provenance is (source, external_id), not external_id alone. Two sources that happen to use
+    // the same key must produce two notes, not one overwriting the other.
+    let state = build_state("source-scoped");
+    let dir = export_dir("source-scoped", &[("Note.md", "# Note\n")]);
+    let path = dir.to_str().expect("path");
+
+    run_import_inner(None, &state, ImportSource::Obsidian, Some(path), None, false)
+        .expect("obsidian");
+    let notion = state
+        .db
+        .note_by_external_id(ImportSource::Notion.as_str(), "Note")
+        .expect("lookup");
+    assert!(
+        notion.is_none(),
+        "an Obsidian row must not answer a Notion lookup"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unknown_source_is_refused() {
+    // Fail closed: an unrecognized wire value must not silently default to a source.
+    assert!(ImportSource::parse("dropbox").is_none());
+    assert_eq!(ImportSource::parse("notion"), Some(ImportSource::Notion));
+    assert_eq!(ImportSource::parse("obsidian"), Some(ImportSource::Obsidian));
+    assert_eq!(
+        ImportSource::parse("apple-notes"),
+        Some(ImportSource::AppleNotes)
+    );
 }

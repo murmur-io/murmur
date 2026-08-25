@@ -1,27 +1,37 @@
 <div class="section-stack">
   <div class="imports-layout">
-    <!-- Source rail. One entry today; the rail is what makes a second one a data change. -->
+    <!-- Source rail. Adding a source is a data change, not a restructure. -->
     <nav class="source-rail" aria-label="Import sources">
-      <button
-        type="button"
-        class="source-item"
-        [class.is-active]="source() === 'notion'"
-        (click)="source.set('notion')"
-      >
-        <span class="source-glyph" aria-hidden="true">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2.4" y="2.2" width="11.2" height="11.6" rx="1.6" />
-            <path d="M5.6 10.6V5.4l4.8 5.2V5.4" />
-          </svg>
-        </span>
-        <span class="source-label">Notion</span>
-      </button>
+      @for (s of sources; track s.id) {
+        <button
+          type="button"
+          class="source-item"
+          [class.is-active]="sourceId() === s.id"
+          (click)="selectSource(s.id)"
+        >
+          <span class="source-glyph" aria-hidden="true">
+            @switch (s.id) {
+              @case ("notion") {
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.4" y="2.2" width="11.2" height="11.6" rx="1.6" /><path d="M5.6 10.6V5.4l4.8 5.2V5.4" /></svg>
+              }
+              @case ("obsidian") {
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.8 2.8 5.3 4.7 12 7 14l-.8-6z" /><path d="M6 1.8 6.2 8 7 14l3.4-2.6L12 5.4 9 2z" /></svg>
+              }
+              @case ("apple-notes") {
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="2.2" width="10" height="11.6" rx="1.6" /><path d="M5.6 5.6h4.8M5.6 8h4.8M5.6 10.4h2.8" /></svg>
+              }
+            }
+          </span>
+          <span class="source-label">{{ s.label }}</span>
+        </button>
+      }
     </nav>
 
     <div class="source-pane">
-      @switch (source()) {
-        @case ("notion") {
-          <div class="card">
+      <!-- STEP 1 — choose the source -->
+      <div class="card">
+        @switch (sourceId()) {
+          @case ("notion") {
             <h3 class="pane-title">Import from Notion</h3>
             <p class="text-secondary pane-intro">
               In Notion: <strong>Settings → Workspace → General → Export all workspace
@@ -29,193 +39,232 @@
               <strong>Create folders for subpages</strong> on. Point Murmur at the archive it
               emails you, or at the folder you unpacked it to.
             </p>
-            <p class="text-muted pane-intro">
-              Everything happens on this Mac. Your export is never uploaded, and Murmur does not
-              contact Notion.
+          }
+          @case ("obsidian") {
+            <h3 class="pane-title">Import from Obsidian</h3>
+            <p class="text-secondary pane-intro">
+              Choose a vault folder. Its notes come in as they are —
+              <code>[[wikilinks]]</code> and front-matter are already the format Murmur uses, so
+              nothing is rewritten. <code>.obsidian</code> config and <code>.trash</code> are
+              skipped.
             </p>
+          }
+          @case ("apple-notes") {
+            <h3 class="pane-title">Import from Apple Notes</h3>
+            <p class="text-secondary pane-intro">
+              Notes has no export, so Murmur asks the app directly. macOS will ask your permission
+              the first time — that prompt is macOS, not a network request.
+            </p>
+          }
+        }
+        <p class="text-muted pane-intro">
+          Everything happens on this Mac. Nothing is uploaded.
+        </p>
 
-            <div class="pick-row">
-              <button type="button" class="btn" (click)="chooseArchive()">
-                Choose export .zip…
-              </button>
-              <button type="button" class="btn btn-ghost" (click)="chooseFolder()">
-                Choose unpacked folder…
-              </button>
-            </div>
+        <div class="pick-row">
+          @if (source().pick === "archive") {
+            <button type="button" class="btn" (click)="chooseArchive()">
+              Choose export .zip…
+            </button>
+            <button type="button" class="btn btn-ghost" (click)="chooseFolder()">
+              Choose unpacked folder…
+            </button>
+          } @else if (source().pick === "folder") {
+            <button type="button" class="btn" (click)="chooseFolder()">
+              Choose vault folder…
+            </button>
+          } @else {
+            <button
+              type="button"
+              class="btn"
+              [disabled]="scanning()"
+              (click)="scan()"
+            >
+              {{ scanning() ? "Reading Notes…" : "Read my Notes" }}
+            </button>
+          }
+        </div>
 
-            @if (exportPath()) {
-              <p class="chosen">
-                <code class="path">{{ exportName() }}</code>
-                @if (scanning()) {
-                  <span class="text-muted">· reading…</span>
+        @if (sourcePath()) {
+          <p class="chosen">
+            <code class="path">{{ sourceName() }}</code>
+            @if (scanning()) {
+              <span class="text-muted">· reading…</span>
+            }
+          </p>
+        }
+      </div>
+
+      <!-- STEP 2 — the plan, produced without writing anything -->
+      @if (plan(); as p) {
+        <div class="card">
+          <h3 class="pane-title">What this will do</h3>
+
+          @if (p.isMurmurVault) {
+            <mur-banner kind="danger">
+              That is the vault Murmur exports to. Importing it would read Murmur’s own notes back
+              in as copies of themselves. Pick a different vault.
+            </mur-banner>
+          }
+
+          @if (p.pages === 0) {
+            <mur-banner kind="warning">Nothing importable was found there.</mur-banner>
+          } @else {
+            <ul class="plan-grid">
+              <li>
+                <span class="plan-n">{{ newPages() }}</span>
+                <span class="plan-k">new notes</span>
+              </li>
+              <li>
+                <span class="plan-n">{{ p.alreadyImported }}</span>
+                <span class="plan-k">already here — will update</span>
+              </li>
+              @if (p.attachments > 0) {
+                <li>
+                  <span class="plan-n">{{ p.attachments }}</span>
+                  <span class="plan-k">attachments ({{ mb(p.attachmentBytes) }}) — skipped</span>
+                </li>
+              }
+              @if (p.databases > 0) {
+                <li>
+                  <span class="plan-n">{{ p.databases }}</span>
+                  <span class="plan-k">databases — skipped</span>
+                </li>
+              }
+            </ul>
+
+            @if (p.nestedArchives > 0) {
+              <p class="text-muted note-line">
+                {{ p.nestedArchives }} nested export part(s) found and opened automatically.
+              </p>
+            }
+            @if (p.csvAllDuplicates > 0) {
+              <p class="text-muted note-line">
+                {{ p.csvAllDuplicates }} duplicate <code>_all.csv</code> file(s) ignored.
+              </p>
+            }
+            @if (p.titleCollisions.length > 0) {
+              <mur-banner kind="info">
+                {{ p.titleCollisions.length }} title(s) appear more than once. Turn on “Mirror the
+                source tree” below to keep them apart.
+              </mur-banner>
+            }
+            @if (p.truncated) {
+              <mur-banner kind="warning">
+                This is larger than one import can take. Only the first pages are planned — import
+                in parts.
+              </mur-banner>
+            }
+
+            @if (p.sampleTitles.length > 0) {
+              <p class="text-muted note-line">
+                For example:
+                @for (t of p.sampleTitles; track t) {
+                  <span class="pill">{{ t }}</span>
                 }
               </p>
             }
+
+            <div class="options">
+              <label class="field">
+                <span class="field-label">Import into</span>
+                <select (change)="selectTarget($event)">
+                  <option value="">Notes (unfiled)</option>
+                  @for (f of folders(); track f.id) {
+                    <option [value]="f.id">{{ f.name }}</option>
+                  }
+                </select>
+              </label>
+
+              <label class="toggle-row">
+                <mur-toggle
+                  [formControl]="mirrorControl"
+                  ariaLabel="Mirror the source tree as folders"
+                />
+                <span>
+                  <span class="toggle-title">Mirror the source tree</span>
+                  <span class="text-muted toggle-hint">
+                    Recreate the original nesting as folders inside {{ targetLabel() }}.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            @if (targetIsSealed()) {
+              <mur-banner kind="danger">
+                {{ targetLabel() }} is locked. Unlock it first — Murmur will not write notes into a
+                sealed folder.
+              </mur-banner>
+            }
+
+            <div class="actions">
+              <button
+                type="button"
+                class="btn btn-primary"
+                [disabled]="phase() === 'running' || targetIsSealed() || p.isMurmurVault"
+                (click)="runImport()"
+              >
+                Import {{ p.pages }} note{{ p.pages === 1 ? "" : "s" }}
+              </button>
+              <button type="button" class="btn btn-ghost" (click)="scan()">Re-read source</button>
+            </div>
+          }
+        </div>
+      }
+
+      <!-- STEP 3 — running -->
+      @if (phase() === "running") {
+        <div class="card">
+          <h3 class="pane-title">
+            {{ stage() === "linking" ? "Resolving links" : "Importing" }}
+          </h3>
+          <mur-progress [value]="percent()" ariaLabel="Import progress" />
+          <p class="text-muted note-line">
+            {{ done() }} of {{ total() }} · you can keep using Murmur while this runs.
+          </p>
+          <div class="actions">
+            <button type="button" class="btn btn-ghost" (click)="cancel()">Stop</button>
           </div>
+        </div>
+      }
 
-          <!-- THE PLAN — produced without writing anything. -->
-          @if (plan(); as p) {
-            <div class="card">
-              <h3 class="pane-title">What this will do</h3>
+      <!-- STEP 4 — the report -->
+      @if (report(); as r) {
+        <div class="card">
+          <h3 class="pane-title">{{ r.cancelled ? "Stopped" : "Done" }}</h3>
+          <ul class="plan-grid">
+            <li><span class="plan-n">{{ r.imported }}</span><span class="plan-k">imported</span></li>
+            <li><span class="plan-n">{{ r.updated }}</span><span class="plan-k">updated</span></li>
+            <li><span class="plan-n">{{ r.foldersCreated }}</span><span class="plan-k">folders created</span></li>
+            <li><span class="plan-n">{{ r.failed }}</span><span class="plan-k">failed</span></li>
+          </ul>
 
-              @if (p.pages === 0) {
-                <mur-banner kind="warning">
-                  No Notion pages in there. Make sure you picked the export itself, not the email.
-                </mur-banner>
-              } @else {
-                <ul class="plan-grid">
-                  <li>
-                    <span class="plan-n">{{ newPages() }}</span>
-                    <span class="plan-k">new notes</span>
-                  </li>
-                  <li>
-                    <span class="plan-n">{{ p.alreadyImported }}</span>
-                    <span class="plan-k">already here — will update</span>
-                  </li>
-                  <li>
-                    <span class="plan-n">{{ p.attachments }}</span>
-                    <span class="plan-k">attachments ({{ mb(p.attachmentBytes) }}) — skipped</span>
-                  </li>
-                  <li>
-                    <span class="plan-n">{{ p.databases }}</span>
-                    <span class="plan-k">databases — skipped</span>
-                  </li>
-                </ul>
-
-                @if (p.nestedArchives > 0) {
-                  <p class="text-muted note-line">
-                    {{ p.nestedArchives }} nested export part(s) found and opened automatically.
-                  </p>
-                }
-                @if (p.csvAllDuplicates > 0) {
-                  <p class="text-muted note-line">
-                    {{ p.csvAllDuplicates }} duplicate <code>_all.csv</code> file(s) ignored.
-                  </p>
-                }
-                @if (p.titleCollisions.length > 0) {
-                  <mur-banner kind="info">
-                    {{ p.titleCollisions.length }} title(s) appear more than once in this export.
-                    Turn on “Mirror the page tree” below to keep them apart.
-                  </mur-banner>
-                }
-                @if (p.truncated) {
-                  <mur-banner kind="warning">
-                    This export is larger than one import can take. Only the first pages are
-                    planned — import in parts.
-                  </mur-banner>
-                }
-
-                @if (p.sampleTitles.length > 0) {
-                  <p class="text-muted note-line">
-                    For example:
-                    @for (t of p.sampleTitles; track t) {
-                      <span class="pill">{{ t }}</span>
-                    }
-                  </p>
-                }
-
-                <div class="options">
-                  <label class="field">
-                    <span class="field-label">Import into</span>
-                    <select (change)="selectTarget($event)">
-                      <option value="">Notes (unfiled)</option>
-                      @for (f of folders(); track f.id) {
-                        <option [value]="f.id">{{ f.name }}</option>
-                      }
-                    </select>
-                  </label>
-
-                  <label class="toggle-row">
-                    <mur-toggle
-                      [formControl]="mirrorControl"
-                      ariaLabel="Mirror the Notion page tree as folders"
-                    />
-                    <span>
-                      <span class="toggle-title">Mirror the page tree</span>
-                      <span class="text-muted toggle-hint">
-                        Recreate Notion’s nesting as folders inside {{ targetLabel() }}.
-                      </span>
-                    </span>
-                  </label>
-                </div>
-
-                @if (targetIsSealed()) {
-                  <mur-banner kind="danger">
-                    {{ targetLabel() }} is locked. Unlock it first — Murmur will not write notes
-                    into a sealed folder.
-                  </mur-banner>
-                }
-
-                <div class="actions">
-                  <button
-                    type="button"
-                    class="btn btn-primary"
-                    [disabled]="phase() === 'running' || targetIsSealed()"
-                    (click)="runImport()"
-                  >
-                    Import {{ p.pages }} page{{ p.pages === 1 ? "" : "s" }}
-                  </button>
-                  <button type="button" class="btn btn-ghost" (click)="scan()">
-                    Re-read export
-                  </button>
-                </div>
-              }
-            </div>
+          @if (r.cancelled) {
+            <p class="text-muted note-line">
+              Everything imported before you stopped was kept. Running the import again picks up
+              the rest and updates what is already here.
+            </p>
           }
-
-          <!-- RUNNING -->
-          @if (phase() === "running") {
-            <div class="card">
-              <h3 class="pane-title">{{ stage() === "linking" ? "Resolving links" : "Importing" }}</h3>
-              <mur-progress [value]="percent()" ariaLabel="Notion import progress" />
-              <p class="text-muted note-line">
-                {{ done() }} of {{ total() }} · you can keep using Murmur while this runs.
-              </p>
-              <div class="actions">
-                <button type="button" class="btn btn-ghost" (click)="cancel()">Stop</button>
-              </div>
-            </div>
+          @if (r.embeddingDeferred) {
+            <mur-banner kind="info">
+              Keyword search covers these notes now. Semantic search picks them up after the next
+              re-index (AI &amp; Models → Reindex).
+            </mur-banner>
           }
-
-          <!-- REPORT -->
-          @if (report(); as r) {
-            <div class="card">
-              <h3 class="pane-title">{{ r.cancelled ? "Stopped" : "Done" }}</h3>
-              <ul class="plan-grid">
-                <li><span class="plan-n">{{ r.imported }}</span><span class="plan-k">imported</span></li>
-                <li><span class="plan-n">{{ r.updated }}</span><span class="plan-k">updated</span></li>
-                <li><span class="plan-n">{{ r.foldersCreated }}</span><span class="plan-k">folders created</span></li>
-                <li><span class="plan-n">{{ r.failed }}</span><span class="plan-k">failed</span></li>
+          @if (r.failures.length > 0) {
+            <details class="failures">
+              <summary>{{ r.failures.length }} note(s) could not be imported</summary>
+              <ul>
+                @for (f of r.failures; track f) {
+                  <li>{{ f }}</li>
+                }
               </ul>
-
-              @if (r.cancelled) {
-                <p class="text-muted note-line">
-                  Everything imported before you stopped was kept. Running the import again picks
-                  up the rest and updates what is already here.
-                </p>
-              }
-              @if (r.embeddingDeferred) {
-                <mur-banner kind="info">
-                  Keyword search covers these notes now. Semantic search picks them up after the
-                  next re-index (AI &amp; Models → Reindex).
-                </mur-banner>
-              }
-              @if (r.failures.length > 0) {
-                <details class="failures">
-                  <summary>{{ r.failures.length }} page(s) could not be imported</summary>
-                  <ul>
-                    @for (f of r.failures; track f) {
-                      <li>{{ f }}</li>
-                    }
-                  </ul>
-                </details>
-              }
-              <div class="actions">
-                <button type="button" class="btn btn-ghost" (click)="reset()">Import more</button>
-              </div>
-            </div>
+            </details>
           }
-        }
+          <div class="actions">
+            <button type="button" class="btn btn-ghost" (click)="reset()">Import more</button>
+          </div>
+        </div>
       }
     </div>
   </div>

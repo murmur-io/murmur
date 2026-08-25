@@ -1,4 +1,4 @@
-//! BULK IMPORT commands — turning an external export into ordinary Murmur notes.
+//! BULK IMPORT commands — turning an external knowledge base into ordinary Murmur notes.
 //!
 //! ## Why these are notes, not documents
 //!
@@ -11,11 +11,18 @@
 //! followed by `update_note_doc_inner_with` (gate → seal-on-write → gated vault export → re-index).
 //! No new write path, no new read path, and therefore no new seal or visibility surface to audit.
 //!
+//! ## One orchestration, three sources
+//!
+//! Everything below is source-agnostic: `crate::import` answers "what pages are in there", and this
+//! module answers "how do pages become notes safely". Adding a fourth source is a normalizer plus
+//! two match arms, not another importer.
+//!
 //! ## Zero egress
 //!
-//! Everything here reads a local file the user already downloaded. No network, no provider, no
-//! consent prompt, no redaction firewall involvement, no egress-ledger row. This is deliberately the
-//! opposite of `crate::connectors::notion`, which is a live cloud search.
+//! Every source reads something already on this Mac — a downloaded export, a vault folder, or the
+//! local Notes app over Apple events. No network, no provider, no consent prompt, no redaction
+//! firewall involvement, no egress-ledger row. This is deliberately the opposite of
+//! `crate::connectors::notion`, which is a live cloud search.
 //!
 //! ## Two passes, and why
 //!
@@ -32,11 +39,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::AppError;
-use crate::import::notion;
+use crate::import::{self, ImportScan, ImportSource, ImportedPage};
 use crate::state::AppState;
-
-/// Provenance label written to `documents.source` for everything this module imports.
-pub(crate) const SOURCE_NOTION: &str = "notion";
 
 /// Cooperative cancel for an in-flight bulk import. A module-level flag rather than `AppState`
 /// because exactly one import may run at a time (the heavy permit enforces that anyway) and the
@@ -46,33 +50,36 @@ static IMPORT_CANCEL: AtomicBool = AtomicBool::new(false);
 /// The dry-run plan — what an import WOULD do. Nothing is written to produce this.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NotionScanReport {
+pub struct ImportScanReport {
     /// Pages that would be imported or updated.
     pub pages: usize,
     /// Of those, how many already exist here from a previous run (they update, never duplicate).
     pub already_imported: usize,
-    /// Files that are not pages — images, PDFs. Counted and weighed, never imported in v1.
+    /// Files that are not pages — images, PDFs. Counted and weighed, never imported yet.
     pub attachments: usize,
     pub attachment_bytes: u64,
-    /// Database CSV exports. Not imported in v1.
+    /// Database CSV exports (Notion only). Not imported yet.
     pub databases: usize,
     /// `…_all.csv` twins Notion ships alongside each database view — the same data again, skipped.
     pub csv_all_duplicates: usize,
-    /// Nested `Export-…-Part-N.zip` archives descended into automatically.
+    /// Nested `Export-…-Part-N.zip` archives descended into automatically (Notion only).
     pub nested_archives: usize,
-    /// Titles that occur more than once in the export; the import disambiguates them by folder.
+    /// Titles that occur more than once in the source; the import disambiguates them by folder.
     pub title_collisions: Vec<String>,
-    /// A handful of titles for the preview, so the user can confirm this is the right export.
+    /// A handful of titles for the preview, so the user can confirm this is the right source.
     pub sample_titles: Vec<String>,
-    /// `true` when the export exceeded the per-import page cap and the plan was cut short.
+    /// `true` when the source exceeded the per-import page cap and the plan was cut short.
     pub truncated: bool,
+    /// `true` when the chosen Obsidian folder IS the vault Murmur exports to — importing it would
+    /// read Murmur's own notes back in as copies of themselves.
+    pub is_murmur_vault: bool,
 }
 
 /// What an import actually did. Counters plus the titles that failed, so a partial run is legible
 /// instead of a silent one.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NotionImportReport {
+pub struct ImportReport {
     pub imported: usize,
     pub updated: usize,
     pub skipped: usize,
@@ -87,41 +94,72 @@ pub struct NotionImportReport {
     pub embedding_deferred: bool,
 }
 
-/// DRY-RUN a Notion export: report what an import would do, WITHOUT writing anything.
-///
-/// Accepts either the `.zip` Notion emails you or an unpacked folder. Reads archives entirely in
-/// memory (so a hostile entry path can never be materialized) under one shared decompression budget
-/// that spans nested `Part-N` archives.
+/// Resolve the wire source name, failing closed on anything unknown.
+fn parse_source(raw: &str) -> Result<ImportSource, AppError> {
+    ImportSource::parse(raw).ok_or_else(|| AppError::InvalidArg(format!("unknown import source")))
+}
+
+/// Read the chosen source into a scan. The ONE place that knows which normalizer to call.
+fn scan_source(source: ImportSource, path: Option<&str>) -> Result<ImportScan, AppError> {
+    match source {
+        ImportSource::Notion => {
+            let path = require_path(path)?;
+            import::notion::scan_export(std::path::Path::new(&path))
+        }
+        ImportSource::Obsidian => {
+            let path = require_path(path)?;
+            import::obsidian::scan_vault(std::path::Path::new(&path))
+        }
+        // Apple Notes has nothing to pick: the library IS the source.
+        ImportSource::AppleNotes => import::apple_notes::scan_notes(),
+    }
+}
+
+fn require_path(path: Option<&str>) -> Result<String, AppError> {
+    match path {
+        Some(p) if !p.trim().is_empty() => Ok(p.to_string()),
+        _ => Err(AppError::InvalidArg(
+            "choose what to import from first".into(),
+        )),
+    }
+}
+
+/// DRY-RUN an import: report what it would do, WITHOUT writing anything.
 #[tauri::command]
-pub async fn scan_notion_export(
+pub async fn scan_import(
     app: AppHandle,
     state: State<'_, AppState>,
-    path: String,
-) -> Result<NotionScanReport, AppError> {
+    source: String,
+    path: Option<String>,
+) -> Result<ImportScanReport, AppError> {
+    let source = parse_source(&source)?;
     let sem = std::sync::Arc::clone(&state.inner().heavy_inference);
     crate::perf::run_heavy(&sem, move || {
         crate::events::emit_bulk_import(&app, "scanning", 0, 0);
-        let scan = notion::scan_export(std::path::Path::new(&path))?;
+        let scan = scan_source(source, path.as_deref())?;
         let state = app.state::<AppState>();
-        let db = &state.inner().db;
+        let st = state.inner();
 
         // How many of these pages we already hold from an earlier run. Reported up front so the
         // preview can say "42 update, 8 new" rather than implying 50 duplicates are coming.
         let mut already_imported = 0usize;
         for page in &scan.pages {
-            if let Some(id) = page.notion_id.as_deref() {
-                if db.note_by_external_id(SOURCE_NOTION, id)?.is_some() {
+            if let Some(id) = page.external_id.as_deref() {
+                if st.db.note_by_external_id(source.as_str(), id)?.is_some() {
                     already_imported += 1;
                 }
             }
         }
-        let sample_titles = scan
-            .pages
-            .iter()
-            .take(8)
-            .map(|p| p.title.clone())
-            .collect();
-        let report = NotionScanReport {
+
+        // Importing Murmur's OWN vault would read our exported notes back in as copies. Detect it
+        // here rather than letting the user discover it as a duplicated library.
+        let is_murmur_vault = matches!(source, ImportSource::Obsidian)
+            && path
+                .as_deref()
+                .zip(crate::commands::vault_path(st))
+                .is_some_and(|(chosen, vault)| same_dir(chosen, &vault));
+
+        let report = ImportScanReport {
             pages: scan.pages.len(),
             already_imported,
             attachments: scan.attachments,
@@ -130,17 +168,18 @@ pub async fn scan_notion_export(
             csv_all_duplicates: scan.csv_all_duplicates,
             nested_archives: scan.nested_archives,
             title_collisions: scan.title_collisions,
-            sample_titles,
+            sample_titles: scan.pages.iter().take(8).map(|p| p.title.clone()).collect(),
             truncated: scan.truncated,
+            is_murmur_vault,
         };
         // Counts only — never a title (titles are user content).
         tracing::info!(
             target: "import",
+            source = source.as_str(),
             pages = report.pages,
             already = report.already_imported,
             attachments = report.attachments,
-            databases = report.databases,
-            "notion export scanned"
+            "import source scanned"
         );
         crate::events::emit_bulk_import(&app, "done", report.pages, report.pages);
         Ok(report)
@@ -148,26 +187,40 @@ pub async fn scan_notion_export(
     .await
 }
 
-/// IMPORT a Notion export into `folder_id` (or the always-open Notes root when absent).
+/// Whether two paths name the same directory, resolving symlinks where possible.
+fn same_dir(a: &str, b: &str) -> bool {
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    canon(a) == canon(b)
+}
+
+/// IMPORT into `folder_id` (or the always-open Notes root when absent).
 ///
 /// WRITE-GATED per page through the authored-note funnel, so a folder that is sealed and not
 /// session-unlocked refuses the write and the run reports how far it got. `mirror_hierarchy`
-/// recreates Notion's page tree as nested note folders; when false, everything lands flat in the
-/// target folder.
+/// recreates the source's own tree as nested note folders; when false, everything lands flat.
 #[tauri::command]
-pub async fn import_notion_export(
+pub async fn run_import(
     app: AppHandle,
     state: State<'_, AppState>,
-    path: String,
+    source: String,
+    path: Option<String>,
     folder_id: Option<String>,
     mirror_hierarchy: bool,
-) -> Result<NotionImportReport, AppError> {
+) -> Result<ImportReport, AppError> {
+    let source = parse_source(&source)?;
     let sem = std::sync::Arc::clone(&state.inner().heavy_inference);
     IMPORT_CANCEL.store(false, Ordering::SeqCst);
     crate::perf::run_heavy(&sem, move || {
         let state = app.state::<AppState>();
         let st = state.inner();
-        run_notion_import(Some(&app), st, &path, folder_id.as_deref(), mirror_hierarchy)
+        run_import_inner(
+            Some(&app),
+            st,
+            source,
+            path.as_deref(),
+            folder_id.as_deref(),
+            mirror_hierarchy,
+        )
     })
     .await
 }
@@ -176,27 +229,29 @@ pub async fn import_notion_export(
 /// import is not a transaction, and pretending otherwise would mean deleting the user's content to
 /// honour a cancel.
 #[tauri::command]
-pub fn cancel_notion_import() -> Result<(), AppError> {
+pub fn cancel_import() -> Result<(), AppError> {
     IMPORT_CANCEL.store(true, Ordering::SeqCst);
     Ok(())
 }
 
-/// The synchronous body of [`import_notion_export`], taking `&AppState` so the whole orchestration
-/// is unit-testable against a temp SQLCipher database without a Tauri runtime.
-pub(crate) fn run_notion_import(
+/// The synchronous body of [`run_import`], taking `&AppState` so the whole orchestration is
+/// unit-testable against a temp SQLCipher database without a Tauri runtime.
+pub(crate) fn run_import_inner(
     app: Option<&AppHandle>,
     state: &AppState,
-    path: &str,
+    source: ImportSource,
+    path: Option<&str>,
     folder_id: Option<&str>,
     mirror_hierarchy: bool,
-) -> Result<NotionImportReport, AppError> {
+) -> Result<ImportReport, AppError> {
     emit(app, "scanning", 0, 0);
-    let scan = notion::scan_export(std::path::Path::new(path))?;
+    let scan = scan_source(source, path)?;
     let total = scan.pages.len();
 
-    // The link map is built from the WHOLE export before a single note is written, so page 1 can
-    // already link to page 400.
-    let titles = notion::titles_by_id(&scan.pages);
+    // Notion links are relative paths that only become wikilinks once every page in the export is
+    // known, so the map is built from the WHOLE scan before a single note is written. The other
+    // sources need no rewriting: a vault already has wikilinks, and Notes has no links at all.
+    let titles = import::notion::titles_by_id(&scan.pages);
 
     // Resolve the target root ONCE and gate it up front, so a sealed destination fails fast instead
     // of after 400 successful writes.
@@ -210,7 +265,7 @@ pub(crate) fn run_notion_import(
         _ => state.db.ensure_notes_root()?,
     };
 
-    let mut report = NotionImportReport {
+    let mut report = ImportReport {
         imported: 0,
         updated: 0,
         skipped: 0,
@@ -231,7 +286,10 @@ pub(crate) fn run_notion_import(
         }
         emit(app, "importing", index, total);
 
-        let markdown = notion::rewrite_notion_links(&page.markdown, &titles);
+        let markdown = match source {
+            ImportSource::Notion => import::notion::rewrite_notion_links(&page.markdown, &titles),
+            ImportSource::Obsidian | ImportSource::AppleNotes => page.markdown.clone(),
+        };
         let target = if mirror_hierarchy && !page.parents.is_empty() {
             match folders.ensure_path(state, &page.parents, &mut report.folders_created) {
                 Ok(id) => id,
@@ -244,7 +302,7 @@ pub(crate) fn run_notion_import(
             root_folder.clone()
         };
 
-        match import_one_page(state, page, &markdown, &target) {
+        match import_one_page(state, source, page, &markdown, &target) {
             Ok(Outcome::Created(id)) => {
                 report.imported += 1;
                 written.push((id, page.title.clone(), markdown));
@@ -266,21 +324,20 @@ pub(crate) fn run_notion_import(
             break;
         }
         emit(app, "linking", index, linked);
-        crate::commands::refresh_note_doc_derived_best_effort(
-            state, id, title, markdown, None,
-        );
+        crate::commands::refresh_note_doc_derived_best_effort(state, id, title, markdown, None);
     }
 
     emit(app, "done", linked, total);
     // Counts only — a title is user content and never reaches a log line.
     tracing::info!(
         target: "import",
+        source = source.as_str(),
         imported = report.imported,
         updated = report.updated,
         failed = report.failed,
         folders = report.folders_created,
         cancelled = report.cancelled,
-        "notion import finished"
+        "import finished"
     );
     Ok(report)
 }
@@ -301,20 +358,21 @@ enum Outcome {
 
 /// Write ONE page through the authored-note funnel.
 ///
-/// Idempotency: a page whose Notion id we have seen before UPDATES that note wherever it now lives,
+/// Idempotency: a page whose source id we have seen before UPDATES that note wherever it now lives,
 /// rather than creating a second copy. The update deliberately re-gates against the note's CURRENT
 /// folder (inside `update_note_doc_inner_with`), not the import target — the user may have moved it
 /// into a folder that is now locked, and writing there ungated would resurrect plaintext behind a
 /// lock.
 fn import_one_page(
     state: &AppState,
-    page: &notion::NotionPage,
+    source: ImportSource,
+    page: &ImportedPage,
     markdown: &str,
     target_folder: &str,
 ) -> Result<Outcome, AppError> {
-    if let Some(external_id) = page.notion_id.as_deref() {
+    if let Some(external_id) = page.external_id.as_deref() {
         if let Some((existing_id, _folder)) =
-            state.db.note_by_external_id(SOURCE_NOTION, external_id)?
+            state.db.note_by_external_id(source.as_str(), external_id)?
         {
             crate::commands::update_note_doc_inner_with(
                 state,
@@ -333,22 +391,22 @@ fn import_one_page(
     // next run recognizes and updates instead of duplicating.
     state
         .db
-        .set_document_provenance(&id, SOURCE_NOTION, page.notion_id.as_deref())?;
+        .set_document_provenance(&id, source.as_str(), page.external_id.as_deref())?;
     crate::commands::update_note_doc_inner_with(state, &id, &page.title, markdown, None)?;
     Ok(Outcome::Created(id))
 }
 
 /// Record a per-page failure for the UI. The title is user content: it goes in the report the user
 /// reads, and never into a log line.
-fn record_failure(report: &mut NotionImportReport, title: &str, error: &AppError) {
+fn record_failure(report: &mut ImportReport, title: &str, error: &AppError) {
     report.failed += 1;
     if report.failures.len() < 20 {
         report.failures.push(format!("{title}: {error}"));
     }
-    tracing::warn!(target: "import", "notion page import failed");
+    tracing::warn!(target: "import", "page import failed");
 }
 
-/// Find-or-create cache for the note-folder tree, so mirroring a deep export does not re-query the
+/// Find-or-create cache for the note-folder tree, so mirroring a deep source does not re-query the
 /// folder list per page.
 struct FolderTree {
     /// `(parent id, lowercased child name) -> child id`. Lowercased because APFS is
@@ -393,8 +451,7 @@ impl FolderTree {
                 current = existing.clone();
                 continue;
             }
-            let folder =
-                crate::commands::create_note_folder_inner(state, name, Some(&current))?;
+            let folder = crate::commands::create_note_folder_inner(state, name, Some(&current))?;
             *created += 1;
             self.children.insert(key, folder.id.clone());
             current = folder.id;
