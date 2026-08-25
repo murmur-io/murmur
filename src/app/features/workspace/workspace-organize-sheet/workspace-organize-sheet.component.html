@@ -1,0 +1,112 @@
+<div
+  class="scrim"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Review Brain organization plan"
+  tabindex="-1"
+  (click)="onScrimClick($event)"
+  (keydown.escape)="busy() ? null : cancelled.emit()"
+>
+  <div #panel class="sheet" tabindex="-1">
+    <header class="sheet-head">
+      <div class="sheet-head-copy">
+        <span class="brain-mark" aria-hidden="true">✦</span>
+        <div>
+          <h3>Organize recordings with Brain</h3>
+          <p>
+            Brain reviewed {{ plan().totalScanned }}
+            {{ plan().totalScanned === 1 ? "recording" : "recordings" }}.
+            Nothing moves until you apply this plan.
+          </p>
+        </div>
+      </div>
+      @if (plan().moves.length > 0) {
+        <button
+          type="button"
+          class="btn btn-ghost select-all"
+          [disabled]="busy()"
+          (click)="toggleSelectAll()"
+        >
+          {{ allSelected() ? "Select none" : "Select all" }}
+        </button>
+      }
+    </header>
+
+    <div class="sheet-body">
+      @if (plan().moves.length > 0) {
+        <section aria-labelledby="brain-moves-title">
+          <h4 id="brain-moves-title">Suggested moves</h4>
+          <ul class="move-list">
+            @for (move of plan().moves; track move.itemId) {
+              <li
+                class="move-row"
+                [class.is-excluded]="!isIncluded(move.itemId)"
+              >
+                <label class="move-toggle">
+                  <input
+                    type="checkbox"
+                    class="switch"
+                    [checked]="isIncluded(move.itemId)"
+                    [attr.aria-label]="'Include ' + move.title"
+                    (change)="toggleMove(move.itemId)"
+                  />
+                </label>
+                <div class="move-copy">
+                  <strong>{{ move.title }}</strong>
+                  <span class="move-path"
+                    >{{ move.fromContainer }} → {{ move.toContainer }}</span
+                  >
+                  <span class="move-reason">{{ move.reason }}</span>
+                </div>
+              </li>
+            }
+          </ul>
+        </section>
+      } @else {
+        <div class="empty-state">
+          <h4>No safe moves to propose</h4>
+          <p>Brain did not find a recording it could confidently file.</p>
+        </div>
+      }
+
+      @if (plan().skipped.length > 0) {
+        <section
+          class="banner is-warning skipped"
+          aria-labelledby="brain-skipped-title"
+        >
+          <div>
+            <h4 id="brain-skipped-title">Left unfiled</h4>
+            <p>These recordings were not changed.</p>
+            <ul>
+              @for (item of plan().skipped; track item.itemId) {
+                <li>
+                  <strong>{{ item.title }}</strong>
+                  <span>{{ item.reason }}</span>
+                </li>
+              }
+            </ul>
+          </div>
+        </section>
+      }
+    </div>
+
+    <footer class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="busy()"
+        (click)="cancelled.emit()"
+      >
+        Cancel
+      </button>
+      <button
+        type="button"
+        class="btn btn-primary"
+        [disabled]="busy() || selectedCount() === 0"
+        (click)="onApply()"
+      >
+        {{ busy() ? "Applying…" : "Apply (" + selectedCount() + ")" }}
+      </button>
+    </footer>
+  </div>
+</div>

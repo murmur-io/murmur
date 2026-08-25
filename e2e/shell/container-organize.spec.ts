@@ -13,7 +13,21 @@ const FOREST = [
     unlocked: false,
     isRoot: false,
     folders: [],
-    groups: [],
+    groups: [
+      {
+        kind: "note",
+        total: 1,
+        items: [
+          {
+            kind: "note",
+            id: "n-1",
+            title: "Standup 14 Aug",
+            durationS: null,
+            sortAt: 1,
+          },
+        ],
+      },
+    ],
   },
   {
     id: "p-sealed",
@@ -34,9 +48,11 @@ const PLAN = {
     {
       noteId: "n-1",
       title: "Standup 14 Aug",
+      fromFolderId: "p-acme",
       fromFolder: "Acme",
       toFolder: "Standups",
       toFolderId: null,
+      reason: "A recurring team sync",
     },
   ],
 };

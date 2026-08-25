@@ -518,11 +518,45 @@ app-shell {
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
+.context-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.brain-action:not(:disabled) {
+  color: var(--accent);
+}
+
+.context-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: context-spin 0.8s linear infinite;
+}
+
+@keyframes context-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .context-spinner {
+    animation: none;
+  }
+}
+
 .context-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
   padding: var(--space-2);
+}
+
+.spaces-sidebar .context-body {
+  scroll-snap-type: y proximity;
 }
 
 .context-footer {

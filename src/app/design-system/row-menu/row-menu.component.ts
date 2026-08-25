@@ -30,20 +30,17 @@ import {
  *
  * Feature-owned via `<ng-content>`: WHICH actions appear and what each one
  * does (Rename / lock-state / Delete-with-confirm) — same shell-vs-logic
- * split `<mur-sidebar-section>` already established. A menu item that
- * launches a multi-step flow (e.g. a delete confirm that replaces the row
- * entirely) should close this menu FIRST via the local template reference
- * (`#actions` → `(click)="actions.close(); startDelete()"`) since opening a
- * different template branch elsewhere doesn't reliably tear this instance
- * down before its next paint.
+ * split `<mur-sidebar-section>` already established. The shell automatically
+ * closes after an enabled `[role=menuitem]` is activated, including when that
+ * item launches a multi-step flow elsewhere.
  *
  * Usage:
  * ```html
- * <mur-row-menu #actions [label]="'Actions for ' + node().name">
+ * <mur-row-menu [label]="'Actions for ' + node().name">
  *   <button type="button" class="menu-item" role="menuitem"
- *     (click)="actions.close(); startRename()">Rename</button>
+ *     (click)="startRename()">Rename</button>
  *   <button type="button" class="menu-item menu-item-danger" role="menuitem"
- *     (click)="actions.close(); startDelete()">Delete</button>
+ *     (click)="startDelete()">Delete</button>
  * </mur-row-menu>
  * ```
  */
@@ -52,6 +49,7 @@ import {
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     "[class.is-open]": "isOpen()",
+    "(click)": "onHostClick($event)",
     "(document:click)": "onDocumentClick($event)",
     "(document:keydown.escape)": "onEscape()",
   },
@@ -89,6 +87,27 @@ export class MurRowMenuComponent {
   /** Close the panel. Safe to call whether or not it's open. */
   close(): void {
     this._open.set(false);
+  }
+
+  /** Close after any enabled projected action; feature code still owns the action. */
+  onHostClick(event: MouseEvent): void {
+    if (!this._open()) {
+      return;
+    }
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const item = target.closest<HTMLElement>("[role='menuitem']");
+    if (
+      !item ||
+      !this.host.nativeElement.contains(item) ||
+      item.getAttribute("aria-disabled") === "true" ||
+      (item instanceof HTMLButtonElement && item.disabled)
+    ) {
+      return;
+    }
+    this.close();
   }
 
   /** Outside-click dismissal — a click landing outside this host closes the panel. */
