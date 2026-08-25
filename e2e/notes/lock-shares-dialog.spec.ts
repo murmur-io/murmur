@@ -43,15 +43,30 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
     await page.goto("/notes");
     await expect(page.locator(".notes-content")).toBeVisible();
 
-    // The open "Notes" folder has a Lock control on its row.
-    // The affordance moved into the container row's actions menu when the one hierarchy
-    // replaced the two per-type trees; the gate it must run is unchanged.
-    await page.getByRole("button", { name: "Expand Workspace" }).click();
+    // Open the hierarchy without navigating away from the mounted Notes list.
+    // Its plaintext stays visible until the user actually confirms a lock.
+    await page
+      .getByRole("navigation", { name: "Global navigation" })
+      .getByRole("button", { name: "Spaces", exact: true })
+      .click();
+    await expect(page).toHaveURL(/\/notes$/);
+    await expect(page.locator(".notes-content")).toBeVisible();
+    await expect(page.getByText("My First Note", { exact: true })).toBeVisible();
+
+    const spacesSidebar = page.getByRole("complementary", {
+      name: "Spaces sidebar",
+    });
+    await expect(spacesSidebar).toBeVisible();
+    await spacesSidebar
+      .getByRole("button", { name: "Expand Workspace" })
+      .click();
     // Reached by FOCUS, not a pointer. A trailing row control sits at the rail's right edge,
     // where a click can land on the rail instead once the tree is long enough to scroll — the
     // failure is engine- and layout-dependent, and passes locally while failing on one CI
     // lane. Keyboard activation is immune to whatever is painted on top.
-    await page.getByRole("button", { name: "Actions for Notes" }).focus();
+    await spacesSidebar
+      .getByRole("button", { name: "Actions for Notes" })
+      .focus();
     await page.keyboard.press("Enter");
     const lockBtn = page.getByRole("menuitem", { name: /^Lock (folder|project)/ });
     await expect(lockBtn).toBeVisible();

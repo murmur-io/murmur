@@ -40,7 +40,8 @@ async function open(page: Page, forest: unknown[]): Promise<void> {
     { list_workspace_tree: forest },
   );
   await page.goto("/");
-  await expect(page.getByRole("tree", { name: "Workspace" })).toBeVisible();
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
 }
 
 test("a note can be created into a container and opens straight away", async ({ page }) => {

@@ -31,7 +31,8 @@ async function backgroundAndReturnToCachedNote(
   page: import("@playwright/test").Page,
 ): Promise<void> {
   await page
-    .getByRole("link", { name: "Record", exact: true })
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("link", { name: "Capture", exact: true })
     .dispatchEvent("click");
   await expect(page).toHaveURL(/\/record$/);
   await expectNoTransientNoteUi(page);
@@ -79,7 +80,10 @@ test("note selection overlays stay interactive and dismiss when the pointer leav
   await expect(popover).toBeVisible();
 
   // Leaving the owning editor for app chrome dismisses the transient overlay.
-  await page.getByRole("link", { name: "Record", exact: true }).click();
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("link", { name: "Capture", exact: true })
+    .click();
   await expect(page).toHaveURL(/\/record$/);
   await expect(popover).toHaveCount(0);
   await expect(toolbar).toHaveCount(0);
@@ -172,7 +176,10 @@ test("main-shell Escape is consumed after its document-level overlay handler run
   await mockNotes(page);
   await page.goto("/notes/n1");
 
-  await page.getByRole("button", { name: "Search (⌘K)" }).first().click();
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("button", { name: "Search", exact: true })
+    .click();
   await expect(page.locator(".qs-scrim")).toBeVisible();
 
   const prevented = await page.evaluate(() => {

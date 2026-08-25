@@ -1,8 +1,7 @@
-/* Settings is a full drill-down (L2): the primary app rail is hidden
-   (app-shell) and this host fills the whole window as a flush-left
-   [section rail | content] layout. Fixed so it ignores .app-main's
-   centered max-width + padding and hugs the viewport edges; below the
-   toast viewport (z-index 60).
+/* Settings is a drill-down (L2) beside the persistent global rail. This fixed
+   host starts after that rail and fills the remaining window as a
+   [section rail | content] layout. Fixed so it ignores .app-main's centered
+   max-width + padding; below the toast viewport (z-index 60).
    `top: var(--tabs-strip-height, 0px)` (not `inset: 0`) — real reserved
    space for `mur-tab-strip`'s in-flow header row; see library.component.scss
    for the full rationale. */
@@ -11,7 +10,7 @@
   top: var(--tabs-strip-height, 0px);
   right: 0;
   bottom: 0;
-  left: 0;
+  left: calc(var(--space-2) + var(--space-8) + var(--space-2) + var(--space-2));
   z-index: 5;
   display: block;
   background: var(--surface-base);
@@ -27,7 +26,7 @@
    space `:host` actually reserves. */
 .settings-shell {
   display: grid;
-  grid-template-columns: 246px minmax(0, 1fr);
+  grid-template-columns: calc(var(--space-8) * 4) minmax(0, 1fr);
   height: calc(100vh - var(--tabs-strip-height, 0px));
   height: calc(100dvh - var(--tabs-strip-height, 0px));
 }
@@ -37,6 +36,8 @@
    live here). */
 .settings-sidebar {
   gap: var(--space-3);
+  height: calc(100% - var(--space-4));
+  margin: var(--space-2) 0;
   animation: settings-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 

@@ -203,8 +203,23 @@ test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async 
   // and only they ever set the Notes list's folder filter. So the property under test moved
   // with the destination: a sealed container must present itself as locked and disclose
   // nothing about what it holds, rather than showing a view of its contents.
-  await page.getByRole("button", { name: "Expand Workspace" }).click();
-  await page.getByRole("button", { name: "Work", exact: true }).click();
+  await page
+    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("button", { name: "Spaces", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/notes$/);
+  await expect(page.locator(".notes-content")).toBeVisible();
+
+  const spacesSidebar = page.getByRole("complementary", {
+    name: "Spaces sidebar",
+  });
+  await expect(spacesSidebar).toBeVisible();
+  await spacesSidebar
+    .getByRole("button", { name: "Expand Workspace" })
+    .click();
+  await spacesSidebar
+    .getByRole("button", { name: "Work", exact: true })
+    .click();
 
   await expect(page).toHaveURL(/\/container\/nf2$/);
   await expect(page.getByText("This container is locked")).toBeVisible();
