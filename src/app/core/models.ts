@@ -2729,12 +2729,31 @@ export interface WorkspaceOrganizeSkip {
   itemId: string;
   title: string;
   reason: string;
+  code: "notReady" | "emptyNote" | "deferred" | "noDestination";
+}
+
+/** Content-bearing recording that Brain deliberately leaves for a human destination choice. */
+export interface WorkspaceOrganizeReview {
+  itemId: string;
+  title: string;
+  suggestedTargetId: string | null;
+  suggestedTarget: string | null;
+  reason: string;
+  code: "uncertain" | "noMatch" | "invalidDecision";
+}
+
+/** Backend-allowlisted manual destination, labelled with its full hierarchy breadcrumb. */
+export interface WorkspaceOrganizeTarget {
+  id: string;
+  label: string;
 }
 
 /** Review-before-apply result for the visible workspace Brain organizer. */
 export interface WorkspaceOrganizePlan {
   moves: WorkspaceOrganizeMove[];
+  review: WorkspaceOrganizeReview[];
   skipped: WorkspaceOrganizeSkip[];
+  targets: WorkspaceOrganizeTarget[];
   totalScanned: number;
 }
 
@@ -3576,6 +3595,8 @@ export interface TypeGroup {
 export interface ContainerNode {
   id: string;
   name: string;
+  /** Canonical namespace; drives honest creation/move affordances, never write authority. */
+  kind: "meeting" | "note";
   level: "project" | "folder";
   emoji: string | null;
   tint: string | null;

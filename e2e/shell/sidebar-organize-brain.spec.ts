@@ -5,6 +5,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
 const FOREST = Array.from({ length: 14 }, (_, index) => ({
   id: `space-${index + 1}`,
   name: index === 0 ? "Acme" : `Space ${index + 1}`,
+  kind: "meeting",
   level: "project",
   emoji: null,
   tint: null,
@@ -34,7 +35,7 @@ const FOREST = Array.from({ length: 14 }, (_, index) => ({
 
 const UNFILED = {
   kind: "meeting",
-  total: 3,
+  total: 4,
   items: [
     {
       kind: "meeting",
@@ -57,8 +58,15 @@ const UNFILED = {
       durationS: 300,
       sortAt: 1,
     },
+    {
+      kind: "meeting",
+      id: "meeting-4",
+      title: "Processing audio",
+      durationS: 120,
+      sortAt: 0,
+    },
   ],
-  totalScanned: 3,
+  totalScanned: 4,
 };
 
 const PLAN = {
@@ -84,12 +92,27 @@ const PLAN = {
   ],
   skipped: [
     {
-      itemId: "meeting-3",
-      title: "Audio only",
+      itemId: "meeting-4",
+      title: "Processing audio",
+      code: "notReady",
       reason: "No generated note to classify",
     },
   ],
-  totalScanned: 3,
+  review: [
+    {
+      itemId: "meeting-3",
+      title: "Audio only",
+      reason: "Two destinations look equally plausible",
+      suggestedTargetId: "space-3",
+      suggestedTarget: "Space 3 / Research",
+    },
+  ],
+  targets: [
+    { id: "space-1", label: "Acme / Standups" },
+    { id: "space-2", label: "Space 2 / Hiring" },
+    { id: "space-3", label: "Space 3 / Research" },
+  ],
+  totalScanned: 4,
 };
 
 async function openWorkspace(page: Page): Promise<string[]> {
@@ -104,7 +127,7 @@ async function openWorkspace(page: Page): Promise<string[]> {
   await mockTauri(
     page,
     {
-      create_folder: () => null,
+      create_folder: () => ({ id: "f-new" }),
       plan_workspace_organization: () => {
         const target = window as unknown as {
           __workspacePlanCalls?: number;
@@ -204,25 +227,36 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
   const runtimeErrors = await openWorkspace(page);
 
   const organize = page.getByRole("button", {
-    name: "Organize unfiled recordings with Brain",
+    name: "Review filing moves with Brain",
   });
   await expect(organize).toBeEnabled();
   await organize.click();
 
   const sheet = page.getByRole("dialog", {
-    name: "Review Brain organization plan",
+    name: "Review Brain filing plan",
   });
   await expect(sheet).toBeVisible();
   await expect(sheet.getByText("Platform standup", { exact: true })).toBeVisible();
   await expect(
-    sheet.getByText("Unfiled → Acme / Standups", { exact: true }),
-  ).toBeVisible();
-  await expect(
-    sheet.getByText("No generated note to classify", { exact: true }),
-  ).toBeVisible();
+    sheet
+      .getByRole("checkbox", {
+        name: "Move Platform standup to Acme / Standups",
+      })
+      .locator("xpath=ancestor::li"),
+  ).toContainText(/Unfiled.*Acme \/ Standups/);
+  await expect(sheet.getByText("Audio only", { exact: true })).toBeVisible();
+  await expect(sheet.getByText("Brain's best match: Space 3 / Research")).toBeVisible();
 
-  await page.getByRole("checkbox", { name: "Include Hiring sync" }).uncheck();
-  await page.getByRole("button", { name: "Apply (1)" }).click();
+  // Zero selection is an honest close-only state, never a dead "Apply (0)".
+  await sheet.getByRole("button", { name: "Clear" }).click();
+  await expect(sheet.getByRole("button", { name: "Close" })).toBeVisible();
+  await expect(sheet.getByRole("button", { name: /Move 0|Apply \(0\)/ })).toHaveCount(0);
+
+  await sheet.getByRole("checkbox", {
+    name: "Move Platform standup to Acme / Standups",
+  }).check();
+  await sheet.getByLabel("Destination for Audio only").selectOption("space-3");
+  await sheet.getByRole("button", { name: "Move 2 recordings" }).click();
 
   await expect
     .poll(() =>
@@ -234,11 +268,52 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
     )
     .toEqual([
       {
-        moves: [PLAN.moves[0]],
+        moves: [
+          PLAN.moves[0],
+          {
+            itemId: "meeting-3",
+            title: "Audio only",
+            fromContainerId: null,
+            fromContainer: "Unfiled",
+            toContainerId: "space-3",
+            toContainer: "Space 3 / Research",
+            reason:
+              "Destination chosen during review. Two destinations look equally plausible",
+          },
+        ],
       },
     ]);
   await expect(page.locator(".toast.is-danger .toast-msg")).toContainText(
     "1 recording organized; 1 failed",
   );
   expect(runtimeErrors).toEqual([]);
+});
+
+test("the visible Brain action exposes its planning state while the plan is pending", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      plan_workspace_organization: () =>
+        new Promise((resolve) => {
+          (window as unknown as { __releaseWorkspacePlan?: () => void }).__releaseWorkspacePlan =
+            () => resolve({ moves: [], review: [], skipped: [], targets: [], totalScanned: 0 });
+        }),
+    },
+    { list_workspace_tree: FOREST, list_container_items: UNFILED },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
+
+  const organize = page.getByRole("button", { name: "Review filing moves with Brain" });
+  await expect(organize).toContainText("File recordings with Brain");
+  await organize.click();
+  await expect(organize).toContainText("Planning filing suggestions…");
+  await expect(organize).toBeDisabled();
+
+  await page.evaluate(() =>
+    (window as unknown as { __releaseWorkspacePlan?: () => void }).__releaseWorkspacePlan?.(),
+  );
+  await expect(organize).toContainText("File recordings with Brain");
 });

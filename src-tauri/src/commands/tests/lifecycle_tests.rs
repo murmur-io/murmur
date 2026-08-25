@@ -5227,7 +5227,15 @@
 
     #[test]
     fn conversion_command_provider_and_canonical_write_failures_preserve_existing_bytes() {
-        let state = build_state("conversion-command-preserve-failures");
+        const ATTACHMENT_ID: &str = "10000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("conversion-command-preserve-failures");
+        let state = build_state_with_vault("conversion-command-preserve-failures", &vault);
         seed_meeting(&state.db, "m-existing", "# Existing source", None);
         let snapshot = capture_meeting_content_snapshot(&state, "m-existing").unwrap();
         let companion = persist_converted_companion_under_snapshot_with(
@@ -5239,12 +5247,74 @@
             None,
         )
         .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser-owned bytes remain outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Quarterly strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
         let before = state
             .db
             .get_note_row(&companion.note_id)
             .unwrap()
-            .unwrap()
-            .text;
+            .unwrap();
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(
+            before
+                .exported_path
+                .as_deref()
+                .expect("real vault tracks the converted note export"),
+        );
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment
+                .exported_path
+                .as_deref()
+                .expect("real vault tracks the converted attachment export"),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES)
+            .expect("simulate the tracked deterministic attachment twin");
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
 
         let provider_failure = block_on(convert_meeting_to_note_inner_with(
             None,
@@ -5261,7 +5331,16 @@
                 .unwrap()
                 .unwrap()
                 .text,
-            before
+            before.text
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
         );
 
         state
@@ -5283,16 +5362,49 @@
             )),
         ));
         assert!(write_failure.is_err());
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
         assert_eq!(
             state
                 .db
-                .get_note_row(&companion.note_id)
-                .unwrap()
-                .unwrap()
-                .text,
-            before,
-            "canonical update failure preserves the companion byte-for-byte"
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash,
+            "canonical update failure preserves the Markdown export baseline"
         );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment],
+            "canonical update failure preserves the attachment row and tracked path"
+        );
+        assert_eq!(
+            std::fs::read(&note_export).unwrap(),
+            note_export_bytes,
+            "the tracked Markdown export is restored byte-identical after rollback"
+        );
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes,
+            "the tracked attachment export is restored byte-identical after rollback"
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes,
+            "the deterministic attachment twin is restored byte-identical after rollback"
+        );
+        let _ = std::fs::remove_dir_all(vault);
     }
 
     #[test]
@@ -5476,6 +5588,773 @@
                 .text,
             before,
             "stale provider output writes nothing"
+        );
+    }
+
+    #[test]
+    fn converted_companion_refuses_an_active_share_even_in_an_open_destination() {
+        let state = build_state("converted-companion-active-share");
+        seed_meeting(&state.db, "m-convert-shared", "# Existing meeting note", None);
+        let snapshot = capture_meeting_content_snapshot(&state, "m-convert-shared").unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-convert-shared",
+            &snapshot,
+            "Shared strategy",
+            "---\ntitle: Shared strategy\n---\n\n# Shared strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let before = state.db.get_note_row(&first.note_id).unwrap().unwrap();
+        state
+            .db
+            .insert_outbound_note_share(
+                "conversion-active-share",
+                &first.note_id,
+                "link",
+                1,
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+
+        let snapshot = capture_meeting_content_snapshot(&state, "m-convert-shared").unwrap();
+        let error = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-convert-shared",
+            &snapshot,
+            "Shared strategy",
+            "---\ntitle: Shared strategy\n---\n\n# Shared strategy\n\nMust not replace.",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::Unavailable(_)));
+        let after = state.db.get_note_row(&first.note_id).unwrap().unwrap();
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.exported_path, before.exported_path);
+    }
+
+    #[test]
+    fn converted_companion_refuses_an_active_share_on_its_source_container_before_rehome() {
+        const MEETING: &str = "m-convert-source-shared";
+        const SOURCE: &str = "f-convert-source-shared";
+        const TARGET: &str = "f-convert-source-target";
+        const ATTACHMENT_ID: &str = "20000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-source-share");
+        let state = build_state_with_vault("converted-companion-source-share", &vault);
+        make_open_folder(&state.db, SOURCE, "Source");
+        make_open_folder(&state.db, TARGET, "Target");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(SOURCE));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Shared strategy",
+            "---\ntitle: Shared strategy\n---\n\n# Shared strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser bytes remain outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Shared strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.folder_id, SOURCE);
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(before.exported_path.as_deref().unwrap());
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
+
+        state.db.set_meeting_folder(MEETING, Some(TARGET)).unwrap();
+        seed_meeting(
+            &state.db,
+            "m-source-container-shared-sibling",
+            "# Shared sibling",
+            Some(SOURCE),
+        );
+        state
+            .db
+            .insert_outbound_share(
+                "conversion-source-container-active-share",
+                "m-source-container-shared-sibling",
+                "link",
+                1,
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+
+        let error = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            MEETING.into(),
+            None,
+            Some(ConversionProvider::fixed(
+                "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            )),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, AppError::Unavailable(_)));
+
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
+        assert_eq!(
+            state.db.companion_note_for_meeting(MEETING).unwrap(),
+            Some(companion.note_id.clone()),
+            "the refused source-share rehome preserves the stable companion id"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment]
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_refuses_a_closing_source_container_before_rehome() {
+        const MEETING: &str = "m-convert-source-closing";
+        const SOURCE: &str = "f-convert-source-closing";
+        const TARGET: &str = "f-convert-source-closing-target";
+        const ATTACHMENT_ID: &str = "25000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-source-closing");
+        let state = build_state_with_vault("converted-companion-source-closing", &vault);
+        make_open_folder(&state.db, SOURCE, "Closing source");
+        make_open_folder(&state.db, TARGET, "Open target");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(SOURCE));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Closing source strategy",
+            "---\ntitle: Closing source strategy\n---\n\n# Strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser bytes remain outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Closing source strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.folder_id, SOURCE);
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(before.exported_path.as_deref().unwrap());
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
+
+        state.db.set_meeting_folder(MEETING, Some(TARGET)).unwrap();
+        assert!(!state.db.org_folder_closure_exists(TARGET).unwrap());
+        state.db.begin_org_folder_closure(SOURCE).unwrap();
+        assert!(state.db.org_folder_closure_exists(SOURCE).unwrap());
+
+        let error = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            MEETING.into(),
+            None,
+            Some(ConversionProvider::fixed(
+                "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            )),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, AppError::Unavailable(_)));
+
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
+        assert_eq!(
+            state.db.companion_note_for_meeting(MEETING).unwrap(),
+            Some(companion.note_id.clone()),
+            "a closing source cannot change the stable companion edge"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment]
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_attachment_seal_verification_failure_preserves_every_source_byte() {
+        const MEETING: &str = "m-convert-seal-verification-failure";
+        const SOURCE: &str = "f-convert-seal-source";
+        const TARGET: &str = "f-convert-seal-target";
+        const ATTACHMENT_ID: &str = "30000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-seal-verification-failure")
+            .canonicalize()
+            .unwrap();
+        let state = build_state_with_vault(
+            "converted-companion-seal-verification-failure",
+            &vault,
+        );
+        state
+            .db
+            .set_setting("vault_path", &vault.to_string_lossy())
+            .unwrap();
+        make_open_folder(&state.db, SOURCE, "Source");
+        make_open_folder(&state.db, TARGET, "Target");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(SOURCE));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Private strategy\n---\n\n# Private strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser bytes survive a refused protection-domain move.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Private strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(before.exported_path.as_deref().unwrap());
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
+
+        lock_folder_inner(&state, TARGET.into()).unwrap();
+        session_unlock(&state, TARGET);
+        move_note_inner_impl(&state, MEETING.into(), Some(TARGET.into())).unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let mismatching_verifier =
+            |_ck: &[u8; 32], _blob: &[u8], _aad: &[u8]| -> Result<Vec<u8>, AppError> {
+                Ok(b"not the attachment plaintext".to_vec())
+            };
+        let _org_mutation = block_on(state.org_share_mutation_lock.lock());
+        let error = persist_converted_companion_under_snapshot_with_attachment_verifier(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            None,
+            Some(&mismatching_verifier),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Storage(_)));
+
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
+        assert_eq!(
+            state.db.companion_note_for_meeting(MEETING).unwrap(),
+            Some(companion.note_id.clone())
+        );
+        assert_eq!(
+            state
+                .db
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment],
+            "a failed new-seal verification preserves attachment plaintext, prior blob, and path"
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_committed_update_has_no_fallible_post_commit_prune() {
+        const MEETING: &str = "m-convert-post-commit-prune";
+        const FOLDER: &str = "f-convert-post-commit-prune";
+        const ATTACHMENT: &str = "40000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-post-commit-prune");
+        let state = build_state_with_vault("converted-companion-post-commit-prune", &vault);
+        make_open_folder(&state.db, FOLDER, "Project");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(FOLDER));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Project strategy",
+            "---\ntitle: Project strategy\n---\n\n# First\n\nGenerated with an image.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: first.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let current = state.db.get_note_row(&first.note_id).unwrap().unwrap().text;
+        let marker = format!("![proof](murmur-attachment://{ATTACHMENT})\n{CONVERTED_NOTE_END}");
+        let with_managed_attachment = current.replacen(CONVERTED_NOTE_END, &marker, 1);
+        assert_ne!(with_managed_attachment, current);
+        update_note_doc_inner_with(
+            &state,
+            &first.note_id,
+            "Project strategy",
+            &with_managed_attachment,
+            None,
+        )
+        .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+
+        state
+            .db
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER conversion_post_commit_prune_fault \
+                   BEFORE UPDATE OF exported_path ON note_attachments \
+                   WHEN OLD.id = '{ATTACHMENT}' \
+                    AND OLD.exported_path IS NULL \
+                    AND NEW.exported_path IS NULL \
+                   BEGIN SELECT RAISE(ABORT, 'post-commit prune fault'); END;"
+            ))
+            .unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let second = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Project strategy",
+            "---\ntitle: Project strategy\n---\n\n# Second\n\nGenerated without the image.",
+            None,
+        )
+        .unwrap();
+        state
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER conversion_post_commit_prune_fault")
+            .unwrap();
+
+        assert_eq!(second.note_id, first.note_id);
+        let row = state.db.get_note_row(&second.note_id).unwrap().unwrap();
+        assert!(row.text.contains("Generated without the image."));
+        assert!(!row.text.contains(ATTACHMENT));
+        assert!(
+            row.exported_path
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).exists()),
+            "the successful committed conversion reaches its best-effort note projection"
+        );
+        let stale = state.db.list_attachments(&owner).unwrap().remove(0);
+        assert_eq!(stale.id, ATTACHMENT);
+        assert_eq!(stale.data, ATTACHMENT_BYTES);
+        assert!(stale.data_blob.is_none());
+        assert!(
+            stale.exported_path.is_none(),
+            "the atomic conversion already cleared the stale attachment retry path"
+        );
+        assert!(!attachment_export.exists());
+        assert!(!attachment_twin.exists());
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_and_attachment_round_trip_through_locked_relock() {
+        const FOLDER: &str = "f-converted-roundtrip";
+        const MEETING: &str = "m-converted-roundtrip";
+        const ATTACHMENT: &str = "123e4567-e89b-42d3-a456-426614174000";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let state = build_state("converted-companion-locked-roundtrip");
+        make_open_folder(&state.db, FOLDER, "Private project");
+        seed_meeting(
+            &state.db,
+            MEETING,
+            "# Existing private meeting note",
+            Some(FOLDER),
+        );
+        lock_folder_inner(&state, FOLDER.into()).unwrap();
+        let ck = session_unlock(&state, FOLDER);
+
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Private strategy\n---\n\n# Private strategy\n\nFirst generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: first.note_id.clone(),
+        };
+        let aad = attachment_aad(FOLDER, &owner, ATTACHMENT);
+        let attachment_blob = crate::crypto::encrypt(&ck, ATTACHMENT_BYTES, &aad).unwrap();
+        assert_eq!(
+            crate::crypto::decrypt(&ck, &attachment_blob, &aad).unwrap(),
+            ATTACHMENT_BYTES
+        );
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: &[],
+                data_blob: Some(&attachment_blob),
+                created_at: 1,
+            })
+            .unwrap();
+        let with_marker = format!(
+            "{}\nUser bytes stay outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT})\n",
+            state.db.get_note_row(&first.note_id).unwrap().unwrap().text
+        );
+        save_note_text_inner(
+            &state,
+            &first.note_id,
+            "Private strategy",
+            &with_marker,
+        )
+        .unwrap();
+
+        state
+            .db
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER conversion_post_commit_restore_fault \
+                   BEFORE UPDATE OF data ON note_attachments \
+                   WHEN OLD.id = '{ATTACHMENT}' \
+                    AND length(OLD.data) = 0 \
+                    AND OLD.data_blob IS NOT NULL \
+                    AND length(NEW.data) > 0 \
+                   BEGIN SELECT RAISE(ABORT, 'post-commit restore fault'); END;"
+            ))
+            .unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let second = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Private strategy\n---\n\n# Private strategy\n\nSecond generated.",
+            None,
+        )
+        .unwrap();
+        state
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER conversion_post_commit_restore_fault")
+            .unwrap();
+        assert_eq!(second.note_id, first.note_id, "companion id remains stable");
+        let expected = state.db.get_note_row(&second.note_id).unwrap().unwrap().text;
+        assert!(expected.contains("Second generated."));
+        assert!(expected.contains("User bytes stay outside the managed block."));
+        assert!(expected.contains(ATTACHMENT));
+        let attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        assert!(
+            attachment.data.is_empty(),
+            "the committed locked shape remains blank instead of attempting a fallible post-commit cache restore"
+        );
+        assert!(attachment.data_blob.is_some());
+        assert!(attachment.exported_path.is_none());
+        assert_eq!(
+            plaintext_attachment_data(&state, &attachment).unwrap(),
+            ATTACHMENT_BYTES,
+            "session reads decrypt the verified target-CK blob without a persisted plaintext cache"
+        );
+
+        state.unlocked_folders.lock().unwrap().remove(FOLDER);
+        reblank_folder_extras(&state, FOLDER).unwrap();
+        let at_rest = state.db.get_note_row(&second.note_id).unwrap().unwrap();
+        assert_eq!(at_rest.text, "", "relock blanks companion plaintext");
+        assert!(at_rest.sealed, "relock retains the verified companion blob");
+        let at_rest_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        assert!(at_rest_attachment.data.is_empty());
+        assert!(at_rest_attachment.data_blob.is_some());
+        assert!(at_rest_attachment.exported_path.is_none());
+
+        unseal_folder_extras(&state, FOLDER, &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&second.note_id).unwrap().unwrap().text,
+            expected,
+            "converted companion restores byte-identical after relock"
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap().remove(0).data,
+            ATTACHMENT_BYTES,
+            "converted attachment restores byte-identical after relock"
         );
     }
 

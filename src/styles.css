@@ -481,6 +481,23 @@ app-shell {
   border-bottom: 1px solid var(--border-subtle);
 }
 
+.spaces-header {
+  align-items: stretch;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-bottom: var(--space-2);
+}
+
+.context-header-main {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.context-header-main h2 {
+  flex: 1 1 auto;
+}
+
 .context-header h2 {
   flex: 1 1 auto;
   margin: 0;
@@ -508,6 +525,28 @@ app-shell {
   cursor: pointer;
 }
 
+.context-action--label {
+  display: inline-flex;
+  width: auto;
+  min-width: var(--space-6);
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  font-family: inherit;
+  font-size: 0.7rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.context-action--label .nav-icon {
+  width: 17px;
+  height: 17px;
+}
+
+.context-action--label .nav-icon svg {
+  width: 17px;
+  height: 17px;
+}
+
 .context-action:hover {
   background: var(--surface-hover);
   color: var(--text-primary);
@@ -523,8 +562,38 @@ app-shell {
   cursor: default;
 }
 
-.brain-action:not(:disabled) {
+.brain-action {
+  display: inline-flex;
+  width: 100%;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
   color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-md);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.brain-action:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+.brain-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.brain-action:disabled {
+  color: var(--text-muted);
+  background: var(--surface-input);
+  border-color: var(--border-subtle);
+  cursor: default;
 }
 
 .context-spinner {
@@ -560,9 +629,39 @@ app-shell {
 }
 
 .context-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
   flex: none;
   padding: var(--space-2);
   border-top: 1px solid var(--border-subtle);
+}
+
+.collapse-context {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.8rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.collapse-context:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.collapse-context:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
 .browse-nav {

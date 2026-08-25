@@ -1,4 +1,11 @@
-import { DestroyRef, Injectable, computed, inject, signal } from "@angular/core";
+import {
+  DestroyRef,
+  Injectable,
+  computed,
+  effect,
+  inject,
+  signal,
+} from "@angular/core";
 
 import { AskHistoryPrivacyBarrierService } from "../../core/ask-history-privacy-barrier.service";
 import { IpcService } from "../../core/ipc.service";
@@ -7,6 +14,7 @@ import type { DraggableKind } from "../folders/note-drag.service";
 
 /** Storage key for persisted container expansion. */
 const EXPANDED_CONTAINERS_KEY = "murmur.workspace.expandedContainers";
+const UNFILED_EXPANDED_KEY = "murmur.workspace.unfiledExpanded";
 
 /**
  * The workspace container forest, owned at the ROOT so it outlives the sidebar.
@@ -35,6 +43,12 @@ export class WorkspaceService {
   });
   /** Newest recordings that do not belong to any lockable container. */
   readonly unfiledRecordings = this._unfiledRecordings.asReadonly();
+
+  private readonly _unfiledExpanded = signal(
+    readStoredBoolean(UNFILED_EXPANDED_KEY, true),
+  );
+  /** Persisted disclosure state for the recording inbox. */
+  readonly unfiledExpanded = this._unfiledExpanded.asReadonly();
 
   private readonly _loading = signal(false);
   readonly loading = this._loading.asReadonly();
@@ -70,6 +84,11 @@ export class WorkspaceService {
       this.scrubAndReload();
     });
     this.destroyRef.onDestroy(unregister);
+    effect(() => {
+      if (this.ipc.workspaceMutationRevision() > 0) {
+        void this.reload();
+      }
+    });
   }
 
   /** Reload the whole forest. Safe to call repeatedly; the last write wins. */
@@ -156,10 +175,23 @@ export class WorkspaceService {
     return id;
   }
 
-  /** Create a folder inside a container, then refresh the tree so it appears. */
-  async createFolder(containerId: string, name: string): Promise<void> {
-    await this.ipc.createFolder(name, containerId);
+  /**
+   * Create the namespace-correct child folder, then refresh the tree.
+   *
+   * Meeting and authored-note containers share one visual hierarchy but retain distinct backend
+   * creation commands. Passing the canonical parent metadata keeps the menu honest; the backend
+   * still validates it independently.
+   */
+  async createFolder(
+    container: Pick<ContainerNode, "id" | "kind">,
+    name: string,
+  ): Promise<string> {
+    const folder =
+      container.kind === "note"
+        ? await this.ipc.createNoteFolder(name, container.id)
+        : await this.ipc.createFolder(name, container.id);
     await this.reload();
+    return folder.id;
   }
 
   /** Create a dashboard inside a container and return its id. */
@@ -213,6 +245,12 @@ export class WorkspaceService {
     );
   }
 
+  toggleUnfiled(): void {
+    const next = !this._unfiledExpanded();
+    this._unfiledExpanded.set(next);
+    writeStoredBoolean(UNFILED_EXPANDED_KEY, next);
+  }
+
 }
 
 function toggled(
@@ -253,6 +291,23 @@ function writeStoredSet(key: string, value: ReadonlySet<string>): void {
     localStorage.setItem(key, JSON.stringify([...value]));
   } catch {
     // A remembered expansion is a convenience; losing it must never break the tree.
+  }
+}
+
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : raw === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredBoolean(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // A remembered disclosure is a convenience; losing it must never break the tree.
   }
 }
 
