@@ -7,10 +7,17 @@ import {
   signal,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
-import { NavigationEnd, Router, RouterLink, RouterOutlet } from "@angular/router";
+import {
+  NavigationEnd,
+  Router,
+  RouterLink,
+  RouterOutlet,
+} from "@angular/router";
 import { filter, map } from "rxjs";
 
 import { TabsService } from "../core/tabs.service";
+import { IpcService } from "../core/ipc.service";
+import type { WorkspaceOrganizeMove } from "../core/models";
 import {
   MurIconComponent,
   type ShellIcon,
@@ -25,6 +32,16 @@ import { ReminderComposerComponent } from "../features/reminders/reminder-compos
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
 import { WorkspaceService } from "../features/workspace/workspace.service";
+import {
+  WorkspaceCreateSheetComponent,
+  type WorkspaceCreateRequest,
+} from "../features/workspace/workspace-create-sheet/workspace-create-sheet.component";
+import { workspaceDestinations } from "../features/workspace/workspace-destination";
+import { WorkspaceOrganizeSheetComponent } from "../features/workspace/workspace-organize-sheet/workspace-organize-sheet.component";
+import type {
+  WorkspaceOrganizeAttemptReceipt,
+  WorkspaceOrganizeViewPlan,
+} from "../features/workspace/workspace-organize-sheet/workspace-organize-sheet.component";
 import { WorkspaceTreeComponent } from "../features/workspace/workspace-tree/workspace-tree.component";
 import { DocumentPreviewService } from "../services/document-preview.service";
 import { FolderLockFlowService } from "../services/folder-lock-flow.service";
@@ -46,16 +63,27 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
   { path: "/library", label: "Meetings", icon: "meetings", group: "Work" },
   { path: "/notes", label: "Notes", icon: "notes", group: "Work" },
   { path: "/tasks", label: "Tasks", icon: "tasks", group: "Work" },
-  { path: "/dashboards", label: "Dashboards", icon: "dashboards", group: "Work" },
+  {
+    path: "/dashboards",
+    label: "Dashboards",
+    icon: "dashboards",
+    group: "Work",
+  },
   { path: "/reminders", label: "Reminders", icon: "reminders", group: "Work" },
   { path: "/brain", label: "Brain", icon: "brain", group: "Intelligence" },
-  { path: "/analytics", label: "Analytics", icon: "analytics", group: "Insights" },
+  {
+    path: "/analytics",
+    label: "Analytics",
+    icon: "analytics",
+    group: "Insights",
+  },
   { path: "/graph", label: "Graph", icon: "graph", group: "Insights" },
   { path: "/people", label: "People", icon: "people", group: "Insights" },
 ];
 
 const BROWSE_GROUPS = ["Work", "Intelligence", "Insights"] as const;
 const NARROW_SHELL_QUERY = "(max-width: 760px)";
+const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
 
 @Component({
   selector: "app-shell",
@@ -68,6 +96,8 @@ const NARROW_SHELL_QUERY = "(max-width: 760px)";
     MurSidebarComponent,
     MurTabStripComponent,
     WorkspaceTreeComponent,
+    WorkspaceCreateSheetComponent,
+    WorkspaceOrganizeSheetComponent,
     LockSharesDialogComponent,
     DocumentPreviewComponent,
     ReminderComposerComponent,
@@ -84,6 +114,7 @@ const NARROW_SHELL_QUERY = "(max-width: 760px)";
 })
 export class AppShellComponent {
   private readonly folders = inject(FoldersService);
+  private readonly ipc = inject(IpcService);
   private readonly notesService = inject(NotesService);
   private readonly toast = inject(ToastService);
   private readonly router = inject(Router);
@@ -107,6 +138,9 @@ export class AppShellComponent {
   readonly currentPath = computed(() => this.currentUrl().split(/[?#]/)[0]);
 
   private readonly _contextOverride = signal<ContextPanel | null>(null);
+  private readonly _spacesCollapsed = signal(
+    readStoredBoolean(SPACES_COLLAPSED_KEY, false),
+  );
 
   private readonly isSpaceLeafRoute = computed(() => {
     const path = this.currentPath();
@@ -133,7 +167,7 @@ export class AppShellComponent {
       return override;
     }
     if (this.isSpaceLeafRoute()) {
-      return "spaces";
+      return this._spacesCollapsed() ? "none" : "spaces";
     }
     if (this.isBrowseRoute()) {
       return "browse";
@@ -147,10 +181,26 @@ export class AppShellComponent {
   readonly unlockedCount = this.folders.unlockedCount;
   readonly relockingAll = signal(false);
   readonly toasts = this.toast.toasts;
-  readonly canCreateWorkspaceFolder = computed(() => {
-    const firstSpace = this.workspace.forest()[0];
-    return Boolean(firstSpace && (!firstSpace.locked || firstSpace.unlocked));
-  });
+  readonly workspaceOrganizePlanning = signal(false);
+  readonly workspaceOrganizeApplying = signal(false);
+  readonly workspaceOrganizePlan = signal<WorkspaceOrganizeViewPlan | null>(
+    null,
+  );
+  readonly workspaceCreateOpen = signal(false);
+  readonly workspaceCreateBusy = signal(false);
+  readonly workspaceCreateError = signal<string | null>(null);
+  readonly workspaceDestinations = computed(() =>
+    workspaceDestinations(this.workspace.forest()),
+  );
+  readonly workspaceOrganizeDisabled = computed(
+    () =>
+      this.workspace.unfiledRecordings().total === 0 ||
+      this.workspaceOrganizePlanning() ||
+      this.workspaceOrganizeApplying(),
+  );
+  readonly canCreateInWorkspace = computed(
+    () => this.workspaceDestinations().length > 0,
+  );
   readonly relockAllAriaLabel = computed(() => {
     const count = this.unlockedCount();
     const noun = count === 1 ? "folder" : "folders";
@@ -175,6 +225,7 @@ export class AppShellComponent {
     const fixedDrilldown =
       path.startsWith("/settings") || path.startsWith("/org-item/");
     const narrowViewport = window.matchMedia(NARROW_SHELL_QUERY).matches;
+    this.setSpacesCollapsed(false);
     if ((fixedDrilldown || narrowViewport) && firstSpace) {
       this._contextOverride.set(null);
       await this.router.navigate(["/container", firstSpace.id]);
@@ -200,7 +251,9 @@ export class AppShellComponent {
   }
 
   isAskActive(): boolean {
-    return this.currentPath().startsWith("/ask") && this.contextPanel() === "none";
+    return (
+      this.currentPath().startsWith("/ask") && this.contextPanel() === "none"
+    );
   }
 
   isSettingsActive(): boolean {
@@ -225,16 +278,198 @@ export class AppShellComponent {
     void this.router.navigate(["/notes/new"]);
   }
 
-  newWorkspaceFolder(): void {
-    void this.createFolderAtTop();
-  }
-
-  private async createFolderAtTop(): Promise<void> {
-    const project = this.workspace.forest()[0];
-    if (!project || (project.locked && !project.unlocked)) {
+  openWorkspaceCreate(): void {
+    if (!this.canCreateInWorkspace()) {
       return;
     }
-    await this.workspace.createFolder(project.id, "New folder");
+    this.workspaceCreateError.set(null);
+    this.workspaceCreateOpen.set(true);
+  }
+
+  closeWorkspaceCreate(): void {
+    if (this.workspaceCreateBusy()) {
+      return;
+    }
+    this.workspaceCreateOpen.set(false);
+    this.workspaceCreateError.set(null);
+  }
+
+  async createInWorkspace(request: WorkspaceCreateRequest): Promise<void> {
+    if (this.workspaceCreateBusy()) {
+      return;
+    }
+    this.workspaceCreateBusy.set(true);
+    this.workspaceCreateError.set(null);
+    try {
+      if (request.kind === "note") {
+        const id = await this.workspace.createNote(
+          request.target.container.id,
+          request.name,
+        );
+        this.workspaceCreateOpen.set(false);
+        await this.router.navigate(["/notes", id]);
+      } else if (request.kind === "dashboard") {
+        const id = await this.workspace.createDashboard(
+          request.target.container.id,
+          request.name,
+        );
+        this.workspaceCreateOpen.set(false);
+        await this.router.navigate(["/dashboards", id]);
+      } else {
+        const id = await this.workspace.createFolder(
+          request.target.container,
+          request.name,
+        );
+        this.workspaceCreateOpen.set(false);
+        await this.router.navigate(["/container", id]);
+      }
+      this.toast.success(`Created ${request.name} in ${request.target.label}`);
+    } catch {
+      this.workspaceCreateError.set(
+        `Couldn’t create this ${request.kind} in ${request.target.label}.`,
+      );
+    } finally {
+      this.workspaceCreateBusy.set(false);
+    }
+  }
+
+  collapseSpaces(): void {
+    this.setSpacesCollapsed(true);
+    this._contextOverride.set("none");
+  }
+
+  private setSpacesCollapsed(collapsed: boolean): void {
+    this._spacesCollapsed.set(collapsed);
+    writeStoredBoolean(SPACES_COLLAPSED_KEY, collapsed);
+  }
+
+  async planWorkspaceOrganization(): Promise<void> {
+    if (this.workspaceOrganizeDisabled() || this.workspaceOrganizePlan()) {
+      return;
+    }
+    this.workspaceOrganizePlanning.set(true);
+    try {
+      const plan = await this.ipc.planWorkspaceOrganization();
+      if (
+        plan.moves.length === 0 &&
+        (plan.review?.length ?? 0) === 0 &&
+        plan.skipped.length === 0
+      ) {
+        this.toast.info("Brain found no unfiled recordings to organize.");
+        return;
+      }
+      this.workspaceOrganizePlan.set({
+        ...plan,
+        receipt: null,
+        applyError: null,
+      });
+    } catch {
+      this.toast.danger(
+        "Brain couldn’t plan the organization. Please try again.",
+      );
+    } finally {
+      this.workspaceOrganizePlanning.set(false);
+    }
+  }
+
+  async applyWorkspaceOrganization(
+    moves: WorkspaceOrganizeMove[],
+  ): Promise<void> {
+    if (moves.length === 0 || this.workspaceOrganizeApplying()) {
+      return;
+    }
+    this.workspaceOrganizeApplying.set(true);
+    try {
+      const result = await this.ipc.applyWorkspaceOrganization(moves);
+      await this.workspace.reload();
+      const plan = this.workspaceOrganizePlan();
+      if (result.failures.length === 0) {
+        this.workspaceOrganizePlan.set(null);
+      } else if (plan) {
+        this.workspaceOrganizePlan.set({
+          ...plan,
+          receipt: this.mergeWorkspaceOrganizeReceipt(
+            plan.receipt,
+            moves,
+            result.appliedIds,
+            result.failures,
+          ),
+          applyError: null,
+        });
+      }
+      const applied = result.appliedIds.length;
+      const failed = result.failures.length;
+      if (failed > 0) {
+        const appliedCopy =
+          applied === 0
+            ? "No recordings organized"
+            : `${applied} ${applied === 1 ? "recording" : "recordings"} organized`;
+        this.toast.danger(
+          `${appliedCopy}; ${failed} failed. Review the filing result.`,
+        );
+      } else {
+        this.toast.success(
+          `${applied} ${applied === 1 ? "recording" : "recordings"} organized`,
+        );
+      }
+    } catch {
+      await this.workspace.reload();
+      this.workspaceOrganizePlan.update((plan) =>
+        plan
+          ? {
+              ...plan,
+              applyError:
+                "The filing request didn’t finish. Review the selected moves and try again.",
+            }
+          : plan,
+      );
+      this.toast.danger(
+        "Couldn’t finish applying the Brain plan. Refresh to see what moved.",
+      );
+    } finally {
+      this.workspaceOrganizeApplying.set(false);
+    }
+  }
+
+  closeWorkspaceOrganization(): void {
+    if (!this.workspaceOrganizeApplying()) {
+      this.workspaceOrganizePlan.set(null);
+    }
+  }
+
+  private mergeWorkspaceOrganizeReceipt(
+    previous: WorkspaceOrganizeAttemptReceipt | null | undefined,
+    attemptedMoves: readonly WorkspaceOrganizeMove[],
+    appliedIds: readonly string[],
+    failures: readonly { itemId: string; reason: string }[],
+  ): WorkspaceOrganizeAttemptReceipt {
+    const moves = new Map(
+      (previous?.moves ?? []).map((move) => [move.itemId, move]),
+    );
+    const applied = new Set(previous?.appliedIds ?? []);
+    const unresolved = new Map(
+      (previous?.failures ?? []).map((failure) => [failure.itemId, failure]),
+    );
+
+    for (const move of attemptedMoves) {
+      moves.set(move.itemId, move);
+      unresolved.delete(move.itemId);
+    }
+    for (const itemId of appliedIds) {
+      applied.add(itemId);
+      unresolved.delete(itemId);
+    }
+    for (const failure of failures) {
+      if (!applied.has(failure.itemId)) {
+        unresolved.set(failure.itemId, failure);
+      }
+    }
+
+    return {
+      moves: [...moves.values()],
+      appliedIds: [...applied],
+      failures: [...unresolved.values()],
+    };
   }
 
   async relockAll(): Promise<void> {
@@ -294,5 +529,22 @@ export class AppShellComponent {
   runToastAction(toast: Toast): void {
     toast.action?.run();
     this.dismissToast(toast.id);
+  }
+}
+
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : raw === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredBoolean(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // Sidebar collapse is a convenience; storage failure must not break navigation.
   }
 }

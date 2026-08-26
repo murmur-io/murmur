@@ -1,0 +1,317 @@
+<div
+  class="scrim"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Review Brain filing plan"
+  [attr.aria-busy]="busy()"
+  tabindex="-1"
+  (click)="onScrimClick($event)"
+  (keydown.escape)="busy() ? null : cancelled.emit()"
+>
+  <div #panel class="sheet" tabindex="-1">
+    <header class="sheet-head">
+      <div class="sheet-head-copy">
+        <span class="brain-mark" aria-hidden="true"
+          ><mur-icon icon="brain"
+        /></span>
+        <div>
+          <h3>Review Brain filing plan</h3>
+          <p>
+            Reviewed {{ plan().totalScanned }}
+            {{ plan().totalScanned === 1 ? "recording" : "recordings" }}.
+            Nothing moves until you confirm it here.
+          </p>
+        </div>
+      </div>
+    </header>
+
+    <div class="plan-summary" aria-label="Plan summary">
+      <div>
+        <strong>{{ selectedCount() }}</strong>
+        <span>Selected to move</span>
+      </div>
+      <div>
+        <strong>{{ needsChoiceCount() }}</strong>
+        <span>Need a choice</span>
+      </div>
+      <div>
+        <strong>{{ skippedItems().length }}</strong>
+        <span>Not ready</span>
+      </div>
+    </div>
+
+    <div class="sheet-body">
+      @if (hasAttemptResult()) {
+        <section
+          class="result-card"
+          aria-live="polite"
+          aria-labelledby="filing-result-title"
+        >
+          <div class="section-head">
+            <div>
+              <h4 id="filing-result-title">Filing result</h4>
+              <p>
+                {{ appliedRows().length }} moved.
+                {{ failedRows().length }} still need attention.
+              </p>
+            </div>
+          </div>
+
+          @if (appliedRows().length > 0) {
+            <div class="result-group is-applied">
+              <h5>Moved successfully</h5>
+              <ul class="result-list">
+                @for (item of appliedRows(); track item.itemId) {
+                  <li class="result-row is-applied">
+                    <span class="result-mark" aria-hidden="true"
+                      ><mur-icon icon="check"
+                    /></span>
+                    <span class="result-copy">
+                      <strong>{{ item.title }}</strong>
+                      @if (item.toContainer) {
+                        <small>Filed in {{ item.toContainer }}</small>
+                      }
+                    </span>
+                  </li>
+                }
+              </ul>
+            </div>
+          }
+
+          @if (failedRows().length > 0) {
+            <div class="result-group is-failed">
+              <h5>Still unfiled — review and retry</h5>
+              <ul class="result-list">
+                @for (item of failedRows(); track item.itemId) {
+                  <li class="result-row is-failed">
+                    <span class="result-mark" aria-hidden="true"
+                      ><mur-icon icon="meetings"
+                    /></span>
+                    <span class="result-copy">
+                      <strong>{{ item.title }}</strong>
+                      @if (item.toContainer) {
+                        <small>Couldn’t move to {{ item.toContainer }}</small>
+                      }
+                      <span class="failure-reason">{{ item.reason }}</span>
+                    </span>
+                  </li>
+                }
+              </ul>
+            </div>
+          }
+        </section>
+      }
+
+      @if (applyError(); as error) {
+        <div class="apply-error" role="alert">
+          <strong>Filing interrupted</strong>
+          <span>{{ error }}</span>
+        </div>
+      }
+
+      @if (pendingAutomaticMoves().length > 0) {
+        <section aria-labelledby="brain-moves-title">
+          <div class="section-head">
+            <div>
+              <h4 id="brain-moves-title">Ready to file</h4>
+              <p>High-confidence matches are selected. You stay in control.</p>
+            </div>
+            <button
+              type="button"
+              class="btn btn-ghost select-all"
+              [disabled]="busy()"
+              (click)="toggleSelectAll()"
+            >
+              {{ allSelected() ? "Clear" : "Select all" }}
+            </button>
+          </div>
+          <ul class="move-list">
+            @for (move of pendingAutomaticMoves(); track move.itemId) {
+              <li
+                class="move-row"
+                [class.is-excluded]="!isIncluded(move.itemId)"
+              >
+                <label class="move-toggle">
+                  <input
+                    type="checkbox"
+                    class="switch"
+                    [checked]="isIncluded(move.itemId)"
+                    [attr.aria-label]="
+                      'Move ' + move.title + ' to ' + move.toContainer
+                    "
+                    [disabled]="busy()"
+                    (change)="toggleMove(move.itemId)"
+                  />
+                </label>
+                <span class="item-mark" aria-hidden="true"
+                  ><mur-icon icon="meetings"
+                /></span>
+                <div class="move-copy">
+                  <strong>{{ move.title }}</strong>
+                  <span class="move-path">
+                    <span>{{ move.fromContainer }}</span>
+                    <mur-icon icon="chevron-right" />
+                    <span>{{ move.toContainer }}</span>
+                  </span>
+                  <span class="move-reason">{{ move.reason }}</span>
+                </div>
+              </li>
+            }
+          </ul>
+        </section>
+      }
+
+      @if (pendingReviewItems().length > 0) {
+        <section aria-labelledby="brain-review-title">
+          <div class="section-head">
+            <div>
+              <h4 id="brain-review-title">Choose a destination</h4>
+              <p>Brain was not confident enough to move these automatically.</p>
+            </div>
+          </div>
+          <ul class="review-list">
+            @for (item of visibleReviewItems(); track item.itemId) {
+              <li class="review-row">
+                <span class="item-mark" aria-hidden="true"
+                  ><mur-icon icon="meetings"
+                /></span>
+                <div class="review-copy">
+                  <strong>{{ item.title }}</strong>
+                  <span class="move-reason">{{ item.reason }}</span>
+                  @if (item.suggestedTarget) {
+                    <span class="suggestion">
+                      Brain's best match: {{ item.suggestedTarget }}
+                    </span>
+                  }
+                  <label>
+                    <span class="sr-only"
+                      >Destination for {{ item.title }}</span
+                    >
+                    <select
+                      [value]="selectedManualTarget(item.itemId)"
+                      [disabled]="busy()"
+                      (change)="chooseManualTarget(item.itemId, $event)"
+                    >
+                      <option value="">Leave unfiled</option>
+                      @for (target of targets(); track target.id) {
+                        <option [value]="target.id">{{ target.label }}</option>
+                      }
+                    </select>
+                  </label>
+                </div>
+              </li>
+            }
+          </ul>
+          @if (hiddenReviewCount() > 0) {
+            <button
+              type="button"
+              class="show-more"
+              [disabled]="busy()"
+              (click)="showAllReview.set(true)"
+            >
+              Show {{ hiddenReviewCount() }} more
+            </button>
+          } @else if (showAllReview() && pendingReviewItems().length > 8) {
+            <button
+              type="button"
+              class="show-more"
+              [disabled]="busy()"
+              (click)="showAllReview.set(false)"
+            >
+              Show less
+            </button>
+          }
+        </section>
+      }
+
+      @if (
+        pendingAutomaticMoves().length === 0 &&
+        pendingReviewItems().length === 0 &&
+        !hasAttemptResult()
+      ) {
+        <div class="empty-state">
+          <span aria-hidden="true"><mur-icon icon="check" /></span>
+          <div>
+            <h4>No moves need review</h4>
+            <p>Everything Brain could inspect remains safely unchanged.</p>
+          </div>
+        </div>
+      }
+
+      @if (skipGroups().length > 0) {
+        <section class="skip-section" aria-labelledby="brain-skipped-title">
+          <div class="section-head">
+            <div>
+              <h4 id="brain-skipped-title">Not ready to file</h4>
+              <p>
+                These items are unchanged. Details stay compact until needed.
+              </p>
+            </div>
+          </div>
+          <div class="skip-groups">
+            @for (group of skipGroups(); track group.code) {
+              <div class="skip-group">
+                <button
+                  type="button"
+                  class="skip-trigger"
+                  [attr.aria-expanded]="isSkipGroupExpanded(group.code)"
+                  (click)="toggleSkipGroup(group.code)"
+                >
+                  <mur-icon icon="chevron-right" />
+                  <span>
+                    <strong>{{ group.label }}</strong>
+                    <small>{{ group.detail }}</small>
+                  </span>
+                  <span class="count-pill">{{ group.items.length }}</span>
+                </button>
+                @if (isSkipGroupExpanded(group.code)) {
+                  <ul class="skip-list">
+                    @for (item of group.items; track item.itemId) {
+                      <li>
+                        <strong>{{ item.title }}</strong>
+                        <span>{{ item.reason }}</span>
+                      </li>
+                    }
+                  </ul>
+                }
+              </div>
+            }
+          </div>
+        </section>
+      }
+    </div>
+
+    <footer class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="busy()"
+        (click)="cancelled.emit()"
+      >
+        {{
+          hasAttemptResult() || applyError() || selectedCount() === 0
+            ? "Close"
+            : "Cancel"
+        }}
+      </button>
+      @if (selectedCount() > 0) {
+        <button
+          type="button"
+          class="btn btn-primary apply-button"
+          [disabled]="busy()"
+          (click)="onApply()"
+        >
+          <mur-icon icon="move" />
+          {{
+            busy()
+              ? "Moving…"
+              : (hasAttemptResult() || applyError() ? "Retry " : "Move ") +
+                selectedCount() +
+                " recording" +
+                (selectedCount() === 1 ? "" : "s")
+          }}
+        </button>
+      }
+    </footer>
+  </div>
+</div>

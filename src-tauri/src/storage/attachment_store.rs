@@ -1018,6 +1018,214 @@ impl Db {
         tx.commit().map_err(map_err)?;
         Ok(())
     }
+
+    /// Conversion-specific companion update: replace only the command-composed Markdown while
+    /// relocating the existing companion into the meeting's exact container in the SAME
+    /// transaction. The caller supplies authenticated attachment plaintext and, for a locked
+    /// destination, target-CK blobs that it already verified byte-identical. The source folder and
+    /// structured meeting id are optimistic identity witnesses; a concurrent move/relink therefore
+    /// changes zero rows and rolls the whole operation back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_converted_companion_atomic(
+        &self,
+        document_id: &str,
+        expected_source_folder_id: &str,
+        target_folder_id: &str,
+        expected_target_locked: bool,
+        meeting_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        updated_at: i64,
+        attachment_plaintext: &HashMap<String, Vec<u8>>,
+        attachment_seals: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        self.update_converted_companion_atomic_core(
+            document_id,
+            expected_source_folder_id,
+            target_folder_id,
+            expected_target_locked,
+            meeting_id,
+            title,
+            text,
+            text_blob,
+            updated_at,
+            attachment_plaintext,
+            attachment_seals,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_converted_companion_atomic_core(
+        &self,
+        document_id: &str,
+        expected_source_folder_id: &str,
+        target_folder_id: &str,
+        expected_target_locked: bool,
+        meeting_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        updated_at: i64,
+        attachment_plaintext: &HashMap<String, Vec<u8>>,
+        attachment_seals: &HashMap<String, Vec<u8>>,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if expected_target_locked != text_blob.is_some()
+            || (expected_target_locked && attachment_plaintext.len() != attachment_seals.len())
+            || (!expected_target_locked && !attachment_seals.is_empty())
+        {
+            return Err(AppError::Storage(
+                "converted companion seal set does not match destination lock state".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let target_matches = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM folders
+                     WHERE id = ?1
+                       AND locked = ?2
+                       AND COALESCE(kind, 'meeting') IN ('meeting', 'note')
+                       AND path NOT LIKE '.murmur/%'
+                 )",
+                rusqlite::params![target_folder_id, expected_target_locked as i64],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !target_matches {
+            return Err(AppError::Locked(
+                "the conversion destination changed or is unavailable; retry".into(),
+            ));
+        }
+        let attachment_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM note_attachments WHERE document_id=?1",
+                [document_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if attachment_count as usize != attachment_plaintext.len() {
+            return Err(AppError::Storage(
+                "attachment set changed during converted companion update".into(),
+            ));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE documents
+                    SET folder_id=?4, title=?5, text=?6, text_blob=?7, updated_at=?8,
+                        exported_path=NULL, exported_hash=NULL
+                  WHERE id=?1 AND kind='note' AND folder_id=?2 AND meeting_id=?3",
+                rusqlite::params![
+                    document_id,
+                    expected_source_folder_id,
+                    meeting_id,
+                    target_folder_id,
+                    title,
+                    text,
+                    text_blob,
+                    updated_at
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Err(AppError::Storage(
+                "the companion note moved or changed identity during conversion".into(),
+            ));
+        }
+        for (id, data) in attachment_plaintext {
+            let changed = if expected_target_locked {
+                let blob = attachment_seals.get(id).ok_or_else(|| {
+                    AppError::Storage("converted companion attachment seal is missing".into())
+                })?;
+                tx.execute(
+                    "UPDATE note_attachments
+                        SET data=X'', data_blob=?3, exported_path=NULL
+                      WHERE id=?1 AND document_id=?2",
+                    rusqlite::params![id, document_id, blob],
+                )
+            } else {
+                tx.execute(
+                    "UPDATE note_attachments
+                        SET data=?3, data_blob=NULL, exported_path=NULL
+                      WHERE id=?1 AND document_id=?2",
+                    rusqlite::params![id, document_id, data],
+                )
+            }
+            .map_err(map_err)?;
+            if changed != 1 {
+                return Err(AppError::Storage(
+                    "attachment disappeared during converted companion update".into(),
+                ));
+            }
+        }
+        if expected_target_locked {
+            let document_ids = [document_id.to_string()];
+            Self::purge_doc_chunks_tx(&tx, &document_ids)?;
+            Self::purge_links_tx(&tx, &[], &document_ids, true)?;
+            Self::purge_all_pending_audit_findings_tx(&tx)?;
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        checkpoint()?;
+        Self::upsert_link_tx(
+            &tx,
+            "note",
+            document_id,
+            "meeting",
+            meeting_id,
+            "companion",
+            1.0,
+            "user",
+            "active",
+            updated_at,
+        )?;
+        tx.execute(
+            "UPDATE org_shares
+                SET republish_dirty = republish_dirty + 1, republish_deferred=0
+              WHERE document_id=?1 AND state IN ('queued','uploaded','failed')",
+            [document_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_converted_companion_atomic_failing(
+        &self,
+        document_id: &str,
+        expected_source_folder_id: &str,
+        target_folder_id: &str,
+        expected_target_locked: bool,
+        meeting_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        updated_at: i64,
+        attachment_plaintext: &HashMap<String, Vec<u8>>,
+        attachment_seals: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        self.update_converted_companion_atomic_core(
+            document_id,
+            expected_source_folder_id,
+            target_folder_id,
+            expected_target_locked,
+            meeting_id,
+            title,
+            text,
+            text_blob,
+            updated_at,
+            attachment_plaintext,
+            attachment_seals,
+            || {
+                Err(AppError::Storage(
+                    "injected converted companion update failure".into(),
+                ))
+            },
+        )
+    }
 }
 
 fn row_to_attachment(r: &Row<'_>) -> rusqlite::Result<AttachmentRecord> {

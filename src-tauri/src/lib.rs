@@ -479,10 +479,12 @@ pub fn run() {
             commands::download_ner_model,
             commands::toggle_bar,
             commands::list_folders,
-            // Workspace hierarchy (Projects › Folders › items) — read-only.
+            // Workspace hierarchy plus review-first organization of visible unfiled recordings.
             commands::list_workspace_tree,
             commands::list_container_items,
             commands::get_container,
+            commands::plan_workspace_organization,
+            commands::apply_workspace_organization,
             commands::create_folder,
             commands::rename_folder,
             commands::delete_folder,

@@ -78,6 +78,147 @@ impl Db {
         )
     }
 
+    /// Atomically birth a converted companion note in the meeting's exact user-visible container.
+    ///
+    /// Unlike [`Self::insert_companion_note_atomic`], which intentionally remains restricted to the
+    /// reserved open Notes root for the recording-time companion flow, conversion may target the
+    /// meeting container (meeting- or note-kind). The command layer has already gated the source,
+    /// resolved the destination under `lifecycle_guard`, and — for a locked destination — produced
+    /// and verified `text_blob` under that destination's CK. This transaction rechecks the
+    /// destination's renderable/lock identity and commits document + structural companion edge
+    /// together, so a lock-state drift or injected failure leaves no orphan row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_converted_companion_atomic(
+        &self,
+        id: &str,
+        folder_id: &str,
+        expected_locked: bool,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        meeting_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        self.insert_converted_companion_atomic_core(
+            id,
+            folder_id,
+            expected_locked,
+            name,
+            title,
+            text,
+            text_blob,
+            meeting_id,
+            created_at,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_converted_companion_atomic_core(
+        &self,
+        id: &str,
+        folder_id: &str,
+        expected_locked: bool,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        meeting_id: &str,
+        created_at: i64,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if expected_locked != text_blob.is_some() {
+            return Err(AppError::Storage(
+                "converted companion seal does not match destination lock state".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let target_matches = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM folders
+                     WHERE id = ?1
+                       AND locked = ?2
+                       AND COALESCE(kind, 'meeting') IN ('meeting', 'note')
+                       AND path NOT LIKE '.murmur/%'
+                 )",
+                rusqlite::params![folder_id, expected_locked as i64],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !target_matches {
+            return Err(AppError::Locked(
+                "the conversion destination changed or is unavailable; retry".into(),
+            ));
+        }
+        let meeting_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+                [meeting_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !meeting_exists {
+            return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
+        }
+        tx.execute(
+            "INSERT INTO documents
+               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at,
+                exported_path, exported_hash, meeting_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'note', ?6, ?7, ?7, NULL, NULL, ?8)",
+            rusqlite::params![id, folder_id, name, title, text, text_blob, created_at, meeting_id],
+        )
+        .map_err(map_err)?;
+        checkpoint()?;
+        Self::upsert_link_tx(
+            &tx,
+            "note",
+            id,
+            "meeting",
+            meeting_id,
+            "companion",
+            1.0,
+            "user",
+            "active",
+            created_at,
+        )?;
+        tx.commit().map_err(map_err)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_converted_companion_atomic_failing(
+        &self,
+        id: &str,
+        folder_id: &str,
+        expected_locked: bool,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        meeting_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        self.insert_converted_companion_atomic_core(
+            id,
+            folder_id,
+            expected_locked,
+            name,
+            title,
+            text,
+            text_blob,
+            meeting_id,
+            created_at,
+            || {
+                Err(AppError::Storage(
+                    "injected converted companion failure".into(),
+                ))
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_companion_note_atomic_core(
         &self,
@@ -1306,6 +1447,191 @@ mod tests {
             )
             .unwrap();
         assert_eq!(link_rows, 1);
+    }
+
+    #[test]
+    fn converted_companion_birth_uses_exact_container_and_rolls_back_atomically() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let target = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: target.clone(),
+            name: "Project meeting folder".into(),
+            path: "Project/Meetings".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+
+        let failed = db.insert_converted_companion_atomic_failing(
+            "converted-rollback",
+            &target,
+            false,
+            "converted",
+            "Converted",
+            "generated",
+            None,
+            &meeting_id,
+            42,
+        );
+        assert!(matches!(failed, Err(AppError::Storage(_))));
+        assert!(db.get_note_row("converted-rollback").unwrap().is_none());
+        assert_eq!(db.companion_note_for_meeting(&meeting_id).unwrap(), None);
+
+        db.insert_converted_companion_atomic(
+            "converted-ok",
+            &target,
+            false,
+            "converted",
+            "Converted",
+            "generated",
+            None,
+            &meeting_id,
+            43,
+        )
+        .unwrap();
+        let row = db.get_note_row("converted-ok").unwrap().unwrap();
+        assert_eq!(row.folder_id, target);
+        assert_eq!(row.text, "generated");
+        assert_eq!(
+            db.companion_note_for_meeting(&meeting_id)
+                .unwrap()
+                .as_deref(),
+            Some("converted-ok")
+        );
+    }
+
+    #[test]
+    fn converted_companion_update_rehomes_content_and_attachment_in_one_transaction() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let source = db.ensure_notes_root().unwrap();
+        let target = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: target.clone(),
+            name: "Meeting destination".into(),
+            path: "Meeting destination".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_companion_note_atomic(
+            "existing-companion",
+            &source,
+            "existing",
+            "Existing",
+            "user prefix\nold generated\nuser suffix",
+            &meeting_id,
+            1,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: "existing-companion".into(),
+        };
+        let bytes = b"attachment bytes";
+        let hash = [7u8; 32];
+        db.insert_attachment(&crate::storage::NewAttachment {
+            id: "attachment-1",
+            owner: &owner,
+            mime_type: "image/png",
+            extension: "png",
+            width: 1,
+            height: 1,
+            sha256: &hash,
+            byte_len: bytes.len(),
+            data: bytes,
+            data_blob: None,
+            created_at: 2,
+        })
+        .unwrap();
+        let plaintext =
+            std::collections::HashMap::from([("attachment-1".to_string(), bytes.to_vec())]);
+        let no_seals = std::collections::HashMap::new();
+
+        let failed = db.update_converted_companion_atomic_failing(
+            "existing-companion",
+            &source,
+            &target,
+            false,
+            &meeting_id,
+            "Converted",
+            "user prefix\nnew generated\nuser suffix",
+            None,
+            3,
+            &plaintext,
+            &no_seals,
+        );
+        assert!(matches!(failed, Err(AppError::Storage(_))));
+        let unchanged = db.get_note_row("existing-companion").unwrap().unwrap();
+        assert_eq!(unchanged.folder_id, source);
+        assert!(unchanged.text.contains("old generated"));
+
+        db.update_converted_companion_atomic(
+            "existing-companion",
+            &source,
+            &target,
+            false,
+            &meeting_id,
+            "Converted",
+            "user prefix\nnew generated\nuser suffix",
+            None,
+            4,
+            &plaintext,
+            &no_seals,
+        )
+        .unwrap();
+        let moved = db.get_note_row("existing-companion").unwrap().unwrap();
+        assert_eq!(moved.folder_id, target);
+        assert_eq!(moved.text, "user prefix\nnew generated\nuser suffix");
+        assert_eq!(db.list_attachments(&owner).unwrap()[0].data, bytes.to_vec());
+        assert_eq!(
+            db.companion_note_for_meeting(&meeting_id)
+                .unwrap()
+                .as_deref(),
+            Some("existing-companion"),
+            "stable companion identity and edge survive rehoming"
+        );
+    }
+
+    #[test]
+    fn converted_companion_locked_target_requires_matching_seal_shape() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let target = seed_locked_folder(&db);
+        let err = db
+            .insert_converted_companion_atomic(
+                "missing-seal",
+                &target,
+                true,
+                "converted",
+                "Converted",
+                "secret",
+                None,
+                &meeting_id,
+                42,
+            )
+            .unwrap_err();
+        assert!(matches!(err, AppError::Storage(_)));
+        assert!(db.get_note_row("missing-seal").unwrap().is_none());
+
+        db.insert_converted_companion_atomic(
+            "sealed-converted",
+            &target,
+            true,
+            "converted",
+            "Converted",
+            "secret",
+            Some(b"verified-by-command-layer"),
+            &meeting_id,
+            43,
+        )
+        .unwrap();
+        let row = db.get_note_row("sealed-converted").unwrap().unwrap();
+        assert_eq!(row.folder_id, target);
+        assert!(row.sealed);
+        assert!(row.exported_path.is_none());
     }
 
     #[test]

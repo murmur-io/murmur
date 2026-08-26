@@ -19,6 +19,15 @@ export type ShellIcon =
   | "browse"
   | "history"
   | "plus"
+  | "note-add"
+  | "folder"
+  | "folder-add"
+  | "move"
+  | "rename"
+  | "trash"
+  | "unlock"
+  | "check"
+  | "chevron-right"
   | "sidebar"
   | "topbar"
   | "sun"
@@ -40,6 +49,9 @@ export type ShellIcon =
 @Component({
   selector: "mur-icon",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  host: {
+    "[attr.data-icon]": "icon()",
+  },
   templateUrl: "./icon.component.html",
   styleUrl: "./icon.component.scss",
 })

@@ -2713,6 +2713,62 @@ export interface OrganizePlan {
   moves: OrganizeMove[];
 }
 
+/** One reviewed recording move proposed by `plan_workspace_organization`. */
+export interface WorkspaceOrganizeMove {
+  itemId: string;
+  title: string;
+  fromContainerId: string | null;
+  fromContainer: string;
+  toContainerId: string;
+  toContainer: string;
+  reason: string;
+}
+
+/** A recording the planner inspected but could not safely classify or move. */
+export interface WorkspaceOrganizeSkip {
+  itemId: string;
+  title: string;
+  reason: string;
+  code: "notReady" | "emptyNote" | "deferred" | "noDestination";
+}
+
+/** Content-bearing recording that Brain deliberately leaves for a human destination choice. */
+export interface WorkspaceOrganizeReview {
+  itemId: string;
+  title: string;
+  suggestedTargetId: string | null;
+  suggestedTarget: string | null;
+  reason: string;
+  code: "uncertain" | "noMatch" | "invalidDecision";
+}
+
+/** Backend-allowlisted manual destination, labelled with its full hierarchy breadcrumb. */
+export interface WorkspaceOrganizeTarget {
+  id: string;
+  label: string;
+}
+
+/** Review-before-apply result for the visible workspace Brain organizer. */
+export interface WorkspaceOrganizePlan {
+  moves: WorkspaceOrganizeMove[];
+  review: WorkspaceOrganizeReview[];
+  skipped: WorkspaceOrganizeSkip[];
+  targets: WorkspaceOrganizeTarget[];
+  totalScanned: number;
+}
+
+/** One per-item refusal returned by `apply_workspace_organization`. */
+export interface WorkspaceOrganizeFailure {
+  itemId: string;
+  reason: string;
+}
+
+/** Honest bulk-apply receipt: successes and failures are reported separately. */
+export interface WorkspaceOrganizeApplyResult {
+  appliedIds: string[];
+  failures: WorkspaceOrganizeFailure[];
+}
+
 /**
  * A note-kind folder (`list_note_folders` / `create_note_folder`). Reuses the
  * folder machinery with `kind='note'`; mirrors the Rust `NoteFolder`. `path` is
@@ -3539,6 +3595,8 @@ export interface TypeGroup {
 export interface ContainerNode {
   id: string;
   name: string;
+  /** Canonical namespace; drives honest creation/move affordances, never write authority. */
+  kind: "meeting" | "note";
   level: "project" | "folder";
   emoji: string | null;
   tint: string | null;

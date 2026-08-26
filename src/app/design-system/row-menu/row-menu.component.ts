@@ -1,11 +1,17 @@
 import {
+  afterNextRender,
   ChangeDetectionStrategy,
   Component,
   ElementRef,
+  Injector,
   inject,
   input,
   signal,
+  viewChild,
 } from "@angular/core";
+
+const PANEL_GAP_PX = 4;
+const VIEWPORT_MARGIN_PX = 8;
 
 /**
  * Design System — `<mur-row-menu>`: THE gear-trigger dropdown for a tree row's
@@ -30,20 +36,17 @@ import {
  *
  * Feature-owned via `<ng-content>`: WHICH actions appear and what each one
  * does (Rename / lock-state / Delete-with-confirm) — same shell-vs-logic
- * split `<mur-sidebar-section>` already established. A menu item that
- * launches a multi-step flow (e.g. a delete confirm that replaces the row
- * entirely) should close this menu FIRST via the local template reference
- * (`#actions` → `(click)="actions.close(); startDelete()"`) since opening a
- * different template branch elsewhere doesn't reliably tear this instance
- * down before its next paint.
+ * split `<mur-sidebar-section>` already established. The shell automatically
+ * closes after an enabled `[role=menuitem]` is activated, including when that
+ * item launches a multi-step flow elsewhere.
  *
  * Usage:
  * ```html
- * <mur-row-menu #actions [label]="'Actions for ' + node().name">
+ * <mur-row-menu [label]="'Actions for ' + node().name">
  *   <button type="button" class="menu-item" role="menuitem"
- *     (click)="actions.close(); startRename()">Rename</button>
+ *     (click)="startRename()">Rename</button>
  *   <button type="button" class="menu-item menu-item-danger" role="menuitem"
- *     (click)="actions.close(); startDelete()">Delete</button>
+ *     (click)="startDelete()">Delete</button>
  * </mur-row-menu>
  * ```
  */
@@ -52,6 +55,7 @@ import {
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     "[class.is-open]": "isOpen()",
+    "(click)": "onHostClick($event)",
     "(document:click)": "onDocumentClick($event)",
     "(document:keydown.escape)": "onEscape()",
   },
@@ -60,6 +64,8 @@ import {
 })
 export class MurRowMenuComponent {
   private readonly host = inject(ElementRef<HTMLElement>);
+  private readonly injector = inject(Injector);
+  private readonly panel = viewChild<ElementRef<HTMLElement>>("panel");
 
   /** Accessible name for the trigger + panel (e.g. "Actions for Product"). */
   readonly label = input.required<string>();
@@ -77,18 +83,52 @@ export class MurRowMenuComponent {
   private readonly _open = signal(false);
   /** Whether the dropdown panel is showing. */
   readonly isOpen = this._open.asReadonly();
+  private readonly _opensAbove = signal(false);
+  /** Whether the panel must flip above its trigger to stay inside its scroller. */
+  readonly opensAbove = this._opensAbove.asReadonly();
+  private readonly _panelMaxHeight = signal<number | null>(null);
+  /** Maximum visible height inside the active viewport/scroll boundary. */
+  readonly panelMaxHeight = this._panelMaxHeight.asReadonly();
 
   /** Open/close the panel. */
   toggle(): void {
     if (this.disabled()) {
       return;
     }
-    this._open.update((v) => !v);
+    if (this._open()) {
+      this.close();
+      return;
+    }
+    this._open.set(true);
+    this.positionPanel();
   }
 
   /** Close the panel. Safe to call whether or not it's open. */
   close(): void {
     this._open.set(false);
+    this._opensAbove.set(false);
+    this._panelMaxHeight.set(null);
+  }
+
+  /** Close after any enabled projected action; feature code still owns the action. */
+  onHostClick(event: MouseEvent): void {
+    if (!this._open()) {
+      return;
+    }
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    const item = target.closest<HTMLElement>("[role='menuitem']");
+    if (
+      !item ||
+      !this.host.nativeElement.contains(item) ||
+      item.getAttribute("aria-disabled") === "true" ||
+      (item instanceof HTMLButtonElement && item.disabled)
+    ) {
+      return;
+    }
+    this.close();
   }
 
   /** Outside-click dismissal — a click landing outside this host closes the panel. */
@@ -100,12 +140,61 @@ export class MurRowMenuComponent {
     if (target && this.host.nativeElement.contains(target)) {
       return; // inside the trigger or panel — let the item's own click run.
     }
-    this._open.set(false);
+    this.close();
   }
 
   onEscape(): void {
     if (this._open()) {
-      this._open.set(false);
+      this.close();
     }
+  }
+
+  /**
+   * Prefer the familiar below-trigger placement, but flip above when the panel
+   * would cross the nearest scrolling ancestor (or the viewport). The hierarchy
+   * sidebar has a fixed footer outside its `.context-body`; viewport-only math
+   * therefore still lets the last row's menu paint underneath that footer.
+   */
+  private positionPanel(): void {
+    afterNextRender(
+      () => {
+        const panel = this.panel()?.nativeElement;
+        if (!panel || !this._open()) {
+          return;
+        }
+
+        const anchorRect = this.host.nativeElement.getBoundingClientRect();
+        let boundaryTop = VIEWPORT_MARGIN_PX;
+        let boundaryBottom = window.innerHeight - VIEWPORT_MARGIN_PX;
+
+        for (
+          let ancestor = this.host.nativeElement.parentElement;
+          ancestor;
+          ancestor = ancestor.parentElement
+        ) {
+          const overflowY = getComputedStyle(ancestor).overflowY;
+          if (overflowY !== "auto" && overflowY !== "scroll") {
+            continue;
+          }
+          const rect = ancestor.getBoundingClientRect();
+          boundaryTop = Math.max(boundaryTop, rect.top);
+          boundaryBottom = Math.min(boundaryBottom, rect.bottom);
+        }
+
+        const below = Math.max(
+          0,
+          boundaryBottom - anchorRect.bottom - PANEL_GAP_PX,
+        );
+        const above = Math.max(
+          0,
+          anchorRect.top - boundaryTop - PANEL_GAP_PX,
+        );
+        const flipAbove = panel.offsetHeight > below && above > below;
+
+        this._opensAbove.set(flipAbove);
+        this._panelMaxHeight.set(Math.floor(flipAbove ? above : below));
+      },
+      { injector: this.injector },
+    );
   }
 }
