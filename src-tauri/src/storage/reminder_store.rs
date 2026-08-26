@@ -13,7 +13,7 @@ use std::borrow::Cow;
 
 use crate::error::{AppError, Result};
 use crate::reminder_audit::ReminderAuditCandidate;
-use crate::storage::db::{map_err, visibility_clause, Db};
+use crate::storage::db::{map_err, meeting_visibility_clause, visibility_clause, Db};
 use crate::storage::models::{
     ReminderDraft, ReminderOrigin, ReminderRepeatUnit, ReminderSourceAnchor, ReminderState,
     ReminderSuggestionGateAnchor, StoredReminder, StoredReminderOccurrence,
@@ -1185,6 +1185,7 @@ impl Db {
         // correlated source subquery scoped to that alias instead of assuming its parameter
         // rewrites the SQL identifier (it does not).
         let folder_visible = visibility_clause("f", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT r.title, r.due_at
                FROM reminders r
@@ -1195,12 +1196,8 @@ impl Db {
                   SELECT 1 FROM reminder_sources rs
                    WHERE rs.reminder_id=r.id AND (
                      (rs.source_kind='meeting' AND NOT EXISTS (
-                       SELECT 1 FROM meetings m WHERE m.id=rs.source_id AND (
-                         NOT EXISTS (SELECT 1 FROM notes any_n WHERE any_n.meeting_id=m.id)
-                         OR EXISTS (SELECT 1 FROM notes mn
-                           LEFT JOIN folders f ON f.id=mn.folder_id
-                          WHERE mn.meeting_id=m.id AND {folder_visible})
-                       )))
+                       SELECT 1 FROM meetings m
+                        WHERE m.id=rs.source_id AND {meeting_visible}))
                      OR (rs.source_kind='note' AND NOT EXISTS (
                        SELECT 1 FROM documents d
                        JOIN folders f ON f.id=d.folder_id

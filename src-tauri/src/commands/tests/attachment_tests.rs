@@ -477,6 +477,195 @@ fn meeting_note(db: &Db, id: &str, markdown: &str) {
     .expect("insert meeting note");
 }
 
+fn ambiguous_legacy_meeting(db: &Db, id: &str) {
+    meeting_note(db, id, "provider one");
+    split_existing_legacy_meeting(db, id);
+}
+
+fn split_existing_legacy_meeting(db: &Db, id: &str) {
+    meeting_folder(db, "legacy-one");
+    meeting_folder(db, "legacy-two");
+    db.upsert_note(&NoteRecord {
+        meeting_id: id.to_string(),
+        provider_id: "other-provider".into(),
+        markdown: "provider two".into(),
+        // Keep `test-provider` as the latest row so the public meeting-owner resolver selects the
+        // exact provider that owns the attachment seeded before this legacy split.
+        created_at: "2026-07-22T11:00:00Z".into(),
+        ..NoteRecord::default()
+    })
+    .expect("insert second provider");
+    db.lock()
+        .execute(
+            "UPDATE notes SET folder_id=CASE provider_id
+                 WHEN 'test-provider' THEN 'legacy-one' ELSE 'legacy-two' END
+              WHERE meeting_id=?1",
+            [id],
+        )
+        .expect("seed ambiguous legacy ownership");
+}
+
+#[test]
+fn ambiguous_legacy_meeting_refuses_add_and_bundle_before_any_attachment_write() {
+    let vault = temp_vault("ambiguous-owner");
+    let state = build_state("ambiguous-owner", Some(&vault));
+    ambiguous_legacy_meeting(&state.db, "ambiguous-meeting");
+    let bytes = png_image(24, 16, None);
+
+    assert!(matches!(
+        add_note_attachment_inner(
+            &state,
+            "meeting",
+            "ambiguous-meeting",
+            "blocked.png",
+            "image/png",
+            &base64url(&bytes),
+        ),
+        Err(AppError::Locked(_))
+    ));
+    let owner = AttachmentOwner::Meeting {
+        meeting_id: "ambiguous-meeting".into(),
+        provider_id: "test-provider".into(),
+    };
+    assert!(state.db.list_attachments(&owner).unwrap().is_empty());
+
+    let incoming = incoming_png(&bytes, 24, 16);
+    assert!(matches!(
+        materialize_attachment_bundle(&state, &owner, &[incoming]),
+        Err(AppError::Locked(_))
+    ));
+    assert!(state.db.list_attachments(&owner).unwrap().is_empty());
+    assert!(
+        !vault.join("Murmur Attachments").exists(),
+        "refusal must happen before any vault materialization"
+    );
+    let _ = std::fs::remove_dir_all(vault);
+}
+
+#[test]
+fn plaintext_attachment_read_and_exports_refuse_a_later_ambiguous_legacy_split() {
+    let vault = temp_vault("ambiguous-plaintext-read");
+    let state = build_state("ambiguous-plaintext-read", Some(&vault));
+    meeting_note(&state.db, "ambiguous-plaintext-meeting", "provider one");
+    let bytes = png_image(24, 16, None);
+    let attachment = add_png(
+        &state,
+        "meeting",
+        "ambiguous-plaintext-meeting",
+        &bytes,
+    );
+    split_existing_legacy_meeting(&state.db, "ambiguous-plaintext-meeting");
+    let owner = AttachmentOwner::Meeting {
+        meeting_id: "ambiguous-plaintext-meeting".into(),
+        provider_id: "test-provider".into(),
+    };
+    let markdown = format!("![private](murmur-attachment://{})", attachment.id);
+
+    assert!(matches!(
+        list_note_attachments_inner(&state, "meeting", "ambiguous-plaintext-meeting"),
+        Err(AppError::Locked(_))
+    ));
+    assert!(matches!(
+        attachment_bundle_for_owner(
+            &state,
+            &owner,
+            &HashSet::from([attachment.id.clone()]),
+        ),
+        Err(AppError::Locked(_))
+    ));
+    assert!(matches!(
+        render_markdown_with_attachments_for_export(&state, &owner, &markdown, &vault),
+        Err(AppError::Locked(_))
+    ));
+    assert!(matches!(
+        render_markdown_with_attachments_for_user_export(&state, &owner, &markdown, &vault),
+        Err(AppError::Locked(_))
+    ));
+    assert!(
+        !vault.join("Murmur Attachments").exists(),
+        "byte authorization must fail before any tracked or user-owned export file is created"
+    );
+    let raw = state.db.list_attachments(&owner).unwrap();
+    assert_eq!(raw.len(), 1, "refusal does not destroy the canonical row");
+    assert_eq!(raw[0].data, bytes, "plaintext stays canonical in SQLCipher");
+    assert!(raw[0].exported_path.is_none());
+    let _ = std::fs::remove_dir_all(vault);
+}
+
+#[test]
+fn genuine_unfiled_meeting_attachment_round_trips_through_every_read_and_export_surface() {
+    let vault = temp_vault("unfiled-attachment-vault");
+    let user_root = temp_vault("unfiled-attachment-user-export");
+    let state = build_state("unfiled-attachment-success", Some(&vault));
+    meeting_note(&state.db, "unfiled-attachment-meeting", "provider one");
+    let owner = AttachmentOwner::Meeting {
+        meeting_id: "unfiled-attachment-meeting".into(),
+        provider_id: "test-provider".into(),
+    };
+    let bytes = png_image(24, 16, None);
+    let incoming = incoming_png(&bytes, 24, 16);
+    let attachment_id = incoming.id.clone();
+
+    materialize_attachment_bundle(&state, &owner, std::slice::from_ref(&incoming))
+        .expect("genuinely unfiled owner accepts plaintext materialization");
+    assert_eq!(
+        state
+            .db
+            .folder_for_meeting("unfiled-attachment-meeting")
+            .unwrap(),
+        None
+    );
+    let listed = list_note_attachments_inner(&state, "meeting", "unfiled-attachment-meeting")
+        .expect("genuinely unfiled owner remains listable");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, attachment_id);
+    assert_eq!(listed[0].byte_len, bytes.len() as u64);
+
+    let bundled = attachment_bundle_for_owner(
+        &state,
+        &owner,
+        &HashSet::from([attachment_id.clone()]),
+    )
+    .expect("genuinely unfiled owner remains bundle-readable");
+    assert_eq!(bundled.len(), 1);
+    assert_eq!(bundled[0].data, bytes);
+
+    let markdown = format!("![unfiled](murmur-attachment://{attachment_id})");
+    let tracked = render_markdown_with_attachments_for_export(&state, &owner, &markdown, &vault)
+        .expect("tracked render succeeds for a genuinely unfiled owner");
+    let user = render_markdown_with_attachments_for_user_export(
+        &state,
+        &owner,
+        &markdown,
+        &user_root,
+    )
+    .expect("explicit export succeeds for a genuinely unfiled owner");
+    assert!(tracked.contains("![[Murmur Attachments/"));
+    assert!(user.contains("![[Murmur Attachments/"));
+    let tracked_asset = vault
+        .join("Murmur Attachments")
+        .join(format!("{attachment_id}.png"));
+    let user_asset = user_root
+        .join("Murmur Attachments")
+        .join(format!("{attachment_id}.png"));
+    assert_eq!(std::fs::read(&tracked_asset).unwrap(), bytes);
+    assert_eq!(std::fs::read(&user_asset).unwrap(), bytes);
+    let stored_tracked = std::path::PathBuf::from(
+        state.db.list_attachments(&owner).unwrap()[0]
+            .exported_path
+            .clone()
+            .expect("tracked render records its vault asset"),
+    );
+    assert_eq!(
+        std::fs::canonicalize(stored_tracked).unwrap(),
+        std::fs::canonicalize(&tracked_asset).unwrap(),
+        "explicit export must not replace the lifecycle-tracked vault path"
+    );
+
+    let _ = std::fs::remove_dir_all(vault);
+    let _ = std::fs::remove_dir_all(user_root);
+}
+
 #[test]
 fn attachment_export_lock_gate_and_round_trip_are_byte_identical() {
     let vault = temp_vault("lock-cycle");

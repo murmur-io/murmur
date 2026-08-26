@@ -53,7 +53,9 @@ export class OrgBrainService {
   private feedUnlisten: (() => void) | null = null;
   private feedDestroyed = false;
   private readonly onWindowFocus = (): void => {
-    void this.loadOrgs();
+    // Focus is passive navigation, not an explicit sync action. A background
+    // sync/feed event will update the local replica independently.
+    void this.loadLocalOrgs();
   };
 
   constructor() {
@@ -66,7 +68,7 @@ export class OrgBrainService {
       window.removeEventListener("focus", this.onWindowFocus);
     });
     void this.ipc
-      .onOrgFeedUpdated(() => void this.loadOrgs())
+      .onOrgFeedUpdated(() => void this.loadLocalOrgs())
       .then((un) => {
         if (this.feedDestroyed) {
           un();
@@ -82,8 +84,14 @@ export class OrgBrainService {
   /**
    * (Re)load the org roster + every org's shared items + the caller's own
    * meeting org-shares. Stale-guarded on {@link loadSeq}; best-effort
-   * throughout — a transient/offline error leaves the last-known state
-   * standing (never blanks already-loaded data).
+   * throughout. Remote refresh failure falls through to the local replica;
+   * failure to read the local membership gate itself clears rendered org data
+   * fail-closed.
+   *
+   * This is the explicit sync path: it may ask the backend to refresh the
+   * encrypted org replica before reading it. A passive Shared Brains route
+   * mount must use {@link loadLocalOrgs} instead so navigation itself never
+   * introduces network egress.
    */
   async loadOrgs(): Promise<void> {
     const seq = ++this.loadSeq;
@@ -94,40 +102,72 @@ export class OrgBrainService {
       } catch {
         /* offline / no server → fall through to the local replica */
       }
-      let orgs: OrgStatus[];
-      try {
-        // PER-INSTANCE ORG TOGGLE: a disabled org must not appear as a pickable
-        // "Shared brains" entry — Settings keeps its own unfiltered fetch so
-        // every joined org's toggle stays reachable there.
-        orgs = (await this.ipc.orgListStatuses()).filter((o) => o.contextEnabled);
-      } catch {
-        return; // keep the last-known orgs on a transient failure
-      }
-      if (seq !== this.loadSeq) {
-        return;
-      }
-      const [itemLists, ownShares] = await Promise.all([
-        Promise.all(
-          orgs.map((o) =>
-            this.ipc.listOrgItems(o.orgId).catch(() => [] as OrgItemHeader[]),
-          ),
-        ),
-        this.ipc.listMeetingOrgShares().catch(() => [] as MeetingOrgShareRow[]),
-      ]);
-      if (seq !== this.loadSeq) {
-        return;
-      }
-      const byOrg: Record<string, OrgItemHeader[]> = {};
-      orgs.forEach((o, i) => {
-        byOrg[o.orgId] = itemLists[i];
-      });
-      this._orgs.set(orgs);
-      this._orgItems.set(byOrg);
-      this._myOrgShares.set(ownShares);
+      await this.readLocalReplica(seq);
     } finally {
       if (seq === this.loadSeq) {
         this._loading.set(false);
       }
     }
+  }
+
+  /**
+   * Read only the already-admitted local org replica. This path deliberately
+   * excludes `org_refresh`: opening Shared Brains is a local database read,
+   * not an implicit synchronization or consent event.
+   */
+  async loadLocalOrgs(): Promise<void> {
+    const seq = ++this.loadSeq;
+    this._loading.set(true);
+    try {
+      await this.readLocalReplica(seq);
+    } finally {
+      if (seq === this.loadSeq) {
+        this._loading.set(false);
+      }
+    }
+  }
+
+  private async readLocalReplica(seq: number): Promise<void> {
+    let orgs: OrgStatus[];
+    try {
+      // PER-INSTANCE ORG TOGGLE: a disabled org must not appear as a pickable
+      // "Shared brains" entry — Settings keeps its own unfiltered fetch so
+      // every joined org's toggle stays reachable there.
+      orgs = (await this.ipc.orgListCachedStatuses()).filter(
+        (o) => o.contextEnabled,
+      );
+    } catch {
+      if (seq === this.loadSeq) {
+        this.clearReplica();
+      }
+      return;
+    }
+    if (seq !== this.loadSeq) {
+      return;
+    }
+    const [itemLists, ownShares] = await Promise.all([
+      Promise.all(
+        orgs.map((o) =>
+          this.ipc.listOrgItems(o.orgId).catch(() => [] as OrgItemHeader[]),
+        ),
+      ),
+      this.ipc.listMeetingOrgShares().catch(() => [] as MeetingOrgShareRow[]),
+    ]);
+    if (seq !== this.loadSeq) {
+      return;
+    }
+    const byOrg: Record<string, OrgItemHeader[]> = {};
+    orgs.forEach((o, i) => {
+      byOrg[o.orgId] = itemLists[i];
+    });
+    this._orgs.set(orgs);
+    this._orgItems.set(byOrg);
+    this._myOrgShares.set(ownShares);
+  }
+
+  private clearReplica(): void {
+    this._orgs.set([]);
+    this._orgItems.set({});
+    this._myOrgShares.set([]);
   }
 }

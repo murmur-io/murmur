@@ -1,0 +1,66 @@
+<div
+  class="scrim"
+  role="dialog"
+  aria-modal="true"
+  [attr.aria-label]="(mode() === 'rename' ? 'Rename ' : 'Delete ') + noun() + ' ' + name()"
+  [attr.aria-busy]="busy()"
+  (click)="onScrimClick($event)"
+  (keydown.escape)="busy() ? null : cancelled.emit()"
+>
+  <form class="sheet" (submit)="$event.preventDefault(); confirm()">
+    <header class="sheet-head" [class.is-danger]="mode() === 'delete'">
+      <span class="sheet-mark" aria-hidden="true">
+        <mur-icon [icon]="mode() === 'rename' ? 'rename' : 'trash'" />
+      </span>
+      <div>
+        <h3>
+          {{ mode() === "rename" ? "Rename" : "Delete" }}
+          {{ noun() }}
+        </h3>
+        @if (mode() === "rename") {
+          <p>The hierarchy updates everywhere this {{ noun() }} appears.</p>
+        } @else {
+          <p>
+            “{{ name() }}” will be removed. Its items are kept and moved out;
+            nested folders must be removed first.
+          </p>
+        }
+      </div>
+    </header>
+
+    @if (mode() === "rename") {
+      <label for="workspace-manage-name">Name</label>
+      <input
+        #nameInput
+        id="workspace-manage-name"
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        [value]="name()"
+        [disabled]="busy()"
+      />
+    }
+
+    @if (error(); as message) {
+      <p class="manage-error" role="alert">{{ message }}</p>
+    }
+
+    <footer class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="busy()"
+        (click)="cancelled.emit()"
+      >
+        Cancel
+      </button>
+      <button
+        type="submit"
+        [class]="mode() === 'delete' ? 'btn btn-danger' : 'btn btn-primary'"
+        [disabled]="busy()"
+      >
+        {{ busy() ? (mode() === "delete" ? "Deleting…" : "Renaming…") : (mode() === "delete" ? "Delete " + noun() : "Rename") }}
+      </button>
+    </footer>
+  </form>
+</div>

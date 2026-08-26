@@ -1283,7 +1283,7 @@ mod tests {
         let p = tmp_path("reconcile-masters");
         let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
 
-        // A locked folder governing meeting m1 (reconcile keys off notes.folder_id + folders.locked).
+        // A locked folder canonically governing meeting m1.
         db.insert_folder(&crate::storage::Folder {
             id: "f1".into(),
             name: "Secret".into(),

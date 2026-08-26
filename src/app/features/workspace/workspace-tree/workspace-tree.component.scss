@@ -2,6 +2,14 @@
   display: block;
 }
 
+/* Teleported modal wrapper: escape the sidebar's backdrop-filter containing
+   block and raise every hierarchy overlay above all shell chrome. */
+.workspace-overlay-host {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+}
+
 .tree-state,
 .tree-error {
   margin: 0;
@@ -21,6 +29,12 @@
   /* The rail scrolls vertically; a row wider than it would put its trailing control
      outside the scroll box, where a click lands on the rail instead of the button. */
   min-width: 0;
+}
+
+/* The fixed header and independently scrolling tree meet at a hard seam. Snap
+   direct rows there so a stopped scroll never leaves half a row clipped. */
+.tree > * {
+  scroll-snap-align: start;
 }
 
 mur-tree-row {
@@ -121,24 +135,6 @@ mur-tree-row:has(mur-row-menu.is-open) {
    deliver unreliably.
 
    So they stay laid out and clickable at all times, and only their emphasis changes. */
-.row-add,
 .row-actions {
   margin-left: auto;
-  opacity: 0.45;
-  transition: opacity var(--transition-fast);
-}
-
-.row-actions {
-  margin-left: 0;
-}
-
-mur-tree-row:hover .row-add,
-mur-tree-row:focus-within .row-add,
-mur-tree-row:hover .row-actions,
-mur-tree-row:focus-within .row-actions,
-.row-add:hover,
-.row-add:focus-within,
-.row-actions:hover,
-.row-actions:focus-within {
-  opacity: 1;
 }

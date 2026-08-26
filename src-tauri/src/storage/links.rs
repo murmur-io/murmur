@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 use crate::error::{AppError, Result};
 use crate::share::org_dto::parse_stable_uuid;
 use crate::storage::db::{
-    backlink_sort_key, doc_sealed_at_rest_tx, extract_wikilink_titles, map_err, visibility_clause,
-    Db, LinkRowRaw,
+    backlink_sort_key, doc_sealed_at_rest_tx, extract_wikilink_titles, map_err,
+    meeting_visibility_clause, visibility_clause, Db, LinkRowRaw,
 };
 use crate::storage::models::{BacklinkSource, SourceKind, WikiTarget};
 
@@ -109,10 +109,14 @@ fn document_seal_aad(folder_id: &str, document_id: &str) -> Vec<u8> {
 fn meeting_sealed_at_rest_tx(tx: &rusqlite::Transaction<'_>, meeting_id: &str) -> Result<bool> {
     tx.query_row(
         "SELECT EXISTS(
-           SELECT 1 FROM notes
-            WHERE meeting_id = ?1
-              AND content_blob IS NOT NULL
-              AND (markdown IS NULL OR markdown = '')
+           SELECT 1 FROM meetings m
+            LEFT JOIN folders f ON f.id=m.folder_id
+            WHERE m.id=?1 AND (
+              EXISTS(SELECT 1 FROM notes n
+                      WHERE n.meeting_id=m.id AND n.content_blob IS NOT NULL
+                        AND (n.markdown IS NULL OR n.markdown=''))
+              OR (f.locked=1 AND NOT EXISTS(SELECT 1 FROM notes n WHERE n.meeting_id=m.id))
+            )
          )",
         rusqlite::params![meeting_id],
         |r| Ok(r.get::<_, i64>(0)? != 0),
@@ -665,13 +669,12 @@ impl Db {
         let conn = self.lock();
         // ── GATE 2, meeting-note leg: VISIBLE meeting notes only (same predicate as list_meetings_visible). ──
         // Newest note per meeting; body = `notes.markdown`; timestamp = `meetings.started_at`.
-        let visible_notes = visibility_clause("n", unlocked);
+        let visible_meetings = meeting_visibility_clause("m", unlocked);
         let meeting_sql = format!(
             "SELECT m.id, m.title, m.started_at, n.markdown
                FROM meetings m
                JOIN notes n ON n.meeting_id = m.id
-               LEFT JOIN folders f ON f.id = n.folder_id
-              WHERE {visible_notes}
+              WHERE {visible_meetings}
               ORDER BY m.started_at DESC, m.id DESC"
         );
         let mut stmt = conn.prepare(&meeting_sql).map_err(map_err)?;
@@ -2576,7 +2579,7 @@ impl Db {
             return Ok(Vec::new());
         }
         let conn = self.lock();
-        let vis_note = visibility_clause("f", unlocked);
+        let vis_meeting = meeting_visibility_clause("m", unlocked);
         let vis_doc = visibility_clause("f", unlocked);
         // The source item's OWN chunk ids, per vec-table, so they never consume the vec0 k budget.
         // A meeting's chunks live in `note_chunks` (→ vec_chunks); a note/document's in `doc_chunks`
@@ -2610,11 +2613,7 @@ impl Db {
                  SELECT 'meeting', nc.meeting_id, kn.distance
                    FROM knn_note kn JOIN note_chunks nc ON nc.id = kn.chunk_id
                    JOIN meetings m ON m.id = nc.meeting_id
-                   WHERE EXISTS (
-                       SELECT 1 FROM notes n
-                        LEFT JOIN folders f ON f.id = n.folder_id
-                        WHERE n.meeting_id = m.id AND {vis_note}
-                   )
+                   WHERE {vis_meeting}
                    {self_note_pred}
                  UNION ALL
                  SELECT CASE WHEN d.kind = 'note' THEN 'note' ELSE 'document' END, d.id, kd.distance
