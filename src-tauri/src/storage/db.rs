@@ -1727,6 +1727,24 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_documents_meeting_id ON documents(meeting_id);",
         )
         .map_err(map_err)?;
+        // IMPORT PROVENANCE (2026-08-25): `source` names where a row came from ('notion'; NULL for
+        // everything authored inside Murmur) and `external_id` is that source's own stable key —
+        // for Notion, the 32-hex page id its export embeds in every filename. Together they make a
+        // re-import IDEMPOTENT: a second run UPDATES the row it created last time instead of
+        // silently duplicating it, which is the loudest recurring complaint in every Notion
+        // importer's issue tracker. The pair is deliberately indexed NON-uniquely and de-duplicated
+        // in the application: a partial UNIQUE index is the tighter guarantee, but it changes what
+        // `migrate()` accepts on a database that already holds duplicates, and an additive
+        // migration must never fail on existing user rows. NON-content (a label + an opaque id) —
+        // rides the SQLCipher-at-rest layer, never sealed. Additive + guarded, so migrate() stays
+        // idempotent.
+        Self::add_column_if_missing(conn, "documents", "source", "TEXT")?;
+        Self::add_column_if_missing(conn, "documents", "external_id", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_documents_source_external
+               ON documents(source, external_id);",
+        )
+        .map_err(map_err)?;
         // The vec0 column width is the embedder's EMBED_DIM (== the note vec_chunks width). Format the
         // DDL (no user input). Parallel to `vec_chunks` but keyed to `doc_chunks.id`.
         conn.execute_batch(&format!(
