@@ -52,6 +52,55 @@ impl Db {
         Ok(())
     }
 
+    /// Stamp an imported row's PROVENANCE — which external system it came from and that system's
+    /// own stable id. Both are non-content metadata (never sealed); the pair is what makes a
+    /// re-import update in place instead of duplicating.
+    pub fn set_document_provenance(
+        &self,
+        id: &str,
+        source: &str,
+        external_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET source = ?2, external_id = ?3 WHERE id = ?1",
+            rusqlite::params![id, source, external_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Look up a previously imported note by its ORIGIN identity, returning `(note id, folder id)`.
+    ///
+    /// This is the idempotency key for re-import. It deliberately returns the folder too: the
+    /// caller must re-run its write-gate against the folder the row ACTUALLY lives in, which may
+    /// not be the folder the current import is targeting — the user is free to have moved the note
+    /// into a locked folder since the first run, and updating it there without gating would
+    /// resurrect plaintext behind a lock.
+    pub fn note_by_external_id(
+        &self,
+        source: &str,
+        external_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, folder_id FROM documents
+                  WHERE kind = 'note' AND source = ?1 AND external_id = ?2
+                  ORDER BY created_at ASC LIMIT 1",
+            )
+            .map_err(map_err)?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![source, external_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(map_err)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Atomically birth a generated companion note in the always-open Notes root. The authored
     /// document body, structured `meeting_id`, and required companion edge either commit together
     /// or leave no rows. The command layer owns the lifecycle/root gate and attachment validation.

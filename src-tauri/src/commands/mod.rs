@@ -231,6 +231,16 @@ pub use org_commands::*;
 mod documents_commands;
 pub use documents_commands::*;
 
+// BULK IMPORT command surface (Settings -> Imports). Reads a LOCAL export the user already
+// downloaded and writes ordinary authored notes through the existing gated funnel — no network, no
+// consent surface, no egress-ledger row, and no new seal or read path (see `commands/import.rs`).
+// Bound as `import_commands` (via `#[path]`) to avoid colliding with the crate-level
+// `crate::import` normalizer module (E0255); the glob re-export keeps every command resolving
+// UNCHANGED at `crate::commands::…` for `generate_handler!`.
+#[path = "import.rs"]
+mod import_commands;
+pub use import_commands::*;
+
 // FOLDERS command surface (create/list/rename/delete of meeting/note folders — a GATED domain:
 // `list_folders` folds the session unlock set into per-folder note counts, `delete_folder` refuses a
 // sealed-not-unlocked folder and PERMANENTLY unseals a session-unlocked one via `remove_lock_inner`

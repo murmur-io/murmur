@@ -101,6 +101,9 @@
               @case ("obsidian") {
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.8 2.8 5.3 4.7 12 7 14l-.8-6z" /><path d="M6 1.8 6.2 8 7 14l3.4-2.6L12 5.4 9 2z" /></svg>
               }
+              @case ("imports") {
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v7" /><path d="M5.2 6.4 8 9.2l2.8-2.8" /><path d="M2.8 10.6v1.6a1.4 1.4 0 0 0 1.4 1.4h7.6a1.4 1.4 0 0 0 1.4-1.4v-1.6" /></svg>
+              }
               @case ("about") {
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2" /><path d="M8 7.4v3.6M8 5.1h.01" /></svg>
               }
@@ -178,6 +181,9 @@
         }
         @case ("obsidian") {
           <app-settings-obsidian-section />
+        }
+        @case ("imports") {
+          <app-settings-imports-section />
         }
         @case ("about") {
           <app-settings-about-section />
