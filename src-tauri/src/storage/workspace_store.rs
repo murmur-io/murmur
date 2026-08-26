@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::Result;
-use crate::storage::db::{map_err, visibility_clause, Db};
+use crate::storage::db::{map_err, meeting_visibility_clause, visibility_clause, Db};
 use crate::storage::models::{ContainerRow, ItemKind, ItemRow};
 
 /// Containers whose kind is outside this set are SYSTEM containers and never reach the tree.
@@ -273,9 +273,9 @@ struct ItemQuery {
 fn visible_items_sql(kind: ItemKind, unlocked: &HashSet<String>, scope: ItemScope) -> ItemQuery {
     match kind {
         ItemKind::Meeting => {
-            // The meeting leg's gate is `list_meetings_visible`'s, verbatim: a meeting is hidden
-            // only when EVERY note it has is sealed-and-not-unlocked, and a meeting with zero notes
-            // stays visible (it has no container either, so it lands in the Inbox).
+            // The meeting leg uses the canonical/fail-closed visibility oracle. A NULL canonical
+            // meeting with no legacy owner stays visible in the Inbox; a filed meeting is governed
+            // by its canonical container even before a note exists.
             //
             // NOTE on the first argument: `visibility_clause` IGNORES it and always emits a clause
             // bound to the alias `f`, so every caller MUST alias the folders table as `f` — which
@@ -283,33 +283,36 @@ fn visible_items_sql(kind: ItemKind, unlocked: &HashSet<String>, scope: ItemScop
             // call honest about which table the emitted SQL actually reads.
             let visible = visibility_clause("f", unlocked);
 
-            // A meeting has no folder column at all; its container lives on its note rows. Three
-            // properties of this subquery are load-bearing, and all three exist so that attribution
-            // can never name a container the reader will not render:
+            // Canonical `meetings.folder_id` wins. The note-derived subquery is legacy-only and
+            // deliberately returns a folder only for an unambiguous visible provider set:
             //
-            // 1. It is GATED by the same clause as the row itself. A meeting whose provider rows
-            //    span two containers is visible as soon as ONE of them is readable — attributing it
-            //    to an unreadable one would put it in a container whose groups are suppressed, so
-            //    the row would appear in NEITHER container: unreachable while still existing.
+            // 1. It is GATED by the same clause as the row itself.
             // 2. It uses the SAME renderable-container definition as the container listing, so a
             //    note filed into a machine-owned container cannot capture the attribution of a
             //    meeting whose other note sits in a real one. Same failure shape as (1).
-            // 3. It is TOTALLY ORDERED. The page query, the totals query and the scope predicate
-            //    each evaluate it independently, so without a total order they could disagree with
-            //    each other. (The shipped `folder_for_meeting` omits the ORDER BY; that
-            //    nondeterminism is pre-existing and untouched — this only makes these three agree.)
+            // 3. COUNT(DISTINCT)=1 prevents an ambiguous legacy provider split from choosing an
+            //    arbitrary container.
             //
             // The JOIN is INNER on purpose: `notes.folder_id` carries no foreign key, so it can
-            // dangle. A dangling id yields no row, attribution falls to NULL, and the meeting lands
-            // in the Inbox — reachable — instead of being attributed to a folder that is gone.
-            let meeting_container = format!(
-                "(SELECT nf.folder_id FROM notes nf
+            // dangle. A dangling id yields no attribution here, while the independent
+            // `meeting_visibility_clause` below rejects that legacy row fail-closed instead of
+            // surfacing it in the Inbox or attributing it to a folder that is gone.
+            let legacy_meeting_container = format!(
+                "(SELECT MIN(nf.folder_id) FROM notes nf
                     JOIN folders f ON f.id = nf.folder_id
                    WHERE nf.meeting_id = m.id AND {visible} AND {renderable}
-                   ORDER BY nf.folder_id, nf.provider_id
-                   LIMIT 1)",
+                  HAVING COUNT(DISTINCT nf.folder_id) = 1)",
                 renderable = renderable_container("f"),
             );
+            let meeting_container = format!(
+                "COALESCE(
+                   (SELECT cf.id FROM folders cf
+                     WHERE cf.id=m.folder_id AND {renderable}),
+                   CASE WHEN m.folder_id IS NULL THEN {legacy_meeting_container} END
+                 )",
+                renderable = renderable_container("cf"),
+            );
+            let meeting_visible = meeting_visibility_clause("m", unlocked);
             let scope_pred = match scope {
                 ItemScope::All => String::new(),
                 ItemScope::Container => format!(" AND {meeting_container} = ?1"),
@@ -325,12 +328,7 @@ fn visible_items_sql(kind: ItemKind, unlocked: &HashSet<String>, scope: ItemScop
                             m.started_at AS sort_text,
                             NULL AS sort_ms
                        FROM meetings m
-                      WHERE (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                             OR EXISTS (
-                                  SELECT 1 FROM notes n
-                                   LEFT JOIN folders f ON f.id = n.folder_id
-                                   WHERE n.meeting_id = m.id AND {visible}
-                                )){scope_pred}"
+                      WHERE {meeting_visible}{scope_pred}"
                 ),
             }
         }

@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use rusqlite::{OptionalExtension, Row, Transaction};
 
 use crate::error::{AppError, Result};
-use crate::storage::db::{map_err, Db};
+use crate::storage::db::{map_err, meeting_visibility_clause, Db};
 use crate::storage::models::{Dashboard, DashboardTile};
 use crate::storage::visibility_clause;
 
@@ -1246,16 +1246,13 @@ impl Db {
         unlocked: &std::collections::HashSet<String>,
     ) -> Result<Vec<String>> {
         let conn = self.lock();
-        let visible = crate::storage::db::visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT m.started_at
                FROM entity_mentions em
                JOIN meetings m ON m.id = em.meeting_id
               WHERE em.entity_id = ?1
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (SELECT 1 FROM notes n
-                                 LEFT JOIN folders f ON f.id = n.folder_id
-                                WHERE n.meeting_id = m.id AND {visible}))
+                AND {meeting_visible}
               ORDER BY m.started_at DESC
               LIMIT ?2"
         );

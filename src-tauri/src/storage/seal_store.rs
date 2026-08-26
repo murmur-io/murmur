@@ -41,7 +41,9 @@ impl Db {
     /// startup can reblank; a crash after commit is a fully open folder. There is no intermediate
     /// locked-with-plaintext-and-no-blob state.
     pub fn commit_folder_permanent_unlock(&self, folder_id: &str) -> Result<()> {
-        const FOLDER_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1";
+        const FOLDER_MEETINGS: &str = "SELECT id FROM meetings WHERE folder_id=?1
+             UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                    WHERE n.folder_id=?1 AND m.folder_id IS NULL";
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         tx.execute(
@@ -76,9 +78,11 @@ impl Db {
         )
         .map_err(map_err)?;
         tx.execute(
-            "UPDATE note_attachments SET data_blob = NULL WHERE
-               document_id IN (SELECT id FROM documents WHERE folder_id = ?1)
-               OR meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id = ?1)",
+            &format!(
+                "UPDATE note_attachments SET data_blob = NULL WHERE
+                   document_id IN (SELECT id FROM documents WHERE folder_id = ?1)
+                   OR meeting_id IN ({FOLDER_MEETINGS})"
+            ),
             rusqlite::params![folder_id],
         )
         .map_err(map_err)?;
@@ -185,9 +189,11 @@ impl Db {
     /// proof — it is the one path that discards sealed content by design (and now provably only the
     /// sealed, unrecoverable part — never a readable never-sealed buffer).
     pub fn discard_folder_seal(&self, folder_id: &str) -> Result<Vec<String>> {
-        // Meetings that belong to THIS folder (folder_id lives on the notes row — the same join the
-        // seal/relock paths use). Documents anchor on the folder row directly.
-        const FOLDER_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1";
+        // Canonically filed meetings plus conservative legacy NULL-canonical note ownership.
+        // Documents anchor on the folder row directly.
+        const FOLDER_MEETINGS: &str = "SELECT id FROM meetings WHERE folder_id=?1
+             UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                    WHERE n.folder_id=?1 AND m.folder_id IS NULL";
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
 
@@ -515,7 +521,11 @@ impl Db {
             // so a re-blanked (sealed) folder never leaves a semantic vector at rest. Resolve the
             // folders' meetings from their note rows (mirrors `meeting_ids_in_folder`).
             let mut mids = tx
-                .prepare("SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1")
+                .prepare(
+                    "SELECT id FROM meetings WHERE folder_id=?1
+                     UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                            WHERE n.folder_id=?1 AND m.folder_id IS NULL",
+                )
                 .map_err(map_err)?;
             let mut meeting_ids: Vec<String> = Vec::new();
             for id in folder_ids {
@@ -670,8 +680,12 @@ impl Db {
     /// recorded so the next startup retries. Mirrors the clean-relock cleanup in
     /// `reblank_folder_extras`.
     pub fn reblank_locked_folders_at_rest(&self) -> Result<LockedAtRestCleanup> {
-        const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
-             WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
+        const LOCKED_MEETINGS: &str = "SELECT m.id AS meeting_id FROM meetings m
+             WHERE m.folder_id IN (SELECT id FROM folders WHERE locked=1)
+             UNION
+             SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+              WHERE m.folder_id IS NULL
+                AND n.folder_id IN (SELECT id FROM folders WHERE locked=1)";
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         #[cfg(debug_assertions)]

@@ -6,6 +6,7 @@ const FOREST = [
   {
     id: "p-acme",
     name: "Acme",
+    kind: "note",
     level: "project",
     emoji: null,
     tint: null,
@@ -13,11 +14,26 @@ const FOREST = [
     unlocked: false,
     isRoot: false,
     folders: [],
-    groups: [],
+    groups: [
+      {
+        kind: "note",
+        total: 1,
+        items: [
+          {
+            kind: "note",
+            id: "n-1",
+            title: "Standup 14 Aug",
+            durationS: null,
+            sortAt: 1,
+          },
+        ],
+      },
+    ],
   },
   {
     id: "p-sealed",
     name: "Clients",
+    kind: "note",
     level: "project",
     emoji: null,
     tint: null,
@@ -34,9 +50,11 @@ const PLAN = {
     {
       noteId: "n-1",
       title: "Standup 14 Aug",
+      fromFolderId: "p-acme",
       fromFolder: "Acme",
       toFolder: "Standups",
       toFolderId: null,
+      reason: "A recurring team sync",
     },
   ],
 };
