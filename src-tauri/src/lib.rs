@@ -16,6 +16,7 @@ pub mod eval;
 pub mod events;
 pub mod export;
 pub mod extract;
+pub mod import;
 pub mod facts;
 mod instance_lock;
 pub mod links;
@@ -218,6 +219,9 @@ pub fn run() {
             commands::delete_companion_note_if_empty,
             commands::import_document,
             commands::import_text,
+            commands::scan_import,
+            commands::run_import,
+            commands::cancel_import,
             commands::brain_overview,
             commands::list_documents,
             commands::get_document,

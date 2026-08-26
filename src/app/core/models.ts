@@ -777,6 +777,66 @@ export interface DocImportProgress {
 }
 
 /**
+ * Progress for a BULK import (Settings -> Imports). Counts only, never a title or a path.
+ * `total` is the page count for the stage in flight, so the bar keeps moving through a
+ * thousand-page workspace instead of freezing after the counting phase.
+ */
+export interface BulkImportProgress {
+  stage: "scanning" | "importing" | "linking" | "done";
+  done: number;
+  total: number;
+}
+
+/**
+ * The DRY-RUN plan for a Notion export: what an import WOULD do. Produced without writing
+ * anything, so the user confirms against real numbers rather than a promise.
+ */
+export interface ImportScanReport {
+  /** Pages that would be imported or updated. */
+  pages: number;
+  /** Of those, how many already exist here (they update in place, never duplicate). */
+  alreadyImported: number;
+  /** Images and other non-page files. Counted and weighed, not imported yet. */
+  attachments: number;
+  attachmentBytes: number;
+  /** Database CSV exports. Not imported yet. */
+  databases: number;
+  /** The `_all.csv` twins Notion ships beside each database view - the same data again. */
+  csvAllDuplicates: number;
+  /** Nested `Export-...-Part-N.zip` archives descended into automatically. */
+  nestedArchives: number;
+  /** Titles occurring more than once in the export. */
+  titleCollisions: string[];
+  /** A few titles for the preview, so the user can confirm this is the right export. */
+  sampleTitles: string[];
+  /** The source exceeded the per-import page cap and the plan was cut short. */
+  truncated: boolean;
+  /**
+   * The chosen Obsidian folder IS the vault Murmur exports to - importing it would read our own
+   * notes back in as copies of themselves.
+   */
+  isMurmurVault: boolean;
+}
+
+/** Where an import reads from. The value is the wire contract with the Rust side. */
+export type ImportSourceId = "notion" | "obsidian" | "apple-notes";
+
+/** What an import actually did. A partial run stays legible instead of silent. */
+export interface ImportReport {
+  imported: number;
+  updated: number;
+  skipped: number;
+  failed: number;
+  /** Up to 20 `title: reason` lines for the failures. */
+  failures: string[];
+  foldersCreated: number;
+  /** The user cancelled: everything already written stays. */
+  cancelled: boolean;
+  /** Vectors were deferred - keyword search works now, semantic search after a Reindex. */
+  embeddingDeferred: boolean;
+}
+
+/**
  * brain2 RAG — result of `reindexEmbeddings()`. Mirrors the backend `ReindexResult`
  * (camelCase). `status` is `"model_missing"` when the real e5 model is absent (no
  * indexing was attempted — the FE nudges the user to download it first), else
