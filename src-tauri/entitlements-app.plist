@@ -35,6 +35,16 @@
     <key>com.apple.security.personal-information.calendars</key>
     <true/>
 
+    <!-- Apple Events automation, required so the Apple Notes importer can drive Notes.app through
+         /usr/bin/osascript (src-tauri/src/import/apple_notes.rs). Under hardened runtime an app with
+         no com.apple.security.automation.apple-events entitlement gets errAEEventNotPermitted (-1743)
+         and never appears under System Settings → Privacy & Security → Automation, so the user has no
+         way to grant it. Paired with NSAppleEventsUsageDescription in src-tauri/Info.plist, which is
+         what the TCC consent prompt shows. MAIN BUNDLE ONLY — the nested Resources/ helpers
+         (meetnotes-*) sign with entitlements.plist and must NOT get this; they send no Apple events. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+
     <!-- Data-protection keychain access group for the biometric KEK + account MK. Authorized by the
          embedded Developer-ID provisioning profile (which grants keychain-access-groups BVF778E5QD.*). -->
     <key>com.apple.application-identifier</key>
