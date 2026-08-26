@@ -139,7 +139,20 @@ if ! codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "keychain-access
   echo "signed app is MISSING the keychain-access-groups entitlement — biometric lock/sharing would fail (and launch may be AMFI-killed)" >&2
   exit 1
 fi
-echo "   verified: embedded profile present + keychain-access-groups entitlement signed in"
+# POST-SIGN ASSERTION: the Apple Notes importer drives Notes.app over Apple events
+# (src-tauri/src/import/apple_notes.rs → /usr/bin/osascript). Under hardened runtime, a bundle
+# without com.apple.security.automation.apple-events gets errAEEventNotPermitted (-1743) and never
+# even appears under System Settings → Privacy & Security → Automation, so the user cannot grant it.
+# Its Info.plist counterpart (NSAppleEventsUsageDescription) is what the TCC prompt renders.
+if ! codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"; then
+  echo "signed app is MISSING the apple-events automation entitlement — Apple Notes import would fail with -1743" >&2
+  exit 1
+fi
+if ! /usr/libexec/PlistBuddy -c "Print :NSAppleEventsUsageDescription" "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+  echo "bundled Info.plist is MISSING NSAppleEventsUsageDescription — the Automation TCC prompt cannot be shown" >&2
+  exit 1
+fi
+echo "   verified: embedded profile present + keychain-access-groups + apple-events entitlement signed in"
 
 echo "3) Building the DMG (with Applications alias)…"
 STAGE="$(mktemp -d)/Murmur"
