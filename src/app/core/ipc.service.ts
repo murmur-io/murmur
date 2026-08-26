@@ -1,4 +1,4 @@
-import { Injectable } from "@angular/core";
+import { Injectable, signal } from "@angular/core";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
@@ -94,6 +94,9 @@ import type {
   NoteTemplateSection,
   OrgAccess,
   OrganizePlan,
+  WorkspaceOrganizeApplyResult,
+  WorkspaceOrganizeMove,
+  WorkspaceOrganizePlan,
   OrgFeedUpdatedPayload,
   OrgItemDetail,
   OrgItemHeader,
@@ -242,6 +245,13 @@ export const EVENT_ASK_HISTORY_INVALIDATED = "murmur://ask-history-invalidated";
  */
 @Injectable({ providedIn: "root" })
 export class IpcService {
+  private readonly _workspaceMutationRevision = signal(0);
+  /**
+   * Content writes that can change the mixed Space hierarchy without going through
+   * `WorkspaceService` bump this revision after backend confirmation. Consumers refetch
+   * canonical SQLite state; no content is mirrored in the signal itself.
+   */
+  readonly workspaceMutationRevision = this._workspaceMutationRevision.asReadonly();
   startRecording(): Promise<StartResult> {
     return invoke<StartResult>("start_recording");
   }
@@ -1145,14 +1155,16 @@ export class IpcService {
    * Generate or refresh this meeting's canonical companion note. Omitting the
    * template id asks the backend to resolve the user's Settings default.
    */
-  convertMeetingToNote(
+  async convertMeetingToNote(
     meetingId: string,
     templateId?: string,
   ): Promise<CompanionAppendResult> {
-    return invoke<CompanionAppendResult>("convert_meeting_to_note", {
+    const result = await invoke<CompanionAppendResult>("convert_meeting_to_note", {
       meetingId,
       ...(templateId ? { templateId } : {}),
     });
+    this._workspaceMutationRevision.update((revision) => revision + 1);
+    return result;
   }
 
   /**
@@ -2982,6 +2994,21 @@ export class IpcService {
    */
   applyOrganizePlan(plan: OrganizePlan): Promise<void> {
     return invoke<void>("apply_organize_plan", { plan });
+  }
+
+  /** Propose where unfiled recordings belong. Nothing moves until apply. */
+  planWorkspaceOrganization(): Promise<WorkspaceOrganizePlan> {
+    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization");
+  }
+
+  /** Apply only the recording moves the user kept selected in the review sheet. */
+  applyWorkspaceOrganization(
+    moves: WorkspaceOrganizeMove[],
+  ): Promise<WorkspaceOrganizeApplyResult> {
+    return invoke<WorkspaceOrganizeApplyResult>(
+      "apply_workspace_organization",
+      { moves },
+    );
   }
 
   // ── Feature C — typed note front-matter properties (folder-level schema +

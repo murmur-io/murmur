@@ -2465,6 +2465,10 @@ pub struct TypeGroup {
 pub struct ContainerNode {
     pub id: String,
     pub name: String,
+    /// Canonical container namespace (`"meeting"` or `"note"`). The frontend uses this only to
+    /// hide creation/move affordances that the command layer would refuse; backend gates remain
+    /// authoritative for every write.
+    pub kind: String,
     /// `"project"` or `"folder"`.
     pub level: String,
     pub emoji: Option<String>,

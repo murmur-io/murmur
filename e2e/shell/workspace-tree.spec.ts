@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
 import { mockTauri } from "../settings-ai/mock-invoke";
 
@@ -17,6 +17,7 @@ const FOREST = [
   {
     id: "p-acme",
     name: "Acme",
+    kind: "meeting",
     level: "project",
     emoji: "🟣",
     tint: null,
@@ -27,6 +28,7 @@ const FOREST = [
       {
         id: "f-q3",
         name: "Q3",
+        kind: "note",
         level: "folder",
         emoji: null,
         tint: null,
@@ -84,6 +86,7 @@ const FOREST = [
   {
     id: "p-private",
     name: "Private",
+    kind: "meeting",
     level: "project",
     emoji: null,
     tint: null,
@@ -95,6 +98,23 @@ const FOREST = [
     folders: [],
     groups: [],
   },
+];
+
+const AUDIT_FOREST = [
+  FOREST[0],
+  ...Array.from({ length: 18 }, (_, index) => ({
+    id: `p-audit-${index + 1}`,
+    name: `Audit Space ${index + 1}`,
+    kind: "meeting",
+    level: "project",
+    emoji: null,
+    tint: null,
+    locked: false,
+    unlocked: false,
+    isRoot: false,
+    folders: [],
+    groups: [],
+  })),
 ];
 
 async function expectMenuItemAtHitPoint(page: Page, itemName: string): Promise<void> {
@@ -121,16 +141,225 @@ async function openWorkspace(page: Page): Promise<void> {
   await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
 }
 
+async function captureAuditScreenshot(
+  page: Page,
+  testInfo: TestInfo,
+  name: string,
+): Promise<void> {
+  const path = testInfo.outputPath(`${name}.png`);
+  await page.screenshot({ path, fullPage: false });
+  await testInfo.attach(name, { path, contentType: "image/png" });
+}
+
+test("audits the complete sidebar at tall and short viewports", async ({ page }, testInfo) => {
+  const runtimeErrors: string[] = [];
+  page.on("pageerror", (error) => runtimeErrors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      runtimeErrors.push(message.text());
+    }
+  });
+  await mockTauri(
+    page,
+    {},
+    {
+      list_workspace_tree: AUDIT_FOREST,
+      list_container_items: { kind: "meeting", items: [], total: 0 },
+    },
+  );
+
+  for (const viewport of [
+    { name: "tall", width: 1440, height: 1000 },
+    { name: "short", width: 1280, height: 480 },
+  ] as const) {
+    await page.setViewportSize(viewport);
+    await page.goto("/meeting/m-standup");
+
+    const sidebar = page.getByRole("complementary", { name: "Spaces sidebar" });
+    const body = sidebar.locator(".context-body");
+    const selected = sidebar.getByRole("treeitem", { name: "Standup" });
+    await expect(sidebar).toBeVisible();
+    await expect(selected).toHaveAttribute("aria-selected", "true");
+    expect(await selected.evaluate((row) => getComputedStyle(row).backgroundColor)).not.toBe(
+      "rgba(0, 0, 0, 0)",
+    );
+
+    const hovered = sidebar.getByRole("treeitem", { name: "Launch brief" });
+    const restingBackground = await hovered.evaluate(
+      (row) => getComputedStyle(row).backgroundColor,
+    );
+    await hovered.hover();
+    await expect
+      .poll(() => hovered.evaluate((row) => getComputedStyle(row).backgroundColor))
+      .not.toBe(restingBackground);
+    await captureAuditScreenshot(
+      page,
+      testInfo,
+      `workspace-sidebar-${viewport.name}-states`,
+    );
+
+    const dimensions = await body.evaluate((element) => ({
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+    }));
+    expect(dimensions.scrollHeight).toBeGreaterThan(dimensions.clientHeight);
+
+    const lastRow = sidebar.getByRole("treeitem", { name: /Audit Space 18/ });
+    await lastRow.scrollIntoViewIfNeeded();
+    await expect(lastRow).toBeVisible();
+    await expect
+      .poll(() =>
+        body.evaluate((element) => ({
+          atBottom:
+            element.scrollTop + element.clientHeight >= element.scrollHeight - 1,
+          scrolled: element.scrollTop > 0,
+        })),
+      )
+      .toEqual({ atBottom: true, scrolled: true });
+
+    const footer = sidebar.getByRole("button", { name: "Collapse Spaces sidebar" });
+    await expect(footer).toBeVisible();
+    await expect
+      .poll(() =>
+        footer.evaluate((element) => {
+          const box = element.getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            box.left + box.width / 2,
+            box.top + box.height / 2,
+          );
+          return hit === element || Boolean(hit && element.contains(hit));
+        }),
+      )
+      .toBe(true);
+
+    await sidebar.getByRole("button", { name: "Actions for Audit Space 18" }).click();
+    await captureAuditScreenshot(
+      page,
+      testInfo,
+      `workspace-sidebar-${viewport.name}-overflow-menu`,
+    );
+    await expectMenuItemAtHitPoint(page, "Rename space");
+    await page.keyboard.press("Escape");
+  }
+
+  expect(runtimeErrors).toEqual([]);
+});
+
 test("keeps both container menus above the following tree rows", async ({ page }) => {
   await openWorkspace(page);
   await page.getByRole("button", { name: "Expand Acme" }).click();
 
   await page.getByRole("button", { name: "Add to Acme" }).click();
-  await expectMenuItemAtHitPoint(page, "New note");
+  await expectMenuItemAtHitPoint(page, "New folder");
+  await expect(
+    page.getByRole("menuitem", { name: "New folder" }).locator("mur-icon"),
+  ).toHaveAttribute("data-icon", "folder-add");
+  await expect(page.getByText("Create in Acme", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByRole("button", { name: "Actions for Acme" }).click();
-  await expectMenuItemAtHitPoint(page, "Rename");
+  await expectMenuItemAtHitPoint(page, "Rename space");
+  await expect(page.getByText("Space actions", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Rename space" }).locator("mur-icon"),
+  ).toHaveAttribute("data-icon", "rename");
+  await expect(
+    page.getByRole("menuitem", { name: "Delete space" }).locator("mur-icon"),
+  ).toHaveAttribute("data-icon", "trash");
+});
+
+test("paints a row menu opaque on its first rendered frame", async ({ page }) => {
+  await openWorkspace(page);
+
+  const trigger = page.getByRole("button", { name: "Actions for Acme" });
+  const firstFrame = await trigger.evaluate(async (button) => {
+    button.click();
+    await Promise.resolve();
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    const host = button.closest<HTMLElement>("mur-row-menu");
+    const panel = host?.querySelector<HTMLElement>("[role='menu']") ?? null;
+    if (!host || !panel) {
+      return null;
+    }
+    const background = getComputedStyle(panel).backgroundColor;
+    const channels = background.match(/[\d.]+/g)?.map(Number) ?? [];
+    return {
+      hostOpacity: Number(getComputedStyle(host).opacity),
+      panelOpacity: Number(getComputedStyle(panel).opacity),
+      backgroundAlpha: channels.length === 4 ? channels[3] : 1,
+    };
+  });
+
+  expect(firstFrame).toEqual({
+    hostOpacity: 1,
+    panelOpacity: 1,
+    backgroundAlpha: 1,
+  });
+});
+
+test("rename and delete use explicit contextual confirmation instead of native prompts", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      rename_folder: (args: unknown) => {
+        const target = window as unknown as { __renames?: unknown[] };
+        (target.__renames ??= []).push(args);
+        return {
+          id: "p-acme",
+          name: "Acme Studio",
+          path: "Acme Studio",
+          parentId: null,
+          noteCount: 0,
+          locked: false,
+          unlocked: false,
+          kind: "meeting",
+        };
+      },
+      delete_folder: (args: unknown) => {
+        const target = window as unknown as { __deletes?: unknown[] };
+        (target.__deletes ??= []).push(args);
+        return null;
+      },
+    },
+    { list_workspace_tree: FOREST },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
+
+  await page.getByRole("button", { name: "Actions for Acme" }).click();
+  await page.getByRole("menuitem", { name: "Rename space" }).click();
+  const rename = page.getByRole("dialog", { name: "Rename space Acme" });
+  await expect(rename).toBeVisible();
+  await rename.getByLabel("Name").fill("Acme Studio");
+  await rename.getByRole("button", { name: "Rename", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => (window as unknown as { __renames?: unknown[] }).__renames ?? [],
+      ),
+    )
+    .toEqual([{ folderId: "p-acme", newName: "Acme Studio" }]);
+
+  await page.getByRole("button", { name: "Actions for Acme" }).click();
+  await page.getByRole("menuitem", { name: "Delete space" }).click();
+  const remove = page.getByRole("dialog", { name: "Delete space Acme" });
+  await expect(remove).toContainText("Its items are kept and moved out");
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __deletes?: unknown[] }).__deletes ?? [],
+    ),
+  ).toEqual([]);
+  await remove.getByRole("button", { name: "Delete space" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => (window as unknown as { __deletes?: unknown[] }).__deletes ?? [],
+      ),
+    )
+    .toEqual([{ folderId: "p-acme" }]);
 });
 
 test("shows unfiled recordings as a real inbox and opens the complete meetings list", async ({
@@ -192,14 +421,24 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
     "Unfiled recording 5",
   ]);
   const moveNewest = page.getByRole("button", {
-    name: "Move Unfiled recording 12",
+    name: "Move recording “Unfiled recording 12”",
   });
   await expect(moveNewest).toBeVisible();
   await moveNewest.click();
-  await expect(page.getByRole("menuitem", { name: "Acme", exact: true })).toBeVisible();
+  await expect(
+    page
+      .getByRole("dialog", { name: "Move recording “Unfiled recording 12”" })
+      .getByRole("button", { name: "Move to Acme" }),
+  ).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByRole("button", { name: "Collapse Unfiled recordings" }).click();
+  await expect(unfiledRows).toHaveCount(0);
+  expect(
+    await page.evaluate(() => localStorage.getItem("murmur.workspace.unfiledExpanded")),
+  ).toBe("false");
+  await page.reload();
+  await page.getByRole("button", { name: "Spaces" }).click();
   await expect(unfiledRows).toHaveCount(0);
   await page.getByRole("button", { name: "Expand Unfiled recordings" }).click();
   await expect(unfiledRows).toHaveCount(8);
@@ -404,6 +643,7 @@ test("treats a sealed container as an intrinsic leaf even when a stale payload i
         {
           id: "p-sealed-stale",
           name: "Private",
+          kind: "meeting",
           level: "project",
           emoji: "🔒",
           tint: "violet",
@@ -414,6 +654,7 @@ test("treats a sealed container as an intrinsic leaf even when a stale payload i
             {
               id: "f-secret",
               name: "Secret child",
+              kind: "meeting",
               level: "folder",
               emoji: null,
               tint: null,
@@ -473,6 +714,7 @@ test("scrubs cached hierarchy titles when relock succeeds even if every refresh 
           {
             id: "p-private",
             name: "Private",
+            kind: "meeting",
             level: "project",
             emoji: null,
             tint: null,

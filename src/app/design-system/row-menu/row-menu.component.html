@@ -33,7 +33,14 @@
   <!-- The global `.menu` primitive (design-system/primitives.css) — the SAME
        opaque `--surface-overlay` panel the note editor's own `⋯` menu uses
        (T3: never the frosted `.card`). Items are entirely content-projected. -->
-  <div class="menu row-menu-panel" role="menu" [attr.aria-label]="label()">
+  <div
+    #panel
+    class="menu row-menu-panel"
+    [class.opens-above]="opensAbove()"
+    [style.max-height.px]="panelMaxHeight()"
+    role="menu"
+    [attr.aria-label]="label()"
+  >
     <ng-content />
   </div>
 }

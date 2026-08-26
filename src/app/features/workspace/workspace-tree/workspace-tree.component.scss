@@ -2,6 +2,14 @@
   display: block;
 }
 
+/* Teleported modal wrapper: escape the sidebar's backdrop-filter containing
+   block and raise every hierarchy overlay above all shell chrome. */
+.workspace-overlay-host {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+}
+
 .tree-state,
 .tree-error {
   margin: 0;
@@ -21,6 +29,12 @@
   /* The rail scrolls vertically; a row wider than it would put its trailing control
      outside the scroll box, where a click lands on the rail instead of the button. */
   min-width: 0;
+}
+
+/* The fixed header and independently scrolling tree meet at a hard seam. Snap
+   direct rows there so a stopped scroll never leaves half a row clipped. */
+.tree > * {
+  scroll-snap-align: start;
 }
 
 mur-tree-row {
@@ -122,8 +136,15 @@ mur-tree-row:has(mur-row-menu.is-open) {
 
    So they stay laid out and clickable at all times, and only their emphasis changes. */
 .row-add,
-.row-actions {
+.row-actions,
+.row-move-trigger {
   margin-left: auto;
+}
+
+/* `mur-row-menu` owns the muted trigger internally. Keep its HOST fully opaque: applying opacity
+   here also fades the absolutely-positioned dropdown and lets tree text bleed through its first
+   WebKit frame. The standalone move button has no floating descendant, so it can fade as a unit. */
+.row-move-trigger {
   opacity: 0.45;
   transition: opacity var(--transition-fast);
 }
@@ -132,13 +153,34 @@ mur-tree-row:has(mur-row-menu.is-open) {
   margin-left: 0;
 }
 
-mur-tree-row:hover .row-add,
-mur-tree-row:focus-within .row-add,
-mur-tree-row:hover .row-actions,
-mur-tree-row:focus-within .row-actions,
-.row-add:hover,
-.row-add:focus-within,
-.row-actions:hover,
-.row-actions:focus-within {
+.row-move-trigger {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.row-move-trigger:hover {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+
+.row-move-trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+  opacity: 1;
+}
+
+mur-tree-row:hover .row-move-trigger,
+mur-tree-row:focus-within .row-move-trigger,
+.row-move-trigger:hover,
+.row-move-trigger:focus-visible {
   opacity: 1;
 }
