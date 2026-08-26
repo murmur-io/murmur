@@ -1188,8 +1188,13 @@ pub fn execute_tool(
                 .join("\n"))
         }
         ToolCall::ListDashboards => {
+            // GATED, on exactly the terms `commands/dashboards.rs::list_dashboards_inner` uses.
+            // This arm used to call the raw `db.list_dashboards()`, so a board filed in a sealed
+            // folder shipped its plaintext title — and its tile count and kinds — to the agent
+            // surface while the UI correctly withheld all three. Two gates for one fact drifted
+            // apart; this one now reads through the same masking query.
             let boards = db
-                .list_dashboards()
+                .list_dashboards_visible(unlocked)
                 .map_err(|e| AppError::Storage(format!("dashboard list failed: {e}")))?;
             if boards.is_empty() {
                 return Ok("No dashboards yet.".to_string());
@@ -1200,6 +1205,13 @@ pub fn execute_tool(
             Ok(boards
                 .iter()
                 .map(|b| {
+                    // A sealed board discloses NO tiles — not their number and not their kinds.
+                    // `list_dashboards_visible` masks the row, but `dashboard_tile_kinds` is a
+                    // SEPARATE ungated read, so masking the row alone still shipped "this locked
+                    // board is built from three meetings and a note".
+                    if b.locked {
+                        return format!("- {} · id:{} · tiles:0 · kinds:none", b.title, b.id);
+                    }
                     let mut tile_kinds: Vec<&str> = kinds
                         .iter()
                         .filter(|(board_id, _, _)| board_id == &b.id)
@@ -1223,12 +1235,20 @@ pub fn execute_tool(
                 .join("\n"))
         }
         ToolCall::GetDashboard { dashboard_id } => {
+            // GATED, mirroring `commands/dashboards.rs::get_dashboard_inner`. The raw
+            // `db.get_dashboard()` this used to call returned the plaintext title of a board in a
+            // sealed folder, and then enumerated its tile ROWS — disclosing the board's shape
+            // (how many tiles, laid out how) even though each tile's CONTENT was redacted by
+            // `resolve_tile`. Shape is one of the easier things to recognise a board by.
             let Some(board) = db
-                .get_dashboard(dashboard_id)
+                .get_dashboard_visible(dashboard_id, unlocked)
                 .map_err(|e| AppError::Storage(format!("dashboard read failed: {e}")))?
             else {
                 return Ok(format!("No dashboard with id {dashboard_id}."));
             };
+            if board.locked {
+                return Ok(format!("# {} (dashboard)\n(no tiles yet)", board.title));
+            }
             let tiles = db
                 .list_dashboard_tile_structures(dashboard_id)
                 .map_err(|e| AppError::Storage(format!("dashboard tiles failed: {e}")))?;
@@ -3927,6 +3947,108 @@ mod tests {
         assert!(
             matches!(reminder, Err(AppError::InvalidArg(_))),
             "durable Ask must refuse create_reminder before external write: {reminder:?}"
+        );
+    }
+
+    /// THE BOARD-LEVEL AGENT LEAK ORACLE (regression for the 2.0 audit finding).
+    ///
+    /// The sibling oracle below covers a sealed TILE. This one covers the sealed BOARD, which is a
+    /// different gate and was missing entirely: `ListDashboards`/`GetDashboard` called the raw
+    /// `db.list_dashboards()` / `db.get_dashboard()` while `commands/dashboards.rs` called the
+    /// `_visible` pair. Two gates for one fact, and only one of them was applied — so a board
+    /// filed in a sealed folder shipped its plaintext TITLE, its tile COUNT and its tile KINDS to
+    /// any MCP client, while the UI correctly withheld all three.
+    ///
+    /// The fixture is the crash-window shape deliberately: a board created while the folder was
+    /// session-unlocked, then the process dies before a relock can seal it. Its `title` column is
+    /// still plaintext and the folder is `locked = 1` and NOT in the session unlock set — so this
+    /// asserts the READ gate holds even when the at-rest seal did not finish. Content redaction
+    /// must never depend on the plaintext having already been blanked.
+    #[test]
+    fn dashboard_tools_withhold_a_sealed_board_from_agents() {
+        use crate::storage::models::Folder;
+        let db = tmp_db();
+        db.insert_folder(&Folder {
+            id: "f-sealed".to_string(),
+            name: "Legal".to_string(),
+            path: "Legal".to_string(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-08-01T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_dashboard_in_folder(
+            "b1",
+            "Q3 layoffs",
+            None,
+            None,
+            Some("f-sealed"),
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+        db.insert_dashboard_tile(
+            "t1",
+            "b1",
+            "meeting",
+            Some("m-x"),
+            None,
+            4,
+            None,
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+        db.insert_dashboard_tile(
+            "t2",
+            "b1",
+            "note",
+            Some("n-x"),
+            None,
+            4,
+            None,
+            "2026-08-03T10:00:00Z",
+        )
+        .unwrap();
+
+        let cfg = AppConfig::default();
+        let nothing_unlocked = HashSet::new();
+
+        let listed = execute_tool(&ToolCall::ListDashboards, &db, &nothing_unlocked, &cfg).unwrap();
+        assert!(
+            !listed.contains("Q3 layoffs"),
+            "sealed board title reached the agent surface: {listed}"
+        );
+        // Shape is a fact about sealed content too: "built from two things, a meeting and a note"
+        // is enough to recognise a board by.
+        assert!(
+            !listed.contains("tiles:2") && !listed.contains("meeting"),
+            "sealed board tile shape reached the agent surface: {listed}"
+        );
+
+        let detail = execute_tool(
+            &ToolCall::GetDashboard {
+                dashboard_id: "b1".to_string(),
+            },
+            &db,
+            &nothing_unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !detail.contains("Q3 layoffs"),
+            "sealed board title reached the agent surface via get_dashboard: {detail}"
+        );
+        assert!(
+            !detail.contains("m-x") && !detail.contains("n-x"),
+            "sealed board tile refs reached the agent surface: {detail}"
+        );
+
+        // CONTROL — the same board in an OPEN folder must still be fully readable, so the oracle
+        // cannot go vacuous by masking everything unconditionally.
+        let unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+        let open = execute_tool(&ToolCall::ListDashboards, &db, &unlocked, &cfg).unwrap();
+        assert!(
+            open.contains("Q3 layoffs") && open.contains("tiles:2"),
+            "control failed — an unlocked board must still be listed in full: {open}"
         );
     }
 
