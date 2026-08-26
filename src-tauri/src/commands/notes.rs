@@ -64,10 +64,9 @@ pub(crate) fn create_note_inner(
     // idempotent + never locked.
     let folder_id = match folder_id {
         Some(f) if !f.is_empty() => {
-            // Must be a NOTE folder — never create a note inside a meeting folder.
-            if state.db.note_folder_by_id(f)?.is_none() {
-                return Err(AppError::InvalidArg(format!("no note folder {f}")));
-            }
+            // The unified hierarchy is mixed-content: any renderable user Space/folder accepts an
+            // authored note. The shared target oracle excludes machine-owned containers.
+            ensure_meeting_folder_target(&state.db, Some(f))?;
             f.to_string()
         }
         _ => state.db.ensure_notes_root()?,
@@ -661,14 +660,10 @@ pub(crate) fn move_note_doc_inner(
             format!("no note {id}"),
         )));
     };
-    // Target must be a NOTE folder and be unlocked (never land plaintext behind a lock). We do not
+    // Target must be a renderable user Space/folder and be unlocked (never land plaintext behind a
+    // lock). We do not
     // support sealing-on-move into a locked note-folder in WP0 — refuse (the FE unlocks first).
-    if state.db.note_folder_by_id(folder_id)?.is_none() {
-        return Err(AppError::InvalidArg(crate::errcode::tag(
-            crate::errcode::NOTE_FOLDER_MISSING,
-            format!("no note folder {folder_id}"),
-        )));
-    }
+    ensure_meeting_folder_target(&state.db, Some(folder_id))?;
     if !folder_is_unlocked(state, folder_id)? {
         return Err(AppError::Locked(crate::errcode::tag(
             crate::errcode::FOLDER_LOCKED,
@@ -1066,9 +1061,8 @@ pub(crate) fn list_notes_typed_inner(
     state.db.list_notes_visible_typed(folder_id, &unlocked)
 }
 
-/// Create a note-folder (`kind='note'`). `parent_id` must itself be a note-folder (or None = a
-/// root note-folder). Path is rooted under the default "Notes" tree so it can't collide with a
-/// meeting-folder path. Mirrors [`create_folder`] but stamps kind='note'.
+/// Create a note-capable folder (`kind='note'`). An explicit parent may be any renderable user
+/// Space/folder in the unified hierarchy; `None` retains the legacy Notes-root default.
 #[tauri::command]
 pub fn create_note_folder(
     state: State<'_, AppState>,
@@ -1105,10 +1099,11 @@ pub(crate) fn create_note_folder_inner(
         Some(pid) => pid.to_string(),
         None => state.db.ensure_notes_root()?,
     };
+    ensure_meeting_folder_target(&state.db, Some(&parent_id_owned))?;
     let parent = state
         .db
-        .note_folder_by_id(&parent_id_owned)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no parent note folder {parent_id_owned}")))?;
+        .folder_by_id(&parent_id_owned)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no parent container {parent_id_owned}")))?;
     // One gate for both, so an explicit and a defaulted parent cannot be governed by different rules.
     let parent_seal = container_parent_seal(state, &parent_id_owned)?;
     // An empty parent path is the vault root (the workspace project's own path), so

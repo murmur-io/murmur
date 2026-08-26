@@ -3814,8 +3814,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Put `id` into a LOCKED folder — folder membership rides the meeting's NOTE row
-    /// (`folder_for_meeting` reads `notes.folder_id`), so a note row is required.
+    /// Put `id` into a LOCKED canonical meeting folder and keep its provider note synchronized.
     fn file_into_locked_folder(db: &Db, id: &str, folder_id: &str) {
         db.insert_folder(&crate::storage::Folder {
             id: folder_id.into(),

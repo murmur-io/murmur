@@ -1,0 +1,102 @@
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 110;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: var(--scrim);
+}
+
+.sheet {
+  display: flex;
+  width: min(28rem, 100%);
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.sheet-head,
+.sheet-actions {
+  display: flex;
+}
+
+.sheet-head {
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.sheet-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-7);
+  height: var(--space-7);
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--radius-md);
+}
+
+.sheet-head.is-danger .sheet-mark {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+h3,
+p {
+  margin: 0;
+}
+
+h3 {
+  color: var(--text-primary);
+  font-size: 1.05rem;
+  text-transform: capitalize;
+}
+
+.sheet-head p {
+  margin-top: var(--space-1);
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+label {
+  margin-bottom: calc(-1 * var(--space-3));
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+input {
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  color: var(--text-primary);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  outline: 0;
+  font: inherit;
+}
+
+input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.manage-error {
+  padding: var(--space-2) var(--space-3);
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+  font-size: 0.8rem;
+}
+
+.sheet-actions {
+  justify-content: flex-end;
+  gap: var(--space-2);
+}

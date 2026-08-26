@@ -41,15 +41,37 @@ export async function mockTauri(
   heldRejectedEventListenerOrdinals: Record<string, number[]> = {},
 ): Promise<void> {
   await page.addInitScript({ path: BASE_MOCK });
+  // `org_list_statuses` is the explicit/live fixture name used by older org
+  // specs. Passive viewers now use the local-only cached command; unless a
+  // test distinguishes them deliberately, mirror the same fixture into that
+  // command so the test keeps describing one local org roster.
+  const normalizedOverrides = { ...overrides };
+  const normalizedConstants = { ...constants };
+  if (
+    normalizedOverrides["org_list_statuses"] &&
+    !normalizedOverrides["org_list_cached_statuses"] &&
+    !("org_list_cached_statuses" in normalizedConstants)
+  ) {
+    normalizedOverrides["org_list_cached_statuses"] =
+      normalizedOverrides["org_list_statuses"];
+  }
+  if (
+    "org_list_statuses" in normalizedConstants &&
+    !("org_list_cached_statuses" in normalizedConstants) &&
+    !normalizedOverrides["org_list_cached_statuses"]
+  ) {
+    normalizedConstants["org_list_cached_statuses"] =
+      normalizedConstants["org_list_statuses"];
+  }
   const serialized = {
     ...Object.fromEntries(
-      Object.entries(constants).map(([k, v]) => [
+      Object.entries(normalizedConstants).map(([k, v]) => [
         k,
         `() => (${JSON.stringify(v)})`,
       ]),
     ),
     ...Object.fromEntries(
-      Object.entries(overrides).map(([k, v]) => [k, v.toString()]),
+      Object.entries(normalizedOverrides).map(([k, v]) => [k, v.toString()]),
     ),
   };
   await page.addInitScript(
@@ -115,7 +137,10 @@ export async function mockTauri(
           ),
         };
       };
-      const rememberAskSourceTitles = (cmd: string, value: unknown): unknown => {
+      const rememberAskSourceTitles = (
+        cmd: string,
+        value: unknown,
+      ): unknown => {
         const remember = (
           window as unknown as {
             __demoRememberAskSourceTitles?: (
@@ -167,8 +192,9 @@ export async function mockTauri(
           value &&
           "meeting" in value
         ) {
-          const meeting = (value as { meeting?: { id?: unknown; title?: unknown } })
-            .meeting;
+          const meeting = (
+            value as { meeting?: { id?: unknown; title?: unknown } }
+          ).meeting;
           if (
             meeting &&
             typeof meeting.id === "string" &&

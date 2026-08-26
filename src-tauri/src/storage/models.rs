@@ -266,7 +266,7 @@ pub struct Meeting {
     pub audio_path: Option<String>,
     pub status: MeetingStatus,
     /// Owning folder id (from the meeting's note rows), or `None` when at the vault root.
-    /// Derived from `notes.folder_id` — a meeting's folder = its note's folder.
+    /// Canonical user-container placement. Legacy rows are conservatively backfilled from notes.
     pub folder_id: Option<String>,
 }
 
@@ -780,6 +780,16 @@ pub struct OrgItemDetail {
     pub access: String,
     pub can_edit: bool,
     pub can_manage: bool,
+}
+
+/// Result of copying a received Shared Brain snapshot into the user's local hierarchy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgItemImportResult {
+    /// Corresponding local kind: `note` for an org document, `meeting` for an org meeting shell.
+    pub kind: String,
+    /// Local authored-note id or local meeting id.
+    pub id: String,
 }
 
 /// Internal edit/management context for a live org item. It preserves immutable envelope provenance
@@ -2465,6 +2475,10 @@ pub struct TypeGroup {
 pub struct ContainerNode {
     pub id: String,
     pub name: String,
+    /// Canonical container namespace (`"meeting"` or `"note"`). The frontend uses this only to
+    /// hide creation/move affordances that the command layer would refuse; backend gates remain
+    /// authoritative for every write.
+    pub kind: String,
     /// `"project"` or `"folder"`.
     pub level: String,
     pub emoji: Option<String>,

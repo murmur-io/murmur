@@ -1145,13 +1145,16 @@ impl Db {
                 "SELECT meeting_id FROM (
                      SELECT rg.meeting_id AS meeting_id
                        FROM recording_generations rg
-                       JOIN notes n ON n.meeting_id=rg.meeting_id
-                      WHERE n.folder_id=?1 AND rg.state!='RETIRED'
+                       JOIN meetings m ON m.id=rg.meeting_id
+                      WHERE (m.folder_id=?1 OR (m.folder_id IS NULL AND EXISTS(
+                              SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=?1)))
+                        AND rg.state!='RETIRED'
                      UNION
                      SELECT lr.meeting_id AS meeting_id
                        FROM legacy_recording_recovery lr
-                       JOIN notes n ON n.meeting_id=lr.meeting_id
-                      WHERE n.folder_id=?1
+                       JOIN meetings m ON m.id=lr.meeting_id
+                      WHERE m.folder_id=?1 OR (m.folder_id IS NULL AND EXISTS(
+                              SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=?1))
                  ) ORDER BY meeting_id",
             )
             .map_err(map_err)?;
@@ -1186,12 +1189,16 @@ impl Db {
                   WHERE rg.state!='RETIRED'
                     AND rg.recovery_blocked=0
                     AND rg.lease_expires_at_ms<=?1
-                    AND EXISTS(SELECT 1 FROM meetings m WHERE m.id=rg.meeting_id)
-                    AND NOT EXISTS(
-                        SELECT 1
-                          FROM notes n
-                          JOIN folders f ON f.id=n.folder_id
-                         WHERE n.meeting_id=rg.meeting_id AND f.locked=1
+                    AND EXISTS(
+                        SELECT 1 FROM meetings m WHERE m.id=rg.meeting_id AND (
+                          (m.folder_id IS NOT NULL AND EXISTS(
+                            SELECT 1 FROM folders f WHERE f.id=m.folder_id AND f.locked=0
+                          )) OR (m.folder_id IS NULL AND NOT EXISTS(
+                            SELECT 1 FROM notes n LEFT JOIN folders f ON f.id=n.folder_id
+                             WHERE n.meeting_id=m.id AND n.folder_id IS NOT NULL
+                               AND (f.id IS NULL OR f.locked=1)
+                          ))
+                        )
                     )
                   ORDER BY rg.created_at_ms ASC, rg.generation_id ASC LIMIT 1",
                 [now_ms],
@@ -1343,13 +1350,17 @@ impl Db {
     pub(crate) fn recording_recovery_owner_is_open(&self, meeting_id: &str) -> Result<bool> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM meetings WHERE id=?1)
-                    AND NOT EXISTS(
-                        SELECT 1
-                          FROM notes n
-                          JOIN folders f ON f.id=n.folder_id
-                         WHERE n.meeting_id=?1 AND f.locked=1
-                    )",
+            "SELECT EXISTS(
+                 SELECT 1 FROM meetings m WHERE m.id=?1 AND (
+                   (m.folder_id IS NOT NULL AND EXISTS(
+                     SELECT 1 FROM folders f WHERE f.id=m.folder_id AND f.locked=0
+                   )) OR (m.folder_id IS NULL AND NOT EXISTS(
+                     SELECT 1 FROM notes n LEFT JOIN folders f ON f.id=n.folder_id
+                      WHERE n.meeting_id=m.id AND n.folder_id IS NOT NULL
+                        AND (f.id IS NULL OR f.locked=1)
+                   ))
+                 )
+             )",
             [meeting_id],
             |row| row.get(0),
         )
@@ -1378,10 +1389,15 @@ impl Db {
         let locked: bool = tx
             .query_row(
                 "SELECT EXISTS(
-                     SELECT 1
-                       FROM notes n
-                       JOIN folders f ON f.id=n.folder_id
-                      WHERE n.meeting_id=?1 AND f.locked=1
+                     SELECT 1 FROM meetings m WHERE m.id=?1 AND NOT (
+                       (m.folder_id IS NOT NULL AND EXISTS(
+                         SELECT 1 FROM folders f WHERE f.id=m.folder_id AND f.locked=0
+                       )) OR (m.folder_id IS NULL AND NOT EXISTS(
+                         SELECT 1 FROM notes n LEFT JOIN folders f ON f.id=n.folder_id
+                          WHERE n.meeting_id=m.id AND n.folder_id IS NOT NULL
+                            AND (f.id IS NULL OR f.locked=1)
+                       ))
+                     )
                  )",
                 [meeting_id],
                 |row| row.get(0),
@@ -1462,14 +1478,17 @@ impl Db {
         conn.query_row(
             "SELECT EXISTS(
                  SELECT 1
-                   FROM notes n
-                  WHERE n.folder_id=?1 AND (
+                   FROM meetings m
+                  WHERE (m.folder_id=?1 OR (m.folder_id IS NULL AND EXISTS(
+                           SELECT 1 FROM notes n
+                            WHERE n.meeting_id=m.id AND n.folder_id=?1
+                         ))) AND (
                         EXISTS(
                             SELECT 1 FROM recording_generations rg
-                             WHERE rg.meeting_id=n.meeting_id AND rg.state!='RETIRED'
+                             WHERE rg.meeting_id=m.id AND rg.state!='RETIRED'
                         ) OR EXISTS(
                             SELECT 1 FROM legacy_recording_recovery lr
-                             WHERE lr.meeting_id=n.meeting_id
+                             WHERE lr.meeting_id=m.id
                         )
                   )
              )",
@@ -2012,18 +2031,7 @@ mod tests {
             created_at: "2026-07-22T12:00:00Z".into(),
         })
         .unwrap();
-        db.upsert_note(&NoteRecord {
-            meeting_id: locked_meeting.clone(),
-            provider_id: "test".into(),
-            markdown: "durable".into(),
-            created_at: "2026-07-22T12:00:01Z".into(),
-            exported_path: None,
-            model_requested: None,
-            model_served: None,
-            gateway_host: None,
-        })
-        .unwrap();
-        db.set_note_folder(&locked_meeting, Some(&folder_id))
+        db.set_meeting_folder(&locked_meeting, Some(&folder_id))
             .unwrap();
         let (locked_key, _) = prepare(&db, &clock, &locked_meeting);
 
@@ -2345,18 +2353,7 @@ mod tests {
             created_at: "2026-07-22T12:00:00Z".into(),
         })
         .unwrap();
-        db.upsert_note(&NoteRecord {
-            meeting_id: meeting.clone(),
-            provider_id: "test".into(),
-            markdown: "durable".into(),
-            created_at: "2026-07-22T12:00:01Z".into(),
-            exported_path: None,
-            model_requested: None,
-            model_served: None,
-            gateway_host: None,
-        })
-        .unwrap();
-        db.set_note_folder(&meeting, Some(&folder_id)).unwrap();
+        db.set_meeting_folder(&meeting, Some(&folder_id)).unwrap();
         assert!(!db
             .folder_has_nonterminal_recording_generation(&folder_id)
             .unwrap());
@@ -2385,20 +2382,15 @@ mod tests {
             created_at: "2026-07-22T12:00:00Z".into(),
         })
         .unwrap();
-        db.upsert_note(&NoteRecord {
-            meeting_id: meeting.clone(),
-            provider_id: "test".into(),
-            markdown: "durable".into(),
-            created_at: "2026-07-22T12:00:01Z".into(),
-            exported_path: None,
-            model_requested: None,
-            model_served: None,
-            gateway_host: None,
-        })
-        .unwrap();
-        db.set_note_folder(&meeting, Some(&folder_id)).unwrap();
+        db.set_meeting_folder(&meeting, Some(&folder_id)).unwrap();
+        db.set_folder_locked(&folder_id, true, Some(b"wrapped"))
+            .unwrap();
 
-        assert!(!db.mark_legacy_recording_recovery_pending(&meeting).unwrap());
+        assert!(
+            db.mark_legacy_recording_recovery_pending(&meeting)
+                .unwrap(),
+            "canonical pre-note placement must report the locked recovery owner"
+        );
 
         assert!(db
             .folder_has_nonterminal_recording_generation(&folder_id)
