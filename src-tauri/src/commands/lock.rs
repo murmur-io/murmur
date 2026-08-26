@@ -51,9 +51,16 @@ use super::*;
 /// the per-container key separation that lets a single folder be unlocked on its own is untouched.
 /// One MCP revocation, held by the caller, covers the whole cascade.
 ///
-/// A container that is ALREADY sealed is skipped rather than re-sealed: locking a project with one
-/// folder already locked is an ordinary thing to do, and re-minting that folder's key would orphan
-/// the ciphertext already written under the old one.
+/// A container that is ALREADY sealed is not RE-KEYED: locking a project with one folder already
+/// locked is an ordinary thing to do, and re-minting that folder's key would orphan the ciphertext
+/// already written under the old one. It is still driven through the ordinary per-container path,
+/// whose already-locked branch is an idempotent repair tail — it bumps the seal epoch, revokes
+/// renderer visibility, drops the folder from the SESSION unlock set and repairs plaintext at rest.
+///
+/// Skipping that tail with a bare `continue` was a leak: a descendant the user had session-unlocked
+/// stayed in `state.unlocked_folders` after its parent project was locked, so every gated reader
+/// — the tree, search, MCP — kept admitting its rows while the UI said the project was sealed.
+/// `locked = 1` is the durable seal JOURNAL, not proof the session-authority cleanup ever ran.
 pub(crate) fn lock_container_subtree(
     state: &AppState,
     folder_id: &str,
@@ -70,13 +77,9 @@ pub(crate) fn lock_container_subtree(
         if id == folder_id {
             continue; // the target is sealed last, below, so its notice fires once at the end.
         }
-        if state
-            .db
-            .folder_by_id(&id)?
-            .is_some_and(|folder| folder.locked)
-        {
-            continue;
-        }
+        // An already-locked descendant is NOT skipped — see this function's doc comment. The
+        // per-container path detects `folder.locked` itself and replays only its idempotent,
+        // non-keyed repair tail, so the existing content key is never re-minted.
         lock_folder_inner_with_visibility_notice_policy(
             state,
             id,
@@ -1169,65 +1172,113 @@ pub fn relock_folder(
         &app,
         crate::mcp::VisibilityRevokingEntrypoint::RelockFolder,
     );
+    relock_folder_inner_with_visibility_notice(state.inner(), &folder_id, || {
+        // Epoch + session membership now authoritatively hide these folders. New MCP responses may
+        // be admitted against that post-revocation snapshot while physical cleanup continues.
+        crate::mcp::finish_visibility_revocation(mcp_revocation);
+        // Emitted while the lifecycle guard is still held. The FE discards cached titles
+        // synchronously; its canonical refresh cannot pass the same guard until physical reblank
+        // has completed.
+        emit_reminder_visibility_invalidated_fail_closed(&app);
+    })?;
+    // The relock purged ALL pending audit findings — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
+    Ok(())
+}
+
+/// The relock cascade itself, with no `AppHandle` — so it is reachable from tests, exactly like its
+/// sibling [`relock_all_inner_with_visibility_notice`].
+///
+/// `visibility_revoked` runs at the ONE point where the folders have been dropped from the session
+/// unlock set and the seal epoch has advanced, but physical cleanup has not started. That ordering
+/// is load-bearing for screen-share relock: gated readers must be shut out before any fallible
+/// filesystem work, and a later failure must not re-open them.
+pub(crate) fn relock_folder_inner_with_visibility_notice(
+    state: &AppState,
+    folder_id: &str,
+    visibility_revoked: impl FnOnce(),
+) -> Result<(), AppError> {
     // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
     // `remove_lock` is mid-restoring).
-    let _lifecycle = lifecycle_guard(state.inner());
-    if !folder_is_unlocked(state.inner(), &folder_id)? {
+    let _lifecycle = lifecycle_guard(state);
+    if !folder_is_unlocked(state, folder_id)? {
         return Err(AppError::Locked(
             "folder visibility changed before relock preparation".into(),
         ));
     }
-    // Verify EVERY non-empty plaintext family before deleting an export or blanking the first DB
-    // column. Retained blobs must match byte-identically; missing blobs are encrypt+verified into an
-    // immutable repair plan. The lifecycle guard prevents either side changing afterward.
-    let verified = verify_relock_retained_blobs(state.inner(), &folder_id)?;
+    // CASCADE, because `unlock_folder` cascades. Unlocking a container opens its whole subtree
+    // (`preflight_unlock_subtree` + the primary restore's descent into locked descendants), so a
+    // relock that closed only the target left every descendant the unlock had opened still in the
+    // session unlock set — "Lock again" on a project reported sealed while its folders stayed
+    // readable through every gated reader. An asymmetric open/close pair is a leak by construction.
+    //
+    // Deepest-first, matching `lock_container_subtree`. Only SESSION-UNLOCKED containers are
+    // targets: a descendant that was never opened has nothing to re-blank, and `relock` is a
+    // session operation — it does not change any durable `locked` bit.
+    let targets: Vec<String> = container_subtree_deepest_first(state, folder_id)?
+        .into_iter()
+        .filter(|id| folder_is_unlocked(state, id).unwrap_or(false))
+        .collect();
+    // Verify EVERY non-empty plaintext family, for EVERY target, before deleting an export or
+    // blanking the first DB column. Retained blobs must match byte-identically; missing blobs are
+    // encrypt+verified into an immutable repair plan. The lifecycle guard prevents either side
+    // changing afterward. This whole pass is read-only, so a refusal anywhere leaves the entire
+    // subtree exactly as it was — that is why it runs before the destructive export pass below.
+    let mut verified_plans: Vec<(String, VerifiedRelockPlan)> = Vec::with_capacity(targets.len());
+    for id in &targets {
+        verified_plans.push((id.clone(), verify_relock_retained_blobs(state, id)?));
+    }
     // Remove every managed plaintext export before revoking visibility. A user-modified export or
     // collision sibling fails here while the folder is still open, never after `locked` is visible.
-    prepare_folder_exports_before_relock(state.inner(), &folder_id)?;
-    // R7: advance the seal epoch at ENTRY — see `bump_seal_epoch`.
-    bump_seal_epoch(state.inner());
-    // Revoke logical visibility FIRST. Screen-share relock must hide the folder from every gated
-    // UI/MCP reader even when a later filesystem cleanup fails. Keep the cached KEK until the
-    // physical reblank succeeds, though, so the same process retains authority to retry safely.
+    for id in &targets {
+        prepare_folder_exports_before_relock(state, id)?;
+    }
+    // R7: advance the seal epoch at ENTRY — see `bump_seal_epoch`. Once for the whole cascade.
+    bump_seal_epoch(state);
+    // Revoke logical visibility FIRST, for every target at once. Screen-share relock must hide the
+    // folders from every gated UI/MCP reader even when a later filesystem cleanup fails. Keep the
+    // cached KEK until the physical reblank succeeds, though, so the same process retains authority
+    // to retry safely.
     {
         let mut g = state
             .unlocked_folders
             .lock()
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
-        g.remove(&folder_id);
+        for id in &targets {
+            g.remove(id);
+        }
     }
-    // Epoch + session membership now authoritatively hide this folder. New MCP responses may be
-    // admitted against that post-revocation snapshot while physical cleanup continues.
-    crate::mcp::finish_visibility_revocation(mcp_revocation);
-    // Emit while the lifecycle guard is still held. The FE discards cached titles synchronously;
-    // its canonical refresh cannot pass the same guard until physical reblank has completed.
-    emit_reminder_visibility_invalidated_fail_closed(&app);
+    // Hand the caller its one revocation point — see this function's doc comment.
+    visibility_revoked();
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
     // Any interrupted-fresh-seal rows now receive only ciphertexts that the preflight already
     // decrypt-verified against their exact plaintext. This is after export cleanup and logical
     // revocation, but before the first broad reblank.
-    verified.apply_repairs(&state.db)?;
-    let mut one = std::collections::HashSet::new();
-    one.insert(folder_id.clone());
+    for (_, verified) in &verified_plans {
+        verified.apply_repairs(&state.db)?;
+    }
+    let sealed: std::collections::HashSet<String> = targets.iter().cloned().collect();
     // Brain-v3 audit Fix 4: strip the just-re-sealed items' `[[Title]]` markers from VISIBLE sources
     // (in other still-open folders) + re-export their `.md`, BEFORE the relock purge drops the naming
-    // edges.
-    enqueue_marker_cleanup_for_folders(state.inner(), &one)?;
+    // edges. The whole cascade goes in one call so a marker pointing from one re-sealed folder into
+    // another is never treated as "still visible".
+    enqueue_marker_cleanup_for_folders(state, &sealed)?;
     // The re-blank tx also purges ALL memory rollups (may paraphrase the re-sealed facts) and
     // returns their exported vault paths — the files are removed here (command layer).
     remove_rollup_exports_before_seal_purge(&state.db)?;
-    let rollup_exports = state.db.blank_sealed_notes_in_folders(&one)?;
+    let rollup_exports = state.db.blank_sealed_notes_in_folders(&sealed)?;
     remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline plaintext and drop the decrypted session WAV
-    // (the .enc + the *_blob columns stay; the folder is still locked=1 on disk).
-    reblank_folder_extras_after_verification(state.inner(), &folder_id, verified.ck())?;
+    // (the .enc + the *_blob columns stay; the folders are still locked=1 on disk). Per folder,
+    // because each carries its OWN content key.
+    for (id, verified) in &verified_plans {
+        reblank_folder_extras_after_verification(state, id, verified.ck())?;
+    }
     drain_lock_marker_export_cleanup(&state.db)?;
-    // The folder has remained logically hidden throughout. A failure above retains the cached KEK
+    // The folders have remained logically hidden throughout. A failure above retains the cached KEK
     // for a repair retry; success leaves it available for other still-unlocked folders.
-    // The relock purged ALL pending audit findings — ping the FE inbox (count-only).
-    emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
