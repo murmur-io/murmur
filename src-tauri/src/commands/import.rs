@@ -96,7 +96,7 @@ pub struct ImportReport {
 
 /// Resolve the wire source name, failing closed on anything unknown.
 fn parse_source(raw: &str) -> Result<ImportSource, AppError> {
-    ImportSource::parse(raw).ok_or_else(|| AppError::InvalidArg(format!("unknown import source")))
+    ImportSource::parse(raw).ok_or_else(|| AppError::InvalidArg("unknown import source".to_string()))
 }
 
 /// Read the chosen source into a scan. The ONE place that knows which normalizer to call.
