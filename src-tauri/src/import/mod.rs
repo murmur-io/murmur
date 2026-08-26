@@ -60,11 +60,6 @@ impl ImportSource {
             Self::AppleNotes => "apple-notes",
         }
     }
-
-    /// Whether this source reads from a user-chosen path. Apple Notes reads the Notes app itself.
-    pub(crate) fn needs_path(self) -> bool {
-        !matches!(self, Self::AppleNotes)
-    }
 }
 
 /// One page recovered from an export, ready to become a note.
