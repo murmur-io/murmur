@@ -5916,6 +5916,9 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
         1,
     )
     .unwrap();
+    let mut pre_note = sample_meeting("closing-meeting", "2026-08-14T00:00:00Z");
+    pre_note.folder_id = Some("closing-folder".into());
+    db.insert_meeting(&pre_note).unwrap();
     db.begin_org_folder_closure("closing-folder").unwrap();
     assert!(
         db.insert_outbound_note_share(
@@ -5928,6 +5931,17 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
         .is_err(),
         "folder closure must reject link/user share admission too"
     );
+    assert!(
+        db.insert_outbound_share(
+            "blocked-pre-note-link",
+            "closing-meeting",
+            "link",
+            1,
+            "2026-08-14T00:00:01Z",
+        )
+        .is_err(),
+        "canonical pre-note placement must participate in the folder closure"
+    );
     assert!(db
         .insert_org_share(
             "blocked-folder",
@@ -5935,6 +5949,20 @@ fn folder_and_source_closures_block_share_insert_and_rearm_until_reopened() {
             None,
             Some("closing-doc"),
             "note",
+            Some("T"),
+            1,
+            1,
+            &sha32(1),
+            "t",
+        )
+        .is_err());
+    assert!(db
+        .insert_org_share(
+            "blocked-pre-note-org",
+            "org-1",
+            Some("closing-meeting"),
+            None,
+            "meeting",
             Some("T"),
             1,
             1,
@@ -7335,6 +7363,146 @@ fn list_corrections_excludes_sealed_meeting() {
         2,
         "session-unlocked meeting's correction must reappear"
     );
+}
+
+/// Canonical-placement gate matrix for correction and voice-biometric derived data.
+///
+/// These rows model data re-derived while a locked folder was session-unlocked and left behind
+/// after a crash/relock boundary. The readers must still treat `meetings.folder_id` as the durable
+/// visibility authority: opening one sealed folder restores only that folder's rows, while another
+/// sealed folder stays invisible and an unrelated open meeting stays independently scoped.
+#[test]
+fn canonical_meeting_folder_gates_corrections_voiceprints_and_speaker_labels() {
+    let db = mem_db();
+    seed_folder(&db, "f-secret", "Secret");
+    seed_folder(&db, "f-other-secret", "Other secret");
+    seed_folder(&db, "f-open", "Open");
+
+    for (meeting_id, folder_id, started_at) in [
+        ("m-secret", "f-secret", "2026-06-24T10:00:00Z"),
+        ("m-other-secret", "f-other-secret", "2026-06-24T11:00:00Z"),
+        ("m-open", "f-open", "2026-06-24T12:00:00Z"),
+    ] {
+        db.insert_meeting(&sample_meeting(meeting_id, started_at))
+            .unwrap();
+        // Use the production filing API. Deliberately create no provider note: this proves the
+        // canonical meetings.folder_id gate also covers pre-note recordings.
+        db.set_meeting_folder(meeting_id, Some(folder_id)).unwrap();
+        assert_eq!(
+            db.get_meeting(meeting_id)
+                .unwrap()
+                .unwrap()
+                .folder_id
+                .as_deref(),
+            Some(folder_id)
+        );
+    }
+
+    db.set_folder_locked("f-secret", true, Some(b"wrapped-secret"))
+        .unwrap();
+    db.set_folder_locked("f-other-secret", true, Some(b"wrapped-other"))
+        .unwrap();
+
+    for (meeting_id, marker, created_at) in [
+        ("m-secret", "secret", "2026-06-28T10:00:00Z"),
+        ("m-other-secret", "other-secret", "2026-06-28T10:01:00Z"),
+        ("m-open", "open", "2026-06-28T10:02:00Z"),
+    ] {
+        db.log_correction(&corr_rec(
+            "canonical-gate",
+            &format!("input-{marker}"),
+            &format!("output-{marker}"),
+            None,
+            true,
+            created_at,
+            Some(meeting_id),
+        ))
+        .unwrap();
+    }
+
+    db.insert_voiceprint(
+        "vp-secret",
+        "m-secret",
+        1,
+        Some("Secret speaker"),
+        &[1.0, 0.0],
+        "2026-06-28T10:00:00Z",
+    )
+    .unwrap();
+    db.insert_voiceprint(
+        "vp-other-secret",
+        "m-other-secret",
+        2,
+        Some("Other secret speaker"),
+        &[0.0, 1.0],
+        "2026-06-28T10:01:00Z",
+    )
+    .unwrap();
+    db.insert_voiceprint(
+        "vp-open",
+        "m-open",
+        3,
+        Some("Open speaker"),
+        &[0.5, 0.5],
+        "2026-06-28T10:02:00Z",
+    )
+    .unwrap();
+
+    let none = std::collections::HashSet::new();
+    let corrections = db.list_corrections("canonical-gate", 10, &none).unwrap();
+    assert_eq!(corrections.len(), 1);
+    assert_eq!(corrections[0].meeting_id.as_deref(), Some("m-open"));
+
+    let voiceprints = db.list_voiceprints_visible(&none).unwrap();
+    assert_eq!(voiceprints.len(), 1);
+    assert_eq!(voiceprints[0].meeting_id, "m-open");
+    assert!(db
+        .list_visible_speaker_labels_for_meeting("m-secret", &none)
+        .unwrap()
+        .is_empty());
+    assert!(db
+        .list_visible_speaker_labels_for_meeting("m-other-secret", &none)
+        .unwrap()
+        .is_empty());
+    let open_labels = db
+        .list_visible_speaker_labels_for_meeting("m-open", &none)
+        .unwrap();
+    assert_eq!(open_labels.len(), 1);
+    assert_eq!(open_labels[0].label, "Open speaker");
+
+    let unlocked = std::collections::HashSet::from(["f-secret".to_string()]);
+    let corrections = db
+        .list_corrections("canonical-gate", 10, &unlocked)
+        .unwrap();
+    assert_eq!(corrections.len(), 2);
+    assert!(corrections
+        .iter()
+        .any(|row| row.meeting_id.as_deref() == Some("m-secret")));
+    assert!(corrections
+        .iter()
+        .any(|row| row.meeting_id.as_deref() == Some("m-open")));
+    assert!(!corrections
+        .iter()
+        .any(|row| row.meeting_id.as_deref() == Some("m-other-secret")));
+
+    let voiceprints = db.list_voiceprints_visible(&unlocked).unwrap();
+    assert_eq!(voiceprints.len(), 2);
+    assert!(voiceprints.iter().any(|row| row.meeting_id == "m-secret"));
+    assert!(voiceprints.iter().any(|row| row.meeting_id == "m-open"));
+    assert!(!voiceprints
+        .iter()
+        .any(|row| row.meeting_id == "m-other-secret"));
+
+    let secret_labels = db
+        .list_visible_speaker_labels_for_meeting("m-secret", &unlocked)
+        .unwrap();
+    assert_eq!(secret_labels.len(), 1);
+    assert_eq!(secret_labels[0].cluster_index, 1);
+    assert_eq!(secret_labels[0].label, "Secret speaker");
+    assert!(db
+        .list_visible_speaker_labels_for_meeting("m-other-secret", &unlocked)
+        .unwrap()
+        .is_empty());
 }
 
 // ── Feature A — note↔note backlinks reader ───────────────────────────────────────────────────
@@ -10326,6 +10494,115 @@ fn multi_provider_meeting_reports_one_consistent_folder_id() {
 }
 
 // ── Phase 1: FTS5/BM25 retrieval ──────────────────────────────────────────
+
+/// A normal provider regeneration must not erase one side of an unresolved legacy folder split.
+/// Otherwise the next startup migration sees the one surviving provider folder as authoritative
+/// and silently files the whole meeting there. Only the explicit filing API may resolve the split.
+#[test]
+fn provider_upsert_preserves_ambiguous_legacy_folders_across_reopen_until_explicit_filing() {
+    const TEST_DEK: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let path = unique_temp_path("murmur-legacy-provider-folder-split", "sqlite");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+        seed_folder(&db, "folder-a", "Folder A");
+        seed_folder(&db, "folder-b", "Folder B");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "provider-a", "# original A");
+        note_for(&db, "m1", "provider-b", "# original B");
+        db.lock()
+            .execute(
+                "UPDATE notes
+                    SET folder_id = CASE provider_id
+                        WHEN 'provider-a' THEN 'folder-a'
+                        WHEN 'provider-b' THEN 'folder-b'
+                    END
+                  WHERE meeting_id = 'm1'",
+                [],
+            )
+            .unwrap();
+
+        // Production re-summarization/upsert for one provider. Canonical placement remains NULL
+        // because the legacy A/B disagreement has not been explicitly resolved by the user.
+        note_for(&db, "m1", "provider-a", "# regenerated A");
+        let folders: Vec<Option<String>> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT folder_id FROM notes
+                      WHERE meeting_id = 'm1' ORDER BY provider_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            folders,
+            vec![Some("folder-a".into()), Some("folder-b".into())],
+            "ordinary provider upsert must preserve both legacy ownership witnesses"
+        );
+    }
+
+    {
+        let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+        assert_eq!(
+            db.get_meeting("m1").unwrap().unwrap().folder_id,
+            None,
+            "startup migration must not guess a canonical folder after provider regeneration"
+        );
+        assert_eq!(
+            db.folders_for_meeting("m1").unwrap(),
+            vec!["folder-a".to_string(), "folder-b".to_string()]
+        );
+        let unlocked = std::collections::HashSet::from([
+            "folder-a".to_string(),
+            "folder-b".to_string(),
+        ]);
+        assert!(
+            db.get_note_if_visible("m1", &unlocked).unwrap().is_none(),
+            "ambiguous legacy ownership must remain fail-closed even when both folders are open"
+        );
+
+        db.set_meeting_folder("m1", Some("folder-a")).unwrap();
+        assert_eq!(
+            db.get_meeting("m1")
+                .unwrap()
+                .unwrap()
+                .folder_id
+                .as_deref(),
+            Some("folder-a")
+        );
+        let synchronized: Vec<Option<String>> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT folder_id FROM notes
+                      WHERE meeting_id = 'm1' ORDER BY provider_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            synchronized,
+            vec![Some("folder-a".into()), Some("folder-a".into())],
+            "explicit filing is the authority that synchronizes provider rows"
+        );
+        assert!(db
+            .get_note_if_visible("m1", &std::collections::HashSet::new())
+            .unwrap()
+            .is_some());
+    }
+
+    let _ = std::fs::remove_file(path);
+}
 
 /// RED-on-LIKE / GREEN-on-FTS: a doc containing BOTH terms is returned for either word order.
 /// The old `LIKE '%alpha beta%'` only matched the contiguous substring, so "beta alpha" missed
@@ -15324,6 +15601,110 @@ fn prunable_candidates_are_oldest_first_and_exclude_locked_folders() {
     let _ = std::fs::remove_file(&p);
 }
 
+#[test]
+fn prunable_candidates_fail_closed_for_dangling_and_ambiguous_owners() {
+    let db = mem_db();
+    for id in ["open-a", "open-b"] {
+        db.insert_folder(&crate::storage::Folder {
+            id: id.into(),
+            name: id.into(),
+            path: id.into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+    for (idx, id) in [
+        "ownerless",
+        "canonical-open",
+        "canonical-dangling",
+        "legacy-open",
+        "legacy-dangling",
+        "legacy-ambiguous",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db.insert_meeting(&crate::storage::Meeting {
+            id: id.into(),
+            started_at: format!("2026-01-{:02}T00:00:00Z", idx + 1),
+            ended_at: None,
+            title: Some(id.into()),
+            duration_s: 1,
+            audio_path: Some(format!("/audio/{id}.wav")),
+            status: crate::storage::MeetingStatus::Summarized,
+            folder_id: match id {
+                "canonical-open" => Some("open-a".into()),
+                "canonical-dangling" => Some("missing-folder".into()),
+                _ => None,
+            },
+        })
+        .unwrap();
+    }
+    let seed_provider = |meeting_id: &str, provider_id: &str, folder_id: Option<&str>| {
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: meeting_id.into(),
+            provider_id: provider_id.into(),
+            markdown: "body".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE notes SET folder_id=?3 WHERE meeting_id=?1 AND provider_id=?2",
+                rusqlite::params![meeting_id, provider_id, folder_id],
+            )
+            .unwrap();
+    };
+    seed_provider("legacy-open", "p1", Some("open-a"));
+    seed_provider("legacy-dangling", "p1", Some("missing-folder"));
+    seed_provider("legacy-ambiguous", "p1", Some("open-a"));
+    seed_provider("legacy-ambiguous", "p2", Some("open-b"));
+
+    let ids: Vec<String> = db
+        .prunable_audio_candidates()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.meeting_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ownerless", "canonical-open", "legacy-open"],
+        "only truly ownerless or unambiguously open-owned audio may be pruned"
+    );
+}
+
+#[test]
+fn delete_folder_refuses_a_remaining_pre_note_canonical_meeting_owner() {
+    let db = mem_db();
+    db.insert_folder(&crate::storage::Folder {
+        id: "folder".into(),
+        name: "Folder".into(),
+        path: "Folder".into(),
+        parent_id: None,
+        locked: false,
+        created_at: "2026-01-01T00:00:00Z".into(),
+    })
+    .unwrap();
+    let mut meeting = sample_meeting("pre-note", "2026-01-01T00:00:00Z");
+    meeting.folder_id = Some("folder".into());
+    db.insert_meeting(&meeting).unwrap();
+
+    let error = db.delete_folder("folder").unwrap_err();
+    assert!(matches!(error, AppError::Storage(_)));
+    assert!(db.folder_by_id("folder").unwrap().is_some());
+    assert_eq!(
+        db.get_meeting("pre-note").unwrap().unwrap().folder_id.as_deref(),
+        Some("folder"),
+        "the refused storage delete must leave canonical ownership intact"
+    );
+}
+
 /// Regression for the note-save contention bug (2026-07-15): `open_with_key` MUST install a
 /// busy handler (non-zero `PRAGMA busy_timeout`) on every connection it opens, so a writer
 /// that collides with another connection's write lock on the SAME on-disk file gets a brief
@@ -15593,6 +15974,82 @@ fn count_notes_per_folder_excludes_sealed_not_unlocked_folder() {
     unlocked.insert("f-secret".to_string());
     let counts2 = db.count_notes_per_folder(&unlocked).unwrap();
     assert_eq!(counts2.get("f-secret").copied().unwrap_or(0), 3);
+}
+
+#[test]
+fn note_aggregates_follow_canonical_and_unambiguous_meeting_visibility() {
+    let db = mem_db();
+    for (id, locked) in [("open-a", false), ("open-b", false), ("secret", true)] {
+        db.insert_folder(&crate::storage::Folder {
+            id: id.into(),
+            name: id.into(),
+            path: id.into(),
+            parent_id: None,
+            locked,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+    for (id, canonical) in [
+        ("visible", Some("open-a")),
+        ("canonical-secret", Some("secret")),
+        ("ambiguous", None),
+    ] {
+        let mut meeting = sample_meeting(id, "2026-01-01T00:00:00Z");
+        meeting.folder_id = canonical.map(str::to_string);
+        db.insert_meeting(&meeting).unwrap();
+    }
+    let seed_provider = |meeting_id: &str, provider_id: &str, folder_id: &str| {
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: meeting_id.into(),
+            provider_id: provider_id.into(),
+            markdown: "body".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        // Deliberately preserve legacy/provider drift instead of using set_meeting_folder, whose
+        // production contract synchronizes every row and therefore cannot construct the bug.
+        db.lock()
+            .execute(
+                "UPDATE notes SET folder_id=?3 WHERE meeting_id=?1 AND provider_id=?2",
+                rusqlite::params![meeting_id, provider_id, folder_id],
+            )
+            .unwrap();
+    };
+    seed_provider("visible", "p1", "open-a");
+    // Stale OPEN provider metadata must not override the canonical LOCKED meeting owner.
+    seed_provider("canonical-secret", "p1", "open-a");
+    // Two individually open legacy owners are still ambiguous and therefore invisible.
+    seed_provider("ambiguous", "p1", "open-a");
+    seed_provider("ambiguous", "p2", "open-b");
+
+    let nothing = std::collections::HashSet::new();
+    let analytics = db.analytics(&nothing).unwrap();
+    assert_eq!(analytics.total_meetings, 1);
+    assert_eq!(analytics.notes_count, 1);
+    assert_eq!(db.brain_counts(&nothing).unwrap().0, 1);
+    let counts = db.count_notes_per_folder(&nothing).unwrap();
+    assert_eq!(counts.get("open-a").copied().unwrap_or(0), 1);
+    assert_eq!(counts.get("open-b").copied().unwrap_or(0), 0);
+    assert_eq!(counts.get("secret").copied().unwrap_or(0), 0);
+
+    let unlocked = std::collections::HashSet::from(["secret".to_string()]);
+    let analytics = db.analytics(&unlocked).unwrap();
+    assert_eq!(analytics.total_meetings, 2);
+    assert_eq!(analytics.notes_count, 2);
+    assert_eq!(db.brain_counts(&unlocked).unwrap().0, 2);
+    let counts = db.count_notes_per_folder(&unlocked).unwrap();
+    assert_eq!(counts.get("open-a").copied().unwrap_or(0), 1);
+    assert_eq!(
+        counts.get("secret").copied().unwrap_or(0),
+        1,
+        "canonical ownership determines the folder badge despite stale provider metadata"
+    );
+    assert_eq!(counts.get("open-b").copied().unwrap_or(0), 0);
 }
 
 /// Race-safety regression (TOCTOU: prune snapshots a plaintext path, a concurrent seal

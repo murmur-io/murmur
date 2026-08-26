@@ -390,7 +390,10 @@ export class OrgItemViewerComponent {
       // Adopt the real title (mirrors note-editor's setTitle) — the caller
       // already passes a best-known title when opening the tab, but this
       // corrects it once the authoritative decrypted detail loads.
-      this.tabsService.setTitle(tabKeyFor("org-item", id), item.title || "Shared note");
+      this.tabsService.setTitle(
+        tabKeyFor("org-item", id),
+        item.title || "Shared note",
+      );
       void this.resolveOrgName(id);
       void this.refreshLoggedIn(id);
     } catch (e) {
@@ -415,7 +418,10 @@ export class OrgItemViewerComponent {
    */
   private async resolveOrgName(id: string): Promise<void> {
     try {
-      const orgs = await this.ipc.orgListStatuses();
+      // Metadata resolution for an already-admitted replica is local-only.
+      // Opening a shared item must not refresh tokens or contact the relay just
+      // to render its organization label.
+      const orgs = await this.ipc.orgListCachedStatuses();
       for (const org of orgs) {
         const items = await this.ipc.listOrgItems(org.orgId).catch(() => []);
         if (items.some((it) => it.itemId === id)) {
