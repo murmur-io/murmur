@@ -170,6 +170,12 @@ fn plaintext_attachment_data_after_owner_gate(
     state: &AppState,
     row: &AttachmentRecord,
 ) -> Result<Vec<u8>, AppError> {
+    // Folder ownership is part of the BYTE authorization, not merely the sealed-blob decrypt path.
+    // `meeting_is_unlocked` allows a legacy meeting when every governing folder is open, but such a
+    // multi-folder split has no unique key/export domain. Resolve it before returning even already-
+    // plaintext bytes so list/render/export all fail closed on ambiguity. `None` remains valid for
+    // a genuinely unfiled meeting and for org-owned rows.
+    let folder_id = state.db.folder_for_attachment_owner(&row.owner)?;
     if !row.data.is_empty() {
         verify_stored_attachment(row, &row.data)?;
         return Ok(row.data.clone());
@@ -177,9 +183,7 @@ fn plaintext_attachment_data_after_owner_gate(
     let blob = row.data_blob.as_deref().ok_or_else(|| {
         AppError::Storage("attachment has neither plaintext nor a recoverable seal".into())
     })?;
-    let folder_id = state
-        .db
-        .folder_for_attachment_owner(&row.owner)?
+    let folder_id = folder_id
         .ok_or_else(|| AppError::Storage("sealed attachment has no owning folder".into()))?;
     let ck = session_folder_ck(state, &folder_id)?;
     let data = crate::crypto::decrypt(&ck, blob, &attachment_aad(&folder_id, &row.owner, &row.id))?;

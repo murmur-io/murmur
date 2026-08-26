@@ -222,6 +222,16 @@ test("Convert to note passes the selected template and opens a canonical note ta
         (w.__convertCalls ??= []).push(args);
         return { noteId: "n-converted", meetingWikilink: "[[Strategy review]]" };
       },
+      list_workspace_tree: () => {
+        const w = window as unknown as { __workspaceReloadCalls?: string[] };
+        (w.__workspaceReloadCalls ??= []).push("tree");
+        return [];
+      },
+      list_container_items: () => {
+        const w = window as unknown as { __workspaceReloadCalls?: string[] };
+        (w.__workspaceReloadCalls ??= []).push("unfiled");
+        return { kind: "meeting", items: [], total: 0 };
+      },
     },
     {
       audit_reminder_suggestions: [],
@@ -238,6 +248,12 @@ test("Convert to note passes the selected template and opens a canonical note ta
     },
   );
   await page.goto("/meeting/m-atlas-roadmap");
+  await expect(page.getByRole("button", { name: "Choose note template" })).toBeVisible();
+  const reloadsBefore = await page.evaluate(
+    () =>
+      (window as unknown as { __workspaceReloadCalls?: string[] })
+        .__workspaceReloadCalls?.length ?? 0,
+  );
 
   await page.getByRole("button", { name: "Choose note template" }).click();
   await page.getByRole("menuitem", { name: /Executive brief/ }).click();
@@ -249,6 +265,15 @@ test("Convert to note passes the selected template and opens a canonical note ta
   expect(calls).toEqual([
     { meetingId: "m-atlas-roadmap", templateId: "tpl-exec" },
   ]);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __workspaceReloadCalls?: string[] })
+            .__workspaceReloadCalls?.length ?? 0,
+      ),
+    )
+    .toBeGreaterThan(reloadsBefore);
   const tabs = await page.evaluate(() =>
     JSON.parse(localStorage.getItem("murmur.tabs.v1") ?? "{}"),
   );

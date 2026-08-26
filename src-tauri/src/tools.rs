@@ -6147,7 +6147,7 @@ mod tests {
     }
 
     /// Seed a meeting + its note in `folder` (folder-scoped so it can be sealed). Mirrors the mcp.rs
-    /// `seed` helper (a meeting's folder = its note's folder via `set_note_folder`).
+    /// `seed` helper (canonical meeting placement, with provider notes synchronized).
     fn seed_meeting(db: &Db, mid: &str, title: &str, md: &str, folder: Option<&str>) {
         db.insert_meeting(&Meeting {
             id: mid.to_string(),

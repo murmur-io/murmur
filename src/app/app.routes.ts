@@ -157,6 +157,13 @@ export const routes: Routes = [
           ),
       },
       {
+        path: "shared-brains",
+        loadComponent: () =>
+          import("./features/shared-brains/shared-brains.component").then(
+            (m) => m.SharedBrainsComponent,
+          ),
+      },
+      {
         // Read-only org-brain item viewer — reached from an org-origin source
         // chip in Ask. Renders one decrypted OrgItemDetail (author + date + md).
         path: "org-item/:id",

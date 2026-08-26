@@ -29,7 +29,8 @@ use rusqlite::OptionalExtension;
 
 use crate::error::Result;
 use crate::storage::db::{
-    map_err, name_matches_query_tokens, row_to_meeting, tokenize_lower, visibility_clause, Db,
+    map_err, meeting_visibility_clause, name_matches_query_tokens, row_to_meeting, tokenize_lower,
+    visibility_clause, Db,
     MAX_FULL_GRAPH_LINK_EDGES, MAX_FULL_GRAPH_PER_KIND, MIN_ENTITY_NAME_LEN,
 };
 use crate::storage::models::{
@@ -97,7 +98,7 @@ impl Db {
     /// so its name (which lived only in encrypted markdown) never reaches the renderer.
     pub fn list_entities_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<GraphNode>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         // 2026-07-13 perf audit (MODERATE): this fed BOTH get_graph's node list and list_people
         // with NO limit, unlike the sibling graph_edges_visible (MAX_GRAPH_EDGES=600, added for
         // the same reason — see its own comment). Visibility is already enforced in WHERE; a
@@ -109,14 +110,7 @@ impl Db {
                FROM entities e
                JOIN entity_mentions em ON em.entity_id = e.id
                JOIN meetings m ON m.id = em.meeting_id
-              WHERE (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+              WHERE {meeting_visible}
               GROUP BY e.id, e.name, e.kind
              HAVING cnt > 0
               ORDER BY cnt DESC, e.name COLLATE NOCASE ASC
@@ -162,7 +156,7 @@ impl Db {
         kind: Option<EntityKind>,
     ) -> Result<i64> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let kind_filter = match kind {
             Some(k) => format!("AND e.kind = '{}'", k.as_str()),
             None => String::new(),
@@ -173,14 +167,7 @@ impl Db {
                  FROM entities e
                  JOIN entity_mentions em ON em.entity_id = e.id
                  JOIN meetings m ON m.id = em.meeting_id
-                WHERE (
-                        NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (
-                          SELECT 1 FROM notes n
-                           LEFT JOIN folders f ON f.id = n.folder_id
-                           WHERE n.meeting_id = m.id AND {visible}
-                        )
-                      )
+                WHERE {meeting_visible}
                       {kind_filter}
                 GROUP BY e.id
                HAVING COUNT(em.meeting_id) > 0
@@ -212,21 +199,14 @@ impl Db {
         limit: usize,
     ) -> Result<Vec<VaultSource>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let row_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT m.id, m.title, m.started_at
                FROM entity_mentions em
                JOIN meetings m ON m.id = em.meeting_id
               WHERE em.entity_id = ?1
-                AND (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+                AND {meeting_visible}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT ?2"
         );
@@ -257,7 +237,7 @@ impl Db {
     /// gated by the visibility predicate, so a co-occurrence in a sealed meeting yields no edge.
     pub fn graph_edges_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<GraphEdge>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         // F5: bound the quadratic co-occurrence self-join — return only the strongest edges. The
         // graph UI (brain-map, ≤60 nodes) consumes only the heaviest connections, so an unbounded
         // ORDER BY over every co-mentioned entity pair is wasted serialization on a large vault.
@@ -274,14 +254,7 @@ impl Db {
                JOIN entity_mentions b
                  ON a.meeting_id = b.meeting_id AND a.entity_id < b.entity_id
                JOIN meetings m ON m.id = a.meeting_id
-              WHERE (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+              WHERE {meeting_visible}
               GROUP BY a.entity_id, b.entity_id
               ORDER BY weight DESC, a.entity_id ASC, b.entity_id ASC
               LIMIT {MAX_GRAPH_EDGES}"
@@ -312,21 +285,14 @@ impl Db {
     /// predicate, so callers that expose an entity to the FE MUST go through this check first.
     pub fn entity_is_visible(&self, entity_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT EXISTS (
                       SELECT 1
                         FROM entity_mentions em
                         JOIN meetings m ON m.id = em.meeting_id
                        WHERE em.entity_id = ?1
-                         AND (
-                               NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                            OR EXISTS (
-                                 SELECT 1 FROM notes n
-                                  LEFT JOIN folders f ON f.id = n.folder_id
-                                  WHERE n.meeting_id = m.id AND {visible}
-                               )
-                             )
+                         AND {meeting_visible}
                     )"
         );
         let visible: bool = conn
@@ -377,7 +343,7 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<EntityNeighbor>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT e.id, e.name, e.kind, COUNT(*) AS shared
                FROM entity_mentions a
@@ -385,14 +351,7 @@ impl Db {
                JOIN entities e ON e.id = b.entity_id
                JOIN meetings m ON m.id = a.meeting_id
               WHERE a.entity_id = ?1
-                AND (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+                AND {meeting_visible}
               GROUP BY e.id, e.name, e.kind
               ORDER BY shared DESC, e.name COLLATE NOCASE ASC
               LIMIT ?2"
@@ -437,7 +396,7 @@ impl Db {
             return Ok(Vec::new());
         }
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         // Same visibility predicate as `list_entities_visible`: keep an entity iff it has ≥1
         // mention in a meeting that is open/NULL-folder OR session-unlocked (or note-less).
         let sql = format!(
@@ -445,14 +404,7 @@ impl Db {
                FROM entities e
                JOIN entity_mentions em ON em.entity_id = e.id
                JOIN meetings m ON m.id = em.meeting_id
-              WHERE (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )"
+              WHERE {meeting_visible}"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
@@ -488,26 +440,18 @@ impl Db {
             return Ok(Vec::new());
         }
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let placeholders = (1..=entity_ids.len())
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status, \
-                    (SELECT nf.folder_id FROM notes nf \
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) AS folder_id \
+                    m.folder_id \
                FROM entity_mentions em \
                JOIN meetings m ON m.id = em.meeting_id \
               WHERE em.entity_id IN ({placeholders}) \
-                AND ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+                AND {meeting_visible} \
               GROUP BY m.id \
               ORDER BY COUNT(DISTINCT em.entity_id) DESC, m.started_at DESC, m.id DESC"
         );
@@ -831,15 +775,11 @@ impl Db {
         let entities = self.count_entities_visible(unlocked, None)?;
         let conn = self.lock();
         // Meetings — the `list_meetings_visible` predicate, uncapped.
-        let m_visible = visibility_clause("f", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let meetings: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM meetings m
-                       WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                          OR EXISTS (SELECT 1 FROM notes n
-                                       LEFT JOIN folders f ON f.id = n.folder_id
-                                      WHERE n.meeting_id = m.id AND {m_visible})"
+                    "SELECT COUNT(*) FROM meetings m WHERE {meeting_visible}"
                 ),
                 [],
                 |r| r.get(0),
@@ -880,21 +820,14 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<(Vec<FullGraphMentionEdge>, bool)> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         const MAX_MENTION_EDGES: usize = 2000;
         // Fetch ONE past the cap so a full page distinguishes "exactly the cap" from "trimmed".
         let sql = format!(
             "SELECT em.entity_id, em.meeting_id
                FROM entity_mentions em
                JOIN meetings m ON m.id = em.meeting_id
-              WHERE (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+              WHERE {meeting_visible}
               ORDER BY m.started_at DESC, em.entity_id ASC, em.meeting_id ASC
               LIMIT {}",
             MAX_MENTION_EDGES + 1
@@ -1010,16 +943,13 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Option<GraphNode>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT e.id,e.name,e.kind,COUNT(em.meeting_id) AS cnt
                FROM entities e
                JOIN entity_mentions em ON em.entity_id=e.id
                JOIN meetings m ON m.id=em.meeting_id
-              WHERE e.id=?1 AND (
-                NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id=m.id)
-                OR EXISTS (SELECT 1 FROM notes n LEFT JOIN folders f ON f.id=n.folder_id
-                            WHERE n.meeting_id=m.id AND {visible}))
+              WHERE e.id=?1 AND {meeting_visible}
               GROUP BY e.id,e.name,e.kind HAVING cnt>0"
         );
         let row = conn

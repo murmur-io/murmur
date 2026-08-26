@@ -4,8 +4,9 @@
 //! [`crate::storage::db::Db`] across files (Rust allows one type's inherent `impl` to live in
 //! multiple files of the same crate). The VISIBILITY-GATED note readers (`list_notes_visible`,
 //! `list_notes_visible_typed`, `note_markdown_if_visible`, `latest_note_visible`,
-//! `get_note_if_visible`, `note_is_visible`) route through `visibility_clause` EXACTLY as on trunk —
-//! a sealed-and-not-session-unlocked note stays invisible/`None`. The SEAL-ON-WRITE twins
+//! `get_note_if_visible`, `note_is_visible`) route through the canonical meeting/folder visibility
+//! gate (or the authored-document folder gate) — a sealed-and-not-session-unlocked note stays
+//! invisible/`None`. The SEAL-ON-WRITE twins
 //! (`insert_note_sealed`, `update_note_row_sealed`, `move_note_row_sealed`, `upsert_note_sealed`)
 //! preserve the CALLER-side verify-before-destroy contract. `upsert_note_sealed` additionally keeps
 //! its folder assignment behind the recording-generation lock backstop in the same transaction.
@@ -23,8 +24,8 @@ use rusqlite::{OptionalExtension, Row, Transaction};
 
 use crate::error::{AppError, Result};
 use crate::storage::db::{
-    coerce_property_value, map_err, note_snippet, parse_front_matter, visibility_clause, Db,
-    NoteRow,
+    coerce_property_value, map_err, meeting_visibility_clause, note_snippet, parse_front_matter,
+    visibility_clause, Db, NoteRow,
 };
 use crate::storage::models::{NoteRecord, NoteSummary, PropertyValue, TypedNoteRow};
 
@@ -124,6 +125,147 @@ impl Db {
             meeting_id,
             created_at,
             |_| Ok(()),
+        )
+    }
+
+    /// Atomically birth a converted companion note in the meeting's exact user-visible container.
+    ///
+    /// Unlike [`Self::insert_companion_note_atomic`], which intentionally remains restricted to the
+    /// reserved open Notes root for the recording-time companion flow, conversion may target the
+    /// meeting container (meeting- or note-kind). The command layer has already gated the source,
+    /// resolved the destination under `lifecycle_guard`, and — for a locked destination — produced
+    /// and verified `text_blob` under that destination's CK. This transaction rechecks the
+    /// destination's renderable/lock identity and commits document + structural companion edge
+    /// together, so a lock-state drift or injected failure leaves no orphan row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_converted_companion_atomic(
+        &self,
+        id: &str,
+        folder_id: &str,
+        expected_locked: bool,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        meeting_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        self.insert_converted_companion_atomic_core(
+            id,
+            folder_id,
+            expected_locked,
+            name,
+            title,
+            text,
+            text_blob,
+            meeting_id,
+            created_at,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_converted_companion_atomic_core(
+        &self,
+        id: &str,
+        folder_id: &str,
+        expected_locked: bool,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        meeting_id: &str,
+        created_at: i64,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if expected_locked != text_blob.is_some() {
+            return Err(AppError::Storage(
+                "converted companion seal does not match destination lock state".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let target_matches = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM folders
+                     WHERE id = ?1
+                       AND locked = ?2
+                       AND COALESCE(kind, 'meeting') IN ('meeting', 'note')
+                       AND path NOT LIKE '.murmur/%'
+                 )",
+                rusqlite::params![folder_id, expected_locked as i64],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !target_matches {
+            return Err(AppError::Locked(
+                "the conversion destination changed or is unavailable; retry".into(),
+            ));
+        }
+        let meeting_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+                [meeting_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !meeting_exists {
+            return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
+        }
+        tx.execute(
+            "INSERT INTO documents
+               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at,
+                exported_path, exported_hash, meeting_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'note', ?6, ?7, ?7, NULL, NULL, ?8)",
+            rusqlite::params![id, folder_id, name, title, text, text_blob, created_at, meeting_id],
+        )
+        .map_err(map_err)?;
+        checkpoint()?;
+        Self::upsert_link_tx(
+            &tx,
+            "note",
+            id,
+            "meeting",
+            meeting_id,
+            "companion",
+            1.0,
+            "user",
+            "active",
+            created_at,
+        )?;
+        tx.commit().map_err(map_err)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_converted_companion_atomic_failing(
+        &self,
+        id: &str,
+        folder_id: &str,
+        expected_locked: bool,
+        name: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        meeting_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        self.insert_converted_companion_atomic_core(
+            id,
+            folder_id,
+            expected_locked,
+            name,
+            title,
+            text,
+            text_blob,
+            meeting_id,
+            created_at,
+            || {
+                Err(AppError::Storage(
+                    "injected converted companion failure".into(),
+                ))
+            },
         )
     }
 
@@ -869,18 +1011,26 @@ impl Db {
     pub fn upsert_note(&self, note: &NoteRecord) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        // Canonical placement wins once the user has filed the recording. While it is still NULL,
+        // preserve an existing provider row's legacy folder witness: clearing one side of an A/B
+        // split would let the next startup backfill misclassify the surviving side as canonical.
         tx.execute(
             "INSERT INTO notes
                (meeting_id, provider_id, markdown, created_at, exported_path,
-                model_requested, model_served, gateway_host)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                model_requested, model_served, gateway_host, folder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                     (SELECT folder_id FROM meetings WHERE id = ?1))
              ON CONFLICT(meeting_id, provider_id) DO UPDATE SET
                markdown = excluded.markdown,
                created_at = excluded.created_at,
                exported_path = excluded.exported_path,
                model_requested = excluded.model_requested,
                model_served = excluded.model_served,
-               gateway_host = excluded.gateway_host",
+               gateway_host = excluded.gateway_host,
+               folder_id = COALESCE(
+                   (SELECT folder_id FROM meetings WHERE id = excluded.meeting_id),
+                   notes.folder_id
+               )",
             rusqlite::params![
                 note.meeting_id,
                 note.provider_id,
@@ -905,10 +1055,12 @@ impl Db {
     /// SEAL-ON-WRITE twin of [`Db::upsert_note`] for a meeting whose folder is LOCKED (and
     /// session-unlocked — the command layer gates first): persist the fresh markdown (session-
     /// visible) AND its freshly-encrypted `content_blob` AND the governing `folder_id` in ONE atomic
-    /// statement. Setting `folder_id` on insert keeps a NEW provider row governed by the meeting's
-    /// lock (a bare insert would leave it NULL → ungoverned → visible). The CALLER must have verified
-    /// the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) — exactly
-    /// like [`Db::seal_note`]. A new association with a LOCKED folder is refused transactionally
+    /// statement. It also establishes canonical meeting placement. Existing provider siblings are
+    /// accepted only when each already belongs to this exact target and retains a recovery blob;
+    /// this method cannot safely invent sibling ciphertext, so plaintext/NULL/conflicting siblings
+    /// fail before mutation. The CALLER must have verified the incoming blob decrypts back
+    /// byte-identical BEFORE calling this (verify-before-destroy) — exactly like [`Db::seal_note`].
+    /// A new association with a LOCKED folder is refused transactionally
     /// while the meeting has a non-retired generation or pending legacy recovery: those plaintext
     /// recording artifacts are not governed by the folder seal. Re-sealing an existing row already
     /// associated with this folder remains valid. 2026-07-10 audit F1.
@@ -926,6 +1078,49 @@ impl Db {
             &note.provider_id,
             folder_id,
         )?;
+        let canonical: Option<String> = tx
+            .query_row(
+                "SELECT folder_id FROM meetings WHERE id = ?1",
+                rusqlite::params![note.meeting_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .ok_or_else(|| AppError::InvalidArg(format!("no meeting {}", note.meeting_id)))?;
+        if canonical.as_deref().is_some_and(|id| id != folder_id) {
+            return Err(AppError::Locked(
+                "meeting is governed by a different folder".into(),
+            ));
+        }
+        let unsafe_sibling: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM notes
+                      WHERE meeting_id = ?1
+                        AND provider_id != ?3
+                        AND (
+                          folder_id IS NULL OR folder_id != ?2 OR content_blob IS NULL
+                        )
+                 )",
+                rusqlite::params![note.meeting_id, folder_id, note.provider_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if unsafe_sibling {
+            return Err(AppError::Locked(
+                "provider sibling is not safely sealed for the target folder".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE meetings SET folder_id = ?2 WHERE id = ?1",
+            rusqlite::params![note.meeting_id, folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE notes SET folder_id = ?2 WHERE meeting_id = ?1",
+            rusqlite::params![note.meeting_id, folder_id],
+        )
+        .map_err(map_err)?;
         tx.execute(
             "INSERT INTO notes
                (meeting_id, provider_id, markdown, created_at, exported_path,
@@ -994,12 +1189,12 @@ impl Db {
     /// skipped so the recorder bar never surfaces its blanked (or, defensively, sealed) content.
     pub fn latest_note_visible(&self, unlocked: &HashSet<String>) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
                     n.model_requested, n.model_served, n.gateway_host
                FROM notes n
-               LEFT JOIN folders f ON f.id = n.folder_id
+               JOIN meetings m ON m.id = n.meeting_id
               WHERE {visible}
               ORDER BY n.created_at DESC LIMIT 1"
         );
@@ -1087,12 +1282,12 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Option<NoteRecord>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
                     n.model_requested, n.model_served, n.gateway_host
                FROM notes n
-               LEFT JOIN folders f ON f.id = n.folder_id
+               JOIN meetings m ON m.id = n.meeting_id
               WHERE n.meeting_id = ?1 AND {visible}
               ORDER BY n.created_at DESC LIMIT 1"
         );
@@ -1358,6 +1553,191 @@ mod tests {
     }
 
     #[test]
+    fn converted_companion_birth_uses_exact_container_and_rolls_back_atomically() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let target = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: target.clone(),
+            name: "Project meeting folder".into(),
+            path: "Project/Meetings".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+
+        let failed = db.insert_converted_companion_atomic_failing(
+            "converted-rollback",
+            &target,
+            false,
+            "converted",
+            "Converted",
+            "generated",
+            None,
+            &meeting_id,
+            42,
+        );
+        assert!(matches!(failed, Err(AppError::Storage(_))));
+        assert!(db.get_note_row("converted-rollback").unwrap().is_none());
+        assert_eq!(db.companion_note_for_meeting(&meeting_id).unwrap(), None);
+
+        db.insert_converted_companion_atomic(
+            "converted-ok",
+            &target,
+            false,
+            "converted",
+            "Converted",
+            "generated",
+            None,
+            &meeting_id,
+            43,
+        )
+        .unwrap();
+        let row = db.get_note_row("converted-ok").unwrap().unwrap();
+        assert_eq!(row.folder_id, target);
+        assert_eq!(row.text, "generated");
+        assert_eq!(
+            db.companion_note_for_meeting(&meeting_id)
+                .unwrap()
+                .as_deref(),
+            Some("converted-ok")
+        );
+    }
+
+    #[test]
+    fn converted_companion_update_rehomes_content_and_attachment_in_one_transaction() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let source = db.ensure_notes_root().unwrap();
+        let target = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: target.clone(),
+            name: "Meeting destination".into(),
+            path: "Meeting destination".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_companion_note_atomic(
+            "existing-companion",
+            &source,
+            "existing",
+            "Existing",
+            "user prefix\nold generated\nuser suffix",
+            &meeting_id,
+            1,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: "existing-companion".into(),
+        };
+        let bytes = b"attachment bytes";
+        let hash = [7u8; 32];
+        db.insert_attachment(&crate::storage::NewAttachment {
+            id: "attachment-1",
+            owner: &owner,
+            mime_type: "image/png",
+            extension: "png",
+            width: 1,
+            height: 1,
+            sha256: &hash,
+            byte_len: bytes.len(),
+            data: bytes,
+            data_blob: None,
+            created_at: 2,
+        })
+        .unwrap();
+        let plaintext =
+            std::collections::HashMap::from([("attachment-1".to_string(), bytes.to_vec())]);
+        let no_seals = std::collections::HashMap::new();
+
+        let failed = db.update_converted_companion_atomic_failing(
+            "existing-companion",
+            &source,
+            &target,
+            false,
+            &meeting_id,
+            "Converted",
+            "user prefix\nnew generated\nuser suffix",
+            None,
+            3,
+            &plaintext,
+            &no_seals,
+        );
+        assert!(matches!(failed, Err(AppError::Storage(_))));
+        let unchanged = db.get_note_row("existing-companion").unwrap().unwrap();
+        assert_eq!(unchanged.folder_id, source);
+        assert!(unchanged.text.contains("old generated"));
+
+        db.update_converted_companion_atomic(
+            "existing-companion",
+            &source,
+            &target,
+            false,
+            &meeting_id,
+            "Converted",
+            "user prefix\nnew generated\nuser suffix",
+            None,
+            4,
+            &plaintext,
+            &no_seals,
+        )
+        .unwrap();
+        let moved = db.get_note_row("existing-companion").unwrap().unwrap();
+        assert_eq!(moved.folder_id, target);
+        assert_eq!(moved.text, "user prefix\nnew generated\nuser suffix");
+        assert_eq!(db.list_attachments(&owner).unwrap()[0].data, bytes.to_vec());
+        assert_eq!(
+            db.companion_note_for_meeting(&meeting_id)
+                .unwrap()
+                .as_deref(),
+            Some("existing-companion"),
+            "stable companion identity and edge survive rehoming"
+        );
+    }
+
+    #[test]
+    fn converted_companion_locked_target_requires_matching_seal_shape() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let target = seed_locked_folder(&db);
+        let err = db
+            .insert_converted_companion_atomic(
+                "missing-seal",
+                &target,
+                true,
+                "converted",
+                "Converted",
+                "secret",
+                None,
+                &meeting_id,
+                42,
+            )
+            .unwrap_err();
+        assert!(matches!(err, AppError::Storage(_)));
+        assert!(db.get_note_row("missing-seal").unwrap().is_none());
+
+        db.insert_converted_companion_atomic(
+            "sealed-converted",
+            &target,
+            true,
+            "converted",
+            "Converted",
+            "secret",
+            Some(b"verified-by-command-layer"),
+            &meeting_id,
+            43,
+        )
+        .unwrap();
+        let row = db.get_note_row("sealed-converted").unwrap().unwrap();
+        assert_eq!(row.folder_id, target);
+        assert!(row.sealed);
+        assert!(row.exported_path.is_none());
+    }
+
+    #[test]
     fn companion_birth_cannot_broaden_nonempty_locked_folder_birth() {
         let db = db();
         let meeting_id = seed_meeting(&db);
@@ -1532,9 +1912,253 @@ mod tests {
             (
                 "shared".into(),
                 Some(b"shared-blob".to_vec()),
-                Some(folder_id)
+                Some(folder_id.clone())
             )
         );
+        assert_eq!(
+            db.folder_for_meeting(&meeting_id).unwrap().as_deref(),
+            Some(folder_id.as_str()),
+            "sealed birth must establish canonical meeting placement"
+        );
+    }
+
+    #[test]
+    fn sealed_upsert_establishes_canonical_placement_and_syncs_provider_siblings() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = seed_locked_folder(&db);
+        let mut sibling = note(&meeting_id, "older provider");
+        sibling.provider_id = "older".into();
+        db.upsert_note(&sibling).unwrap();
+        db.lock()
+            .execute(
+                "UPDATE notes SET markdown='', content_blob=?3, folder_id=?2
+                  WHERE meeting_id=?1 AND provider_id='older'",
+                rusqlite::params![meeting_id, folder_id, b"older-blob"],
+            )
+            .unwrap();
+        let mut incoming = note(&meeting_id, "sealed provider");
+        incoming.provider_id = "incoming".into();
+
+        db.upsert_note_sealed(&incoming, b"incoming-blob", &folder_id)
+            .unwrap();
+
+        let canonical: Option<String> = db
+            .lock()
+            .query_row(
+                "SELECT folder_id FROM meetings WHERE id=?1",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical.as_deref(), Some(folder_id.as_str()));
+        let distinct: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(DISTINCT folder_id) FROM notes WHERE meeting_id=?1",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let synced: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE meeting_id=?1 AND folder_id=?2",
+                rusqlite::params![meeting_id, folder_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct, 1);
+        assert_eq!(
+            synced, 2,
+            "every provider sibling inherits the canonical folder"
+        );
+        let older: (String, Option<Vec<u8>>, Option<String>) = db
+            .lock()
+            .query_row(
+                "SELECT markdown,content_blob,folder_id FROM notes
+                  WHERE meeting_id=?1 AND provider_id='older'",
+                [&meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            older,
+            ("".into(), Some(b"older-blob".to_vec()), Some(folder_id)),
+            "an existing provider remains blank-at-rest with its recovery blob unchanged"
+        );
+    }
+
+    #[test]
+    fn sealed_upsert_refuses_plaintext_provider_sibling_before_mutation() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = seed_locked_folder(&db);
+        let mut sibling = note(&meeting_id, "plaintext sibling");
+        sibling.provider_id = "older".into();
+        db.upsert_note(&sibling).unwrap();
+        let mut incoming = note(&meeting_id, "must not land");
+        incoming.provider_id = "incoming".into();
+
+        let result = db.upsert_note_sealed(&incoming, b"incoming-blob", &folder_id);
+
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(db.folder_for_meeting(&meeting_id).unwrap(), None);
+        assert!(db.get_note(&meeting_id, "incoming").unwrap().is_none());
+        let sibling_after: (String, Option<Vec<u8>>, Option<String>) = db
+            .lock()
+            .query_row(
+                "SELECT markdown,content_blob,folder_id FROM notes
+                  WHERE meeting_id=?1 AND provider_id='older'",
+                [&meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sibling_after, ("plaintext sibling".into(), None, None));
+    }
+
+    #[test]
+    fn sealed_upsert_refuses_conflicting_legacy_sibling_before_mutation() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let target_id = seed_locked_folder(&db);
+        let other_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: other_id.clone(),
+            name: "Other".into(),
+            path: other_id.clone(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+        let mut existing = note(&meeting_id, "existing");
+        existing.provider_id = "existing".into();
+        db.upsert_note(&existing).unwrap();
+        db.lock()
+            .execute(
+                "UPDATE notes SET folder_id=?2 WHERE meeting_id=?1 AND provider_id='existing'",
+                rusqlite::params![meeting_id, other_id],
+            )
+            .unwrap();
+        let mut incoming = note(&meeting_id, "must not land");
+        incoming.provider_id = "incoming".into();
+
+        let result = db.upsert_note_sealed(&incoming, b"blob", &target_id);
+
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        let canonical: Option<String> = db
+            .lock()
+            .query_row(
+                "SELECT folder_id FROM meetings WHERE id=?1",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical, None);
+        assert!(db.get_note(&meeting_id, "incoming").unwrap().is_none());
+        let legacy: Option<String> = db
+            .lock()
+            .query_row(
+                "SELECT folder_id FROM notes WHERE meeting_id=?1 AND provider_id='existing'",
+                [&meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy.as_deref(), Some(other_id.as_str()));
+    }
+
+    #[test]
+    fn sealed_upsert_refuses_mismatched_canonical_folder_with_all_bytes_unchanged() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let canonical_id = seed_locked_folder(&db);
+        let other_id = seed_locked_folder(&db);
+        db.upsert_note_sealed(&note(&meeting_id, "before"), b"before-blob", &canonical_id)
+            .unwrap();
+        let before = stored_note_seal(&db, &meeting_id);
+
+        let result = db.upsert_note_sealed(&note(&meeting_id, "after"), b"after-blob", &other_id);
+
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(stored_note_seal(&db, &meeting_id), before);
+        assert_eq!(
+            db.folder_for_meeting(&meeting_id).unwrap().as_deref(),
+            Some(canonical_id.as_str())
+        );
+    }
+
+    #[test]
+    fn raw_note_readers_follow_canonical_meeting_visibility() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let locked_id = seed_locked_folder(&db);
+        let open_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: open_id.clone(),
+            name: "Open".into(),
+            path: open_id.clone(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+        db.set_meeting_folder(&meeting_id, Some(&locked_id))
+            .unwrap();
+        db.upsert_note(&note(&meeting_id, "secret")).unwrap();
+        db.lock()
+            .execute(
+                "UPDATE notes SET folder_id=?2 WHERE meeting_id=?1",
+                rusqlite::params![meeting_id, open_id],
+            )
+            .unwrap();
+
+        let none = HashSet::new();
+        assert!(db
+            .get_note_if_visible(&meeting_id, &none)
+            .unwrap()
+            .is_none());
+        assert!(db.latest_note_visible(&none).unwrap().is_none());
+        let unlocked = HashSet::from([locked_id]);
+        assert_eq!(
+            db.get_note_if_visible(&meeting_id, &unlocked)
+                .unwrap()
+                .unwrap()
+                .markdown,
+            "secret"
+        );
+    }
+
+    #[test]
+    fn raw_note_readers_fail_closed_for_conflicting_legacy_folders() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let locked_id = seed_locked_folder(&db);
+        let open_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: open_id.clone(),
+            name: "Open".into(),
+            path: open_id.clone(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+        for (provider_id, folder_id) in [("open", &open_id), ("locked", &locked_id)] {
+            let mut provider_note = note(&meeting_id, provider_id);
+            provider_note.provider_id = provider_id.into();
+            db.upsert_note(&provider_note).unwrap();
+            db.lock()
+                .execute(
+                    "UPDATE notes SET folder_id=?3 WHERE meeting_id=?1 AND provider_id=?2",
+                    rusqlite::params![meeting_id, provider_id, folder_id],
+                )
+                .unwrap();
+        }
+
+        let none = HashSet::new();
+        assert!(db.get_note_if_visible(&meeting_id, &none).unwrap().is_none());
+        assert!(db.latest_note_visible(&none).unwrap().is_none());
     }
 
     #[test]

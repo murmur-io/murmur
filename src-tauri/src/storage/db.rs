@@ -901,6 +901,31 @@ impl Db {
         // masked DTO; they are export-only via gated commands.
         Self::add_column_if_missing(&conn, "meetings", "mic_master_path", "TEXT")?;
         Self::add_column_if_missing(&conn, "meetings", "sys_master_path", "TEXT")?;
+        // Workspace filing is owned by the RECORDING, not by a provider note that may not exist
+        // yet.  Legacy databases stored placement only on `notes.folder_id`; backfill only when all
+        // non-NULL provider rows agree. Ambiguous rows deliberately stay NULL and continue through
+        // the legacy visibility fallback until the user files them explicitly.
+        Self::add_column_if_missing(&conn, "meetings", "folder_id", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_meetings_folder_id ON meetings(folder_id);
+             UPDATE meetings
+                SET folder_id = (
+                      SELECT MIN(n.folder_id) FROM notes n
+                       WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL
+                    )
+              WHERE folder_id IS NULL
+                AND 1 = (
+                      SELECT COUNT(DISTINCT n.folder_id) FROM notes n
+                       WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL
+                    );
+             UPDATE notes
+                SET folder_id = (SELECT m.folder_id FROM meetings m WHERE m.id=notes.meeting_id)
+              WHERE EXISTS (SELECT 1 FROM meetings m
+                             WHERE m.id=notes.meeting_id AND m.folder_id IS NOT NULL)
+                AND folder_id IS NOT (SELECT m.folder_id FROM meetings m
+                                      WHERE m.id=notes.meeting_id);",
+        )
+        .map_err(map_err)?;
         // brain2 realtime notes: the user's free-text notes typed DURING a meeting — the live
         // editable buffer, ONE per meeting, and the DURABLE CANONICAL STORE of those typed notes.
         // It is (a) injected into the in-meeting brain's system prompt while recording, and (b)
@@ -1028,6 +1053,35 @@ impl Db {
                     AND n.folder_id=c.scope_id))))
              ) BEGIN SELECT RAISE(ABORT,'org share source is closing'); END;
              ",
+        )
+        .map_err(map_err)?;
+        // Canonical meeting placement is now owned by `meetings.folder_id`, including the
+        // pre-note interval. The legacy guards above remain in place for additive migration
+        // safety; these v2 guards close the canonical path without DROP/recreate and retain the
+        // note-derived fallback only for historical NULL canonical rows.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS org_shares_closure_insert_guard_v2
+             BEFORE INSERT ON org_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND
+               NEW.meeting_id IS NOT NULL AND EXISTS(
+                 SELECT 1 FROM meetings m
+                  JOIN org_share_closures c ON c.scope_kind='folder'
+                   AND (m.folder_id=c.scope_id OR (m.folder_id IS NULL AND EXISTS(
+                     SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=c.scope_id)))
+                 WHERE m.id=NEW.meeting_id
+               )
+             BEGIN SELECT RAISE(ABORT,'org share source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS org_shares_closure_update_guard_v2
+             BEFORE UPDATE ON org_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND
+               NEW.meeting_id IS NOT NULL AND EXISTS(
+                 SELECT 1 FROM meetings m
+                  JOIN org_share_closures c ON c.scope_kind='folder'
+                   AND (m.folder_id=c.scope_id OR (m.folder_id IS NULL AND EXISTS(
+                     SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=c.scope_id)))
+                 WHERE m.id=NEW.meeting_id
+               )
+             BEGIN SELECT RAISE(ABORT,'org share source is closing'); END;",
         )
         .map_err(map_err)?;
         // Freeze the exact plaintext source while a destructive revoke is in flight: a cleanup may
@@ -1430,6 +1484,29 @@ impl Db {
                     AND n.folder_id=c.scope_id))))
              ) BEGIN SELECT RAISE(ABORT,'share source is closing'); END;
              ",
+        )
+        .map_err(map_err)?;
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS outbound_shares_closure_insert_guard_v2
+             BEFORE INSERT ON outbound_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND NEW.meeting_id <> '' AND EXISTS(
+               SELECT 1 FROM meetings m
+                JOIN org_share_closures c ON c.scope_kind='folder'
+                 AND (m.folder_id=c.scope_id OR (m.folder_id IS NULL AND EXISTS(
+                   SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=c.scope_id)))
+               WHERE m.id=NEW.meeting_id
+             )
+             BEGIN SELECT RAISE(ABORT,'share source is closing'); END;
+             CREATE TRIGGER IF NOT EXISTS outbound_shares_closure_update_guard_v2
+             BEFORE UPDATE ON outbound_shares
+             WHEN NEW.state NOT IN ('revoke_pending','revoked') AND NEW.meeting_id <> '' AND EXISTS(
+               SELECT 1 FROM meetings m
+                JOIN org_share_closures c ON c.scope_kind='folder'
+                 AND (m.folder_id=c.scope_id OR (m.folder_id IS NULL AND EXISTS(
+                   SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=c.scope_id)))
+               WHERE m.id=NEW.meeting_id
+             )
+             BEGIN SELECT RAISE(ABORT,'share source is closing'); END;",
         )
         .map_err(map_err)?;
 
@@ -2321,6 +2398,22 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_org_chunks_item ON org_chunks(item_id);",
         )
         .map_err(map_err)?;
+        // Local provenance for explicit "Add to Space" copies. The org replica remains untouched;
+        // this additive mapping makes the snapshot's origin durable without pretending the local
+        // copy is still a live org-owned object.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS local_org_imports (
+               local_kind TEXT NOT NULL CHECK(local_kind IN ('note','meeting')),
+               local_id   TEXT PRIMARY KEY,
+               org_id     TEXT NOT NULL,
+               item_id    TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               UNIQUE(item_id, local_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_local_org_imports_item
+               ON local_org_imports(item_id);",
+        )
+        .map_err(map_err)?;
         // ADDITIVE: `source_kind` (`"document"` | `"meeting"` | NULL) — the item's SOURCE type, opened
         // straight off the `OrgEnvelope` wire field once a peer publishes on the v2 wire format (see
         // `share::org_envelope::OrgSourceKind`). NULL for every row ingested before this column existed,
@@ -2867,10 +2960,13 @@ impl Db {
             .prepare(
                 "SELECT DISTINCT s.share_id, s.mode
                    FROM outbound_shares s
-                   LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
-                   LEFT JOIN documents d ON d.id = s.document_id
                   WHERE s.state <> 'revoked'
-                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
+                    AND ((s.document_id IS NOT NULL AND EXISTS(
+                          SELECT 1 FROM documents d WHERE d.id=s.document_id AND d.folder_id=?1))
+                      OR (s.meeting_id <> '' AND EXISTS(
+                          SELECT 1 FROM meetings m WHERE m.id=s.meeting_id AND
+                            (m.folder_id=?1 OR (m.folder_id IS NULL AND EXISTS(
+                              SELECT 1 FROM notes n WHERE n.meeting_id=m.id AND n.folder_id=?1))))))",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -3280,7 +3376,7 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<CorrectionRecord>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT cl.id, cl.kind, cl.input, cl.model_output, cl.final_output, cl.accepted,
                     cl.owner_id, cl.created_at, cl.meeting_id
@@ -3288,9 +3384,8 @@ impl Db {
               WHERE cl.kind = ?1
                 AND cl.meeting_id IS NOT NULL
                 AND EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = cl.meeting_id AND {visible}
+                      SELECT 1 FROM meetings m
+                       WHERE m.id = cl.meeting_id AND {meeting_visible}
                     )
               ORDER BY cl.created_at DESC, cl.id DESC
               LIMIT ?2"
@@ -3473,9 +3568,9 @@ impl Db {
                  )
                  SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
                         m.audio_path, m.status, \
-                        (SELECT nf.folder_id FROM notes nf \
-                          WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
-                          AS folder_id
+                        COALESCE(m.folder_id, (SELECT MIN(nf.folder_id) FROM notes nf \
+                          WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL \
+                          HAVING COUNT(DISTINCT nf.folder_id) = 1)) AS folder_id
                    FROM ranked r
                    JOIN meetings m ON m.id = r.meeting_id
                   ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
@@ -3728,16 +3823,13 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<String>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT e.name FROM entities e
                JOIN entity_mentions em ON em.entity_id = e.id
                JOIN meetings m ON m.id = em.meeting_id
               WHERE em.meeting_id = ?1
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (SELECT 1 FROM notes n
-                                 LEFT JOIN folders f ON f.id = n.folder_id
-                                WHERE n.meeting_id = m.id AND {visible}))
+                AND {meeting_visible}
               ORDER BY CASE WHEN e.kind = 'person' THEN 0 ELSE 1 END, e.name ASC
               LIMIT ?2"
         );
@@ -3767,16 +3859,13 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<String>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT ft.subject, ft.predicate, ft.object
                FROM facts ft
                JOIN meetings m ON m.id = ft.meeting_id
               WHERE ft.meeting_id = ?1
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (SELECT 1 FROM notes n
-                                 LEFT JOIN folders f ON f.id = n.folder_id
-                                WHERE n.meeting_id = m.id AND {visible}))
+                AND {meeting_visible}
               ORDER BY (ft.valid_to IS NULL) DESC, ft.valid_from DESC, ft.id DESC
               LIMIT ?2"
         );
@@ -4379,7 +4468,7 @@ impl Db {
             return Ok(Vec::new());
         }
         let conn = self.lock();
-        let visible = visibility_clause("f", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         // KNN is isolated to the vec0 table in a CTE (only a single MATCH+k constraint is allowed on
         // a vec0 query); visibility + meeting columns are joined OUTSIDE it.
         let sql = format!(
@@ -4389,17 +4478,14 @@ impl Db {
                   ORDER BY distance
              )
              SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) AS folder_id,
+                    COALESCE(m.folder_id, (SELECT MIN(nf.folder_id) FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL
+                      HAVING COUNT(DISTINCT nf.folder_id) = 1)) AS folder_id,
                     nc.text, knn.distance
                FROM knn
                JOIN note_chunks nc ON nc.id = knn.chunk_id
                JOIN meetings m ON m.id = nc.meeting_id
-              WHERE EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )
+              WHERE {meeting_visible}
               ORDER BY knn.distance ASC, m.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -4539,7 +4625,7 @@ impl Db {
             return Ok(Vec::new());
         };
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(date_filter);
         let sql = format!(
             "WITH hits(meeting_id, rank) AS (
@@ -4569,12 +4655,7 @@ impl Db {
              SELECT m.id, r.rank
                FROM ranked r
                JOIN meetings m ON m.id = r.meeting_id
-              WHERE (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )){date}
+              WHERE {meeting_visible}{date}
               ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
               LIMIT ?2"
         );
@@ -4625,7 +4706,7 @@ impl Db {
             return Ok(Vec::new());
         }
         let conn = self.lock();
-        let visible = visibility_clause("f", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(date_filter);
         // Each vec0 table gets its own single-MATCH CTE (a vec0 query allows exactly one MATCH+k
         // constraint); the union + visibility + window join happen OUTSIDE the KNN CTEs.
@@ -4651,11 +4732,7 @@ impl Db {
              SELECT m.id, b.distance
                FROM best b
                JOIN meetings m ON m.id = b.meeting_id
-              WHERE EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    ){date}
+              WHERE {meeting_visible}{date}
               ORDER BY b.distance ASC, m.id ASC"
         );
         let blob = crate::embed::vec_to_blob(query_vec);
@@ -4840,20 +4917,13 @@ impl Db {
             return Ok(Vec::new());
         };
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(Some(range));
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+                    m.folder_id
                FROM meetings m
-              WHERE (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )){date}
+              WHERE {meeting_visible}{date}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT ?1"
         );
@@ -4933,16 +5003,12 @@ impl Db {
     /// total counts only what is currently indexed (= visible) and is leak-free (a bare number).
     pub fn brain_counts(&self, unlocked: &HashSet<String>) -> Result<(i64, i64, i64, i64)> {
         let conn = self.lock();
-        // Meetings — mirror `list_meetings_visible`: visible if no notes OR any visible note.
-        let m_visible = visibility_clause("f", unlocked);
+        // Meetings — use the canonical/legacy-conservative visibility oracle.
+        let m_visible = meeting_visibility_clause("m", unlocked);
         let meeting_count: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM meetings m
-                       WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                          OR EXISTS (SELECT 1 FROM notes n
-                                       LEFT JOIN folders f ON f.id = n.folder_id
-                                      WHERE n.meeting_id = m.id AND {m_visible})"
+                    "SELECT COUNT(*) FROM meetings m WHERE {m_visible}"
                 ),
                 [],
                 |r| r.get(0),
@@ -6333,20 +6399,13 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Option<String>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT t.data
                FROM timelines t
                JOIN meetings m ON m.id = t.meeting_id
               WHERE m.id = ?1
-                AND (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )"
+                AND {meeting_visible}"
         );
         conn.query_row(&sql, rusqlite::params![meeting_id], |row| row.get(0))
             .optional()
@@ -6626,20 +6685,14 @@ impl Db {
     // ── analytics ──────────────────────────────────────────────────────────────
 
     /// Aggregate stats for the dashboard + Analytics tab. VISIBLE-content only: mirrors the
-    /// `list_meetings_visible`/`brain_counts` predicate (a meeting counts iff it has no notes at
-    /// all, or at least one note whose folder is open/session-unlocked) so a sealed-and-not-
-    /// unlocked folder's meetings never contribute to totals/durations/status-breakdown/per-day
-    /// activity — the same leak class `visibility_clause` closes for search/graph/brain reads.
+    /// `list_meetings_visible`/`brain_counts` predicate: canonical ownership governs first; a
+    /// canonical-NULL legacy row is visible only when truly unfiled or every provider agrees on one
+    /// existing open/session-unlocked folder. Sealed, dangling and ambiguous ownership therefore
+    /// contributes nothing to totals/durations/status-breakdown/per-day activity.
     pub fn analytics(&self, unlocked: &HashSet<String>) -> Result<Analytics> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        // "meeting m is visible" = no notes at all, OR at least one visible note — reused below.
-        let visible_meeting = format!(
-            "(NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (SELECT 1 FROM notes n
-                              LEFT JOIN folders f ON f.id = n.folder_id
-                             WHERE n.meeting_id = m.id AND {visible}))"
-        );
+        let visible_meeting = meeting_visibility_clause("m", unlocked);
+        // One canonical/fail-closed meeting visibility oracle is reused by every aggregate below.
 
         let total_meetings: i64 = conn
             .query_row(
@@ -6666,12 +6719,16 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(map_err)?;
-        // Notes count — same folder-visibility gate as brain_counts's note/document split.
+        // Provider-note count follows the meeting's canonical/fail-closed visibility, not the
+        // potentially stale per-provider `notes.folder_id`. This prevents a canonical locked owner
+        // with an open legacy note row — or an ambiguous legacy provider split — from leaking a
+        // count while the meeting itself is hidden.
         let notes_count: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM notes n LEFT JOIN folders f ON f.id = n.folder_id
-                      WHERE {visible}"
+                    "SELECT COUNT(*) FROM notes n
+                       JOIN meetings m ON m.id=n.meeting_id
+                      WHERE {visible_meeting}"
                 ),
                 [],
                 |r| r.get(0),
@@ -6814,6 +6871,29 @@ impl Db {
     pub fn delete_folder(&self, id: &str) -> Result<usize> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        // A recording can be filed before its first provider note exists. The command layer must
+        // rehome those canonical meeting owners before deleting the container, just as it already
+        // rehomes note-backed meetings. Refuse here as the final loss/leak boundary: deleting the
+        // folder row would otherwise leave a dangling `meetings.folder_id` that fails every read
+        // gate and makes the recording disappear from the workspace tree.
+        let meetings_remaining: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM meetings m
+                  WHERE m.folder_id = ?1
+                     OR (m.folder_id IS NULL AND EXISTS(
+                          SELECT 1 FROM notes n
+                           WHERE n.meeting_id=m.id AND n.folder_id=?1
+                        ))",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        if meetings_remaining > 0 {
+            return Err(AppError::Storage(format!(
+                "refusing to delete folder {id}: {meetings_remaining} meeting(s) still assigned \
+                 — reparent them first"
+            )));
+        }
         // NOTES-1 (2026-07-11 audit, CRITICAL data loss): AUTHORED notes (`documents(kind='note')`)
         // must have been REPARENTED to the default note-folder by the command layer BEFORE we get
         // here — the FE promises "delete folder" MOVES its notes, never destroys them. If any authored
@@ -6925,12 +7005,14 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<std::collections::HashMap<String, usize>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
-            "SELECT n.folder_id, COUNT(*) FROM notes n
-               LEFT JOIN folders f ON f.id = n.folder_id
-              WHERE n.folder_id IS NOT NULL AND {visible}
-              GROUP BY n.folder_id"
+            "SELECT COALESCE(m.folder_id, n.folder_id) AS governing_folder_id, COUNT(*)
+               FROM notes n
+               JOIN meetings m ON m.id = n.meeting_id
+              WHERE COALESCE(m.folder_id, n.folder_id) IS NOT NULL
+                AND {meeting_visible}
+              GROUP BY governing_folder_id"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
@@ -6944,6 +7026,37 @@ impl Db {
             out.insert(id, n);
         }
         Ok(out)
+    }
+
+    /// Whether `folder_id` participates in a meeting ownership shape that cannot be sealed or
+    /// unsealed under one content key.
+    ///
+    /// Valid shapes are deliberately narrow: either the meeting is canonically owned by this
+    /// folder and every provider row agrees, or it is a legacy canonical-NULL meeting whose every
+    /// provider row points at this one folder. Any NULL/mismatched sibling provider or a canonical
+    /// owner elsewhere is ambiguous. Lock lifecycle callers refuse this before the first mutation,
+    /// preventing one meeting's provider rows/extras from being encrypted under mixed folder keys.
+    pub fn folder_has_ambiguous_meeting_governance(&self, folder_id: &str) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM meetings m
+                WHERE (m.folder_id=?1 OR EXISTS(
+                         SELECT 1 FROM notes nt
+                          WHERE nt.meeting_id=m.id AND nt.folder_id=?1
+                      ))
+                  AND (
+                    (m.folder_id IS NOT NULL AND m.folder_id IS NOT ?1)
+                    OR EXISTS(
+                         SELECT 1 FROM notes ns
+                          WHERE ns.meeting_id=m.id AND ns.folder_id IS NOT ?1
+                    )
+                  )
+             )",
+            rusqlite::params![folder_id],
+            |row| row.get(0),
+        )
+        .map_err(map_err)
     }
 
     // `set_meeting_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
@@ -6973,27 +7086,49 @@ impl Db {
     // timeline. These helpers add the SAME defense-in-depth the note markdown already has — an
     // AES-GCM blob under the folder CK in an OPEN db, with the plaintext column blanked while
     // sealed, reversed on session-unlock / re-blanked on relock / permanently restored on
-    // remove-lock. All keyed off the meeting set of a folder (a meeting's folder = its notes'
-    // folder, derived from `notes.folder_id`).
+    // remove-lock. All keyed off the meeting's canonical folder, with conservative legacy fallback.
 
     // `meeting_ids_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `folder_for_meeting` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Meetings whose audio may be auto-pruned: every meeting NOT in a locked folder
-    /// (a meeting's folder = its `notes.folder_id`), OLDEST FIRST. A locked folder's audio
+    /// Meetings whose audio may be auto-pruned: every meeting NOT in a locked canonical/legacy
+    /// folder, OLDEST FIRST. A locked folder's audio
     /// is exempt — it is the sealed `.enc` at rest and must never be deleted by prune.
     pub fn prunable_audio_candidates(&self) -> Result<Vec<PrunableAudio>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, started_at, audio_path, mic_master_path, sys_master_path \
-                   FROM meetings \
-                  WHERE id NOT IN ( \
-                      SELECT DISTINCT meeting_id FROM notes \
-                       WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1) \
-                  ) \
-                  ORDER BY started_at ASC, id ASC",
+                "SELECT m.id, m.started_at, m.audio_path, m.mic_master_path, m.sys_master_path
+                   FROM meetings m
+                  WHERE (
+                    (m.folder_id IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM folders f
+                        WHERE f.id=m.folder_id AND f.locked=0
+                    )) OR (
+                      m.folder_id IS NULL AND (
+                        NOT EXISTS (
+                          SELECT 1 FROM notes n
+                           WHERE n.meeting_id=m.id AND n.folder_id IS NOT NULL
+                        ) OR (
+                          NOT EXISTS (
+                            SELECT 1 FROM notes n
+                             WHERE n.meeting_id=m.id AND n.folder_id IS NULL
+                          )
+                          AND 1 = (
+                            SELECT COUNT(DISTINCT n.folder_id) FROM notes n
+                             WHERE n.meeting_id=m.id AND n.folder_id IS NOT NULL
+                          )
+                          AND EXISTS (
+                            SELECT 1 FROM notes n
+                            JOIN folders f ON f.id=n.folder_id
+                             WHERE n.meeting_id=m.id AND f.locked=0
+                          )
+                        )
+                      )
+                    )
+                  )
+                  ORDER BY m.started_at ASC, m.id ASC",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -7083,7 +7218,7 @@ impl Db {
             return Ok((Vec::new(), false, false));
         };
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let channel_filter = match channel {
             crate::audio::merge::RenderChannel::Merged => "AND s.echo_suppressed = 0",
             crate::audio::merge::RenderChannel::Mic => "AND s.speaker = 'me'",
@@ -7109,14 +7244,7 @@ impl Db {
                  SELECT m.id, m.started_at
                    FROM segment_hits h
                    JOIN meetings m ON m.id = h.meeting_id
-                  WHERE (
-                          NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                       OR EXISTS (
-                            SELECT 1 FROM notes n
-                             LEFT JOIN folders f ON f.id = n.folder_id
-                             WHERE n.meeting_id = m.id AND {visible}
-                          )
-                        )
+                  WHERE {meeting_visible}
                     {scope}
                   GROUP BY m.id, m.started_at
                   ORDER BY m.started_at DESC, m.id DESC
@@ -7242,7 +7370,7 @@ impl Db {
             return Ok(Vec::new());
         };
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let date = date_clause(date_filter);
         // FTS5/BM25 candidates (same UNION/MIN(bm25) ranking as `search`), THEN gated by exactly the
         // prior visibility predicate so a sealed-and-not-session-unlocked meeting is excluded: keep
@@ -7274,17 +7402,10 @@ impl Db {
              )
              SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, \
                     m.audio_path, m.status, \
-                    (SELECT nf.folder_id FROM notes nf \
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
-                      AS folder_id
+                    m.folder_id
                FROM ranked r
                JOIN meetings m ON m.id = r.meeting_id
-              WHERE (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )){date}
+              WHERE {meeting_visible}{date}
               ORDER BY r.rank ASC, m.started_at DESC, m.id DESC
               LIMIT ?2"
         );
@@ -7429,18 +7550,11 @@ impl Db {
         // Meetings leg — starts where the notes leg ends in the combined ordering: pages
         // that fell entirely inside the notes leg read meetings from offset 0; pages past
         // it skip exactly the meeting rows earlier pages consumed.
-        let visible_meetings = visibility_clause("n", unlocked);
+        let visible_meetings = meeting_visibility_clause("m", unlocked);
         let meetings_where = format!(
             "m.title IS NOT NULL AND TRIM(m.title) != ''
              AND (:pat IS NULL OR m.title LIKE :pat ESCAPE '\\')
-             AND (
-               NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-               OR EXISTS (
-                 SELECT 1 FROM notes n
-                  LEFT JOIN folders f ON f.id = n.folder_id
-                  WHERE n.meeting_id = m.id AND {visible_meetings}
-               )
-             )"
+             AND {visible_meetings}"
         );
         let meeting_count: i64 = conn
             .query_row(
@@ -8091,20 +8205,13 @@ impl Db {
     /// fails to decode is skipped defensively (never surfaced malformed).
     pub fn list_voiceprints_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<Voiceprint>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT vp.id, vp.meeting_id, vp.cluster_index, vp.label, vp.dim, vp.embedding, \
                     vp.created_at \
                FROM speaker_voiceprints vp \
                JOIN meetings m ON m.id = vp.meeting_id \
-              WHERE ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+              WHERE {meeting_visible} \
               ORDER BY vp.created_at DESC, vp.id DESC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -8155,7 +8262,7 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<VisibleSpeakerLabel>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT vp.cluster_index, vp.label
                FROM speaker_voiceprints vp
@@ -8173,14 +8280,7 @@ impl Db {
                            OR (newer.created_at = vp.created_at AND newer.id > vp.id)
                          )
                     )
-                AND (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                   OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+                AND {meeting_visible}
               ORDER BY vp.cluster_index ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -8527,6 +8627,40 @@ pub(crate) fn visibility_clause(_alias: &str, unlocked: &HashSet<String>) -> Str
     clause
 }
 
+/// Complete visibility predicate for a `meetings` alias. Canonical `meetings.folder_id` governs a
+/// recording even before any note exists; NULL rows retain the conservative legacy note-owned
+/// rule so an ambiguous historical provider split is never assigned to an arbitrary folder.
+pub(crate) fn meeting_visibility_clause(alias: &str, unlocked: &HashSet<String>) -> String {
+    // `visibility_clause` is historically hard-bound to alias `f`; keep that alias local to each
+    // subquery instead of trusting its ignored argument.
+    let visible = visibility_clause("f", unlocked);
+    format!(
+        "(({alias}.folder_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM folders f WHERE f.id={alias}.folder_id AND {visible}
+           )) OR ({alias}.folder_id IS NULL AND (
+              NOT EXISTS (
+                SELECT 1 FROM notes mn
+                 WHERE mn.meeting_id={alias}.id AND mn.folder_id IS NOT NULL
+              )
+              OR (
+                NOT EXISTS (
+                  SELECT 1 FROM notes mn
+                   WHERE mn.meeting_id={alias}.id AND mn.folder_id IS NULL
+                )
+                AND 1 = (
+                  SELECT COUNT(DISTINCT mn.folder_id) FROM notes mn
+                   WHERE mn.meeting_id={alias}.id AND mn.folder_id IS NOT NULL
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM notes mn LEFT JOIN folders f ON f.id=mn.folder_id
+                   WHERE mn.meeting_id={alias}.id AND mn.folder_id IS NOT NULL
+                     AND (f.id IS NULL OR NOT {visible})
+                )
+              )
+           )))"
+    )
+}
+
 /// Split a note's full markdown into `(front_matter_yaml, body)`. A leading `---\n … \n---` block
 /// is the YAML front-matter (Obsidian-native properties); everything after the closing `---` is the
 /// BODY. When there is no well-formed front-matter block the whole string is the body and the yaml
@@ -8794,7 +8928,7 @@ pub(crate) fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>>
     let duration_s: i64 = row.get(4)?;
     let audio_path: Option<String> = row.get(5)?;
     let status_str: String = row.get(6)?;
-    // Trailing column: the meeting's folder, derived from its note rows (NULL = vault root).
+    // Trailing column: the meeting's canonical folder (NULL = unfiled / conservative legacy).
     // Every SELECT feeding this mapper appends a `folder_id` column in this position.
     let folder_id: Option<String> = row.get(7)?;
 

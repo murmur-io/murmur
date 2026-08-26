@@ -300,25 +300,22 @@ impl Db {
         }
     }
 
+    /// Governing folder for attachment seal/materialization. Meeting owners use the same canonical
+    /// resolver as content reads, so a genuine unfiled meeting returns `None` while an ambiguous
+    /// legacy provider split fails closed instead of selecting an arbitrary key/domain.
     pub fn folder_for_attachment_owner(&self, owner: &AttachmentOwner) -> Result<Option<String>> {
-        let conn = self.lock();
         match owner {
-            AttachmentOwner::Document { document_id } => conn
-                .query_row(
+            AttachmentOwner::Document { document_id } => {
+                let conn = self.lock();
+                conn.query_row(
                     "SELECT folder_id FROM documents WHERE id = ?1 AND kind IN ('note','task')",
                     rusqlite::params![document_id],
                     |r| r.get::<_, String>(0),
                 )
                 .optional()
-                .map_err(map_err),
-            AttachmentOwner::Meeting { meeting_id, .. } => conn
-                .query_row(
-                    "SELECT folder_id FROM notes WHERE meeting_id = ?1 AND folder_id IS NOT NULL LIMIT 1",
-                    rusqlite::params![meeting_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(map_err),
+                .map_err(map_err)
+            }
+            AttachmentOwner::Meeting { meeting_id, .. } => self.folder_for_meeting(meeting_id),
             AttachmentOwner::OrgItem { .. } => Ok(None),
         }
     }
@@ -687,7 +684,10 @@ impl Db {
                 "SELECT a.id,a.exported_path FROM note_attachments a
                    WHERE a.exported_path IS NOT NULL AND (
                      a.document_id IN (SELECT id FROM documents WHERE folder_id=?1)
-                     OR a.meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id=?1)
+                     OR a.meeting_id IN (
+                       SELECT id FROM meetings WHERE folder_id=?1
+                       UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                              WHERE n.folder_id=?1 AND m.folder_id IS NULL)
                    )",
             )
             .map_err(map_err)?;
@@ -701,7 +701,10 @@ impl Db {
             "UPDATE note_attachments SET data=X''
                WHERE data_blob IS NOT NULL AND (
                  document_id IN (SELECT id FROM documents WHERE folder_id=?1)
-                 OR meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id=?1)
+                 OR meeting_id IN (
+                   SELECT id FROM meetings WHERE folder_id=?1
+                   UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                          WHERE n.folder_id=?1 AND m.folder_id IS NULL)
                )",
             rusqlite::params![folder_id],
         )
@@ -719,7 +722,10 @@ impl Db {
         let locked_owner = "(document_id IN (
               SELECT d.id FROM documents d JOIN folders f ON f.id=d.folder_id WHERE f.locked=1
             ) OR meeting_id IN (
-              SELECT n.meeting_id FROM notes n JOIN folders f ON f.id=n.folder_id WHERE f.locked=1
+              SELECT m.id FROM meetings m JOIN folders f ON f.id=m.folder_id WHERE f.locked=1
+              UNION SELECT n.meeting_id FROM notes n
+                    JOIN meetings m ON m.id=n.meeting_id JOIN folders f ON f.id=n.folder_id
+                    WHERE m.folder_id IS NULL AND f.locked=1
             ))";
         let mut stmt = tx
             .prepare(&format!(
@@ -751,7 +757,10 @@ impl Db {
                 "SELECT id,document_id,meeting_id,provider_id,org_item_id,mime_type,extension,byte_len,width,height,sha256,data,data_blob,exported_path,created_at
                    FROM note_attachments WHERE
                      document_id IN (SELECT id FROM documents WHERE folder_id=?1)
-                     OR meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id=?1)
+                     OR meeting_id IN (
+                       SELECT id FROM meetings WHERE folder_id=?1
+                       UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                              WHERE n.folder_id=?1 AND m.folder_id IS NULL)
                    ORDER BY created_at,id",
             )
             .map_err(map_err)?;
@@ -803,6 +812,11 @@ impl Db {
             ));
         }
         tx.execute(
+            "UPDATE meetings SET folder_id=?2 WHERE id=?1",
+            rusqlite::params![meeting_id, folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
             "UPDATE notes SET folder_id=?2 WHERE meeting_id=?1",
             rusqlite::params![meeting_id, folder_id],
         )
@@ -848,6 +862,11 @@ impl Db {
             ));
         }
         tx.execute(
+            "UPDATE meetings SET folder_id=?2 WHERE id=?1",
+            rusqlite::params![meeting_id, folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
             "UPDATE notes SET folder_id=?2 WHERE meeting_id=?1",
             rusqlite::params![meeting_id, folder_id],
         )
@@ -891,7 +910,10 @@ impl Db {
                 "SELECT id,exported_path FROM note_attachments
                    WHERE data_blob IS NOT NULL AND exported_path IS NOT NULL AND (
                      document_id IN (SELECT id FROM documents WHERE folder_id=?1)
-                     OR meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id=?1)
+                     OR meeting_id IN (
+                       SELECT id FROM meetings WHERE folder_id=?1
+                       UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                              WHERE n.folder_id=?1 AND m.folder_id IS NULL)
                    )",
             )
             .map_err(map_err)?;
@@ -908,7 +930,10 @@ impl Db {
         conn.execute(
             "DELETE FROM note_attachments WHERE data_blob IS NOT NULL AND (
                document_id IN (SELECT id FROM documents WHERE folder_id=?1)
-               OR meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id=?1)
+               OR meeting_id IN (
+                 SELECT id FROM meetings WHERE folder_id=?1
+                 UNION SELECT n.meeting_id FROM notes n JOIN meetings m ON m.id=n.meeting_id
+                        WHERE n.folder_id=?1 AND m.folder_id IS NULL)
              )",
             rusqlite::params![folder_id],
         )
@@ -1018,6 +1043,214 @@ impl Db {
         tx.commit().map_err(map_err)?;
         Ok(())
     }
+
+    /// Conversion-specific companion update: replace only the command-composed Markdown while
+    /// relocating the existing companion into the meeting's exact container in the SAME
+    /// transaction. The caller supplies authenticated attachment plaintext and, for a locked
+    /// destination, target-CK blobs that it already verified byte-identical. The source folder and
+    /// structured meeting id are optimistic identity witnesses; a concurrent move/relink therefore
+    /// changes zero rows and rolls the whole operation back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_converted_companion_atomic(
+        &self,
+        document_id: &str,
+        expected_source_folder_id: &str,
+        target_folder_id: &str,
+        expected_target_locked: bool,
+        meeting_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        updated_at: i64,
+        attachment_plaintext: &HashMap<String, Vec<u8>>,
+        attachment_seals: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        self.update_converted_companion_atomic_core(
+            document_id,
+            expected_source_folder_id,
+            target_folder_id,
+            expected_target_locked,
+            meeting_id,
+            title,
+            text,
+            text_blob,
+            updated_at,
+            attachment_plaintext,
+            attachment_seals,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_converted_companion_atomic_core(
+        &self,
+        document_id: &str,
+        expected_source_folder_id: &str,
+        target_folder_id: &str,
+        expected_target_locked: bool,
+        meeting_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        updated_at: i64,
+        attachment_plaintext: &HashMap<String, Vec<u8>>,
+        attachment_seals: &HashMap<String, Vec<u8>>,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if expected_target_locked != text_blob.is_some()
+            || (expected_target_locked && attachment_plaintext.len() != attachment_seals.len())
+            || (!expected_target_locked && !attachment_seals.is_empty())
+        {
+            return Err(AppError::Storage(
+                "converted companion seal set does not match destination lock state".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let target_matches = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM folders
+                     WHERE id = ?1
+                       AND locked = ?2
+                       AND COALESCE(kind, 'meeting') IN ('meeting', 'note')
+                       AND path NOT LIKE '.murmur/%'
+                 )",
+                rusqlite::params![target_folder_id, expected_target_locked as i64],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !target_matches {
+            return Err(AppError::Locked(
+                "the conversion destination changed or is unavailable; retry".into(),
+            ));
+        }
+        let attachment_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM note_attachments WHERE document_id=?1",
+                [document_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if attachment_count as usize != attachment_plaintext.len() {
+            return Err(AppError::Storage(
+                "attachment set changed during converted companion update".into(),
+            ));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE documents
+                    SET folder_id=?4, title=?5, text=?6, text_blob=?7, updated_at=?8,
+                        exported_path=NULL, exported_hash=NULL
+                  WHERE id=?1 AND kind='note' AND folder_id=?2 AND meeting_id=?3",
+                rusqlite::params![
+                    document_id,
+                    expected_source_folder_id,
+                    meeting_id,
+                    target_folder_id,
+                    title,
+                    text,
+                    text_blob,
+                    updated_at
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Err(AppError::Storage(
+                "the companion note moved or changed identity during conversion".into(),
+            ));
+        }
+        for (id, data) in attachment_plaintext {
+            let changed = if expected_target_locked {
+                let blob = attachment_seals.get(id).ok_or_else(|| {
+                    AppError::Storage("converted companion attachment seal is missing".into())
+                })?;
+                tx.execute(
+                    "UPDATE note_attachments
+                        SET data=X'', data_blob=?3, exported_path=NULL
+                      WHERE id=?1 AND document_id=?2",
+                    rusqlite::params![id, document_id, blob],
+                )
+            } else {
+                tx.execute(
+                    "UPDATE note_attachments
+                        SET data=?3, data_blob=NULL, exported_path=NULL
+                      WHERE id=?1 AND document_id=?2",
+                    rusqlite::params![id, document_id, data],
+                )
+            }
+            .map_err(map_err)?;
+            if changed != 1 {
+                return Err(AppError::Storage(
+                    "attachment disappeared during converted companion update".into(),
+                ));
+            }
+        }
+        if expected_target_locked {
+            let document_ids = [document_id.to_string()];
+            Self::purge_doc_chunks_tx(&tx, &document_ids)?;
+            Self::purge_links_tx(&tx, &[], &document_ids, true)?;
+            Self::purge_all_pending_audit_findings_tx(&tx)?;
+            Self::purge_all_ask_conversations_tx(&tx)?;
+        }
+        checkpoint()?;
+        Self::upsert_link_tx(
+            &tx,
+            "note",
+            document_id,
+            "meeting",
+            meeting_id,
+            "companion",
+            1.0,
+            "user",
+            "active",
+            updated_at,
+        )?;
+        tx.execute(
+            "UPDATE org_shares
+                SET republish_dirty = republish_dirty + 1, republish_deferred=0
+              WHERE document_id=?1 AND state IN ('queued','uploaded','failed')",
+            [document_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_converted_companion_atomic_failing(
+        &self,
+        document_id: &str,
+        expected_source_folder_id: &str,
+        target_folder_id: &str,
+        expected_target_locked: bool,
+        meeting_id: &str,
+        title: &str,
+        text: &str,
+        text_blob: Option<&[u8]>,
+        updated_at: i64,
+        attachment_plaintext: &HashMap<String, Vec<u8>>,
+        attachment_seals: &HashMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        self.update_converted_companion_atomic_core(
+            document_id,
+            expected_source_folder_id,
+            target_folder_id,
+            expected_target_locked,
+            meeting_id,
+            title,
+            text,
+            text_blob,
+            updated_at,
+            attachment_plaintext,
+            attachment_seals,
+            || {
+                Err(AppError::Storage(
+                    "injected converted companion update failure".into(),
+                ))
+            },
+        )
+    }
 }
 
 fn row_to_attachment(r: &Row<'_>) -> rusqlite::Result<AttachmentRecord> {
@@ -1053,4 +1286,64 @@ fn row_to_attachment(r: &Row<'_>) -> rusqlite::Result<AttachmentRecord> {
         exported_path: r.get(13)?,
         created_at: r.get(14)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{Folder, Meeting, MeetingStatus, NoteRecord};
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn ambiguous_legacy_meeting_attachment_owner_fails_closed() {
+        let db = Db::open_with_key(std::path::Path::new(":memory:"), TEST_DEK).unwrap();
+        for id in ["f-one", "f-two"] {
+            db.insert_folder(&Folder {
+                id: id.into(),
+                name: id.into(),
+                path: id.into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-08-26T00:00:00Z".into(),
+            })
+            .unwrap();
+        }
+        db.insert_meeting(&Meeting {
+            id: "m".into(),
+            started_at: "2026-08-26T00:00:00Z".into(),
+            ended_at: None,
+            title: Some("meeting".into()),
+            duration_s: 1,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        for (provider_id, folder_id) in [("one", "f-one"), ("two", "f-two")] {
+            db.upsert_note(&NoteRecord {
+                meeting_id: "m".into(),
+                provider_id: provider_id.into(),
+                markdown: "private".into(),
+                created_at: "2026-08-26T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            db.lock()
+                .execute(
+                    "UPDATE notes SET folder_id=?2 WHERE meeting_id='m' AND provider_id=?1",
+                    rusqlite::params![provider_id, folder_id],
+                )
+                .unwrap();
+        }
+        let owner = AttachmentOwner::Meeting {
+            meeting_id: "m".into(),
+            provider_id: "one".into(),
+        };
+
+        assert!(matches!(
+            db.folder_for_attachment_owner(&owner),
+            Err(AppError::Locked(_))
+        ));
+    }
 }

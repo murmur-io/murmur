@@ -1,20 +1,14 @@
-/* :host is the trigger's positioning context — `position: relative` so the
-   panel below anchors to THIS element, not the row. Quiet until the row is
+/* :host keeps only the in-row trigger. The panel is teleported to `body` and
+   fixed to viewport coordinates so no sidebar stacking context can cover it. Quiet until the row is
    hovered/focused (`:host-context` reaches out to the ANCESTOR `mur-tree-row`
    — Angular emulated encapsulation supports it — so no consumer file has to
-   re-declare a hover-reveal rule for this component's internals) or the
-   panel is open (never hide out from under an open menu). */
+   re-declare a hover-emphasis rule for this component's internals) or the
+   panel is open. The trigger remains faintly visible at rest for keyboard and
+   touch discoverability; only the trigger fades, never its floating panel. */
 :host {
   position: relative;
   display: inline-flex;
   flex: none;
-  opacity: 0;
-  transition: opacity var(--transition-fast);
-}
-:host-context(mur-tree-row:hover),
-:host-context(mur-tree-row:focus-within),
-:host(.is-open) {
-  opacity: 1;
 }
 
 .row-menu-trigger {
@@ -28,9 +22,16 @@
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
+  opacity: 0.45;
   transition:
+    opacity var(--transition-fast),
     background var(--transition-fast),
     color var(--transition-fast);
+}
+:host-context(mur-tree-row:hover) .row-menu-trigger,
+:host-context(mur-tree-row:focus-within) .row-menu-trigger,
+:host(.is-open) .row-menu-trigger {
+  opacity: 1;
 }
 .row-menu-trigger:hover:not(:disabled),
 .row-menu-trigger.is-open {
@@ -46,22 +47,33 @@
   cursor: default;
 }
 
-/* The panel floats OVER the tree — anchored to the trigger's bottom-right so
-   it never runs off the sidebar's right edge. `.menu` (primitives.css)
+/* The panel floats OVER the tree — viewport-anchored to the trigger's bottom-right
+   after it is teleported to `body`. `.menu` (primitives.css)
    supplies the opaque surface/border/shadow; this file only positions it.
    OVERRIDES `.menu`'s 240px min-width (live-found bug, 2026-07-12): that
    width is sized for the note editor's multi-item "⋯" menu, but a nested
    tree row can have very little room to the panel's LEFT (it's right-
    anchored, so it grows leftward) before hitting the sidebar's own
-   `overflow: hidden` glass panel (`.drill-rail`, styles.css) — which clips
-   silently, no scrollbar, no visual cue (the "ename"/"elete" bug: the panel
-   was wide enough to lose "R"/"D" off its clipped left edge). This menu only
-   ever holds 2-3 short items (Rename/Lock/Delete), so a much narrower panel
-   comfortably fits even at deep indentation. */
+   `overflow: hidden` glass panel (`.drill-rail`, styles.css). The hierarchy's
+   context labels are now explicit ("Lock project and its folders", not a glyph),
+   so the panel needs a readable width and its own bounded scroll instead of
+   squeezing words into an anonymous 140px strip. */
 .row-menu-panel {
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
-  z-index: 30;
-  min-width: 140px;
+  position: fixed;
+  z-index: var(--z-overlay);
+  min-width: 220px;
+  max-width: min(260px, calc(100vw - 2 * var(--space-4)));
+  max-height: min(320px, calc(100dvh - 2 * var(--space-4)));
+  overflow-y: auto;
+  visibility: hidden;
+  pointer-events: none;
+  /* Never fade the floating surface with its hover-revealed trigger. WebKit can paint the newly
+     inserted panel during the host's opacity transition, briefly exposing tree text through the
+     menu even though the `.menu` primitive itself uses an opaque token. */
+  opacity: 1;
+}
+
+.row-menu-panel.is-positioned {
+  visibility: visible;
+  pointer-events: auto;
 }

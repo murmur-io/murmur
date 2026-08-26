@@ -6,6 +6,7 @@ const FOREST = [
   {
     id: "p-acme",
     name: "Acme",
+    kind: "meeting",
     level: "project",
     emoji: "🟣",
     tint: null,
@@ -125,7 +126,32 @@ test("uses a persistent global rail beside a contextual Spaces panel", async ({ 
   await expect(rail.getByRole("button", { name: "Spaces" })).toBeVisible();
   await expect(rail.getByRole("link", { name: "Ask" })).toBeVisible();
   await expect(rail.getByRole("button", { name: "Browse" })).toBeVisible();
+  await expect(
+    rail.getByRole("button", { name: "New note" }).locator("mur-icon"),
+  ).toHaveAttribute("data-icon", "note-add");
   await expect(rail.getByRole("link", { name: "Settings" })).toBeVisible();
+});
+
+test("collapsing the whole Spaces panel persists on leaf routes and the rail restores it", async ({
+  page,
+}) => {
+  await boot(page, "/container/p-acme");
+  const spaces = page.getByRole("complementary", { name: "Spaces sidebar" });
+  await expect(spaces).toBeVisible();
+
+  await spaces.getByRole("button", { name: "Collapse Spaces sidebar" }).click();
+  await expect(spaces).toHaveCount(0);
+  expect(
+    await page.evaluate(() => localStorage.getItem("murmur.shell.spacesCollapsed")),
+  ).toBe("true");
+
+  await page.reload();
+  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  expect(
+    await page.evaluate(() => localStorage.getItem("murmur.shell.spacesCollapsed")),
+  ).toBe("false");
 });
 
 test("task and dashboard leaves keep Spaces visible and select the matching row", async ({
@@ -245,7 +271,7 @@ test("does not offer or dispatch top-level folder creation into a sealed first S
       create_folder: (args: unknown) => {
         const target = window as unknown as { __shellFolderCalls?: unknown[] };
         (target.__shellFolderCalls ??= []).push(args);
-        return null;
+        return { id: "f-new" };
       },
     },
     { list_workspace_tree: SEALED_FIRST_FOREST },
