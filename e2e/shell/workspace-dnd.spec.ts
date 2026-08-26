@@ -6,6 +6,7 @@ const FOREST = [
   {
     id: "p-acme",
     name: "Acme",
+    kind: "meeting",
     level: "project",
     emoji: null,
     tint: null,
@@ -40,6 +41,7 @@ const FOREST = [
   {
     id: "p-target",
     name: "Target",
+    kind: "meeting",
     level: "project",
     emoji: null,
     tint: null,
@@ -52,6 +54,7 @@ const FOREST = [
   {
     id: "p-sealed",
     name: "Clients",
+    kind: "meeting",
     level: "project",
     emoji: null,
     tint: null,

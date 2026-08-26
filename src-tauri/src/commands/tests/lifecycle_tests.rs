@@ -2004,9 +2004,7 @@
                 gateway_host: None,
             })
             .unwrap();
-        // Associate the note (hence the meeting) with the folder, then seal it. `meeting_is_unlocked`
-        // resolves the folder via `notes.folder_id` (`folder_for_meeting`), so this MUST be set or the
-        // meeting reads as vault-root/open and the gate is a no-op.
+        // Synchronize the provider note with the meeting's canonical folder, then seal it.
         state
             .db
             .set_note_folder("m-locked", Some("f-lock"))
@@ -4528,6 +4526,43 @@
         .unwrap();
     }
 
+    fn seed_ambiguous_legacy_meeting(db: &Db, meeting_id: &str, folder_a: &str, folder_b: &str) {
+        db.insert_meeting(&Meeting {
+            id: meeting_id.into(),
+            started_at: "2026-06-27T09:00:00Z".into(),
+            ended_at: None,
+            title: Some("Legacy split".into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        for (provider_id, folder_id, markdown) in [
+            ("provider-a", folder_a, "provider A body"),
+            ("provider-b", folder_b, "provider B body"),
+        ] {
+            db.upsert_note(&NoteRecord {
+                meeting_id: meeting_id.into(),
+                provider_id: provider_id.into(),
+                markdown: markdown.into(),
+                created_at: "2026-06-27T09:01:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+            // Bypass the synchronizing production setter to reproduce a pre-canonical database.
+            db.lock()
+                .execute(
+                    "UPDATE notes SET folder_id=?3 WHERE meeting_id=?1 AND provider_id=?2",
+                    rusqlite::params![meeting_id, provider_id, folder_id],
+                )
+                .unwrap();
+        }
+    }
+
     /// Seed a meeting with an explicit title + audio path into a folder (association lives on the
     /// note's `folder_id`, resolved back by `list_meetings`).
     fn seed_titled_meeting(db: &Db, mid: &str, title: &str, audio: &str, folder_id: &str) {
@@ -4909,6 +4944,518 @@
         }
     }
 
+    struct CanonicalPreNoteHistory {
+        folder_id: String,
+        meeting_id: String,
+        owner: crate::storage::AttachmentOwner,
+        note: String,
+        segments: [String; 2],
+        timeline: String,
+        manual_notes: String,
+        attachment: Vec<u8>,
+        audio: Vec<(std::path::PathBuf, Vec<u8>)>,
+    }
+
+    /// Birth the recording in a container before any provider note exists, then let the normal
+    /// processing artifacts arrive. This is the exact history `meetings.folder_id` was added to
+    /// preserve: placement exists from recording time and every later provider-owned artifact
+    /// inherits that one governing lock domain.
+    fn seed_canonical_pre_note_history(
+        state: &AppState,
+        tag: &str,
+        with_audio: bool,
+    ) -> CanonicalPreNoteHistory {
+        let folder_id = format!("f-canonical-{tag}");
+        let meeting_id = format!("m-canonical-{tag}");
+        make_open_folder(&state.db, &folder_id, &format!("Canonical {tag}"));
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: meeting_id.clone(),
+                started_at: "2026-08-26T09:00:00Z".into(),
+                ended_at: Some("2026-08-26T09:10:00Z".into()),
+                title: Some(format!("PRIVATE canonical title {tag}")),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Draft,
+                folder_id: Some(folder_id.clone()),
+            })
+            .unwrap();
+        assert!(
+            state
+                .db
+                .sealable_notes_for_meeting(&meeting_id)
+                .unwrap()
+                .is_empty(),
+            "placement must precede the first provider note"
+        );
+
+        let note = format!("# PRIVATE canonical note {tag}\n\nDECISION-{tag}");
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: meeting_id.clone(),
+                provider_id: "claude_code".into(),
+                markdown: note.clone(),
+                created_at: "2026-08-26T09:11:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        let inherited_folder: Option<String> = state
+            .db
+            .lock()
+            .query_row(
+                "SELECT folder_id FROM notes WHERE meeting_id=?1 AND provider_id='claude_code'",
+                rusqlite::params![meeting_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inherited_folder.as_deref(),
+            Some(folder_id.as_str()),
+            "a provider note born after filing inherits canonical recording placement"
+        );
+
+        let segments = [
+            format!("PRIVATE segment alpha {tag}"),
+            format!("PRIVATE segment omega {tag}"),
+        ];
+        state
+            .db
+            .insert_segments(
+                &meeting_id,
+                &[
+                    Segment {
+                        idx: 0,
+                        start_s: 0.0,
+                        end_s: 2.0,
+                        text: segments[0].clone(),
+                        speaker: Some("Me".into()),
+                        confidence: Some(0.99),
+                    },
+                    Segment {
+                        idx: 1,
+                        start_s: 2.0,
+                        end_s: 4.0,
+                        text: segments[1].clone(),
+                        speaker: Some("Others".into()),
+                        confidence: Some(0.98),
+                    },
+                ],
+            )
+            .unwrap();
+        let timeline = format!(r#"{{"topics":[{{"label":"PRIVATE timeline {tag}"}}]}}"#);
+        state
+            .db
+            .set_timeline_data(&meeting_id, &timeline)
+            .unwrap();
+        let manual_notes = format!("PRIVATE manual notes {tag}");
+        state
+            .db
+            .set_manual_notes(&meeting_id, &manual_notes)
+            .unwrap();
+
+        let owner = crate::storage::AttachmentOwner::Meeting {
+            meeting_id: meeting_id.clone(),
+            provider_id: "claude_code".into(),
+        };
+        let attachment = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+                           \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+                           \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+                           \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+                           \xae\x42\x60\x82"
+            .to_vec();
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(&attachment).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: &format!("attachment-{tag}"),
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: attachment.len(),
+                data: &attachment,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+
+        let mut audio = Vec::new();
+        if with_audio {
+            for (role, bytes) in [
+                ("playback", b"RIFF canonical playback bytes".as_slice()),
+                ("mic", b"RIFF canonical mic bytes".as_slice()),
+                ("sys", b"RIFF canonical system bytes".as_slice()),
+            ] {
+                let path = crate::storage::db::unique_temp_path(
+                    &format!("murmur-canonical-{tag}-{role}"),
+                    "wav",
+                );
+                std::fs::write(&path, bytes).unwrap();
+                let path_string = path.to_string_lossy().to_string();
+                match role {
+                    "playback" => state
+                        .db
+                        .set_meeting_audio_path(&meeting_id, Some(&path_string))
+                        .unwrap(),
+                    "mic" => state
+                        .db
+                        .set_meeting_mic_master_path(&meeting_id, Some(&path_string))
+                        .unwrap(),
+                    "sys" => state
+                        .db
+                        .set_meeting_sys_master_path(&meeting_id, Some(&path_string))
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                audio.push((path, bytes.to_vec()));
+            }
+        }
+
+        CanonicalPreNoteHistory {
+            folder_id,
+            meeting_id,
+            owner,
+            note,
+            segments,
+            timeline,
+            manual_notes,
+            attachment,
+            audio,
+        }
+    }
+
+    #[test]
+    fn canonical_pre_note_history_round_trips_lock_relock_and_permanent_unlock_byte_identical() {
+        let state = build_state("canonical-pre-note-roundtrip");
+        let history = seed_canonical_pre_note_history(&state, "roundtrip", true);
+
+        lock_folder_inner(&state, history.folder_id.clone()).unwrap();
+        let assert_at_rest = || {
+            let note = &state
+                .db
+                .sealable_notes_for_meeting(&history.meeting_id)
+                .unwrap()[0];
+            assert_eq!(note.markdown, "");
+            assert!(note.content_blob.is_some());
+            let segments = state.db.raw_segments(&history.meeting_id).unwrap();
+            assert_eq!(segments.len(), 2);
+            assert!(segments
+                .iter()
+                .all(|segment| segment.text.is_empty() && segment.text_blob.is_some()));
+            let timeline = state
+                .db
+                .raw_timeline(&history.meeting_id)
+                .unwrap()
+                .unwrap();
+            assert!(timeline.data.is_empty() && timeline.data_blob.is_some());
+            let manual = state
+                .db
+                .raw_manual_notes(&history.meeting_id)
+                .unwrap()
+                .unwrap();
+            assert!(manual.text.is_empty() && manual.blob.is_some());
+            let attachment = &state.db.list_attachments(&history.owner).unwrap()[0];
+            assert!(attachment.data.is_empty() && attachment.data_blob.is_some());
+
+            let meeting = state.db.get_meeting(&history.meeting_id).unwrap().unwrap();
+            let (mic, sys) = state
+                .db
+                .get_meeting_master_paths(&history.meeting_id)
+                .unwrap();
+            let stored = [meeting.audio_path, mic, sys];
+            for ((plain, _), sealed) in history.audio.iter().zip(stored) {
+                let sealed = sealed.expect("all three audio roles stay tracked");
+                assert_eq!(sealed, format!("{}.enc", plain.to_string_lossy()));
+                assert!(!plain.exists(), "plaintext audio must be absent at rest");
+                assert!(std::path::Path::new(&sealed).exists());
+            }
+        };
+        assert_at_rest();
+
+        // Mirror the production unlock closure: restore every provider note first, then all extras,
+        // then publish the in-memory folder admission.
+        let ck = restore_notes_and_ck(&state, &history.folder_id);
+        unseal_folder_extras(&state, &history.folder_id, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(history.folder_id.clone());
+
+        assert_eq!(
+            state
+                .db
+                .get_latest_note_for_meeting(&history.meeting_id)
+                .unwrap()
+                .unwrap()
+                .markdown,
+            history.note
+        );
+        assert_eq!(
+            state
+                .db
+                .get_segments(&history.meeting_id)
+                .unwrap()
+                .into_iter()
+                .map(|segment| segment.text)
+                .collect::<Vec<_>>(),
+            history.segments
+        );
+        assert_eq!(
+            state
+                .db
+                .get_timeline_data(&history.meeting_id)
+                .unwrap()
+                .as_deref(),
+            Some(history.timeline.as_str())
+        );
+        assert_eq!(
+            state.db.get_manual_notes(&history.meeting_id).unwrap(),
+            history.manual_notes
+        );
+        let attachment = &state.db.list_attachments(&history.owner).unwrap()[0];
+        assert_eq!(attachment.data, history.attachment);
+        assert!(attachment.data_blob.is_some(), "session restore retains recovery blob");
+        let meeting = state.db.get_meeting(&history.meeting_id).unwrap().unwrap();
+        let (mic, sys) = state
+            .db
+            .get_meeting_master_paths(&history.meeting_id)
+            .unwrap();
+        for ((plain, bytes), restored) in history
+            .audio
+            .iter()
+            .zip([meeting.audio_path, mic, sys])
+        {
+            assert_eq!(restored.as_deref(), Some(plain.to_string_lossy().as_ref()));
+            assert_eq!(std::fs::read(plain).unwrap(), *bytes);
+            assert!(std::path::Path::new(&format!("{}.enc", plain.to_string_lossy())).exists());
+        }
+
+        // The real lifecycle relock verifies every retained blob against session plaintext before
+        // destroying any readable copy, then revokes the session admission.
+        relock_all_inner(&state).unwrap();
+        assert_at_rest();
+        assert!(!state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .contains(&history.folder_id));
+
+        // Permanent unlock repeats the verified restore but clears blobs and retires `.enc` only
+        // after the durable `locked=0` commit.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, history.folder_id.clone()).unwrap();
+        assert!(!state
+            .db
+            .folder_by_id(&history.folder_id)
+            .unwrap()
+            .unwrap()
+            .locked);
+        let note = &state
+            .db
+            .sealable_notes_for_meeting(&history.meeting_id)
+            .unwrap()[0];
+        assert_eq!(note.markdown, history.note);
+        assert!(note.content_blob.is_none());
+        let segments = state.db.raw_segments(&history.meeting_id).unwrap();
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<Vec<_>>(),
+            history
+                .segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert!(segments.iter().all(|segment| segment.text_blob.is_none()));
+        let timeline = state
+            .db
+            .raw_timeline(&history.meeting_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(timeline.data, history.timeline);
+        assert!(timeline.data_blob.is_none());
+        let manual = state
+            .db
+            .raw_manual_notes(&history.meeting_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manual.text, history.manual_notes);
+        assert!(manual.blob.is_none());
+        let attachment = &state.db.list_attachments(&history.owner).unwrap()[0];
+        assert_eq!(attachment.data, history.attachment);
+        assert!(attachment.data_blob.is_none());
+        let meeting = state.db.get_meeting(&history.meeting_id).unwrap().unwrap();
+        let (mic, sys) = state
+            .db
+            .get_meeting_master_paths(&history.meeting_id)
+            .unwrap();
+        for ((plain, bytes), restored) in history
+            .audio
+            .iter()
+            .zip([meeting.audio_path, mic, sys])
+        {
+            assert_eq!(restored.as_deref(), Some(plain.to_string_lossy().as_ref()));
+            assert_eq!(std::fs::read(plain).unwrap(), *bytes);
+            assert!(!std::path::Path::new(&format!("{}.enc", plain.to_string_lossy())).exists());
+            std::fs::remove_file(plain).unwrap();
+        }
+    }
+
+    #[test]
+    fn canonical_pre_note_permanent_unlock_failure_retains_all_recovery_bytes() {
+        let state = build_state("canonical-pre-note-failed-unlock");
+        let history = seed_canonical_pre_note_history(&state, "failed-unlock", true);
+        lock_folder_inner(&state, history.folder_id.clone()).unwrap();
+
+        let note_blob = state
+            .db
+            .sealable_notes_for_meeting(&history.meeting_id)
+            .unwrap()[0]
+            .content_blob
+            .clone()
+            .unwrap();
+        let segments_before = state
+            .db
+            .raw_segments(&history.meeting_id)
+            .unwrap()
+            .into_iter()
+            .map(|segment| (segment.idx, segment.text, segment.text_blob))
+            .collect::<Vec<_>>();
+        let timeline_before = state
+            .db
+            .raw_timeline(&history.meeting_id)
+            .unwrap()
+            .unwrap();
+        let manual_before = state
+            .db
+            .raw_manual_notes(&history.meeting_id)
+            .unwrap()
+            .unwrap();
+        let mut corrupt_attachment_blob = state.db.list_attachments(&history.owner).unwrap()[0]
+            .data_blob
+            .clone()
+            .unwrap();
+        let corrupt_at = corrupt_attachment_blob.len() / 2;
+        corrupt_attachment_blob[corrupt_at] ^= 0x80;
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE note_attachments SET data_blob=?2 WHERE id=?1",
+                rusqlite::params![
+                    format!("attachment-{}", "failed-unlock"),
+                    corrupt_attachment_blob
+                ],
+            )
+            .unwrap();
+        let meeting_before = state.db.get_meeting(&history.meeting_id).unwrap().unwrap();
+        let masters_before = state
+            .db
+            .get_meeting_master_paths(&history.meeting_id)
+            .unwrap();
+        let audio_ciphertexts = history
+            .audio
+            .iter()
+            .map(|(plain, _)| {
+                let sealed = std::path::PathBuf::from(format!("{}.enc", plain.to_string_lossy()));
+                (sealed.clone(), std::fs::read(sealed).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let wrapped_before = state
+            .db
+            .folder_wrapped_key(&history.folder_id)
+            .unwrap()
+            .unwrap();
+
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        let error = remove_lock_inner(&state, history.folder_id.clone())
+            .expect_err("corrupt attachment ciphertext must abort permanent unlock");
+        assert!(matches!(
+            error,
+            AppError::Locked(_) | AppError::Storage(_) | AppError::Other(_)
+        ));
+        assert!(state
+            .db
+            .folder_by_id(&history.folder_id)
+            .unwrap()
+            .unwrap()
+            .locked);
+        assert_eq!(
+            state
+                .db
+                .folder_wrapped_key(&history.folder_id)
+                .unwrap()
+                .unwrap(),
+            wrapped_before
+        );
+
+        // Provider markdown was restored before the deliberately failing attachment step, but its
+        // recovery blob is retained. Thus both copies remain valid; failure never creates the fatal
+        // blank-plus-NULL shape.
+        let note = &state
+            .db
+            .sealable_notes_for_meeting(&history.meeting_id)
+            .unwrap()[0];
+        assert_eq!(note.markdown, history.note);
+        assert_eq!(note.content_blob.as_deref(), Some(note_blob.as_slice()));
+        let segments_after = state
+            .db
+            .raw_segments(&history.meeting_id)
+            .unwrap()
+            .into_iter()
+            .map(|segment| (segment.idx, segment.text, segment.text_blob))
+            .collect::<Vec<_>>();
+        assert_eq!(segments_after, segments_before);
+        let timeline_after = state
+            .db
+            .raw_timeline(&history.meeting_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(timeline_after.data, timeline_before.data);
+        assert_eq!(timeline_after.data_blob, timeline_before.data_blob);
+        let manual_after = state
+            .db
+            .raw_manual_notes(&history.meeting_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manual_after.text, manual_before.text);
+        assert_eq!(manual_after.blob, manual_before.blob);
+        let attachment = &state.db.list_attachments(&history.owner).unwrap()[0];
+        assert!(attachment.data.is_empty());
+        assert_eq!(
+            attachment.data_blob.as_deref(),
+            Some(corrupt_attachment_blob.as_slice()),
+            "the failing ciphertext is retained for diagnosis/recovery, never deleted"
+        );
+        let meeting_after = state.db.get_meeting(&history.meeting_id).unwrap().unwrap();
+        assert_eq!(meeting_after.audio_path, meeting_before.audio_path);
+        assert_eq!(
+            state
+                .db
+                .get_meeting_master_paths(&history.meeting_id)
+                .unwrap(),
+            masters_before
+        );
+        for ((sealed, bytes), (plain, _)) in audio_ciphertexts.iter().zip(&history.audio) {
+            assert_eq!(std::fs::read(sealed).unwrap(), *bytes);
+            assert!(!plain.exists(), "failed unlock must not strand plaintext audio");
+            std::fs::remove_file(sealed).unwrap();
+        }
+    }
+
     #[test]
     fn conversion_command_relock_during_provider_await_writes_nothing() {
         let state = std::sync::Arc::new(build_state("conversion-command-await-relock"));
@@ -5227,7 +5774,15 @@
 
     #[test]
     fn conversion_command_provider_and_canonical_write_failures_preserve_existing_bytes() {
-        let state = build_state("conversion-command-preserve-failures");
+        const ATTACHMENT_ID: &str = "10000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("conversion-command-preserve-failures");
+        let state = build_state_with_vault("conversion-command-preserve-failures", &vault);
         seed_meeting(&state.db, "m-existing", "# Existing source", None);
         let snapshot = capture_meeting_content_snapshot(&state, "m-existing").unwrap();
         let companion = persist_converted_companion_under_snapshot_with(
@@ -5239,12 +5794,74 @@
             None,
         )
         .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser-owned bytes remain outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Quarterly strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
         let before = state
             .db
             .get_note_row(&companion.note_id)
             .unwrap()
-            .unwrap()
-            .text;
+            .unwrap();
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(
+            before
+                .exported_path
+                .as_deref()
+                .expect("real vault tracks the converted note export"),
+        );
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment
+                .exported_path
+                .as_deref()
+                .expect("real vault tracks the converted attachment export"),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES)
+            .expect("simulate the tracked deterministic attachment twin");
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
 
         let provider_failure = block_on(convert_meeting_to_note_inner_with(
             None,
@@ -5261,7 +5878,16 @@
                 .unwrap()
                 .unwrap()
                 .text,
-            before
+            before.text
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
         );
 
         state
@@ -5283,16 +5909,49 @@
             )),
         ));
         assert!(write_failure.is_err());
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
         assert_eq!(
             state
                 .db
-                .get_note_row(&companion.note_id)
-                .unwrap()
-                .unwrap()
-                .text,
-            before,
-            "canonical update failure preserves the companion byte-for-byte"
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash,
+            "canonical update failure preserves the Markdown export baseline"
         );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment],
+            "canonical update failure preserves the attachment row and tracked path"
+        );
+        assert_eq!(
+            std::fs::read(&note_export).unwrap(),
+            note_export_bytes,
+            "the tracked Markdown export is restored byte-identical after rollback"
+        );
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes,
+            "the tracked attachment export is restored byte-identical after rollback"
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes,
+            "the deterministic attachment twin is restored byte-identical after rollback"
+        );
+        let _ = std::fs::remove_dir_all(vault);
     }
 
     #[test]
@@ -5476,6 +6135,773 @@
                 .text,
             before,
             "stale provider output writes nothing"
+        );
+    }
+
+    #[test]
+    fn converted_companion_refuses_an_active_share_even_in_an_open_destination() {
+        let state = build_state("converted-companion-active-share");
+        seed_meeting(&state.db, "m-convert-shared", "# Existing meeting note", None);
+        let snapshot = capture_meeting_content_snapshot(&state, "m-convert-shared").unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-convert-shared",
+            &snapshot,
+            "Shared strategy",
+            "---\ntitle: Shared strategy\n---\n\n# Shared strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let before = state.db.get_note_row(&first.note_id).unwrap().unwrap();
+        state
+            .db
+            .insert_outbound_note_share(
+                "conversion-active-share",
+                &first.note_id,
+                "link",
+                1,
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+
+        let snapshot = capture_meeting_content_snapshot(&state, "m-convert-shared").unwrap();
+        let error = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-convert-shared",
+            &snapshot,
+            "Shared strategy",
+            "---\ntitle: Shared strategy\n---\n\n# Shared strategy\n\nMust not replace.",
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::Unavailable(_)));
+        let after = state.db.get_note_row(&first.note_id).unwrap().unwrap();
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.exported_path, before.exported_path);
+    }
+
+    #[test]
+    fn converted_companion_refuses_an_active_share_on_its_source_container_before_rehome() {
+        const MEETING: &str = "m-convert-source-shared";
+        const SOURCE: &str = "f-convert-source-shared";
+        const TARGET: &str = "f-convert-source-target";
+        const ATTACHMENT_ID: &str = "20000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-source-share");
+        let state = build_state_with_vault("converted-companion-source-share", &vault);
+        make_open_folder(&state.db, SOURCE, "Source");
+        make_open_folder(&state.db, TARGET, "Target");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(SOURCE));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Shared strategy",
+            "---\ntitle: Shared strategy\n---\n\n# Shared strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser bytes remain outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Shared strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.folder_id, SOURCE);
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(before.exported_path.as_deref().unwrap());
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
+
+        state.db.set_meeting_folder(MEETING, Some(TARGET)).unwrap();
+        seed_meeting(
+            &state.db,
+            "m-source-container-shared-sibling",
+            "# Shared sibling",
+            Some(SOURCE),
+        );
+        state
+            .db
+            .insert_outbound_share(
+                "conversion-source-container-active-share",
+                "m-source-container-shared-sibling",
+                "link",
+                1,
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+
+        let error = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            MEETING.into(),
+            None,
+            Some(ConversionProvider::fixed(
+                "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            )),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, AppError::Unavailable(_)));
+
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
+        assert_eq!(
+            state.db.companion_note_for_meeting(MEETING).unwrap(),
+            Some(companion.note_id.clone()),
+            "the refused source-share rehome preserves the stable companion id"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment]
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_refuses_a_closing_source_container_before_rehome() {
+        const MEETING: &str = "m-convert-source-closing";
+        const SOURCE: &str = "f-convert-source-closing";
+        const TARGET: &str = "f-convert-source-closing-target";
+        const ATTACHMENT_ID: &str = "25000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-source-closing");
+        let state = build_state_with_vault("converted-companion-source-closing", &vault);
+        make_open_folder(&state.db, SOURCE, "Closing source");
+        make_open_folder(&state.db, TARGET, "Open target");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(SOURCE));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Closing source strategy",
+            "---\ntitle: Closing source strategy\n---\n\n# Strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser bytes remain outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Closing source strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.folder_id, SOURCE);
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(before.exported_path.as_deref().unwrap());
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
+
+        state.db.set_meeting_folder(MEETING, Some(TARGET)).unwrap();
+        assert!(!state.db.org_folder_closure_exists(TARGET).unwrap());
+        state.db.begin_org_folder_closure(SOURCE).unwrap();
+        assert!(state.db.org_folder_closure_exists(SOURCE).unwrap());
+
+        let error = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            MEETING.into(),
+            None,
+            Some(ConversionProvider::fixed(
+                "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            )),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, AppError::Unavailable(_)));
+
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
+        assert_eq!(
+            state.db.companion_note_for_meeting(MEETING).unwrap(),
+            Some(companion.note_id.clone()),
+            "a closing source cannot change the stable companion edge"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment]
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_attachment_seal_verification_failure_preserves_every_source_byte() {
+        const MEETING: &str = "m-convert-seal-verification-failure";
+        const SOURCE: &str = "f-convert-seal-source";
+        const TARGET: &str = "f-convert-seal-target";
+        const ATTACHMENT_ID: &str = "30000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-seal-verification-failure")
+            .canonicalize()
+            .unwrap();
+        let state = build_state_with_vault(
+            "converted-companion-seal-verification-failure",
+            &vault,
+        );
+        state
+            .db
+            .set_setting("vault_path", &vault.to_string_lossy())
+            .unwrap();
+        make_open_folder(&state.db, SOURCE, "Source");
+        make_open_folder(&state.db, TARGET, "Target");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(SOURCE));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let companion = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Private strategy\n---\n\n# Private strategy\n\nOriginal generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT_ID,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let with_attachment = format!(
+            "{}\nUser bytes survive a refused protection-domain move.\n![proof](murmur-attachment://{ATTACHMENT_ID})\n",
+            state
+                .db
+                .get_note_row(&companion.note_id)
+                .unwrap()
+                .unwrap()
+                .text
+        );
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Private strategy",
+            &with_attachment,
+            None,
+        )
+        .unwrap();
+
+        let before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        let before_hash = state
+            .db
+            .get_note_doc_exported_hash(&companion.note_id)
+            .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let note_export = std::path::PathBuf::from(before.exported_path.as_deref().unwrap());
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT_ID}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+        let note_export_bytes = std::fs::read(&note_export).unwrap();
+        let attachment_export_bytes = std::fs::read(&attachment_export).unwrap();
+        let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
+
+        lock_folder_inner(&state, TARGET.into()).unwrap();
+        session_unlock(&state, TARGET);
+        move_note_inner_impl(&state, MEETING.into(), Some(TARGET.into())).unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let mismatching_verifier =
+            |_ck: &[u8; 32], _blob: &[u8], _aad: &[u8]| -> Result<Vec<u8>, AppError> {
+                Ok(b"not the attachment plaintext".to_vec())
+            };
+        let _org_mutation = block_on(state.org_share_mutation_lock.lock());
+        let error = persist_converted_companion_under_snapshot_with_attachment_verifier(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Replacement\n---\n\n# Replacement\n\nMust not persist.",
+            None,
+            Some(&mismatching_verifier),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::Storage(_)));
+
+        let after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.folder_id, before.folder_id);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.exported_path, before.exported_path);
+        assert_eq!(after.sealed, before.sealed);
+        assert_eq!(
+            state.db.companion_note_for_meeting(MEETING).unwrap(),
+            Some(companion.note_id.clone())
+        );
+        assert_eq!(
+            state
+                .db
+                .get_note_doc_exported_hash(&companion.note_id)
+                .unwrap(),
+            before_hash
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap(),
+            vec![before_attachment],
+            "a failed new-seal verification preserves attachment plaintext, prior blob, and path"
+        );
+        assert_eq!(std::fs::read(&note_export).unwrap(), note_export_bytes);
+        assert_eq!(
+            std::fs::read(&attachment_export).unwrap(),
+            attachment_export_bytes
+        );
+        assert_eq!(
+            std::fs::read(&attachment_twin).unwrap(),
+            attachment_twin_bytes
+        );
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_committed_update_has_no_fallible_post_commit_prune() {
+        const MEETING: &str = "m-convert-post-commit-prune";
+        const FOLDER: &str = "f-convert-post-commit-prune";
+        const ATTACHMENT: &str = "40000000-0000-4000-8000-000000000001";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let vault = tmp_vault("converted-companion-post-commit-prune");
+        let state = build_state_with_vault("converted-companion-post-commit-prune", &vault);
+        make_open_folder(&state.db, FOLDER, "Project");
+        seed_meeting(&state.db, MEETING, "# Existing meeting note", Some(FOLDER));
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Project strategy",
+            "---\ntitle: Project strategy\n---\n\n# First\n\nGenerated with an image.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: first.note_id.clone(),
+        };
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: ATTACHMENT_BYTES,
+                data_blob: None,
+                created_at: 1,
+            })
+            .unwrap();
+        let current = state.db.get_note_row(&first.note_id).unwrap().unwrap().text;
+        let marker = format!("![proof](murmur-attachment://{ATTACHMENT})\n{CONVERTED_NOTE_END}");
+        let with_managed_attachment = current.replacen(CONVERTED_NOTE_END, &marker, 1);
+        assert_ne!(with_managed_attachment, current);
+        update_note_doc_inner_with(
+            &state,
+            &first.note_id,
+            "Project strategy",
+            &with_managed_attachment,
+            None,
+        )
+        .unwrap();
+        let before_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        let attachment_export = std::path::PathBuf::from(
+            before_attachment.exported_path.as_deref().unwrap(),
+        );
+        let attachment_twin = attachment_export
+            .with_file_name(format!(".{ATTACHMENT}.murmur.tmp"));
+        std::fs::write(&attachment_twin, ATTACHMENT_BYTES).unwrap();
+
+        state
+            .db
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER conversion_post_commit_prune_fault \
+                   BEFORE UPDATE OF exported_path ON note_attachments \
+                   WHEN OLD.id = '{ATTACHMENT}' \
+                    AND OLD.exported_path IS NULL \
+                    AND NEW.exported_path IS NULL \
+                   BEGIN SELECT RAISE(ABORT, 'post-commit prune fault'); END;"
+            ))
+            .unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let second = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Project strategy",
+            "---\ntitle: Project strategy\n---\n\n# Second\n\nGenerated without the image.",
+            None,
+        )
+        .unwrap();
+        state
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER conversion_post_commit_prune_fault")
+            .unwrap();
+
+        assert_eq!(second.note_id, first.note_id);
+        let row = state.db.get_note_row(&second.note_id).unwrap().unwrap();
+        assert!(row.text.contains("Generated without the image."));
+        assert!(!row.text.contains(ATTACHMENT));
+        assert!(
+            row.exported_path
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).exists()),
+            "the successful committed conversion reaches its best-effort note projection"
+        );
+        let stale = state.db.list_attachments(&owner).unwrap().remove(0);
+        assert_eq!(stale.id, ATTACHMENT);
+        assert_eq!(stale.data, ATTACHMENT_BYTES);
+        assert!(stale.data_blob.is_none());
+        assert!(
+            stale.exported_path.is_none(),
+            "the atomic conversion already cleared the stale attachment retry path"
+        );
+        assert!(!attachment_export.exists());
+        assert!(!attachment_twin.exists());
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    #[test]
+    fn converted_companion_and_attachment_round_trip_through_locked_relock() {
+        const FOLDER: &str = "f-converted-roundtrip";
+        const MEETING: &str = "m-converted-roundtrip";
+        const ATTACHMENT: &str = "123e4567-e89b-42d3-a456-426614174000";
+        const ATTACHMENT_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\
+            \x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\
+            \x00\x00\x00\x0bIDAT\x78\xda\x63\x64\xf8\x0f\x00\x01\
+            \x05\x01\x01\x27\x18\xe3\x66\x00\x00\x00\x00IEND\
+            \xae\x42\x60\x82";
+
+        let state = build_state("converted-companion-locked-roundtrip");
+        make_open_folder(&state.db, FOLDER, "Private project");
+        seed_meeting(
+            &state.db,
+            MEETING,
+            "# Existing private meeting note",
+            Some(FOLDER),
+        );
+        lock_folder_inner(&state, FOLDER.into()).unwrap();
+        let ck = session_unlock(&state, FOLDER);
+
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Private strategy\n---\n\n# Private strategy\n\nFirst generated.",
+            None,
+        )
+        .unwrap();
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: first.note_id.clone(),
+        };
+        let aad = attachment_aad(FOLDER, &owner, ATTACHMENT);
+        let attachment_blob = crate::crypto::encrypt(&ck, ATTACHMENT_BYTES, &aad).unwrap();
+        assert_eq!(
+            crate::crypto::decrypt(&ck, &attachment_blob, &aad).unwrap(),
+            ATTACHMENT_BYTES
+        );
+        let hash: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(ATTACHMENT_BYTES).into();
+        state
+            .db
+            .insert_attachment(&crate::storage::NewAttachment {
+                id: ATTACHMENT,
+                owner: &owner,
+                mime_type: "image/png",
+                extension: "png",
+                width: 1,
+                height: 1,
+                sha256: &hash,
+                byte_len: ATTACHMENT_BYTES.len(),
+                data: &[],
+                data_blob: Some(&attachment_blob),
+                created_at: 1,
+            })
+            .unwrap();
+        let with_marker = format!(
+            "{}\nUser bytes stay outside the managed block.\n![proof](murmur-attachment://{ATTACHMENT})\n",
+            state.db.get_note_row(&first.note_id).unwrap().unwrap().text
+        );
+        save_note_text_inner(
+            &state,
+            &first.note_id,
+            "Private strategy",
+            &with_marker,
+        )
+        .unwrap();
+
+        state
+            .db
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER conversion_post_commit_restore_fault \
+                   BEFORE UPDATE OF data ON note_attachments \
+                   WHEN OLD.id = '{ATTACHMENT}' \
+                    AND length(OLD.data) = 0 \
+                    AND OLD.data_blob IS NOT NULL \
+                    AND length(NEW.data) > 0 \
+                   BEGIN SELECT RAISE(ABORT, 'post-commit restore fault'); END;"
+            ))
+            .unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, MEETING).unwrap();
+        let second = persist_converted_companion_under_snapshot_with(
+            &state,
+            MEETING,
+            &snapshot,
+            "Private strategy",
+            "---\ntitle: Private strategy\n---\n\n# Private strategy\n\nSecond generated.",
+            None,
+        )
+        .unwrap();
+        state
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER conversion_post_commit_restore_fault")
+            .unwrap();
+        assert_eq!(second.note_id, first.note_id, "companion id remains stable");
+        let expected = state.db.get_note_row(&second.note_id).unwrap().unwrap().text;
+        assert!(expected.contains("Second generated."));
+        assert!(expected.contains("User bytes stay outside the managed block."));
+        assert!(expected.contains(ATTACHMENT));
+        let attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        assert!(
+            attachment.data.is_empty(),
+            "the committed locked shape remains blank instead of attempting a fallible post-commit cache restore"
+        );
+        assert!(attachment.data_blob.is_some());
+        assert!(attachment.exported_path.is_none());
+        assert_eq!(
+            plaintext_attachment_data(&state, &attachment).unwrap(),
+            ATTACHMENT_BYTES,
+            "session reads decrypt the verified target-CK blob without a persisted plaintext cache"
+        );
+
+        state.unlocked_folders.lock().unwrap().remove(FOLDER);
+        reblank_folder_extras(&state, FOLDER).unwrap();
+        let at_rest = state.db.get_note_row(&second.note_id).unwrap().unwrap();
+        assert_eq!(at_rest.text, "", "relock blanks companion plaintext");
+        assert!(at_rest.sealed, "relock retains the verified companion blob");
+        let at_rest_attachment = state.db.list_attachments(&owner).unwrap().remove(0);
+        assert!(at_rest_attachment.data.is_empty());
+        assert!(at_rest_attachment.data_blob.is_some());
+        assert!(at_rest_attachment.exported_path.is_none());
+
+        unseal_folder_extras(&state, FOLDER, &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&second.note_id).unwrap().unwrap().text,
+            expected,
+            "converted companion restores byte-identical after relock"
+        );
+        assert_eq!(
+            state.db.list_attachments(&owner).unwrap().remove(0).data,
+            ATTACHMENT_BYTES,
+            "converted attachment restores byte-identical after relock"
         );
     }
 
@@ -7723,8 +9149,8 @@
                 folder_id: None,
             })
             .unwrap();
-        // A meeting's folder anchor is its NOTE row (`notes.folder_id` — see `folder_for_meeting`),
-        // so the fixture needs a note for `set_meeting_folder` to bite.
+        // Seed note content before exercising the fact receipt; canonical meeting placement is set
+        // below and synchronizes this provider row for legacy readers.
         state
             .db
             .upsert_note(&NoteRecord {
@@ -8994,13 +10420,10 @@
         );
     }
 
-    /// 2026-07-14 folder-leak mirror (RED-before-GREEN): a MEETING must never be filed under a NOTE
-    /// folder. `ensure_meeting_folder_target` (the `move_note` write-gate) rejects a note-folder id
-    /// with `InvalidArg`, accepts a meeting-folder id, and accepts `None` (the vault root). Before
-    /// this gate `move_note` resolved the target kind-agnostically and would move a meeting's `.md`
-    /// under the Notes namespace — this test is RED against that.
+    /// Unified hierarchy contract: every renderable user Space/folder accepts meetings regardless
+    /// of its legacy `kind`; machine-owned containers remain excluded by the shared target oracle.
     #[test]
-    fn move_note_write_gate_rejects_a_note_folder_target() {
+    fn move_note_write_gate_accepts_mixed_user_container_targets() {
         let state = build_state("move-note-kind-gate");
         state
             .db
@@ -9015,15 +10438,7 @@
             .unwrap();
         let nf = create_note_folder_inner(&state, "Ideas", None).unwrap();
 
-        // A note-folder target is refused with InvalidArg.
-        assert!(
-            matches!(
-                ensure_meeting_folder_target(&state.db, Some(nf.id.as_str())).unwrap_err(),
-                AppError::InvalidArg(_)
-            ),
-            "a meeting must not be movable into a note folder"
-        );
-        // A meeting-folder target and the vault root are allowed.
+        assert!(ensure_meeting_folder_target(&state.db, Some(nf.id.as_str())).is_ok());
         assert!(ensure_meeting_folder_target(&state.db, Some("mf1")).is_ok());
         assert!(ensure_meeting_folder_target(&state.db, None).is_ok());
     }
@@ -17356,6 +18771,196 @@
         let _ = std::fs::remove_dir_all(&vault);
     }
 
+    #[test]
+    fn delete_open_folder_rehomes_a_pre_note_canonical_meeting() {
+        let state = build_state("del-pre-note");
+        make_open_folder(&state.db, "folder", "Folder");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "pre-note".into(),
+                started_at: "2026-08-26T10:00:00Z".into(),
+                ended_at: None,
+                title: Some("Still processing".into()),
+                duration_s: 30,
+                audio_path: None,
+                status: MeetingStatus::Transcribed,
+                folder_id: Some("folder".into()),
+            })
+            .unwrap();
+
+        delete_folder_inner(&state, "folder".into()).unwrap();
+
+        assert!(state.db.folder_by_id("folder").unwrap().is_none());
+        assert_eq!(
+            state
+                .db
+                .get_meeting("pre-note")
+                .unwrap()
+                .unwrap()
+                .folder_id,
+            None,
+            "a recording filed before note generation must return to Unfiled, never dangle"
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_meeting_refuses_lock_and_delete_before_any_mutation() {
+        let state = build_state("ambiguous-lock-delete");
+        make_open_folder(&state.db, "folder-a", "A");
+        make_open_folder(&state.db, "folder-b", "B");
+        seed_ambiguous_legacy_meeting(&state.db, "meeting", "folder-a", "folder-b");
+
+        for folder_id in ["folder-a", "folder-b"] {
+            let epoch_before = state.seal_epoch.load(Ordering::SeqCst);
+            let error = lock_folder_inner(&state, folder_id.into()).unwrap_err();
+            assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+            let folder = state.db.folder_by_id(folder_id).unwrap().unwrap();
+            assert!(!folder.locked);
+            assert!(state.db.folder_wrapped_key(folder_id).unwrap().is_none());
+            assert_eq!(state.seal_epoch.load(Ordering::SeqCst), epoch_before);
+        }
+        let rows = state.db.sealable_notes_for_meeting("meeting").unwrap();
+        assert!(rows.iter().all(|row| row.content_blob.is_none()));
+        let bodies = rows
+            .iter()
+            .map(|row| row.markdown.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            bodies,
+            std::collections::HashSet::from(["provider A body", "provider B body"])
+        );
+
+        let error = delete_folder_inner(&state, "folder-a".into()).unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert!(state.db.folder_by_id("folder-a").unwrap().is_some());
+        assert_eq!(
+            state.db.folders_for_meeting("meeting").unwrap(),
+            vec!["folder-a".to_string(), "folder-b".to_string()],
+            "the refused delete must not detach the sibling provider owner"
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_parent_refuses_subtree_lock_before_a_child_seals() {
+        let state = build_state("ambiguous-subtree-lock");
+        make_open_folder(&state.db, "parent", "Parent");
+        make_child_folder(&state.db, "child", "Child", "Parent/Child", "parent");
+        make_open_folder(&state.db, "other", "Other");
+        seed_ambiguous_legacy_meeting(&state.db, "meeting", "parent", "other");
+        let epoch_before = state.seal_epoch.load(Ordering::SeqCst);
+
+        let error = lock_container_subtree(&state, "parent", false, || {}).unwrap_err();
+
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert!(!state.db.folder_by_id("parent").unwrap().unwrap().locked);
+        assert!(
+            !state.db.folder_by_id("child").unwrap().unwrap().locked,
+            "the deepest child must not seal before the knowable parent conflict refuses"
+        );
+        assert_eq!(state.seal_epoch.load(Ordering::SeqCst), epoch_before);
+    }
+
+    #[test]
+    fn unlock_subtree_preflight_rejects_ambiguous_descendant_before_any_restore() {
+        let state = build_state("ambiguous-subtree-unlock");
+        make_open_folder(&state.db, "parent", "Parent");
+        make_child_folder(&state.db, "child", "Child", "Parent/Child", "parent");
+        make_open_folder(&state.db, "other", "Other");
+        seed_meeting(&state.db, "parent-meeting", "parent secret", Some("parent"));
+        seed_ambiguous_legacy_meeting(&state.db, "child-meeting", "child", "other");
+        for (folder_id, wrapped) in [
+            ("parent", b"wrapped-parent".as_slice()),
+            ("child", b"wrapped-child".as_slice()),
+            ("other", b"wrapped-other".as_slice()),
+        ] {
+            state
+                .db
+                .set_folder_locked(folder_id, true, Some(wrapped))
+                .unwrap();
+        }
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE notes
+                    SET markdown='',
+                        content_blob=CASE WHEN meeting_id='parent-meeting'
+                                          THEN X'0A0B' ELSE X'010203' END
+                  WHERE meeting_id IN ('parent-meeting','child-meeting')",
+                [],
+            )
+            .unwrap();
+        let note_snapshot = |meeting_id: &str| {
+            state
+                .db
+                .sealable_notes_for_meeting(meeting_id)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.provider_id, row.markdown, row.content_blob))
+                .collect::<Vec<_>>()
+        };
+        let parent_before = note_snapshot("parent-meeting");
+        let child_before = note_snapshot("child-meeting");
+        let epoch_before = state.seal_epoch.load(Ordering::SeqCst);
+
+        let error = preflight_unlock_subtree(&state, "parent").unwrap_err();
+
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert_eq!(state.seal_epoch.load(Ordering::SeqCst), epoch_before);
+        assert!(state.master_kek.lock().unwrap().is_none());
+        assert!(state.unlocked_folders.lock().unwrap().is_empty());
+        assert!(state.db.folder_by_id("parent").unwrap().unwrap().locked);
+        assert!(state.db.folder_by_id("child").unwrap().unwrap().locked);
+        assert_eq!(
+            note_snapshot("parent-meeting"),
+            parent_before,
+            "the root note must remain blank with its recovery blob intact"
+        );
+        assert_eq!(
+            note_snapshot("child-meeting"),
+            child_before,
+            "the ambiguous descendant providers must remain blank with both blobs intact"
+        );
+    }
+
+    #[test]
+    fn ambiguous_sealed_legacy_meeting_refuses_remove_lock_without_restoring_plaintext() {
+        let state = build_state("ambiguous-remove-lock");
+        make_open_folder(&state.db, "folder-a", "A");
+        make_open_folder(&state.db, "folder-b", "B");
+        seed_ambiguous_legacy_meeting(&state.db, "meeting", "folder-a", "folder-b");
+        state
+            .db
+            .set_folder_locked("folder-a", true, Some(b"wrapped-a"))
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("folder-b", true, Some(b"wrapped-b"))
+            .unwrap();
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE notes SET markdown='', content_blob=X'010203' WHERE meeting_id='meeting'",
+                [],
+            )
+            .unwrap();
+        let epoch_before = state.seal_epoch.load(Ordering::SeqCst);
+
+        let error = remove_lock_inner(&state, "folder-a".into()).unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert_eq!(state.seal_epoch.load(Ordering::SeqCst), epoch_before);
+        assert!(state.db.folder_by_id("folder-a").unwrap().unwrap().locked);
+        assert!(state.db.folder_by_id("folder-b").unwrap().unwrap().locked);
+        let rows = state.db.sealable_notes_for_meeting("meeting").unwrap();
+        assert!(rows.iter().all(|row| row.markdown.is_empty()));
+        assert!(rows
+            .iter()
+            .all(|row| row.content_blob.as_deref() == Some(&[1, 2, 3][..])));
+        assert!(state.unlocked_folders.lock().unwrap().is_empty());
+    }
+
     /// SECURITY: deleting a LOCKED folder that is NOT session-unlocked is REFUSED (`AppError::Locked`)
     /// — the row (with the wrapped key) and the sealed `content_blob` are untouched, so nothing is
     /// orphaned encrypted-and-unrecoverable.
@@ -23243,6 +24848,424 @@
         .unwrap();
     }
 
+    #[test]
+    fn org_read_command_chain_admits_only_live_received_items_from_enabled_local_memberships() {
+        let state = build_state("org-read-command-chain");
+        seed_org(&state.db, "org-live", "Live Org", "member", 1);
+        seed_org(&state.db, "org-disabled", "Disabled Org", "member", 1);
+        make_open_folder(&state.db, "f-org-import", "Imported");
+        assert!(
+            state.account_session.lock().unwrap().is_none(),
+            "cached status/list/detail reads must not require authentication or network setup"
+        );
+
+        let statuses = org_list_cached_statuses_inner(&state).unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.iter().any(|status| {
+            status.org_id == "org-live" && status.name == "Live Org" && status.member_count == 1
+        }));
+        assert!(statuses
+            .iter()
+            .any(|status| status.org_id == "org-disabled"));
+
+        let upsert_received = |item_id: &str, org_id: &str, seq: u64, title: &str| {
+            state
+                .db
+                .upsert_org_item(
+                    item_id,
+                    org_id,
+                    seq,
+                    "peer",
+                    title,
+                    &format!("# {title}\n\nreceived body"),
+                    "2026-08-26T10:00:00Z",
+                    1,
+                    1,
+                    &[seq as u8; 32],
+                    Some("document"),
+                    Some("peer-user"),
+                    None,
+                )
+                .unwrap();
+        };
+
+        // A current received item in an enabled locally-admitted org is available at all three
+        // production command cores: bounded header, detail and explicit copy into an OPEN user
+        // container. No account token or HTTP fixture exists, so success also pins the local-only
+        // nature of passive Shared Brains navigation.
+        upsert_received("item-live", "org-live", 1, "Live received");
+        let headers = list_org_items_inner(&state, "org-live").unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].item_id, "item-live");
+        assert_eq!(
+            org_get_item_inner(&state, "item-live")
+                .unwrap()
+                .unwrap()
+                .title,
+            "Live received"
+        );
+        let imported = add_org_item_to_container_inner(
+            &state,
+            "item-live",
+            "f-org-import",
+        )
+        .unwrap();
+        assert_eq!(imported.kind, "note");
+        assert_eq!(
+            state.db.get_note_row(&imported.id).unwrap().unwrap().folder_id,
+            "f-org-import"
+        );
+
+        // An orphan replica has no membership witness. The org-scoped list refuses, the direct
+        // stale-link read is indistinguishable from unknown, and import cannot cross that boundary.
+        upsert_received("item-orphan", "org-orphan", 1, "Orphan secret");
+        assert!(matches!(
+            list_org_items_inner(&state, "org-orphan"),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert!(org_get_item_inner(&state, "item-orphan")
+            .unwrap()
+            .is_none());
+        assert!(add_org_item_to_container_inner(
+            &state,
+            "item-orphan",
+            "f-org-import"
+        )
+        .is_err());
+
+        // The per-device context toggle withholds both browse and stale direct links, and the same
+        // SQL witness inside the import transaction refuses a copy while the replica stays cached.
+        upsert_received("item-disabled", "org-disabled", 1, "Disabled secret");
+        state
+            .db
+            .set_org_context_enabled("org-disabled", false)
+            .unwrap();
+        assert!(list_org_items_inner(&state, "org-disabled")
+            .unwrap()
+            .is_empty());
+        assert!(org_get_item_inner(&state, "item-disabled")
+            .unwrap()
+            .is_none());
+        assert!(add_org_item_to_container_inner(
+            &state,
+            "item-disabled",
+            "f-org-import"
+        )
+        .is_err());
+
+        let assert_withheld = |item_id: &str| {
+            assert!(!list_org_items_inner(&state, "org-live")
+                .unwrap()
+                .iter()
+                .any(|item| item.item_id == item_id));
+            assert!(org_get_item_inner(&state, item_id).unwrap().is_none());
+            assert!(add_org_item_to_container_inner(&state, item_id, "f-org-import").is_err());
+        };
+
+        // Tombstones and non-current stable-document revisions are equally non-addressable across
+        // all three command cores; neither can be revived by an explicit Add to Space click.
+        upsert_received("item-tombstoned", "org-live", 2, "Withdrawn secret");
+        state.db.tombstone_org_item("item-tombstoned").unwrap();
+        assert_withheld("item-tombstoned");
+
+        upsert_received("item-stale", "org-live", 3, "Stale revision secret");
+        state
+            .db
+            .lock()
+            .execute(
+                "UPDATE org_items SET doc_id=?2, is_current=0 WHERE item_id=?1",
+                rusqlite::params![
+                    "item-stale",
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ],
+            )
+            .unwrap();
+        assert_withheld("item-stale");
+
+        // An origin-device replica is not a received item. Its outbound share anchor makes import
+        // refuse before creating local provenance or a duplicate authored note.
+        upsert_received("item-owned", "org-live", 4, "Owned source");
+        state
+            .db
+            .insert_note(
+                "owned-source-note",
+                "f-org-import",
+                "owned.md",
+                "Owned source",
+                "body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "share-owned-command-chain",
+                "org-live",
+                None,
+                Some("owned-source-note"),
+                "note",
+                Some("Owned source"),
+                1,
+                1,
+                &[4u8; 32],
+                "2026-08-26T10:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded(
+                "share-owned-command-chain",
+                "item-owned",
+                "2026-08-26T10:00:00Z",
+            )
+            .unwrap();
+        assert!(matches!(
+            add_org_item_to_container_inner(&state, "item-owned", "f-org-import"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // The finite IPC header envelope is already pinned exhaustively by
+        // `list_org_items_is_bounded_to_the_newest_500_headers`; this matrix exercises admission,
+        // not another 501-row allocation.
+    }
+
+    #[test]
+    fn received_org_note_and_meeting_import_as_corresponding_local_kinds_with_provenance() {
+        let state = build_state("org-add-to-space");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-local", "Local");
+
+        let attachment_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .upsert_org_item(
+                "item-note",
+                "org-1",
+                1,
+                "colleague",
+                "Shared plan",
+                &format!("# Plan\n\n![diagram](murmur-attachment://{attachment_id})"),
+                "2026-08-20T09:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                Some("document"),
+                Some("peer"),
+                None,
+            )
+            .unwrap();
+        state
+            .db
+            .replace_org_item_attachment_bundle(
+                "item-note",
+                &[crate::storage::IncomingAttachment {
+                    id: attachment_id.clone(),
+                    mime_type: "image/png".into(),
+                    extension: "png".into(),
+                    width: 1,
+                    height: 1,
+                    sha256: [2u8; 32],
+                    data: vec![1, 2, 3],
+                }],
+            )
+            .unwrap();
+        let note = state
+            .db
+            .import_received_org_item_atomic("item-note", "f-local")
+            .unwrap();
+        assert_eq!(note.kind, "note");
+        finalize_imported_org_item_best_effort(&state, &note);
+        let local_note = state.db.get_note_row(&note.id).unwrap().unwrap();
+        assert_eq!(local_note.folder_id, "f-local");
+        let copied = state
+            .db
+            .list_attachments(&crate::storage::AttachmentOwner::Document {
+                document_id: note.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(copied.len(), 1);
+        assert_ne!(copied[0].id, attachment_id, "attachment ids are remapped");
+        assert!(local_note.text.contains(&copied[0].id));
+        assert!(
+            state.db.doc_chunk_count(&note.id).unwrap() > 0,
+            "a copied org document is indexed as an ordinary authored note"
+        );
+        assert!(state
+            .db
+            .search_doc_chunks_fts_visible("Plan", 10, &std::collections::HashSet::new())
+            .unwrap()
+            .iter()
+            .any(|hit| hit.document_id == note.id));
+
+        state
+            .db
+            .upsert_org_item(
+                "item-meeting",
+                "org-1",
+                2,
+                "colleague",
+                "Shared sync",
+                "# Shared sync\n\nDecisions",
+                "2026-08-20T10:00:00Z",
+                1,
+                1,
+                &[3u8; 32],
+                Some("meeting"),
+                Some("peer"),
+                None,
+            )
+            .unwrap();
+        let meeting = state
+            .db
+            .import_received_org_item_atomic("item-meeting", "f-local")
+            .unwrap();
+        assert_eq!(meeting.kind, "meeting");
+        let shell = state.db.get_meeting(&meeting.id).unwrap().unwrap();
+        assert_eq!(shell.folder_id.as_deref(), Some("f-local"));
+        assert!(shell.audio_path.is_none(), "org import must never invent audio");
+        assert_eq!(
+            state
+                .db
+                .get_latest_note_for_meeting(&meeting.id)
+                .unwrap()
+                .unwrap()
+                .provider_id,
+            "shared-brain"
+        );
+        assert!(state
+            .db
+            .search_visible(
+                "Decisions",
+                10,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap()
+            .iter()
+            .any(|hit| hit.meeting.id == meeting.id));
+
+        let provenance: Vec<(String, String)> = {
+            let conn = state.db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT local_kind,item_id FROM local_org_imports ORDER BY local_kind,item_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            provenance,
+            vec![
+                ("meeting".into(), "item-meeting".into()),
+                ("note".into(), "item-note".into())
+            ]
+        );
+        assert!(state.db.get_org_item("item-note").unwrap().is_some());
+        assert!(state.db.get_org_item("item-meeting").unwrap().is_some());
+    }
+
+    #[test]
+    fn org_add_to_space_refuses_locked_target_and_owned_source_before_mutation() {
+        let state = build_state("org-add-refusals");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-locked".into(),
+                name: "Locked".into(),
+                path: "Locked".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-08-20T00:00:00Z".into(),
+            })
+            .unwrap();
+        make_open_folder(&state.db, "f-open", "Open");
+        for item in ["item-locked", "item-owned"] {
+            state
+                .db
+                .upsert_org_item(
+                    item,
+                    "org-1",
+                    1,
+                    "peer",
+                    item,
+                    "body",
+                    "2026-08-20T09:00:00Z",
+                    1,
+                    1,
+                    &[4u8; 32],
+                    Some("document"),
+                    Some("peer"),
+                    None,
+                )
+                .unwrap();
+        }
+        let locked = state
+            .db
+            .import_received_org_item_atomic("item-locked", "f-locked")
+            .unwrap_err();
+        assert!(matches!(locked, AppError::Locked(_)));
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-internal-root".into(),
+                name: ".murmur".into(),
+                path: ".murmur".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-08-20T00:00:00Z".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            state
+                .db
+                .import_received_org_item_atomic("item-locked", "f-internal-root"),
+            Err(AppError::Locked(_))
+        ));
+
+        state
+            .db
+            .insert_note("owned-note", "f-open", "owned", "Owned", "body", 1)
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "share-owned",
+                "org-1",
+                None,
+                Some("owned-note"),
+                "note",
+                Some("Owned"),
+                1,
+                1,
+                &[4u8; 32],
+                "2026-08-20T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded(
+                "share-owned",
+                "item-owned",
+                "2026-08-20T09:00:00Z",
+            )
+            .unwrap();
+        assert!(matches!(
+            state
+                .db
+                .import_received_org_item_atomic("item-owned", "f-open"),
+            Err(AppError::InvalidArg(_))
+        ));
+        let imports: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM local_org_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(imports, 0, "both refusals must precede local mutation");
+    }
+
     /// Seed a local org row with an explicit `joined_at` so the `.next()` (ORDER BY joined_at ASC)
     /// ordering is DETERMINISTIC — the targeting tests need the pre-fix first-org to be a fixed org so
     /// their RED direction (a `.next()` returning the WRONG org) is unambiguous, not flaky.
@@ -28624,6 +30647,57 @@
     }
 
     #[test]
+    fn active_share_enumeration_includes_a_canonically_filed_pre_note_meeting() {
+        let state = build_state("folder-pre-note-shares");
+        make_open_folder(&state.db, "f", "Team");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "pre-note-shared".into(),
+                started_at: "2026-08-14T12:00:00Z".into(),
+                ended_at: None,
+                title: Some("Processing recording".into()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Draft,
+                folder_id: Some("f".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share("pre-note-link", "pre-note-shared", "link", 1, "t")
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "pre-note-org",
+                "org-1",
+                Some("pre-note-shared"),
+                None,
+                "meeting",
+                Some("Processing recording"),
+                1,
+                1,
+                &[1u8; 32],
+                "t",
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.db.active_link_user_shares_for_folder("f").unwrap(),
+            vec![("pre-note-link".into(), "link".into())]
+        );
+        assert_eq!(
+            state.db.active_org_share_ids_for_folder("f").unwrap(),
+            vec![(
+                "pre-note-org".into(),
+                None,
+                "Processing recording".into()
+            )]
+        );
+    }
+
+    #[test]
     fn lock_final_recheck_refuses_live_link_or_user_share() {
         let state = build_state("lock-link-user-share");
         make_open_folder(&state.db, "shared-folder", "Shared");
@@ -32554,6 +34628,22 @@
     // sealed parent was itself OPEN while its vault directory sat inside the sealed parent's. Under
     // Projects › Folders that is the ordinary way a folder is made.
 
+    #[test]
+    fn authored_notes_and_note_folders_can_live_under_a_mixed_space() {
+        let state = build_state("mixed-space-note-content");
+        make_open_folder(&state.db, "space", "Product");
+
+        let note_id = create_note_inner(&state, Some("space"), "Brief").unwrap();
+        assert_eq!(
+            state.db.get_note_row(&note_id).unwrap().unwrap().folder_id,
+            "space"
+        );
+
+        let child = create_note_folder_inner(&state, "Research", Some("space")).unwrap();
+        assert_eq!(child.parent_id.as_deref(), Some("space"));
+        assert_eq!(child.path, "Product/Research");
+    }
+
     /// Session-unlock a sealed container, the way a successful Touch ID unlock leaves it.
     /// Put a folder in the state a real session-unlock leaves it in.
     ///
@@ -33299,12 +35389,43 @@
         );
     }
 
-    /// Filing a meeting that has no note row is refused instead of silently affecting nothing.
-    ///
-    /// A meeting's container lives on its note rows, so one still recording — or whose summarize
-    /// failed — has nothing to carry the assignment, and the write matches zero rows.
     #[test]
-    fn filing_a_meeting_with_no_note_is_refused_and_several_provider_rows_move_together() {
+    fn create_space_births_multiple_peer_project_roots() {
+        let state = build_state("create-peer-spaces");
+        let work = create_space_inner(&state, "Work".into()).unwrap();
+        let home = create_space_inner(&state, "Home".into()).unwrap();
+        assert_ne!(work.id, home.id);
+        let containers = state.db.list_containers().unwrap();
+        for created in [&work, &home] {
+            let row = containers.iter().find(|row| row.id == created.id).unwrap();
+            assert_eq!(row.level, "project");
+            assert!(row.parent_id.is_none());
+        }
+    }
+
+    #[test]
+    fn create_space_rejects_a_case_insensitive_vault_path_collision() {
+        let state = build_state("create-space-case-collision");
+        create_space_inner(&state, "Work".into()).unwrap();
+        let error = create_space_inner(&state, "work".into()).unwrap_err();
+        assert!(matches!(error, AppError::InvalidArg(_)));
+        assert_eq!(
+            state
+                .db
+                .list_containers()
+                .unwrap()
+                .iter()
+                .filter(|folder| folder.name.eq_ignore_ascii_case("work"))
+                .count(),
+            1
+        );
+    }
+
+    /// A pre-note meeting can move to an OPEN container, while a locked target is refused before
+    /// mutation because there is no generated content to seal on birth. Multi-provider rows still
+    /// move as one unit.
+    #[test]
+    fn filing_a_pre_note_meeting_uses_canonical_placement_and_locked_refusal_is_unchanged() {
         let state = build_state("file-without-note");
         make_open_folder(&state.db, "f-work", "Work");
         state
@@ -33321,9 +35442,40 @@
             })
             .unwrap();
 
-        let err = move_note_inner_impl(&state, "m-raw".into(), Some("f-work".into()))
-            .expect_err("filing a meeting with no note must be refused");
-        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+        move_note_inner_impl(&state, "m-raw".into(), Some("f-work".into())).unwrap();
+        assert_eq!(
+            state.db.folder_for_meeting("m-raw").unwrap().as_deref(),
+            Some("f-work")
+        );
+
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-locked".into(),
+                name: "Locked".into(),
+                path: "Locked".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-08-21T09:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-locked".into(),
+                started_at: "2026-08-21T09:00:00Z".into(),
+                ended_at: None,
+                title: Some("No note".into()),
+                duration_s: 1,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let err = move_note_inner_impl(&state, "m-locked".into(), Some("f-locked".into()))
+            .expect_err("pre-note move into locked target must refuse before mutation");
+        assert!(matches!(err, AppError::Locked(_)), "got {err:?}");
+        assert!(state.db.folder_for_meeting("m-locked").unwrap().is_none());
 
         // A meeting WITH several provider rows still moves as one unit.
         seed_meeting(&state.db, "m-two", "# claude", None);
@@ -33349,4 +35501,181 @@
             )
             .unwrap();
         assert_eq!(stragglers, 0, "a provider row was left behind in a stale container");
+    }
+
+    // Keep this oracle at EOF. In this highly repetitive include fragment, placing it beside its
+    // fixture makes Git's default diff lose stable anchors and inflates the exact receipt patch.
+    #[test]
+    fn canonical_pre_note_recording_is_non_disclosing_across_changed_read_sinks() {
+        let state = build_state("canonical-pre-note-read-gates");
+        let history = seed_canonical_pre_note_history(&state, "read-gates", false);
+        state
+            .db
+            .set_meeting_audio_path(
+                &history.meeting_id,
+                Some("/tmp/PRIVATE-canonical-residual-audio.wav"),
+            )
+            .unwrap();
+        let entity_id = state
+            .db
+            .upsert_entity(
+                "PRIVATE Canonical Entity",
+                crate::storage::models::EntityKind::Project,
+            )
+            .unwrap();
+        state
+            .db
+            .add_mention(&entity_id, &history.meeting_id)
+            .unwrap();
+        add_user_fact(
+            &state.db,
+            &history.meeting_id,
+            "PRIVATE canonical preference",
+        );
+        state
+            .db
+            .create_reminder(
+                "r-canonical-private",
+                &crate::storage::models::ReminderDraft {
+                    title: "PRIVATE canonical reminder".into(),
+                    details: None,
+                    due_at: 1_900_000_000_000,
+                    repeat_every: None,
+                    repeat_unit: None,
+                    sources: vec![crate::storage::models::ReminderSourceAnchor {
+                        kind: "meeting".into(),
+                        id: history.meeting_id.clone(),
+                    }],
+                },
+                crate::storage::models::ReminderOrigin::Smart,
+                1,
+            )
+            .unwrap();
+
+        // Publish only the durable visibility authority, deliberately leaving every plaintext
+        // column/file path behind. This is stronger than a normal seal: every assertion below must
+        // be enforced by its reader, not accidentally pass because the seal already blanked data.
+        state
+            .db
+            .set_folder_locked(&history.folder_id, true, None)
+            .unwrap();
+        let none = HashSet::new();
+
+        let detail = get_meeting_detail_inner(&state, &history.meeting_id)
+            .unwrap()
+            .unwrap();
+        assert!(detail.locked);
+        assert_eq!(detail.meeting.title.as_deref(), Some("🔒 Locked"));
+        assert!(detail.meeting.audio_path.is_none());
+        assert!(detail.note.is_none());
+        assert!(get_meeting_segments_inner(&state, &history.meeting_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state
+                .db
+                .get_timeline_data_visible(&history.meeting_id, &none)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            get_manual_notes_inner(&state, &history.meeting_id).unwrap(),
+            ""
+        );
+        assert!(matches!(
+            list_note_attachments_inner(&state, "meeting", &history.meeting_id),
+            Err(AppError::Locked(_))
+        ));
+        assert!(state
+            .db
+            .get_note_if_visible(&history.meeting_id, &none)
+            .unwrap()
+            .is_none());
+        assert!(state.db.latest_note_visible(&none).unwrap().is_none());
+
+        assert!(state
+            .db
+            .search_visible("DECISION-read-gates", 10, &none)
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .list_meetings_visible(200, &none)
+            .unwrap()
+            .is_empty());
+        assert!(state.db.list_entities_visible(&none).unwrap().is_empty());
+        assert!(state
+            .db
+            .entity_mention_pulse_visible(&entity_id, 10, &none)
+            .unwrap()
+            .is_empty());
+        assert!(state
+            .db
+            .facts_for_meeting_visible(&history.meeting_id, &none)
+            .unwrap()
+            .is_empty());
+        assert!(state.db.list_user_facts_visible(&none).unwrap().is_empty());
+        assert!(state
+            .db
+            .search_user_facts_visible("canonical", 10, &none)
+            .unwrap()
+            .is_empty());
+
+        let analytics = state.db.analytics(&none).unwrap();
+        assert_eq!(analytics.total_meetings, 0);
+        assert_eq!(analytics.total_duration_s, 0);
+        assert_eq!(analytics.notes_count, 0);
+        assert!(!state
+            .db
+            .count_notes_per_folder(&none)
+            .unwrap()
+            .contains_key(&history.folder_id));
+        assert!(state
+            .db
+            .list_dashboard_reminders_visible(&none)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            container_items_inner(
+                &state.db,
+                &none,
+                None,
+                crate::storage::models::ItemKind::Meeting,
+                0,
+                50,
+            )
+            .unwrap()
+            .total,
+            0,
+            "a canonically filed row must not escape back into Unfiled"
+        );
+        assert!(matches!(
+            container_items_inner(
+                &state.db,
+                &none,
+                Some(&history.folder_id),
+                crate::storage::models::ItemKind::Meeting,
+                0,
+                50,
+            ),
+            Err(AppError::Locked(_))
+        ));
+        let tool = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchMeetings {
+                query: "DECISION-read-gates".into(),
+            },
+            &state.db,
+            &none,
+            &AppConfig::default(),
+        )
+        .unwrap();
+        assert!(!tool.contains("PRIVATE canonical note read-gates"));
+        assert!(!tool.contains("PRIVATE canonical title read-gates"));
+
+        // N/A by construction: Shared Brain replicas live outside folder locks; authored notes,
+        // tasks and dashboard-container cosmetics are separate owners with their own existing seal
+        // oracles. Corrections/voiceprints have no producer in this pre-note fixture. `tools.rs`
+        // changed only its test-helper wording; the production tool path above delegates to the
+        // canonical `search_visible` gate exercised directly and through `execute_tool`.
     }

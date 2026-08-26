@@ -1,4 +1,4 @@
-import { Injectable } from "@angular/core";
+import { Injectable, signal } from "@angular/core";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
@@ -98,9 +98,13 @@ import type {
   NoteTemplateSection,
   OrgAccess,
   OrganizePlan,
+  WorkspaceOrganizeApplyResult,
+  WorkspaceOrganizeMove,
+  WorkspaceOrganizePlan,
   OrgFeedUpdatedPayload,
   OrgItemDetail,
   OrgItemHeader,
+  OrgItemImportResult,
   OrgMember,
   OrgShareEntry,
   OrgSharePreview,
@@ -247,6 +251,14 @@ export const EVENT_ASK_HISTORY_INVALIDATED = "murmur://ask-history-invalidated";
  */
 @Injectable({ providedIn: "root" })
 export class IpcService {
+  private readonly _workspaceMutationRevision = signal(0);
+  /**
+   * Content writes that can change the mixed Space hierarchy without going through
+   * `WorkspaceService` bump this revision after backend confirmation. Consumers refetch
+   * canonical SQLite state; no content is mirrored in the signal itself.
+   */
+  readonly workspaceMutationRevision =
+    this._workspaceMutationRevision.asReadonly();
   startRecording(): Promise<StartResult> {
     return invoke<StartResult>("start_recording");
   }
@@ -659,6 +671,15 @@ export class IpcService {
   }
 
   /**
+   * Read every already-admitted org from the local SQLCipher replica only.
+   * Unlike {@link orgListStatuses}, this never refreshes an access token or
+   * contacts the relay, so passive Shared Brains navigation uses this method.
+   */
+  orgListCachedStatuses(): Promise<OrgStatus[]> {
+    return invoke<OrgStatus[]>("org_list_cached_statuses");
+  }
+
+  /**
    * PER-INSTANCE org toggle (Settings → Organization): flip whether a JOINED org
    * contributes content — browsing + brain/assistant context — on THIS Murmur
    * install. Membership-checked server-side; purely local, no egress. Disabling
@@ -771,6 +792,17 @@ export class IpcService {
    */
   listOrgItems(orgId: string): Promise<OrgItemHeader[]> {
     return invoke<OrgItemHeader[]>("list_org_items", { orgId });
+  }
+
+  /** Import a received org replica into an open local user container. */
+  addOrgItemToContainer(
+    itemId: string,
+    containerId: string,
+  ): Promise<OrgItemImportResult> {
+    return invoke<OrgItemImportResult>("add_org_item_to_container", {
+      itemId,
+      containerId,
+    });
   }
 
   /**
@@ -1150,14 +1182,19 @@ export class IpcService {
    * Generate or refresh this meeting's canonical companion note. Omitting the
    * template id asks the backend to resolve the user's Settings default.
    */
-  convertMeetingToNote(
+  async convertMeetingToNote(
     meetingId: string,
     templateId?: string,
   ): Promise<CompanionAppendResult> {
-    return invoke<CompanionAppendResult>("convert_meeting_to_note", {
-      meetingId,
-      ...(templateId ? { templateId } : {}),
-    });
+    const result = await invoke<CompanionAppendResult>(
+      "convert_meeting_to_note",
+      {
+        meetingId,
+        ...(templateId ? { templateId } : {}),
+      },
+    );
+    this._workspaceMutationRevision.update((revision) => revision + 1);
+    return result;
   }
 
   /**
@@ -2727,6 +2764,11 @@ export class IpcService {
     return invoke<ContainerNode[]>("list_workspace_tree");
   }
 
+  /** Create one new top-level Space and its safe vault-relative directory. */
+  createSpace(name: string): Promise<Folder> {
+    return invoke<Folder>("create_space", { name });
+  }
+
   /**
    * One page of a single container's items of a single kind — what "Zobacz
    * wszystkie" pages through.
@@ -2987,6 +3029,21 @@ export class IpcService {
    */
   applyOrganizePlan(plan: OrganizePlan): Promise<void> {
     return invoke<void>("apply_organize_plan", { plan });
+  }
+
+  /** Propose where unfiled recordings belong. Nothing moves until apply. */
+  planWorkspaceOrganization(): Promise<WorkspaceOrganizePlan> {
+    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization");
+  }
+
+  /** Apply only the recording moves the user kept selected in the review sheet. */
+  applyWorkspaceOrganization(
+    moves: WorkspaceOrganizeMove[],
+  ): Promise<WorkspaceOrganizeApplyResult> {
+    return invoke<WorkspaceOrganizeApplyResult>(
+      "apply_workspace_organization",
+      { moves },
+    );
   }
 
   // ── Feature C — typed note front-matter properties (folder-level schema +

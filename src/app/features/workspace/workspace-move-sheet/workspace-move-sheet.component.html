@@ -1,0 +1,76 @@
+<div
+  class="scrim"
+  role="dialog"
+  aria-modal="true"
+  [attr.aria-label]="actionVerb() + ' ' + itemKind() + ' “' + title() + '” to Space'"
+  [attr.aria-busy]="busy()"
+  (click)="onScrimClick($event)"
+  (keydown.escape)="busy() ? null : cancelled.emit()"
+>
+  <section class="sheet">
+    <header class="sheet-head">
+      <span class="sheet-mark"><mur-icon icon="move" /></span>
+      <div class="sheet-copy">
+        <h3>{{ actionVerb() }} {{ itemKind() }} “{{ title() }}” to Space</h3>
+        <p>From <strong>{{ fromLabel() }}</strong></p>
+      </div>
+    </header>
+
+    <label class="search-field">
+      <mur-icon icon="search" />
+      <input
+        #searchInput
+        type="search"
+        [value]="query()"
+        (input)="query.set(searchInput.value)"
+        placeholder="Search destinations…"
+        aria-label="Search destinations"
+      />
+    </label>
+
+    @if (error(); as message) {
+      <p class="move-error" role="alert">{{ message }}</p>
+    }
+
+    <div class="destination-list" aria-label="Destinations">
+      @for (target of filteredTargets(); track target.container.id) {
+        <button
+          type="button"
+          class="destination"
+          [attr.aria-label]="actionVerb() + ' to ' + target.label"
+          [disabled]="busy()"
+          (click)="choose(target)"
+        >
+          <span class="destination-icon">
+            <mur-icon [icon]="target.container.level === 'project' ? 'spaces' : 'folder'" />
+          </span>
+          <span class="destination-copy">
+            <strong>{{ target.label }}</strong>
+            <span>{{ target.container.level === "project" ? "Space" : "Folder" }}</span>
+          </span>
+          @if (busy()) {
+            <span class="busy-copy">{{ actionVerb() === "Move" ? "Moving…" : "Copying…" }}</span>
+          } @else {
+            <span class="destination-arrow" aria-hidden="true">→</span>
+          }
+        </button>
+      } @empty {
+        <div class="empty-state">
+          <strong>No matching destination</strong>
+          <span>Try a folder or Space name.</span>
+        </div>
+      }
+    </div>
+
+    <footer class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        [disabled]="busy()"
+        (click)="cancelled.emit()"
+      >
+        Cancel
+      </button>
+    </footer>
+  </section>
+</div>

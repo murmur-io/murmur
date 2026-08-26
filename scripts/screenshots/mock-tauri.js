@@ -931,6 +931,7 @@ scope to the GA-critical path only.
       // ── Shared Brain (org) ──
       case "org_refresh": return null;
       case "org_list_statuses": return ORGS;
+      case "org_list_cached_statuses": return ORGS;
       case "list_org_items": return ORG_ITEMS_BY_ORG[args.orgId] || [];
       case "org_resolve_source": return null;
       // Per-meeting (Detail header pill) / bulk (Library row badge) share
