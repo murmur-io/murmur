@@ -24,15 +24,18 @@ import { IpcService } from "../../../core/ipc.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
+import { SharingAuthFlowComponent } from "../../sharing/sharing-auth-flow/sharing-auth-flow.component";
 import { NoteAttachmentService } from "../../../services/note-attachment.service";
 import { TaskStore } from "../task.store";
 
 type TaskFilter = "open" | TaskStatus | "all";
+/** Which door of the shared account flow the signed-out gate opened. */
+type AuthDoor = "signin" | "create";
 
 @Component({
   selector: "app-task-view",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurEmptyStateComponent, MurSpinnerComponent],
+  imports: [MurEmptyStateComponent, MurSpinnerComponent, SharingAuthFlowComponent],
   templateUrl: "./task-view.component.html",
   styleUrl: "./task-view.component.scss",
 })
@@ -107,6 +110,15 @@ export class TaskViewComponent {
       (this.isNew() || this.current()?.canEdit === true),
   );
 
+  /**
+   * The account door the signed-out gate has opened, or `null` while it only shows the two CTAs.
+   *
+   * `SharingAuthFlowComponent` is `:host { display: contents }` and paints no surface of its own,
+   * so it is embedded INLINE in the empty state rather than in a floating panel — which keeps this
+   * clear of the opaque-overlay trap entirely instead of re-deriving a second modal.
+   */
+  readonly authDoor = signal<AuthDoor | null>(null);
+
   readonly newSubtask = signal("");
   readonly relatedTaskId = signal("");
   readonly localRefKind = signal<TaskLocalRef["kind"]>("dashboard");
@@ -153,6 +165,23 @@ export class TaskViewComponent {
       const orgId = this.orgId();
       if (orgId) untracked(() => void this.store.loadAssignees(orgId));
     });
+  }
+
+  openAuth(door: AuthDoor): void {
+    this.authDoor.set(door);
+  }
+
+  closeAuth(): void {
+    this.authDoor.set(null);
+  }
+
+  /**
+   * A finished sign-in/sign-up. Re-run the authoritative read: it is the read itself that decides
+   * whether the gate stays up, so nothing here guesses at the new session state.
+   */
+  onAuthCompleted(): void {
+    this.authDoor.set(null);
+    void this.store.reload();
   }
 
   selectFilter(value: TaskFilter): void {
