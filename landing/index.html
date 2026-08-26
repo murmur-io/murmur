@@ -604,7 +604,7 @@
             </tbody>
           </table>
         </div>
-        <div class="egress-foot">Murmur tells you, in plain language, exactly what leaves your Mac — and defaults to keeping it all on-device.</div>
+        <div class="egress-foot">Murmur tells you, in plain language, exactly what leaves your Mac — and defaults to keeping it all on-device. One model picker is used across every AI surface, and it always accepts a model id you type yourself — so a model released after this build still works.</div>
       </div>
     </div>
   </section>
@@ -618,6 +618,30 @@
         <p>One encrypted store, three ways to use it — the app, a local MCP server, and your exported Markdown files.</p>
       </div>
 
+      <!-- New in 2.0 — the structural changes, no screenshots yet -->
+      <div class="section-head reveal" style="margin-top:8px">
+        <span class="eyebrow">New in 2.0</span>
+        <h2>One hierarchy. Boards over it. And a door in.</h2>
+        <p>2.0 rebuilt the shell around a single tree, added composable boards on top of it, and opened an offline import path for the notes you already have somewhere else.</p>
+      </div>
+      <div class="steps reveal" style="margin-bottom:96px">
+        <div class="step">
+          <div class="step-n">Spaces</div>
+          <h3>One tree for everything</h3>
+          <p>The separate Meetings and Notes folder trees are gone. There's now a single tree — <b>Spaces › folders › your recordings and notes</b> — behind a persistent icon rail and a contextual panel. Lock a Space and everything inside it is sealed with it.</p>
+        </div>
+        <div class="step">
+          <div class="step-n">Dashboards</div>
+          <h3>Boards you compose</h3>
+          <p>Pull notes, recordings, documents, people, promise ledgers and reminders onto a board, then read it through <b>Brief / Overview / Commitments / Sources / People</b> lenses. Pin a <b>living answer</b> — a question the app keeps up to date, and withholds the moment its sources stop being readable. You can ask a board directly, grounded only in what's on it.</p>
+        </div>
+        <div class="step">
+          <div class="step-n">Imports</div>
+          <h3>Bring your existing notes</h3>
+          <p>Settings → Imports pulls in a <b>Notion export</b>, an <b>Obsidian vault</b>, or <b>Apple Notes</b>. Entirely offline — no API token, no account, no network call. Every import is a dry run first, so you see what it would write before it writes anything. (Apple Notes asks macOS for permission the first time.)</p>
+        </div>
+      </div>
+
       <!-- Feature 1 -->
       <div class="feature reveal">
         <div class="ftext">
@@ -628,6 +652,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device reasoner (Bielik-11B, Qwen) via Metal</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Grounded, not hallucinated — retrieved from your own transcripts</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional consent-gated web — off by default</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Conversations are remembered — vault, note and meeting threads persist, with a history browser on each surface. A conversation disappears the instant any folder it drew on stops being readable.</li>
           </ul>
         </div>
         <div class="shot"><img src="./assets/ask.jpg" alt="Ask Your Vault — grounded Q&A across months of meetings, every claim linked to its source" loading="lazy" /></div>
@@ -653,7 +678,7 @@
         <div class="ftext">
           <span class="eyebrow">Notes &amp; memory</span>
           <h3>Structured notes and a graph that builds itself.</h3>
-          <p>Every call becomes a clean note — summary, decisions, action items, quotes. People and projects are extracted automatically into a knowledge graph, and sealed folders stay hidden from it.</p>
+          <p>Every call becomes a clean note — summary, decisions, action items, quotes. Recordings and notes live side by side in the same Space. People and projects are extracted automatically into a knowledge graph, and sealed Spaces stay hidden from it.</p>
           <ul class="flist">
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Ask across every meeting with hybrid semantic search</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Entity dossiers, related meetings, weekly digests</li>
@@ -700,11 +725,11 @@
         <div class="ftext">
           <span class="eyebrow">Notes</span>
           <h3>Not just meeting notes. All your notes.</h3>
-          <p>A full Markdown editor with folders, tags, and properties — for anything you write, not just what Murmur transcribes. Select any passage and a command menu appears: refine, shorten, change tone, translate, fact-check, or just type what you want done.</p>
+          <p>A full Markdown editor with tags and properties, filed in the same Spaces as your recordings — for anything you write, not just what Murmur transcribes. Select any passage and a command menu appears: refine, shorten, change tone, translate, fact-check, or just type what you want done.</p>
           <ul class="flist">
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Nineteen Brain actions, one keystroke away</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Grounded in your own meetings &amp; notes, not the model's guesses</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Paste screenshots into notes; they stay local and follow the folder lock</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Paste screenshots into notes; they stay local and follow the Space's lock</li>
           </ul>
         </div>
         <div class="shot"><img src="assets/notes-editor-brain-menu.png" alt="The standalone note editor with a text selection and the Brain command menu open, showing Refine, Shorten, Change tone and more actions" loading="lazy" /></div>
@@ -719,7 +744,9 @@
           <ul class="flist">
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> AES-256-GCM sealed under an org content key before upload</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Verify-before-publish — the same discipline as locking a folder</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-document permissions — the author sets <b>View only</b> or <b>Can edit</b> on each shared document</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Belong to more than one org — each gets its own encrypted feed</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Shared <b>Tasks</b> — assignees, due dates, subtasks and the same permissions. Tasks live inside an org, so they need a signed-in account.</li>
           </ul>
         </div>
         <div class="shot"><img src="assets/shared-brain-rail.png" alt="The Notes view Shared Brains rail with an organization selected, showing synced org items with author badges" loading="lazy" /></div>
@@ -747,9 +774,10 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> In-meeting AI assistant + Ask Your Vault</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Semantic search &amp; the auto knowledge graph</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Standalone notes with a Brain-assisted editor</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> E2EE sharing (account required)</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> E2EE sharing with per-document View only / Can edit (account required)</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Spaces, composable dashboards, and offline Notion / Obsidian / Apple Notes import</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Expiring, encrypted share links for a note or meeting</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-folder Touch ID lock &amp; AES-256 encryption</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-Space and per-folder Touch ID lock &amp; AES-256 encryption</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Screen-share auto-relock</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Local MCP server + Markdown export</li>
           </ul>
@@ -772,9 +800,10 @@
           <a class="btn btn-ghost" href="https://github.com/murmur-io/murmur">Follow on GitHub</a>
         </div>
 
-        <!-- Team / Enterprise — roadmap. Shared Brain org sharing itself already
-             shipped free (see the Free plan above) — this tier is only the
-             admin/governance layer on top: roles, SSO, audit log, SLA. -->
+        <!-- Team / Enterprise — roadmap. Shared Brain org sharing already shipped
+             free (see the Free plan above), and per-document View only / Can edit
+             permissions shipped in 2.0 — so this tier is only the remaining
+             admin/governance layer: SSO/SCIM, policy & audit log, SLA. -->
         <div class="plan soon reveal">
           <span class="plan-badge soon">Coming soon</span>
           <h3>Team</h3>
@@ -782,7 +811,6 @@
           <p class="tagline">Pricing and availability to be announced.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Pro</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Member roles &amp; permissions for your Shared Brain org</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> SSO &amp; SCIM provisioning</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Security policy, retention &amp; audit log</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Priority support &amp; SLA</li>

@@ -62,8 +62,15 @@ zero-knowledge, no plaintext ever touching a server.
   something useful it offers a quiet **"✓ Add to notes"** — nothing enters your notes unless you say so.
 - 🔒 **Truly local-first.** The brain, transcription, and search all run on your Mac. Pick a fully-local
   stack (Ollama or the bundled GGUF model) and **nothing ever leaves the device.**
-- 📝 **A real notes product, not an afterthought.** A standalone Markdown editor with its own folders,
-  its own lock lifecycle, a 19-action AI command menu, and per-note end-to-end-encrypted sharing — for
+- 🗂️ **One hierarchy: Spaces.** Recordings and notes live in the same tree — **Spaces › folders ›
+  items** — not in two parallel folder systems. Lock a Space and everything inside it is sealed with it.
+- 📊 **Dashboards you compose.** Put notes, recordings, documents, people, promise ledgers and reminders
+  on a board, pin a **living answer** the app keeps current, and read it through Brief / Overview /
+  Commitments / Sources / People lenses. A board's sources going locked withholds the answer.
+- 📥 **Bring the notes you already have.** Import a Notion export, an Obsidian vault, or Apple Notes —
+  entirely offline, dry-run first, no token and no account.
+- 📝 **A real notes product, not an afterthought.** A standalone Markdown editor filed in the same
+  Spaces as your recordings, with the same lock lifecycle, a 19-action AI command menu, and per-note end-to-end-encrypted sharing — for
   writing that never came from a recording.
 - 🌐 **A Shared Brain for your org — free, E2EE.** Opt in and publish notes or meetings into a
   zero-knowledge shared pool your teammates' apps replicate and search locally. The server only ever
@@ -268,9 +275,9 @@ recording. Same store, same lock model, same brain.
 - **A real editor** at its own route, with collapsible YAML front-matter, a formatting toolbar, markdown
   keyboard shortcuts, an 11-type slash-`/` block-insert menu, Edit/Preview toggle, and debounced
   autosave.
-- **Note folders**, entirely separate from meeting folders, that reuse the exact same **Touch-ID-gated
-  per-folder lock** — a locked note folder masks its title to `🔒 Locked` and blanks body, tags, and
-  properties, just like a locked meeting.
+- **Filed in Spaces alongside your recordings** — one hierarchy, not a separate note-folder tree.
+  It reuses the exact same **Touch-ID-gated per-container lock**: a locked container masks its notes'
+  titles to `🔒 Locked` and blanks body, tags, and properties, just like a locked meeting.
 - **AI auto-organize** — the brain proposes a folder/tag reorganization plan, you review it, nothing
   moves until you approve.
 - **A 19-action AI command menu on selected text** — grouped into Edit / Structure / From
@@ -316,6 +323,10 @@ everyone's notes and meetings — without anyone's plaintext ever touching a ser
   index, cached keys.
 - **Per-meeting revocation** — the detail view shows any active org shares sourced from a
   meeting and lets you revoke them individually.
+- **Per-document permissions** — the document's author sets **View only** or **Can edit** on each
+  shared item; the org owner can manage it too.
+- **Shared Tasks** — assignees, due dates, subtasks, and the same per-document permissions, scoped to
+  one org. Tasks require a signed-in account.
 - **Owner-managed membership** — invite by email, remove members, from Settings → Organization.
 
 The wire format (`murmur-protocol`, MIT/Apache) is compiled into both this app and the server, so it's
@@ -542,7 +553,7 @@ axum + Postgres relay, AGPL-3.0).
 
 ## 🗺️ Status
 
-Murmur ships at **v1.0.0** — a signed, notarized macOS app, ~30 releases past the record →
+Murmur ships at **v2.0.0** — a signed, notarized macOS app, well past the record →
 transcribe → summarize MVP.
 
 **Shipped and in daily use:**
@@ -559,12 +570,31 @@ transcribe → summarize MVP.
 - **A self-building link graph** — notes, meetings, *and* imported documents are first-class
   `[[link]]` targets you pick/link/open from any surface; backlinks resolve by id, and the full-brain
   graph renders as a living neural map.
-- **Notes** as a full standalone product — editor, note folders with their own lock lifecycle, AI
+- **Spaces** — one hierarchy for everything. The separate Meetings and Notes folder trees are gone;
+  there is a single tree of **Spaces › folders › your recordings and notes**, behind a rebuilt shell
+  (a persistent icon rail plus a contextual panel). Locking a Space seals everything inside it.
+- **Dashboards** — compose a board from your notes, recordings, documents, people, promise ledgers
+  and reminders, plus pinned **living answers** (a question whose answer the app keeps up to date, and
+  withholds the moment its sources stop being readable). Read a board through **Brief / Overview /
+  Commitments / Sources / People** lenses, or ask it directly, grounded only in what's on it.
+- **Imports** — Settings → Imports pulls in a **Notion export**, an **Obsidian vault**, or **Apple
+  Notes**. Entirely offline: no API token, no account, no network call. Every import is a dry run
+  first, reporting what it would write (new vs. already imported) before anything is written. Apple
+  Notes asks macOS for permission on the first run.
+- **Ask remembers** — vault, note and meeting conversations persist, each surface with its own history
+  browser. A conversation disappears the instant any folder it drew on stops being readable.
+- **One model picker** across every AI surface, always accepting a free-text model id — so a model
+  released after this build is still selectable.
+- **Notes** as a full standalone product — editor, the shared Space/folder lock lifecycle, AI
   auto-organize, and the 19-action AI command menu.
 - **Shared Brain** — free, opt-in, end-to-end-encrypted org sharing of notes and meetings, multi-org
-  aware, auto-refreshing, with its own MCP tool.
-- The per-folder Touch ID lock model (two encryption layers, gated reads, verify-before-destroy seals),
-  the content-free egress ledger, and the read-only MCP server.
+  aware, auto-refreshing, with its own MCP tool, and **per-document permissions** (**View only** /
+  **Can edit**, set by the document's author).
+- **Tasks** — shared work inside a Shared Brain org: assignees, due dates, subtasks, and the same
+  per-document permissions. Tasks belong to an org, so — like Shared Brain and link sharing — they
+  require a signed-in account. Everything else in this list works with no account at all.
+- The per-Space / per-folder Touch ID lock model (two encryption layers, gated reads,
+  verify-before-destroy seals), the content-free egress ledger, and the read-only MCP server.
 - Per-note and per-meeting expiring E2EE link sharing.
 
 **Honest gaps, not yet shipped or only partially proven:**
