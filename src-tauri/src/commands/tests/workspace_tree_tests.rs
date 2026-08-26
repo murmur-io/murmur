@@ -127,6 +127,7 @@ fn workspace_dto_fields_are_camel_case_on_the_wire() {
     let node = ContainerNode {
         id: "p1".into(),
         name: "Acme".into(),
+        kind: "meeting".into(),
         level: "project".into(),
         emoji: Some("🗂".into()),
         tint: Some("#fff".into()),
@@ -980,8 +981,8 @@ fn the_tree_node_key_set_is_pinned_for_a_sealed_container() {
     assert_eq!(
         keys,
         vec![
-            "emoji", "folders", "groups", "id", "isRoot", "level", "locked", "name", "tint",
-            "unlocked",
+            "emoji", "folders", "groups", "id", "isRoot", "kind", "level", "locked", "name",
+            "tint", "unlocked",
         ],
         "ContainerNode gained a field: decide explicitly whether a SEALED container may disclose it"
     );
@@ -990,16 +991,11 @@ fn the_tree_node_key_set_is_pinned_for_a_sealed_container() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// `Meeting.folder_id` is DERIVED on read, never stored — pinned because the whole hierarchy reader
-/// depends on it.
-///
-/// `meetings` has no folder column and `insert_meeting` does not persist one, so the field on a
-/// fixture is inert. Every container decision in this module therefore has exactly one source,
-/// `notes.folder_id`; if a real column is ever added, this fails and forces the duplicate source of
-/// truth to be reconciled rather than silently introduced.
+/// A recording can be filed BEFORE its generated note exists, and the later note inherits exactly
+/// that canonical placement.
 #[test]
-fn a_meetings_folder_id_is_derived_not_stored() {
-    let (db, path) = fresh_db("derived-folder-id");
+fn a_pre_note_meeting_is_filed_and_its_later_note_inherits_the_folder() {
+    let (db, path) = fresh_db("canonical-folder-id");
     container(&db, "f1", "Legal", "Legal", None, "folder");
     db.insert_meeting(&Meeting {
         id: "m1".into(),
@@ -1008,26 +1004,105 @@ fn a_meetings_folder_id_is_derived_not_stored() {
         title: Some("Raw".into()),
         duration_s: 1,
         audio_path: None,
-        // Deliberately names a container: it must be ignored, because there is nowhere to put it.
         folder_id: Some("f1".into()),
         status: MeetingStatus::Recording,
     })
     .unwrap();
 
-    let has_column = db
-        .lock()
-        .prepare("SELECT folder_id FROM meetings LIMIT 1")
-        .is_ok();
-    assert!(
-        !has_column,
-        "meetings gained a folder_id column — the hierarchy derives a container from notes.folder_id \
-         and now has two sources of truth"
-    );
-    assert!(db.folder_for_meeting("m1").unwrap().is_none());
+    assert_eq!(db.folder_for_meeting("m1").unwrap().as_deref(), Some("f1"));
 
     let inbox = container_items_inner(&db, &HashSet::new(), None, ItemKind::Meeting, 0, 50).unwrap();
-    assert_eq!(inbox.total, 1, "it is unfiled regardless of the DTO field");
+    assert_eq!(inbox.total, 0, "the pre-note recording must leave Unfiled");
+    let filed = container_items_inner(
+        &db,
+        &HashSet::new(),
+        Some("f1"),
+        ItemKind::Meeting,
+        0,
+        50,
+    )
+    .unwrap();
+    assert_eq!(filed.total, 1);
 
+    db.upsert_note(&NoteRecord {
+        meeting_id: "m1".into(),
+        provider_id: "claude_code".into(),
+        markdown: "# Ready".into(),
+        created_at: "2026-08-21T09:01:00Z".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let inherited: Option<String> = db
+        .lock()
+        .query_row(
+            "SELECT folder_id FROM notes WHERE meeting_id='m1' AND provider_id='claude_code'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(inherited.as_deref(), Some("f1"));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Canonical placement covers pre-note recordings across the read tree, seal enumeration, and
+/// audio retention. A locked recording with no provider note must not leak into Unfiled or be
+/// offered to the audio pruner merely because the old note-derived join is empty.
+#[test]
+fn a_locked_pre_note_meeting_is_hidden_enumerated_for_seal_and_not_audio_prunable() {
+    let (db, path) = fresh_db("locked-pre-note");
+    container(&db, "f1", "Secret", "Secret", None, "folder");
+    seal(&db, "f1");
+    db.insert_meeting(&Meeting {
+        id: "m1".into(),
+        started_at: "2026-08-21T09:00:00Z".into(),
+        ended_at: None,
+        title: Some("Hidden raw".into()),
+        duration_s: 1,
+        audio_path: Some("/tmp/hidden.wav".into()),
+        status: MeetingStatus::Recording,
+        folder_id: Some("f1".into()),
+    })
+    .unwrap();
+
+    assert!(db.list_meetings_visible(50, &HashSet::new()).unwrap().is_empty());
+    assert_eq!(
+        container_items_inner(&db, &HashSet::new(), None, ItemKind::Meeting, 0, 50)
+            .unwrap()
+            .total,
+        0
+    );
+    assert_eq!(db.meeting_ids_in_folder("f1").unwrap(), vec!["m1"]);
+    assert!(
+        db.prunable_audio_candidates()
+            .unwrap()
+            .iter()
+            .all(|row| row.meeting_id != "m1")
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Nullable canonical ownership is read as `None`, not as a rusqlite type error, for an attachment
+/// owned by a genuinely unfiled pre-note recording.
+#[test]
+fn an_unfiled_meeting_attachment_owner_has_no_folder_without_error() {
+    let (db, path) = fresh_db("attachment-none");
+    db.insert_meeting(&Meeting {
+        id: "m1".into(),
+        started_at: "2026-08-21T09:00:00Z".into(),
+        ended_at: None,
+        title: Some("Unfiled".into()),
+        duration_s: 1,
+        audio_path: None,
+        status: MeetingStatus::Recording,
+        folder_id: None,
+    })
+    .unwrap();
+    let owner = crate::storage::AttachmentOwner::Meeting {
+        meeting_id: "m1".into(),
+        provider_id: "claude_code".into(),
+    };
+    assert_eq!(db.folder_for_attachment_owner(&owner).unwrap(), None);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1309,6 +1384,150 @@ fn the_migration_is_idempotent() {
         "a second project was created"
     );
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// User-created Spaces are peer project roots. Re-running migration or reopening must not demote
+/// one under the other, otherwise only the first Space survives the hierarchy.
+#[test]
+fn reopening_preserves_multiple_peer_spaces() {
+    let (db, path) = pre_migration_db("multiple-spaces");
+    container(&db, "p-work", "Work", "Work", None, "project");
+    container(&db, "p-home", "Home", "Home", None, "project");
+    container(&db, "f-home", "Plans", "Home/Plans", Some("p-home"), "folder");
+    drop(db);
+
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    let projects: Vec<_> = db
+        .list_containers()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.level == "project")
+        .collect();
+    assert_eq!(
+        projects.len(),
+        3,
+        "the vault-root Workspace plus both user Spaces must survive"
+    );
+    assert!(projects.iter().any(|row| row.id == "p-work"));
+    assert!(projects.iter().any(|row| row.id == "p-home"));
+    assert!(projects.iter().all(|row| row.parent_id.is_none()));
+    assert_eq!(
+        db.list_containers()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "f-home")
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("p-home")
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Legacy provider rows with one unambiguous non-null folder become one canonical meeting placement,
+/// and every sibling provider row is normalized in the same migration pass. Leaving a NULL sibling
+/// beside a canonical locked folder would expose that note through note-level readers.
+#[test]
+fn migration_backfills_one_folder_and_normalizes_null_provider_siblings() {
+    let (db, path) = fresh_db("canonical-backfill");
+    container(&db, "f1", "Secret", "Secret", None, "folder");
+    db.insert_meeting(&Meeting {
+        id: "m1".into(),
+        started_at: "2026-08-20T09:00:00Z".into(),
+        ended_at: None,
+        title: Some("Legacy".into()),
+        duration_s: 1,
+        audio_path: None,
+        status: MeetingStatus::Summarized,
+        folder_id: None,
+    })
+    .unwrap();
+    for provider in ["a", "b"] {
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m1".into(),
+            provider_id: provider.into(),
+            markdown: provider.into(),
+            created_at: "2026-08-20T09:01:00Z".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    db.lock()
+        .execute(
+            "UPDATE notes SET folder_id='f1' WHERE meeting_id='m1' AND provider_id='a'",
+            [],
+        )
+        .unwrap();
+    drop(db);
+
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    assert_eq!(db.folder_for_meeting("m1").unwrap().as_deref(), Some("f1"));
+    let folders: Vec<Option<String>> = {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare("SELECT folder_id FROM notes WHERE meeting_id='m1' ORDER BY provider_id")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(folders, vec![Some("f1".into()), Some("f1".into())]);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A split legacy meeting is never assigned to an arbitrary provider folder. Every governing
+/// folder must be readable, so one locked sibling fails closed until the user explicitly files it.
+#[test]
+fn migration_leaves_conflicting_legacy_folders_ambiguous_and_visibility_fails_closed() {
+    let (db, path) = fresh_db("ambiguous-backfill");
+    container(&db, "f-open", "Open", "Open", None, "folder");
+    container(&db, "f-locked", "Locked", "Locked", None, "folder");
+    db.insert_meeting(&Meeting {
+        id: "m1".into(),
+        started_at: "2026-08-20T09:00:00Z".into(),
+        ended_at: None,
+        title: Some("Legacy split".into()),
+        duration_s: 1,
+        audio_path: None,
+        status: MeetingStatus::Summarized,
+        folder_id: None,
+    })
+    .unwrap();
+    for (provider, folder) in [("a", "f-open"), ("b", "f-locked")] {
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m1".into(),
+            provider_id: provider.into(),
+            markdown: provider.into(),
+            created_at: "2026-08-20T09:01:00Z".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE notes SET folder_id=?2 WHERE meeting_id='m1' AND provider_id=?1",
+                rusqlite::params![provider, folder],
+            )
+            .unwrap();
+    }
+    seal(&db, "f-locked");
+    drop(db);
+
+    let db = Db::open_with_key(&path, TEST_DEK).unwrap();
+    let canonical: Option<String> = db
+        .lock()
+        .query_row("SELECT folder_id FROM meetings WHERE id='m1'", [], |row| row.get(0))
+        .unwrap();
+    assert!(canonical.is_none());
+    assert!(matches!(db.folder_for_meeting("m1"), Err(AppError::Locked(_))));
+    assert!(
+        db.list_meetings_visible(50, &HashSet::new())
+            .unwrap()
+            .iter()
+            .all(|meeting| meeting.id != "m1"),
+        "one open provider must not authorize a conflicting locked sibling"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

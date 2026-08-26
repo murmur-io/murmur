@@ -54,13 +54,19 @@ use super::*;
 /// A container that is ALREADY sealed is skipped rather than re-sealed: locking a project with one
 /// folder already locked is an ordinary thing to do, and re-minting that folder's key would orphan
 /// the ciphertext already written under the old one.
-fn lock_container_subtree(
+pub(crate) fn lock_container_subtree(
     state: &AppState,
     folder_id: &str,
     allow_live_remote_shares: bool,
     visibility_revoked: impl FnOnce(),
 ) -> Result<(), AppError> {
-    for id in container_subtree_deepest_first(state, folder_id)? {
+    let subtree = container_subtree_deepest_first(state, folder_id)?;
+    // All-or-nothing preflight for the knowable mixed-key legacy condition. Without this pass, a
+    // valid deepest child could seal before a later ambiguous sibling/parent refuses.
+    for id in &subtree {
+        ensure_unambiguous_meeting_governance(state, id)?;
+    }
+    for id in subtree {
         if id == folder_id {
             continue; // the target is sealed last, below, so its notice fires once at the end.
         }
@@ -161,6 +167,7 @@ pub async fn lock_folder(
                 format!("revoke the shares on {name} before locking this project")
             }));
         }
+        ensure_unambiguous_meeting_governance(state.inner(), id)?;
     }
     // EVERY container in the subtree, not just the target — see `open_subtree_closures`.
     let closures_created = open_subtree_closures(state.inner(), &subtree)?;
@@ -210,14 +217,16 @@ pub async fn lock_folder_allow_remote_access(
     // mid-revocation is the same race the target's check exists to refuse, and the cascade would
     // otherwise walk straight into it. This command deliberately opens NO closure of its own — it
     // keeps remote copies readable by design — so refusing is the only move available here.
-    for id in container_subtree_deepest_first(state.inner(), &folder_id)? {
-        if state.db.org_folder_closure_exists(&id)? {
-            return Err(AppError::Unavailable(if id == folder_id {
+    let subtree = container_subtree_deepest_first(state.inner(), &folder_id)?;
+    for id in &subtree {
+        ensure_unambiguous_meeting_governance(state.inner(), id)?;
+        if state.db.org_folder_closure_exists(id)? {
+            return Err(AppError::Unavailable(if id == &folder_id {
                 "this folder is already closing for verified share revocation".into()
             } else {
                 let name = state
                     .db
-                    .folder_by_id(&id)?
+                    .folder_by_id(id)?
                     .map(|f| f.name)
                     .unwrap_or_else(|| id.clone());
                 format!("{name} is already closing for verified share revocation")
@@ -403,6 +412,40 @@ pub(crate) fn wrapped_key_for_new_sealed_container(
     Ok(wrapped)
 }
 
+/// Refuse a folder whose meeting/provider rows do not agree on one governing container.
+///
+/// This is a PRE-MUTATION lock-lifecycle gate. Without it, locking folder A can seal one provider
+/// row and the meeting extras under A's CK while folder B later seals a sibling provider under B's
+/// CK. Unlocking/removing either lock would then materialize only part of one logical meeting. The
+/// ambiguity must be resolved explicitly by filing the meeting, which synchronizes every provider
+/// row to the canonical owner.
+fn ensure_unambiguous_meeting_governance(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    if state
+        .db
+        .folder_has_ambiguous_meeting_governance(folder_id)?
+    {
+        return Err(AppError::Locked(
+            "this folder contains a legacy meeting assigned to multiple locations — move the meeting to one folder before changing its lock"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read-only all-or-nothing preflight for a cascading session unlock.
+///
+/// Kept as one testable seam so the command cannot accidentally validate only its root while a
+/// descendant later restores a mixed-key legacy meeting after the root has already materialized.
+pub(crate) fn preflight_unlock_subtree(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    for id in container_subtree_deepest_first(state, folder_id)? {
+        ensure_unambiguous_meeting_governance(state, &id)?;
+    }
+    Ok(())
+}
+
 fn lock_folder_inner_with_visibility_notice_policy(
     state: &AppState,
     folder_id: String,
@@ -427,6 +470,9 @@ fn lock_folder_inner_with_visibility_notice_policy(
             "the Notes root can't be locked — move notes into a folder to seal them".into(),
         ));
     }
+    // Must precede the already-locked repair branch too: that branch bumps epochs, revokes
+    // renderer visibility, edits the session set and may repair plaintext at rest.
+    ensure_unambiguous_meeting_governance(state, &folder_id)?;
     if folder.locked {
         // `locked=1` is the durable seal journal, not proof that its non-keyed cleanup tail finished.
         // Always replay that idempotent tail. Only release the CK when primary plaintext/audio residue
@@ -756,6 +802,10 @@ pub async fn unlock_folder(
     if !folder.locked {
         return Err(AppError::InvalidArg("folder is not locked".into()));
     }
+    // Read-only WHOLE-SUBTREE preflight before Keychain release, plaintext restore, cache/session
+    // mutation or vault export. The primary restore later cascades into locked descendants; finding
+    // a mixed-key legacy row only after opening the parent would be a preventable partial unlock.
+    preflight_unlock_subtree(state.inner(), &folder_id)?;
     let wrapped = state
         .db
         .folder_wrapped_key(&folder_id)?
@@ -1030,6 +1080,7 @@ async fn unlock_container_with_cached_kek(
     state: &AppState,
     folder_id: &str,
 ) -> Result<(), AppError> {
+    ensure_unambiguous_meeting_governance(state, folder_id)?;
     let kek: Zeroizing<[u8; 32]> = {
         let guard = state
             .master_kek
@@ -1365,6 +1416,10 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     if !folder.locked {
         return Ok(()); // already open — idempotent.
     }
+    // Permanent unlock restores plaintext and later re-exports it. Refuse before epoch/key/cache/
+    // DB mutation when any provider sibling belongs elsewhere, so opening one folder can never
+    // materialize only part of a meeting still governed by another lock.
+    ensure_unambiguous_meeting_governance(state, &folder_id)?;
     // Permanent unlock destroys this folder's wrapped-key generation. A salvage finalizer may
     // still need that exact CK to seal output produced after an immediate session relock.
     ensure_no_active_salvage_in_folder(state, &folder_id)?;

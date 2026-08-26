@@ -1,0 +1,196 @@
+<main class="shared-page">
+  <header class="page-head">
+    <span class="page-mark" aria-hidden="true"
+      ><mur-icon icon="shared-brains"
+    /></span>
+    <div>
+      <h1>Shared Brains</h1>
+      <p>Meetings and notes shared with you by your organizations.</p>
+    </div>
+  </header>
+
+  <section class="filters" aria-label="Shared Brain filters">
+    <div class="filter-group">
+      <span class="filter-label">Organization</span>
+      <div
+        class="filter-pills"
+        role="group"
+        aria-label="Filter by organization"
+      >
+        <button
+          type="button"
+          [class.is-active]="activeOrgId() === 'all'"
+          [attr.aria-pressed]="activeOrgId() === 'all'"
+          (click)="selectOrg('all')"
+        >
+          All organizations
+        </button>
+        @for (org of orgBrain.orgs(); track org.orgId) {
+          <button
+            type="button"
+            [class.is-active]="activeOrgId() === org.orgId"
+            [attr.aria-pressed]="activeOrgId() === org.orgId"
+            (click)="selectOrg(org.orgId)"
+          >
+            {{ org.name }}
+          </button>
+        }
+      </div>
+    </div>
+
+    <div class="filter-group filter-group--kind">
+      <span class="filter-label">Type</span>
+      <div class="filter-pills" role="group" aria-label="Filter by item type">
+        <button
+          type="button"
+          [class.is-active]="kindFilter() === 'all'"
+          [attr.aria-pressed]="kindFilter() === 'all'"
+          (click)="selectKind('all')"
+        >
+          All
+        </button>
+        <button
+          type="button"
+          [class.is-active]="kindFilter() === 'meeting'"
+          [attr.aria-pressed]="kindFilter() === 'meeting'"
+          (click)="selectKind('meeting')"
+        >
+          Meetings
+        </button>
+        <button
+          type="button"
+          [class.is-active]="kindFilter() === 'note'"
+          [attr.aria-pressed]="kindFilter() === 'note'"
+          (click)="selectKind('note')"
+        >
+          Notes
+        </button>
+      </div>
+    </div>
+  </section>
+
+  @if (listEmpty() && orgBrain.loading()) {
+    <div class="state-card" role="status">Loading Shared Brains…</div>
+  } @else if (orgBrain.orgs().length === 0) {
+    <div class="empty-state">
+      <mur-icon icon="shared-brains" />
+      <h2>No Shared Brains yet</h2>
+      <p>
+        Join an organization or enable its local Shared Brain context in
+        Settings.
+      </p>
+    </div>
+  } @else if (listEmpty()) {
+    <div class="empty-state">
+      <mur-icon icon="search" />
+      <h2>No items match these filters</h2>
+      <p>Try another organization or switch the type filter to All.</p>
+    </div>
+  } @else {
+    <section class="shared-list" aria-label="Shared items">
+      @for (row of rows(); track row.key) {
+        <article class="shared-row">
+          <button type="button" class="row-main" (click)="openRow(row)">
+            <span
+              class="row-mark"
+              [class.is-unclassified]="row.kind === 'unclassified'"
+            >
+              <mur-icon
+                [icon]="
+                  row.kind === 'meeting'
+                    ? 'meetings'
+                    : row.kind === 'note'
+                      ? 'notes'
+                      : 'browse'
+                "
+              />
+            </span>
+            <span class="row-copy">
+              <strong>{{ row.item.title || "Untitled" }}</strong>
+              <span class="row-meta">
+                <span>{{ row.item.authorHint || "Organization member" }}</span>
+                <span aria-hidden="true">·</span>
+                <span>{{ row.orgName }}</span>
+                <span aria-hidden="true">·</span>
+                <span>{{ row.displayDate }}</span>
+              </span>
+            </span>
+            <span
+              class="kind-badge"
+              [class.is-unclassified]="row.kind === 'unclassified'"
+            >
+              {{
+                row.kind === "meeting"
+                  ? "Meeting"
+                  : row.kind === "note"
+                    ? "Note"
+                    : "Unclassified"
+              }}
+            </span>
+          </button>
+          <mur-row-menu
+            [label]="'Actions for ' + (row.item.title || 'Untitled')"
+          >
+            <span class="menu-group-label">Shared item actions</span>
+            <button
+              type="button"
+              class="menu-item"
+              role="menuitem"
+              (click)="openRow(row)"
+            >
+              <mur-icon
+                [icon]="
+                  row.kind === 'meeting'
+                    ? 'meetings'
+                    : row.kind === 'note'
+                      ? 'notes'
+                      : 'browse'
+                "
+              />
+              Open
+              {{
+                row.kind === "meeting"
+                  ? "meeting"
+                  : row.kind === "note"
+                    ? "note"
+                    : "shared item"
+              }}
+            </button>
+            @if (row.kind !== "unclassified") {
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                (click)="openAddToSpace(row)"
+              >
+                <mur-icon
+                  [icon]="row.item.ownedSource ? 'move' : 'folder-add'"
+                />
+                {{
+                  row.item.ownedSource
+                    ? "Move local original to Space…"
+                    : "Add a copy to Space…"
+                }}
+              </button>
+            }
+          </mur-row-menu>
+        </article>
+      }
+    </section>
+  }
+</main>
+
+@if (addRequest(); as row) {
+  @if (addRequestItem(); as moveItem) {
+    <app-workspace-move-sheet
+      [item]="moveItem"
+      fromLabel="Shared Brains"
+      [actionVerb]="addActionVerb()"
+      [targets]="targets()"
+      [busy]="addBusy()"
+      [error]="addError()"
+      (move)="addToSpace($event)"
+      (cancelled)="closeAddToSpace()"
+    />
+  }
+}

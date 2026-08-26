@@ -77,9 +77,9 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     await page.goto("/settings");
     await page.getByRole("button", { name: "Organization" }).first().click();
 
-    await expect(
-      page.locator("app-settings-organization-section"),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("app-settings-organization-section")).toBeVisible(
+      { timeout: 10_000 },
+    );
     // Both org cards render, by name.
     await expect(page.getByText("Acme Inc.").first()).toBeVisible();
     await expect(page.getByText("Globex Design").first()).toBeVisible();
@@ -114,9 +114,9 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     await page.goto("/settings");
     await page.getByRole("button", { name: "Organization" }).first().click();
 
-    await expect(
-      page.getByText("Create an organization"),
-    ).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Create an organization")).toBeVisible({
+      timeout: 10_000,
+    });
     await expect(
       page.getByRole("button", { name: "Create organization" }),
     ).toBeVisible();
@@ -176,13 +176,19 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     // Open a meeting, go to the Share tab.
     await page.goto("/library");
     await page.locator("li.row-item a.row").first().click();
-    await page.getByRole("tab", { name: /share/i }).first().click().catch(async () => {
-      // Fallback if the tab is a button, not a role=tab.
-      await page.getByText("Share", { exact: false }).first().click();
-    });
+    await page
+      .getByRole("tab", { name: /share/i })
+      .first()
+      .click()
+      .catch(async () => {
+        // Fallback if the tab is a button, not a role=tab.
+        await page.getByText("Share", { exact: false }).first().click();
+      });
 
     // The Org Brain section CTA.
-    const addBtn = page.getByRole("button", { name: "Add to Org Brain" }).first();
+    const addBtn = page
+      .getByRole("button", { name: "Add to Org Brain" })
+      .first();
     await expect(addBtn).toBeVisible({ timeout: 10_000 });
     await page.screenshot({
       path: "e2e/org/__screens__/share-panel-org-section.png",
@@ -207,7 +213,9 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     });
   });
 
-  test("Lock×shares dialog blocks locking a shared folder", async ({ page }) => {
+  test("Lock×shares dialog blocks locking a shared folder", async ({
+    page,
+  }) => {
     await mockTauri(page, {
       // The ONE tree needs a folder to offer a lock on; the demo default has no hierarchy.
       list_workspace_tree: () => [
@@ -267,17 +275,23 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
       .first()
       .click();
     // Focus, not a pointer — see the note in lock-shares-dialog.spec.ts.
-    await spacesSidebar
-      .getByRole("button", { name: /^Actions for / })
-      .last()
-      .focus();
+    // Expansion updates the flattened tree asynchronously. Target the intended
+    // folder by its contextual label instead of racing `.last()` against that
+    // update (which can leave focus on a detached project trigger).
+    const sharedFolderActions = spacesSidebar.getByRole("button", {
+      name: "Actions for Shared work",
+    });
+    await expect(sharedFolderActions).toBeVisible();
+    await sharedFolderActions.focus();
     await page.keyboard.press("Enter");
     // The lock entry names the CASCADE now: locking a container seals every container inside it,
     // so a project holding folders says so rather than calling itself "Lock folder". This test is
     // about the shares gate, not the wording, so it matches the affordance rather than one label —
     // and the project is the case where the gate matters most, since the seal reaches its
     // descendants too.
-    await page.getByRole("menuitem", { name: /^Lock (folder|project)/ }).focus();
+    const lockFolder = page.getByRole("menuitem", { name: /^Lock folder/ });
+    await expect(lockFolder).toBeVisible();
+    await lockFolder.focus();
     await page.keyboard.press("Enter");
 
     // The blocking dialog appears with the three choices. The host has no size

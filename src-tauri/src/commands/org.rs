@@ -2219,10 +2219,8 @@ fn ingest_shared_note_with_app(
         .map(|f| f.locked)
         .unwrap_or(false);
 
-    // Set the meeting's folder FIRST so `upsert_note_reseal_if_locked` resolves the (locked) folder
-    // via `folder_for_meeting`. It reads `notes.folder_id`, but there is no note row yet — so seed a
-    // folder association through a folder-set on the (about-to-be-written) note. We do this by writing
-    // the note with the folder resolved directly below instead of relying on a two-step.
+    // The meeting shell above is born with canonical `meetings.folder_id`. Write its provider note
+    // into the same target so canonical and legacy note-level ownership stay synchronized.
     // Keep SQLite canonical and delay vault export until all referenced image files exist.
     let mut note = NoteRecord {
         meeting_id: meeting_id.clone(),
@@ -2251,8 +2249,7 @@ fn ingest_shared_note_with_app(
         state.db.upsert_note_sealed(&note, &blob, &target.id)?;
     } else {
         state.db.upsert_note(&note)?;
-        // The meeting's folder is resolved via `notes.folder_id` (`folder_for_meeting`) — set it so
-        // every gate (`meeting_is_unlocked`, `visibility_clause`) sees this note in the target folder.
+        // Keep every provider row synchronized with canonical meeting placement for legacy readers.
         state.db.set_note_folder(&meeting_id, Some(&target.id))?;
     }
 
@@ -2898,6 +2895,30 @@ pub(crate) async fn org_list_statuses_inner(state: &AppState) -> Result<Vec<OrgS
         }
     }
     Ok(out)
+}
+
+/// `org_list_cached_statuses()` — the local-replica-only counterpart to
+/// [`org_list_statuses`]. It performs no token refresh, HTTP request, or membership
+/// reconciliation; it only renders the currently admitted `org_state` rows and
+/// their local counts. Passive navigation surfaces use this command so merely
+/// opening Shared Brains never creates network egress.
+#[tauri::command]
+pub fn org_list_cached_statuses(
+    state: State<'_, AppState>,
+) -> Result<Vec<OrgStatus>, AppError> {
+    org_list_cached_statuses_inner(state.inner())
+}
+
+pub(crate) fn org_list_cached_statuses_inner(
+    state: &AppState,
+) -> Result<Vec<OrgStatus>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    state
+        .db
+        .list_org_states()?
+        .into_iter()
+        .map(|local| org_status_from_local(state, local, 1))
+        .collect()
 }
 
 /// `org_set_context_enabled(org_id, enabled)` — the PER-INSTANCE org toggle (Settings →
@@ -10982,6 +11003,95 @@ pub(crate) fn org_get_item_inner(
         }
     }
     Ok(Some(detail))
+}
+
+/// Copy a RECEIVED Shared Brain snapshot into an OPEN user Space/folder while retaining the org
+/// replica. Documents become authored notes; meetings become local meeting shells with the shared
+/// snapshot as their provider note. No recording/audio is copied or invented.
+#[tauri::command]
+pub async fn add_org_item_to_container(
+    state: State<'_, AppState>,
+    item_id: String,
+    container_id: String,
+) -> Result<crate::storage::models::OrgItemImportResult, AppError> {
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
+    add_org_item_to_container_inner(state.inner(), &item_id, &container_id)
+}
+
+/// Synchronous production core for [`add_org_item_to_container`]. Keeping every
+/// membership/current/context/destination check in this unit gives the command
+/// one auditable, deterministic gate chain; the async wrapper owns only mutation
+/// serialization.
+pub(crate) fn add_org_item_to_container_inner(
+    state: &AppState,
+    item_id: &str,
+    container_id: &str,
+) -> Result<crate::storage::models::OrgItemImportResult, AppError> {
+    let lifecycle = lifecycle_guard(state);
+    let ctx = state
+        .db
+        .org_item_edit_ctx(item_id)?
+        .ok_or_else(|| AppError::InvalidArg("no current Shared Brain item".into()))?;
+    resolve_org(state, &ctx.org_id)?;
+    ensure_meeting_folder_target(&state.db, Some(container_id))?;
+    let target = state
+        .db
+        .folder_by_id(container_id)?
+        .ok_or_else(|| AppError::InvalidArg("no such destination".into()))?;
+    if target.locked {
+        return Err(AppError::Locked(
+            "unlock the destination before adding shared content".into(),
+        ));
+    }
+    let imported = state
+        .db
+        .import_received_org_item_atomic(item_id, container_id)?;
+
+    drop(lifecycle);
+    finalize_imported_org_item_best_effort(state, &imported);
+    Ok(imported)
+}
+
+/// Publish the ordinary local derived projections after the atomic received-item import. This is
+/// deliberately best-effort after the canonical commit: a vault/index failure must not turn a
+/// successful copy into a false IPC failure. Every plaintext read is re-gated in a fresh lifecycle
+/// interval, so a lock racing the post-commit work only defers projections and never leaks content.
+pub(crate) fn finalize_imported_org_item_best_effort(
+    state: &AppState,
+    imported: &crate::storage::models::OrgItemImportResult,
+) {
+    if imported.kind != "note" {
+        // Meetings and their provider notes are inserted in one transaction; the existing
+        // meetings/notes FTS triggers make the shell lexically searchable immediately, and the
+        // ordinary gated `export_note` command can export its shared provider note. No audio row or
+        // path is synthesized.
+        return;
+    }
+    let note_projection = (|| -> Result<Option<(String, String)>, AppError> {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((folder_id, _, _)) = state.db.note_gate_anchor(&imported.id)? else {
+            return Ok(None);
+        };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Ok(None);
+        }
+        let Some(row) = state.db.get_note_row(&imported.id)? else {
+            return Ok(None);
+        };
+        if let Err(error) = export_note_to_vault_under_lifecycle_authorized(state, &row.id) {
+            tracing::warn!(target: "org", error = %error, "received note vault projection deferred");
+        }
+        Ok(Some((note_display_title(&row), row.text)))
+    })();
+    let Some((title, markdown)) = note_projection.unwrap_or_else(|error| {
+        tracing::warn!(target: "org", error = %error, "received note projection deferred");
+        None
+    }) else {
+        return;
+    };
+    // Chunk-only indexing keeps keyword retrieval available without loading an embedding model;
+    // semantic vectors are repaired by the normal model-aware reindex path when available.
+    refresh_note_doc_derived_best_effort(state, &imported.id, &title, &markdown, None);
 }
 
 pub(crate) fn org_item_permissions(st: &AppState, item_id: &str) -> Result<(bool, bool), AppError> {

@@ -525,12 +525,11 @@ fn mcp_visibility_filter() {
     assert!(visible_after.contains("sealed1"));
 }
 
-/// A meeting has no independent folder column: its canonical ownership edge is created only when
-/// a note row receives `notes.folder_id`. Live/crash-recovery meetings therefore remain visible at
-/// the vault root before their first note, while the same meeting must disappear atomically from
-/// every meeting-row resolver once its note is owned by a sealed folder.
+/// A NULL canonical `meetings.folder_id` leaves a live/crash-recovery meeting in the unfiled inbox.
+/// Once assigned to a sealed folder, the same meeting must disappear atomically from every
+/// meeting-row resolver; provider notes are synchronized but do not establish canonical ownership.
 #[test]
-fn no_note_live_meeting_is_root_visible_until_note_establishes_locked_ownership() {
+fn unfiled_live_meeting_is_visible_until_canonical_locked_ownership_is_assigned() {
     let db = file_db("no-note-root-ownership");
     let empty: HashSet<String> = HashSet::new();
     let title = "live root visibility sentinel";
