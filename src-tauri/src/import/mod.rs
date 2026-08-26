@@ -15,7 +15,7 @@
 //! | Source | Identity (`external_id`) | Body | Links |
 //! |---|---|---|---|
 //! | Notion | the 32-hex page id in every filename | Markdown, verbatim | relative paths rewritten to `[[wikilinks]]` |
-//! | Obsidian | the vault-relative path | Markdown, verbatim | already `[[wikilinks]]` — left alone |
+//! | Obsidian | the vault-relative path, SCOPED to a fingerprint of the vault root | Markdown, verbatim | already `[[wikilinks]]` — left alone |
 //! | Apple Notes | the note's Core Data id | HTML rendered to text | none to speak of |
 
 use std::collections::BTreeMap;
