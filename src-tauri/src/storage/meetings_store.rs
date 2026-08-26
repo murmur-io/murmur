@@ -23,18 +23,27 @@ use std::collections::HashSet;
 use rusqlite::OptionalExtension;
 
 use crate::error::{AppError, Result};
-use crate::storage::db::{map_err, row_to_meeting, visibility_clause, Db, RawManualNotes};
+use crate::storage::db::{
+    map_err, meeting_visibility_clause, row_to_meeting, visibility_clause, Db, RawManualNotes,
+};
 use crate::storage::models::{Meeting, MeetingStatus};
 
 pub(crate) type MeetingTriageRow = (Meeting, i64, bool);
+
+/// Visibility of one `meetings m` row. Canonical recording placement wins; rows intentionally left
+/// NULL by the conservative migration retain the legacy note-owned gate (and therefore never pick
+/// an arbitrary provider folder).
+fn meeting_visible_sql(unlocked: &HashSet<String>) -> String {
+    meeting_visibility_clause("m", unlocked)
+}
 
 impl Db {
     pub fn insert_meeting(&self, m: &Meeting) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO meetings
-               (id, started_at, ended_at, title, duration_s, audio_path, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (id, started_at, ended_at, title, duration_s, audio_path, status, folder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 m.id,
                 m.started_at,
@@ -43,6 +52,7 @@ impl Db {
                 m.duration_s,
                 m.audio_path,
                 m.status.as_str(),
+                m.folder_id,
             ],
         )
         .map_err(map_err)?;
@@ -287,10 +297,7 @@ impl Db {
     pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
-                    (SELECT n.folder_id FROM notes n
-                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status, folder_id
                FROM meetings WHERE id = ?1",
             rusqlite::params![id],
             row_to_meeting,
@@ -306,10 +313,7 @@ impl Db {
     pub fn get_meeting_gate_anchor(&self, id: &str) -> Result<Option<Meeting>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, started_at, ended_at, NULL, duration_s, NULL, status,
-                    (SELECT n.folder_id FROM notes n
-                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+            "SELECT id, started_at, ended_at, NULL, duration_s, NULL, status, folder_id
                FROM meetings WHERE id = ?1",
             rusqlite::params![id],
             row_to_meeting,
@@ -322,10 +326,7 @@ impl Db {
     pub fn latest_meeting(&self) -> Result<Option<Meeting>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
-                    (SELECT n.folder_id FROM notes n
-                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status, folder_id
                FROM meetings ORDER BY started_at DESC, id DESC LIMIT 1",
             [],
             row_to_meeting,
@@ -340,10 +341,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
-                        (SELECT n.folder_id FROM notes n
-                          WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                          AS folder_id
+                "SELECT id, started_at, ended_at, title, duration_s, audio_path, status, folder_id
                    FROM meetings ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
             .map_err(map_err)?;
@@ -421,10 +419,7 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, \
-                        m.status, \
-                        (SELECT nf.folder_id FROM notes nf \
-                          WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
-                          AS folder_id
+                        m.status, m.folder_id
                    FROM meetings m
                    JOIN meeting_tags t ON t.meeting_id = m.id
                   WHERE t.tag = ?1
@@ -544,23 +539,16 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<Meeting>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visible_sql(unlocked);
         // A meeting is hidden only when EVERY note it has is sealed-and-not-unlocked. Expressed
         // as: no note row exists that is currently sealed-and-hidden for this meeting, unless a
         // sibling visible note exists. Simpler + correct: keep the meeting if it has zero notes
         // OR at least one visible note.
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+                    m.folder_id
                FROM meetings m
-              WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )
+              WHERE {meeting_visible}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT ?1"
         );
@@ -587,13 +575,12 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<MeetingTriageRow>> {
         let conn = self.lock();
+        let meeting_visible = meeting_visible_sql(unlocked);
         let visible = visibility_clause("n", unlocked);
         let limit = limit.clamp(1, 100);
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id,
+                    m.folder_id,
                     COALESCE(
                       (SELECT SUM(LENGTH(s.text)) FROM segments s WHERE s.meeting_id = m.id),
                       0
@@ -604,12 +591,7 @@ impl Db {
                        WHERE n.meeting_id = m.id AND {visible}
                     ) AS has_visible_note
                FROM meetings m
-              WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )
+              WHERE {meeting_visible}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT ?1"
         );
@@ -641,20 +623,13 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Option<Meeting>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visible_sql(unlocked);
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+                    m.folder_id
                FROM meetings m
               WHERE m.title = ?1
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (
-                          SELECT 1 FROM notes n
-                           LEFT JOIN folders f ON f.id = n.folder_id
-                           WHERE n.meeting_id = m.id AND {visible}
-                        ))
+                AND {meeting_visible}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT 1"
         );
@@ -667,31 +642,23 @@ impl Db {
     /// Full meeting row through one SQL visibility predicate. Unlike a check-then-`get_meeting`
     /// pair, a concurrent relock cannot land between authorization and reading title/audio_path.
     ///
-    /// Canonical ownership invariant: a meeting's only folder edge is `notes.folder_id`, so a
-    /// meeting with no note rows is necessarily unfiled/root-visible. That state is intentional
-    /// for live recordings and crash-recovery ghosts. Do not infer a former seal from optional
-    /// artifacts: segment/timeline/manual-note blobs and encrypted audio can all legitimately be
-    /// absent. Once a note establishes folder ownership, the predicate below gates and hydrates
-    /// the row in the same SQL statement.
+    /// Canonical ownership invariant: a meeting's folder edge is `meetings.folder_id`, including
+    /// before its first note exists. A NULL canonical edge is unfiled unless conservative legacy
+    /// note ownership governs it. Do not infer placement from optional artifacts: segment/timeline/
+    /// manual-note blobs and encrypted audio can all legitimately be absent. The predicate below
+    /// gates and hydrates the row in the same SQL statement.
     pub fn get_meeting_if_visible(
         &self,
         id: &str,
         unlocked: &HashSet<String>,
     ) -> Result<Option<Meeting>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visible_sql(unlocked);
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
+                    m.folder_id
                FROM meetings m
-              WHERE m.id = ?1 AND (
-                    NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                    OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    ))"
+              WHERE m.id = ?1 AND {meeting_visible}"
         );
         conn.query_row(&sql, rusqlite::params![id], row_to_meeting)
             .optional()
@@ -710,20 +677,13 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Option<Meeting>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visible_sql(unlocked);
         let sql = format!(
             "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
+                    m.folder_id
                FROM meetings m
               WHERE LOWER(m.title) = LOWER(?1)
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (
-                          SELECT 1 FROM notes n
-                           LEFT JOIN folders f ON f.id = n.folder_id
-                           WHERE n.meeting_id = m.id AND {visible}
-                        ))
+                AND {meeting_visible}
               ORDER BY m.started_at DESC, m.id DESC
               LIMIT 1"
         );
@@ -737,20 +697,11 @@ impl Db {
     /// in MCP `get_meeting` so a sealed meeting's transcript is not leaked either.
     pub fn meeting_is_visible(&self, meeting_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = ?1) AS has_notes,
-                    EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = ?1 AND {visible}
-                    ) AS has_visible"
-        );
-        let (has_notes, has_visible): (bool, bool) = conn
-            .query_row(&sql, rusqlite::params![meeting_id], |r| {
-                Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
-            })
-            .map_err(map_err)?;
-        Ok(!has_notes || has_visible)
+        let meeting_visible = meeting_visible_sql(unlocked);
+        let sql = format!("SELECT EXISTS(SELECT 1 FROM meetings m WHERE m.id=?1 AND {meeting_visible})");
+        conn.query_row(&sql, rusqlite::params![meeting_id], |r| {
+            Ok(r.get::<_, i64>(0)? != 0)
+        })
+        .map_err(map_err)
     }
 }

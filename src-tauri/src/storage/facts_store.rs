@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use rusqlite::{OptionalExtension, Row};
 
 use crate::error::Result;
-use crate::storage::db::{fts_match_query_any, map_err, visibility_clause, Db};
+use crate::storage::db::{fts_match_query_any, map_err, meeting_visibility_clause, Db};
 
 impl Db {
     // ── bitemporal FACTS layer (brain2 R2) ────────────────────────────────────
@@ -123,21 +123,14 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<crate::facts::Fact>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT ft.id, ft.entity_id, ft.subject, ft.predicate, ft.object, ft.valid_from, \
                     ft.valid_to, ft.recorded_at, ft.meeting_id, ft.confidence \
                FROM facts ft \
                JOIN meetings m ON m.id = ft.meeting_id \
               WHERE ft.entity_id = ?1 \
-                AND ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+                AND {meeting_visible} \
               ORDER BY (ft.valid_to IS NULL) DESC, ft.valid_from DESC, ft.id DESC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -513,21 +506,14 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<crate::facts::Fact>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT uf.id, uf.subject, uf.predicate, uf.object, uf.valid_from, \
                     uf.valid_to, uf.recorded_at, uf.meeting_id, uf.confidence \
                FROM user_facts uf \
                JOIN meetings m ON m.id = uf.meeting_id \
               WHERE uf.valid_to IS NULL \
-                AND ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+                AND {meeting_visible} \
               ORDER BY uf.valid_from DESC, uf.id DESC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -558,7 +544,7 @@ impl Db {
             return Ok(Vec::new());
         };
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT uf.id, uf.subject, uf.predicate, uf.object, uf.valid_from, \
                     uf.valid_to, uf.recorded_at, uf.meeting_id, uf.confidence \
@@ -567,14 +553,7 @@ impl Db {
                JOIN meetings m ON m.id = uf.meeting_id \
               WHERE fts_user_facts MATCH ?1 \
                 AND uf.valid_to IS NULL \
-                AND ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+                AND {meeting_visible} \
               ORDER BY bm25(fts_user_facts) ASC, uf.valid_from DESC, uf.id DESC \
               LIMIT ?2"
         );
@@ -703,21 +682,14 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<crate::facts::Fact>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT ft.id, ft.entity_id, ft.subject, ft.predicate, ft.object, ft.valid_from, \
                     ft.valid_to, ft.recorded_at, ft.meeting_id, ft.confidence \
                FROM facts ft \
                JOIN meetings m ON m.id = ft.meeting_id \
               WHERE ft.valid_to IS NULL \
-                AND ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+                AND {meeting_visible} \
               ORDER BY ft.valid_from ASC, ft.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -740,21 +712,14 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<crate::facts::Fact>> {
         let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
+        let meeting_visible = meeting_visibility_clause("m", unlocked);
         let sql = format!(
             "SELECT ft.id, ft.entity_id, ft.subject, ft.predicate, ft.object, ft.valid_from, \
                     ft.valid_to, ft.recorded_at, ft.meeting_id, ft.confidence \
                FROM facts ft \
                JOIN meetings m ON m.id = ft.meeting_id \
               WHERE ft.meeting_id = ?1 \
-                AND ( \
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
-                   OR EXISTS ( \
-                        SELECT 1 FROM notes n \
-                         LEFT JOIN folders f ON f.id = n.folder_id \
-                         WHERE n.meeting_id = m.id AND {visible} \
-                      ) \
-                    ) \
+                AND {meeting_visible} \
               ORDER BY ft.valid_from ASC, ft.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;

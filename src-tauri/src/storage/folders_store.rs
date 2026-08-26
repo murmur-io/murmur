@@ -550,6 +550,20 @@ impl Db {
         Ok(())
     }
 
+    /// Insert a peer top-level Space. Unlike the migration-owned default project, a user-created
+    /// Space owns its own vault-relative directory and therefore has a non-empty unique path.
+    pub(crate) fn insert_space(&self, f: &Folder) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO folders
+               (id, name, path, parent_id, locked, wrapped_key, created_at, kind, level)
+             VALUES (?1, ?2, ?3, NULL, 0, NULL, ?4, 'meeting', 'project')",
+            rusqlite::params![f.id, f.name, f.path, f.created_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// All folders (creation order). The tree is assembled by the caller.
     pub fn list_folders(&self) -> Result<Vec<Folder>> {
         let conn = self.lock();
@@ -658,7 +672,8 @@ impl Db {
                 &format!(
                     "SELECT EXISTS(
                        SELECT 1 FROM folders
-                        WHERE parent_id IS NULL AND path <> '' AND {NOT_SYSTEM})"
+                        WHERE parent_id IS NULL AND path <> ''
+                          AND COALESCE(level, 'folder') <> 'project' AND {NOT_SYSTEM})"
                 ),
                 [],
                 |r| Ok(r.get::<_, i64>(0)? != 0),
@@ -825,7 +840,8 @@ impl Db {
         conn.execute(
             &format!(
                 "UPDATE folders SET parent_id = ?1
-                  WHERE parent_id IS NULL AND id <> ?1 AND {NOT_SYSTEM}"
+                  WHERE parent_id IS NULL AND id <> ?1
+                    AND COALESCE(level, 'folder') <> 'project' AND {NOT_SYSTEM}"
             ),
             rusqlite::params![project_id],
         )
@@ -839,7 +855,8 @@ impl Db {
         conn.execute(
             &format!(
                 "UPDATE folders SET level = 'folder'
-                  WHERE id <> ?1 AND COALESCE(level, 'folder') <> 'folder' AND {NOT_SYSTEM}"
+                  WHERE id <> ?1 AND COALESCE(level, 'folder') NOT IN ('project', 'folder')
+                    AND {NOT_SYSTEM}"
             ),
             rusqlite::params![project_id],
         )
@@ -876,6 +893,7 @@ impl Db {
                   WHERE id = ?1
                     AND NOT EXISTS (SELECT 1 FROM folders WHERE parent_id = ?1)
                     AND NOT EXISTS (SELECT 1 FROM notes WHERE folder_id = ?1)
+                    AND NOT EXISTS (SELECT 1 FROM meetings WHERE folder_id = ?1)
                     AND NOT EXISTS (SELECT 1 FROM documents WHERE folder_id = ?1)",
                 rusqlite::params![id],
             )
@@ -1000,6 +1018,30 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Whether a user-visible vault directory already occupies `path` under macOS-style
+    /// case-insensitive matching. `folders.path` keeps its exact UNIQUE constraint as the final
+    /// same-spelling race guard; Space creation additionally holds the lifecycle mutex while this
+    /// Unicode-lowercase scan and insert run, preventing `Work`/`work` siblings in one process.
+    pub(crate) fn user_folder_path_exists_case_insensitive(&self, path: &str) -> Result<bool> {
+        let conn = self.lock();
+        let mut statement = conn
+            .prepare("SELECT path FROM folders WHERE id <> ?1")
+            .map_err(map_err)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![crate::storage::tasks_store::TASK_FOLDER_ID],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_err)?;
+        let needle = path.to_lowercase();
+        for row in rows {
+            if row.map_err(map_err)?.to_lowercase() == needle {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Set a folder's `locked` flag + its KEK-wrapped content key (`Some` when sealing,
     /// `None` to clear on permanent remove-lock).
     pub fn set_folder_locked(
@@ -1080,10 +1122,9 @@ impl Db {
         Ok(())
     }
 
-    /// Assign (or clear) a MEETING's folder. A meeting's folder = its note's folder, so this
-    /// updates `folder_id` on EVERY provider row of the meeting (`WHERE meeting_id = ?1`) — the
-    /// note moves as a unit and the seal/unlock lifecycle (which iterates provider rows) stays
-    /// coherent (no row left in a stale folder). `None` clears the folder (move to vault root).
+    /// Assign (or clear) a meeting's canonical `meetings.folder_id`, synchronizing EVERY provider
+    /// note row (`WHERE meeting_id = ?1`) so legacy note-level readers and the seal lifecycle stay
+    /// coherent. `None` clears the canonical placement (move to the unfiled inbox).
     /// A locked target additionally refuses any nonterminal generation or pending legacy recovery
     /// marker in the SAME transaction, so no caller can associate unmanaged plaintext audio behind
     /// a folder lock even if it bypasses the command-side recovery seam.
@@ -1118,6 +1159,14 @@ impl Db {
                     .into(),
             ));
         }
+        let changed = tx.execute(
+            "UPDATE meetings SET folder_id = ?2 WHERE id = ?1",
+            rusqlite::params![meeting_id, folder_id],
+        )
+        .map_err(map_err)?;
+        if changed != 1 {
+            return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
+        }
         tx.execute(
             "UPDATE notes SET folder_id = ?2 WHERE meeting_id = ?1",
             rusqlite::params![meeting_id, folder_id],
@@ -1126,7 +1175,7 @@ impl Db {
         tx.commit().map_err(map_err)
     }
 
-    /// Back-compat alias for [`Db::set_meeting_folder`] — a note's folder is the meeting's folder.
+    /// Back-compat alias for [`Db::set_meeting_folder`]; canonical placement is meeting-owned.
     pub fn set_note_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
         self.set_meeting_folder(meeting_id, folder_id)
     }
@@ -1147,12 +1196,19 @@ impl Db {
         Ok(out)
     }
 
-    /// Distinct meeting ids whose notes live in `folder_id` (the meetings governed by the
-    /// folder's lock). Used to seal/unseal each meeting's transcript + timeline.
+    /// Distinct meeting ids canonically filed in `folder_id`, plus legacy note-owned rows that have
+    /// not yet been assigned canonically. This COMPLETE enumeration is the lock boundary for a
+    /// pre-note recording's transcript/timeline/manual-notes/audio.
     pub fn meeting_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1")
+            .prepare(
+                "SELECT id FROM meetings WHERE folder_id = ?1
+                 UNION
+                 SELECT n.meeting_id FROM notes n
+                  JOIN meetings m ON m.id = n.meeting_id
+                  WHERE n.folder_id = ?1 AND m.folder_id IS NULL",
+            )
             .map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
@@ -1164,19 +1220,58 @@ impl Db {
         Ok(out)
     }
 
-    /// The owning folder id for a meeting (its notes' `folder_id`), or `None` at the vault root.
-    /// Drives the read-gate predicate `meeting_is_unlocked`.
-    pub fn folder_for_meeting(&self, meeting_id: &str) -> Result<Option<String>> {
+    /// Every folder that governs a meeting's visibility.
+    ///
+    /// New rows have one canonical `meetings.folder_id`. The note-derived branch is retained only
+    /// for legacy rows that could not be canonicalized safely. Returning *all* of those legacy
+    /// folders lets the command-layer gate require every governing folder to be readable instead
+    /// of accidentally choosing an unlocked sibling beside a locked one.
+    pub fn folders_for_meeting(&self, meeting_id: &str) -> Result<Vec<String>> {
         let conn = self.lock();
-        conn.query_row(
-            "SELECT folder_id FROM notes
-              WHERE meeting_id = ?1 AND folder_id IS NOT NULL LIMIT 1",
+        let canonical = conn
+            .query_row(
+            "SELECT folder_id FROM meetings WHERE id = ?1",
             rusqlite::params![meeting_id],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()
-        .map_err(map_err)
-        .map(Option::flatten)
+        .map_err(map_err)?
+        .flatten();
+        if let Some(folder_id) = canonical {
+            return Ok(vec![folder_id]);
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT folder_id FROM notes
+                  WHERE meeting_id = ?1 AND folder_id IS NOT NULL
+                  ORDER BY folder_id",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut folders = Vec::new();
+        for row in rows {
+            folders.push(row.map_err(map_err)?);
+        }
+        Ok(folders)
+    }
+
+    /// The single owning folder id for a meeting, or `None` when unfiled.
+    ///
+    /// Ambiguous legacy ownership is deliberately not collapsed to an arbitrary folder. Read gates
+    /// use [`Self::folders_for_meeting`] and require every governing folder to be visible; callers
+    /// that need one mutation target must first resolve the ambiguity explicitly.
+    pub fn folder_for_meeting(&self, meeting_id: &str) -> Result<Option<String>> {
+        let folders = self.folders_for_meeting(meeting_id)?;
+        match folders.as_slice() {
+            [] => Ok(None),
+            [folder_id] => Ok(Some(folder_id.clone())),
+            _ => Err(crate::error::AppError::Locked(
+                "legacy meeting belongs to multiple folders".into(),
+            )),
+        }
     }
 }
 

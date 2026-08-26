@@ -186,6 +186,45 @@ pub fn create_folder(
     create_folder_inner(state.inner(), name, parent_id)
 }
 
+/// Create a first-class peer Space. The row and its vault-relative directory either both become
+/// visible or the freshly-created row is removed by the same bounded undo used for folders.
+#[tauri::command]
+pub fn create_space(state: State<'_, AppState>, name: String) -> Result<Folder, AppError> {
+    create_space_inner(state.inner(), name)
+}
+
+pub(crate) fn create_space_inner(state: &AppState, name: String) -> Result<Folder, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let clean = crate::summarize::organize::sanitize_folder(&name)
+        .ok_or_else(|| AppError::InvalidArg("space name is empty or invalid".into()))?;
+    if state
+        .db
+        .user_folder_path_exists_case_insensitive(&clean)?
+    {
+        return Err(AppError::InvalidArg(
+            "a Space with this name already exists".into(),
+        ));
+    }
+    let dir = match vault_path(state) {
+        Some(vault) => Some(assert_in_vault(
+            std::path::Path::new(&vault),
+            std::path::Path::new(&clean),
+        )?),
+        None => None,
+    };
+    let space = Folder {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: clean.clone(),
+        path: clean,
+        parent_id: None,
+        locked: false,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.db.insert_space(&space)?;
+    create_container_dir_or_undo(state, &space.id, dir.as_deref())?;
+    Ok(space)
+}
+
 /// Inner of [`create_folder`] taking `&AppState`, so the real creation path can be exercised by a
 /// test rather than approximated by calling its name sanitiser directly.
 pub(crate) fn create_folder_inner(
@@ -663,6 +702,20 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
         ));
     }
 
+    // A canonical-NULL legacy meeting can still have provider rows split across this folder and a
+    // sibling. Rehoming it through `set_meeting_folder(None)` would synchronize EVERY provider row,
+    // detaching the sibling from its own (possibly sealed) content key. Refuse before lock removal,
+    // DB placement changes or filesystem moves; the user must first file the meeting explicitly.
+    if state
+        .db
+        .folder_has_ambiguous_meeting_governance(&folder_id)?
+    {
+        return Err(AppError::Locked(
+            "this folder contains a legacy meeting assigned to multiple locations — move the meeting to one folder before deleting it"
+                .into(),
+        ));
+    }
+
     // If sealed, it MUST be session-unlocked so we can unseal its notes back to plaintext before the
     // folder row (which carries the wrapped key) is destroyed. Otherwise refuse — never orphan
     // sealed content.
@@ -689,21 +742,23 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
     let _lifecycle = lifecycle_guard(state);
     ensure_no_active_salvage_in_folder(state, &folder_id)?;
 
-    // Move every note in this folder to the vault root (folder_id = NULL). The notes' plaintext `.md`
-    // files already live in this folder's vault subdir; we re-point each meeting's exported_path to
-    // the root by moving the file (best-effort, copy-then-remove — never loses bytes).
+    // Rehome EVERY meeting governed by this folder, including a newly filed recording that has no
+    // provider note yet. Enumerating only `notes_in_folder` made that pre-note row keep a dangling
+    // canonical `meetings.folder_id` after the folder disappeared, hiding it behind the fail-closed
+    // read gate. The note rows below are retained only to locate an optional exported Markdown file.
     let notes = state.db.notes_in_folder(&folder_id)?;
-    let mut moved_meetings = std::collections::HashSet::new();
-    for n in &notes {
-        if !moved_meetings.insert(n.meeting_id.clone()) {
-            continue;
-        }
-        // Reassign every provider row of this meeting to the root.
-        state.db.set_meeting_folder(&n.meeting_id, None)?;
+    let meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
+    for meeting_id in meeting_ids {
+        // Reassign the canonical owner and every provider row atomically to the root.
+        state.db.set_meeting_folder(&meeting_id, None)?;
         // Best-effort move of the plaintext `.md` to the vault root (only when one exists).
-        if let Some(src_path) = n.exported_path.clone() {
+        if let Some(src_path) = notes
+            .iter()
+            .find(|note| note.meeting_id == meeting_id)
+            .and_then(|note| note.exported_path.clone())
+        {
             if let Some(vault) = vault_path(state) {
-                move_note_file_to_root(state, &n.meeting_id, &src_path, &vault)?;
+                move_note_file_to_root(state, &meeting_id, &src_path, &vault)?;
             }
         }
     }

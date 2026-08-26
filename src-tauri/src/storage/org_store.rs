@@ -19,7 +19,7 @@
 //! `pub(crate)` in `db.rs` and is reached cross-file. The 1:1-share (`outbound_shares`) machinery
 //! stays in `db.rs`. Tests stay in db.rs's `mod tests` (shared harness); the count is conserved.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::OptionalExtension;
 
@@ -36,6 +36,17 @@ use crate::storage::models::OrgChunkHit;
 /// Natural-language org queries should never approach this; taking the first bounded unique terms
 /// also prevents an untrusted query from making SQL preparation scale without bound.
 const MAX_ORG_FTS_CONTENT_TERMS: usize = 32;
+
+/// A received org item crosses from the SQLCipher-backed replica into an ordinary local note or
+/// meeting. Bound that copy independently of the wire parser: old/corrupt local replicas must not
+/// turn one click into an unbounded allocation. These ceilings match the local attachment owner
+/// limits and stay within the authenticated org-note bundle ceiling.
+const MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECEIVED_ORG_IMPORT_ATTACHMENTS: usize = crate::storage::MAX_ATTACHMENTS_PER_OWNER;
+const MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES: usize = crate::storage::MAX_ATTACHMENT_BYTES;
+const MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_TOTAL_BYTES: usize =
+    crate::storage::MAX_ATTACHMENT_BYTES_PER_OWNER;
+const MAX_RECEIVED_ORG_IMPORT_TOTAL_BYTES: usize = murmur_protocol::caps::MAX_NOTE_BUNDLE_BYTES;
 
 fn require_stable_uuid(value: &str, error: &'static str) -> Result<()> {
     parse_stable_uuid(value)
@@ -1551,8 +1562,10 @@ impl Db {
                     AND ((s.document_id IS NOT NULL AND EXISTS(
                           SELECT 1 FROM documents d WHERE d.id=s.document_id AND d.folder_id=?1))
                       OR (s.meeting_id IS NOT NULL AND EXISTS(
-                          SELECT 1 FROM notes n WHERE n.meeting_id=s.meeting_id
-                           AND n.folder_id=?1)))",
+                          SELECT 1 FROM meetings m WHERE m.id=s.meeting_id AND
+                            (m.folder_id=?1 OR (m.folder_id IS NULL AND EXISTS(
+                              SELECT 1 FROM notes n WHERE n.meeting_id=m.id
+                               AND n.folder_id=?1))))))",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -1589,8 +1602,10 @@ impl Db {
                     AND ((s.document_id IS NOT NULL AND EXISTS(
                           SELECT 1 FROM documents d WHERE d.id=s.document_id AND d.folder_id=?1))
                       OR (s.meeting_id IS NOT NULL AND EXISTS(
-                          SELECT 1 FROM notes n WHERE n.meeting_id=s.meeting_id
-                           AND n.folder_id=?1)))",
+                          SELECT 1 FROM meetings m WHERE m.id=s.meeting_id AND
+                            (m.folder_id=?1 OR (m.folder_id IS NULL AND EXISTS(
+                              SELECT 1 FROM notes n WHERE n.meeting_id=m.id
+                               AND n.folder_id=?1))))))",
             )
             .map_err(map_err)?;
         let rows = stmt
@@ -4382,5 +4397,481 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok(out)
+    }
+
+    /// Atomically copy the current, context-enabled head of a RECEIVED Shared Brain item into an
+    /// open local container. The org replica is retained. A document becomes an authored note; a
+    /// meeting becomes a local meeting shell plus its provider snapshot note. Audio is deliberately
+    /// absent: the relay never supplied an authenticated local recording and this import never
+    /// invents one.
+    pub fn import_received_org_item_atomic(
+        &self,
+        item_id: &str,
+        folder_id: &str,
+    ) -> Result<crate::storage::models::OrgItemImportResult> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // Read only metadata and SQLite-computed byte length first. Pulling `markdown` into Rust
+        // before checking its size would already make the resource bound ineffective.
+        let source = tx
+            .query_row(
+                "SELECT oi.org_id, oi.source_kind, oi.title, oi.created_at,
+                        length(CAST(oi.markdown AS BLOB))
+                   FROM org_items oi
+                   JOIN org_state os ON os.org_id=oi.org_id
+                  WHERE oi.item_id=?1 AND oi.tombstoned=0 AND os.context_enabled=1
+                    AND (oi.doc_id IS NULL OR oi.is_current=1)
+                    AND COALESCE(oi.source_kind,'') IN ('document','meeting')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM org_shares s WHERE s.item_id=oi.item_id
+                    )",
+                rusqlite::params![item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?
+            .ok_or_else(|| {
+                crate::error::AppError::InvalidArg(
+                    "this received Shared Brain item is unavailable or no longer current".into(),
+                )
+            })?;
+        let (org_id, source_kind, title, source_created_at, markdown_bytes) = source;
+        let markdown_bytes = usize::try_from(markdown_bytes).map_err(|_| {
+            crate::error::AppError::InvalidArg(
+                "shared content has an invalid markdown length".into(),
+            )
+        })?;
+        if markdown_bytes > MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES {
+            return Err(crate::error::AppError::InvalidArg(
+                "shared note is too large to add to a Space".into(),
+            ));
+        }
+
+        // Re-check the destination inside the same transaction that births the copy. Locked targets
+        // are refused before any local row or attachment is written; seal-on-birth is intentionally
+        // not approximated here.
+        let target_open = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM folders
+                    WHERE id=?1 AND locked=0
+                      AND COALESCE(kind,'meeting') IN ('meeting','note')
+                      AND LOWER(path) <> '.murmur'
+                      AND LOWER(path) NOT LIKE '.murmur/%'
+                 )",
+                rusqlite::params![folder_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(map_err)?;
+        if !target_open {
+            return Err(crate::error::AppError::Locked(
+                "unlock the destination before adding shared content".into(),
+            ));
+        }
+
+        // Validate count and byte totals without selecting attachment BLOBs. Check both the
+        // authenticated `byte_len` witness and SQLite's actual BLOB length: a corrupt legacy row
+        // must not evade the cap by lying in either direction. No local mutation has happened yet.
+        let attachment_bounds = tx
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(MAX(byte_len),0),
+                        COALESCE(MAX(length(data)),0),
+                        COALESCE(SUM(byte_len),0),
+                        COALESCE(SUM(length(data)),0),
+                        COALESCE(SUM(CASE WHEN byte_len != length(data) THEN 1 ELSE 0 END),0)
+                   FROM note_attachments WHERE org_item_id=?1",
+                rusqlite::params![item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(map_err)?;
+        let (attachment_count, max_declared, max_actual, declared_total, actual_total, mismatches) =
+            attachment_bounds;
+        let attachment_count = usize::try_from(attachment_count).map_err(|_| {
+            crate::error::AppError::InvalidArg("invalid shared attachment count".into())
+        })?;
+        let max_declared = usize::try_from(max_declared).map_err(|_| {
+            crate::error::AppError::InvalidArg("invalid shared attachment length".into())
+        })?;
+        let max_actual = usize::try_from(max_actual).map_err(|_| {
+            crate::error::AppError::InvalidArg("invalid shared attachment length".into())
+        })?;
+        let declared_total = usize::try_from(declared_total).map_err(|_| {
+            crate::error::AppError::InvalidArg("invalid shared attachment total".into())
+        })?;
+        let actual_total = usize::try_from(actual_total).map_err(|_| {
+            crate::error::AppError::InvalidArg("invalid shared attachment total".into())
+        })?;
+        let imported_total = markdown_bytes.checked_add(actual_total).ok_or_else(|| {
+            crate::error::AppError::InvalidArg("shared import size overflow".into())
+        })?;
+        if mismatches != 0 {
+            return Err(crate::error::AppError::InvalidArg(
+                "shared attachment metadata is inconsistent".into(),
+            ));
+        }
+        if attachment_count > MAX_RECEIVED_ORG_IMPORT_ATTACHMENTS {
+            return Err(crate::error::AppError::InvalidArg(
+                "shared item has too many attachments to add to a Space".into(),
+            ));
+        }
+        if max_declared > MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES
+            || max_actual > MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES
+        {
+            return Err(crate::error::AppError::InvalidArg(
+                "a shared attachment is too large to add to a Space".into(),
+            ));
+        }
+        if declared_total > MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_TOTAL_BYTES
+            || actual_total > MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_TOTAL_BYTES
+            || imported_total > MAX_RECEIVED_ORG_IMPORT_TOTAL_BYTES
+        {
+            return Err(crate::error::AppError::InvalidArg(
+                "shared item is too large to add to a Space".into(),
+            ));
+        }
+
+        // The preflight above makes this first plaintext allocation explicitly bounded.
+        let markdown = tx
+            .query_row(
+                "SELECT markdown FROM org_items WHERE item_id=?1",
+                rusqlite::params![item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_err)?;
+
+        let mut attachment_stmt = tx
+            .prepare(
+                "SELECT id,mime_type,extension,byte_len,width,height,sha256,data,created_at
+                   FROM note_attachments WHERE org_item_id=?1 ORDER BY created_at,id",
+            )
+            .map_err(map_err)?;
+        let source_attachments = attachment_stmt
+            .query_map(rusqlite::params![item_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        drop(attachment_stmt);
+
+        let mut remap = HashMap::new();
+        for (old_id, ..) in &source_attachments {
+            remap.insert(old_id.clone(), uuid::Uuid::new_v4().to_string());
+        }
+        let markdown = crate::share::envelope::remap_share_images(&markdown, &remap);
+        let local_id = uuid::Uuid::new_v4().to_string();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let clean_title = if title.trim().is_empty() {
+            crate::storage::db::UNTITLED_TITLE
+        } else {
+            title.trim()
+        };
+
+        let local_kind = if source_kind == "document" {
+            tx.execute(
+                "INSERT INTO documents
+                   (id,folder_id,name,title,text,kind,text_blob,created_at,updated_at,exported_path)
+                 VALUES (?1,?2,?3,?4,?5,'note',NULL,?6,?6,NULL)",
+                rusqlite::params![
+                    local_id,
+                    folder_id,
+                    crate::export::sanitize_title(clean_title),
+                    clean_title,
+                    markdown,
+                    now_ms,
+                ],
+            )
+            .map_err(map_err)?;
+            "note"
+        } else {
+            tx.execute(
+                "INSERT INTO meetings
+                   (id,started_at,ended_at,title,duration_s,audio_path,status,folder_id)
+                 VALUES (?1,?2,?2,?3,0,NULL,'SUMMARIZED',?4)",
+                rusqlite::params![local_id, source_created_at, clean_title, folder_id],
+            )
+            .map_err(map_err)?;
+            tx.execute(
+                "INSERT INTO notes
+                   (meeting_id,provider_id,markdown,created_at,exported_path,folder_id)
+                 VALUES (?1,'shared-brain',?2,?3,NULL,?4)",
+                rusqlite::params![local_id, markdown, source_created_at, folder_id],
+            )
+            .map_err(map_err)?;
+            "meeting"
+        };
+
+        for (old_id, mime, extension, byte_len, width, height, sha256, data, created_at) in
+            source_attachments
+        {
+            let new_id = remap.get(&old_id).ok_or_else(|| {
+                crate::error::AppError::Storage("attachment remap disappeared".into())
+            })?;
+            let (document_id, meeting_id, provider_id) = if local_kind == "note" {
+                (Some(local_id.as_str()), None, None)
+            } else {
+                (None, Some(local_id.as_str()), Some("shared-brain"))
+            };
+            tx.execute(
+                "INSERT INTO note_attachments
+                   (id,document_id,meeting_id,provider_id,org_item_id,mime_type,extension,
+                    byte_len,width,height,sha256,data,data_blob,exported_path,created_at)
+                 VALUES (?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,?10,?11,NULL,NULL,?12)",
+                rusqlite::params![
+                    new_id,
+                    document_id,
+                    meeting_id,
+                    provider_id,
+                    mime,
+                    extension,
+                    byte_len,
+                    width,
+                    height,
+                    sha256,
+                    data,
+                    created_at,
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        tx.execute(
+            "INSERT INTO local_org_imports(local_kind,local_id,org_id,item_id,created_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![local_kind, local_id, org_id, item_id, now_iso],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(crate::storage::models::OrgItemImportResult {
+            kind: local_kind.to_string(),
+            id: local_id,
+        })
+    }
+}
+
+#[cfg(test)]
+mod received_import_bounds_tests {
+    use super::*;
+    use crate::error::AppError;
+    use crate::storage::models::Folder;
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn test_db(tag: &str) -> Db {
+        let path = crate::storage::db::unique_temp_path(
+            &format!("murmur-org-import-bounds-{tag}"),
+            "sqlite",
+        );
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open_with_key(&path, TEST_DEK).expect("open test SQLCipher db");
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-bounds".into(),
+            name: "Bounds".into(),
+            role: "member".into(),
+            joined_at: "2026-08-26T00:00:00Z".into(),
+            consented: false,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .expect("seed org");
+        db.insert_folder(&Folder {
+            id: "destination".into(),
+            name: "Destination".into(),
+            path: "Destination".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-08-26T00:00:00Z".into(),
+        })
+        .expect("seed destination");
+        db
+    }
+
+    fn seed_received_item(db: &Db, item_id: &str, markdown: &str) {
+        db.lock()
+            .execute(
+                "INSERT INTO org_items
+                   (item_id,org_id,seq,author_hint,title,markdown,created_at,rev,generation,
+                    content_sha256,is_current,tombstoned,source_kind)
+                 VALUES (?1,'org-bounds',1,'peer','Shared item',?2,
+                         '2026-08-26T00:00:00Z',1,1,X'01',1,0,'document')",
+                rusqlite::params![item_id, markdown],
+            )
+            .expect("seed received item");
+    }
+
+    fn seed_attachment(db: &Db, item_id: &str, index: usize, data: Vec<u8>) {
+        let id = format!("{item_id}-attachment-{index}");
+        let byte_len = i64::try_from(data.len()).expect("test attachment length fits i64");
+        db.lock()
+            .execute(
+                "INSERT INTO note_attachments
+                   (id,document_id,meeting_id,provider_id,org_item_id,mime_type,extension,
+                    byte_len,width,height,sha256,data,data_blob,exported_path,created_at)
+                 VALUES (?1,NULL,NULL,NULL,?2,'image/png','png',?3,1,1,?4,?5,NULL,NULL,1)",
+                rusqlite::params![id, item_id, byte_len, vec![7u8; 32], data],
+            )
+            .expect("seed received attachment");
+    }
+
+    fn mutation_snapshot(db: &Db, item_id: &str) -> (i64, i64, i64, i64, i64, i64) {
+        db.lock()
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM documents),
+                   (SELECT COUNT(*) FROM meetings),
+                   (SELECT COUNT(*) FROM local_org_imports),
+                   (SELECT length(CAST(markdown AS BLOB)) FROM org_items WHERE item_id=?1),
+                   (SELECT COUNT(*) FROM note_attachments WHERE org_item_id=?1),
+                   (SELECT COALESCE(SUM(length(data)),0) FROM note_attachments WHERE org_item_id=?1)",
+                rusqlite::params![item_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("snapshot import state")
+    }
+
+    fn assert_rejected_without_mutation(db: &Db, item_id: &str) {
+        let before = mutation_snapshot(db, item_id);
+        let error = db
+            .import_received_org_item_atomic(item_id, "destination")
+            .expect_err("oversized received item must be refused");
+        assert!(matches!(error, AppError::InvalidArg(_)));
+        assert_eq!(
+            mutation_snapshot(db, item_id),
+            before,
+            "rejection must preserve both the received source and local destination"
+        );
+    }
+
+    #[test]
+    fn received_org_import_accepts_exact_markdown_and_attachment_boundaries() {
+        let db = test_db("exact");
+        let markdown = "m".repeat(MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES);
+        seed_received_item(&db, "item-exact", &markdown);
+        seed_attachment(
+            &db,
+            "item-exact",
+            0,
+            vec![1u8; MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES],
+        );
+
+        let imported = db
+            .import_received_org_item_atomic("item-exact", "destination")
+            .expect("exact limits remain importable");
+        assert_eq!(imported.kind, "note");
+        let local = db
+            .get_note_row(&imported.id)
+            .expect("read imported note")
+            .expect("imported note exists");
+        assert_eq!(local.text.len(), MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES);
+        let copied = db
+            .list_attachments(&crate::storage::AttachmentOwner::Document {
+                document_id: imported.id,
+            })
+            .expect("read copied attachments");
+        assert_eq!(copied.len(), 1);
+        assert_eq!(
+            copied[0].data.len(),
+            MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES
+        );
+        assert_eq!(
+            mutation_snapshot(&db, "item-exact").3,
+            MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES as i64,
+            "the received replica remains byte-identical"
+        );
+    }
+
+    #[test]
+    fn received_org_import_rejects_each_resource_ceiling_before_any_mutation() {
+        let db = test_db("over");
+
+        let markdown = "m".repeat(MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES + 1);
+        seed_received_item(&db, "item-markdown-over", &markdown);
+        assert_rejected_without_mutation(&db, "item-markdown-over");
+
+        seed_received_item(&db, "item-count-over", "body");
+        for index in 0..=MAX_RECEIVED_ORG_IMPORT_ATTACHMENTS {
+            seed_attachment(&db, "item-count-over", index, vec![index as u8]);
+        }
+        assert_rejected_without_mutation(&db, "item-count-over");
+
+        seed_received_item(&db, "item-single-over", "body");
+        seed_attachment(
+            &db,
+            "item-single-over",
+            0,
+            vec![2u8; MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES + 1],
+        );
+        assert_rejected_without_mutation(&db, "item-single-over");
+
+        seed_received_item(&db, "item-length-mismatch", "body");
+        seed_attachment(&db, "item-length-mismatch", 0, vec![2u8]);
+        db.lock()
+            .execute(
+                "UPDATE note_attachments SET byte_len=0 WHERE org_item_id='item-length-mismatch'",
+                [],
+            )
+            .expect("corrupt attachment length witness");
+        assert_rejected_without_mutation(&db, "item-length-mismatch");
+
+        seed_received_item(&db, "item-attachment-total-over", "body");
+        for index in 0..4 {
+            seed_attachment(
+                &db,
+                "item-attachment-total-over",
+                index,
+                vec![3u8; MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES],
+            );
+        }
+        assert_rejected_without_mutation(&db, "item-attachment-total-over");
+
+        let markdown = "m".repeat(MAX_RECEIVED_ORG_IMPORT_MARKDOWN_BYTES);
+        seed_received_item(&db, "item-total-over", &markdown);
+        for index in 0..3 {
+            seed_attachment(
+                &db,
+                "item-total-over",
+                index,
+                vec![4u8; MAX_RECEIVED_ORG_IMPORT_ATTACHMENT_BYTES],
+            );
+        }
+        assert_rejected_without_mutation(&db, "item-total-over");
     }
 }
