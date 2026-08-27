@@ -618,3 +618,78 @@ fn a_folder_that_is_not_the_murmur_vault_still_imports() {
     let _ = std::fs::remove_dir_all(&vault);
     let _ = std::fs::remove_dir_all(&other);
 }
+
+// ── the default destination ───────────────────────────────────────────────────
+
+/// An import the user did not file lands in its OWN badged container, not loose in the notes root.
+///
+/// Dropping several hundred Notion pages straight into the root mixed them irreversibly with the
+/// user's own notes, with nothing recording where they came from. The container is created on
+/// demand, named per source, and REUSED on the next run so a re-import updates in place instead of
+/// growing "Imported from Notion 2".
+#[test]
+fn an_unfiled_import_lands_in_a_named_badged_container_and_reuses_it() {
+    let state = build_state("import-destination");
+    let dir = export_dir("import-destination", &two_linked_pages());
+    let path = dir.to_str().expect("path");
+
+    let first = run_import_inner(None, &state, ImportSource::Notion, Some(path), None, false)
+        .expect("first import");
+    assert_eq!(first.imported, 2);
+
+    let containers = state.db.list_containers().expect("containers");
+    let landed: Vec<_> = containers
+        .iter()
+        .filter(|c| c.name == "Imported from Notion")
+        .collect();
+    assert_eq!(
+        landed.len(),
+        1,
+        "exactly one destination container, got: {:?}",
+        containers.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    let destination = landed[0];
+    assert_eq!(
+        destination.emoji.as_deref(),
+        Some("\u{1F5C2}\u{FE0F}"),
+        "the destination carries its badge"
+    );
+
+    // REUSE: a second run of the same export updates in place and creates no second container.
+    let second = run_import_inner(None, &state, ImportSource::Notion, Some(path), None, false)
+        .expect("second import");
+    assert_eq!(
+        second.updated, 2,
+        "the re-import updated rather than duplicated"
+    );
+    assert_eq!(
+        state
+            .db
+            .list_containers()
+            .expect("containers")
+            .iter()
+            .filter(|c| c.name == "Imported from Notion")
+            .count(),
+        1,
+        "the second run reused the container instead of making another"
+    );
+
+    // CONTROL — an EXPLICIT destination still wins, so the default cannot hijack a chosen folder.
+    let chosen = crate::commands::create_note_folder_inner(&state, "Chosen", None)
+        .expect("chosen folder");
+    let third = run_import_inner(
+        None,
+        &state,
+        ImportSource::Notion,
+        Some(path),
+        Some(&chosen.id),
+        false,
+    )
+    .expect("third import");
+    assert_eq!(
+        third.updated, 2,
+        "the same pages, filed where the user asked"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
