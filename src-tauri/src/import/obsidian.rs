@@ -5,15 +5,26 @@
 //! folder, reads each file **verbatim**, and touches nothing. Rewriting links here would be actively
 //! wrong: they are already in the target form, and our own link indexer resolves them by title.
 //!
-//! IDENTITY is the vault-relative PATH. A vault has no per-note id, and the path is the only key
-//! that is stable across re-imports, which is what makes a second run update rather than duplicate.
-//! Its weakness is honest and worth stating: move a note inside the vault and the next import treats
-//! it as new. Notion's 32-hex id has no such problem, which is exactly why that source uses it.
+//! IDENTITY is the VAULT-SCOPED relative path — `<vault fingerprint>:<relative path>`. A vault has
+//! no per-note id, and the path is the only key that is stable across re-imports, which is what
+//! makes a second run update rather than duplicate. But the relative path ALONE is not an identity:
+//! two different vaults routinely both contain `Area/Note.md`, and keying on the bare relative path
+//! made importing the second vault silently OVERWRITE the first one's title and body, reported as a
+//! benign "updated", with no warning and no undo. So the key is prefixed with a fingerprint of the
+//! CANONICALIZED vault root: a second vault produces new notes, while re-importing the same vault
+//! through a trailing slash or a symlink still matches and updates.
+//!
+//! Its remaining weakness is honest and worth stating: move a note inside the vault, or move the
+//! vault itself, and the next import treats it as new. Notion's 32-hex id has no such problem,
+//! which is exactly why that source uses it.
 //!
 //! WHAT IS SKIPPED: `.obsidian/` (workspace config, plugins, hotkeys — never content), `.trash/`
 //! (deleted notes; importing them would resurrect what the user threw away), and every dotfile.
 
+use std::fmt::Write as _;
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 use super::{title_from_body_or_stem, ImportScan, ImportedPage, MAX_PAGES_PER_IMPORT};
 use crate::error::{AppError, Result};
@@ -32,6 +43,7 @@ pub(crate) fn scan_vault(root: &Path) -> Result<ImportScan> {
             "pick the vault FOLDER — an Obsidian vault is a directory of .md files".into(),
         ));
     }
+    let scope = vault_scope(root);
     let mut scan = ImportScan::default();
     let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
     while let Some((dir, parents)) = stack.pop() {
@@ -78,7 +90,7 @@ pub(crate) fn scan_vault(root: &Path) -> Result<ImportScan> {
                 continue;
             };
             let stem = name.strip_suffix(".md").unwrap_or(&name).to_string();
-            let external_id = relative_id(&parents, &stem);
+            let external_id = vault_external_id(&scope, &parents, &stem);
             scan.pages.push(ImportedPage {
                 external_id: Some(external_id),
                 title: title_from_body_or_stem(&markdown, &stem),
@@ -91,12 +103,38 @@ pub(crate) fn scan_vault(root: &Path) -> Result<ImportScan> {
     Ok(scan)
 }
 
-/// The vault-relative path used as the stable identity, e.g. `Projects/Q4/Plan`.
+/// The vault-relative path, e.g. `Projects/Q4/Plan`. Half of the identity, never the whole of it.
 fn relative_id(parents: &[String], stem: &str) -> String {
     if parents.is_empty() {
         return stem.to_string();
     }
     format!("{}/{}", parents.join("/"), stem)
+}
+
+/// Length of the vault fingerprint kept in every id. 16 hex chars = 64 bits: far past the point
+/// where two vaults on one Mac could collide, and short enough that the id stays readable.
+const VAULT_SCOPE_HEX: usize = 16;
+
+/// A stable fingerprint of WHICH vault this is.
+///
+/// CANONICALIZED first, so `~/Vault`, `~/Vault/`, and a symlink pointing at it are one identity and
+/// a re-import updates rather than duplicates. Canonicalization can fail (a path that vanished
+/// between the picker and here); falling back to the path as given is the safe direction — it can
+/// only ever split one vault into two identities, never merge two vaults into one, and merging is
+/// the failure that destroys content.
+pub(crate) fn vault_scope(root: &Path) -> String {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let mut out = String::with_capacity(VAULT_SCOPE_HEX);
+    for byte in digest.iter().take(VAULT_SCOPE_HEX / 2) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+/// The stable identity of one note: `<vault fingerprint>:<vault-relative path>`.
+pub(crate) fn vault_external_id(scope: &str, parents: &[String], stem: &str) -> String {
+    format!("{scope}:{}", relative_id(parents, stem))
 }
 
 #[cfg(test)]
