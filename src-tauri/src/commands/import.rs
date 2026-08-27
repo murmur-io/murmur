@@ -244,6 +244,20 @@ pub(crate) fn run_import_inner(
     folder_id: Option<&str>,
     mirror_hierarchy: bool,
 ) -> Result<ImportReport, AppError> {
+    // Murmur's OWN vault is not an import source: every `.md` in there is a note we exported, so
+    // reading it back would duplicate the whole library as copies of itself. `scan_import` reports
+    // this as `isMurmurVault` for the preview, but a FE warning is not a guard — a direct `invoke`
+    // skips it entirely — so the refusal has to live on this side of the IPC boundary too.
+    if matches!(source, ImportSource::Obsidian) {
+        if let (Some(chosen), Some(vault)) = (path, crate::commands::vault_path(state)) {
+            if same_dir(chosen, &vault) {
+                return Err(AppError::InvalidArg(
+                    "that folder is the Obsidian vault Murmur exports to — importing it would read your own notes back in as copies".into(),
+                ));
+            }
+        }
+    }
+
     emit(app, "scanning", 0, 0);
     let scan = scan_source(source, path)?;
     let total = scan.pages.len();
