@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
+import { Router } from "@angular/router";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
@@ -21,6 +22,7 @@ import type {
 import { MurBannerComponent } from "../../../../design-system/banner/banner.component";
 import { MurProgressComponent } from "../../../../design-system/progress/progress.component";
 import { MurToggleComponent } from "../../../../design-system/toggle/toggle.component";
+import { NotesService } from "../../../../services/notes.service";
 import { ToastService } from "../../../../services/toast.service";
 
 /** How a source is chosen: an archive file, a folder, or nothing at all. */
@@ -72,6 +74,8 @@ export class SettingsImportsSectionComponent {
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly notes = inject(NotesService);
+  private readonly router = inject(Router);
 
   readonly sources = SOURCES;
   readonly sourceId = signal<ImportSourceId>("notion");
@@ -126,12 +130,22 @@ export class SettingsImportsSectionComponent {
     return plan ? Math.max(0, plan.pages - plan.alreadyImported) : 0;
   });
 
+  /**
+   * The destination, named. Picking nothing does NOT mean the notes root — the backend files an
+   * unfiled import into a per-source container ("Imported from Notion", ...), and this label used
+   * to say "Notes (unfiled)" regardless. That was the whole bug the user reported as "I can't see
+   * them": the import was filed correctly and the UI pointed at the wrong place.
+   *
+   * The name comes from the scan report rather than a copy of the backend's map here, so the two
+   * cannot drift. Before a scan there is no source chosen and nothing to promise.
+   */
   readonly targetLabel = computed(() => {
     const id = this.targetFolder();
+    const fallback = this.plan()?.defaultDestination ?? "Notes";
     if (!id) {
-      return "Notes (unfiled)";
+      return fallback;
     }
-    return this.folders().find((f) => f.id === id)?.name ?? "Notes (unfiled)";
+    return this.folders().find((f) => f.id === id)?.name ?? fallback;
   });
 
   /** A locked, not-session-unlocked target refuses every write; say so before the user tries. */
@@ -274,7 +288,7 @@ export class SettingsImportsSectionComponent {
         );
       } else {
         this.toast.success(
-          `${report.imported} imported, ${report.updated} updated.`,
+          `${report.imported} imported, ${report.updated} updated — in ${report.destinationName}.`,
         );
       }
       // A fresh import may have created folders; keep the picker honest.
@@ -287,6 +301,23 @@ export class SettingsImportsSectionComponent {
 
   async cancel(): Promise<void> {
     await this.ipc.cancelImport();
+  }
+
+  /**
+   * Open the folder the import landed in. `selectFolder` is the SHARED note-folder scope the
+   * sidebar tree and the notes list both read, so selecting it before navigating means /notes opens
+   * already showing the imported notes rather than "All notes".
+   *
+   * Selecting first, navigating second: the reverse order lands on the list while it is still
+   * scoped to whatever was selected before, which flashes the wrong content.
+   */
+  async openDestination(): Promise<void> {
+    const report = this.report();
+    if (!report?.destinationId) {
+      return;
+    }
+    await this.notes.selectFolder(report.destinationId);
+    await this.router.navigate(["/notes"]);
   }
 
   /** Back to the start without losing the chosen source. */

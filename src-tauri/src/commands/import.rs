@@ -73,6 +73,10 @@ pub struct ImportScanReport {
     /// `true` when the chosen Obsidian folder IS the vault Murmur exports to — importing it would
     /// read Murmur's own notes back in as copies of themselves.
     pub is_murmur_vault: bool,
+    /// Name of the container an unfiled import will land in, for THIS source. The picker's default
+    /// option shows it, so "where will this go" is answered before the run rather than guessed.
+    /// Name only — the scan is a dry run and must not create the folder.
+    pub default_destination: String,
 }
 
 /// What an import actually did. Counters plus the titles that failed, so a partial run is legible
@@ -92,6 +96,16 @@ pub struct ImportReport {
     /// `true` when vectors were deferred — keyword search works now, semantic search after a
     /// Reindex. Surfaced so the UI never implies the brain is fully caught up when it is not.
     pub embedding_deferred: bool,
+    /// The note-folder the notes actually landed in — the per-source container for an unfiled
+    /// import, or whatever the user explicitly picked.
+    ///
+    /// Reported because counters alone are not an answer to "where did my 400 pages go". The
+    /// container has existed since containers landed, but nothing on either side of the IPC
+    /// boundary ever NAMED it, so a successful import read as "imported: 412" followed by an empty
+    /// notes root. The id is what lets the UI open it in one click instead of asking the user to go
+    /// find it.
+    pub destination_id: String,
+    pub destination_name: String,
 }
 
 /// Resolve the wire source name, failing closed on anything unknown.
@@ -171,6 +185,7 @@ pub async fn scan_import(
             sample_titles: scan.pages.iter().take(8).map(|p| p.title.clone()).collect(),
             truncated: scan.truncated,
             is_murmur_vault,
+            default_destination: import_container(source).0.to_string(),
         };
         // Counts only — never a title (titles are user content).
         tracing::info!(
@@ -234,6 +249,20 @@ pub fn cancel_import() -> Result<(), AppError> {
     Ok(())
 }
 
+/// The name and badge of the per-source container an unfiled import lands in.
+///
+/// Split out from [`import_destination`] so the NAME is available without creating anything: the
+/// scan report carries it (`defaultDestination`) so the picker can say where the notes will go
+/// BEFORE the run, and the picker used to claim "Notes (unfiled)" — which stopped being true the
+/// moment containers landed, and left users looking for their import in the notes root.
+fn import_container(source: ImportSource) -> (&'static str, &'static str) {
+    match source {
+        ImportSource::Notion => ("Imported from Notion", "🗂️"),
+        ImportSource::Obsidian => ("Imported from Obsidian", "🔮"),
+        ImportSource::AppleNotes => ("Imported from Apple Notes", "🍎"),
+    }
+}
+
 /// Where an import lands when the user did not pick a destination themselves.
 ///
 /// Previously everything went to the bare notes root, so importing a Notion export dropped several
@@ -245,11 +274,7 @@ pub fn cancel_import() -> Result<(), AppError> {
 /// container belongs to the user the moment it exists, and once they rename or move it, the next
 /// import should start a fresh one rather than reach back into somewhere they reorganised.
 fn import_destination(state: &AppState, source: ImportSource) -> Result<String, AppError> {
-    let (name, emoji) = match source {
-        ImportSource::Notion => ("Imported from Notion", "🗂️"),
-        ImportSource::Obsidian => ("Imported from Obsidian", "🔮"),
-        ImportSource::AppleNotes => ("Imported from Apple Notes", "🍎"),
-    };
+    let (name, emoji) = import_container(source);
     // The notes root, not the workspace project: this holds NOTES, and `run_import_inner` resolves
     // its destination through `note_folder_by_id`. A container created by the meeting-side
     // `create_folder_inner` is not a note folder, so an explicit re-import into it would be refused
@@ -305,14 +330,19 @@ pub(crate) fn run_import_inner(
 
     // Resolve the target root ONCE and gate it up front, so a sealed destination fails fast instead
     // of after 400 successful writes.
-    let root_folder = match folder_id {
+    // The NAME comes out of this match too, not a second lookup: the explicit branch already reads
+    // the row to gate it, and the default branch's name is the container constant.
+    let (root_folder, root_name) = match folder_id {
         Some(f) if !f.is_empty() => {
-            if state.db.note_folder_by_id(f)?.is_none() {
+            let Some(folder) = state.db.note_folder_by_id(f)? else {
                 return Err(AppError::InvalidArg(format!("no note folder {f}")));
-            }
-            f.to_string()
+            };
+            (f.to_string(), folder.name)
         }
-        _ => import_destination(state, source)?,
+        _ => (
+            import_destination(state, source)?,
+            import_container(source).0.to_string(),
+        ),
     };
 
     let mut report = ImportReport {
@@ -324,6 +354,8 @@ pub(crate) fn run_import_inner(
         folders_created: 0,
         cancelled: false,
         embedding_deferred: true,
+        destination_id: root_folder.clone(),
+        destination_name: root_name,
     };
     // (note id, title, markdown) for the second pass.
     let mut written: Vec<(String, String, String)> = Vec::with_capacity(total);

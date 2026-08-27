@@ -169,7 +169,10 @@
               <label class="field">
                 <span class="field-label">Import into</span>
                 <select (change)="selectTarget($event)">
-                  <option value="">Notes (unfiled)</option>
+                  <!-- Names the container the backend will actually create/reuse, not "unfiled":
+                       the default HAS a destination, and claiming otherwise sent people looking
+                       for their import in the notes root. -->
+                  <option value="">{{ p.defaultDestination }} (default)</option>
                   @for (f of folders(); track f.id) {
                     <option [value]="f.id">{{ f.name }}</option>
                   }
@@ -232,6 +235,14 @@
       @if (report(); as r) {
         <div class="card">
           <h3 class="pane-title">{{ r.cancelled ? "Stopped" : "Done" }}</h3>
+          <!-- WHERE, not just how many. A bare count next to an untouched notes root is what made
+               a correctly-filed import look like a lost one. -->
+          @if (r.imported + r.updated > 0) {
+            <p class="note-line">
+              {{ r.imported + r.updated }} note{{ r.imported + r.updated === 1 ? "" : "s" }} in
+              <strong>{{ r.destinationName }}</strong>
+            </p>
+          }
           <ul class="plan-grid">
             <li><span class="plan-n">{{ r.imported }}</span><span class="plan-k">imported</span></li>
             <li><span class="plan-n">{{ r.updated }}</span><span class="plan-k">updated</span></li>
@@ -262,6 +273,11 @@
             </details>
           }
           <div class="actions">
+            @if (r.destinationId && r.imported + r.updated > 0) {
+              <button type="button" class="btn btn-primary" (click)="openDestination()">
+                Open {{ r.destinationName }}
+              </button>
+            }
             <button type="button" class="btn btn-ghost" (click)="reset()">Import more</button>
           </div>
         </div>
