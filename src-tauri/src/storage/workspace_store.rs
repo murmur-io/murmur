@@ -26,6 +26,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rusqlite::OptionalExtension;
+
 use crate::error::Result;
 use crate::storage::db::{map_err, meeting_visibility_clause, visibility_clause, Db};
 use crate::storage::models::{ContainerRow, ItemKind, ItemRow};
@@ -227,6 +229,39 @@ impl Db {
             out.push(r.map_err(map_err)?);
         }
         Ok((out, total as u32))
+    }
+
+    /// A direct child of `parent_id` with exactly this name, if one exists.
+    ///
+    /// Used by the importers to REUSE their destination container instead of creating
+    /// "Imported from Notion" again on every run. Name-matched on purpose: the container is the
+    /// user's to rename or move, and once they do, the next import should start a fresh one rather
+    /// than reach into somewhere they deliberately reorganised.
+    pub(crate) fn child_folder_by_name(
+        &self,
+        parent_id: &str,
+        name: &str,
+    ) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT id FROM folders WHERE parent_id = ?1 AND name = ?2 LIMIT 1",
+                rusqlite::params![parent_id, name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)
+    }
+
+    /// Set a container's display emoji. Cosmetic only — it mirrors the `dashboards.emoji` column
+    /// and carries no behaviour.
+    pub(crate) fn set_folder_emoji(&self, folder_id: &str, emoji: &str) -> Result<()> {
+        self.lock()
+            .execute(
+                "UPDATE folders SET emoji = ?2 WHERE id = ?1",
+                rusqlite::params![folder_id, emoji],
+            )
+            .map(|_| ())
+            .map_err(map_err)
     }
 }
 
