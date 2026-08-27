@@ -896,7 +896,10 @@ impl Db {
                 "Ask history visibility generation is unavailable".into(),
             ));
         }
-        let placeholders = std::iter::repeat_n("?", folder_ids.len())
+        // `repeat(..).take(n)` rather than `repeat_n`: the latter is stable only since 1.82 and
+        // this crate's MSRV is 1.77, which `clippy::incompatible_msrv` enforces as a hard error.
+        let placeholders = std::iter::repeat("?")
+            .take(folder_ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let deleted = tx
