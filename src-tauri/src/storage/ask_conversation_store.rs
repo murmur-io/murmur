@@ -814,6 +814,15 @@ impl Db {
         Ok(purged)
     }
 
+    /// Destroy EVERY durable Ask conversation, whatever it was derived from.
+    ///
+    /// Still correct — and still required — wherever the caller cannot name the folders whose
+    /// content is going away: a deleted meeting or note, an org item withdrawn, a fact retracted.
+    /// Those callers have no folder set to scope by, and a conversation may paraphrase content
+    /// whose id no longer exists, so the global sweep is the only fail-closed option there.
+    ///
+    /// It is NOT correct for the seal paths — see
+    /// [`Self::purge_ask_conversations_for_folders_tx`], which replaced it in those three.
     pub(crate) fn purge_all_ask_conversations_tx(tx: &rusqlite::Transaction<'_>) -> Result<usize> {
         let advanced = tx
             .execute(
@@ -833,6 +842,109 @@ impl Db {
             [],
         )
         .map_err(map_err)
+    }
+
+    /// Destroy every durable Ask conversation that could have drawn on one of `folder_ids`, and
+    /// leave every other conversation intact AND READABLE.
+    ///
+    /// This replaced a GLOBAL `DELETE FROM ask_conversations WHERE provenance_mode='globalDerived'`
+    /// (2.0 audit). The schema CHECK pins `provenance_mode` to that single value, so the predicate
+    /// matched every row: one locked folder anywhere in the vault wiped ALL durable history — on
+    /// every lock, every relock (including the screen-share auto-relock) and, via
+    /// `reblank_locked_folders_at_rest`, on EVERY app launch. A feature whose headline is that it
+    /// persists did not survive a restart.
+    ///
+    /// Scoping is sound because the dependency snapshot is CONSERVATIVE, not analytical:
+    /// `commands/ask_history.rs` records `db.visible_folder_ids(&unlocked)` — every folder that was
+    /// READABLE when the exchange was written, not the subset the answer happened to cite. So any
+    /// folder whose content could have reached a conversation is in that conversation's dependency
+    /// set, and sealing it destroys the conversation. A folder that was not readable could not have
+    /// contributed. (This is exactly why the sibling purges here stay GLOBAL: a pending audit
+    /// finding may cite a title with no matching id, so it has no dependency set to scope by.)
+    ///
+    /// The generation still advances, because it is the barrier against a conversation written
+    /// concurrently with the seal. Survivors are then carried onto the NEW generation — but only
+    /// those that were on the immediately-preceding one, so a row racing this transaction is not
+    /// resurrected. Advancing the generation WITHOUT carrying survivors forward would be the same
+    /// data loss by another route: `list_ask_conversation_ids` admits a row only while
+    /// `c.visibility_generation` equals the current one, so a surviving-but-unreadable row is, to
+    /// the user, an erased one.
+    pub(crate) fn purge_ask_conversations_for_folders_tx(
+        tx: &rusqlite::Transaction<'_>,
+        folder_ids: &HashSet<String>,
+    ) -> Result<usize> {
+        if folder_ids.is_empty() {
+            return Ok(0);
+        }
+        let previous: i64 = tx
+            .query_row(
+                "SELECT visibility_generation FROM ask_history_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        let advanced = tx
+            .execute(
+                "UPDATE ask_history_state
+                    SET visibility_generation = visibility_generation + 1
+                  WHERE singleton = 1",
+                [],
+            )
+            .map_err(map_err)?;
+        if advanced != 1 {
+            return Err(AppError::Storage(
+                "Ask history visibility generation is unavailable".into(),
+            ));
+        }
+        // `repeat(..).take(n)` rather than `repeat_n`: the latter is stable only since 1.82 and
+        // this crate's MSRV is 1.77, which `clippy::incompatible_msrv` enforces as a hard error.
+        let placeholders = std::iter::repeat("?")
+            .take(folder_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let deleted = tx
+            .execute(
+                &format!(
+                    "DELETE FROM ask_conversations
+                      WHERE provenance_mode = 'globalDerived'
+                        AND id IN (SELECT d.conversation_id
+                                     FROM ask_conversation_dependencies d
+                                    WHERE d.dependency_kind = 'folder'
+                                      AND d.dependency_ref IN ({placeholders}))"
+                ),
+                rusqlite::params_from_iter(folder_ids.iter()),
+            )
+            .map_err(map_err)?;
+        tx.execute(
+            "UPDATE ask_conversations
+                SET visibility_generation =
+                      (SELECT visibility_generation FROM ask_history_state WHERE singleton = 1)
+              WHERE provenance_mode = 'globalDerived'
+                AND visibility_generation = ?1",
+            rusqlite::params![previous],
+        )
+        .map_err(map_err)?;
+        Ok(deleted)
+    }
+
+    /// The [`Self::purge_ask_conversations_for_folders_tx`] scope for a startup reconcile: every
+    /// folder that is sealed AT REST. Nothing was derived from a folder while it was sealed, so a
+    /// conversation that never saw one of these is not the reconcile's business.
+    pub(crate) fn purge_ask_conversations_for_locked_folders_tx(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<usize> {
+        let locked: HashSet<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM folders WHERE locked = 1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?;
+            rows.into_iter().collect()
+        };
+        Self::purge_ask_conversations_for_folders_tx(tx, &locked)
     }
 }
 
