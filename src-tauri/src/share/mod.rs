@@ -262,10 +262,19 @@ pub fn new_share_id() -> String {
 }
 
 /// Map an absent session to a fail-closed `Unavailable` (spec §7 inv. 8: share ops require login).
+///
+/// Tagged with [`crate::errcode::SHARING_ACCOUNT_REQUIRED`] because this refusal is REACHED BY THE
+/// DEFAULT USER: Murmur is local-first and fully usable with no account, so opening any org-only
+/// surface lands here. Untagged, the bare developer prose rendered verbatim in a red banner —
+/// exactly what `errcode.rs` says must never be what the user reads. The body after the code is
+/// still developer prose for logs; the frontend renders its own sentence from the code.
 pub(crate) fn require_login(session: &Option<AccountSession>) -> Result<&AccountSession> {
-    session
-        .as_ref()
-        .ok_or_else(|| AppError::Unavailable("not signed in to the sharing account".into()))
+    session.as_ref().ok_or_else(|| {
+        AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::SHARING_ACCOUNT_REQUIRED,
+            "not signed in to the sharing account",
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -292,6 +301,21 @@ mod tests {
         assert!(uuid::Uuid::parse_str(&id).is_ok());
     }
 
+    /// A minimal live session for the CONTROL leg of the gate tests. Content-free.
+    fn test_session() -> AccountSession {
+        AccountSession {
+            account_id: "a@example.com".into(),
+            email: "a@example.com".into(),
+            server_user_id: Some("00000000-0000-4000-8000-000000000000".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([0u8; 32]),
+            generation: 1,
+            access_token: "t".into(),
+            access_expires_at: None,
+            refresh_token: "r".into(),
+        }
+    }
+
     #[test]
     fn require_login_fails_closed_when_logged_out() {
         let none: Option<AccountSession> = None;
@@ -299,6 +323,32 @@ mod tests {
             require_login(&none),
             Err(AppError::Unavailable(_))
         ));
+    }
+
+    /// REGRESSION (2.0 release blocker): the DEFAULT local-first user — no account, ever — opened
+    /// the org-only Tasks surface and the frontend rendered this refusal VERBATIM, because it
+    /// carried no `[code]` and `error-copy.service.ts` is deny-by-default. The refusal must arrive
+    /// tagged with [`crate::errcode::SHARING_ACCOUNT_REQUIRED`] so the surface can render an
+    /// invitation instead of developer prose.
+    #[test]
+    fn require_login_carries_the_account_required_code() {
+        let none: Option<AccountSession> = None;
+        // `unwrap_err()` would require `&AccountSession: Debug`, and AccountSession deliberately
+        // does not derive it — it holds the account master key.
+        let wire = match require_login(&none) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("require_login must refuse when there is no session"),
+        };
+        assert_eq!(
+            wire, "provider unavailable: [sharing-account-required] not signed in to the sharing account",
+            "the logged-out refusal must carry its code first in the body"
+        );
+        // CONTROL: the code is the NEVER-SIGNED-IN one, not the lapsed-session one. Collapsing the
+        // two would tell a first-time user they had "been signed out".
+        assert_ne!("sharing-account-required", crate::errcode::SHARING_SIGNIN_REQUIRED);
+        // CONTROL: a LIVE session is still returned, so the gate cannot go vacuous by refusing
+        // everything.
+        assert!(require_login(&Some(test_session())).is_ok());
     }
 
     #[test]

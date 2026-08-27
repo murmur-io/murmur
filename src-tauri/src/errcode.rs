@@ -126,6 +126,14 @@ pub const SHARING_REJECTED: &str = "sharing-rejected";
 pub const ORG_EDIT_CONFLICT: &str = "org-edit-conflict";
 /// The sharing session is gone (401) — the user must sign in again.
 pub const SHARING_SIGNIN_REQUIRED: &str = "sharing-signin-required";
+/// An org-only surface was opened by an install that has NO sharing account at all.
+///
+/// DISTINCT from [`SHARING_SIGNIN_REQUIRED`] on purpose, and the difference is the whole point:
+/// that one means a session existed and lapsed, so "sign in again" is the right sentence. This one
+/// is the DEFAULT state of Murmur — local-first, fully usable with no account — meeting a feature
+/// that lives inside a Shared Brain org. It is not an error and must never render as one; the
+/// surface turns it into an explanation of what the feature is, plus a way in.
+pub const SHARING_ACCOUNT_REQUIRED: &str = "sharing-account-required";
 /// The configured relay has not advertised the owner-bound share reservation contract required to
 /// prevent a delayed create from resurrecting ciphertext after local deletion/lock.
 pub const SHARING_UPGRADE_REQUIRED: &str = "sharing-upgrade-required";
@@ -160,6 +168,7 @@ pub const ALL: &[&str] = &[
     SHARING_REJECTED,
     ORG_EDIT_CONFLICT,
     SHARING_SIGNIN_REQUIRED,
+    SHARING_ACCOUNT_REQUIRED,
     SHARING_UPGRADE_REQUIRED,
     REMINDERS_DENIED,
 ];
@@ -240,6 +249,12 @@ mod tests {
             "sharing-rejected",
             "org-edit-conflict",
             "sharing-signin-required",
+            // Added 2.0: the org-only Tasks surface met by an install that has no account at all.
+            // Deliberately NOT folded into `sharing-signin-required` — that one says "you were
+            // signed out", which is a lie to a user who never had an account. Landing here means
+            // updating `src/app/core/copy/error-copy.service.ts` in the same commit; that is the
+            // whole point of this test.
+            "sharing-account-required",
             "sharing-upgrade-required",
             "reminders-denied",
         ];

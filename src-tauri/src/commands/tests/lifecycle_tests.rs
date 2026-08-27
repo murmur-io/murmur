@@ -4448,6 +4448,173 @@
         );
     }
 
+    /// RELOCK MUST CASCADE, BECAUSE UNLOCK CASCADES.
+    ///
+    /// Regression for the 2.0 audit finding. `unlock_folder` opens a container's WHOLE subtree
+    /// (`preflight_unlock_subtree`, then the primary restore descends into locked descendants),
+    /// but `relock_folder` closed only the folder it was handed. So "Lock again" on a project
+    /// reported sealed while every folder the unlock had opened stayed in the session unlock set,
+    /// readable through the tree, through search and through MCP.
+    ///
+    /// An asymmetric open/close pair is a leak by construction: whatever the open reaches, the
+    /// close must reach too.
+    #[test]
+    fn relocking_a_project_re_closes_its_whole_subtree() {
+        let vault = tmp_vault("relock-cascade");
+        let state = build_state_with_vault("relock-cascade", &vault);
+        make_open_folder(&state.db, "p-acme", "Acme");
+        make_open_child_folder(&state.db, "f-weekly", "Acme/Weekly", "p-acme");
+        std::fs::create_dir_all(vault.join("Acme/Weekly")).unwrap();
+        seed_meeting(&state.db, "m-deep", "Layoff plan", Some("f-weekly"));
+
+        // Seal the project (which cascades), then open the whole subtree the way `unlock_folder`
+        // leaves it: every container in the subtree present in the session unlock set.
+        let revocation = crate::mcp::begin_visibility_revocation_for_gate(
+            None,
+            crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+        );
+        crate::commands::lock_folder_with_visibility_revocation(&state, "p-acme", revocation)
+            .unwrap();
+        {
+            let mut g = state.unlocked_folders.lock().unwrap();
+            g.insert("p-acme".to_string());
+            g.insert("f-weekly".to_string());
+        }
+
+        // Relock the PROJECT only.
+        relock_folder_inner_with_visibility_notice(&state, "p-acme", || {})
+            .unwrap();
+
+        // THE ASSERTION THAT WAS FAILING: the descendant must be closed too.
+        let still_open = state.unlocked_folders.lock().unwrap().clone();
+        assert!(
+            !still_open.contains("f-weekly"),
+            "relocking the project left its descendant session-unlocked: {still_open:?}"
+        );
+        assert!(
+            !still_open.contains("p-acme"),
+            "relocking the project left the project itself session-unlocked: {still_open:?}"
+        );
+        assert!(
+            state
+                .db
+                .get_note_if_visible("m-deep", &still_open)
+                .unwrap()
+                .is_none(),
+            "a gated reader still returns a note from inside a relocked project"
+        );
+    }
+
+    /// CONTROL for the relock cascade: it must close the subtree of the folder it was given, and
+    /// NOTHING outside it. A cascade that over-reaches would silently relock an unrelated folder
+    /// the user still has open — which reads as data disappearing.
+    #[test]
+    fn the_relock_cascade_does_not_touch_a_sibling_subtree() {
+        let vault = tmp_vault("relock-scope");
+        let state = build_state_with_vault("relock-scope", &vault);
+        make_open_folder(&state.db, "p-acme", "Acme");
+        make_open_child_folder(&state.db, "f-weekly", "Acme/Weekly", "p-acme");
+        make_open_folder(&state.db, "p-other", "Other");
+        std::fs::create_dir_all(vault.join("Acme/Weekly")).unwrap();
+        std::fs::create_dir_all(vault.join("Other")).unwrap();
+
+        for target in ["p-acme", "p-other"] {
+            let revocation = crate::mcp::begin_visibility_revocation_for_gate(
+                None,
+                crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+            );
+            crate::commands::lock_folder_with_visibility_revocation(&state, target, revocation)
+                .unwrap();
+        }
+        {
+            let mut g = state.unlocked_folders.lock().unwrap();
+            g.insert("p-acme".to_string());
+            g.insert("f-weekly".to_string());
+            g.insert("p-other".to_string());
+        }
+
+        relock_folder_inner_with_visibility_notice(&state, "p-acme", || {})
+            .unwrap();
+
+        let still_open = state.unlocked_folders.lock().unwrap().clone();
+        assert!(
+            still_open.contains("p-other"),
+            "the relock cascade reached outside its own subtree: {still_open:?}"
+        );
+        assert!(
+            !still_open.contains("p-acme") && !still_open.contains("f-weekly"),
+            "the relock cascade did not close its own subtree: {still_open:?}"
+        );
+    }
+
+    /// LOCKING A PROJECT MUST RE-CLOSE A DESCENDANT THE USER HAD SESSION-UNLOCKED.
+    ///
+    /// Regression for the 2.0 audit finding. `lock_container_subtree` used to `continue` past any
+    /// descendant whose durable `locked` bit was already set. Skipping the RE-KEY is correct —
+    /// re-minting that folder's content key would orphan the ciphertext already written under the
+    /// old one — but the bare `continue` also skipped the per-container path's already-locked
+    /// branch, which is the ONLY place that bumps the seal epoch, revokes renderer visibility and
+    /// drops the folder from `state.unlocked_folders`.
+    ///
+    /// So: lock a folder, session-unlock it, then lock its parent project. The project reports
+    /// sealed, the child's `locked` bit was already 1 — and the child stayed in the session unlock
+    /// set, so every gated reader (tree, search, MCP) kept serving its rows. `locked = 1` is the
+    /// durable seal JOURNAL, not proof the session-authority cleanup ever ran.
+    #[test]
+    fn locking_a_project_re_closes_a_session_unlocked_descendant() {
+        let vault = tmp_vault("cascade-reclose");
+        let state = build_state_with_vault("cascade-reclose", &vault);
+        make_open_folder(&state.db, "p-acme", "Acme");
+        make_open_child_folder(&state.db, "f-weekly", "Acme/Weekly", "p-acme");
+        std::fs::create_dir_all(vault.join("Acme/Weekly")).unwrap();
+        seed_meeting(&state.db, "m-deep", "Layoff plan", Some("f-weekly"));
+
+        // The child is sealed on its own first…
+        let revocation = crate::mcp::begin_visibility_revocation_for_gate(
+            None,
+            crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+        );
+        crate::commands::lock_folder_with_visibility_revocation(&state, "f-weekly", revocation)
+            .unwrap();
+        // …and then session-unlocked, exactly as `unlock_folder` leaves it.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-weekly".to_string());
+
+        // Now lock the PARENT project.
+        let revocation = crate::mcp::begin_visibility_revocation_for_gate(
+            None,
+            crate::mcp::VisibilityRevokingEntrypoint::LockFolder,
+        );
+        crate::commands::lock_folder_with_visibility_revocation(&state, "p-acme", revocation)
+            .unwrap();
+
+        // THE ASSERTION THAT WAS FAILING: the descendant must no longer be session-unlocked.
+        let still_open = state.unlocked_folders.lock().unwrap().clone();
+        assert!(
+            !still_open.contains("f-weekly"),
+            "locking the project left its descendant session-unlocked: {still_open:?}"
+        );
+        // And therefore the gated reader must withhold its content.
+        assert!(
+            state
+                .db
+                .get_note_if_visible("m-deep", &still_open)
+                .unwrap()
+                .is_none(),
+            "a gated reader still returns a note from a descendant of a locked project"
+        );
+
+        // CONTROL — the child's durable seal was NOT re-keyed. Its wrapped key still exists, so
+        // the existing ciphertext is still openable; a re-mint would have orphaned it.
+        assert!(
+            state.db.folder_wrapped_key("f-weekly").unwrap().is_some(),
+            "the already-sealed descendant lost its wrapped key — its ciphertext is now orphaned"
+        );
+    }
+
     /// The cascade is DEEPEST-FIRST, so a failure can only over-lock, never under-lock.
     ///
     /// Locking is not atomic across containers. Whichever order the cascade takes decides what a
@@ -31986,106 +32153,172 @@
         config.share_base_url = base.to_string();
     }
 
+    // REMOVED (2.0): `link_share_missing_owner_claim_capability_keeps_retryable_journal_without_content`
+    //
+    // It pinned the OPPOSITE contract to the regression below, and only one of them can hold: it
+    // asserted that a refused capability check LEAVES a `create_pending` journal row and that the
+    // second click is bounded by that row rather than re-probing. That bounding is what made the
+    // source permanently unshareable — the second click failed on the journal guard with a
+    // different, untagged message, and the only recovery path needed the very capability that was
+    // missing. The row was never load-bearing here: the capability proof is a bearer-free
+    // GET /healthz that leaves no remote state, so there is nothing to clean up after it refuses.
+    //
+    // What it protected against — hammering an old relay — costs one bearer-free GET per MANUAL
+    // click, which is not a rate-limiting problem worth a locked-out source. Its coverage now lives
+    // in the regression below, which additionally carries a CONTROL (the same source shares
+    // normally once the relay advertises the capability) so it cannot pass vacuously.
+
+    /// REGRESSION (2.0 blocker): a refused PRECONDITION must not permanently lock the source out.
+    ///
+    /// The relay-capability proof (`require_share_owner_claim_capability`) is a pure precondition —
+    /// it leaves no remote state (a bearer-free `GET /healthz`). Committing the durable
+    /// `outbound_shares` journal row BEFORE it meant the FIRST refused click wrote a
+    /// `create_pending` row, and every LATER click hit `insert_outbound_share_attempt`'s
+    /// "one create_pending per (mode, owner, source)" guard instead — a different, untagged
+    /// `Unavailable("… cleanup is already pending …")` the frontend cannot map, while the recovery
+    /// path (`revoke_share_inner`) needs the very capability that is missing, so it never converges.
+    /// The source became permanently unshareable without a DB repair.
+    ///
+    /// Oracle: two consecutive refusals return the SAME tagged refusal, leave NO journal row, and
+    /// the source still shares normally once the relay advertises the capability (the CONTROL —
+    /// without it this test could pass vacuously on a build where sharing is broken outright).
     #[test]
-    fn link_share_missing_owner_claim_capability_keeps_retryable_journal_without_content() {
+    fn link_share_capability_refusal_is_idempotent_and_leaves_the_source_shareable() {
         use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe = listener.try_clone().unwrap();
         let addr = listener.local_addr().unwrap();
+        let (share_tx, share_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
+            // Two capability probes from an OLD relay (no `share-owner-claim-v1`).
+            for _ in 0..2 {
+                let (mut health, _) = accept_with_timeout(&listener);
+                let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
+                assert!(request.starts_with("GET /healthz "));
+                let body = r#"{"status":"ok","version":"0.1.0"}"#;
+                write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+            // CONTROL: the relay is upgraded; the very same source must still share.
             let (mut health, _) = accept_with_timeout(&listener);
             let request = String::from_utf8_lossy(&read_http_request(&mut health)).to_string();
             assert!(request.starts_with("GET /healthz "));
-            assert!(
-                !request.to_ascii_lowercase().contains("authorization:"),
-                "health capability discovery must remain bearer-free"
-            );
-            let body = r#"{"status":"ok","version":"0.1.0"}"#;
-            write!(
-                    health,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-        });
+            let body = r#"{"status":"ok","version":"0.1.0","capabilities":["share-owner-claim-v1"]}"#;
+            write!(health,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
 
-        let state = build_state("link-share-capability-required");
-        seed_link_share_source(
-            &state,
-            "claim-cap-folder",
-            "claim-cap-meeting",
-            &format!("http://{addr}/"),
-        );
-        let error = block_on(share_note_to_link_inner(
-            &state,
-            "claim-cap-meeting".into(),
-            None,
-            None,
-            None,
-        ))
-        .expect_err("an old relay must fail closed before share creation");
-        server.join().unwrap();
-        assert!(matches!(
-            error,
-            AppError::Unavailable(message)
-                if message.starts_with("[sharing-upgrade-required] ")
-        ));
-        probe.set_nonblocking(true).unwrap();
-        let second = block_on(share_note_to_link_inner(
-            &state,
-            "claim-cap-meeting".into(),
-            None,
-            None,
-            None,
-        ))
-        .expect_err("the existing cleanup journal bounds repeated old-relay clicks");
-        assert!(matches!(
-            second,
-            AppError::Unavailable(message) if message.contains("cleanup is already pending")
-        ));
-        assert!(matches!(
-            probe.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-        let journal: (i64, String, String, String) = state
-            .db
-            .lock()
-            .query_row(
-                "SELECT COUNT(*),state,mode,owner_user_id FROM outbound_shares",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            let (mut reserve, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut reserve);
+            let request_text = String::from_utf8_lossy(&request);
+            let share_id = request_text
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("PUT /v1/shares/")
+                .and_then(|tail| tail.strip_suffix("/reservation HTTP/1.1"))
+                .expect("reservation path carries the exact client id")
+                .to_string();
+            write!(
+                reserve,
+                "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             )
             .unwrap();
-        assert_eq!(
-            journal.0, 1,
-            "one bounded cleanup authority survives capability failure"
+
+            let (mut create, _) = accept_with_timeout(&listener);
+            let request = read_http_request(&mut create);
+            let body_at = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let json: serde_json::Value = serde_json::from_slice(&request[body_at..]).unwrap();
+            assert_eq!(json["shareId"], share_id);
+            let body =
+                format!("{{\"shareId\":\"{share_id}\",\"shareBaseUrl\":\"http://share.invalid\"}}");
+            write!(create,"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+            share_tx.send(share_id).unwrap();
+        });
+
+        let state = build_state("link-share-capability-retry");
+        seed_link_share_source(
+            &state,
+            "cap-retry-folder",
+            "cap-retry-meeting",
+            &format!("http://{addr}/"),
         );
-        assert_eq!(journal.1, "create_pending");
-        assert_eq!(journal.2, "link");
-        assert_eq!(journal.3, "c534b6d2-02c1-4c2c-a256-3af8592b1567");
+
+        let mut refusals = Vec::new();
+        for _ in 0..2 {
+            let error = block_on(share_note_to_link_inner(
+                &state,
+                "cap-retry-meeting".into(),
+                None,
+                None,
+                None,
+            ))
+            .expect_err("an old relay must fail closed before share creation");
+            let AppError::Unavailable(message) = error else {
+                panic!("a refused precondition must stay Unavailable");
+            };
+            assert!(
+                message.starts_with("[sharing-upgrade-required] "),
+                "every repeated click must carry the SAME tagged refusal, got: {message}"
+            );
+            refusals.push(message);
+        }
+        assert_eq!(
+            refusals[0], refusals[1],
+            "the second click must not degrade into a different, untagged failure"
+        );
+
+        let rows: i64 = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM outbound_shares", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "a refused local precondition must leave NO durable journal row to recover"
+        );
+
+        // CONTROL — the same source shares normally once the capability appears.
+        let url = block_on(share_note_to_link_inner(
+            &state,
+            "cap-retry-meeting".into(),
+            None,
+            None,
+            None,
+        ))
+        .expect("the source is still shareable after the relay is upgraded");
+        server.join().unwrap();
+        let share_id = share_rx.recv().unwrap();
+        assert!(url.contains(&format!("#{}.", share_id)));
+        let stored: (i64, String) = state
+            .db
+            .lock()
+            .query_row("SELECT COUNT(*),MAX(state) FROM outbound_shares", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored.0, 1);
+        assert_eq!(stored.1, "active");
         assert_eq!(
             state
                 .db
                 .count_share_egress_by_kind("share_capability_read")
                 .unwrap(),
-            1
+            3
         );
         assert_eq!(
             state
                 .db
                 .count_share_egress_by_kind("share_reserve")
                 .unwrap(),
-            0
+            1,
+            "no reservation is dispatched while the capability is missing"
         );
         assert_eq!(
             state.db.count_share_egress_by_kind("share_create").unwrap(),
-            0
+            1
         );
     }
 
     #[test]
-    fn user_share_missing_owner_claim_capability_keeps_content_free_retry_journal() {
+    fn user_share_missing_owner_claim_capability_leaves_no_journal_and_no_recipient_pii() {
         use std::io::Write;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -32124,24 +32357,20 @@
             probe.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
-        let journal: (String, String, Option<String>, Option<Vec<u8>>) = state
+        // The capability proof now runs BEFORE the journal write, so a refused precondition leaves
+        // NOTHING behind — see the removal note above `link_share_capability_refusal_is_idempotent…`.
+        // This used to assert the shape of a `create_pending` row (state/mode present, recipient
+        // email and content hash both NULL). The privacy property it existed for — recipient PII is
+        // never captured before the capability proof — now holds a fortiori: there is no row to
+        // capture it into. Asserting on the whole table keeps that guarantee checkable.
+        let rows: i64 = state
             .db
             .lock()
-            .query_row(
-                "SELECT state,mode,recipient_email,content_hash FROM outbound_shares",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            .query_row("SELECT COUNT(*) FROM outbound_shares", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(journal.0, "create_pending");
-        assert_eq!(journal.1, "user");
         assert_eq!(
-            journal.2, None,
-            "recipient PII is not captured before capability proof"
-        );
-        assert_eq!(
-            journal.3, None,
-            "no ciphertext hash exists before capability proof"
+            rows, 0,
+            "a refused capability precondition must leave no journal row — and therefore no recipient PII"
         );
         assert_eq!(
             state

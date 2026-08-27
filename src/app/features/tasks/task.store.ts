@@ -7,6 +7,7 @@ import type {
   TaskLocalRef,
 } from "../../core/models";
 import { IpcService } from "../../core/ipc.service";
+import { ErrorCopyService } from "../../core/copy/error-copy.service";
 
 /**
  * Root signal store for org Tasks.
@@ -19,6 +20,7 @@ import { IpcService } from "../../core/ipc.service";
 export class TaskStore {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errors = inject(ErrorCopyService);
 
   private readonly _tasks = signal<OrgTask[]>([]);
   private readonly _orgs = signal<OrgStatus[]>([]);
@@ -26,11 +28,22 @@ export class TaskStore {
   private readonly _error = signal<string | null>(null);
   private readonly _assignees = signal<Record<string, TaskAssignee[]>>({});
   private readonly _scrubEpoch = signal(0);
+  private readonly _signedOut = signal(false);
 
   readonly tasks = this._tasks.asReadonly();
   readonly orgs = this._orgs.asReadonly();
   readonly loading = this._loading.asReadonly();
   readonly error = this._error.asReadonly();
+  /**
+   * True when the backend refused because this device has no sharing account at all.
+   *
+   * This is a BEHAVIOUR decision, so it is bound to the stable `[code]`
+   * (`errcode::SHARING_ACCOUNT_REQUIRED`), never to the prose — see
+   * `core/copy/error-copy.service.ts`. Tasks are org-only, and the default Murmur user has no
+   * account, so this is the EXPECTED state for most installs, not a failure: the view renders
+   * an invitation instead of an error banner.
+   */
+  readonly signedOut = this._signedOut.asReadonly();
   readonly assignees = this._assignees.asReadonly();
   /** Advances before every feed-driven refetch so mounted editors can synchronously drop drafts. */
   readonly scrubEpoch = this._scrubEpoch.asReadonly();
@@ -97,8 +110,9 @@ export class TaskStore {
       this._orgs.set(orgs.filter((org) => org.contextEnabled));
       this._tasks.set(tasks);
       this._error.set(null);
+      this._signedOut.set(false);
     } catch (error) {
-      if (token === this.loadToken) this._error.set(this.message(error));
+      if (token === this.loadToken) this.publishFailure(error);
     } finally {
       if (token === this.loadToken) this._loading.set(false);
     }
@@ -110,7 +124,7 @@ export class TaskStore {
       await this.reload();
       return task;
     } catch (error) {
-      this._error.set(this.message(error));
+      this.publishFailure(error);
       return null;
     }
   }
@@ -121,7 +135,7 @@ export class TaskStore {
       await this.reload();
       return task;
     } catch (error) {
-      this._error.set(this.message(error));
+      this.publishFailure(error);
       return null;
     }
   }
@@ -132,7 +146,7 @@ export class TaskStore {
       await this.reload();
       return true;
     } catch (error) {
-      this._error.set(this.message(error));
+      this.publishFailure(error);
       return false;
     }
   }
@@ -143,7 +157,7 @@ export class TaskStore {
       await this.reload();
       return true;
     } catch (error) {
-      this._error.set(this.message(error));
+      this.publishFailure(error);
       return false;
     }
   }
@@ -154,7 +168,7 @@ export class TaskStore {
       await this.reload();
       return true;
     } catch (error) {
-      this._error.set(this.message(error));
+      this.publishFailure(error);
       return false;
     }
   }
@@ -168,7 +182,7 @@ export class TaskStore {
       this._assignees.update((all) => ({ ...all, [orgId]: rows }));
     } catch (error) {
       if (this.canCommitAssignees(orgId, token)) {
-        this._error.set(this.message(error));
+        this.publishFailure(error);
       }
     }
   }
@@ -184,8 +198,28 @@ export class TaskStore {
     this._error.set(null);
   }
 
-  private message(error: unknown): string {
-    if (error instanceof Error) return error.message;
-    return String(error);
+  /**
+   * The ONE place a backend failure becomes state this view renders.
+   *
+   * Two jobs, in this order:
+   *
+   * 1. Classify by `[code]`. `sharing-account-required` is not an error on this surface — it is the
+   *    default local-first install meeting an org-only feature — so it raises {@link signedOut}
+   *    and leaves the banner EMPTY.
+   * 2. Humanize everything else. `String(error)` used to render the raw `AppError` `Display` here,
+   *    which is exactly the developer prose `src-tauri/src/error.rs` says must never be what the
+   *    user reads. `ErrorCopyService` is deny-by-default, so an un-coded failure degrades to a
+   *    fixed sentence rather than leaking Rust vocabulary into a banner.
+   */
+  private publishFailure(error: unknown): void {
+    if (this.errors.is(error, "sharing-account-required")) {
+      this._signedOut.set(true);
+      this._error.set(null);
+      this._tasks.set([]);
+      this._orgs.set([]);
+      this._assignees.set({});
+      return;
+    }
+    this._error.set(this.errors.humanize(error, "tasks"));
   }
 }
