@@ -8,6 +8,8 @@
     <string>Murmur captures the other participants' audio playing on your Mac to transcribe meetings locally on device.</string>
     <key>NSRemindersUsageDescription</key>
     <string>Murmur can add your meeting action items to Apple Reminders.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Murmur reads your Apple Notes so it can import them.</string>
     <key>NSCalendarsUsageDescription</key>
     <string>Murmur reads your upcoming events — title, attendees, and agenda — to prepare pre-meeting context and briefs, all on your device.</string>
   </dict>

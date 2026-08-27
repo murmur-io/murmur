@@ -485,9 +485,21 @@ pub(crate) async fn share_note_to_link_inner(
     let share_id = crate::share::new_share_id();
     let rev = 1u32;
     require_current_org_share_snapshot(state, Some(&meeting_id), None, &source.source_version)?;
-    // Mint the exact owner-bound cleanup authority before capability discovery. An old/unavailable
-    // relay therefore leaves a visible, retryable local journal rather than losing the id. Recovery
-    // may reserve + DELETE this id, but it never redispatches the content POST.
+    // Capability discovery FIRST, then mint the owner-bound cleanup authority. Discovery is a pure
+    // read (`client.health` -> GET /healthz) that mutates nothing remote, so a journal row written
+    // ahead of it could only ever describe work that never started.
+    //
+    // Writing it first permanently locked the source out (2.0 audit). Against a relay that does not
+    // advertise the capability: the first click journalled a 'create_pending' row and then failed;
+    // the second failed EARLIER and DIFFERENTLY, on `insert_outbound_share_attempt` returning false,
+    // with the bare untagged "an interrupted link-share cleanup is already pending"; and the only
+    // recovery path, `revoke_share_inner`, needs the SAME missing capability, so it could never
+    // converge. Two clicks and that source could not be shared again without a DB repair.
+    //
+    // The guarantee the original ordering existed for is untouched: once the capability IS present
+    // the journal row is still written before the content POST, so a POST failing mid-flight still
+    // leaves a visible, retryable local journal rather than losing the id.
+    require_share_owner_claim_capability(state, &client).await?;
     if !state.db.insert_outbound_share_attempt(
         &share_id,
         Some(&meeting_id),
@@ -502,7 +514,6 @@ pub(crate) async fn share_note_to_link_inner(
                 .into(),
         ));
     }
-    require_share_owner_claim_capability(state, &client).await?;
 
     let OrgShareBodySnapshot {
         title,
@@ -658,6 +669,21 @@ pub(crate) async fn share_note_to_link_doc_inner(
     let share_id = crate::share::new_share_id();
     let rev = 1u32;
     require_current_org_share_snapshot(state, None, Some(&id), &source.source_version)?;
+    // Capability discovery FIRST, then mint the owner-bound cleanup authority. Discovery is a pure
+    // read (`client.health` -> GET /healthz) that mutates nothing remote, so a journal row written
+    // ahead of it could only ever describe work that never started.
+    //
+    // Writing it first permanently locked the source out (2.0 audit). Against a relay that does not
+    // advertise the capability: the first click journalled a 'create_pending' row and then failed;
+    // the second failed EARLIER and DIFFERENTLY, on `insert_outbound_share_attempt` returning false,
+    // with the bare untagged "an interrupted link-share cleanup is already pending"; and the only
+    // recovery path, `revoke_share_inner`, needs the SAME missing capability, so it could never
+    // converge. Two clicks and that source could not be shared again without a DB repair.
+    //
+    // The guarantee the original ordering existed for is untouched: once the capability IS present
+    // the journal row is still written before the content POST, so a POST failing mid-flight still
+    // leaves a visible, retryable local journal rather than losing the id.
+    require_share_owner_claim_capability(state, &client).await?;
     if !state.db.insert_outbound_share_attempt(
         &share_id,
         None,
@@ -672,7 +698,6 @@ pub(crate) async fn share_note_to_link_doc_inner(
                 .into(),
         ));
     }
-    require_share_owner_claim_capability(state, &client).await?;
 
     let OrgShareBodySnapshot {
         title,
@@ -1403,6 +1428,21 @@ pub(crate) async fn share_note_to_user_inner(
     let share_id = crate::share::new_share_id();
     let rev = 1u32;
     require_current_org_share_snapshot(state, Some(&meeting_id), None, &source.source_version)?;
+    // Capability discovery FIRST, then mint the owner-bound cleanup authority. Discovery is a pure
+    // read (`client.health` -> GET /healthz) that mutates nothing remote, so a journal row written
+    // ahead of it could only ever describe work that never started.
+    //
+    // Writing it first permanently locked the source out (2.0 audit). Against a relay that does not
+    // advertise the capability: the first click journalled a 'create_pending' row and then failed;
+    // the second failed EARLIER and DIFFERENTLY, on `insert_outbound_share_attempt` returning false,
+    // with the bare untagged "an interrupted link-share cleanup is already pending"; and the only
+    // recovery path, `revoke_share_inner`, needs the SAME missing capability, so it could never
+    // converge. Two clicks and that source could not be shared again without a DB repair.
+    //
+    // The guarantee the original ordering existed for is untouched: once the capability IS present
+    // the journal row is still written before the content POST, so a POST failing mid-flight still
+    // leaves a visible, retryable local journal rather than losing the id.
+    require_share_owner_claim_capability(state, &client).await?;
     if !state.db.insert_outbound_share_attempt(
         &share_id,
         Some(&meeting_id),
@@ -1417,7 +1457,6 @@ pub(crate) async fn share_note_to_user_inner(
                 .into(),
         ));
     }
-    require_share_owner_claim_capability(state, &client).await?;
 
     let OrgShareBodySnapshot {
         title,
