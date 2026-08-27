@@ -119,6 +119,7 @@ export const ERROR_CODES = [
   "sharing-rate-limited",
   "sharing-rejected",
   "sharing-signin-required",
+  "sharing-account-required",
   "sharing-upgrade-required",
   "org-edit-conflict",
   "reminders-denied",
@@ -145,7 +146,8 @@ export type ErrorContext =
   | "brain-delete"
   | "doc-note"
   | "unlock"
-  | "account";
+  | "account"
+  | "tasks";
 
 /**
  * The sentence for each code when no context adds anything.
@@ -195,6 +197,12 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
   "sharing-rejected":
     "That didn’t work. Check the code (it may have expired) and try again.",
   "sharing-signin-required": "You’ve been signed out — sign in again to continue.",
+  // DISTINCT from `sharing-signin-required` on purpose. That one means a session EXISTED and
+  // lapsed; this one means there has never been an account on this device — the DEFAULT
+  // local-first user, who is the product's headline promise. Telling that person they have
+  // "been signed out" is a lie, and it was the second-order trap inside the 2.0 Tasks blocker.
+  "sharing-account-required":
+    "Sharing needs a Murmur account. Everything already on this Mac keeps working without one.",
   "sharing-upgrade-required":
     "Sharing is paused until the server supports crash-safe share creation. Try again after the server is updated.",
   "org-edit-conflict":
@@ -251,6 +259,12 @@ const CONTEXT_COPY: Partial<
     "note-locked":
       "That folder is locked. Unlock it, or accept into an open folder or the default one.",
   },
+  tasks: {
+    "sharing-account-required":
+      "Tasks are shared work inside an organization — sign in to your Murmur account to see them.",
+    "sharing-signin-required":
+      "Your sharing session ended — sign in again to see your organization’s tasks.",
+  },
   "org-share": {
     "note-locked":
       "This item is locked — unlock its folder before adding it to the org brain.",
@@ -297,6 +311,7 @@ const CONTEXT_FALLBACK: Partial<Record<ErrorContext, string>> = {
   "brain-delete": "Couldn’t remove that. Please try again.",
   "doc-note": "Couldn’t make a note from this document. Please try again.",
   unlock: "Couldn’t unlock. Please try again.",
+  tasks: "Couldn’t load shared tasks. Please try again.",
   recording: "Couldn’t finish that recording. Please try again.",
 };
 
