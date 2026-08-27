@@ -234,6 +234,42 @@ pub fn cancel_import() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Where an import lands when the user did not pick a destination themselves.
+///
+/// Previously everything went to the bare notes root, so importing a Notion export dropped several
+/// hundred pages loose among the user's own notes with nothing marking where they came from and no
+/// way to undo the mixing. Each source now gets its own named, badged container, created on demand.
+///
+/// REUSED across runs by name, so re-importing the same export updates in place instead of growing
+/// "Imported from Notion 2". Matching on the name rather than a stored id is deliberate: the
+/// container belongs to the user the moment it exists, and once they rename or move it, the next
+/// import should start a fresh one rather than reach back into somewhere they reorganised.
+fn import_destination(state: &AppState, source: ImportSource) -> Result<String, AppError> {
+    let (name, emoji) = match source {
+        ImportSource::Notion => ("Imported from Notion", "🗂️"),
+        ImportSource::Obsidian => ("Imported from Obsidian", "🔮"),
+        ImportSource::AppleNotes => ("Imported from Apple Notes", "🍎"),
+    };
+    // The notes root, not the workspace project: this holds NOTES, and `run_import_inner` resolves
+    // its destination through `note_folder_by_id`. A container created by the meeting-side
+    // `create_folder_inner` is not a note folder, so an explicit re-import into it would be refused
+    // as "no note folder" — which is exactly how the control leg of this feature's test caught it.
+    //
+    // `create_note_folder_inner` is also the seam that birth-seals into a locked parent, so an
+    // import under a sealed Notes root inherits the seal instead of writing plaintext into it.
+    let parent = state.db.ensure_notes_root()?;
+    if let Some(existing) = state.db.child_folder_by_name(&parent, name)? {
+        return Ok(existing);
+    }
+    let folder = crate::commands::create_note_folder_inner(state, name, Some(&parent))?;
+    // Cosmetic, and deliberately not fatal: an import that wrote every page correctly must not fail
+    // because a badge did not stick.
+    if let Err(error) = state.db.set_folder_emoji(&folder.id, emoji) {
+        tracing::warn!(target: "import", folder = %folder.id, %error, "could not set the import container emoji");
+    }
+    Ok(folder.id)
+}
+
 /// The synchronous body of [`run_import`], taking `&AppState` so the whole orchestration is
 /// unit-testable against a temp SQLCipher database without a Tauri runtime.
 pub(crate) fn run_import_inner(
@@ -276,7 +312,7 @@ pub(crate) fn run_import_inner(
             }
             f.to_string()
         }
-        _ => state.db.ensure_notes_root()?,
+        _ => import_destination(state, source)?,
     };
 
     let mut report = ImportReport {
