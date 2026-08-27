@@ -390,8 +390,10 @@ fn imports_an_obsidian_vault_and_leaves_its_wikilinks_untouched() {
 }
 
 #[test]
-fn an_obsidian_re_import_matches_on_the_vault_path() {
-    // The vault has no per-note id, so the relative path is the identity. Re-import must update.
+fn an_obsidian_re_import_matches_on_the_vault_scoped_path() {
+    // The vault has no per-note id, so the identity is the VAULT-SCOPED relative path. Re-importing
+    // the same vault must update; the bare relative path must NOT be the key, because a second
+    // vault holding the same relative path would then overwrite this note.
     let state = build_state("obsidian-reimport");
     let dir = export_dir("obsidian-reimport", &[("Area/Note.md", "# Note\n")]);
     let path = dir.to_str().expect("path");
@@ -405,11 +407,26 @@ fn an_obsidian_re_import_matches_on_the_vault_path() {
     assert_eq!((second.imported, second.updated), (0, 1));
     assert_eq!(imported_notes(&state).len(), 1, "no duplicate");
 
+    let scope = crate::import::obsidian::vault_scope(&dir);
     let found = state
+        .db
+        .note_by_external_id(
+            ImportSource::Obsidian.as_str(),
+            &format!("{scope}:Area/Note"),
+        )
+        .expect("lookup");
+    assert!(
+        found.is_some(),
+        "identity is the vault fingerprint plus the vault-relative path"
+    );
+    let unscoped = state
         .db
         .note_by_external_id(ImportSource::Obsidian.as_str(), "Area/Note")
         .expect("lookup");
-    assert!(found.is_some(), "identity is the vault-relative path");
+    assert!(
+        unscoped.is_none(),
+        "the bare relative path must NOT match — that is what let a second vault overwrite this one"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -423,9 +440,18 @@ fn sources_do_not_collide_on_the_same_external_id() {
 
     run_import_inner(None, &state, ImportSource::Obsidian, Some(path), None, false)
         .expect("obsidian");
+    let key = format!("{}:Note", crate::import::obsidian::vault_scope(&dir));
+    assert!(
+        state
+            .db
+            .note_by_external_id(ImportSource::Obsidian.as_str(), &key)
+            .expect("lookup")
+            .is_some(),
+        "CONTROL: the row IS reachable under its own source"
+    );
     let notion = state
         .db
-        .note_by_external_id(ImportSource::Notion.as_str(), "Note")
+        .note_by_external_id(ImportSource::Notion.as_str(), &key)
         .expect("lookup");
     assert!(
         notion.is_none(),
@@ -444,4 +470,151 @@ fn an_unknown_source_is_refused() {
         ImportSource::parse("apple-notes"),
         Some(ImportSource::AppleNotes)
     );
+}
+
+// ── the two-vault collision (BLOCKER oracle) ─────────────────────────────────
+
+#[test]
+fn a_second_vault_with_a_colliding_relative_path_does_not_overwrite_the_first() {
+    // CONTENT-LOSS ORACLE. Two DIFFERENT vaults may both hold `Area/Note.md`. If identity is the
+    // vault-RELATIVE path alone, importing the second silently REPLACES the first vault's title and
+    // body and reports it as a benign "updated" — no warning, no undo. Identity must be scoped to
+    // the vault root, so a second vault creates a NEW note.
+    let state = build_state("obsidian-two-vaults");
+    let vault_a = export_dir(
+        "obsidian-vault-a",
+        &[("Area/Note.md", "# Note\n\nvault A body\n")],
+    );
+    let vault_b = export_dir(
+        "obsidian-vault-b",
+        &[("Area/Note.md", "# Note\n\nvault B body\n")],
+    );
+
+    let first = run_import_inner(
+        None,
+        &state,
+        ImportSource::Obsidian,
+        Some(vault_a.to_str().expect("path")),
+        None,
+        false,
+    )
+    .expect("first vault");
+    assert_eq!((first.imported, first.updated), (1, 0));
+
+    let second = run_import_inner(
+        None,
+        &state,
+        ImportSource::Obsidian,
+        Some(vault_b.to_str().expect("path")),
+        None,
+        false,
+    )
+    .expect("second vault");
+    assert_eq!(
+        (second.imported, second.updated),
+        (1, 0),
+        "a second vault sharing a relative path must CREATE, never overwrite"
+    );
+
+    let rows = imported_notes(&state);
+    assert_eq!(rows.len(), 2, "both vaults' notes exist");
+    assert!(
+        rows.iter().any(|r| r.text.contains("vault A body")),
+        "the first vault's body survived the second import, got: {:?}",
+        rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().any(|r| r.text.contains("vault B body")),
+        "the second vault's body landed"
+    );
+    let _ = std::fs::remove_dir_all(&vault_a);
+    let _ = std::fs::remove_dir_all(&vault_b);
+}
+
+#[test]
+fn re_importing_the_same_vault_through_a_trailing_slash_still_matches() {
+    // The scope must be CANONICAL: a trailing slash is the same vault, not a second identity.
+    let state = build_state("obsidian-trailing-slash");
+    let dir = export_dir("obsidian-trailing-slash", &[("Area/Note.md", "# Note\n")]);
+    let plain = dir.to_str().expect("path").to_string();
+    let slashed = format!("{plain}/");
+
+    let first = run_import_inner(None, &state, ImportSource::Obsidian, Some(&plain), None, false)
+        .expect("first");
+    assert_eq!((first.imported, first.updated), (1, 0));
+
+    let second = run_import_inner(
+        None,
+        &state,
+        ImportSource::Obsidian,
+        Some(&slashed),
+        None,
+        false,
+    )
+    .expect("second");
+    assert_eq!(
+        (second.imported, second.updated),
+        (0, 1),
+        "a trailing slash names the SAME vault"
+    );
+    assert_eq!(imported_notes(&state).len(), 1, "no duplicate");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_import_refuses_murmurs_own_vault_server_side() {
+    // The FE-only `isMurmurVault` warning is not a guard: a direct `invoke` bypasses it and reads
+    // Murmur's own exported notes back in as duplicates. The refusal must live server-side.
+    let state = build_state("own-vault");
+    let dir = export_dir("own-vault", &[("Note.md", "# Note\n")]);
+    let path = dir.to_str().expect("path").to_string();
+    state
+        .config
+        .lock()
+        .expect("config")
+        .vault_path
+        .replace(path.clone());
+
+    let err = run_import_inner(
+        None,
+        &state,
+        ImportSource::Obsidian,
+        Some(&path),
+        None,
+        false,
+    )
+    .expect_err("importing Murmur's own vault must be refused");
+    assert!(
+        matches!(err, AppError::InvalidArg(ref m) if m.contains("vault")),
+        "the refusal should name the vault, got {err:?}"
+    );
+    assert_eq!(imported_notes(&state).len(), 0, "nothing was written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_folder_that_is_not_the_murmur_vault_still_imports() {
+    // CONTROL for the guard above: the ordinary case must keep working with a vault configured.
+    let state = build_state("own-vault-control");
+    let vault = export_dir("own-vault-control-vault", &[("Exported.md", "# Exported\n")]);
+    let other = export_dir("own-vault-control-other", &[("Note.md", "# Note\n")]);
+    state
+        .config
+        .lock()
+        .expect("config")
+        .vault_path
+        .replace(vault.to_str().expect("path").to_string());
+
+    let report = run_import_inner(
+        None,
+        &state,
+        ImportSource::Obsidian,
+        Some(other.to_str().expect("path")),
+        None,
+        false,
+    )
+    .expect("a different folder imports normally");
+    assert_eq!(report.imported, 1);
+    let _ = std::fs::remove_dir_all(&vault);
+    let _ = std::fs::remove_dir_all(&other);
 }
