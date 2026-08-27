@@ -142,7 +142,7 @@
 .sidebar-nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
@@ -153,11 +153,36 @@
   mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
 }
+/* Cluster heading. The component doc says this rail "mirrors the main rail's
+   labeled clusters" — but the class carried NO styles anywhere in the repo, so
+   it inherited body text 2px from its neighbours and the whole rail read as one
+   dense column. Mirror the shell rail's own `.context-group-label`
+   (src/styles.css): a muted uppercase caption whose TOP padding is what
+   separates a cluster from the previous cluster's last item. */
+.sidebar-group-label {
+  display: block;
+  /* No bottom padding: the nav's own row gap already separates the heading from
+     the first item of ITS cluster, and keeping that side tight is what makes the
+     heading read as belonging to the group below rather than floating between
+     two of them. */
+  padding: var(--space-4) var(--space-3) 0;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+/* The first cluster label sits directly under the search field, which already
+   supplies that separation. */
+.sidebar-group-label:first-child {
+  padding-top: 0;
+}
 .nav-item {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   width: 100%;
+  min-height: 38px;
   padding: var(--space-2) var(--space-3);
   border: 0;
   border-radius: var(--radius-md);
