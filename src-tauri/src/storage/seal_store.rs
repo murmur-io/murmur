@@ -331,7 +331,7 @@ impl Db {
         // folder's titles in its evidence with no matching id, so a scoped purge cannot cover it.
         // Cheap re-derivable rows; the next pass re-stages anything still true.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
-        Self::purge_all_ask_conversations_tx(&tx)?;
+        Self::purge_ask_conversations_for_folders_tx(&tx, &HashSet::from([folder_id.to_string()]))?;
         // Smart-reminder audit candidates/cache are disposable source-derived plaintext too.
         // Accepted reminders live in separate tables and deliberately survive this purge.
         Self::purge_all_reminder_derived_tx(&tx)?;
@@ -632,7 +632,7 @@ impl Db {
             // meeting/document id can match; a relock invalidates the pass's visibility
             // snapshot). Resolved rows were blanked on resolve and survive.
             Self::purge_all_pending_audit_findings_tx(&tx)?;
-            Self::purge_all_ask_conversations_tx(&tx)?;
+            Self::purge_ask_conversations_for_folders_tx(&tx, folder_ids)?;
             // A relock withdraws the visibility snapshot that authorized every pending Smart
             // candidate. Purge the whole derived audit domain in this same re-blank transaction.
             Self::purge_all_reminder_derived_tx(&tx)?;
@@ -858,7 +858,7 @@ impl Db {
             .map_err(map_err)?;
         if any_locked {
             Self::purge_all_pending_audit_findings_tx(&tx)?;
-            Self::purge_all_ask_conversations_tx(&tx)?;
+            Self::purge_ask_conversations_for_locked_folders_tx(&tx)?;
             // Startup reconciliation must not leave candidates derived during a crashed unlocked
             // session at rest. Canonical promoted reminders remain untouched.
             Self::purge_all_reminder_derived_tx(&tx)?;

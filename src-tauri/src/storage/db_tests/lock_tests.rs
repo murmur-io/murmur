@@ -2370,3 +2370,133 @@ fn clear_voiceprints_removes_all() {
         .unwrap()
         .is_empty());
 }
+
+/// Helper for the scoped-Ask-purge oracle: how many durable Ask conversation rows survive AT REST
+/// (not "are visible" — the row count, so a merely-hidden row still counts as surviving).
+fn ask_rows_at_rest(db: &Db) -> i64 {
+    db.lock()
+        .query_row("SELECT COUNT(*) FROM ask_conversations", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// RELEASE BLOCKER (2.0) — durable Ask history must not be globally erased by a session-visibility
+/// WITHDRAWAL. `blank_sealed_notes_in_folders` (relock / relock-all — the app-quit, window-close and
+/// screen-share auto-relock hooks) and `reblank_locked_folders_at_rest` (EVERY launch, guarded only
+/// on "some folder is locked") used to run the GLOBAL
+/// `purge_all_ask_conversations_tx`, whose predicate `provenance_mode = 'globalDerived'` matches
+/// every row the schema CHECK allows — a total wipe for any user with one locked folder.
+///
+/// Both directions, one oracle:
+///   * LEAK leg (fail-closed CONTROL): a conversation whose conservative dependency snapshot
+///     contains the folder being sealed MUST be destroyed at rest by BOTH paths.
+///   * LOSS leg: a conversation that only ever saw an unrelated, still-open folder MUST survive
+///     BOTH paths and MUST STAY READABLE afterwards (a surviving-but-invisible row — e.g. one
+///     orphaned by a bumped `visibility_generation` — is the same data loss to the user).
+#[test]
+fn ask_history_purge_on_visibility_withdrawal_is_scoped_to_the_sealed_folders() {
+    let db = file_db("ask-scoped-purge");
+    seed_folder(&db, "f-open", "Open");
+    seed_folder(&db, "f-sealed", "Sealed");
+    // `f-sealed` is locked AT REST and session-unlocked right now — the exact state both paths
+    // reconcile (a relock withdraws the session unlock; the startup reconcile re-asserts at rest).
+    db.lock()
+        .execute("UPDATE folders SET locked = 1 WHERE id = 'f-sealed'", [])
+        .unwrap();
+    let session_unlocked: HashSet<String> = ["f-sealed".to_string()].into_iter().collect();
+
+    let unrelated = db
+        .persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "What did we decide about the open folder?",
+            "Derived only from content that stays visible.",
+            &[],
+            &[],
+            &[],
+            &["f-open".to_string()],
+            "2026-08-26T09:00:00Z",
+        )
+        .unwrap();
+    let derived = db
+        .persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "What did we decide in the private folder?",
+            "Derived from content that is about to be sealed.",
+            &[],
+            &[],
+            &[],
+            &["f-open".to_string(), "f-sealed".to_string()],
+            "2026-08-26T09:01:00Z",
+        )
+        .unwrap();
+
+    let visible_now = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &session_unlocked)
+        .unwrap();
+    assert!(
+        visible_now.contains(&unrelated) && visible_now.contains(&derived),
+        "both threads start readable while the sealed folder is session-unlocked"
+    );
+    assert_eq!(ask_rows_at_rest(&db), 2);
+
+    // ── RELOCK (app quit / window close / screen-share auto-relock) ──────────────────────────────
+    db.blank_sealed_notes_in_folders(&session_unlocked).unwrap();
+    assert_eq!(
+        ask_rows_at_rest(&db),
+        1,
+        "the thread derived from the sealed folder must be DESTROYED at rest by the relock"
+    );
+    let after_relock = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap();
+    assert_eq!(
+        after_relock,
+        vec![unrelated.clone()],
+        "the unrelated thread must survive the relock AND stay readable"
+    );
+
+    // ── STARTUP RECONCILE (runs at EVERY launch while any folder is locked) ──────────────────────
+    db.reblank_locked_folders_at_rest().unwrap();
+    assert_eq!(
+        ask_rows_at_rest(&db),
+        1,
+        "the startup reconcile must not erase an unrelated thread"
+    );
+    let after_launch = db
+        .list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+        .unwrap();
+    assert_eq!(
+        after_launch,
+        vec![unrelated.clone()],
+        "durable Ask history must survive relaunch when nothing it depended on was sealed"
+    );
+
+    // ── LEAK leg for the startup path on its own (crash-while-unlocked recovery) ─────────────────
+    let crashed = db
+        .persist_ask_exchange(
+            &AskConversationScope::Vault,
+            None,
+            "What is in the private folder?",
+            "Derived during a session that crashed before relocking.",
+            &[],
+            &[],
+            &[],
+            &["f-open".to_string(), "f-sealed".to_string()],
+            "2026-08-26T09:02:00Z",
+        )
+        .unwrap();
+    assert_eq!(ask_rows_at_rest(&db), 2);
+    db.reblank_locked_folders_at_rest().unwrap();
+    assert_eq!(
+        ask_rows_at_rest(&db),
+        1,
+        "startup reconcile must DESTROY a thread that depended on a folder locked at rest"
+    );
+    assert!(
+        !db.list_ask_conversation_ids(&AskConversationScope::Vault, &HashSet::new())
+            .unwrap()
+            .contains(&crashed),
+        "the crash-derived thread is gone, not merely hidden"
+    );
+}
