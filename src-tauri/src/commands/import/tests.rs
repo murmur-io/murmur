@@ -321,6 +321,7 @@ fn dtos_cross_ipc_in_camel_case() {
         sample_titles: vec![],
         truncated: false,
         is_murmur_vault: false,
+        default_destination: "Imported from Notion".into(),
     };
     let report = ImportReport {
         imported: 1,
@@ -331,6 +332,8 @@ fn dtos_cross_ipc_in_camel_case() {
         folders_created: 0,
         cancelled: false,
         embedding_deferred: true,
+        destination_id: "f1".into(),
+        destination_name: "Imported from Notion".into(),
     };
     for value in [
         serde_json::to_value(&scan).expect("scan json"),
@@ -344,10 +347,16 @@ fn dtos_cross_ipc_in_camel_case() {
             );
         }
     }
-    // Spot-check two keys the FE binds by name, so a rename cannot pass silently.
+    // Spot-check the keys the FE binds by name, so a rename cannot pass silently.
     let json = serde_json::to_value(&scan).expect("scan json");
     assert!(json.get("alreadyImported").is_some());
     assert!(json.get("attachmentBytes").is_some());
+    // The destination trio. These exist so the UI can NAME and OPEN where an import landed; a
+    // silent rename here puts the app straight back to "imported: 412" and an empty notes root.
+    assert!(json.get("defaultDestination").is_some());
+    let json = serde_json::to_value(&report).expect("report json");
+    assert!(json.get("destinationId").is_some());
+    assert!(json.get("destinationName").is_some());
 }
 
 // ── Obsidian ──────────────────────────────────────────────────────────────────
@@ -691,5 +700,47 @@ fn an_unfiled_import_lands_in_a_named_badged_container_and_reuses_it() {
         "the same pages, filed where the user asked"
     );
 
+    // The report NAMES where the notes landed, in both branches. Without this the UI can only say
+    // "imported: 2" — which is what left users hunting an empty notes root for an import that had
+    // in fact been filed correctly all along.
+    assert_eq!(first.destination_id, destination.id);
+    assert_eq!(first.destination_name, "Imported from Notion");
+    assert_eq!(
+        third.destination_id, chosen.id,
+        "an explicit destination is reported as itself, not as the container"
+    );
+    assert_eq!(third.destination_name, "Chosen");
+
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The picker's default option must name the SAME container the import will actually use.
+///
+/// These two came from one constant but were read through different call paths — the scan reports
+/// the name without creating anything, the import creates it — so a drift between them would show
+/// the user one destination and use another. Pinning them together is what keeps the promise the UI
+/// makes checkable.
+#[test]
+fn the_scanned_default_destination_matches_where_the_import_lands() {
+    for source in [
+        ImportSource::Notion,
+        ImportSource::Obsidian,
+        ImportSource::AppleNotes,
+    ] {
+        let state = build_state(&format!("default-dest-{}", source.as_str()));
+        let promised = import_container(source).0;
+        let landed = import_destination(&state, source)
+            .expect("the destination resolves");
+        let folder = state
+            .db
+            .note_folder_by_id(&landed)
+            .expect("read the folder")
+            .expect("the container is a NOTE folder the importer can resolve");
+        assert_eq!(
+            folder.name, promised,
+            "{} promises {promised} but lands in {}",
+            source.as_str(),
+            folder.name
+        );
+    }
 }
