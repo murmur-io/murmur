@@ -1,295 +1,347 @@
-<header class="tasks-head">
-  <div>
-    <span class="eyebrow">Shared work</span>
-    <h1>Tasks</h1>
-    <p>Encrypted work owned by one organization. Private links stay on this Mac.</p>
-  </div>
-  <button type="button" class="btn btn-primary" (click)="newTask()">New task</button>
-</header>
+<!--
+  The DEFAULT Murmur user has no sharing account — local-first with no account is the product's
+  headline promise — and Tasks is org-only, so the backend refuses every read here. That refusal
+  used to render VERBATIM in a red banner ("provider unavailable: not signed in to the sharing
+  account") on top of an empty state that told the user to "create shared work". Both are gone: the
+  store classifies the refusal by its stable `[code]` and raises `signedOut`, and this branch
+  explains what Tasks ARE and offers the same two doors the account banner offers.
 
-@if (error(); as message) {
-  <div class="banner banner-error" role="alert">
-    <span>{{ message }}</span>
-    <button type="button" class="btn btn-ghost btn-sm" (click)="store.clearError(); localError.set(null)">
-      Dismiss
-    </button>
-  </div>
-}
-
-<div class="tasks-shell" [class.show-detail]="showingDetail()">
-  <aside class="task-list" aria-label="Tasks">
-    <div class="list-tools">
-      <input
-        type="search"
-        placeholder="Find a task"
-        aria-label="Find a task"
-        [value]="query()"
-        (input)="onQuery($event)"
-      />
-      <select aria-label="Filter organization" [value]="orgFilter()" (change)="onOrgFilter($event)">
-        <option value="all">All organizations</option>
-        @for (org of store.orgs(); track org.orgId) {
-          <option [value]="org.orgId">{{ org.name }}</option>
-        }
-      </select>
-    </div>
-
-    <nav class="status-tabs" aria-label="Task status">
-      <button type="button" [class.active]="filter() === 'open'" (click)="selectFilter('open')">Open</button>
-      <button type="button" [class.active]="filter() === 'todo'" (click)="selectFilter('todo')">To do</button>
-      <button type="button" [class.active]="filter() === 'inProgress'" (click)="selectFilter('inProgress')">In progress</button>
-      <button type="button" [class.active]="filter() === 'done'" (click)="selectFilter('done')">Done</button>
-      <button type="button" [class.active]="filter() === 'all'" (click)="selectFilter('all')">All</button>
-    </nav>
-
-    <div class="task-rows">
-      @for (task of filteredTasks(); track task.id) {
-        <button
-          type="button"
-          class="task-row"
-          [class.active]="routeId() === task.id"
-          (click)="open(task)"
-          [attr.data-task-id]="task.id"
-        >
-          <span class="state-dot" [attr.data-status]="task.status"></span>
-          <span class="row-copy">
-            <strong>{{ task.title }}</strong>
-            <span>{{ orgName(task.orgId) }} · {{ formatDue(task) }}</span>
-          </span>
-          @if (task.assigneeUserId) {
-            <span class="avatar" aria-label="Assigned">A</span>
-          }
-        </button>
-      } @empty {
-        @if (store.loading()) {
-          <mur-empty-state><mur-spinner /> Syncing tasks…</mur-empty-state>
-        } @else {
-          <mur-empty-state>
-            <strong>No tasks here.</strong>
-            <p>Create shared work or change the filters.</p>
-          </mur-empty-state>
-        }
-      }
-    </div>
-  </aside>
-
-  <main class="task-detail">
-    @if (isNew() || current() !== null) {
-      @let task = current();
-      <header class="detail-head">
-        <button type="button" class="mobile-back btn btn-ghost btn-sm" (click)="backToList()">← Tasks</button>
-        <div class="detail-context">
-          <span class="eyebrow">{{ isNew() ? "New shared task" : orgName(task?.orgId ?? orgId()) }}</span>
-          @if (!isNew() && task && !task.canEdit) {
-            <span class="permission-pill">View only</span>
-          }
+  The nav item deliberately still appears for a signed-out user: `/tasks` is directly routable, so
+  hiding the chrome would leave the raw-prose route reachable while making the feature undiscoverable.
+-->
+@if (store.signedOut()) {
+  <section class="tasks-gate" aria-labelledby="tasks-gate-title">
+    <mur-empty-state>
+      <svg class="gate-mark" viewBox="0 0 44 44" fill="none" aria-hidden="true">
+        <circle cx="22" cy="22" r="20" stroke="currentColor" stroke-width="1.4" opacity="0.5" />
+        <path
+          d="M16 22.4l4 4 8.4-8.8"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <h1 class="empty-title" id="tasks-gate-title">Tasks live in a Shared Brain</h1>
+      <p class="empty gate-lede">
+        Tasks are shared work inside an organization — end-to-end encrypted and kept in step with
+        the people you invite. Your meetings, notes and recordings on this Mac keep working exactly
+        as they do now, with no account.
+      </p>
+      @if (authDoor(); as door) {
+        <div class="gate-auth">
+          <app-sharing-auth-flow
+            [initialDoor]="door"
+            (completed)="onAuthCompleted()"
+            (dismissed)="closeAuth()"
+          />
         </div>
-        <div class="detail-actions">
-          @if (!isNew() && task?.canManage) {
-            <button type="button" class="btn btn-danger btn-sm" [disabled]="deleting()" (click)="remove()">
-              {{ deleting() ? "Deleting…" : "Delete" }}
-            </button>
-          }
-          <button type="button" class="btn btn-primary" [disabled]="!canSave()" (click)="save()">
-            {{ saving() ? "Saving…" : isNew() ? "Create task" : "Save" }}
+      } @else {
+        <div class="gate-actions">
+          <button type="button" class="btn btn-primary" (click)="openAuth('signin')">
+            Sign in
+          </button>
+          <button type="button" class="btn btn-ghost" (click)="openAuth('create')">
+            Create account
           </button>
         </div>
-      </header>
+      }
+    </mur-empty-state>
+  </section>
+} @else {
+  <header class="tasks-head">
+    <div>
+      <span class="eyebrow">Shared work</span>
+      <h1>Tasks</h1>
+      <p>Encrypted work owned by one organization. Private links stay on this Mac.</p>
+    </div>
+    <button type="button" class="btn btn-primary" (click)="newTask()">New task</button>
+  </header>
 
-      <section class="editor" data-testid="task-editor">
-        @if (isNew()) {
-          <label class="field compact">
-            <span>Organization</span>
-            <select [value]="orgId()" (change)="setOrg($event)">
-              @for (org of store.orgs(); track org.orgId) {
-                <option [value]="org.orgId">{{ org.name }}</option>
-              }
-            </select>
-          </label>
-        }
+  @if (error(); as message) {
+    <div class="banner banner-error" role="alert">
+      <span>{{ message }}</span>
+      <button type="button" class="btn btn-ghost btn-sm" (click)="store.clearError(); localError.set(null)">
+        Dismiss
+      </button>
+    </div>
+  }
 
+  <div class="tasks-shell" [class.show-detail]="showingDetail()">
+    <aside class="task-list" aria-label="Tasks">
+      <div class="list-tools">
         <input
-          class="title-field"
-          type="text"
-          placeholder="Task title"
-          aria-label="Task title"
-          [value]="title()"
-          [disabled]="!isNew() && !task?.canEdit"
-          (input)="setText('title', $event)"
+          type="search"
+          placeholder="Find a task"
+          aria-label="Find a task"
+          [value]="query()"
+          (input)="onQuery($event)"
         />
-        <textarea
-          class="description-field"
-          rows="6"
-          placeholder="Describe the outcome, context, or constraints…"
-          aria-label="Task description"
-          [value]="description()"
-          [disabled]="!isNew() && !task?.canEdit"
-          (input)="setText('description', $event)"
-        ></textarea>
-
-        <div class="properties">
-          <label class="field">
-            <span>Status</span>
-            <select [value]="status()" [disabled]="!isNew() && !task?.canEdit" (change)="setStatus($event)">
-              <option value="todo">To do</option>
-              <option value="inProgress">In progress</option>
-              <option value="done">Done</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>Due</span>
-            <input type="datetime-local" [value]="dueAt()" [disabled]="!isNew() && !task?.canEdit" (input)="setDueAt($event)" />
-          </label>
-          <label class="field">
-            <span>Assignee</span>
-            <select [value]="assigneeUserId()" [disabled]="!isNew() && !task?.canEdit" (change)="setAssignee($event)">
-              <option value="">Unassigned</option>
-              @for (member of assignees(); track member.userId) {
-                <option [value]="member.userId">{{ member.label }}</option>
-              }
-            </select>
-          </label>
-          <label class="field">
-            <span>Members may</span>
-            <select [value]="access()" [disabled]="!isNew() && !task?.canManage" (change)="setAccess($event)">
-              <option value="edit">Edit</option>
-              <option value="view">View</option>
-            </select>
-          </label>
-        </div>
-
-        <section class="detail-section">
-          <header>
-            <div><span class="eyebrow">Checklist</span><h2>Subtasks</h2></div>
-            <span class="count">{{ subtasks().length }}</span>
-          </header>
-          <div class="subtasks">
-            @for (subtask of subtasks(); track subtask.id) {
-              <div class="subtask" [class.done]="subtask.done">
-                <input
-                  type="checkbox"
-                  [checked]="subtask.done"
-                  [disabled]="!isNew() && !task?.canEdit"
-                  (change)="toggleSubtask(subtask.id)"
-                  [attr.aria-label]="'Complete ' + subtask.title"
-                />
-                <span>{{ subtask.title }}</span>
-                @if (isNew() || task?.canEdit) {
-                  <button type="button" class="icon-button" (click)="removeSubtask(subtask.id)" aria-label="Remove subtask">×</button>
-                }
-              </div>
-            }
-          </div>
-          @if (isNew() || task?.canEdit) {
-            <form class="inline-add" (submit)="addSubtask(); $event.preventDefault()">
-              <input type="text" placeholder="Add a subtask" [value]="newSubtask()" (input)="onNewSubtask($event)" />
-              <button type="submit" class="btn btn-ghost btn-sm" [disabled]="!newSubtask().trim()">Add</button>
-            </form>
+        <select aria-label="Filter organization" [value]="orgFilter()" (change)="onOrgFilter($event)">
+          <option value="all">All organizations</option>
+          @for (org of store.orgs(); track org.orgId) {
+            <option [value]="org.orgId">{{ org.name }}</option>
           }
-        </section>
+        </select>
+      </div>
 
-        <section class="detail-section">
-          <header><div><span class="eyebrow">Encrypted</span><h2>Related org tasks</h2></div></header>
-          <div class="chips">
-            @for (ref of orgRefs(); track ref.docId) {
-              <span class="ref-chip">
-                <button type="button" (click)="openRelated(ref)">{{ relatedTitle(ref.docId) }}</button>
-                @if (isNew() || task?.canEdit) {
-                  <button type="button" class="remove-chip" (click)="removeRelated(ref.docId)" aria-label="Remove related task">×</button>
-                }
-              </span>
+      <nav class="status-tabs" aria-label="Task status">
+        <button type="button" [class.active]="filter() === 'open'" (click)="selectFilter('open')">Open</button>
+        <button type="button" [class.active]="filter() === 'todo'" (click)="selectFilter('todo')">To do</button>
+        <button type="button" [class.active]="filter() === 'inProgress'" (click)="selectFilter('inProgress')">In progress</button>
+        <button type="button" [class.active]="filter() === 'done'" (click)="selectFilter('done')">Done</button>
+        <button type="button" [class.active]="filter() === 'all'" (click)="selectFilter('all')">All</button>
+      </nav>
+
+      <div class="task-rows">
+        @for (task of filteredTasks(); track task.id) {
+          <button
+            type="button"
+            class="task-row"
+            [class.active]="routeId() === task.id"
+            (click)="open(task)"
+            [attr.data-task-id]="task.id"
+          >
+            <span class="state-dot" [attr.data-status]="task.status"></span>
+            <span class="row-copy">
+              <strong>{{ task.title }}</strong>
+              <span>{{ orgName(task.orgId) }} · {{ formatDue(task) }}</span>
+            </span>
+            @if (task.assigneeUserId) {
+              <span class="avatar" aria-label="Assigned">A</span>
+            }
+          </button>
+        } @empty {
+          @if (store.loading()) {
+            <mur-empty-state><mur-spinner /> Syncing tasks…</mur-empty-state>
+          } @else {
+            <mur-empty-state>
+              <strong>No tasks here.</strong>
+              <p>Create shared work or change the filters.</p>
+            </mur-empty-state>
+          }
+        }
+      </div>
+    </aside>
+
+    <main class="task-detail">
+      @if (isNew() || current() !== null) {
+        @let task = current();
+        <header class="detail-head">
+          <button type="button" class="mobile-back btn btn-ghost btn-sm" (click)="backToList()">← Tasks</button>
+          <div class="detail-context">
+            <span class="eyebrow">{{ isNew() ? "New shared task" : orgName(task?.orgId ?? orgId()) }}</span>
+            @if (!isNew() && task && !task.canEdit) {
+              <span class="permission-pill">View only</span>
             }
           </div>
-          @if (isNew() || task?.canEdit) {
-            <div class="inline-add">
-              <select [value]="relatedTaskId()" (change)="setRelatedTask($event)">
-                <option value="">Choose task…</option>
-                @for (candidate of relatedCandidates(); track candidate.id) {
-                  <option [value]="candidate.id">{{ candidate.title }}</option>
+          <div class="detail-actions">
+            @if (!isNew() && task?.canManage) {
+              <button type="button" class="btn btn-danger btn-sm" [disabled]="deleting()" (click)="remove()">
+                {{ deleting() ? "Deleting…" : "Delete" }}
+              </button>
+            }
+            <button type="button" class="btn btn-primary" [disabled]="!canSave()" (click)="save()">
+              {{ saving() ? "Saving…" : isNew() ? "Create task" : "Save" }}
+            </button>
+          </div>
+        </header>
+
+        <section class="editor" data-testid="task-editor">
+          @if (isNew()) {
+            <label class="field compact">
+              <span>Organization</span>
+              <select [value]="orgId()" (change)="setOrg($event)">
+                @for (org of store.orgs(); track org.orgId) {
+                  <option [value]="org.orgId">{{ org.name }}</option>
                 }
               </select>
-              <button type="button" class="btn btn-ghost btn-sm" [disabled]="!relatedTaskId()" (click)="addRelatedTask()">Link</button>
-            </div>
+            </label>
           }
-        </section>
 
-        <section class="detail-section">
-          <header>
-            <div><span class="eyebrow">E2EE bundle</span><h2>Images</h2></div>
-            @if (!isNew() && task?.canEdit) {
-              <label class="btn btn-ghost btn-sm file-button">
-                {{ uploading() ? "Adding…" : "Add image" }}
-                <input type="file" accept="image/png,image/jpeg,image/webp" multiple [disabled]="uploading()" (change)="addImages($event)" />
-              </label>
-            }
-          </header>
-          @if (isNew()) {
-            <p class="section-note">Create the task first, then add images to its encrypted document.</p>
-          }
-          <div class="image-grid">
-            @for (image of images(); track image.reference) {
-              <figure>
-                @if (imageData(image); as src) {
-                  <img [src]="src" [alt]="image.alt" />
-                } @else {
-                  <div class="image-placeholder">Encrypted image</div>
+          <input
+            class="title-field"
+            type="text"
+            placeholder="Task title"
+            aria-label="Task title"
+            [value]="title()"
+            [disabled]="!isNew() && !task?.canEdit"
+            (input)="setText('title', $event)"
+          />
+          <textarea
+            class="description-field"
+            rows="6"
+            placeholder="Describe the outcome, context, or constraints…"
+            aria-label="Task description"
+            [value]="description()"
+            [disabled]="!isNew() && !task?.canEdit"
+            (input)="setText('description', $event)"
+          ></textarea>
+
+          <div class="properties">
+            <label class="field">
+              <span>Status</span>
+              <select [value]="status()" [disabled]="!isNew() && !task?.canEdit" (change)="setStatus($event)">
+                <option value="todo">To do</option>
+                <option value="inProgress">In progress</option>
+                <option value="done">Done</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Due</span>
+              <input type="datetime-local" [value]="dueAt()" [disabled]="!isNew() && !task?.canEdit" (input)="setDueAt($event)" />
+            </label>
+            <label class="field">
+              <span>Assignee</span>
+              <select [value]="assigneeUserId()" [disabled]="!isNew() && !task?.canEdit" (change)="setAssignee($event)">
+                <option value="">Unassigned</option>
+                @for (member of assignees(); track member.userId) {
+                  <option [value]="member.userId">{{ member.label }}</option>
                 }
-                <figcaption>{{ image.alt || "Image" }}</figcaption>
-                @if (task?.canEdit) {
-                  <button type="button" class="remove-image" (click)="removeImage(image)" aria-label="Remove image">×</button>
-                }
-              </figure>
-            }
+              </select>
+            </label>
+            <label class="field">
+              <span>Members may</span>
+              <select [value]="access()" [disabled]="!isNew() && !task?.canManage" (change)="setAccess($event)">
+                <option value="edit">Edit</option>
+                <option value="view">View</option>
+              </select>
+            </label>
           </div>
-        </section>
 
-        @if (!isNew() && task) {
-          <section class="detail-section local-links">
-            <header><div><span class="eyebrow">This Mac only</span><h2>Local links</h2></div></header>
-            <p class="section-note">Note, recording and dashboard links never enter the shared task document.</p>
+          <section class="detail-section">
+            <header>
+              <div><span class="eyebrow">Checklist</span><h2>Subtasks</h2></div>
+              <span class="count">{{ subtasks().length }}</span>
+            </header>
+            <div class="subtasks">
+              @for (subtask of subtasks(); track subtask.id) {
+                <div class="subtask" [class.done]="subtask.done">
+                  <input
+                    type="checkbox"
+                    [checked]="subtask.done"
+                    [disabled]="!isNew() && !task?.canEdit"
+                    (change)="toggleSubtask(subtask.id)"
+                    [attr.aria-label]="'Complete ' + subtask.title"
+                  />
+                  <span>{{ subtask.title }}</span>
+                  @if (isNew() || task?.canEdit) {
+                    <button type="button" class="icon-button" (click)="removeSubtask(subtask.id)" aria-label="Remove subtask">×</button>
+                  }
+                </div>
+              }
+            </div>
+            @if (isNew() || task?.canEdit) {
+              <form class="inline-add" (submit)="addSubtask(); $event.preventDefault()">
+                <input type="text" placeholder="Add a subtask" [value]="newSubtask()" (input)="onNewSubtask($event)" />
+                <button type="submit" class="btn btn-ghost btn-sm" [disabled]="!newSubtask().trim()">Add</button>
+              </form>
+            }
+          </section>
+
+          <section class="detail-section">
+            <header><div><span class="eyebrow">Encrypted</span><h2>Related org tasks</h2></div></header>
             <div class="chips">
-              @for (ref of localRefs(); track ref.kind + ':' + ref.refId) {
-                <span class="ref-chip local">
-                  <button type="button" (click)="openLocalRef(ref)">{{ ref.kind }} · {{ ref.refId }}</button>
-                  <button type="button" class="remove-chip" (click)="removeLocalRef(ref)" aria-label="Remove local link">×</button>
+              @for (ref of orgRefs(); track ref.docId) {
+                <span class="ref-chip">
+                  <button type="button" (click)="openRelated(ref)">{{ relatedTitle(ref.docId) }}</button>
+                  @if (isNew() || task?.canEdit) {
+                    <button type="button" class="remove-chip" (click)="removeRelated(ref.docId)" aria-label="Remove related task">×</button>
+                  }
                 </span>
               }
             </div>
-            <div class="inline-add">
-              <select [value]="dashboardRefId()" (change)="setDashboardRef($event)">
-                <option value="">Add to dashboard…</option>
-                @for (dashboard of dashboards(); track dashboard.id) {
-                  <option [value]="dashboard.id">{{ dashboard.title }}</option>
-                }
-              </select>
-              <button type="button" class="btn btn-ghost btn-sm" [disabled]="!dashboardRefId()" (click)="addDashboardRef()">Add</button>
-            </div>
-            <div class="inline-add manual-ref">
-              <select [value]="localRefKind()" (change)="setLocalRefKind($event)">
-                <option value="note">Note</option>
-                <option value="meeting">Recording</option>
-                <option value="dashboard">Dashboard</option>
-              </select>
-              <input type="text" placeholder="Local item id" [value]="localRefId()" (input)="setLocalRefId($event)" />
-              <button type="button" class="btn btn-ghost btn-sm" [disabled]="!localRefId().trim()" (click)="addLocalRef()">Link</button>
+            @if (isNew() || task?.canEdit) {
+              <div class="inline-add">
+                <select [value]="relatedTaskId()" (change)="setRelatedTask($event)">
+                  <option value="">Choose task…</option>
+                  @for (candidate of relatedCandidates(); track candidate.id) {
+                    <option [value]="candidate.id">{{ candidate.title }}</option>
+                  }
+                </select>
+                <button type="button" class="btn btn-ghost btn-sm" [disabled]="!relatedTaskId()" (click)="addRelatedTask()">Link</button>
+              </div>
+            }
+          </section>
+
+          <section class="detail-section">
+            <header>
+              <div><span class="eyebrow">E2EE bundle</span><h2>Images</h2></div>
+              @if (!isNew() && task?.canEdit) {
+                <label class="btn btn-ghost btn-sm file-button">
+                  {{ uploading() ? "Adding…" : "Add image" }}
+                  <input type="file" accept="image/png,image/jpeg,image/webp" multiple [disabled]="uploading()" (change)="addImages($event)" />
+                </label>
+              }
+            </header>
+            @if (isNew()) {
+              <p class="section-note">Create the task first, then add images to its encrypted document.</p>
+            }
+            <div class="image-grid">
+              @for (image of images(); track image.reference) {
+                <figure>
+                  @if (imageData(image); as src) {
+                    <img [src]="src" [alt]="image.alt" />
+                  } @else {
+                    <div class="image-placeholder">Encrypted image</div>
+                  }
+                  <figcaption>{{ image.alt || "Image" }}</figcaption>
+                  @if (task?.canEdit) {
+                    <button type="button" class="remove-image" (click)="removeImage(image)" aria-label="Remove image">×</button>
+                  }
+                </figure>
+              }
             </div>
           </section>
-        }
-      </section>
-    } @else if (routeId() && store.loading()) {
-      <mur-empty-state><mur-spinner /> Opening task…</mur-empty-state>
-    } @else if (routeId()) {
-      <mur-empty-state>
-        <strong>Task unavailable.</strong>
-        <p>It may have been withdrawn, or its organization is disabled on this Mac.</p>
-        <button type="button" class="btn btn-primary" (click)="backToList()">Back to Tasks</button>
-      </mur-empty-state>
-    } @else {
-      <mur-empty-state>
-        <strong>Select a task.</strong>
-        <p>Open shared work from the list, or create a task for one organization.</p>
-        <button type="button" class="btn btn-primary" (click)="newTask()">New task</button>
-      </mur-empty-state>
-    }
-  </main>
-</div>
+
+          @if (!isNew() && task) {
+            <section class="detail-section local-links">
+              <header><div><span class="eyebrow">This Mac only</span><h2>Local links</h2></div></header>
+              <p class="section-note">Note, recording and dashboard links never enter the shared task document.</p>
+              <div class="chips">
+                @for (ref of localRefs(); track ref.kind + ':' + ref.refId) {
+                  <span class="ref-chip local">
+                    <button type="button" (click)="openLocalRef(ref)">{{ ref.kind }} · {{ ref.refId }}</button>
+                    <button type="button" class="remove-chip" (click)="removeLocalRef(ref)" aria-label="Remove local link">×</button>
+                  </span>
+                }
+              </div>
+              <div class="inline-add">
+                <select [value]="dashboardRefId()" (change)="setDashboardRef($event)">
+                  <option value="">Add to dashboard…</option>
+                  @for (dashboard of dashboards(); track dashboard.id) {
+                    <option [value]="dashboard.id">{{ dashboard.title }}</option>
+                  }
+                </select>
+                <button type="button" class="btn btn-ghost btn-sm" [disabled]="!dashboardRefId()" (click)="addDashboardRef()">Add</button>
+              </div>
+              <div class="inline-add manual-ref">
+                <select [value]="localRefKind()" (change)="setLocalRefKind($event)">
+                  <option value="note">Note</option>
+                  <option value="meeting">Recording</option>
+                  <option value="dashboard">Dashboard</option>
+                </select>
+                <input type="text" placeholder="Local item id" [value]="localRefId()" (input)="setLocalRefId($event)" />
+                <button type="button" class="btn btn-ghost btn-sm" [disabled]="!localRefId().trim()" (click)="addLocalRef()">Link</button>
+              </div>
+            </section>
+          }
+        </section>
+      } @else if (routeId() && store.loading()) {
+        <mur-empty-state><mur-spinner /> Opening task…</mur-empty-state>
+      } @else if (routeId()) {
+        <mur-empty-state>
+          <strong>Task unavailable.</strong>
+          <p>It may have been withdrawn, or its organization is disabled on this Mac.</p>
+          <button type="button" class="btn btn-primary" (click)="backToList()">Back to Tasks</button>
+        </mur-empty-state>
+      } @else {
+        <mur-empty-state>
+          <strong>Select a task.</strong>
+          <p>Open shared work from the list, or create a task for one organization.</p>
+          <button type="button" class="btn btn-primary" (click)="newTask()">New task</button>
+        </mur-empty-state>
+      }
+    </main>
+  </div>
+}

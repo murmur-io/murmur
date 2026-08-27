@@ -527,3 +527,46 @@ select:disabled {
     flex-basis: auto;
   }
 }
+
+/* --- Signed-out gate ------------------------------------------------------
+   In-flow content, NOT a floating overlay, so it rides the frosted `.card`
+   language rather than `--surface-overlay` (trap T3 is about panels that float
+   OVER other content; this one replaces the surface). */
+.tasks-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: var(--space-8) var(--space-6);
+}
+
+.tasks-gate mur-empty-state {
+  max-width: 34rem;
+}
+
+.gate-mark {
+  width: 44px;
+  height: 44px;
+  margin-bottom: var(--space-2);
+  color: var(--accent);
+}
+
+.gate-lede {
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+.gate-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.gate-auth {
+  width: 100%;
+  margin-top: var(--space-5);
+  text-align: start;
+}
