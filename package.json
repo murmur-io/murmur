@@ -1,6 +1,6 @@
 {
   "name": "murmur",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "scripts": {
     "start": "cargo build -p murmur-brain && ng serve --port 1420",
     "build": "ng build",
@@ -19,7 +19,7 @@
     "@angular/router": "^22.0.8",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
-    "dompurify": "^3.4.12",
+    "dompurify": "^3.4.13",
     "marked": "^18.0.5",
     "rxjs": "^7.8.2",
     "tslib": "^2.8.1"
