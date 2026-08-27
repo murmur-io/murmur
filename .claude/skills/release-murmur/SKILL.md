@@ -66,6 +66,41 @@ scripts/agent-resource-run -- bash scripts/ci.sh  # must end "✅ CI: all gates 
 
 Do not proceed unless CI is green.
 
+### Stage 0b — the murmur-server checks (BOTH were missing until the 2.0 release, and both bit)
+
+`src-tauri/Cargo.toml` takes `murmur-protocol` as a **path dependency** into the sibling checkout
+`../murmur-server/crates/murmur-protocol`. CI clones that repo fresh at `.murmur-server-revision`,
+but YOUR LOCAL BUILD compiles whatever is checked out on disk. A green CI therefore proves nothing
+about the binary you are about to sign.
+
+```bash
+cd /Users/jakubgawronski/Projects/meetnotes
+cat .murmur-server-revision                       # the pinned 40-hex commit
+git -C ../murmur-server rev-parse HEAD            # MUST be identical
+git -C ../murmur-server status --short            # MUST be empty
+```
+
+If they differ, the sibling checkout is on someone's feature branch. **Commit that work on its own
+branch first** (never stash-and-forget, never discard), then `git -C ../murmur-server checkout main
+&& git merge --ff-only origin/main`. In the 2.0 release the checkout sat on an unmerged
+Stripe/entitlement branch whose working tree had DELETED `CAP_SHARE_OWNER_CLAIM_V1` — a symbol
+`src-tauri/src/commands/org.rs` still references — so the release build could not have compiled at
+all, while CI stayed green.
+
+Second: **the deployed relay must already advertise what this client requires.** The client refuses
+every share-create path unless `/healthz` advertises `share-owner-claim-v1`
+(`commands/org.rs::require_share_owner_claim_capability`). Deploying the server AFTER tagging the
+client ships a release whose sharing is dead on arrival.
+
+```bash
+curl -s https://murmur-server-production-b9e8.up.railway.app/healthz
+# MUST contain "capabilities":[...,"share-owner-claim-v1",...]
+```
+
+If it does not, deploy the server to the pinned revision FIRST (skill: `deploy-murmur-server`) and
+re-probe. Deploy from **clean `main`**, never from the paywall/entitlement branch the checkout
+tends to sit on.
+
 > **Also refresh the public copy before you ship.** Run **`/sync-release-copy`** now —
 > it checks the landing page (`landing/index.html`) and the GitHub repo description
 > against what the app actually does as of this release, and lands any needed edits
@@ -78,12 +113,22 @@ Do not proceed unless CI is green.
 NEW=0.4.0   # example — set to the real bump
 ```
 
-## Stage 2 — Bump version in all 3 files + sync the lock
+## Stage 2 — Bump version in all 4 files + sync the lock
 
-Edit the `version` field in each (keep `identifier` untouched in tauri.conf.json):
+Edit the `version` field in each **by hand** — never a repo-wide `sed`, which would rewrite
+unrelated dependency versions in the lockfiles (keep `identifier` untouched in tauri.conf.json):
 - `package.json` → `"version": "<NEW>"`
+- `package-lock.json` → `"version": "<NEW>"` in **BOTH** places: the top-level key (line ~3) and
+  the `""` root-package entry under `"packages"` (line ~9). Missed until the 2.0 audit, because
+  nothing builds from it — but leaving it stale makes `npm version`/`npm ci` disagree with the
+  three files below, and the next release inherits the confusion.
 - `src-tauri/tauri.conf.json` → `"version": "<NEW>"`
 - `src-tauri/Cargo.toml` → `version = "<NEW>"`
+
+`src-tauri/Cargo.toml` is the one that actually matters at runtime: the in-app About screen, the
+MCP `serverInfo`, and `src-tauri/src/update.rs` (the GitHub-release updater — the ONLY way an
+existing user learns a new version exists) all read `CARGO_PKG_VERSION`. Miss it and you ship a
+DMG that calls itself by the old version and never prompts anyone to upgrade.
 
 Then **re-pin `Cargo.lock`** (the `murmur` package entry must match, or the build/CI
 drifts):
@@ -96,7 +141,7 @@ grep -A1 '^name = "murmur"' Cargo.lock   # workspace-root lock; confirm version 
 ## Stage 3 — Commit as QueaT (no Claude trailers)
 
 ```bash
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml Cargo.lock
+git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml Cargo.lock
 git commit -m "chore(release): bump version to $NEW"
 git log -1 --format='%an <%ae>%n%b'   # author QueaT, body has NO Co-Authored-By / Claude
 ```
