@@ -27,18 +27,73 @@
 
     <div class="plan-summary" aria-label="Plan summary">
       <div>
-        <strong>{{ selectedCount() }}</strong>
-        <span>{{ hasAttemptResult() ? "Selected to retry" : "Selected to move" }}</span>
+        <strong>{{ plan().totalScanned }}</strong>
+        <span>Scanned</span>
       </div>
       <div>
-        <strong>{{ needsChoiceCount() }}</strong>
+        <strong>{{ proposedCount() }}</strong>
+        <span>Proposed</span>
+      </div>
+      <div>
+        <strong>{{ needsUnassistedChoiceCount() }}</strong>
         <span>Need a choice</span>
       </div>
       <div>
         <strong>{{ skippedItems().length }}</strong>
-        <span>Not ready</span>
+        <span>Not ready / deferred</span>
       </div>
     </div>
+
+    <section class="guidance" aria-labelledby="workspace-guidance-label">
+      <label id="workspace-guidance-label" for="workspace-guidance">
+        Filing guidance <span>Optional</span>
+      </label>
+      <div class="guidance-row">
+        <textarea
+          id="workspace-guidance"
+          rows="2"
+          maxlength="600"
+          placeholder="Example: Keep client work separate from internal meetings"
+          [value]="guidance()"
+          [disabled]="busy()"
+          (input)="guidance.set($any($event.target).value)"
+        ></textarea>
+        <button
+          type="button"
+          class="btn btn-ghost"
+          [disabled]="busy()"
+          (click)="onReplan()"
+        >
+          {{ planning() ? "Planning…" : "Replan" }}
+        </button>
+      </div>
+    </section>
+
+    @if (!hasAttemptResult()) {
+      <div class="selection-summary">
+        <span>{{ selectedCount() }} selected to move</span>
+        <span>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            [disabled]="busy()"
+            (click)="clearAll()"
+          >
+            Clear all
+          </button>
+          @if (selectedCount() === 0 && proposedCount() > 0) {
+            <button
+              type="button"
+              class="btn btn-ghost"
+              [disabled]="busy()"
+              (click)="selectSuggestions()"
+            >
+              Restore suggestions
+            </button>
+          }
+        </span>
+      </div>
+    }
 
     <div class="sheet-body">
       @if (hasAttemptResult()) {
@@ -109,7 +164,8 @@
                       }
                       @if (!item.retryable) {
                         <span class="failure-status">
-                          Needs a fresh plan — close this result and run Brain again.
+                          Needs a fresh plan — close this result and run Brain
+                          again.
                         </span>
                       }
                     </span>
@@ -135,9 +191,17 @@
             <h4 id="unchanged-title">Left unchanged</h4>
             <p>
               {{ unchangedAfterAttemptCount() }}
-              {{ unchangedAfterAttemptCount() === 1 ? "recording was" : "recordings were" }}
+              {{
+                unchangedAfterAttemptCount() === 1
+                  ? "recording was"
+                  : "recordings were"
+              }}
               not included in this attempt.
-              {{ unchangedAfterAttemptCount() === 1 ? "It remains" : "They remain" }}
+              {{
+                unchangedAfterAttemptCount() === 1
+                  ? "It remains"
+                  : "They remain"
+              }}
               unfiled. Start a new plan to file
               {{ unchangedAfterAttemptCount() === 1 ? "it" : "them" }}.
             </p>
@@ -150,7 +214,10 @@
           <div class="section-head">
             <div>
               <h4 id="brain-moves-title">Ready to file</h4>
-              <p>High-confidence matches are selected. You stay in control.</p>
+              <p>
+                Matches are selected except privacy-changing moves, which need
+                individual confirmation.
+              </p>
             </div>
             <button
               type="button"
@@ -189,6 +256,21 @@
                     <mur-icon icon="chevron-right" />
                     <span>{{ move.toContainer }}</span>
                   </span>
+                  @if (isDeSealingMove(move.itemId)) {
+                    <span
+                      class="unsealed-warning"
+                      data-testid="organizer-unsealed-warning"
+                    >
+                      <span class="unsealed-warning-badge">
+                        <app-lock-badge exposure="session" />
+                        Privacy change
+                      </span>
+                      <span>
+                        Moving from this session-unlocked source to an open
+                        destination will store the recording unsealed.
+                      </span>
+                    </span>
+                  }
                   <span class="move-reason">{{ move.reason }}</span>
                 </div>
               </li>
@@ -202,7 +284,7 @@
           <div class="section-head">
             <div>
               <h4 id="brain-review-title">Choose a destination</h4>
-              <p>Brain was not confident enough to move these automatically.</p>
+              <p>Suggested destinations are preselected and remain editable.</p>
             </div>
           </div>
           <ul class="review-list">
@@ -228,9 +310,21 @@
                       [disabled]="busy()"
                       (change)="chooseManualTarget(item.itemId, $event)"
                     >
-                      <option value="">Leave unfiled</option>
+                      <option
+                        value=""
+                        [selected]="selectedManualTarget(item.itemId) === ''"
+                      >
+                        Leave unfiled
+                      </option>
                       @for (target of targets(); track target.id) {
-                        <option [value]="target.id">{{ target.label }}</option>
+                        <option
+                          [value]="target.id"
+                          [selected]="
+                            selectedManualTarget(item.itemId) === target.id
+                          "
+                        >
+                          {{ target.label }}
+                        </option>
                       }
                     </select>
                   </label>
@@ -339,7 +433,7 @@
         >
           <mur-icon icon="move" />
           {{
-            busy()
+            applying()
               ? "Moving…"
               : (hasAttemptResult() || applyError() ? "Retry " : "Move ") +
                 selectedCount() +

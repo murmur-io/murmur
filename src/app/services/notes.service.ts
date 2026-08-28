@@ -3,7 +3,7 @@ import { IpcService } from "../core/ipc.service";
 import type {
   NoteFolder,
   NoteSummary,
-  OrganizeMove,
+  OrganizeApplyResult,
   OrganizePlan,
   PropertySchemaField,
   TypedNoteRow,
@@ -271,10 +271,13 @@ export class NotesService {
    * review; nothing moves yet. Rejects so the caller can surface + reset its
    * loading state.
    */
-  async planOrganize(folderId: string | null): Promise<OrganizePlan> {
+  async planOrganize(
+    folderId: string | null,
+    guidance: string | null = null,
+  ): Promise<OrganizePlan> {
     this._error.set(null);
     try {
-      return await this.ipc.planOrganizeNotes(folderId);
+      return await this.ipc.planOrganizeNotes(folderId, guidance);
     } catch (e) {
       this._error.set(this.errorCopy.humanize(e));
       throw e;
@@ -286,15 +289,17 @@ export class NotesService {
    * creates needed folders + moves the notes. The APPLY is the only failure that
    * rejects; both the note + folder lists are then refreshed.
    */
-  async applyOrganize(moves: OrganizeMove[]): Promise<void> {
+  async applyOrganize(plan: OrganizePlan): Promise<OrganizeApplyResult> {
     this._error.set(null);
+    let result: OrganizeApplyResult;
     try {
-      await this.ipc.applyOrganizePlan({ moves });
+      result = await this.ipc.applyOrganizePlan(plan);
     } catch (e) {
       this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await Promise.allSettled([this.loadFolders(), this.loadNotes()]);
+    return result;
   }
 
   // ── Feature C — typed properties (schema + typed rows) ─────────────────────

@@ -1,131 +1,252 @@
-@if (meetingId() && !dismissed()) {
-  <section
-    class="placement card"
-    aria-labelledby="placement-heading"
-    data-testid="recording-placement"
-  >
-    @if (filedIn(); as filed) {
-      <div class="filed" data-testid="placement-filed">
-        <svg class="filed-glyph" viewBox="0 0 16 16" aria-hidden="true">
+@if (meetingId(); as id) {
+  <section class="result card" data-testid="recording-result">
+    <div class="result-status">
+      <span class="result-check" aria-hidden="true">
+        <svg viewBox="0 0 24 24">
           <path
-            d="M3 8.5 6.2 12 13 4.5"
+            d="m6.5 12.5 3.3 3.3 7.7-8"
             fill="none"
             stroke="currentColor"
-            stroke-width="1.8"
+            stroke-width="2"
             stroke-linecap="round"
             stroke-linejoin="round"
           />
         </svg>
-        <p class="filed-line">
-          Filed in
-          <strong>{{ filed.emoji ? filed.emoji + " " : "" }}{{ filed.name }}</strong>
-        </p>
-        <button type="button" class="btn-ghost change" (click)="change()">
-          Change
-        </button>
+      </span>
+      <div class="result-copy">
+        <p class="result-kicker">Recording complete</p>
+        <h1>Saved</h1>
+        <p>{{ savedCopy() }}</p>
       </div>
-    } @else {
-      <header class="placement-head">
-        <h2 id="placement-heading" class="placement-title">
-          Where should this recording live?
-        </h2>
-        <button
-          type="button"
-          class="btn-ghost later"
-          (click)="dismiss()"
-          data-testid="placement-later"
-        >
-          Later
-        </button>
-      </header>
+    </div>
 
-      @if (empty()) {
-        <p class="placement-empty">
-          No projects yet — create one in the sidebar and this recording can go
-          straight into it.
-        </p>
-      } @else {
-        @if (destinations().length > 6) {
-          <input
-            type="search"
-            class="placement-search"
-            placeholder="Filter projects and folders"
-            aria-label="Filter destinations"
-            [value]="query()"
-            (input)="query.set($any($event.target).value)"
-            data-testid="placement-search"
+    <div class="result-actions">
+      <a class="btn btn-primary open-meeting" [routerLink]="['/meeting', id]">
+        Open saved meeting
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            d="M3.5 8h8.5M8.5 4.5 12 8l-3.5 3.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
           />
-        }
+        </svg>
+      </a>
 
-        <ul class="placement-list" role="list">
-          @for (destination of visible(); track destination.id) {
-            <li>
-              <button
-                type="button"
-                class="destination"
-                [class.is-blocked]="destination.blocked"
-                [class.is-last]="destination.id === lastDestinationId()"
-                [style.--depth]="destination.depth"
-                [disabled]="destination.blocked || filing()"
-                [attr.title]="
-                  destination.blocked
-                    ? 'Unlock this folder before filing a recording into it'
-                    : null
-                "
-                (click)="file(destination)"
-                [attr.data-testid]="'placement-destination-' + destination.id"
+      @if (placementMasked()) {
+        <div
+          class="location-masked"
+          data-testid="recording-location-masked"
+          role="status"
+        >
+          <svg class="location-icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M4.5 7V5.2a3.5 3.5 0 0 1 7 0V7M3.6 7h8.8v6H3.6z"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span class="location-copy">
+            <span class="location-label">Location hidden</span>
+            <strong>Unlock its Space to view or change it</strong>
+          </span>
+        </div>
+      } @else {
+        <div class="location">
+          <button
+            type="button"
+            class="location-toggle"
+            [class.is-filed]="!!filedIn()"
+            [attr.aria-expanded]="pickerOpen()"
+            aria-haspopup="dialog"
+            (click)="togglePicker()"
+            data-testid="recording-location-toggle"
+          >
+            <svg class="location-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M2.5 5.2A1.7 1.7 0 0 1 4.2 3.5h2l1.3 1.7h4.3a1.7 1.7 0 0 1 1.7 1.7v4.4a1.2 1.2 0 0 1-1.2 1.2H3.7a1.2 1.2 0 0 1-1.2-1.2z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <span class="location-copy">
+              <span class="location-label">Location</span>
+              <strong>{{ locationCopy() }}</strong>
+            </span>
+            <svg class="chevron" viewBox="0 0 12 12" aria-hidden="true">
+              <path
+                d="m3 4.5 3 3 3-3"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+
+          @if (pickerOpen()) {
+            <div
+              class="location-menu"
+              role="dialog"
+              aria-labelledby="location-heading"
+              data-testid="recording-location-menu"
+            >
+              <header class="menu-head">
+                <div>
+                  <h2 id="location-heading">Choose a location</h2>
+                  <p>The recording and its generated note move together.</p>
+                </div>
+                <button
+                  type="button"
+                  class="menu-close"
+                  aria-label="Close location picker"
+                  (click)="closePicker()"
+                >
+                  ×
+                </button>
+              </header>
+
+              @if (destinations().length > 6) {
+                <input
+                  type="search"
+                  class="location-search"
+                  aria-label="Filter recording locations"
+                  placeholder="Find a Space or folder"
+                  [value]="query()"
+                  (input)="query.set($any($event.target).value)"
+                />
+              }
+
+              <div
+                class="destination-list"
+                role="listbox"
+                aria-label="Open locations"
               >
-                <span class="destination-glyph" aria-hidden="true">
-                  @if (destination.blocked) {
-                    <svg viewBox="0 0 16 16">
-                      <path
-                        d="M4.5 7V5.2a3.5 3.5 0 0 1 7 0V7M3.6 7h8.8v6H3.6z"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.4"
-                        stroke-linejoin="round"
-                      />
-                    </svg>
-                  } @else if (destination.emoji) {
-                    {{ destination.emoji }}
-                  } @else if (destination.level === "project") {
-                    <svg viewBox="0 0 16 16">
-                      <rect
-                        x="2.5"
-                        y="3.5"
-                        width="11"
-                        height="9"
-                        rx="2"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.4"
-                      />
-                    </svg>
-                  } @else {
-                    <svg viewBox="0 0 16 16">
-                      <path
-                        d="M2.5 5.2A1.7 1.7 0 0 1 4.2 3.5h2l1.3 1.7h4.3a1.7 1.7 0 0 1 1.7 1.7v4.4a1.2 1.2 0 0 1-1.2 1.2H3.7a1.2 1.2 0 0 1-1.2-1.2z"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.4"
-                        stroke-linejoin="round"
-                      />
-                    </svg>
-                  }
-                </span>
-                <span class="destination-name">{{ destination.name }}</span>
-                @if (destination.blocked) {
-                  <span class="destination-note">Locked</span>
-                } @else if (destination.id === lastDestinationId()) {
-                  <span class="destination-note">Last used</span>
+                @for (
+                  destination of visibleDestinations();
+                  track destination.id
+                ) {
+                  <button
+                    type="button"
+                    class="destination"
+                    role="option"
+                    [disabled]="filing() || destination.blocked"
+                    [attr.aria-selected]="filedIn()?.id === destination.id"
+                    [attr.title]="
+                      destination.blocked
+                        ? 'Unlock this location before moving a recording into it'
+                        : null
+                    "
+                    (click)="file(destination)"
+                    [attr.data-testid]="
+                      'placement-destination-' + destination.id
+                    "
+                  >
+                    <span
+                      class="destination-glyph"
+                      [attr.data-level]="destination.level"
+                      aria-hidden="true"
+                    >
+                      @if (destination.blocked) {
+                        <svg viewBox="0 0 16 16">
+                          <path
+                            d="M4.5 7V5.2a3.5 3.5 0 0 1 7 0V7M3.6 7h8.8v6H3.6z"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.4"
+                            stroke-linejoin="round"
+                          />
+                        </svg>
+                      } @else if (destination.emoji) {
+                        {{ destination.emoji }}
+                      } @else if (destination.level === "project") {
+                        <svg viewBox="0 0 16 16">
+                          <rect x="2.5" y="2.5" width="4" height="4" rx="0.8" />
+                          <rect x="9.5" y="2.5" width="4" height="4" rx="0.8" />
+                          <rect x="2.5" y="9.5" width="4" height="4" rx="0.8" />
+                          <rect x="9.5" y="9.5" width="4" height="4" rx="0.8" />
+                        </svg>
+                      } @else {
+                        <svg viewBox="0 0 16 16">
+                          <path
+                            d="M2.5 5.2A1.7 1.7 0 0 1 4.2 3.5h2l1.3 1.7h4.3a1.7 1.7 0 0 1 1.7 1.7v4.4a1.2 1.2 0 0 1-1.2 1.2H3.7a1.2 1.2 0 0 1-1.2-1.2z"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.4"
+                            stroke-linejoin="round"
+                          />
+                        </svg>
+                      }
+                    </span>
+                    <span class="destination-name">{{
+                      destination.label
+                    }}</span>
+                    @if (destination.blocked) {
+                      <span class="destination-note">Locked</span>
+                    } @else if (filedIn()?.id === destination.id) {
+                      <span class="destination-note is-current">Current</span>
+                    }
+                  </button>
+                } @empty {
+                  <div class="destination-empty">
+                    <p>No open locations match.</p>
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-sm"
+                      (click)="retryDestinations()"
+                      [disabled]="destinationsLoading()"
+                    >
+                      {{
+                        destinationsLoading()
+                          ? "Refreshing…"
+                          : "Refresh locations"
+                      }}
+                    </button>
+                  </div>
                 }
-              </button>
-            </li>
-          } @empty {
-            <li class="placement-empty">Nothing matches that filter.</li>
+              </div>
+
+              @if (placementUnavailable()) {
+                <div class="location-error" role="status">
+                  <span>Couldn’t confirm the current location.</span>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-sm"
+                    (click)="retryPlacement()"
+                  >
+                    Try again
+                  </button>
+                </div>
+              }
+
+              @if (error(); as filingError) {
+                <div
+                  class="location-error"
+                  role="alert"
+                  data-testid="recording-location-error"
+                >
+                  <span>{{ filingError }}</span>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-sm"
+                    (click)="retry()"
+                    [disabled]="filing()"
+                  >
+                    {{ filing() ? "Trying…" : "Try again" }}
+                  </button>
+                </div>
+              }
+            </div>
           }
-        </ul>
+        </div>
       }
-    }
+    </div>
   </section>
 }

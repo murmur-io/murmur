@@ -105,6 +105,7 @@ export const ERROR_CODES = [
   "meeting-locked",
   "doc-locked",
   "folder-locked",
+  "recording-linked-note",
   "note-missing",
   "note-folder-missing",
   "doc-unsupported",
@@ -172,6 +173,8 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
   "meeting-locked": "This meeting is locked — unlock it first.",
   "doc-locked": "That folder is locked — unlock it first.",
   "folder-locked": "That folder is locked — unlock it first.",
+  "recording-linked-note":
+    "This recording has a linked note. Move it between open folders, or remove the destination folder lock first.",
   "note-missing": "This note no longer exists.",
   "note-folder-missing": "That folder no longer exists.",
   "doc-unsupported":
