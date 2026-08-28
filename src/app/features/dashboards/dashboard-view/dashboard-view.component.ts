@@ -20,6 +20,7 @@ import type {
   SourceRef,
 } from "../../../core/models";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.component";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
@@ -64,6 +65,7 @@ const LENSES: readonly { id: DashboardLens; label: string }[] = [
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     MurEmptyStateComponent,
+    MurCopyIdComponent,
     MurIconComponent,
     MurSpinnerComponent,
     DashboardComposeComponent,

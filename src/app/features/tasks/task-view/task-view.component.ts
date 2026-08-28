@@ -22,6 +22,7 @@ import type {
 } from "../../../core/models";
 import { IpcService } from "../../../core/ipc.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.component";
 import { MurEmptyStateComponent } from "../../../design-system/empty-state/empty-state.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { SharingAuthFlowComponent } from "../../sharing/sharing-auth-flow/sharing-auth-flow.component";
@@ -35,7 +36,12 @@ type AuthDoor = "signin" | "create";
 @Component({
   selector: "app-task-view",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurEmptyStateComponent, MurSpinnerComponent, SharingAuthFlowComponent],
+  imports: [
+    MurCopyIdComponent,
+    MurEmptyStateComponent,
+    MurSpinnerComponent,
+    SharingAuthFlowComponent,
+  ],
   templateUrl: "./task-view.component.html",
   styleUrl: "./task-view.component.scss",
 })
