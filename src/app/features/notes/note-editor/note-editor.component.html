@@ -84,6 +84,10 @@
           }
         </div>
 
+        <!-- The note's stable id, for pointing Claude at THIS note over the local MCP
+             server (`get_document` / `get_document_outline`). -->
+        <mur-copy-id [id]="doc.id" label="Note" />
+
         <span class="head-spacer"></span>
 
         <!-- Autosave indicator — shows ONLY for "saving"/"error" now (2026-07-19

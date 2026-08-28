@@ -58,6 +58,7 @@ import {
 import { NoteSharePanelComponent } from "../note-share-panel/note-share-panel.component";
 import { NoteSelectionToolbarComponent } from "../note-selection-toolbar/note-selection-toolbar.component";
 import { NoteChatComponent } from "../note-chat/note-chat.component";
+import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.component";
 import { MurToggleComponent } from "../../../design-system/toggle/toggle.component";
 import { parseDoc, serializeDoc } from "./front-matter";
 import {
@@ -187,6 +188,7 @@ const NOTE_CHAT_OPEN_KEY = "murmur-note-chat-open";
     NoteSharePanelComponent,
     NoteChatComponent,
     MurToggleComponent,
+    MurCopyIdComponent,
     SmartReminderCardComponent,
     FormsModule,
   ],
