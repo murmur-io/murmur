@@ -352,6 +352,28 @@ pub enum ToolCall {
         from: String,
         to: String,
     },
+    /// LOCAL-MCP-ONLY roster of the user's SHARED ORG TASKS — title, id, status, due date, org.
+    /// The discovery half of the pair: without it a task id can only be pasted in by hand from the
+    /// app's header control, and an agent has no way to find the task it is being asked about.
+    ///
+    /// GATE: `Db::list_org_tasks` JOINs `org_state` on `context_enabled = 1` in SQL, which is the
+    /// same per-instance org toggle every other org reader uses (`get_org_item`,
+    /// `search_org_chunks_*`) — a disabled org's tasks are excluded before any row reaches Rust.
+    ///
+    /// Absent from [`tool_specs`] and every [`GatedToolExecutor`] scope, exactly like
+    /// [`Self::KnowledgeDiff`]. Org tasks are colleagues' shared work; opening them to the
+    /// cloud-capable assistant scope would be a new cloud egress wearing a feature's clothes, and
+    /// that is a decision to take deliberately rather than as a side-effect of adding an MCP tool.
+    ListTasks,
+    /// LOCAL-MCP-ONLY read of ONE shared org task by id — the id the app's header copy control puts
+    /// on the clipboard. Carries the task's own fields (title, description, status, due, assignee,
+    /// subtasks) plus its ORG document refs.
+    ///
+    /// It deliberately does NOT carry `task_local_refs`. Those are this device's private links from
+    /// a task to a local board or note (`tasks_store` header: "`task_local_refs` never egresses"),
+    /// and MCP output reaches whatever model the user pointed at the server. Same gate and same
+    /// loopback-only placement as [`Self::ListTasks`].
+    GetTask { task_id: String },
     /// CONNECTOR — live WEB SEARCH ("research about the world"). This is the ONE [`ToolCall`] that can
     /// EGRESS: it reaches an external search service through the consent-gated, redacting connector
     /// framework ([`crate::connectors`]). It is NOT runnable through the synchronous [`execute_tool`]
@@ -1338,6 +1360,104 @@ pub fn execute_tool(
                         AppError::Storage(format!("knowledge diff note context failed: {e}"))
                     })?;
             Ok(format_knowledge_diff(entity, &kd, &note_context))
+        }
+        ToolCall::ListTasks => {
+            // GATED IN SQL: `list_org_tasks` JOINs `org_state` on `context_enabled = 1`, so a task
+            // in an org whose context toggle is off is excluded before any row reaches Rust. No
+            // folder-lock gate applies — org items live outside the per-folder seal domain by
+            // design (`storage/org_store.rs` header, spec §"Trust model").
+            let rows = db
+                .list_org_tasks(None)
+                .map_err(|e| AppError::Storage(format!("task list failed: {e}")))?;
+            if rows.is_empty() {
+                return Ok("No shared tasks. (Tasks live in an organization you have joined, with                            its context toggle on.)"
+                    .to_string());
+            }
+            let org_names: std::collections::HashMap<String, String> = db
+                .list_org_states()
+                .map_err(|e| AppError::Storage(format!("org list failed: {e}")))?
+                .into_iter()
+                .map(|o| (o.org_id, o.name))
+                .collect();
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                // A malformed envelope must not take the whole roster down: skip the row rather
+                // than turning one bad payload into "you have no tasks".
+                let Ok(envelope) =
+                    crate::share::task_envelope::TaskEnvelope::from_json(&row.envelope_json, &row.org_id)
+                else {
+                    continue;
+                };
+                out.push(format!(
+                    "- {} · id:{} · status:{} · due:{} · org:{}",
+                    envelope.title,
+                    row.id,
+                    envelope.status.as_str(),
+                    envelope.due_at.as_deref().unwrap_or("none"),
+                    org_names.get(&row.org_id).map_or("unknown", String::as_str),
+                ));
+            }
+            if out.is_empty() {
+                return Ok("No readable shared tasks.".to_string());
+            }
+            Ok(out.join("\n"))
+        }
+        ToolCall::GetTask { task_id } => {
+            // Same SQL gate as `ListTasks`. An id in a context-disabled org is byte-identical to an
+            // id that does not exist — the caller learns nothing either way.
+            let Some(row) = db
+                .get_org_task(task_id)
+                .map_err(|e| AppError::Storage(format!("task read failed: {e}")))?
+            else {
+                return Ok(format!("No task {task_id}."));
+            };
+            let envelope = crate::share::task_envelope::TaskEnvelope::from_json(
+                &row.envelope_json,
+                &row.org_id,
+            )?;
+            let org_name = db
+                .list_org_states()
+                .map_err(|e| AppError::Storage(format!("org list failed: {e}")))?
+                .into_iter()
+                .find(|o| o.org_id == row.org_id)
+                .map(|o| o.name)
+                .unwrap_or_else(|| "unknown".to_string());
+            let mut out = String::new();
+            out.push_str(&format!("TASK: {}\n", envelope.title));
+            out.push_str(&format!("id: {}\n", row.id));
+            out.push_str(&format!("status: {}\n", envelope.status.as_str()));
+            out.push_str(&format!(
+                "due: {}\n",
+                envelope.due_at.as_deref().unwrap_or("none")
+            ));
+            out.push_str(&format!("org: {org_name}\n"));
+            out.push_str(&format!("access: {}\n", row.access));
+            out.push_str(&format!("updated: {}\n", row.updated_at));
+            // The assignee is an opaque server user id; this device holds no member roster to turn
+            // it into a name, so it is reported as the id it is rather than guessed at.
+            if let Some(assignee) = envelope.assignee_user_id.as_deref() {
+                out.push_str(&format!("assigneeUserId: {assignee}\n"));
+            }
+            if !envelope.description.trim().is_empty() {
+                out.push_str(&format!("\nDESCRIPTION:\n{}\n", envelope.description.trim()));
+            }
+            if !envelope.subtasks.is_empty() {
+                out.push_str("\nSUBTASKS:\n");
+                for sub in &envelope.subtasks {
+                    out.push_str(&format!(
+                        "- [{}] {}\n",
+                        if sub.done { "x" } else { " " },
+                        sub.title
+                    ));
+                }
+            }
+            if !envelope.org_refs.is_empty() {
+                out.push_str("\nORG REFS (shared notes this task points at):\n");
+                for r in &envelope.org_refs {
+                    out.push_str(&format!("- doc:{}\n", r.doc_id));
+                }
+            }
+            Ok(out)
         }
         ToolCall::WebSearch { .. } => {
             // EGRESS GUARD: the synchronous, egress-free `execute_tool` is the MCP surface's only
@@ -3824,6 +3944,154 @@ mod tests {
     fn tmp_db() -> Db {
         let p = crate::storage::db::unique_temp_path("murmur-tools-web", "sqlite");
         Db::open_with_key(&p, TEST_DEK).unwrap()
+    }
+
+    /// Seed one org (with its context toggle) and one task inside it.
+    ///
+    /// Writes `org_tasks` directly rather than through `upsert_org_task_projection_tx`, which needs
+    /// a live feed transaction — the same shortcut `db_tests/tests.rs` takes for the bounded-list
+    /// test. What is under test here is the READ gate, not the projection writer.
+    fn seed_org_task(db: &Db, org_id: &str, task_id: &str, title: &str, context_enabled: bool) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.to_string(),
+            name: format!("Org {org_id}"),
+            role: "member".into(),
+            joined_at: "2026-08-21T09:00:00Z".into(),
+            consented: true,
+            last_seq: 1,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        if !context_enabled {
+            db.set_org_context_enabled(org_id, false).unwrap();
+        }
+        let envelope = crate::share::task_envelope::TaskEnvelope {
+            version: crate::share::task_envelope::TASK_ENVELOPE_VERSION,
+            org_id: org_id.to_string(),
+            title: title.to_string(),
+            description: "Body of the shared task.".into(),
+            status: crate::share::task_envelope::TaskStatus::InProgress,
+            due_at: Some("2026-09-01T09:00:00Z".into()),
+            assignee_user_id: None,
+            created_at: "2026-08-21T09:00:00Z".into(),
+            subtasks: vec![crate::share::task_envelope::TaskSubtask {
+                id: "44444444-4444-4444-8444-444444444444".into(),
+                title: "First step".into(),
+                done: false,
+            }],
+            org_refs: vec![],
+            images: vec![],
+        };
+        let json = envelope.to_canonical_json(org_id).unwrap();
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO org_tasks
+               (id,org_id,doc_id,item_id,source_document_id,envelope_json,status,due_at,
+                assignee_user_id,access,author_user_id,owner_user_id,rev,generation,seq,updated_at)
+             VALUES(?1,?2,?3,?4,NULL,?5,'inProgress','2026-09-01T09:00:00Z',NULL,'edit',
+                    'author','owner',1,1,1,'2026-08-21T09:00:00Z')",
+            rusqlite::params![
+                task_id,
+                org_id,
+                format!("doc-{task_id}"),
+                format!("item-{task_id}"),
+                json,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// The id the app's header copy control puts on the clipboard resolves over local MCP.
+    ///
+    /// Before `ListTasks`/`GetTask` existed the copy control on the Task header handed the user a
+    /// string no tool could accept — the one surface of four where "copy this id and ask Claude"
+    /// did not work.
+    #[test]
+    fn a_copied_task_id_resolves_through_get_task() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = std::collections::HashSet::new();
+        const ORG_A: &str = "11111111-1111-4111-8111-111111111111";
+        let task_a = format!("{ORG_A}:doc-1");
+        seed_org_task(&db, ORG_A, &task_a, "Finish onboarding", true);
+
+        let listed = execute_tool(&ToolCall::ListTasks, &db, &unlocked, &cfg).unwrap();
+        assert!(listed.contains("Finish onboarding"), "roster: {listed}");
+        assert!(listed.contains(&format!("id:{task_a}")), "roster: {listed}");
+        assert!(listed.contains("status:inProgress"), "roster: {listed}");
+
+        let one = execute_tool(
+            &ToolCall::GetTask {
+                task_id: task_a.clone(),
+            },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(one.contains("TASK: Finish onboarding"), "detail: {one}");
+        assert!(one.contains("Body of the shared task."), "detail: {one}");
+        assert!(one.contains("[ ] First step"), "detail: {one}");
+    }
+
+    /// THE LEAK ORACLE: a task in an org whose context toggle is OFF must be byte-identical to a
+    /// task that does not exist — no title, no id, no acknowledgement that it is there.
+    ///
+    /// `context_enabled` is the per-instance org gate every other org reader applies in SQL
+    /// (`get_org_item`, `search_org_chunks_*`). These two tools reach `list_org_tasks` /
+    /// `get_org_task`, which already JOIN it; this test is what keeps that true.
+    #[test]
+    fn a_context_disabled_org_discloses_no_task_over_mcp() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        let unlocked = std::collections::HashSet::new();
+        const ORG_OFF: &str = "22222222-2222-4222-8222-222222222222";
+        const ORG_ON: &str = "33333333-3333-4333-8333-333333333333";
+        let hidden_id = format!("{ORG_OFF}:doc-9");
+        let missing_id = format!("{ORG_OFF}:doc-does-not-exist");
+        seed_org_task(&db, ORG_OFF, &hidden_id, "Secret migration plan", false);
+        seed_org_task(&db, ORG_ON, &format!("{ORG_ON}:doc-1"), "Visible work", true);
+
+        let listed = execute_tool(&ToolCall::ListTasks, &db, &unlocked, &cfg).unwrap();
+        assert!(listed.contains("Visible work"), "roster: {listed}");
+        assert!(!listed.contains("Secret migration plan"), "roster leaked: {listed}");
+        assert!(!listed.contains(ORG_OFF), "roster leaked an id: {listed}");
+
+        let hidden = execute_tool(
+            &ToolCall::GetTask {
+                task_id: hidden_id.clone(),
+            },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        let absent = execute_tool(
+            &ToolCall::GetTask {
+                task_id: missing_id.clone(),
+            },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(!hidden.contains("Secret migration plan"), "detail leaked: {hidden}");
+        assert_eq!(
+            hidden.replace(&hidden_id, "X"),
+            absent.replace(&missing_id, "X"),
+            "a gated task must read exactly like a missing one"
+        );
+    }
+
+    /// The task tools stay OFF the model-facing catalog, like `KnowledgeDiff`. Org tasks are
+    /// colleagues' shared work; reaching a cloud-capable assistant scope must be a deliberate
+    /// decision, not a side-effect of adding an MCP tool.
+    #[test]
+    fn task_tools_are_absent_from_the_model_facing_tool_specs() {
+        let names: Vec<String> = tool_specs().into_iter().map(|s| s.name).collect();
+        assert!(!names.iter().any(|n| n == "list_tasks"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "get_task"), "{names:?}");
     }
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
