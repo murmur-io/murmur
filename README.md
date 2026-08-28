@@ -671,6 +671,7 @@ murmur/
 │  └─ src/           commands.rs · pipeline.rs · agent.rs · tools.rs · router.rs · embed/ · mcp.rs · crypto.rs ·
 │                      audio/ · transcribe/ · summarize/ · share/ · storage/ · secrets/ · export/
 └─ docs/            design notes, research, branding, screenshots
+                    (see docs/README.md — it says which of it is current)
 ```
 
 `../murmur-server/` (a sibling checkout, not part of this repo) holds the accounts + sharing backend —

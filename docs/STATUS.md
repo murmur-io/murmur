@@ -1,81 +1,66 @@
-# MeetNotes — Status
+# Murmur — status
 
-> Updated 2026-06-24. Authoritative current state. Honest by construction: every
-> "verified" claim below is backed by `bash scripts/ci.sh` passing on this machine.
+> **Updated 2026-08-28 · v2.0.0.**
+>
+> **The authoritative feature list is [`README.md` → Status](../README.md#%EF%B8%8F-status).** This
+> file exists because several agent prompts and the `research` skill point at it, and because it used
+> to be the single worst piece of documentation in the repo: until this rewrite it still said
+> *"MeetNotes — Status. Updated 2026-06-24 … Phase 0 (skeleton), Phase 1 (3 AI providers) … 34
+> tests"*, two months and a product rename out of date, while presenting itself as *"Authoritative
+> current state."* Several agent definitions had already learned to distrust it by name.
+>
+> So: **this file does not maintain a second copy of the feature list.** It answers the two questions
+> a status doc should answer and that the README deliberately does not — *how do I check?* and *what
+> can a headless machine not prove?*
 
-## TL;DR
-- **Implemented + verified (CI-green):** Phase 0 (skeleton), Phase 1 (3 AI providers,
-  SQLite, Keychain, Obsidian export), Phase 3 (Library + Detail UI), plus the headless
-  core pipeline E2E and the CI gate.
-- **One command proves it:** `bash scripts/ci.sh` → clippy (`-D warnings`) + cargo test
-  (31) + cargo build + `ng lint` + `ng build` + headless E2E, all green.
-- **Remaining for prod-ready (all require YOU / a real Mac — cannot be verified in a
-  headless build):** Phase 2 system-audio **runtime** verification (code is implemented +
-  compiles + typechecks; capturing live audio needs a desktop + the Screen Recording
-  permission), Apple code-signing + notarization, and a real GUI + microphone run.
+## How to check, rather than believe
 
-## Implemented & verified
-| Area | What | Verified by |
-|---|---|---|
-| Skeleton | Tauri (Rust core) + Angular (zoneless, signals) frontend | `cargo build`, `ng build` |
-| Capture | Mic via cpal → 16 kHz mono WAV; **system audio via ScreenCaptureKit Swift sidecar (opt-in)** | unit tests + swiftc typecheck (capture runtime: user-gated) |
-| Transcription | whisper.cpp (`whisper-rs`, Metal) | **headless E2E** (real audio→text) |
-| AI providers | `SummarizerProvider` trait + ClaudeCode (default) / Anthropic / Ollama | unit tests + **E2E** (ClaudeCode) |
-| Storage | SQLite (meetings/segments/notes/settings) | unit tests |
-| Secrets | Anthropic key in macOS Keychain | unit-level |
-| Export | Atomic `.md` write into the vault + vault auto-detect | unit tests + **E2E** |
-| Library/Detail | list meetings, view note + transcript, re-summarize | `ng build` + `ng lint` |
-| Release bundle | `scripts/release.sh`: builds .app + ad-hoc codesign+verify + functional .dmg (hdiutil) | **verified headless**; Developer-ID identity + notarization + *styled* DMG = account/GUI-gated |
-| Quality | clippy `-D warnings`, `ng lint`, 34 tests | `scripts/ci.sh` |
+Nothing here is worth trusting over the code. Three commands and one file:
 
-The headless E2E (`scripts/e2e-core.sh`) drives `say → ffmpeg → Whisper(base.en) →
-deterministic provider stub → Obsidian .md` and asserts a real note with front-matter — the core
-pipeline is proven end-to-end, minus the parts that need a desktop (below).
-
-## Remaining for prod-ready (user / runtime gated)
-1. **Phase 2 — system-audio capture** (the other side of a call). **Implemented:** a
-   Swift ScreenCaptureKit sidecar (`src-tauri/sysaudio/sysaudio.swift`, compiled by
-   `build.rs`, typechecked in CI) + `audio::system::SystemAudioRecorder` + a unit-tested
-   mic/system `mixer`, opt-in via the Settings "Capture system audio" toggle (default
-   off). The compile, typecheck, mixer tests, and the graceful no-permission exit are
-   verified. **Unverified (needs a real Mac):** capturing *live* system audio — that
-   requires a desktop session + the Screen Recording (TCC) permission + real audio.
-   Enable the toggle and confirm a mixed recording. Design notes: `docs/PHASE2-SYSTEM-AUDIO.md`.
-2. **Apple code-sign + notarize / styled DMG.** The release `.app` builds, **ad-hoc-signs,
-   and passes `codesign --verify --deep --strict`**, and a functional `.dmg` builds via
-   `hdiutil` — all headless (`scripts/release.sh`). What remains is account/GUI-gated: a
-   **Developer-ID identity** + **notarization** (paid Apple account; template in
-   `scripts/macos-sign-notarize.sh`) and Tauri's *styled* DMG layout (Finder/AppleScript).
-3. **Real GUI + mic run** (closes the last Phase-0 DoD item). See §Run below.
-
-## Toolchain (installed in this environment)
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-brew install cmake pkg-config           # whisper.cpp build deps
-cd /Users/jakubgawronski/Projects/meetnotes && npm install
+.agents/h/mirror-check                    # 0.02 s — the cheapest check in the repo, run it always
+( cd src-tauri && cargo test --lib )      # the Rust unit suite
+npx ng lint && npx ng build               # the frontend gates
+bash scripts/ci.sh                        # the full gate: clippy -D warnings + tests + lint + build + headless E2E
 ```
 
-## Verify (what's green here)
-```bash
-bash scripts/ci.sh          # the full gate
-bash scripts/e2e-core.sh    # just the headless core pipeline
-```
+GitHub Actions running `scripts/ci.sh` is the **only** merge authority. A claim that is not covered
+by one of those, or by a named oracle below, is a claim about intent.
 
-## Run the app (needs a desktop session — NOT verified headless)
-```bash
-npx tauri dev               # Angular dev server (:1420) + Tauri window
-```
-Then in **Settings**: set the Vault folder; install the checksum-pinned Whisper model once:
-```bash
-scripts/ensure-whisper-model.sh
-```
-Leave Provider = Claude Code (needs the `claude` CLI in PATH), or set an Anthropic key /
-run Ollama. Then **Record → speak → Stop** and confirm a note appears in the vault.
+Never pin a test count in documentation. The suite grows continuously, and every count written down
+here has been wrong within a fortnight — which is exactly how this file came to claim "34 tests".
 
-## Phase roadmap
-- **0/1/3 + hygiene** — done (this session).
-- **2** — system audio: **implemented + compile-verified**; live-capture runtime is user-gated.
-- **4** — signing/notarization (template ready), Tauri auto-updater (needs a signing
-  keypair + release endpoint), then later: hosted provider tier, OpenAI/Groq/Gemini,
-  diarization, live transcription, Windows (WASAPI loopback).
+## What a headless machine cannot prove
+
+These are real capabilities with real code behind them, and they still only *truly* verify on a
+Developer-ID-signed build on a physical Mac. They are listed as user/runtime-gated rather than
+claimed from unit tests:
+
+| Capability | Why it can't be proven in CI |
+| --- | --- |
+| Touch ID unlock, lock-at-rest | The Keychain's `SecAccessControl` user-presence prompt needs a signed binary with a stable signature and a real GUI session. Debug builds can bypass it with the `MURMUR_DEV_KEK` hatch — convenient for iteration, not a security guarantee. |
+| System-audio capture | A Core Audio process tap (macOS 14.4+) or the ScreenCaptureKit sidecar needs the Screen Recording permission and a desktop session. The graceful no-permission degrade IS unit-tested; the capture itself is not. |
+| Screen-share auto-relock | Requires an actual screen-sharing session to detect. |
+| Notarization + Gatekeeper | Needs the Apple account and the notary service. |
+| A two-account Shared Brain round-trip | Validated manually per release; there is no automated headless test that runs two signed clients against the server. |
+| Packaged-WebKit rendering | `ng serve` sends no `Content-Security-Policy` header at all, which is the only reason the 0.5.0 style-loss bug never reproduced in development. `e2e/render/csp-style-src.spec.ts` now supplies the header and reproduces it in both engines; `scripts/wkwebview-probe` executes JS inside the real shipping engine when a UI failure will not reproduce in Playwright. |
+
+## The oracles
+
+A bug class that reached a user is not closed until a deterministic check for it exists. The shipped
+classes and the check that owns each:
+
+| Bug class | Oracle |
+| --- | --- |
+| Seal destroys content | `src-tauri/src/storage/db_tests/lock_tests.rs::seal_transcript_timeline_round_trips_byte_identical` |
+| Sealed content leaks through a read path | `src-tauri/src/commands/tests/lock_read_gate_tests.rs` |
+| macOS FFI abort at launch | `scripts/harness-runtime-smoke.py` |
+| Packaged-WebKit CSP style loss | `e2e/render/csp-style-src.spec.ts` (with a control that asserts the blocking really happens, so the guard cannot go vacuous) |
+| An IPC DTO serialized in snake_case against a camelCase frontend | `src-tauri/src/commands/tests/dashboard_cmd_tests.rs` — the camelCase wire oracle |
+| Developer vocabulary reaching a user-visible string | `scripts/check-vocabulary.mjs` |
+| A product screenshot carrying real data | the privacy gate in `scripts/screenshots/capture.mjs`, which refuses the shot rather than writing it |
+
+## Related documents
+
+`docs/` mixes current reference with historical planning notes. See [`docs/README.md`](README.md) for
+which is which before citing any of it.
