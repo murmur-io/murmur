@@ -42,17 +42,23 @@
 
   // ── The demo world ────────────────────────────────────────────────────────
   const VAULT = "/Users/demo/Obsidian/Sonora";
+  // Injected by capture.mjs from package.json; the literal is only a fallback for
+  // a manual page load.
+  const VERSION = (typeof window !== "undefined" && window.__demoVersion) || "2.0.0";
   const DEMO_MEETING_ID = "m-atlas-roadmap";
 
   // Deterministic-ish recent timestamps anchored to a fixed day (browser Date is
   // fine here — this runs in the page, not the workflow sandbox).
-  const ANCHOR = new Date("2026-07-02T15:00:00");
+  const ANCHOR = new Date("2026-08-26T15:00:00");
   const daysAgo = (d, h = 10, m = 0) => {
     const t = new Date(ANCHOR);
     t.setDate(t.getDate() - d);
     t.setHours(h, m, 0, 0);
     return t.toISOString();
   };
+
+  /** A plain calendar day — the shape `find_date` produces for an action item. */
+  const ymd = (d) => daysAgo(d).slice(0, 10);
 
   const FOLDERS = [
     {
@@ -155,32 +161,47 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
   });
 
   // Merged Me / Others transcript for the flagship meeting.
+  // The demo meeting is 47 minutes long (`durationS: 2820`), so segment and
+  // timeline times must be spread across it. They used to sit inside the first
+  // 60 seconds, which rendered the timeline bands as an invisible sliver at the
+  // far left — the shot looked like the feature was broken.
   const SEGMENTS = [
-    { idx: 0, startS: 0, endS: 6, speaker: "me", text: "Okay, let's lock the Q2 roadmap. Three things: Atlas GA, the mobile redesign, and the Sales Engine pilot." },
-    { idx: 1, startS: 6, endS: 14, speaker: "others", text: "On Atlas — the Windows loopback spike is the last blocker. We were waiting on the shared sync layer." },
-    { idx: 2, startS: 14, endS: 20, speaker: "me", text: "Is that dependency still in the way? I thought Priya's team landed it last sprint." },
-    { idx: 3, startS: 20, endS: 29, speaker: "others", text: "They did — it merged Thursday. So the loopback work is unblocked. I can commit to a May 30 GA if nothing else moves." },
-    { idx: 4, startS: 29, endS: 36, speaker: "me", text: "Good. Let's write that down as a decision. Marcus owns the GA checklist." },
-    { idx: 5, startS: 36, endS: 45, speaker: "others", text: "On the redesign, I want to cut scope. Onboarding, search, and the note detail view. Everything else waits." },
-    { idx: 6, startS: 45, endS: 52, speaker: "me", text: "Agreed. Let's not gold-plate it. Anya, can you get onboarding mocks by Friday?" },
-    { idx: 7, startS: 52, endS: 60, speaker: "others", text: "Friday works. I'll share the trimmed flow first so we're aligned before I go high-fidelity." },
+    { idx: 0, startS: 12, endS: 21, speaker: "me", text: "Okay, let's lock the Q2 roadmap. Three things: Atlas GA, the mobile redesign, and the Sales Engine pilot." },
+    { idx: 1, startS: 21, endS: 34, speaker: "others", text: "On Atlas — the Windows loopback spike is the last blocker. We were waiting on the shared sync layer." },
+    { idx: 2, startS: 214, endS: 231, speaker: "others", text: "That dependency is gone. Priya's team merged the sync-layer rewrite on Thursday, so the loopback work is unblocked." },
+    { idx: 3, startS: 231, endS: 244, speaker: "me", text: "Then let's write it down as a decision. Atlas ships to GA on May 30 and Marcus owns the release checklist." },
+    { idx: 4, startS: 612, endS: 627, speaker: "me", text: "On the redesign — I want to cut scope. Onboarding, search, and the note detail view. Everything else waits." },
+    { idx: 5, startS: 638, endS: 659, speaker: "others", text: "Agreed, let's not gold-plate it. I'll share the trimmed flow before I go high-fidelity, so we're aligned first." },
+    { idx: 6, startS: 1102, endS: 1126, speaker: "others", text: "For the Sales Engine pilot we have two design partners in the pipeline, but only one has actually signed." },
+    { idx: 7, startS: 1126, endS: 1141, speaker: "me", text: "Devon, can you confirm the second one this week? The Aug 15 commitment assumes both." },
+    { idx: 8, startS: 1744, endS: 1771, speaker: "others", text: "The activation funnel data is in — p95 sync latency is down to 168 milliseconds, and activation is up eleven percent." },
+    { idx: 9, startS: 1771, endS: 1783, speaker: "me", text: "That's comfortably under the 180 target. Good. Let's put it in the GA brief." },
+    { idx: 10, startS: 2208, endS: 2227, speaker: "others", text: "One risk: if Windows loopback slips, do we cut the platform from GA or move the date?" },
+    { idx: 11, startS: 2227, endS: 2246, speaker: "me", text: "We cut the platform. The date is the commitment we made to the partners; the platform isn't." },
+    { idx: 12, startS: 2640, endS: 2661, speaker: "others", text: "Then I'll circulate the trimmed roadmap deck, and Sarah takes the migration plan to the partners." },
+    { idx: 13, startS: 2661, endS: 2680, speaker: "me", text: "Perfect. Same time next week, and we do a go/no-go two days before the cut." },
   ];
 
   const TIMELINE = {
     speakers: [
-      { speaker: "Sarah", startS: 0, endS: 6 },
-      { speaker: "Marcus", startS: 6, endS: 14 },
-      { speaker: "Sarah", startS: 14, endS: 20 },
-      { speaker: "Marcus", startS: 20, endS: 29 },
-      { speaker: "Sarah", startS: 29, endS: 36 },
-      { speaker: "Marcus", startS: 36, endS: 45 },
-      { speaker: "Sarah", startS: 45, endS: 52 },
-      { speaker: "Anya", startS: 52, endS: 60 },
+      { speaker: "Sarah", startS: 0, endS: 210 },
+      { speaker: "Marcus", startS: 210, endS: 430 },
+      { speaker: "Sarah", startS: 430, endS: 640 },
+      { speaker: "Anya", startS: 640, endS: 980 },
+      { speaker: "Marcus", startS: 980, endS: 1240 },
+      { speaker: "Devon", startS: 1240, endS: 1520 },
+      { speaker: "Sarah", startS: 1520, endS: 1800 },
+      { speaker: "Marcus", startS: 1800, endS: 2200 },
+      { speaker: "Sarah", startS: 2200, endS: 2520 },
+      { speaker: "Marcus", startS: 2520, endS: 2820 },
     ],
     topics: [
-      { label: "Project Atlas — GA", startS: 0, endS: 35 },
-      { label: "Mobile redesign scope", startS: 35, endS: 52 },
-      { label: "Onboarding mocks", startS: 52, endS: 60 },
+      { label: "Project Atlas — GA date", startS: 0, endS: 520 },
+      { label: "Mobile redesign scope", startS: 520, endS: 1020 },
+      { label: "Sales Engine — design partners", startS: 1020, endS: 1560 },
+      { label: "Activation funnel data", startS: 1560, endS: 2080 },
+      { label: "Open risks", startS: 2080, endS: 2520 },
+      { label: "Next steps", startS: 2520, endS: 2820 },
     ],
   };
 
@@ -418,6 +439,16 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
     const chars = Array.from(normalized);
     return chars.length > 56 ? `${chars.slice(0, 56).join("").trimEnd()}…` : chars.join("");
   };
+  /** `VaultSource[]` — the grounding the assistant answer renders as chips. */
+  const ASK_SOURCES = [
+    { meetingId: DEMO_MEETING_ID, title: "Q2 Roadmap Planning", startedAt: daysAgo(0), origin: null },
+    { meetingId: "m-atlas-kickoff", title: "Project Atlas — Kickoff", startedAt: daysAgo(3), origin: null },
+    { meetingId: "m-data-review", title: "Data Review — Activation Funnel", startedAt: daysAgo(9), origin: null },
+    { meetingId: "m-eng-sync", title: "Eng Sync — Sales Engine", startedAt: daysAgo(1), origin: null },
+  ];
+
+  const ASK_CITATIONS = ["[[Q2 Roadmap Planning]]", "[[Project Atlas — Kickoff]]"];
+
   const sendPersistedAsk = (scope, args, answer = ASK_ANSWER) => {
     const now = new Date().toISOString();
     const id = args.conversationId || crypto.randomUUID();
@@ -457,8 +488,8 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
         ordinal: ordinal + 1,
         role: "assistant",
         content: answer,
-        sources: [],
-        citations: [],
+        sources: RICH() ? ASK_SOURCES : [],
+        citations: RICH() ? ASK_CITATIONS : [],
         createdAt: now,
       },
     );
@@ -468,8 +499,8 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
       userMessageId,
       assistantMessageId,
       answer,
-      sources: [],
-      citations: [],
+      sources: RICH() ? ASK_SOURCES : [],
+      citations: RICH() ? ASK_CITATIONS : [],
     };
   };
 
@@ -506,9 +537,9 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
   }
 
   const ACTION_ITEMS = [
-    { idx: 0, done: false, text: "Circulate the trimmed roadmap deck", owner: "Sarah", dueDate: daysAgo(-2, 17, 0) },
+    { idx: 0, done: false, text: "Circulate the trimmed roadmap deck", owner: "Sarah", dueDate: ymd(-2) },
     { idx: 1, done: false, text: "Finalize the Atlas GA release checklist", owner: "Marcus", dueDate: null },
-    { idx: 2, done: true, text: "Deliver the mobile onboarding mocks", owner: "Anya", dueDate: daysAgo(-1, 17, 0) },
+    { idx: 2, done: true, text: "Deliver the mobile onboarding mocks", owner: "Anya", dueDate: ymd(-1) },
     { idx: 3, done: false, text: "Schedule the Acme pilot kickoff", owner: "Devon", dueDate: null },
   ];
 
@@ -582,6 +613,16 @@ scope to the GA-critical path only.
     },
   ];
 
+  const COMPANION_NOTE_ID = "n-companion-atlas";
+  const COMPANION_MD = `Kickoff ran long — good energy on the GA date.
+
+- Sync-layer dependency is gone → Atlas unblocked for GA
+- Ship the three flows people actually use; the rest waits for Q4
+- Marcus: Windows loopback is the last blocker
+
+> Ask Brain: what did we promise Acme on the renewal call?
+`;
+
   function noteDocFor(id) {
     const summary = NOTES.find((n) => n.id === id);
     if (id === DEMO_NOTE_ID) {
@@ -595,6 +636,21 @@ scope to the GA-critical path only.
         updatedAt: summary ? summary.updatedAt : ANCHOR.getTime(),
         createdAt: summary ? summary.createdAt : ANCHOR.getTime(),
         exportedPath: `${VAULT}/Notes/Product/Atlas-PRD-v3.md`,
+        locked: false,
+        shared: false,
+      };
+    }
+    if (id === COMPANION_NOTE_ID) {
+      return {
+        id,
+        title: "Q2 Roadmap Planning — notes",
+        folderId: "f-atlas",
+        markdown: COMPANION_MD,
+        tags: [],
+        properties: {},
+        updatedAt: ANCHOR.getTime(),
+        createdAt: ANCHOR.getTime(),
+        exportedPath: null,
         locked: false,
         shared: false,
       };
@@ -676,15 +732,743 @@ scope to the GA-critical path only.
     ],
   };
 
+  /*
+   * SHARED FIXTURE WARNING.
+   *
+   * This file is not private to the screenshot harness. `e2e/settings-ai/mock-invoke.ts`
+   * loads it as the BASE layer for the whole Playwright suite (~450 tests), and each spec
+   * then overrides only the commands it asserts on. So adding data to a command that used
+   * to fall through to the benign `[]` default silently changes the world every one of
+   * those tests boots into.
+   *
+   * That is not hypothetical: giving `list_dashboards` three boards put a board at the top
+   * of every `mur-source-picker`, and four `e2e/ask` specs that click ".sp-row first" and
+   * expect a MEETING went red.
+   *
+   * So the aggregate 2.0 lists that the screenshots need are OPT-IN. `capture.mjs` sets
+   * `window.__demoRich`; without it these commands return exactly what they returned
+   * before, and the e2e baseline is unchanged. Per-surface data that no spec could have
+   * depended on (there was nothing there to depend on) stays unconditional.
+   */
+  const RICH = () => typeof window !== "undefined" && !!window.__demoRich;
+
+  // ── 2.0 surfaces: Spaces, boards, tasks, reminders, people, receipts ───────
+  //
+  // Shapes here are taken from the RUST DTOs, not invented: `ContainerNode` /
+  // `TypeGroup` / `ItemRow` (storage/models.rs), `TileData` (commands/dashboards.rs),
+  // `OrgTask` / `RemindersSnapshot` / `PeopleList` (core/models.ts mirrors). A
+  // hand-written mock DEFINES a contract rather than verifying one (angular-zoneless
+  // T6), so the only defence against drift is copying the producer's field names —
+  // camelCase on the wire, `snake_case` nowhere.
+
+  const ms = (d, h = 10, m = 0) => new Date(daysAgo(d, h, m)).getTime();
+
+  /** One `ItemRow`. `durationS` is meetings-only; every other kind sends null. */
+  const IR = (kind, id, title, day, durationS = null) => ({
+    kind,
+    id,
+    title,
+    durationS,
+    sortAt: ms(day, 9 + (day % 6), (day * 7) % 60),
+  });
+
+  const G = (kind, total, items) => ({ kind, total, items });
+
+  // Every container's FULL contents, keyed by container id then kind. The tree's
+  // type groups are DERIVED from this the way the reader derives them — the newest
+  // few plus the true total — so the sidebar preview and the container page can
+  // never disagree, which is exactly the drift a hand-written mock invites.
+  const CONTAINER_ITEMS = {
+    // containerId `null` is the UNFILED inbox — recordings that belong to no
+    // lockable container yet. It renders as the first section of the Spaces tree,
+    // above "File recordings with Brain", which is what that button acts on.
+    unfiled: {
+      meeting: [
+        IR("meeting", "m-unfiled-standup", "Monday standup", 0, 900),
+        IR("meeting", "m-unfiled-call", "Intro call — Redwood Labs", 1, 1620),
+        IR("meeting", "m-unfiled-1on1", "1:1 — Priya", 2, 1380),
+      ],
+    },
+    "f-product": {
+      meeting: [
+        IR("meeting", "m-all-hands", "Weekly All-Hands", 7, 2040),
+        IR("meeting", "m-pricing", "Pricing Workshop", 11, 2400),
+        IR("meeting", "m-1on1", "1:1 — Sarah & Marcus", 4, 1260),
+        IR("meeting", "m-support", "Support Escalation — Acme", 13, 900),
+      ],
+      dashboard: [IR("dashboard", "d-atlas", "Atlas — GA readiness", 0)],
+    },
+    "f-atlas": {
+      meeting: [
+        IR("meeting", DEMO_MEETING_ID, "Q2 Roadmap Planning", 0, 2820),
+        IR("meeting", "m-atlas-kickoff", "Project Atlas — Kickoff", 3, 2460),
+        IR("meeting", "m-atlas-ga-review", "Atlas — GA go/no-go", 2, 1680),
+        IR("meeting", "m-atlas-partners", "Design partners — intro call", 5, 1980),
+        IR("meeting", "m-atlas-sync", "Atlas — weekly sync", 8, 1500),
+        IR("meeting", "m-atlas-scope", "Atlas — scope cut", 12, 2160),
+      ],
+      note: [
+        IR("note", DEMO_NOTE_ID, "Atlas — PRD v3", 1),
+        IR("note", "n-atlas-ga", "Atlas GA — release checklist", 2),
+        IR("note", "n-atlas-risks", "Atlas — open risks", 4),
+      ],
+    },
+    "f-mobile": {
+      meeting: [
+        IR("meeting", "m-design-review", "Design Review — Mobile Redesign", 1, 2280),
+        IR("meeting", "m-mobile-scope", "Mobile — top three flows", 6, 1740),
+        IR("meeting", "m-mobile-q4", "Mobile — deferred to Q4", 14, 1320),
+      ],
+      note: [IR("note", "n-mobile-flows", "Mobile — flow inventory", 3)],
+    },
+    "f-eng": {
+      meeting: [
+        IR("meeting", "m-eng-sync", "Eng Sync — Sales Engine", 1, 1560),
+        IR("meeting", "m-retro", "Sprint 24 Retro", 5, 1980),
+        IR("meeting", "m-data-review", "Data Review — Activation Funnel", 9, 1740),
+        IR("meeting", "m-eng-oncall", "On-call handover", 10, 720),
+      ],
+      note: [
+        IR("note", "n-sync-latency", "Sync-layer latency — findings", 2),
+        IR("note", "n-eng-runbook", "Release runbook", 7),
+      ],
+    },
+    "f-clients": {
+      meeting: [
+        IR("meeting", "m-acme", "Customer Call — Acme Corp", 2, 3120),
+        IR("meeting", "m-northwind", "Discovery — Northwind", 6, 2760),
+        IR("meeting", "m-acme-renewal", "Acme — renewal review", 4, 1860),
+      ],
+      task: [
+        IR("task", "t-acme-redlines", "Acme — return contract redlines", 1),
+        IR("task", "t-northwind-followup", "Northwind — send the pilot brief", 3),
+      ],
+    },
+  };
+
+  /** The reader's group shape: the newest few, plus the container's true total. */
+  const groupsFor = (id) => {
+    const byKind = CONTAINER_ITEMS[id] || {};
+    // ItemKind::ORDER — a fixed presentation order; an EMPTY group is ABSENT.
+    return ["meeting", "note", "task", "dashboard"]
+      .filter((k) => (byKind[k] || []).length)
+      .map((k) => G(k, byKind[k].length, byKind[k].slice(0, 3)));
+  };
+
+  const CN = (id, name, level, extra = {}) => ({
+    id,
+    name,
+    kind: "meeting",
+    level,
+    emoji: null,
+    tint: null,
+    locked: false,
+    unlocked: false,
+    isRoot: false,
+    folders: [],
+    groups: groupsFor(id),
+    ...extra,
+  });
+
+  // The Spaces tree: Spaces (projects) › folders › items, exactly what
+  // `list_workspace_tree` returns. "Personal" is SEALED and not session-unlocked,
+  // so it carries NO groups at all — not even totals. That is the lock model on
+  // screen, and it is why a marketing shot of the sidebar is honest.
+  const WORKSPACE_TREE = [
+    CN("f-product", "Product", "project", {
+      folders: [CN("f-atlas", "Project Atlas", "folder"), CN("f-mobile", "Mobile Redesign", "folder")],
+    }),
+    CN("f-eng", "Engineering", "project"),
+    CN("f-clients", "Clients", "project"),
+    CN("f-personal", "Personal", "project", { locked: true, groups: [] }),
+  ];
+
+  /** Flat index so `get_container` and the item pager can answer by id. */
+  const CONTAINERS_BY_ID = new Map();
+  (function indexContainers(nodes, parent) {
+    for (const n of nodes) {
+      CONTAINERS_BY_ID.set(n.id, {
+        node: n,
+        parentId: parent ? parent.id : null,
+        parentName: parent ? parent.name : null,
+      });
+      indexContainers(n.folders || [], n);
+    }
+  })(WORKSPACE_TREE, null);
+
+  const containerDto = (id) => {
+    const hit = CONTAINERS_BY_ID.get(id);
+    if (!hit) return null;
+    const { node, parentId, parentName } = hit;
+    return {
+      id: node.id,
+      name: node.name,
+      level: node.level,
+      emoji: node.emoji,
+      tint: node.tint,
+      locked: node.locked,
+      unlocked: node.unlocked,
+      isRoot: node.isRoot,
+      parentId,
+      parentName,
+    };
+  };
+
+  // ── Boards ────────────────────────────────────────────────────────────────
+  const TILE_ROW = (text, meta, status = null) => ({ text, meta, status, source: null });
+
+  const BOARD_TILES = [
+    {
+      id: "tl-answer",
+      dashboardId: "d-atlas",
+      kind: "living_answer",
+      refId: null,
+      title: "What still blocks the Atlas GA cut?",
+      span: 2,
+      position: 0,
+      config: null,
+      createdAt: daysAgo(6),
+      data: {
+        kind: "livingAnswer",
+        question: "What still blocks the Atlas GA cut?",
+        answer:
+          "One blocker is open: Windows loopback capture, owned by Marcus. The shared sync-layer dependency that deferred GA twice was removed on the 24th, and the design-partner track is committed for Aug 15.",
+        answeredAt: daysAgo(0, 8, 40),
+        withheld: false,
+      },
+    },
+    {
+      id: "tl-promises",
+      dashboardId: "d-atlas",
+      kind: "promises",
+      refId: null,
+      title: null,
+      span: 1,
+      position: 1,
+      config: null,
+      createdAt: daysAgo(6),
+      data: {
+        kind: "promises",
+        owner: null,
+        rows: [
+          TILE_ROW("Marcus — close the Windows loopback spike", "Marcus Reid · due Sep 2", "open"),
+          TILE_ROW("Sarah — circulate the migration plan", "Sarah Chen · due Aug 29", "open"),
+          TILE_ROW("Priya — sign off on the GA checklist", "Priya Nair · due Sep 4", "open"),
+          TILE_ROW("Devon — confirm the second design partner", "Devon Blake", "late"),
+        ],
+      },
+    },
+    {
+      id: "tl-meeting",
+      dashboardId: "d-atlas",
+      kind: "meeting",
+      refId: DEMO_MEETING_ID,
+      title: null,
+      span: 1,
+      position: 2,
+      config: null,
+      createdAt: daysAgo(5),
+      data: {
+        kind: "meeting",
+        id: DEMO_MEETING_ID,
+        title: "Q2 Roadmap Planning",
+        startedAt: daysAgo(0, 9, 0),
+        durationS: 2820,
+        hasAudio: true,
+      },
+    },
+    {
+      id: "tl-note",
+      dashboardId: "d-atlas",
+      kind: "note",
+      refId: DEMO_NOTE_ID,
+      title: null,
+      span: 1,
+      position: 3,
+      config: null,
+      createdAt: daysAgo(5),
+      data: {
+        kind: "note",
+        id: DEMO_NOTE_ID,
+        title: "Atlas — PRD v3",
+        snippet:
+          "Atlas removes the shared sync layer. Success is p95 under 180 ms on the activation path, measured on the funnel we reviewed on the 19th.",
+        updatedAt: ms(1, 16, 20),
+      },
+    },
+    {
+      id: "tl-person",
+      dashboardId: "d-atlas",
+      kind: "person",
+      refId: "p-marcus",
+      title: null,
+      span: 1,
+      position: 4,
+      config: null,
+      createdAt: daysAgo(4),
+      data: { kind: "person", id: "p-marcus", name: "Marcus Reid", mentionCount: 28, openCommitments: 2 },
+    },
+    {
+      id: "tl-pulse",
+      dashboardId: "d-atlas",
+      kind: "pulse",
+      refId: "pr-atlas",
+      title: null,
+      span: 1,
+      position: 5,
+      config: null,
+      createdAt: daysAgo(4),
+      data: { kind: "pulse", entity: "Project Atlas", weekly: [2, 3, 1, 4, 3, 5, 4, 6], total: 34, quietDays: null },
+    },
+    {
+      id: "tl-numbers",
+      dashboardId: "d-atlas",
+      kind: "numbers",
+      refId: "pr-atlas",
+      title: null,
+      span: 1,
+      position: 6,
+      config: null,
+      createdAt: daysAgo(3),
+      data: {
+        kind: "numbers",
+        entity: "Project Atlas",
+        rows: [
+          TILE_ROW("p95 sync latency — 168 ms", "Data Review, Aug 19"),
+          TILE_ROW("Design partners committed — 2", "Pricing Workshop, Aug 15"),
+          TILE_ROW("Activation lift — 11%", "Data Review, Aug 19"),
+        ],
+      },
+    },
+    {
+      id: "tl-reminders",
+      dashboardId: "d-atlas",
+      kind: "reminders",
+      refId: null,
+      title: null,
+      span: 1,
+      position: 7,
+      config: null,
+      createdAt: daysAgo(3),
+      data: {
+        kind: "reminders",
+        dueCount: 2,
+        rows: [
+          TILE_ROW("Send Acme the redlined contract", "due today"),
+          TILE_ROW("Book the GA go/no-go review", "due tomorrow"),
+        ],
+      },
+    },
+  ];
+
+  const BOARDS = [
+    {
+      id: "d-atlas",
+      title: "Atlas — GA readiness",
+      emoji: null,
+      tint: "indigo",
+      pinned: true,
+      position: 0,
+      createdAt: daysAgo(21),
+      updatedAt: daysAgo(0, 8, 40),
+      tileCount: BOARD_TILES.length,
+      tileKinds: BOARD_TILES.map((t) => ({ kind: t.kind, span: t.span })),
+    },
+    {
+      id: "d-clients",
+      title: "Client pipeline",
+      emoji: null,
+      tint: "azure",
+      pinned: false,
+      position: 1,
+      createdAt: daysAgo(30),
+      updatedAt: daysAgo(2, 11, 10),
+      tileCount: 4,
+      tileKinds: [
+        { kind: "promises", span: 1 },
+        { kind: "meeting", span: 1 },
+        { kind: "person", span: 1 },
+        { kind: "numbers", span: 1 },
+      ],
+    },
+    {
+      id: "d-weekly",
+      title: "This week",
+      emoji: null,
+      tint: "mint",
+      pinned: false,
+      position: 2,
+      createdAt: daysAgo(45),
+      updatedAt: daysAgo(1, 9, 5),
+      tileCount: 3,
+      tileKinds: [
+        { kind: "reminders", span: 1 },
+        { kind: "pulse", span: 1 },
+        { kind: "living_answer", span: 2 },
+      ],
+    },
+  ];
+
+  // ── Tasks (org-owned, E2EE) ───────────────────────────────────────────────
+  const TASKS = [
+    {
+      id: "t-acme-redlines",
+      docId: "doc-t1",
+      itemId: "item-t1",
+      sourceDocumentId: null,
+      version: 3,
+      createdAt: daysAgo(4),
+      updatedAt: daysAgo(0, 9, 20),
+      canEdit: true,
+      canManage: true,
+      localRefs: [{ kind: "meeting", refId: "m-acme" }],
+      orgId: "org-sonora",
+      title: "Acme — return contract redlines",
+      description: "Legal flagged the liability cap in §7. Turn it around before the renewal call.",
+      status: "inProgress",
+      dueAt: daysAgo(-2, 17, 0),
+      assigneeUserId: "u-devon",
+      subtasks: [
+        { id: "s1", title: "Collect legal's comments", done: true },
+        { id: "s2", title: "Redline §7 liability cap", done: true },
+        { id: "s3", title: "Send back to Acme", done: false },
+      ],
+      orgRefs: [],
+      images: [],
+      access: "edit",
+    },
+    {
+      id: "t-loopback",
+      docId: "doc-t2",
+      itemId: "item-t2",
+      sourceDocumentId: null,
+      version: 2,
+      createdAt: daysAgo(6),
+      updatedAt: daysAgo(1, 14, 0),
+      canEdit: true,
+      canManage: true,
+      localRefs: [{ kind: "meeting", refId: DEMO_MEETING_ID }],
+      orgId: "org-sonora",
+      title: "Close the Windows loopback spike",
+      description: "Last blocker on the Atlas GA cut. Decide capture path or cut the platform from GA.",
+      status: "todo",
+      dueAt: daysAgo(-5, 17, 0),
+      assigneeUserId: "u-marcus",
+      subtasks: [{ id: "s1", title: "Benchmark WASAPI loopback", done: false }],
+      orgRefs: [],
+      images: [],
+      access: "edit",
+    },
+    {
+      id: "t-migration",
+      docId: "doc-t3",
+      itemId: "item-t3",
+      sourceDocumentId: null,
+      version: 5,
+      createdAt: daysAgo(9),
+      updatedAt: daysAgo(2, 10, 30),
+      canEdit: true,
+      canManage: false,
+      localRefs: [{ kind: "note", refId: DEMO_NOTE_ID }],
+      orgId: "org-sonora",
+      title: "Circulate the Atlas migration plan",
+      description: "One page, for the design partners. Sarah owns it.",
+      status: "done",
+      dueAt: daysAgo(1, 17, 0),
+      assigneeUserId: "u-sarah",
+      subtasks: [],
+      orgRefs: [],
+      images: [],
+      access: "view",
+    },
+  ];
+
+  // ── Reminders ─────────────────────────────────────────────────────────────
+  const REM = (id, title, details, day, hour, state, origin, sources) => ({
+    id,
+    title,
+    details,
+    dueAt: ms(day, hour, 0),
+    repeatEvery: null,
+    repeatUnit: null,
+    state,
+    origin,
+    createdAt: ms(day + 5, 10, 0),
+    updatedAt: ms(day + 1, 10, 0),
+    completedAt: state === "completed" ? ms(day + 1, 12, 0) : null,
+    sources,
+  });
+
+  const REMINDERS = {
+    dueInboxCount: 2,
+    inbox: [
+      {
+        occurrenceId: "occ-1",
+        dueAt: ms(0, 9, 0),
+        reminder: REM("r-acme", "Send Acme the redlined contract", "Agreed on the call — before the renewal review.", 0, 9, "active", "smart", [
+          { kind: "meeting", id: "m-acme", title: "Customer Call — Acme Corp" },
+        ]),
+      },
+      {
+        occurrenceId: "occ-2",
+        dueAt: ms(0, 14, 30),
+        reminder: REM("r-gonogo", "Book the GA go/no-go review", null, 0, 14, "active", "manual", [
+          { kind: "meeting", id: DEMO_MEETING_ID, title: "Q2 Roadmap Planning" },
+        ]),
+      },
+    ],
+    upcoming: [
+      REM("r-partner", "Confirm the second design partner", "Devon was chasing two — only one signed.", -2, 11, "active", "smart", [
+        { kind: "meeting", id: "m-northwind", title: "Discovery — Northwind" },
+      ]),
+      REM("r-migration", "Follow up on the migration plan", null, -4, 10, "active", "manual", [
+        { kind: "note", id: DEMO_NOTE_ID, title: "Atlas — PRD v3" },
+      ]),
+    ],
+    completed: [
+      REM("r-retro", "Share the Sprint 24 retro actions", null, 3, 16, "completed", "smart", [
+        { kind: "meeting", id: "m-retro", title: "Sprint 24 Retro" },
+      ]),
+    ],
+  };
+
+  // ── People ────────────────────────────────────────────────────────────────
+  const PEOPLE = {
+    totalVisiblePeople: 5,
+    people: [
+      { id: "p-sarah", name: "Sarah Chen", meetingCount: 31, lastTalked: daysAgo(0, 9, 0), openCommitmentCount: 1, currentFactCount: 7 },
+      { id: "p-marcus", name: "Marcus Reid", meetingCount: 28, lastTalked: daysAgo(0, 9, 0), openCommitmentCount: 2, currentFactCount: 9 },
+      { id: "p-anya", name: "Anya Petrov", meetingCount: 19, lastTalked: daysAgo(1, 13, 0), openCommitmentCount: 0, currentFactCount: 4 },
+      { id: "p-devon", name: "Devon Blake", meetingCount: 15, lastTalked: daysAgo(2, 10, 0), openCommitmentCount: 1, currentFactCount: 5 },
+      { id: "p-priya", name: "Priya Nair", meetingCount: 12, lastTalked: daysAgo(5, 15, 0), openCommitmentCount: 1, currentFactCount: 3 },
+    ],
+  };
+
+  // ── Full brain graph ──────────────────────────────────────────────────────
+  // `FullGraphData` — every kind of node in one map (entities, meetings, notes,
+  // documents) with typed edges. Built from the existing demo world so the map
+  // and the rest of the shots describe the same vault.
+  const FG_NODE = (id, kind, label, degree, date = null) => ({ id, kind, label, date, degree });
+  const FG_EDGE = (src, dst, srcKind, dstKind, kind, score = 0.8, status = "active") => ({
+    src, dst, srcKind, dstKind, kind, score, status,
+  });
+
+  const FULL_GRAPH = (() => {
+    const nodes = [
+      FG_NODE("p-sarah", "entity", "Sarah Chen", 9),
+      FG_NODE("p-marcus", "entity", "Marcus Reid", 8),
+      FG_NODE("p-anya", "entity", "Anya Petrov", 5),
+      FG_NODE("p-devon", "entity", "Devon Blake", 5),
+      FG_NODE("p-priya", "entity", "Priya Nair", 4),
+      FG_NODE("pr-atlas", "entity", "Project Atlas", 10),
+      FG_NODE("pr-sales", "entity", "Sales Engine", 6),
+      FG_NODE("pr-mobile", "entity", "Mobile Redesign", 5),
+      FG_NODE("pr-acme", "entity", "Acme Corp", 4),
+      FG_NODE("pr-northwind", "entity", "Northwind", 3),
+      FG_NODE(DEMO_MEETING_ID, "meeting", "Q2 Roadmap Planning", 7, daysAgo(0)),
+      FG_NODE("m-atlas-kickoff", "meeting", "Project Atlas — Kickoff", 5, daysAgo(3)),
+      FG_NODE("m-atlas-ga-review", "meeting", "Atlas — GA go/no-go", 4, daysAgo(2)),
+      FG_NODE("m-eng-sync", "meeting", "Eng Sync — Sales Engine", 4, daysAgo(1)),
+      FG_NODE("m-design-review", "meeting", "Design Review — Mobile Redesign", 3, daysAgo(1)),
+      FG_NODE("m-acme", "meeting", "Customer Call — Acme Corp", 4, daysAgo(2)),
+      FG_NODE("m-northwind", "meeting", "Discovery — Northwind", 3, daysAgo(6)),
+      FG_NODE("m-data-review", "meeting", "Data Review — Activation Funnel", 4, daysAgo(9)),
+      FG_NODE("m-retro", "meeting", "Sprint 24 Retro", 3, daysAgo(5)),
+      FG_NODE("m-pricing", "meeting", "Pricing Workshop", 3, daysAgo(11)),
+      FG_NODE(DEMO_NOTE_ID, "note", "Atlas — PRD v3", 6, daysAgo(1)),
+      FG_NODE("n-atlas-ga", "note", "Atlas GA — release checklist", 4, daysAgo(2)),
+      FG_NODE("n-atlas-risks", "note", "Atlas — open risks", 3, daysAgo(4)),
+      FG_NODE("n-sync-latency", "note", "Sync-layer latency — findings", 3, daysAgo(2)),
+      FG_NODE("n-mobile-flows", "note", "Mobile — flow inventory", 2, daysAgo(3)),
+      FG_NODE("n-eng-runbook", "note", "Release runbook", 2, daysAgo(7)),
+      FG_NODE("d-atlas-brief", "document", "Atlas — design-partner brief.pdf", 3, daysAgo(4)),
+      FG_NODE("d-acme-msa", "document", "Acme — MSA redlines.docx", 2, daysAgo(2)),
+      FG_NODE("d-funnel", "document", "Activation funnel — Q2.xlsx", 2, daysAgo(9)),
+    ];
+    const E = [
+      // people/projects ↔ the meetings they were mentioned in
+      ["p-marcus", DEMO_MEETING_ID, "entity", "meeting", "mention"],
+      ["p-sarah", DEMO_MEETING_ID, "entity", "meeting", "mention"],
+      ["pr-atlas", DEMO_MEETING_ID, "entity", "meeting", "mention"],
+      ["pr-atlas", "m-atlas-kickoff", "entity", "meeting", "mention"],
+      ["pr-atlas", "m-atlas-ga-review", "entity", "meeting", "mention"],
+      ["p-priya", "m-atlas-kickoff", "entity", "meeting", "mention"],
+      ["p-anya", "m-design-review", "entity", "meeting", "mention"],
+      ["pr-mobile", "m-design-review", "entity", "meeting", "mention"],
+      ["p-devon", "m-acme", "entity", "meeting", "mention"],
+      ["pr-acme", "m-acme", "entity", "meeting", "mention"],
+      ["p-devon", "m-northwind", "entity", "meeting", "mention"],
+      ["pr-northwind", "m-northwind", "entity", "meeting", "mention"],
+      ["pr-sales", "m-eng-sync", "entity", "meeting", "mention"],
+      ["p-marcus", "m-eng-sync", "entity", "meeting", "mention"],
+      ["pr-atlas", "m-data-review", "entity", "meeting", "mention"],
+      ["p-sarah", "m-pricing", "entity", "meeting", "mention"],
+      ["p-marcus", "m-retro", "entity", "meeting", "mention"],
+      // people co-occurring
+      ["p-sarah", "p-marcus", "entity", "entity", "co_occurrence"],
+      ["p-sarah", "p-anya", "entity", "entity", "co_occurrence"],
+      ["p-marcus", "p-priya", "entity", "entity", "co_occurrence"],
+      ["pr-atlas", "pr-sales", "entity", "entity", "co_occurrence"],
+      // notes ↔ meetings and notes ↔ notes
+      [DEMO_NOTE_ID, DEMO_MEETING_ID, "note", "meeting", "manual"],
+      [DEMO_NOTE_ID, "n-atlas-ga", "note", "note", "wikilink"],
+      [DEMO_NOTE_ID, "n-atlas-risks", "note", "note", "wikilink"],
+      ["n-atlas-ga", "m-atlas-ga-review", "note", "meeting", "companion"],
+      ["n-sync-latency", "m-data-review", "note", "meeting", "semantic"],
+      ["n-mobile-flows", "m-design-review", "note", "meeting", "companion"],
+      ["n-eng-runbook", "m-retro", "note", "meeting", "semantic"],
+      [DEMO_NOTE_ID, "pr-atlas", "note", "entity", "mention"],
+      ["n-sync-latency", "pr-atlas", "note", "entity", "mention"],
+      // documents
+      ["d-atlas-brief", DEMO_NOTE_ID, "document", "note", "wikilink"],
+      ["d-atlas-brief", "pr-atlas", "document", "entity", "mention"],
+      ["d-acme-msa", "m-acme", "document", "meeting", "semantic"],
+      ["d-funnel", "m-data-review", "document", "meeting", "semantic"],
+      ["d-funnel", "pr-atlas", "document", "entity", "mention"],
+    ].map(([a, b, ak, bk, k]) => FG_EDGE(a, b, ak, bk, k));
+    // A couple of SUGGESTED edges — the graph proposes links it hasn't been told about.
+    E.push(FG_EDGE("n-atlas-risks", "m-atlas-ga-review", "note", "meeting", "semantic", 0.66, "suggested"));
+    E.push(FG_EDGE("pr-mobile", "m-pricing", "entity", "meeting", "co_occurrence", 0.58, "suggested"));
+    return {
+      nodes,
+      edges: E,
+      hasHidden: true,
+      totalVisibleNodes: nodes.length,
+      edgesTruncated: false,
+    };
+  })();
+
+  // ── Links ("Related") ─────────────────────────────────────────────────────
+  // `LinkEdge[]` from `list_links`. Mixed `edgeType`/`createdBy` on purpose: the
+  // claim is that the graph builds itself (semantic + wikilink + companion) with
+  // manual links alongside, so a one-kind shot would undersell it.
+  const LE = (id, otherKind, otherId, otherTitle, edgeType, createdBy, status, score, day) => ({
+    id,
+    direction: "out",
+    otherKind,
+    otherId,
+    navigationId: null,
+    otherTitle,
+    edgeType,
+    createdBy,
+    status,
+    score,
+    createdAt: ms(day, 10, 0),
+  });
+
+  const LINKS_BY_KEY = {
+    [`meeting:${DEMO_MEETING_ID}`]: [
+      LE(1, "note", DEMO_NOTE_ID, "Atlas — PRD v3", "manual", "user", "active", 1, 1),
+      LE(2, "meeting", "m-atlas-kickoff", "Project Atlas — Kickoff", "semantic", "accepted", "active", 0.86, 3),
+      LE(3, "document", "d-atlas-brief", "Atlas — design-partner brief.pdf", "wikilink", "auto", "active", 0.79, 4),
+      LE(4, "meeting", "m-data-review", "Data Review — Activation Funnel", "semantic", "auto", "suggested", 0.71, 9),
+    ],
+    [`note:${DEMO_NOTE_ID}`]: [
+      LE(5, "meeting", DEMO_MEETING_ID, "Q2 Roadmap Planning", "manual", "user", "active", 1, 0),
+      LE(6, "note", "n-atlas-ga", "Atlas GA — release checklist", "wikilink", "auto", "active", 0.9, 2),
+      LE(7, "meeting", "m-atlas-ga-review", "Atlas — GA go/no-go", "semantic", "auto", "suggested", 0.68, 2),
+    ],
+  };
+
+  const BACKLINKS_BY_KEY = {
+    [`meeting:${DEMO_MEETING_ID}`]: [
+      { id: "n-atlas-ga", kind: "note", title: "Atlas GA — release checklist", timestamp: daysAgo(2) },
+    ],
+    [`note:${DEMO_NOTE_ID}`]: [
+      { id: "d-atlas", kind: "dashboard", title: "Atlas — GA readiness", timestamp: daysAgo(0) },
+    ],
+  };
+
+  // ── Receipts (ClaimAlignment[]) ───────────────────────────────────────────
+  // A grounded note line carries a receipt back to the second of audio it came
+  // from; a paraphrased line carries none. That asymmetry is the feature, so the
+  // demo data has to show both.
+  // `claimIndex` is a RAW line index into the note markdown, so these must point
+  // at prose and decision lines — pointing one at line 0 put a receipt on the
+  // note's own H1, and on "## Summary", which is not what a receipt means.
+  const RECEIPTS = [
+    { claimIndex: 3, segmentId: 2, startS: 214, endS: 231, speaker: "others", confidence: 0.94, overlap: 0.81 },
+    { claimIndex: 11, segmentId: 3, startS: 231, endS: 244, speaker: "me", confidence: 0.9, overlap: 0.77 },
+    { claimIndex: 12, segmentId: 5, startS: 638, endS: 659, speaker: "others", confidence: 0.88, overlap: 0.74 },
+    { claimIndex: 13, segmentId: 6, startS: 1102, endS: 1126, speaker: "others", confidence: 0.83, overlap: 0.69 },
+  ];
+
+
   function handle(cmd, args) {
     switch (cmd) {
       // ── config / product ──
       case "get_config": return currentConfig();
       case "save_config": return null;
-      case "app_info": return { name: "Murmur", version: "0.6.3", description: "Local-first meeting notes with an on-device brain.", repository: "https://github.com/murmur-io/murmur" };
-      case "check_for_update": return { currentVersion: "0.6.3", latestVersion: "0.6.3", updateAvailable: false, releaseUrl: "https://github.com/murmur-io/murmur/releases/latest", releaseName: null, releaseNotes: null };
+      // The version is injected by the driver from package.json (`__demoVersion`),
+      // so a release bump can never leave a stale number in the About shot — this
+      // mock shipped "0.6.3" into 2.0-era captures before that.
+      case "app_info": return { name: "Murmur", version: VERSION, description: "Local-first meeting notes with an on-device brain.", repository: "https://github.com/murmur-io/murmur" };
+      case "check_for_update": return { currentVersion: VERSION, latestVersion: VERSION, updateAvailable: false, releaseUrl: "https://github.com/murmur-io/murmur/releases/latest", releaseName: null, releaseNotes: null };
       case "provider_statuses": return PROVIDERS;
       case "consent_to_cloud_egress": case "revoke_cloud_egress": case "consent_to_web_search": return null;
+
+      // ── 2.0: the recording surface is document-first ──
+      // It resolves a COMPANION note per meeting and renders it as the live
+      // notepad. Unmocked, the record screen sits on "Loading note…" forever.
+      case "get_or_create_companion_note":
+      case "append_to_companion_note":
+        return { noteId: COMPANION_NOTE_ID, meetingWikilink: "[[Q2 Roadmap Planning]]" };
+      case "brain_reactions_shadow_count": return 0;
+      case "set_brain_contradiction_cards": return null;
+      case "brain_model_present": return true;
+      case "brain_live_ram_ok": return true;
+
+      // ── 2.0: Spaces — the single workspace hierarchy ──
+      case "list_workspace_tree": return RICH() ? WORKSPACE_TREE : [];
+      case "get_container": return containerDto(args.id);
+      case "create_space":
+        return { id: "f-new", name: args.name, path: `Spaces/${args.name}`, parentId: null, locked: false, createdAt: daysAgo(0) };
+      case "get_filing_recovery_status":
+      case "retry_filing_recovery":
+      case "keep_existing_filing_file":
+        return { degraded: false, attemptCount: 0, projectionCount: 0, sourceSnapshotCount: 0, issueToken: null, issueKind: null, canKeepExisting: false };
+
+      // ── 2.0: boards ──
+      case "list_dashboards": return RICH() ? BOARDS : [];
+      case "get_dashboard": {
+        const board = BOARDS.find((b) => b.id === args.id) || BOARDS[0];
+        // Only the demo board is populated; the others exist to fill the list.
+        const tiles = board.id === "d-atlas" ? BOARD_TILES : [];
+        return { ...board, tiles, work: TASKS.slice(0, 2) };
+      }
+      case "get_dashboard_sources": return [];
+      case "create_dashboard":
+        return { id: "d-new", title: args.title || "New board", emoji: null, tint: null, pinned: false, position: BOARDS.length, createdAt: daysAgo(0), updatedAt: daysAgo(0) };
+      case "add_dashboard_tile": case "update_dashboard": case "update_dashboard_tile":
+      case "delete_dashboard": case "delete_dashboard_tile": case "reorder_dashboard_tiles":
+        return null;
+
+      // ── 2.0: tasks (org-owned) ──
+      case "list_tasks": return RICH() ? TASKS : [];
+      case "get_task": return TASKS.find((t) => t.id === args.id) || null;
+      case "create_task": case "update_task": return TASKS[0];
+      case "delete_task": case "set_task_container": return null;
+
+      // ── 2.0: reminders ──
+      case "list_reminders": return REMINDERS;
+      case "get_reminder_summary": return { dueInboxCount: REMINDERS.dueInboxCount };
+      case "audit_reminder_suggestions": return [];
+      case "create_reminder": case "update_reminder": return REMINDERS.upcoming[0];
+      case "complete_reminder": case "delete_reminder": case "dismiss_reminder_occurrence":
+      case "accept_reminder_suggestion": case "dismiss_reminder_suggestion":
+        return null;
+
+      // ── 2.0: people ──
+      case "list_people": return PEOPLE;
+
+      case "get_full_graph": return FULL_GRAPH;
+      // ── 2.0: links ("Related") ──
+      case "list_links": return LINKS_BY_KEY[`${args.kind}:${args.id}`] || [];
+      case "get_backlinks": return BACKLINKS_BY_KEY[`${args.kind}:${args.id}`] || [];
+      case "accept_link": case "dismiss_link": case "link_items": case "unlink_items": return null;
+
+      // ── 2.0: receipts — grounded note lines trace back to the tape ──
+      case "get_note_receipts": return RECEIPTS;
 
       // ── recorder ──
       case "start_recording": return { meetingId: DEMO_MEETING_ID };
@@ -711,6 +1495,19 @@ scope to the GA-critical path only.
       case "get_meeting_tags": return ["atlas", "roadmap"];
       case "set_meeting_tags": return null;
       case "get_meeting_detail": return detailFor(args.meetingId);
+      // Voiceprint-derived speaker-name suggestions. Returns a LIST; `null` here
+      // makes the timeline's `suggestionByLabel` computed throw and blanks the
+      // speaker lanes + topic bands.
+      case "suggest_speaker_labels":
+        return [
+          { speaker: "Sarah", suggestedLabel: "Sarah Chen", score: 0.93 },
+          { speaker: "Marcus", suggestedLabel: "Marcus Reid", score: 0.9 },
+        ];
+
+      // The transcript is loaded LAZILY when the Audio tab opens (it used to ride
+      // along on every detail read). Unmocked, that read fell through the generic
+      // `get_*` fallback to `[]` and the panel said "No transcript."
+      case "get_meeting_segments": return SEGMENTS;
       case "get_timeline": return TIMELINE;
       case "rename_speaker": return TIMELINE;
       case "get_action_items": return ACTION_ITEMS;
@@ -736,9 +1533,9 @@ scope to the GA-critical path only.
           intentKind: "recall",
           status: "ok",
           summary:
-            "The mobile redesign was deferred twice — the blocker was the shared sync layer. **Project Atlas** removed that dependency, so it's unblocked for Q4.",
+            "On the renewal call you committed to two things: redlined contract terms back before the renewal review, and the Atlas migration plan as a one-pager for their team. Devon owns the redlines; Sarah owns the migration plan.",
           command: (args.messages && args.messages.length ? args.messages[args.messages.length - 1].text : ""),
-          citations: ["[[Q2 Roadmap Planning]]", "[[Eng Sync — Sales Engine]]"],
+          citations: ["[[Customer Call — Acme Corp]]", "[[Acme — renewal review]]"],
           proposedNote: null,
           threadId: args.threadId || "t-live-1",
         };
@@ -941,10 +1738,19 @@ scope to the GA-critical path only.
       case "meeting_org_shares": return [];
       case "org_live_shares_for_source": return [];
 
-      // Workspace's unfiled inbox expects a typed ItemPage, not the generic
-      // array fallback used by other `list_*` demo commands.
-      case "list_container_items":
-        return { kind: args.kind || "meeting", total: 0, items: [] };
+      // A typed ItemPage, not the generic array fallback other `list_*` demo
+      // commands use. Reads the same CONTAINER_ITEMS the tree derives its groups
+      // from, so a container page and its sidebar preview always agree.
+      case "list_container_items": {
+        const kind = args.kind || "meeting";
+        // A null containerId is the unfiled inbox. It rides the same RICH() gate as
+        // the tree it renders inside of, so the e2e baseline stays untouched.
+        const key = args.containerId == null ? (RICH() ? "unfiled" : "__none__") : args.containerId;
+        const all = (CONTAINER_ITEMS[key] || {})[kind] || [];
+        const offset = args.offset || 0;
+        const limit = args.limit || all.length;
+        return { kind, total: all.length, items: all.slice(offset, offset + limit) };
+      }
 
       // ── Vault audit — weekly schedule + AI explain ──
       // Object-shaped (a bare `get_` name would fall through to the `[]`

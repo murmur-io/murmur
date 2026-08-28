@@ -502,7 +502,7 @@
       </div>
       <div class="shot-glow">
         <div class="shot">
-          <img src="./assets/record-brain.jpg" alt="Asking Murmur's on-device assistant a question mid-meeting and getting a grounded answer with sources — while the recording keeps rolling" loading="eager" />
+          <img src="./assets/record-brain.png" alt="Asking Murmur a question mid-meeting and getting a grounded answer with its sources listed — while the recording keeps rolling" loading="eager" />
         </div>
       </div>
     </div>
@@ -599,11 +599,13 @@
               <tr><td>On-device brain (Bielik / Qwen)</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
               <tr><td>Ollama</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
               <tr><td>Claude Code <span style="color:var(--text-muted);font-weight:400">(default summarizer)</span></td><td>Local CLI → cloud</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
+              <tr><td>Codex <span style="color:var(--text-muted);font-weight:400">(OpenAI's CLI, run tool-free)</span></td><td>Local CLI → cloud</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
               <tr><td>Anthropic API <span style="color:var(--text-muted);font-weight:400">(bring your own key)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
               <tr><td>AI Gateway <span style="color:var(--text-muted);font-weight:400">(any OpenAI-compatible endpoint — LiteLLM, Kong, Portkey, vLLM…)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
             </tbody>
           </table>
         </div>
+        <div class="shot" style="margin-top:32px"><img src="./assets/settings-privacy.png" alt="Murmur's privacy settings, stating in plain language what is removed before any text leaves, which providers are cloud, and that cloud processing is off until you allow it once" loading="lazy" /></div>
         <div class="egress-foot">Murmur tells you, in plain language, exactly what leaves your Mac — and defaults to keeping it all on-device. One model picker is used across every AI surface, and it always accepts a model id you type yourself — so a model released after this build still works.</div>
       </div>
     </div>
@@ -618,32 +620,57 @@
         <p>One encrypted store, three ways to use it — the app, a local MCP server, and your exported Markdown files.</p>
       </div>
 
-      <!-- New in 2.0 — the structural changes, no screenshots yet -->
+      <!-- New in 2.0 -->
       <div class="section-head reveal" style="margin-top:8px">
         <span class="eyebrow">New in 2.0</span>
         <h2>One hierarchy. Boards over it. And a door in.</h2>
         <p>2.0 rebuilt the shell around a single tree, added composable boards on top of it, and opened an offline import path for the notes you already have somewhere else.</p>
       </div>
-      <div class="steps reveal" style="margin-bottom:96px">
-        <div class="step">
-          <div class="step-n">Spaces</div>
+
+      <div class="feature reveal">
+        <div class="ftext">
+          <span class="eyebrow">Spaces</span>
           <h3>One tree for everything</h3>
           <p>The separate Meetings and Notes folder trees are gone. There's now a single tree — <b>Spaces › folders › your recordings and notes</b> — behind a persistent icon rail and a contextual panel. Lock a Space and everything inside it is sealed with it.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Recordings, notes, tasks and boards file into the same place</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A sealed Space shows its name and nothing else — no counts, no contents</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Ask the Brain to file a stray recording for you</li>
+          </ul>
         </div>
-        <div class="step">
-          <div class="step-n">Dashboards</div>
+        <div class="shot"><img src="./assets/hero-spaces.png" alt="The Spaces sidebar: one tree of Spaces and folders holding recordings, notes and boards, with a locked Space at the bottom" loading="lazy" /></div>
+      </div>
+
+      <div class="feature flip reveal">
+        <div class="ftext">
+          <span class="eyebrow">Dashboards</span>
           <h3>Boards you compose</h3>
           <p>Pull notes, recordings, documents, people, promise ledgers and reminders onto a board, then read it through <b>Brief / Overview / Commitments / Sources / People</b> lenses. Pin a <b>living answer</b> — a question the app keeps up to date, and withholds the moment its sources stop being readable. You can ask a board directly, grounded only in what's on it.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Ten kinds of tile, including drift, numbers and activity pulse</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Five lenses over the same tiles — no second copy of anything</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A board states its own boundary: what it can read, and what it derived</li>
+          </ul>
         </div>
-        <div class="step">
-          <div class="step-n">Imports</div>
+        <div class="shot"><img src="./assets/dashboard.png" alt="A board in its Brief lens: a pinned living answer, what needs attention, and the recent evidence behind it" loading="lazy" /></div>
+      </div>
+
+      <div class="feature reveal">
+        <div class="ftext">
+          <span class="eyebrow">Imports</span>
           <h3>Bring your existing notes</h3>
-          <p>Settings → Imports pulls in a <b>Notion export</b>, an <b>Obsidian vault</b>, or <b>Apple Notes</b>. Entirely offline — no API token, no account, no network call. Every import is a dry run first, so you see what it would write before it writes anything. (Apple Notes asks macOS for permission the first time.)</p>
+          <p>Settings → Imports pulls in a <b>Notion export</b>, an <b>Obsidian vault</b>, or <b>Apple Notes</b>. Entirely offline — no account, no key, no network call. Every import is a dry run first, so you see what it would write before it writes anything. (Apple Notes asks macOS for permission the first time.)</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Three sources: a Notion export, an Obsidian vault, Apple Notes</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Dry run first — nothing is written until you say so</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Imported notes land in their own named container, and join the same Brain</li>
+          </ul>
         </div>
+        <div class="shot"><img src="./assets/settings-imports.png" alt="Settings → Imports: Notion, Obsidian and Apple Notes, with the note that everything happens on this Mac and nothing is uploaded" loading="lazy" /></div>
       </div>
 
       <!-- Feature 1 -->
-      <div class="feature reveal">
+      <div class="feature flip reveal">
         <div class="ftext">
           <span class="eyebrow">The brain</span>
           <h3>Talk to your AI — during the meeting.</h3>
@@ -655,26 +682,26 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Conversations are remembered — vault, note and meeting threads persist, with a history browser on each surface. A conversation disappears the instant any folder it drew on stops being readable.</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/ask.jpg" alt="Ask Your Vault — grounded Q&A across months of meetings, every claim linked to its source" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/ask.png" alt="Asking across months of meetings and getting one answer, with the meetings it was drawn from listed underneath" loading="lazy" /></div>
       </div>
 
       <!-- Feature 2 -->
-      <div class="feature flip reveal">
+      <div class="feature reveal">
         <div class="ftext">
           <span class="eyebrow">Capture &amp; transcribe</span>
           <h3>It hears both sides of the call.</h3>
           <p>Dual-stream recording captures your mic and the other side's system audio, transcribes each independently on-device, and merges them by wall-clock into a clean Me / Others transcript with live captions as you speak.</p>
           <ul class="flist">
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device Whisper, tiny to large-v3 — pick your speed/accuracy tradeoff</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device Whisper — tiny through large-v3, including the faster turbo build, plus quantized variants</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Two-stream attribution: you and everyone else, plus voice-activity detection</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A floating recorder bar — record from anywhere (⌘⇧R)</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/transcript.jpg" alt="The merged Me / Others transcript, time-indexed" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/transcript.png" alt="The merged Me / Others transcript, time-indexed, beside the speaker and topic timeline" loading="lazy" /></div>
       </div>
 
       <!-- Feature 3 -->
-      <div class="feature reveal">
+      <div class="feature flip reveal">
         <div class="ftext">
           <span class="eyebrow">Notes &amp; memory</span>
           <h3>Structured notes and a graph that builds itself.</h3>
@@ -686,11 +713,11 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Feed it PDFs, Office docs, web pages &amp; images — chunked into the same brain, on-device</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/graph.jpg" alt="People & Projects knowledge graph, extracted automatically" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/full-brain-graph.png" alt="The full brain graph — meetings, notes, documents and people as one map, with typed links between them" loading="lazy" /></div>
       </div>
 
       <!-- Feature: Receipts -->
-      <div class="feature flip reveal">
+      <div class="feature reveal">
         <div class="ftext">
           <span class="eyebrow">Receipts</span>
           <h3>Every claim traces back to the tape.</h3>
@@ -701,8 +728,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Sealed folders leak no timing or speaker, ever</li>
           </ul>
         </div>
-        <!-- TODO(screenshot): replace detail-note.jpg with a real receipts.jpg showing the receipt chips on a note's claims -->
-        <div class="shot"><img src="./assets/detail-note.jpg" alt="A generated note where each grounded line carries a receipt chip linking to the exact transcript segment" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/detail-receipts.png" alt="A generated note's receipts: one row per grounded claim, each carrying the speaker and the second of audio it came from" loading="lazy" /></div>
       </div>
 
       <!-- Feature 4 -->
@@ -717,7 +743,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Plain Markdown exports you can open in any editor</li>
           </ul>
         </div>
-        <div class="shot"><img src="./assets/detail-note.jpg" alt="A structured note — summary, decisions, action items, quotes" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/detail-note.png" alt="A structured note — summary, decisions, action items and quotes — beside the recordings and notes it links to" loading="lazy" /></div>
       </div>
 
       <!-- Feature 5 -->
@@ -732,7 +758,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Paste screenshots into notes; they stay local and follow the Space's lock</li>
           </ul>
         </div>
-        <div class="shot"><img src="assets/notes-editor-brain-menu.png" alt="The standalone note editor with a text selection and the Brain command menu open, showing Refine, Shorten, Change tone and more actions" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/notes-editor-brain-menu.png" alt="The standalone note editor with a text selection and the Brain command menu open, showing Refine, Shorten, Change tone and more actions" loading="lazy" /></div>
       </div>
 
       <!-- Feature 6 -->
@@ -749,7 +775,7 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Shared <b>Tasks</b> — assignees, due dates, subtasks and the same permissions. Tasks live inside an org, so they need a signed-in account.</li>
           </ul>
         </div>
-        <div class="shot"><img src="assets/shared-brain-rail.png" alt="The Notes view Shared Brains rail with an organization selected, showing synced org items with author badges" loading="lazy" /></div>
+        <div class="shot"><img src="./assets/shared-brains.png" alt="The Shared Brains view: meetings and notes your organizations have shared with you, each with its author and organization" loading="lazy" /></div>
       </div>
     </div>
   </section>

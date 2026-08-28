@@ -260,7 +260,7 @@
   @if (interactions().length) {
     <section class="block print-keep">
       <div class="block-head">
-        <h3 class="section-label">🎙 Asystent — Q&amp;A</h3>
+        <h3 class="section-label">🎙 Assistant — Q&amp;A</h3>
         <span class="count">{{ interactions().length }}</span>
       </div>
       <ul class="qa-list">
@@ -268,7 +268,7 @@
           <li class="card qa-row" [class.is-pending]="q.status === 'pending'">
             <div class="qa-heard">
               <span class="qa-ico" aria-hidden="true">🎙</span>
-              <span class="qa-heard-text">Pytałeś: <strong>{{ q.command || "…" }}</strong></span>
+              <span class="qa-heard-text">You asked: <strong>{{ q.command || "…" }}</strong></span>
               @if (qaStatusLabel(q.status)) {
                 <span class="pill" [class]="qaStatusPillClass(q.status)">
                   <span class="pill-dot"></span>
