@@ -30,6 +30,7 @@ import type {
   OrganizePlan,
 } from "../../../core/models";
 import { IpcService } from "../../../core/ipc.service";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
 import {
   type OrganizeAttemptReceipt,
@@ -116,6 +117,7 @@ export class WorkspaceTreeComponent {
   private readonly destroyRef = inject(DestroyRef);
   private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
   protected readonly workspace = inject(WorkspaceService);
   private readonly drag = inject(NoteDragService);
   private readonly folders = inject(FoldersService);
@@ -500,8 +502,8 @@ export class WorkspaceTreeComponent {
       this.toast.success(
         `Moved “${this.itemTitle(request.item)}” to ${target.label}`,
       );
-    } catch {
-      const message = `Couldn’t move “${this.itemTitle(request.item)}” to ${target.label}.`;
+    } catch (error) {
+      const message = this.errorCopy.humanize(error);
       this.moveError.set(message);
       this.toast.danger(message);
     } finally {
@@ -536,8 +538,8 @@ export class WorkspaceTreeComponent {
     try {
       await this.workspace.moveItem(payload.kind, payload.id, container.id);
       this.toast.success(`Moved item to ${targetLabel}`);
-    } catch {
-      this.toast.danger(`Couldn’t move this item to ${targetLabel}.`);
+    } catch (error) {
+      this.toast.danger(this.errorCopy.humanize(error));
     }
   }
 

@@ -10028,8 +10028,10 @@ fn move_note_locked_domain_compat(
     }
     if state.db.companion_note_for_meeting(&meeting_id)?.is_some() {
         return Err(AppError::Unavailable(
-            "this recording has a linked note; move it between open folders or remove the folder lock first"
-                .into(),
+            crate::errcode::tag(
+                crate::errcode::RECORDING_LINKED_NOTE,
+                "this recording has a linked note; move it between open folders or remove the folder lock first",
+            ),
         ));
     }
 
