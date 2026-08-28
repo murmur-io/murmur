@@ -1167,7 +1167,7 @@ export interface ClaimAlignment {
 /**
  * One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken
  * command, the assistant's answer, the grounding citations, and the dispatch
- * status. Surfaced in the meeting detail's "Asystent — Q&A" section. EMPTY when
+ * status. Surfaced in the meeting detail's "Assistant — Q&A" section. EMPTY when
  * the meeting is locked-and-not-session-unlocked (gated, like note/segments) and
  * also empty for a sealed meeting at rest (the rows are PURGED on seal). Mirrors
  * the Rust `AssistantInteraction` (serde camelCase).
@@ -1197,7 +1197,7 @@ export interface MeetingDetail {
   /**
    * Persisted in-meeting assistant Q&A for this meeting. Present (gated) only
    * when the meeting is unlocked; empty otherwise. The FE renders these in the
-   * "🎙 Asystent — Q&A" detail section.
+   * "🎙 Assistant — Q&A" detail section.
    */
   assistantInteractions: AssistantInteraction[];
   /**
