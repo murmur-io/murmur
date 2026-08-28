@@ -10,6 +10,7 @@ zamiast odmowy: pas zasobów to optymalizacja, nie granica bezpieczeństwa.
 Wejście: JSON hooka na stdin. Wyjście: exit 0 = przepuść, exit 2 = zablokuj.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -47,16 +48,61 @@ def secret_hits(added: str) -> list:
     return sorted(set(hits))
 
 
+def selftest() -> None:
+    """Bramka na cichą awarię guarda. Stary audyt zlapal raz zmiane w hooku, ktora po
+    cichu wylaczyla skan sekretow i finish-guard — te przypadki to ta sama klasa."""
+    cases = [
+        ("git push origin murmur", 2, "push na chroniony branch"),
+        ("git push --force-with-lease origin murmur", 2, "push z flagami"),
+        ("git push origin HEAD:murmur", 2, "push przez refspec"),
+        ("git push origin feature/x", 0, "push na zwykly branch"),
+        ("git push origin agent/v2/foo", 0, "push na branch agentowy"),
+        ('echo "niedomkniety cudzyslow', 0, "to, co stary guard odrzucal 48 razy"),
+        ("cargo test --lib", 0, "ciezka komenda = ostrzezenie, nie odmowa"),
+        ("ls", 0, "zwykla komenda"),
+    ]
+    failed = []
+    devnull = open(os.devnull, "w")
+    real_err, sys.stderr = sys.stderr, devnull      # przypadki blokujace pisza na stderr
+    for cmd, want, label in cases:
+        code = 0
+        try:
+            _inspect(cmd)
+        except SystemExit as e:
+            code = e.code or 0
+        if code != want:
+            failed.append(f"  {label}: `{cmd}` -> exit {code}, oczekiwano {want}")
+    sys.stderr = real_err
+    devnull.close()
+    # Skan sekretow na sztucznej tresci, bez dotykania repozytorium.
+    fake = "+" + "sk" + "-ant-" + "A" * 24
+    if not secret_hits(fake):
+        failed.append("  skan sekretow NIE wykrywa klucza Anthropic")
+    if secret_hits("+zwykla linia kodu"):
+        failed.append("  skan sekretow ma falszywy alarm")
+    if failed:
+        print("guard selftest: FAIL", file=sys.stderr)
+        print("\n".join(failed), file=sys.stderr)
+        raise SystemExit(1)
+    print(f"guard selftest: PASS ({len(cases)} przypadkow + skan sekretow)")
+
+
 def main() -> None:
+    if "--selftest" in sys.argv:
+        selftest()
+        return
     try:
         payload = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         return
     cmd = (payload.get("tool_input") or {}).get("command") or ""
-    if not cmd:
-        return
+    if cmd:
+        _inspect(cmd)
 
-    if re.search(r"\bgit\b[^|;&]*\bcommit\b", cmd):
+
+def _inspect(cmd: str) -> None:
+    if re.search(r"\bgit\b[^|;&]*\bcommit\b", cmd) \
+            and os.environ.get("MURMUR_ALLOW_SECRET") != "1":
         raw = git("diff", "--cached", "--no-color", "--no-ext-diff", "--unified=0", "--")
         added = "\n".join(l[1:] for l in raw.splitlines()
                           if l.startswith("+") and not l.startswith("+++"))

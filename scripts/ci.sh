@@ -84,8 +84,8 @@ rust_gate() {
   echo "── mirror .claude/ vs .codex/ ──"
   .agents/h/mirror-check
 
-  echo "── development agent hooks: adversarial self-test ──"
-  bash .codex/hooks/selftest.sh
+  echo "── guard hooka Bash: self-test ──"
+  python3 .agents/h/guard.py --selftest
 
   # ── Scaffold eval, control arm only. `--mode fake` runs NO model: it replays each task's
   #    recorded good/bad answers through the real graders and asserts good passes and bad fails.
