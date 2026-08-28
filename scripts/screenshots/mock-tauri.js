@@ -488,8 +488,8 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
         ordinal: ordinal + 1,
         role: "assistant",
         content: answer,
-        sources: ASK_SOURCES,
-        citations: ASK_CITATIONS,
+        sources: RICH() ? ASK_SOURCES : [],
+        citations: RICH() ? ASK_CITATIONS : [],
         createdAt: now,
       },
     );
@@ -499,8 +499,8 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
       userMessageId,
       assistantMessageId,
       answer,
-      sources: ASK_SOURCES,
-      citations: ASK_CITATIONS,
+      sources: RICH() ? ASK_SOURCES : [],
+      citations: RICH() ? ASK_CITATIONS : [],
     };
   };
 
@@ -731,6 +731,26 @@ scope to the GA-critical path only.
       },
     ],
   };
+
+  /*
+   * SHARED FIXTURE WARNING.
+   *
+   * This file is not private to the screenshot harness. `e2e/settings-ai/mock-invoke.ts`
+   * loads it as the BASE layer for the whole Playwright suite (~450 tests), and each spec
+   * then overrides only the commands it asserts on. So adding data to a command that used
+   * to fall through to the benign `[]` default silently changes the world every one of
+   * those tests boots into.
+   *
+   * That is not hypothetical: giving `list_dashboards` three boards put a board at the top
+   * of every `mur-source-picker`, and four `e2e/ask` specs that click ".sp-row first" and
+   * expect a MEETING went red.
+   *
+   * So the aggregate 2.0 lists that the screenshots need are OPT-IN. `capture.mjs` sets
+   * `window.__demoRich`; without it these commands return exactly what they returned
+   * before, and the e2e baseline is unchanged. Per-surface data that no spec could have
+   * depended on (there was nothing there to depend on) stays unconditional.
+   */
+  const RICH = () => typeof window !== "undefined" && !!window.__demoRich;
 
   // ── 2.0 surfaces: Spaces, boards, tasks, reminders, people, receipts ───────
   //
@@ -1389,7 +1409,7 @@ scope to the GA-critical path only.
       case "brain_live_ram_ok": return true;
 
       // ── 2.0: Spaces — the single workspace hierarchy ──
-      case "list_workspace_tree": return WORKSPACE_TREE;
+      case "list_workspace_tree": return RICH() ? WORKSPACE_TREE : [];
       case "get_container": return containerDto(args.id);
       case "create_space":
         return { id: "f-new", name: args.name, path: `Spaces/${args.name}`, parentId: null, locked: false, createdAt: daysAgo(0) };
@@ -1399,7 +1419,7 @@ scope to the GA-critical path only.
         return { degraded: false, attemptCount: 0, projectionCount: 0, sourceSnapshotCount: 0, issueToken: null, issueKind: null, canKeepExisting: false };
 
       // ── 2.0: boards ──
-      case "list_dashboards": return BOARDS;
+      case "list_dashboards": return RICH() ? BOARDS : [];
       case "get_dashboard": {
         const board = BOARDS.find((b) => b.id === args.id) || BOARDS[0];
         // Only the demo board is populated; the others exist to fill the list.
@@ -1414,7 +1434,7 @@ scope to the GA-critical path only.
         return null;
 
       // ── 2.0: tasks (org-owned) ──
-      case "list_tasks": return TASKS;
+      case "list_tasks": return RICH() ? TASKS : [];
       case "get_task": return TASKS.find((t) => t.id === args.id) || null;
       case "create_task": case "update_task": return TASKS[0];
       case "delete_task": case "set_task_container": return null;
