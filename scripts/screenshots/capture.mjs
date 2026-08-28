@@ -569,6 +569,10 @@ async function main() {
     page.on("console", (m) => {
       if (m.type() === "error") errs.push(m.text());
     });
+    // `__demoRich` opts the mock into the aggregate 2.0 lists (the Spaces tree,
+    // boards, tasks, ask grounding). They are opt-in because this mock is also the
+    // e2e suite's base fixture — see the SHARED FIXTURE WARNING in mock-tauri.js.
+    await page.addInitScript("window.__demoRich = true;");
     await page.addInitScript(`window.__demoVersion = ${JSON.stringify(VERSION)};`);
     await page.addInitScript(MOCK);
     if (shot.config) {
