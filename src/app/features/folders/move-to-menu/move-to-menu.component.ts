@@ -182,7 +182,11 @@ export class MoveToMenuComponent {
       this.moved.emit(targetId);
       this.closed.emit();
     } catch (error) {
-      this.moveError.set(this.errorCopy.humanize(error));
+      this.moveError.set(
+        this.errorCopy.is(error, "recording-linked-note")
+          ? this.errorCopy.humanize(error)
+          : "Couldn’t move this note. Please try again.",
+      );
     } finally {
       this.moving.set(false);
     }
