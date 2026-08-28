@@ -22,6 +22,7 @@ import { IpcService } from "../../../core/ipc.service";
 import { tabKeyFor } from "../../../core/tab-keys";
 import { TabsService } from "../../../core/tabs.service";
 import { meetingStatusPillClass } from "../../../design-system/meeting-status";
+import { MurCopyIdComponent } from "../../../design-system/copy-id/copy-id.component";
 import type {
   AppConfigDto,
   AssistantInteraction,
@@ -80,6 +81,7 @@ interface ActionItem {
     SharePanelComponent,
     VerifyPanelComponent,
     MeetingCommandBarComponent,
+    MurCopyIdComponent,
   ],
   templateUrl: "./detail.component.html",
   styleUrl: "./detail.component.scss",
