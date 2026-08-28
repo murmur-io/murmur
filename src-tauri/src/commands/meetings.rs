@@ -217,9 +217,10 @@ pub(crate) fn rename_speaker_inner(
     // rename a speaker (would persist a near-empty plaintext timeline over the sealed blob in a
     // locked folder). Fail closed.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to rename a speaker".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to rename a speaker",
+            )));
     }
     let json = state
         .db
