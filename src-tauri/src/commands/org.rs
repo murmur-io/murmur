@@ -3805,9 +3805,10 @@ pub(crate) fn build_org_share_snapshot(
             (Some(mid), None) => {
                 // (1) READ-GATE FIRST — a sealed-not-unlocked meeting refuses before any read/egress.
                 if !meeting_is_unlocked(state, mid)? {
-                    return Err(AppError::Locked(
-                        "this meeting's folder is locked — unlock it to share to the org".into(),
-                    ));
+                    return Err(AppError::Locked(crate::errcode::tag(
+                            crate::errcode::MEETING_LOCKED,
+                            "this meeting's folder is locked — unlock it to share to the org",
+                        )));
                 }
                 let note = state
                     .db
