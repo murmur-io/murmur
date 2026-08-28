@@ -305,6 +305,29 @@ def phase_verify(task: str, plan: str, wt: Path, checks: list, vendor: str) -> d
 
 # ---------- komendy ----------
 
+def link_shared_target(wt: Path) -> None:
+    """Podepnij `target/` worktree pod cieply target glownego checkoutu.
+
+    Symlink, nie zmienna srodowiskowa: Claude Code odtwarza wlasne srodowisko ze
+    shell-snapshotu, wiec CARGO_TARGET_DIR wstrzykniety w proces modelu NIE dochodzi
+    do jego wywolan basha — zmierzone. Symlinka czyta kazdy, kto uruchomi cargo.
+    `target/` jest w .gitignore, wiec nie brudzi diffa zadania.
+
+    Zmierzone na tym repo: zimny target w worktree = ~15 min i 4 GB; przez symlink
+    ten sam zawezony test = 1 min 53 s.
+    """
+    link = wt / "target"
+    if link.is_symlink():
+        return
+    if link.exists():                       # prawdziwy katalog z poprzedniego przebiegu
+        shutil.rmtree(link, ignore_errors=True)
+    if not SHARED_TARGET.exists():
+        log(f"uwaga: {SHARED_TARGET} nie istnieje — build bedzie zimny")
+        return
+    link.symlink_to(SHARED_TARGET)
+    log(f"target -> {SHARED_TARGET} (wspoldzielony, cieply)")
+
+
 def cmd_run(a) -> None:
     task_id, task = a.task_id, a.prompt
     wt = TASKS_ROOT / task_id
@@ -314,6 +337,7 @@ def cmd_run(a) -> None:
         git("worktree", "add", "-b", f"h/{task_id}", str(wt), "HEAD")
     else:
         log(f"worktree istnieje: {wt}")
+    link_shared_target(wt)
     save_state(task_id, task=task, worktree=str(wt), started=time.time())
 
     plan = phase_plan(task_id, task, wt, a.planner) if not a.no_plan else task
@@ -379,6 +403,11 @@ def cmd_clean(a) -> None:
     s = load_state(a.task_id)
     wt = s.get("worktree")
     if wt and Path(wt).exists():
+        # Zdejmij symlink PRZED usunieciem worktree — inaczej `worktree remove`
+        # poszedlby po nim i skasowal wspoldzielony, cieply target.
+        link = Path(wt) / "target"
+        if link.is_symlink():
+            link.unlink()
         git("worktree", "remove", wt, *(["--force"] if a.force else []))
         log(f"usunięto worktree {wt}")
     git("branch", "-D", f"h/{a.task_id}", check=False)
