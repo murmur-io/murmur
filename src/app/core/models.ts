@@ -6,6 +6,8 @@ export type Stage =
   | "transcribing"
   | "summarizing"
   | "exporting"
+  | "saved"
+  | "finalized"
   | "done"
   | "error";
 
@@ -1071,10 +1073,6 @@ export interface StartResult {
 
 export interface StopResult {
   meetingId: string;
-  markdown: string;
-  /** Path of the exported Obsidian `.md`, or `null` when no vault is configured (the note is
-   *  still saved to Murmur — the vault is export-only). */
-  exportedPath: string | null;
 }
 
 export type MeetingStatus =
@@ -2766,11 +2764,37 @@ export interface OrganizeMove {
   toFolderId: string | null;
   /** One-line why (shown to the user). */
   reason: string;
+  /** Brain's review confidence. Every proposal still requires confirmation. */
+  confidence: "high" | "medium" | "low";
+  /**
+   * Frontend review receipt copied from the plan that produced this move.
+   * NotesHome applies only selected moves, so the IPC boundary uses this to
+   * preserve the reviewed scope without trusting current UI state.
+   */
+  reviewScopeFolderId: string | null;
 }
 
 /** An auto-organize plan (`plan_organize_notes`). Mirrors the Rust `OrganizePlan`. */
 export interface OrganizePlan {
+  scopeFolderId: string | null;
   moves: OrganizeMove[];
+  totalScanned: number;
+  alreadyOrganized: number;
+  deferred: number;
+  targets: WorkspaceOrganizeTarget[];
+}
+
+/** One per-note refusal returned by `apply_organize_plan`. */
+export interface OrganizeFailure {
+  noteId: string;
+  reason: string;
+  retryable: boolean;
+}
+
+/** Honest auto-organize apply receipt. */
+export interface OrganizeApplyResult {
+  appliedIds: string[];
+  failures: OrganizeFailure[];
 }
 
 /** One reviewed recording move proposed by `plan_workspace_organization`. */
@@ -2829,6 +2853,19 @@ export interface WorkspaceOrganizeFailure {
 export interface WorkspaceOrganizeApplyResult {
   appliedIds: string[];
   failures: WorkspaceOrganizeFailure[];
+}
+
+/** Content-free filing-journal health shown when crash recovery needs attention. */
+export interface FilingRecoveryStatus {
+  degraded: boolean;
+  attemptCount: number;
+  projectionCount: number;
+  sourceSnapshotCount: number;
+  /** Opaque, single-issue confirmation token. It contains no id, path, or title. */
+  issueToken: string | null;
+  /** Content-free reason category; copy only, never recovery authority. */
+  issueKind: "externalTargetOccupant" | "externalSourceReplacement" | null;
+  canKeepExisting: boolean;
 }
 
 /**

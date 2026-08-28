@@ -437,6 +437,22 @@ impl Db {
         Ok(())
     }
 
+    /// Content-free organizer guard: whether this authored-note row is structurally owned by a
+    /// meeting companion link. Selects only an `EXISTS` bit — never title, markdown, or meeting id.
+    /// Companion placement follows its meeting and must not be mutated independently.
+    pub fn authored_note_is_companion(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM documents
+                  WHERE id = ?1 AND kind = 'note' AND meeting_id IS NOT NULL
+             )",
+            rusqlite::params![id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .map_err(map_err)
+    }
+
     /// Recording-time COMPANION NOTE — the note id of the ONE companion note (`kind='note'`) linked
     /// to `meeting_id`, or `None` when none exists yet (the append command then lazily creates it).
     /// Structured lookup by the indexed `meeting_id` column — never a fragile title-string match.
@@ -471,17 +487,18 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        let changed = tx.execute(
-            "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
+        let changed = tx
+            .execute(
+                "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
                WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, title, text, updated_at],
-        )
-        .map_err(map_err)?;
+                rusqlite::params![id, title, text, updated_at],
+            )
+            .map_err(map_err)?;
         if changed != 0 {
             tx.execute(
-            "UPDATE org_shares SET republish_dirty = republish_dirty + 1, republish_deferred=0
+                "UPDATE org_shares SET republish_dirty = republish_dirty + 1, republish_deferred=0
               WHERE document_id = ?1 AND state IN ('queued','uploaded','failed')",
-            rusqlite::params![id],
+                rusqlite::params![id],
             )
             .map_err(map_err)?;
         }
@@ -507,7 +524,8 @@ impl Db {
             "UPDATE org_shares SET republish_deferred=1
               WHERE document_id=?1 AND state IN ('queued','uploaded','failed')",
             rusqlite::params![id],
-        ).map_err(map_err)?;
+        )
+        .map_err(map_err)?;
         tx.commit().map_err(map_err)
     }
 
@@ -580,17 +598,18 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        let changed = tx.execute(
-            "UPDATE documents SET title = ?2, text = ?3, text_blob = ?4, updated_at = ?5
+        let changed = tx
+            .execute(
+                "UPDATE documents SET title = ?2, text = ?3, text_blob = ?4, updated_at = ?5
                WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, title, text, text_blob, updated_at],
-        )
-        .map_err(map_err)?;
+                rusqlite::params![id, title, text, text_blob, updated_at],
+            )
+            .map_err(map_err)?;
         if changed != 0 {
             tx.execute(
-            "UPDATE org_shares SET republish_dirty = republish_dirty + 1, republish_deferred=0
+                "UPDATE org_shares SET republish_dirty = republish_dirty + 1, republish_deferred=0
               WHERE document_id = ?1 AND state IN ('queued','uploaded','failed')",
-            rusqlite::params![id],
+                rusqlite::params![id],
             )
             .map_err(map_err)?;
         }
@@ -617,7 +636,8 @@ impl Db {
             "UPDATE org_shares SET republish_deferred=1
               WHERE document_id=?1 AND state IN ('queued','uploaded','failed')",
             rusqlite::params![id],
-        ).map_err(map_err)?;
+        )
+        .map_err(map_err)?;
         tx.commit().map_err(map_err)
     }
 
@@ -920,7 +940,6 @@ impl Db {
         ))
     }
 
-
     /// Insert a fresh reserved note-root at `path` (name = `path`, `is_root=1`, unlocked, no parent).
     /// `INSERT OR IGNORE` on the UNIQUE path guards a race, then reads the id back.
     /// Insert the reserved note root at `path`, parented into `parent_id`, as ONE unit.
@@ -1003,9 +1022,7 @@ impl Db {
         )
         .optional()
         .map_err(map_err)?
-        .ok_or_else(|| {
-            AppError::Storage("could not establish the reserved notes root".into())
-        })
+        .ok_or_else(|| AppError::Storage("could not establish the reserved notes root".into()))
     }
 
     pub fn upsert_note(&self, note: &NoteRecord) -> Result<()> {
@@ -1392,8 +1409,7 @@ fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
 mod tests {
     use super::*;
     use crate::storage::models::{
-        Folder, Meeting, MeetingStatus, NoteFolder, RecordingGenerationKey,
-        RecordingMicAssertion,
+        Folder, Meeting, MeetingStatus, NoteFolder, RecordingGenerationKey, RecordingMicAssertion,
     };
 
     const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -1535,7 +1551,9 @@ mod tests {
         let row = db.get_note_row("companion-ok").unwrap().unwrap();
         assert_eq!(row.text, markdown);
         assert_eq!(
-            db.companion_note_for_meeting(&meeting_id).unwrap().as_deref(),
+            db.companion_note_for_meeting(&meeting_id)
+                .unwrap()
+                .as_deref(),
             Some("companion-ok")
         );
         let link_rows: i64 = db
@@ -2157,7 +2175,10 @@ mod tests {
         }
 
         let none = HashSet::new();
-        assert!(db.get_note_if_visible(&meeting_id, &none).unwrap().is_none());
+        assert!(db
+            .get_note_if_visible(&meeting_id, &none)
+            .unwrap()
+            .is_none());
         assert!(db.latest_note_visible(&none).unwrap().is_none());
     }
 

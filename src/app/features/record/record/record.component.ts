@@ -16,7 +16,6 @@ import { IpcService } from "../../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../../core/models";
 import { MicMuteToggleComponent } from "../mic-mute-toggle/mic-mute-toggle.component";
 import { MeetingConversationComponent } from "../meeting-conversation/meeting-conversation.component";
-import { BrainRevealCardComponent } from "../brain-reveal-card/brain-reveal-card.component";
 import { ReTruthCardComponent } from "../re-truth-card/re-truth-card.component";
 import { RecordingPlacementComponent } from "../recording-placement/recording-placement.component";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
@@ -45,11 +44,7 @@ const VAULT_NOTICE_DISMISSED_KEY = "murmur-vault-notice-dismissed";
  *  - `""` / absent    — not probed (an older backend, or a mocked config): render nothing.
  */
 type LiveCaptionsState =
-  | "ready"
-  | "modelMissing"
-  | "pinnedHeavy"
-  | "noModel"
-  | "";
+  "ready" | "modelMissing" | "pinnedHeavy" | "noModel" | "";
 
 @Component({
   selector: "app-record",
@@ -58,7 +53,6 @@ type LiveCaptionsState =
     RouterLink,
     MicMuteToggleComponent,
     MeetingConversationComponent,
-    BrainRevealCardComponent,
     RecordingPlacementComponent,
     ReTruthCardComponent,
   ],
@@ -96,7 +90,6 @@ export class RecordComponent implements OnInit {
   readonly detectedApp = signal<string | null>(null);
   /** Once dismissed, the nudge stays hidden for the rest of this session. */
   private readonly nudgeDismissed = signal(false);
-
   /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
   private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
 
@@ -158,6 +151,9 @@ export class RecordComponent implements OnInit {
    * home). The thread itself subscribes to the wake/result streams regardless.
    */
   readonly showAssistant = computed(() => {
+    if (this.store.stage() === "done") {
+      return false;
+    }
     const c = this.config();
     // Mirror the LIVE role resolver: an explicit roleLiveConnection wins over
     // the legacy brainBackend fallback (Ask=Off compat-writes brainBackend and
@@ -180,8 +176,7 @@ export class RecordComponent implements OnInit {
       this.assistant.manualAskInFlight() ||
       (this.enhanceMode() &&
         this.isProcessing() &&
-        this.assistant.hasPersistedNotes()) ||
-      this.enhanceSettled()
+        this.assistant.hasPersistedNotes())
     );
   });
 
@@ -263,10 +258,11 @@ export class RecordComponent implements OnInit {
    * Dismissed permanently (localStorage — live-found bug, 2026-07-12: this used
    * to be a plain component-local signal, so it "forgot" the dismissal on the
    * very next remount, e.g. navigating away and back to /record within the
-   * same session — mirrors {@link BrainRevealCardComponent}'s one-time-seen
-   * pattern). Re-appears only if a vault gets configured then unset again.
+   * same session. Re-appears only if a vault gets configured then unset again.
    */
-  private readonly vaultNoticeDismissed = signal(this.readVaultNoticeDismissed());
+  private readonly vaultNoticeDismissed = signal(
+    this.readVaultNoticeDismissed(),
+  );
 
   /**
    * Show the calm, non-blocking "no vault set" info notice: only when no vault is configured
@@ -327,20 +323,16 @@ export class RecordComponent implements OnInit {
   readonly downloadingModel = signal(false);
   readonly modelDownloadError = signal<string | null>(null);
 
-  /** Busy but not capturing audio → transcribing / summarizing / exporting. */
+  /** Busy but not capturing audio → transcribing / summarizing / exporting / saved reconciliation. */
   readonly isProcessing = computed(
     () => this.store.isBusy() && !this.store.isRecording(),
   );
 
   /**
    * BOUND the record surface to the viewport (fixed height → the note scrolls
-   * INTERNALLY, nothing spills past the window) whenever the note surface is shown —
-   * recording, an in-flight pipeline, AND the resolved "done" review (the Brain-reveal
-   * / Re-Truth cards now sit ABOVE the note, so the note is always the flex:1 filler
-   * and everything fits). EXCLUDED only when an error banner is up: it renders below
-   * the note and legitimately needs the page to scroll so it stays visible. Idle (no
-   * note surface) stays unbounded (its short content fills the calm min-height). Fixes
-   * the note overflowing off the bottom on smaller screens (2026-07-19).
+   * internally) only while the conversation/editor is mounted. The terminal
+   * result intentionally stays unbounded so its card and optional Re-Truth can
+   * scroll naturally on a short window.
    */
   readonly boundToViewport = computed(
     () => this.showAssistant() && !this.store.error(),
@@ -364,6 +356,7 @@ export class RecordComponent implements OnInit {
       summarizing: "Summarizing",
       exporting: "Exporting",
       saved: "Saved",
+      finalized: "Finalizing",
       done: "Done",
       error: "Error",
     };
@@ -422,7 +415,8 @@ export class RecordComponent implements OnInit {
       // legitimately skips export (locked folder, resummarize on an already-sealed
       // folder) and returns `exportedPath: null` even with a vault set. Only claim
       // "in the vault" when this note's own exportedPath says so.
-      const exported = !this.vaultMissing() && !!this.store.lastNote()?.exportedPath;
+      const exported =
+        !this.vaultMissing() && !!this.store.lastNote()?.exportedPath;
       if (this.enhanceSettled())
         return exported
           ? "Saved ✓ — your enhanced note is in the vault."
@@ -463,6 +457,12 @@ export class RecordComponent implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
+    this.store.enterRecordRoute();
+    // `/record` owns only the terminal review presentation. Clear an old
+    // done/error visit immediately on remount; active capture/finalization is
+    // backend-owned and `resetRoutePresentation()` deliberately preserves it.
+    this.resetRoutePresentation();
+
     // Register the teardown FIRST — before ANY await. This ngOnInit suspends
     // several times below, and the component can be destroyed mid-await (the
     // boot tab-restore navigation in `AppComponent.ngOnInit` replaces the
@@ -476,12 +476,14 @@ export class RecordComponent implements OnInit {
     let destroyed = false;
     this.destroyRef.onDestroy(() => {
       destroyed = true;
+      this.store.leaveRecordRoute();
       if (this.meetingAppPoll !== null) {
         clearInterval(this.meetingAppPoll);
         this.meetingAppPoll = null;
       }
       this.unlistenModelDownload?.();
       this.unlistenModelDownload = null;
+      this.resetRoutePresentation();
     });
     // Live-caption readiness is a DEVICE/DISK fact, not a setting, so it can change while this
     // screen is open — a model download finishing anywhere (Settings, the onboarding wizard, the
@@ -501,12 +503,18 @@ export class RecordComponent implements OnInit {
       // refreshes on the next mount and after this screen's own download action.
     }
     await this.store.init();
+    // On the first app mount `init()` also refreshes the historical last note.
+    // Scrub that idle-only snapshot after init so it cannot become a stale
+    // terminal review; an active recording or pipeline still remains intact.
+    this.resetRoutePresentation();
     // Subscribe the notes/threads store to the wake/result + BOTH tool-trace
     // streams now, regardless of whether the surface is visible yet — otherwise
     // events fired before it renders (or while the config snapshot is stale) drop.
     void this.assistant.init();
     await this.refreshConfig();
-    void this.ipc.outputIsBuiltinSpeakers().then((v) => this.onSpeakers.set(v ?? true));
+    void this.ipc
+      .outputIsBuiltinSpeakers()
+      .then((v) => this.onSpeakers.set(v ?? true));
     this.modelPresent.set(await this.ipc.modelPresent());
     // Stats are secondary — never let a failure here block the record screen.
     try {
@@ -568,9 +576,22 @@ export class RecordComponent implements OnInit {
     }
   }
 
-  /** Nudge primary action — kick off a recording, then let it fade out. */
-  startFromNudge(): void {
-    void this.store.start();
+  /** Every main Record-screen start is explicit Unfiled. */
+  async startRecording(): Promise<void> {
+    if (this.canRecord()) {
+      await this.store.start(null);
+    }
+  }
+
+  /** Clear route-local terminal state and its matching assistant focus together. */
+  private resetRoutePresentation(): void {
+    if (this.store.resetRoutePresentation()) {
+      // `setMeetingId(null)` clears companion identity/focus but deliberately
+      // preserves the in-memory thread. A terminal route reset owns that
+      // presentation too, so purge it before dropping the meeting pointer.
+      this.assistant.clear();
+      this.assistant.setMeetingId(null);
+    }
   }
 
   /** Nudge ghost action — hide it for the rest of this session. */
@@ -600,7 +621,7 @@ export class RecordComponent implements OnInit {
       if (this.store.isRecording()) {
         void this.store.stop();
       } else if (this.canRecord()) {
-        void this.store.start();
+        void this.startRecording();
       }
     }
   }

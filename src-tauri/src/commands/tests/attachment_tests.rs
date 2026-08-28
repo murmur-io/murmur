@@ -548,12 +548,7 @@ fn plaintext_attachment_read_and_exports_refuse_a_later_ambiguous_legacy_split()
     let state = build_state("ambiguous-plaintext-read", Some(&vault));
     meeting_note(&state.db, "ambiguous-plaintext-meeting", "provider one");
     let bytes = png_image(24, 16, None);
-    let attachment = add_png(
-        &state,
-        "meeting",
-        "ambiguous-plaintext-meeting",
-        &bytes,
-    );
+    let attachment = add_png(&state, "meeting", "ambiguous-plaintext-meeting", &bytes);
     split_existing_legacy_meeting(&state.db, "ambiguous-plaintext-meeting");
     let owner = AttachmentOwner::Meeting {
         meeting_id: "ambiguous-plaintext-meeting".into(),
@@ -566,11 +561,7 @@ fn plaintext_attachment_read_and_exports_refuse_a_later_ambiguous_legacy_split()
         Err(AppError::Locked(_))
     ));
     assert!(matches!(
-        attachment_bundle_for_owner(
-            &state,
-            &owner,
-            &HashSet::from([attachment.id.clone()]),
-        ),
+        attachment_bundle_for_owner(&state, &owner, &HashSet::from([attachment.id.clone()]),),
         Err(AppError::Locked(_))
     ));
     assert!(matches!(
@@ -621,11 +612,8 @@ fn genuine_unfiled_meeting_attachment_round_trips_through_every_read_and_export_
     assert_eq!(listed[0].id, attachment_id);
     assert_eq!(listed[0].byte_len, bytes.len() as u64);
 
-    let bundled = attachment_bundle_for_owner(
-        &state,
-        &owner,
-        &HashSet::from([attachment_id.clone()]),
-    )
+    let bundled =
+        attachment_bundle_for_owner(&state, &owner, &HashSet::from([attachment_id.clone()]))
     .expect("genuinely unfiled owner remains bundle-readable");
     assert_eq!(bundled.len(), 1);
     assert_eq!(bundled[0].data, bytes);
@@ -633,12 +621,8 @@ fn genuine_unfiled_meeting_attachment_round_trips_through_every_read_and_export_
     let markdown = format!("![unfiled](murmur-attachment://{attachment_id})");
     let tracked = render_markdown_with_attachments_for_export(&state, &owner, &markdown, &vault)
         .expect("tracked render succeeds for a genuinely unfiled owner");
-    let user = render_markdown_with_attachments_for_user_export(
-        &state,
-        &owner,
-        &markdown,
-        &user_root,
-    )
+    let user =
+        render_markdown_with_attachments_for_user_export(&state, &owner, &markdown, &user_root)
     .expect("explicit export succeeds for a genuinely unfiled owner");
     assert!(tracked.contains("![[Murmur Attachments/"));
     assert!(user.contains("![[Murmur Attachments/"));
@@ -1252,7 +1236,7 @@ fn authored_note_attachment_rekeys_locked_to_open_moves() {
 }
 
 #[test]
-fn meeting_attachment_rekeys_locked_to_open_moves() {
+fn meeting_attachment_filing_refuses_a_session_unlocked_locked_source_without_rekey() {
     let state = build_state("meeting-move", None);
     meeting_note(&state.db, "meeting-a", "# Meeting with image");
     meeting_folder(&state.db, "locked-target");
@@ -1266,23 +1250,26 @@ fn meeting_attachment_rekeys_locked_to_open_moves() {
         .expect("unlock set")
         .insert("locked-target".into());
 
-    move_note_inner_impl(&state, "meeting-a".into(), Some("locked-target".into()))
-        .expect("move meeting into locked folder");
+    move_into_locked_folder(&state, "meeting-a", "locked-target")
+        .expect("legacy auto-file seal into locked folder");
     let owner = AttachmentOwner::Meeting {
         meeting_id: "meeting-a".into(),
         provider_id: "test-provider".into(),
     };
-    let locked = &state.db.list_attachments(&owner).expect("locked row")[0];
+    let locked = state.db.list_attachments(&owner).expect("locked row")[0].clone();
     assert_eq!(locked.data, bytes);
     assert!(locked.data_blob.is_some());
 
-    move_note_inner_impl(&state, "meeting-a".into(), None).expect("move meeting to open root");
-    let opened = &state.db.list_attachments(&owner).expect("open row")[0];
-    assert_eq!(opened.data, bytes);
-    assert!(opened.data_blob.is_none());
+    let err = move_note_inner_impl(&state, "meeting-a".into(), None)
+        .expect_err("session unlock must not authorize destructive filing");
+    assert!(matches!(err, AppError::Locked(_)));
+    assert_eq!(
+        state.db.list_attachments(&owner).expect("retained row"),
+        vec![locked]
+    );
     assert_eq!(
         state.db.folder_for_meeting("meeting-a").expect("folder"),
-        None
+        Some("locked-target".into())
     );
 }
 

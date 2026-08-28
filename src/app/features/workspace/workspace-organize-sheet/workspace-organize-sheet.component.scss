@@ -105,8 +105,66 @@ h4 {
 
 .plan-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-2);
+}
+
+.guidance {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.guidance label {
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.guidance label span {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.guidance-row,
+.selection-summary,
+.selection-summary > span {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.guidance textarea {
+  flex: 1 1 auto;
+  padding: var(--space-2) var(--space-3);
+  resize: vertical;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.guidance textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: var(--space-1);
+}
+
+.selection-summary {
+  justify-content: space-between;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 640px) {
+  .plan-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .guidance-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 .plan-summary > div {
@@ -230,6 +288,26 @@ h4 {
 
 .suggestion {
   color: var(--accent);
+}
+
+.unsealed-warning {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  color: var(--text-secondary);
+  font-size: var(--type-command-caption);
+  line-height: 1.4;
+}
+
+.unsealed-warning-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--warning);
+  font-weight: 650;
 }
 
 .review-copy select {

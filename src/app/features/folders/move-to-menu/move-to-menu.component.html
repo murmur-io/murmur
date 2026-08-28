@@ -19,7 +19,18 @@
     </button>
   </header>
 
-  @if (pending(); as target) {
+  @if (sourceLocked()) {
+    <div class="confirm" role="status">
+      <p class="confirm-title">Remove the folder lock first</p>
+      <p class="confirm-body">
+        This recording is still encrypted at rest. Remove its folder lock before moving it to
+        another folder.
+      </p>
+      <div class="confirm-actions">
+        <button type="button" class="btn btn-primary" (click)="closed.emit()">Close</button>
+      </div>
+    </div>
+  } @else if (pending(); as target) {
     <!-- Load-bearing confirm for a cross-encryption-boundary move -->
     <div class="confirm" role="alertdialog" aria-modal="true">
       <p class="confirm-title">{{ confirmTitle() }}</p>

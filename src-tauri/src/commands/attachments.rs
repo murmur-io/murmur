@@ -1,7 +1,7 @@
 //! Gated note-image attachment commands and the shared E2EE-bundle seam.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1083,6 +1083,648 @@ pub(crate) fn validate_attachment_references_before_save(
     Ok(())
 }
 
+struct AttachmentExportFileSnapshot {
+    path: std::path::PathBuf,
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    permissions: std::fs::Permissions,
+    exact: crate::export::ExactFileLink,
+}
+
+struct CreatedAttachmentExport {
+    link: crate::export::ExactFileLink,
+}
+
+struct AttachmentExportRollbackEntry {
+    id: String,
+    owner: AttachmentOwner,
+    byte_len: u64,
+    sha256: [u8; 32],
+    before_exported_path: Option<String>,
+    before_files: Vec<AttachmentExportFileSnapshot>,
+    staged_path: Option<std::path::PathBuf>,
+    staged_before_files: Vec<AttachmentExportFileSnapshot>,
+    created_files: Vec<CreatedAttachmentExport>,
+}
+
+/// Exact pre-publication receipts for the attachment side of finalized-recording filing. Entries
+/// contain plaintext only in zeroizing memory and never cross IPC or the egress/logging seams.
+pub(crate) struct AttachmentExportRollbackJournal {
+    attempt_id: String,
+    entries: Vec<AttachmentExportRollbackEntry>,
+    vault: Option<crate::export::ExactVault>,
+}
+
+impl Default for AttachmentExportRollbackJournal {
+    fn default() -> Self {
+        Self::with_attempt_id(uuid::Uuid::new_v4().to_string())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestAttachmentWriteFault {
+    PartialWriteUnknownHardlinkAndReplacement,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ATTACHMENT_WRITE_FAULT: std::cell::Cell<Option<TestAttachmentWriteFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_attachment_partial_write_fault() {
+    TEST_ATTACHMENT_WRITE_FAULT.with(|slot| {
+        slot.set(Some(
+            TestAttachmentWriteFault::PartialWriteUnknownHardlinkAndReplacement,
+        ));
+    });
+}
+
+#[cfg(test)]
+fn take_test_attachment_write_fault() -> Option<TestAttachmentWriteFault> {
+    TEST_ATTACHMENT_WRITE_FAULT.with(|slot| slot.take())
+}
+
+impl AttachmentExportRollbackJournal {
+    pub(crate) fn with_attempt_id(attempt_id: String) -> Self {
+        Self {
+            attempt_id,
+            entries: Vec::new(),
+            vault: None,
+        }
+    }
+
+    pub(crate) fn configure_vault(
+        &mut self,
+        vault_root: &std::path::Path,
+    ) -> Result<crate::export::ExactVault, AppError> {
+        if let Some(vault) = self.vault.as_ref() {
+            if vault.configured_path() != vault_root {
+                return Err(AppError::Export(
+                    "one attachment filing journal cannot span two vault roots".into(),
+                ));
+            }
+            return Ok(vault.clone());
+        }
+        let vault = crate::export::ExactVault::open(vault_root)?;
+        self.vault = Some(vault.clone());
+        Ok(vault)
+    }
+
+    fn snapshot_file_if_present(
+        path: &std::path::Path,
+        expected_len: u64,
+        expected_sha256: &[u8; 32],
+    ) -> Result<Option<AttachmentExportFileSnapshot>, AppError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(exact) = crate::export::open_exact_absolute_existing_file(path)? else {
+            return Ok(None);
+        };
+        let (bytes, before) = exact.read_stable_bytes(expected_len)?;
+        if before.nlink() != 1 || before.len() != expected_len {
+            return Err(AppError::Export(
+                "attachment export rollback target is not a regular file".into(),
+            ));
+        }
+        if bytes.len() as u64 != expected_len
+            || Sha256::digest(&bytes).as_slice() != expected_sha256
+        {
+            return Err(AppError::Export(
+                "attachment rollback snapshot does not match canonical SQLCipher integrity".into(),
+            ));
+        }
+        Ok(Some(AttachmentExportFileSnapshot {
+            path: path.to_path_buf(),
+            bytes: zeroize::Zeroizing::new(bytes),
+            permissions: before.permissions(),
+            exact,
+        }))
+    }
+
+    fn snapshot_projection(
+        path: &std::path::Path,
+        attachment_id: &str,
+        expected_len: u64,
+        expected_sha256: &[u8; 32],
+    ) -> Result<Vec<AttachmentExportFileSnapshot>, AppError> {
+        let mut files = Vec::new();
+        if let Some(snapshot) = Self::snapshot_file_if_present(path, expected_len, expected_sha256)?
+        {
+            files.push(snapshot);
+        }
+        let twin = attachment_export_temp_path(path, attachment_id);
+        if let Some(snapshot) =
+            Self::snapshot_file_if_present(&twin, expected_len, expected_sha256)?
+        {
+            files.push(snapshot);
+        }
+        Ok(files)
+    }
+
+    fn capture_before(&mut self, row: &AttachmentRecord) -> Result<(), AppError> {
+        if self.entries.iter().any(|entry| entry.id == row.id) {
+            return Ok(());
+        }
+        let before_files = row
+            .exported_path
+            .as_deref()
+            .map(|path| {
+                Self::snapshot_projection(
+                    std::path::Path::new(path),
+                    &row.id,
+                    row.byte_len,
+                    &row.sha256,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        self.entries.push(AttachmentExportRollbackEntry {
+            id: row.id.clone(),
+            owner: row.owner.clone(),
+            byte_len: row.byte_len,
+            sha256: row.sha256,
+            before_exported_path: row.exported_path.clone(),
+            before_files,
+            staged_path: None,
+            staged_before_files: Vec::new(),
+            created_files: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn prepare_staged(
+        &mut self,
+        row: &AttachmentRecord,
+        path: &std::path::Path,
+    ) -> Result<(), AppError> {
+        let snapshots = Self::snapshot_projection(path, &row.id, row.byte_len, &row.sha256)?;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == row.id)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal missed its pre-stage receipt".into())
+            })?;
+        if let Some(existing) = entry.staged_path.as_deref() {
+            if existing != path {
+                return Err(AppError::Storage(
+                    "one attachment filing attempt selected two projection paths".into(),
+                ));
+            }
+            return Ok(());
+        }
+        entry.staged_path = Some(path.to_path_buf());
+        entry.staged_before_files = snapshots;
+        Ok(())
+    }
+
+    fn remove_snapshotted_staged_file(
+        &self,
+        row: &AttachmentRecord,
+        path: &std::path::Path,
+    ) -> Result<bool, AppError> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == row.id)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal missed its staged snapshot".into())
+            })?;
+        let Some(snapshot) = entry
+            .staged_before_files
+            .iter()
+            .find(|snapshot| snapshot.path == path)
+        else {
+            return Ok(false);
+        };
+        crate::export::remove_exact_created_links(
+            std::slice::from_ref(&snapshot.exact),
+            snapshot.bytes.len() as u64,
+            &entry.sha256,
+        )?;
+        Ok(true)
+    }
+
+    fn remove_captured_before_projection(&self, row: &AttachmentRecord) -> Result<(), AppError> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == row.id)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal missed its old-vault snapshot".into())
+            })?;
+        let mut groups =
+            std::collections::HashMap::<(u64, u64), Vec<&crate::export::ExactFileLink>>::new();
+        for snapshot in &entry.before_files {
+            groups
+                .entry(snapshot.exact.identity())
+                .or_default()
+                .push(&snapshot.exact);
+        }
+        for group in groups.values() {
+            crate::export::remove_exact_created_link_refs(group, entry.byte_len, &entry.sha256)?;
+        }
+        Ok(())
+    }
+
+    fn mark_created_link(
+        &mut self,
+        row: &AttachmentRecord,
+        link: &mut Option<crate::export::ExactFileLink>,
+    ) -> Result<(), AppError> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == row.id)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal missed its creation receipt".into())
+            })?;
+        if entry.created_files.iter().any(|created| {
+            link.as_ref()
+                .is_some_and(|link| created.link.path() == link.path())
+        }) {
+            return Err(AppError::Storage(
+                "attachment filing journal received duplicate creation authority".into(),
+            ));
+        }
+        let link = link.take().ok_or_else(|| {
+            AppError::Storage("attachment creation authority was already consumed".into())
+        })?;
+        entry.created_files.push(CreatedAttachmentExport { link });
+        Ok(())
+    }
+
+    fn created_link(
+        &self,
+        row: &AttachmentRecord,
+        path: &std::path::Path,
+    ) -> Result<&crate::export::ExactFileLink, AppError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == row.id)
+            .and_then(|entry| {
+                entry
+                    .created_files
+                    .iter()
+                    .find(|created| created.link.path() == path)
+            })
+            .map(|created| &created.link)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal lost exact creation authority".into())
+            })
+    }
+
+    fn created_link_mut(
+        &mut self,
+        row: &AttachmentRecord,
+        path: &std::path::Path,
+    ) -> Result<&mut crate::export::ExactFileLink, AppError> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == row.id)
+            .and_then(|entry| {
+                entry
+                    .created_files
+                    .iter_mut()
+                    .find(|created| created.link.path() == path)
+            })
+            .map(|created| &mut created.link)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal lost exact creation authority".into())
+            })
+    }
+
+    fn staged_snapshot_link(
+        &self,
+        row: &AttachmentRecord,
+        path: &std::path::Path,
+    ) -> Result<&crate::export::ExactFileLink, AppError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == row.id)
+            .and_then(|entry| {
+                entry
+                    .staged_before_files
+                    .iter()
+                    .find(|snapshot| snapshot.path == path)
+            })
+            .map(|snapshot| &snapshot.exact)
+            .ok_or_else(|| {
+                AppError::Storage("attachment filing journal lost its staged snapshot".into())
+            })
+    }
+
+    fn staged_snapshot_link_optional(
+        &self,
+        row: &AttachmentRecord,
+        path: &std::path::Path,
+    ) -> Option<&crate::export::ExactFileLink> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == row.id)
+            .and_then(|entry| {
+                entry
+                    .staged_before_files
+                    .iter()
+                    .find(|snapshot| snapshot.path == path)
+            })
+            .map(|snapshot| &snapshot.exact)
+    }
+
+    fn snapshot_matches_current(snapshot: &AttachmentExportFileSnapshot) -> Result<bool, AppError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !snapshot.exact.is_present()? {
+            return Ok(false);
+        }
+        let digest: [u8; 32] = Sha256::digest(snapshot.bytes.as_slice()).into();
+        match snapshot
+            .exact
+            .read_stable_bytes(snapshot.bytes.len() as u64)
+        {
+            Ok((bytes, metadata)) => {
+                if metadata.permissions().mode() != snapshot.permissions.mode()
+                    || bytes.as_slice() != snapshot.bytes.as_slice()
+                    || Sha256::digest(&bytes).as_slice() != digest
+                {
+                    return Err(AppError::Export(
+                        "refusing to overwrite a changed attachment rollback target".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(true)
+    }
+
+    fn restore_snapshot(
+        state: &AppState,
+        attempt_id: &str,
+        entry: &AttachmentExportRollbackEntry,
+        snapshot: &AttachmentExportFileSnapshot,
+    ) -> Result<(), AppError> {
+        use std::os::unix::fs::MetadataExt;
+
+        if Self::snapshot_matches_current(snapshot)? {
+            return Ok(());
+        }
+        let projection_id = uuid::Uuid::new_v4().to_string();
+        let path = snapshot
+            .path
+            .to_str()
+            .ok_or_else(|| AppError::Export("attachment restore path is not valid UTF-8".into()))?;
+        let folder_id = state
+            .db
+            .folder_for_attachment_owner(&entry.owner)?
+            .unwrap_or_default();
+        state
+            .db
+            .reserve_filing_projection(&crate::storage::FilingProjectionReservation {
+                attempt_id,
+                projection_id: &projection_id,
+                operation_kind: "recording_filing_attachment_restore",
+                owner_kind: "attachment",
+                owner_id: &entry.id,
+                provider_id: "",
+                source_folder_id: &folder_id,
+                target_folder_id: &folder_id,
+                source_path: entry.before_exported_path.as_deref(),
+                temp_path: path,
+                final_path: Some(path),
+                expected_len: snapshot.bytes.len() as u64,
+                expected_sha256: &entry.sha256,
+            })?;
+        let mut ownership = match snapshot.exact.create_replacement(0o600) {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                state
+                    .db
+                    .clear_filing_projection(attempt_id, &projection_id)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = state.db.bind_filing_projection_identity(
+            attempt_id,
+            &projection_id,
+            ownership.identity().0,
+            ownership.identity().1,
+        ) {
+            let cleanup = crate::export::remove_exact_created_link(&ownership, 1);
+            if cleanup.is_ok() {
+                state
+                    .db
+                    .clear_filing_projection(attempt_id, &projection_id)?;
+            }
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => AppError::Storage(format!(
+                    "{error}; unbound attachment restore cleanup failed: {cleanup}"
+                )),
+            });
+        }
+        let restore = (|| -> Result<(), AppError> {
+            ownership
+                .file_mut()
+                .write_all(&snapshot.bytes)
+                .and_then(|()| {
+                    ownership
+                        .file_mut()
+                        .set_permissions(snapshot.permissions.clone())
+                })
+                .and_then(|()| ownership.file_mut().sync_all())
+                .map_err(|error| {
+                    AppError::Export(format!(
+                        "could not restore an attachment rollback target: {error}"
+                    ))
+                })?;
+            ownership
+                .file_mut()
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| {
+                    AppError::Export(format!("seek restored attachment failed: {error}"))
+                })?;
+            let mut readback = Vec::with_capacity(snapshot.bytes.len());
+            ownership
+                .file_mut()
+                .read_to_end(&mut readback)
+                .map_err(|error| {
+                    AppError::Export(format!("read back restored attachment failed: {error}"))
+                })?;
+            let metadata = ownership.file_mut().metadata().map_err(|error| {
+                AppError::Export(format!("stat restored attachment failed: {error}"))
+            })?;
+            if metadata.dev() != ownership.identity().0
+                || metadata.ino() != ownership.identity().1
+                || metadata.nlink() != 1
+                || readback.as_slice() != snapshot.bytes.as_slice()
+            {
+                return Err(AppError::Export(
+                    "restored attachment failed exact-inode readback verification".into(),
+                ));
+            }
+            ownership.sync_parent()
+        })();
+        if let Err(original) = restore {
+            return match crate::export::remove_exact_created_link(&ownership, 1) {
+                Ok(()) => {
+                    state
+                        .db
+                        .clear_filing_projection(attempt_id, &projection_id)?;
+                    Err(original)
+                }
+                Err(cleanup) => match ownership.scrub_attempt_owned_plaintext() {
+                    Ok(()) => {
+                        state
+                            .db
+                            .clear_filing_projection(attempt_id, &projection_id)?;
+                        Err(AppError::Storage(format!(
+                            "{original}; partial attachment restore unlink refused ({cleanup}); retained inode scrubbed"
+                        )))
+                    }
+                    Err(scrub) => Err(AppError::Storage(format!(
+                        "{original}; partial attachment restore cleanup failed: {cleanup}; retained-inode scrub failed: {scrub}"
+                    ))),
+                },
+            };
+        }
+        state
+            .db
+            .mark_filing_projection_published(attempt_id, &projection_id)?;
+        Ok(())
+    }
+
+    fn rollback_entry(
+        &self,
+        state: &AppState,
+        entry: &AttachmentExportRollbackEntry,
+    ) -> Result<(), AppError> {
+        let current_path = state.db.attachment_exported_path(&entry.id)?;
+        let staged_text = entry
+            .staged_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+        if current_path != entry.before_exported_path
+            && current_path != staged_text
+            && current_path.is_some()
+        {
+            return Err(AppError::Export(
+                "attachment projection changed concurrently during filing rollback".into(),
+            ));
+        }
+
+        // A deterministic temp can appear in both sets. `before_files` is the authoritative
+        // pre-attempt inode; a staged snapshot may intentionally be displaced by publication and
+        // must never replace that rollback authority merely because sorting changed tie order.
+        let mut snapshots_by_path = std::collections::BTreeMap::new();
+        for snapshot in &entry.before_files {
+            snapshots_by_path.insert(snapshot.path.clone(), snapshot);
+        }
+        for snapshot in &entry.staged_before_files {
+            snapshots_by_path
+                .entry(snapshot.path.clone())
+                .or_insert(snapshot);
+        }
+        let mut seen_snapshot_inodes = std::collections::HashSet::new();
+        let snapshots = snapshots_by_path
+            .into_values()
+            .filter(|snapshot| seen_snapshot_inodes.insert(snapshot.exact.identity()))
+            .collect::<Vec<_>>();
+        let mut preflight_failures = Vec::new();
+        for snapshot in &snapshots {
+            if let Err(error) = Self::snapshot_matches_current(snapshot) {
+                preflight_failures.push(format!("{}: {error}", snapshot.path.display()));
+            }
+        }
+
+        let mut created_groups =
+            std::collections::HashMap::<(u64, u64), Vec<&crate::export::ExactFileLink>>::new();
+        for created in &entry.created_files {
+            created_groups
+                .entry(created.link.identity())
+                .or_default()
+                .push(&created.link);
+        }
+        if !preflight_failures.is_empty() {
+            return Err(AppError::Export(format!(
+                "attachment rollback preflight failed: {}",
+                preflight_failures.join("; ")
+            )));
+        }
+
+        let mut removal_failures = Vec::new();
+        for links in created_groups.values() {
+            if let Err(error) =
+                crate::export::remove_exact_created_link_refs(links, entry.byte_len, &entry.sha256)
+            {
+                let scrub = links
+                    .first()
+                    .ok_or_else(|| {
+                        AppError::Storage("attachment rollback group lost its exact link".into())
+                    })?
+                    .scrub_attempt_owned_plaintext();
+                if let Err(scrub) = scrub {
+                    removal_failures.push(format!(
+                        "{error}; exact attachment plaintext scrub also failed: {scrub}"
+                    ));
+                }
+            }
+        }
+        if !removal_failures.is_empty() {
+            return Err(AppError::Export(format!(
+                "attachment rollback removal failed: {}",
+                removal_failures.join("; ")
+            )));
+        }
+
+        // Fail closed while old projections are recreated. The canonical row must not point at a
+        // just-created empty/partial inode; only verified readback below restores the prior path.
+        state.db.set_attachment_exported_path(&entry.id, None)?;
+        let mut restore_failures = Vec::new();
+        for snapshot in snapshots {
+            if let Err(error) = Self::restore_snapshot(state, &self.attempt_id, entry, snapshot) {
+                restore_failures.push(format!("{}: {error}", snapshot.path.display()));
+            }
+        }
+        if !restore_failures.is_empty() {
+            return Err(AppError::Export(format!(
+                "attachment rollback restore failed: {}",
+                restore_failures.join("; ")
+            )));
+        }
+        state.db.promote_attachment_restore_and_clear(
+            &self.attempt_id,
+            &entry.id,
+            entry.before_exported_path.as_deref(),
+        )?;
+        if state.db.attachment_exported_path(&entry.id)? != entry.before_exported_path {
+            return Err(AppError::Storage(
+                "attachment rollback did not restore its canonical path".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Attempt every attachment receipt in reverse publication order and surface all failures.
+    pub(crate) fn rollback(&self, state: &AppState) -> Result<(), AppError> {
+        let mut failures = Vec::new();
+        for entry in self.entries.iter().rev() {
+            if let Err(error) = self.rollback_entry(state, entry) {
+                failures.push(format!("{}: {error}", entry.id));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Export(format!(
+                "one or more attachment projections could not be rolled back: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+}
+
 /// Write every referenced attachment first, then return Obsidian-native markdown. The caller writes
 /// that markdown only after this succeeds and hashes the returned text, not the canonical DB text.
 #[cfg(test)]
@@ -1098,15 +1740,7 @@ pub(crate) fn render_markdown_with_attachments_for_export(
         return Ok(markdown.to_string());
     }
     gate_attachment_owner(state, owner)?;
-    render_markdown_with_attachment_markers(
-        state,
-        owner,
-        markdown,
-        vault_root,
-        markers,
-        true,
-        AttachmentRenderAuthorization::OwnerGate,
-    )
+    render_markdown_with_attachment_markers(state, owner, markdown, vault_root, markers, true, None)
 }
 
 /// Explicit "Save Markdown…" export. Its image copies are user-owned, just like the selected
@@ -1150,7 +1784,7 @@ pub(crate) fn render_markdown_with_attachments_for_user_export_under_lifecycle_a
         export_root,
         markers,
         false,
-        AttachmentRenderAuthorization::OwnerGate,
+        None,
     )
 }
 
@@ -1166,6 +1800,23 @@ pub(crate) fn render_markdown_with_attachments_for_export_under_lifecycle_author
     if markers.is_empty() {
         return Ok(markdown.to_string());
     }
+    render_markdown_with_attachment_markers(state, owner, markdown, vault_root, markers, true, None)
+}
+
+/// Filing-only renderer. Its journal is updated at the exact metadata/write/link seams so a later
+/// bundle-stage or SQLite failure can restore the attachment projection without guessing which
+/// files this attempt created.
+pub(crate) fn render_markdown_with_attachments_for_export_with_rollback_journal(
+    state: &AppState,
+    owner: &AttachmentOwner,
+    markdown: &str,
+    vault_root: &std::path::Path,
+    journal: &mut AttachmentExportRollbackJournal,
+) -> Result<String, AppError> {
+    let markers = parse_attachment_markers(markdown)?;
+    if markers.is_empty() {
+        return Ok(markdown.to_string());
+    }
     render_markdown_with_attachment_markers(
         state,
         owner,
@@ -1173,12 +1824,8 @@ pub(crate) fn render_markdown_with_attachments_for_export_under_lifecycle_author
         vault_root,
         markers,
         true,
-        AttachmentRenderAuthorization::OwnerGate,
+        Some(journal),
     )
-}
-
-enum AttachmentRenderAuthorization {
-    OwnerGate,
 }
 
 fn render_markdown_with_attachment_markers(
@@ -1188,17 +1835,21 @@ fn render_markdown_with_attachment_markers(
     vault_root: &std::path::Path,
     markers: Vec<AttachmentMarker>,
     tracked: bool,
-    authorization: AttachmentRenderAuthorization,
+    mut rollback_journal: Option<&mut AttachmentExportRollbackJournal>,
 ) -> Result<String, AppError> {
     let ids: HashSet<String> = markers.iter().map(|marker| marker.id.clone()).collect();
     let rows = state.db.list_referenced_attachments(owner, &ids)?;
     let mut names = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        let data = match authorization {
-            AttachmentRenderAuthorization::OwnerGate => plaintext_attachment_data(state, &row)?,
-        };
+        let data = plaintext_attachment_data(state, &row)?;
         let name = if tracked {
-            ensure_attachment_exported(state, &row, &data, vault_root)?
+            ensure_attachment_exported(
+                state,
+                &row,
+                &data,
+                vault_root,
+                rollback_journal.as_deref_mut(),
+            )?
         } else {
             ensure_user_owned_attachment_export(&row, &data, vault_root)?
         };
@@ -1226,10 +1877,19 @@ fn ensure_attachment_exported(
     row: &AttachmentRecord,
     data: &[u8],
     vault_root: &std::path::Path,
+    mut rollback_journal: Option<&mut AttachmentExportRollbackJournal>,
 ) -> Result<String, AppError> {
+    let exact_vault = if let Some(journal) = rollback_journal.as_deref_mut() {
+        journal.configure_vault(vault_root)?
+    } else {
+        crate::export::ExactVault::open(vault_root)?
+    };
+    if let Some(journal) = rollback_journal.as_deref_mut() {
+        journal.capture_before(row)?;
+    }
     let dir = assert_in_vault(vault_root, std::path::Path::new("Murmur Attachments"))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| AppError::Export(format!("create attachment export dir failed: {e}")))?;
+    exact_vault.ensure_directory(&dir)?;
+    let attachment_dir_identity = exact_vault.directory_identity(&dir)?;
     let desired = if let Some(existing) = row.exported_path.as_deref() {
         let path = std::path::PathBuf::from(existing);
         if let Ok(relative) = path.strip_prefix(vault_root) {
@@ -1242,37 +1902,52 @@ fn ensure_attachment_exported(
             // Once a path is tracked, modified bytes must stay tracked and block lifecycle
             // operations. Publishing a suffix and forgetting this path would leave private
             // plaintext outside lock.
-            verify_tracked_export_pair(
-                &verified,
-                &row.id,
-                row.byte_len,
-                &row.sha256,
-                "could not reuse the tracked exported image",
-            )?;
+            match exact_vault.existing_bytes_match(&verified, data)? {
+                Some(true) => {}
+                Some(false) | None => {
+                    return Err(AppError::Export(
+                        "could not reuse the tracked exported image: exact bytes are missing or changed"
+                            .into(),
+                    ))
+                }
+            }
             verified
         } else {
             // The configured vault changed. Retire the old app-owned replica while it is still
             // durably tracked, then start a new lifecycle in the current vault. A user edit blocks
             // this transition and stays preserved/tracked rather than becoming an orphan.
-            remove_attachment_exports(
-                std::slice::from_ref(row),
-                "could not retire the attachment export from the previous vault",
-            )?;
+            if let Some(journal) = rollback_journal.as_deref_mut() {
+                journal.remove_captured_before_projection(row)?;
+            } else {
+                remove_tracked_attachment_projection_exact(row)?;
+            }
             state.db.set_attachment_exported_path(&row.id, None)?;
-            choose_attachment_export_path(&dir, row, data)?
+            choose_attachment_export_path_exact(&exact_vault, &dir, row, data)?
         }
     } else {
-        choose_attachment_export_path(&dir, row, data)?
+        choose_attachment_export_path_exact(&exact_vault, &dir, row, data)?
     };
     let desired_text = desired
         .to_str()
         .ok_or_else(|| AppError::Export("attachment export path is not valid UTF-8".into()))?;
+    if let Some(journal) = rollback_journal.as_deref_mut() {
+        journal.prepare_staged(row, &desired)?;
+    }
     // LOAD-BEARING ordering: durable tracking precedes the first plaintext temp/write/link. Any
     // crash after this line is recoverable from `exported_path` plus the deterministic temp name.
     state
         .db
         .set_attachment_exported_path(&row.id, Some(desired_text))?;
-    publish_tracked_attachment(&desired, row, data)?;
+    exact_vault.verify_directory_identity(&dir, attachment_dir_identity)?;
+    publish_tracked_attachment(
+        state,
+        &exact_vault,
+        attachment_dir_identity,
+        &desired,
+        row,
+        data,
+        rollback_journal,
+    )?;
     desired
         .file_name()
         .and_then(|n| n.to_str())
@@ -1281,60 +1956,396 @@ fn ensure_attachment_exported(
 }
 
 fn publish_tracked_attachment(
+    state: &AppState,
+    vault: &crate::export::ExactVault,
+    directory_identity: (u64, u64),
     desired: &std::path::Path,
     row: &AttachmentRecord,
     data: &[u8],
+    rollback_journal: Option<&mut AttachmentExportRollbackJournal>,
 ) -> Result<(), AppError> {
-    verify_tracked_export_pair(
-        desired,
-        &row.id,
-        row.byte_len,
-        &row.sha256,
-        "could not publish the tracked exported image",
-    )?;
+    if vault.existing_bytes_match(desired, data)? == Some(false) {
+        return Err(AppError::Export(
+            "could not publish the tracked exported image: destination bytes changed".into(),
+        ));
+    }
     let tmp = attachment_export_temp_path(desired, &row.id);
-    if std::fs::symlink_metadata(desired).is_ok() {
-        remove_file_if_present(&tmp, "remove recovered attachment temp failed")?;
+    if let Some(journal) = rollback_journal {
+        return publish_tracked_attachment_journaled(
+            state,
+            vault,
+            directory_identity,
+            desired,
+            &tmp,
+            row,
+            data,
+            journal,
+        );
+    }
+    if vault.existing_bytes_match(desired, data)? == Some(true) {
+        if let Some(link) = vault.open_existing_file(&tmp)? {
+            crate::export::remove_exact_verified_link(&link, 1, row.byte_len, &row.sha256)?;
+        }
         return Ok(());
     }
 
-    if std::fs::symlink_metadata(&tmp).is_err() {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| AppError::Export(format!("create attachment temp failed: {e}")))?;
-        file.write_all(data)
-            .and_then(|()| file.sync_all())
-            .map_err(|e| AppError::Export(format!("write attachment export failed: {e}")))?;
-    }
-    // A crash may leave the deterministic temp behind. It was verified above, so linking it is a
-    // safe resume rather than an overwrite.
-    match std::fs::hard_link(&tmp, desired) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_tracked_export_file(
-                desired,
-                row.byte_len,
-                &row.sha256,
-                "attachment export path raced with another file",
-            )?;
+    let mut temp_link = if let Some(link) = vault.open_existing_file(&tmp)? {
+        let (bytes, _) = link.read_stable_bytes(row.byte_len)?;
+        if bytes.as_slice() != data {
+            return Err(AppError::Export(
+                "recovered tracked attachment temp has changed bytes".into(),
+            ));
         }
-        Err(e) => {
+        link
+    } else {
+        vault.verify_directory_identity(
+            desired.parent().ok_or_else(|| {
+                AppError::Export("attachment export has no parent directory".into())
+            })?,
+            directory_identity,
+        )?;
+        let mut link = vault.create_file(&tmp, 0o600)?;
+        let write_result = link
+            .file_mut()
+            .write_all(data)
+            .and_then(|()| link.file_mut().sync_all());
+        if let Err(error) = write_result {
+            return Err(remove_or_scrub_attempt_owned(
+                &link,
+                AppError::Export(format!("write attachment export failed: {error}")),
+                "partial attachment temp",
+            ));
+        }
+        link
+    };
+    match temp_link.publish_exclusive(desired) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if vault.existing_bytes_match(desired, data)? != Some(true) {
+                return Err(AppError::Export(
+                    "attachment export path raced with different bytes".into(),
+                ));
+            }
+            crate::export::remove_exact_verified_link(&temp_link, 1, row.byte_len, &row.sha256)?;
+            return Ok(());
+        }
+        Err(error) => {
             return Err(AppError::Export(format!(
-                "publish attachment export failed: {e}"
+                "publish exact attachment export failed: {error}"
             )))
         }
     }
-    sync_export_directory(desired)?;
-    remove_file_if_present(&tmp, "remove attachment temp failed")?;
-    sync_export_directory(desired)?;
-    verify_tracked_export_file(
-        desired,
+    temp_link.sync_parent()?;
+    vault.verify_directory_identity(
+        desired
+            .parent()
+            .ok_or_else(|| AppError::Export("attachment export has no parent directory".into()))?,
+        directory_identity,
+    )?;
+    let (bytes, _) = temp_link.read_stable_bytes(row.byte_len)?;
+    if bytes.as_slice() != data {
+        return Err(AppError::Export(
+            "published attachment failed exact readback".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_or_scrub_attempt_owned(
+    link: &crate::export::ExactFileLink,
+    original: AppError,
+    context: &str,
+) -> AppError {
+    match crate::export::remove_exact_created_link(link, 1) {
+        Ok(()) => original,
+        Err(cleanup) => match link.scrub_attempt_owned_plaintext() {
+            Ok(()) => AppError::Storage(format!(
+                "{original}; {context} unlink refused ({cleanup}); retained inode scrubbed"
+            )),
+            Err(scrub) => AppError::Storage(format!(
+                "{original}; {context} cleanup failed: {cleanup}; retained-inode scrub failed: {scrub}"
+            )),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_tracked_attachment_journaled(
+    state: &AppState,
+    vault: &crate::export::ExactVault,
+    directory_identity: (u64, u64),
+    desired: &std::path::Path,
+    tmp: &std::path::Path,
+    row: &AttachmentRecord,
+    data: &[u8],
+    journal: &mut AttachmentExportRollbackJournal,
+) -> Result<(), AppError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if vault.existing_bytes_match(desired, data)? == Some(true) {
+        if !journal.remove_snapshotted_staged_file(row, tmp)?
+            && vault.open_existing_file(tmp)?.is_some()
+        {
+            return Err(AppError::Export(
+                "recovered attachment temp exists without exact snapshot authority".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let temp_was_created = journal.staged_snapshot_link_optional(row, tmp).is_none();
+    let mut durable_projection_id = None;
+    if temp_was_created {
+        vault.verify_directory_identity(
+            desired.parent().ok_or_else(|| {
+                AppError::Export("attachment export has no parent directory".into())
+            })?,
+            directory_identity,
+        )?;
+        let projection_id = uuid::Uuid::new_v4().to_string();
+        let temp_path = tmp.to_str().ok_or_else(|| {
+            AppError::Export("attachment filing temp path is not valid UTF-8".into())
+        })?;
+        let final_path = desired.to_str().ok_or_else(|| {
+            AppError::Export("attachment filing target path is not valid UTF-8".into())
+        })?;
+        let folder_id = state
+            .db
+            .folder_for_attachment_owner(&row.owner)?
+            .unwrap_or_default();
+        state
+            .db
+            .reserve_filing_projection(&crate::storage::FilingProjectionReservation {
+                attempt_id: &journal.attempt_id,
+                projection_id: &projection_id,
+                operation_kind: "recording_filing",
+                owner_kind: "attachment",
+                owner_id: &row.id,
+                provider_id: "",
+                source_folder_id: &folder_id,
+                target_folder_id: &folder_id,
+                source_path: row.exported_path.as_deref(),
+                temp_path,
+                final_path: Some(final_path),
+                expected_len: row.byte_len,
+                expected_sha256: &row.sha256,
+            })?;
+        let link = match vault.create_file(tmp, 0o600) {
+            Ok(link) => link,
+            Err(error) => {
+                state
+                    .db
+                    .clear_filing_projection(&journal.attempt_id, &projection_id)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = state.db.bind_filing_projection_identity(
+            &journal.attempt_id,
+            &projection_id,
+            link.identity().0,
+            link.identity().1,
+        ) {
+            let cleanup = crate::export::remove_exact_created_link(&link, 1);
+            if cleanup.is_ok() {
+                state
+                    .db
+                    .clear_filing_projection(&journal.attempt_id, &projection_id)?;
+            }
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => AppError::Storage(format!(
+                    "{error}; unbound attachment filing temp cleanup failed: {cleanup}"
+                )),
+            });
+        }
+        durable_projection_id = Some(projection_id);
+        let mut authority = Some(link);
+        if let Err(original) = journal.mark_created_link(row, &mut authority) {
+            let cleanup = authority
+                .as_ref()
+                .map(|link| crate::export::remove_exact_created_link(link, 1))
+                .transpose();
+            return Err(match cleanup {
+                Ok(_) => original,
+                Err(cleanup) => AppError::Storage(format!(
+                    "{original}; unjournaled exact attachment temp cleanup failed: {cleanup}"
+                )),
+            });
+        }
+        #[cfg(test)]
+        let write_fault = take_test_attachment_write_fault();
+        #[cfg(test)]
+        let write_result = if matches!(
+            write_fault,
+            Some(TestAttachmentWriteFault::PartialWriteUnknownHardlinkAndReplacement)
+        ) {
+            let prefix_len = data.len().max(1).div_ceil(2).min(data.len());
+            {
+                let link = journal.created_link_mut(row, tmp)?;
+                link.file_mut()
+                    .write_all(&data[..prefix_len])
+                    .and_then(|()| link.file_mut().sync_all())
+                    .map_err(|error| {
+                        AppError::Export(format!("inject partial attachment write failed: {error}"))
+                    })?;
+            }
+            let hostile = tmp.with_file_name(format!(
+                ".murmur-test-partial-attachment-hardlink-{}",
+                row.id
+            ));
+            let hostile_authority = journal
+                .created_link(row, tmp)?
+                .hard_link_sibling(&hostile)
+                .map_err(|error| {
+                    AppError::Export(format!("inject attachment hardlink failed: {error}"))
+                })?;
+            drop(hostile_authority);
+            std::fs::remove_file(tmp).map_err(|error| {
+                AppError::Export(format!("inject attachment name removal failed: {error}"))
+            })?;
+            std::fs::write(tmp, b"concurrent replacement").map_err(|error| {
+                AppError::Export(format!(
+                    "inject attachment name replacement failed: {error}"
+                ))
+            })?;
+            Err(std::io::Error::other(
+                "injected partial attachment write failure",
+            ))
+        } else {
+            let link = journal.created_link_mut(row, tmp)?;
+            link.file_mut()
+                .write_all(data)
+                .and_then(|()| link.file_mut().sync_all())
+        };
+        #[cfg(not(test))]
+        let write_result = {
+            let link = journal.created_link_mut(row, tmp)?;
+            link.file_mut()
+                .write_all(data)
+                .and_then(|()| link.file_mut().sync_all())
+        };
+        if let Err(error) = write_result {
+            let original = AppError::Export(format!("write exact attachment temp failed: {error}"));
+            return Err(remove_or_scrub_attempt_owned(
+                journal.created_link(row, tmp)?,
+                original,
+                "partial attachment temp",
+            ));
+        }
+        let metadata = match journal.created_link_mut(row, tmp)?.file_mut().metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let original =
+                    AppError::Export(format!("stat exact attachment temp failed: {error}"));
+                return Err(remove_or_scrub_attempt_owned(
+                    journal.created_link(row, tmp)?,
+                    original,
+                    "unverified attachment temp",
+                ));
+            }
+        };
+        let identity = journal.created_link(row, tmp)?.identity();
+        if metadata.dev() != identity.0
+            || metadata.ino() != identity.1
+            || metadata.nlink() != 1
+            || metadata.len() != row.byte_len
+        {
+            let original =
+                AppError::Export("exact attachment temp failed identity verification".into());
+            return Err(remove_or_scrub_attempt_owned(
+                journal.created_link(row, tmp)?,
+                original,
+                "invalid attachment temp",
+            ));
+        }
+    }
+
+    let final_link = {
+        let source = if temp_was_created {
+            journal.created_link(row, tmp)?
+        } else {
+            journal.staged_snapshot_link(row, tmp)?
+        };
+        match source.hard_link_sibling(desired) {
+            Ok(link) => Some(link),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if vault.existing_bytes_match(desired, data)? != Some(true) {
+                    return Err(AppError::Export(
+                        "attachment export path raced with another file".into(),
+                    ));
+                }
+                None
+            }
+            Err(error) => {
+                return Err(AppError::Export(format!(
+                    "publish exact attachment export failed: {error}"
+                )))
+            }
+        }
+    };
+    let published_new = final_link.is_some();
+    if let Some(link) = final_link {
+        let mut authority = Some(link);
+        if let Err(original) = journal.mark_created_link(row, &mut authority) {
+            let cleanup = authority
+                .as_ref()
+                .map(|link| {
+                    crate::export::remove_exact_verified_link(link, 2, row.byte_len, &row.sha256)
+                })
+                .transpose();
+            return Err(match cleanup {
+                Ok(_) => original,
+                Err(cleanup) => match authority
+                    .as_ref()
+                    .ok_or_else(|| {
+                        AppError::Storage(
+                            "unjournaled attachment link lost its affine authority".into(),
+                        )
+                    })?
+                    .scrub_attempt_owned_plaintext()
+                {
+                    Ok(()) => AppError::Storage(format!(
+                        "{original}; unjournaled attachment link unlink refused ({cleanup}); retained inode scrubbed"
+                    )),
+                    Err(scrub) => AppError::Storage(format!(
+                        "{original}; unjournaled attachment link cleanup failed: {cleanup}; retained-inode scrub failed: {scrub}"
+                    )),
+                },
+            });
+        }
+    }
+    vault.verify_directory_identity(
+        desired
+            .parent()
+            .ok_or_else(|| AppError::Export("attachment export has no parent directory".into()))?,
+        directory_identity,
+    )?;
+    if published_new {
+        journal.created_link(row, desired)?.sync_parent()?;
+    }
+
+    let source = if temp_was_created {
+        journal.created_link(row, tmp)?
+    } else {
+        journal.staged_snapshot_link(row, tmp)?
+    };
+    crate::export::remove_exact_verified_link(
+        source,
+        if published_new { 2 } else { 1 },
         row.byte_len,
         &row.sha256,
-        "published attachment failed its integrity check",
-    )
+    )?;
+    if vault.existing_bytes_match(desired, data)? != Some(true) {
+        return Err(AppError::Export(
+            "published attachment failed its exact integrity check".into(),
+        ));
+    }
+    if let Some(projection_id) = durable_projection_id {
+        state
+            .db
+            .mark_filing_projection_published(&journal.attempt_id, &projection_id)?;
+    }
+    Ok(())
 }
 
 fn ensure_user_owned_attachment_export(
@@ -1438,6 +2449,54 @@ fn choose_attachment_export_path(
             AppError::Export("attachment export collision suffix exhausted".into())
         })?;
     }
+}
+
+fn choose_attachment_export_path_exact(
+    vault: &crate::export::ExactVault,
+    dir: &std::path::Path,
+    row: &AttachmentRecord,
+    data: &[u8],
+) -> Result<std::path::PathBuf, AppError> {
+    let mut n = 0usize;
+    loop {
+        let name = if n == 0 {
+            format!("{}.{}", row.id, row.extension)
+        } else {
+            format!("{} ({n}).{}", row.id, row.extension)
+        };
+        let candidate = dir.join(name);
+        match vault.existing_bytes_match(&candidate, data)? {
+            None | Some(true) => return Ok(candidate),
+            Some(false) => {}
+        }
+        n = n.checked_add(1).ok_or_else(|| {
+            AppError::Export("attachment export collision suffix exhausted".into())
+        })?;
+    }
+}
+
+fn remove_tracked_attachment_projection_exact(row: &AttachmentRecord) -> Result<(), AppError> {
+    let Some(path) = row.exported_path.as_deref() else {
+        return Ok(());
+    };
+    let path = std::path::Path::new(path);
+    let temp = attachment_export_temp_path(path, &row.id);
+    let mut links = Vec::new();
+    if let Some(link) = crate::export::open_exact_absolute_existing_file(path)? {
+        links.push(link);
+    }
+    if let Some(link) = crate::export::open_exact_absolute_existing_file(&temp)? {
+        links.push(link);
+    }
+    let mut groups =
+        std::collections::HashMap::<(u64, u64), Vec<&crate::export::ExactFileLink>>::new();
+    for link in &links {
+        groups.entry(link.identity()).or_default().push(link);
+    }
+    for group in groups.values() {
+        crate::export::remove_exact_created_link_refs(group, row.byte_len, &row.sha256)?;
+    }
+    Ok(())
 }
 
 struct ValidatedImage {
