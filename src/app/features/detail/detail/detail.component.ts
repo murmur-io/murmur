@@ -1509,7 +1509,12 @@ export class DetailComponent implements OnInit {
       await this.tabsService.openNote(result.noteId, `${title} — note`);
     } catch (error) {
       if (this.isCurrentConversion(request) && this.isActiveMeeting(id)) {
-        this.toast.danger(this.errorCopy.because("Couldn’t convert this meeting", error));
+        // The "convert" context, not the default "generic": every refusal on this path now
+        // carries an errcode, and the context is what turns a locked folder or an active share
+        // into the sentence that names the ONE thing the user has to do next.
+        this.toast.danger(
+          this.errorCopy.because("Couldn’t convert this meeting", error, "convert"),
+        );
       }
     } finally {
       if (this.conversionRequest()?.sequence === request.sequence) {
