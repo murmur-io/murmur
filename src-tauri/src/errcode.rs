@@ -84,6 +84,8 @@ pub const MEETING_LOCKED: &str = "meeting-locked";
 pub const DOC_LOCKED: &str = "doc-locked";
 /// The target folder itself is locked (accepting a share into it, moving into it, …).
 pub const FOLDER_LOCKED: &str = "folder-locked";
+/// A recording with a linked companion note cannot cross into the sealed storage domain.
+pub const RECORDING_LINKED_NOTE: &str = "recording-linked-note";
 
 // ── Missing rows ────────────────────────────────────────────────────────────────────────────
 
@@ -153,6 +155,7 @@ pub const ALL: &[&str] = &[
     MEETING_LOCKED,
     DOC_LOCKED,
     FOLDER_LOCKED,
+    RECORDING_LINKED_NOTE,
     NOTE_MISSING,
     NOTE_FOLDER_MISSING,
     DOC_UNSUPPORTED,
@@ -234,6 +237,7 @@ mod tests {
             "meeting-locked",
             "doc-locked",
             "folder-locked",
+            "recording-linked-note",
             "note-missing",
             "note-folder-missing",
             "doc-unsupported",

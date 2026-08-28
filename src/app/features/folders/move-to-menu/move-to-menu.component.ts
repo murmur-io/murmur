@@ -10,6 +10,7 @@ import {
 import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import type { FolderNode } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { LockBadgeComponent } from "../lock-badge/lock-badge.component";
 
 /** A flattened, indented folder option for the picker list. */
@@ -40,6 +41,7 @@ interface FolderOption {
 export class MoveToMenuComponent {
   readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The note being moved. */
   readonly meetingId = input.required<string>();
@@ -179,8 +181,8 @@ export class MoveToMenuComponent {
       this.toast.success(`Moved to ${targetName}`);
       this.moved.emit(targetId);
       this.closed.emit();
-    } catch {
-      this.moveError.set("Couldn’t move this note. Please try again.");
+    } catch (error) {
+      this.moveError.set(this.errorCopy.humanize(error));
     } finally {
       this.moving.set(false);
     }

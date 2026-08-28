@@ -41,6 +41,8 @@ import { mockTauri } from "../settings-ai/mock-invoke";
 /** Rendered copy, hard-coded on purpose: importing it from the module under test proves nothing. */
 const COPY = {
   folderLocked: "That folder is locked — unlock it first.",
+  recordingLinkedNote:
+    "This recording has a linked note. Move it between open folders, or remove the destination folder lock first.",
   docNoText: "No readable text was found in that file, even after reading the images.",
   docUnsupported:
     "That file type can’t be imported. Try Markdown, text, PDF, Word, PowerPoint, Excel, HTML or an image.",
@@ -171,6 +173,20 @@ test.describe("Error copy — the rendered sentence is owned, never the wire str
     );
     await expect(shown).toHaveText(COPY.generic);
     expect(await shown.textContent()).not.toContain("E2EE");
+  });
+
+  test("a linked-note filing refusal renders an actionable restriction", async ({
+    page,
+  }) => {
+    await boot(page);
+
+    const shown = await renderedFor(
+      page,
+      `provider unavailable: [recording-linked-note] ${INTERNAL}`,
+    );
+    await expect(shown).toHaveText(COPY.recordingLinkedNote);
+    expect(await shown.textContent()).not.toContain("provider unavailable");
+    expect(await shown.textContent()).not.toContain("HKDF");
   });
 
   test("the document-import ladder is decided by the code, never by the prose", async ({
