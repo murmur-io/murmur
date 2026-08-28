@@ -21,6 +21,11 @@ HDIR = ROOT / ".agents" / "h"
 CFG = json.loads((HDIR / "checks.json").read_text())
 TASKS_ROOT = ROOT.parent / ".murmur-agent-tasks"
 STATE_DIR = ROOT / ".git" / "h"
+# Kazdy worktree ma wlasny, ZIMNY target/ — pelna kompilacja ML tree od zera (~15 min, 4 GB).
+# Wskazanie wszystkich taskow na cieply target glownego checkoutu robi z tego kilkadziesiat
+# sekund. Cargo trzyma wlasny file-lock, a artefakty sa kluczowane odciskiem zrodel, wiec
+# rownolegle buildy sie serializuja zamiast psuc. Nadpisz H_TARGET_DIR, jesli chcesz osobny.
+SHARED_TARGET = Path(os.environ.get("H_TARGET_DIR") or (ROOT / "target"))
 MAX_FIX_ROUNDS = 2
 
 VERIFY_SCHEMA = {
@@ -166,7 +171,7 @@ def run_check(cid: str, cmd: str, cwd: str, budget: int, wt: Path) -> dict:
     where = wt / cwd if cwd else wt
     log(f"check {cid}: {cmd}")
     t0 = time.time()
-    env = dict(os.environ, CARGO_BUILD_JOBS="2")
+    env = dict(os.environ, CARGO_BUILD_JOBS="2", CARGO_TARGET_DIR=str(SHARED_TARGET))
     try:
         r = subprocess.run(["/bin/zsh", "-f", "-c", cmd], cwd=str(where), capture_output=True,
                            text=True, timeout=budget, env=env)
@@ -209,8 +214,9 @@ def call_model(vendor: str, prompt: str, cwd: Path, *, write: bool, schema: dict
     else:
         die(f"nieznany vendor: {vendor}")
 
+    env = dict(os.environ, CARGO_TARGET_DIR=str(SHARED_TARGET), CARGO_BUILD_JOBS="2")
     r = subprocess.run(argv, cwd=str(cwd), input=prompt, capture_output=True, text=True,
-                       timeout=timeout)
+                       timeout=timeout, env=env)
     if r.returncode != 0:
         die(f"{vendor} zakończył się kodem {r.returncode}:\n{(r.stderr or r.stdout)[-1500:]}")
     if schema:
