@@ -6529,8 +6529,95 @@
         assert_eq!(after.exported_path, before.exported_path);
     }
 
+    /// A share on a SIBLING of the meeting's container must not block conversion.
+    ///
+    /// The regression this pins (reported 2026-08-28, live user data): the conversion guards asked
+    /// `folder_has_active_remote_share` for the whole destination container, so ONE shared note
+    /// anywhere in a folder made "Convert to note" fail for EVERY meeting filed there. The refusal
+    /// carries no `errcode`, so the only thing the user ever saw was the deny-by-default sentence
+    /// "Couldn't convert this meeting. Please try again."
+    ///
+    /// The hazard the guard really covers is ITEM-scoped — rewriting the managed block of a note
+    /// whose own ciphertext is still readable on the relay — and that is asserted by
+    /// `converted_companion_refuses_an_active_share_even_in_an_open_destination` above. Birthing a
+    /// different, unshared note beside a shared sibling changes nothing about the sibling's server
+    /// copy, which is why `notes.rs::move_note_to_folder` has only ever used the item-scoped check.
     #[test]
-    fn converted_companion_refuses_an_active_share_on_its_source_container_before_rehome() {
+    fn converted_companion_ignores_a_shared_sibling_in_the_meetings_container() {
+        const MEETING: &str = "m-convert-sibling-share";
+        const CONTAINER: &str = "f-convert-sibling-share";
+        const SIBLING: &str = "d-convert-shared-sibling";
+
+        let state = build_state("converted-companion-sibling-share");
+        make_open_folder(&state.db, CONTAINER, "Murmur");
+        seed_meeting(
+            &state.db,
+            MEETING,
+            "# Existing meeting note",
+            Some(CONTAINER),
+        );
+        state
+            .db
+            .insert_document(SIBLING, CONTAINER, "Shared sibling", "# Shared", "note", 1)
+            .unwrap();
+        // BOTH legs of `folder_has_active_remote_share`, because the report that found this came
+        // from an ORG share (a note shared to a Shared Brain) and the link leg is the one a test
+        // reaches for by reflex. Removing the folder-wide question has to clear both.
+        state
+            .db
+            .insert_outbound_note_share(
+                "conversion-sibling-share",
+                SIBLING,
+                "link",
+                1,
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "conversion-sibling-org-share",
+                "org-convert-sibling",
+                None,
+                Some(SIBLING),
+                "note",
+                Some("Shared sibling"),
+                1,
+                1,
+                &[0u8; 32],
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+
+        let converted = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            MEETING.into(),
+            None,
+            Some(ConversionProvider::fixed(
+                "---\ntitle: Converted\n---\n\n# Converted\n\nGenerated body.",
+            )),
+        ))
+        .unwrap();
+
+        let row = state.db.get_note_row(&converted.note_id).unwrap().unwrap();
+        assert_eq!(
+            row.folder_id, CONTAINER,
+            "the converted note is born in the meeting's own container"
+        );
+        assert!(row.text.contains("Generated body."));
+    }
+
+    /// A rehome must refuse while the companion's OWN copy is still readable on the relay, and must
+    /// leave every canonical byte, attachment and export exactly where it was.
+    ///
+    /// This used to share a SIBLING meeting in the source container and assert the same refusal,
+    /// pinning a folder-wide guard that made one shared item veto conversion for a whole folder
+    /// (see `converted_companion_ignores_a_shared_sibling_in_the_meetings_container`). The
+    /// preserved-state assertions below are the valuable half, so they now ride the item-scoped
+    /// guard that survives.
+    #[test]
+    fn converted_companion_refuses_its_own_active_share_before_rehome() {
         const MEETING: &str = "m-convert-source-shared";
         const SOURCE: &str = "f-convert-source-shared";
         const TARGET: &str = "f-convert-source-target";
@@ -6611,17 +6698,11 @@
         let attachment_twin_bytes = std::fs::read(&attachment_twin).unwrap();
 
         state.db.set_meeting_folder(MEETING, Some(TARGET)).unwrap();
-        seed_meeting(
-            &state.db,
-            "m-source-container-shared-sibling",
-            "# Shared sibling",
-            Some(SOURCE),
-        );
         state
             .db
-            .insert_outbound_share(
-                "conversion-source-container-active-share",
-                "m-source-container-shared-sibling",
+            .insert_outbound_note_share(
+                "conversion-companion-active-share",
+                &companion.note_id,
                 "link",
                 1,
                 "2026-08-25T20:00:00Z",
@@ -6653,7 +6734,7 @@
         assert_eq!(
             state.db.companion_note_for_meeting(MEETING).unwrap(),
             Some(companion.note_id.clone()),
-            "the refused source-share rehome preserves the stable companion id"
+            "the refused own-share rehome preserves the stable companion id"
         );
         assert_eq!(
             state
