@@ -134,6 +134,12 @@
             @if (!isNew() && task && !task.canEdit) {
               <span class="permission-pill">View only</span>
             }
+            <!-- The task's stable id. Unlike a meeting/note/board there is no MCP tool that
+                 resolves a task id yet, so this is the one surface where the id is for
+                 referring to the task by hand rather than for a tool call. -->
+            @if (!isNew() && task) {
+              <mur-copy-id [id]="task.id" label="Task" />
+            }
           </div>
           <div class="detail-actions">
             @if (!isNew() && task?.canManage) {
