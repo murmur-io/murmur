@@ -6480,6 +6480,92 @@
         );
     }
 
+    /// Every refusal the user can ACT ON must carry its `errcode`, so the frontend renders the
+    /// sentence that names the next step instead of the deny-by-default "Please try again".
+    ///
+    /// This is the oracle for the class, not for one message. The convert path had SIX anonymous
+    /// refusals; the one that actually fired in production ("a note in this folder is shared")
+    /// took a SQLCipher session against the user's own database to identify, because the app
+    /// could not say it. A future refactor that drops a tag puts us straight back there, and the
+    /// only thing that would notice is this test.
+    #[test]
+    fn actionable_conversion_refusals_carry_their_error_code() {
+        fn code_of(error: &AppError) -> String {
+            let rendered = error.to_string();
+            let body = rendered.split_once(": ").map_or(rendered.as_str(), |(_, b)| b);
+            body.strip_prefix('[')
+                .and_then(|rest| rest.split_once(']'))
+                .map(|(code, _)| code.to_string())
+                .unwrap_or_else(|| format!("UNCODED: {body}"))
+        }
+
+        // 1. No transcript — the meeting exists and is unlocked, but there is nothing to summarize.
+        let state = build_state("convert-code-no-transcript");
+        seed_meeting(&state.db, "m-no-transcript", "# Note", None);
+        {
+            let conn = state.db.lock();
+            conn.execute("DELETE FROM segments WHERE meeting_id='m-no-transcript'", [])
+                .unwrap();
+        }
+        let error = block_on(convert_meeting_to_note_inner_with(
+            None,
+            &state,
+            "m-no-transcript".into(),
+            None,
+            Some(ConversionProvider::fixed("---\ntitle: x\n---\n\n# x\n\nBody.")),
+        ))
+        .unwrap_err();
+        assert_eq!(code_of(&error), "convert-no-transcript");
+
+        // 2. A template id that no longer exists.
+        let error = resolve_conversion_template(Some("no-such-template"), "standard", vec![])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(code_of(&error), "note-template-missing");
+
+        // 3. An empty provider body must not blank a note — and must say which knob to turn.
+        let error = compose_converted_companion_markdown("", "Meeting", "---\ntitle: x\n---\n\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(code_of(&error), "note-provider-empty");
+
+        // 4. The companion's OWN live share — the guard that survives, and the exact shape of the
+        //    refusal the reporting user hit before the folder-wide guards were removed.
+        let state = build_state("convert-code-share-active");
+        seed_meeting(&state.db, "m-shared", "# Existing", None);
+        let snapshot = capture_meeting_content_snapshot(&state, "m-shared").unwrap();
+        let first = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-shared",
+            &snapshot,
+            "Shared",
+            "---\ntitle: Shared\n---\n\n# Shared\n\nOriginal.",
+            None,
+        )
+        .unwrap();
+        state
+            .db
+            .insert_outbound_note_share(
+                "convert-code-share",
+                &first.note_id,
+                "link",
+                1,
+                "2026-08-25T20:00:00Z",
+            )
+            .unwrap();
+        let snapshot = capture_meeting_content_snapshot(&state, "m-shared").unwrap();
+        let error = persist_converted_companion_under_snapshot_with(
+            &state,
+            "m-shared",
+            &snapshot,
+            "Shared",
+            "---\ntitle: Shared\n---\n\n# Shared\n\nReplacement.",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(code_of(&error), "share-active");
+    }
+
     #[test]
     fn converted_companion_refuses_an_active_share_even_in_an_open_destination() {
         let state = build_state("converted-companion-active-share");

@@ -59,9 +59,10 @@ pub async fn link_meeting_entities(
     // BLK-2b READ-GATE: a sealed-and-not-unlocked meeting's note is blanked; refuse to extract
     // entities from it (would feed a cloud provider blank text + re-write vault stubs). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to link entities".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to link entities",
+            )));
     }
     let meeting = state
         .db
