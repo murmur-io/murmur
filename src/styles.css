@@ -388,6 +388,9 @@ app-shell {
   height: var(--space-7);
 }
 
+/* The brand tile carries the Murmur waveform mark (mur-icon "murmur"), which
+   paints in `currentColor` — so the bars follow the user's accent theme rather
+   than the fixed gradient the app-icon PNG bakes in. */
 .rail-brand {
   display: grid;
   place-items: center;
@@ -398,8 +401,6 @@ app-shell {
   border-radius: var(--radius-md);
   background: var(--accent-soft);
   color: var(--accent-hover);
-  font-size: 0.85rem;
-  font-weight: 750;
 }
 
 .rail-item {
