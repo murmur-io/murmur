@@ -3,48 +3,82 @@
   "rust_test_scope_limit": 6,
   "checks": {
     "ng-lint": {
-      "when": ["src/app/**", "src/*.ts", "eslint.config.js"],
+      "when": [
+        "src/app/**",
+        "src/*.ts",
+        "eslint.config.js"
+      ],
       "cmd": "npx ng lint",
       "budget_s": 60
     },
     "ng-build": {
-      "when": ["src/**", "angular.json", "tsconfig*.json"],
+      "when": [
+        "src/**",
+        "angular.json",
+        "tsconfig*.json"
+      ],
       "cmd": "npx ng build",
       "budget_s": 120
     },
     "rust-clippy": {
-      "when": ["src-tauri/**/*.rs", "src-tauri/Cargo.toml", "crates/**/*.rs"],
+      "when": [
+        "src-tauri/**/*.rs",
+        "src-tauri/Cargo.toml",
+        "crates/**/*.rs"
+      ],
       "cmd": "cargo clippy --lib --tests -- -D warnings",
       "cwd": "src-tauri",
       "budget_s": 600
     },
     "rust-test": {
-      "when": ["src-tauri/**/*.rs", "src-tauri/Cargo.toml", "crates/**/*.rs"],
+      "when": [
+        "src-tauri/**/*.rs",
+        "src-tauri/Cargo.toml",
+        "crates/**/*.rs"
+      ],
       "cmd": "cargo test --lib -- --test-threads=1",
       "cwd": "src-tauri",
       "scoped": true,
       "budget_s": 900
     },
     "tauri-boot": {
-      "when": ["src-tauri/src/lib.rs", "src-tauri/src/state.rs", "src-tauri/src/audio/**", "src-tauri/src/transcribe/**", "src-tauri/tauri.conf.json", "src-tauri/**/*.swift"],
+      "when": [
+        "src-tauri/src/lib.rs",
+        "src-tauri/src/state.rs",
+        "src-tauri/src/audio/**",
+        "src-tauri/src/transcribe/**",
+        "src-tauri/tauri.conf.json",
+        "src-tauri/**/*.swift"
+      ],
       "cmd": "scripts/harness-runtime-smoke",
       "budget_s": 600
     },
     "playwright": {
-      "when": ["src/app/**", "e2e/**", "playwright.config.ts"],
+      "when": [
+        "src/app/**",
+        "e2e/**",
+        "playwright.config.ts"
+      ],
       "cmd": "npm run test:e2e -- --workers=2",
       "scoped": true,
       "budget_s": 1200
+    },
+    "perf-contracts": {
+      "when": [
+        "src-tauri/src/audio/**",
+        "src-tauri/src/perf.rs",
+        "src-tauri/src/thermal.rs",
+        "scripts/measure-recording-ram.sh"
+      ],
+      "cmd": "bash .agents/h/perf-contracts.sh",
+      "budget_s": 30
     }
   },
   "manual_only": {
-    "_comment": "Realne checki produktowe, ale w 74 uruchomieniach nie zlapaly nic. Odpalasz recznie: h check <id>.",
+    "_comment": "protocol-server: 38 uruchomien w starym harnessie, zero zlapanych bledow, a kosztuje kompilacje calego workspace. Odpalasz recznie: scripts/h check protocol-server.",
     "protocol-server": {
       "cmd": "DATABASE_URL=postgresql://postgres:postgres@localhost:5433/urc_dev cargo test --workspace -- --test-threads=1",
       "cwd": "src-tauri"
-    },
-    "perf-contracts": {
-      "cmd": "bash .agents/h/perf-contracts.sh"
     }
   }
 }
