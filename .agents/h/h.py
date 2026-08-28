@@ -182,13 +182,14 @@ def run_check(cid: str, cmd: str, cwd: str, budget: int, wt: Path) -> dict:
 # ---------- modele ----------
 
 def call_model(vendor: str, prompt: str, cwd: Path, *, write: bool, schema: dict = None,
-               timeout: int = 2400) -> str:
+               timeout: int = 2400, resume: bool = False) -> str:
     exe = shutil.which(vendor)
     if not exe:
         die(f"nie znaleziono `{vendor}` w PATH")
     if vendor == "codex":
         argv = [exe, "exec", "--skip-git-repo-check", "--cd", str(cwd),
                 "--sandbox", "workspace-write" if write else "read-only"]
+        # codex exec nie ma odpowiednika --continue; poprawka czyta wlasny kod z worktree.
         out_file = None
         if schema:
             sf = cwd / ".h-schema.json"; sf.write_text(json.dumps(schema))
@@ -198,6 +199,10 @@ def call_model(vendor: str, prompt: str, cwd: Path, *, write: bool, schema: dict
     elif vendor == "claude":
         argv = [exe, "--print", "--add-dir", str(cwd),
                 "--permission-mode", "acceptEdits" if write else "plan"]
+        # Poprawka kontynuuje TE SAMA sesje w tym worktree — agent pamieta, co juz probowal,
+        # zamiast odtwarzac rozumowanie z samego kodu.
+        if resume:
+            argv.append("--continue")
         out_file = None
         if schema:
             argv += ["--json-schema", json.dumps(schema)]
@@ -252,7 +257,7 @@ def phase_implement(task: str, plan: str, wt: Path, vendor: str, feedback: str =
     if feedback:
         p += (f"\n## Weryfikacja odrzuciła poprzednią wersję\n\n{feedback}\n\n"
               "Popraw dokładnie to. Nie zaczynaj od zera, nie przepisuj reszty.\n")
-    call_model(vendor, p, wt, write=True)
+    call_model(vendor, p, wt, write=True, resume=bool(feedback))
 
 
 def phase_check(wt: Path) -> tuple:
