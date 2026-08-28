@@ -25,6 +25,7 @@
   <a href="#-quick-start">Quick start</a> ·
   <a href="#-the-brain--your-meeting-memory-you-can-talk-to">The brain</a> ·
   <a href="#-features">Features</a> ·
+  <a href="#-spaces-boards--imports">Spaces &amp; boards</a> ·
   <a href="#-notes">Notes</a> ·
   <a href="#-shared-brain-org">Shared Brain</a> ·
   <a href="#-architecture">Architecture</a> ·
@@ -175,8 +176,22 @@ across your whole history, and browse what it knows — all over the same store.
   across everything they touched.
 
 <p align="center">
-  <img src="docs/screenshots/graph.png" alt="People & Projects knowledge graph, automatically extracted and counted" width="860">
-  <br/><em>People & Projects, extracted automatically and counted — sealed folders stay hidden.</em>
+  <img src="docs/screenshots/people.png" alt="The People surface — everyone across your meetings, with what they still owe" width="860">
+  <br/><em>Everyone across your meetings: how recently you talked, what they still owe you, and how many
+  durable facts the brain holds about them.</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/full-brain-graph.png" alt="The full brain graph — meetings, notes, documents and people as one map with typed links" width="860">
+  <br/><em>The full brain graph — meetings, notes, documents and people as one map, with typed links
+  (co-occurrence, mentions, wikilinks, companion, manual, semantic) and suggested links drawn dashed.
+  Sealed Spaces produce no nodes, and the map says so rather than pretending it is complete.</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/graph.png" alt="The Graph surface — people and projects with their mention counts, searchable and sortable" width="820">
+  <br/><em>The same graph as a list when you just want to find someone: people and projects with their
+  mention counts, searchable and sortable.</em>
 </p>
 
 ---
@@ -254,6 +269,20 @@ across your whole history, and browse what it knows — all over the same store.
   </tr>
 </table>
 
+### 🧾 Receipts — every claim traces back to the tape
+
+<p align="center">
+  <img src="docs/screenshots/detail-receipts.png" alt="A note's receipts — one row per grounded claim, each carrying the speaker and the second of audio it came from" width="860">
+  <br/><em>One row per grounded claim, each a jump to the second of audio it came from — with the
+  speaker and the ASR confidence.</em>
+</p>
+
+- **Murmur's notes don't ask you to trust them.** Each line that aligns to something actually said gets a
+  receipt; paraphrased or unsupported lines get none, so you can see at a glance what is verified.
+- **A receipt is a jump.** Click it and the audio seeks to that second, with the speaker attributed.
+- **A sealed meeting leaks no timing and no speaker** — the backend returns no receipts at all for a
+  meeting you have not unlocked, so the absence is a gate, not an accident.
+
 ### 📁 Yours to keep
 
 A nice-to-have, not a lock-in: every note is also exported as plain **Markdown** — atomic `.md`
@@ -263,13 +292,106 @@ Markdown you own, openable in any editor. (The encrypted SQLite DB — not the v
 
 ---
 
+## 🗂️ Spaces, boards & imports
+
+The three structural changes 2.0 made. Everything above lives inside them.
+
+### 🗂️ Spaces — one hierarchy
+
+<p align="center">
+  <img src="docs/screenshots/hero-spaces.png" alt="The Spaces sidebar — one tree of Spaces and folders holding recordings, notes and boards" width="860">
+  <br/><em>One tree: <b>Spaces › folders › your recordings, notes, tasks and boards</b>. The separate
+  Meetings and Notes folder trees are gone.</em>
+</p>
+
+- **One tree, four kinds of thing.** A Space holds folders; a folder holds recordings, notes, tasks and
+  boards. There is no second hierarchy to keep in sync, and no item that belongs to "notes" rather than
+  to a project.
+- **A persistent icon rail plus a contextual panel.** The rail is always there (Capture, Search, Spaces,
+  Shared Brains, Ask, Browse, New note, Settings); the panel beside it switches between the Spaces tree
+  and a flat Browse view of every kind.
+- **Lock a Space and everything inside it is sealed with it.** A project lock cascades to each child
+  folder in its own right, so every existing visibility gate applies unchanged.
+- **Brain-assisted filing.** "File recordings with Brain" proposes where stray recordings belong; you
+  review the plan and nothing moves until you approve it.
+
+<p align="center">
+  <img src="docs/screenshots/spaces-locked.png" alt="A sealed Space discloses its name and nothing else" width="820">
+  <br/><em>A sealed Space discloses its <b>name</b> — which is what you need in order to unlock it — and
+  nothing else. No counts, no children, no items, not even totals.</em>
+</p>
+
+### 📊 Dashboards — boards you compose
+
+<p align="center">
+  <img src="docs/screenshots/dashboard.png" alt="A board in its Brief lens — a pinned living answer, what needs attention, and the recent evidence" width="860">
+  <br/><em>The <b>Brief</b> lens: a pinned living answer, what needs attention, and the evidence behind it.</em>
+</p>
+
+- **Ten kinds of tile** — a note, a recording, a document, a person, a reminders list, a **drift** watch
+  (how a fact changed over time), a **numbers** roll-up, an activity **pulse**, a **promise ledger**, and
+  a **living answer**.
+- **A living answer** is a question the app keeps up to date. It reports when it was last answered, and
+  it **withholds itself** the moment any source it drew on stops being readable.
+- **Five lenses over the same tiles** — **Brief / Overview / Commitments / Sources / People**. No lens
+  keeps a second copy of anything.
+- **Ask a board directly**, grounded only in what is on it — and the board states its own boundary: how
+  many sources it can actually read, and how many views it derived from them.
+
+<p align="center">
+  <img src="docs/screenshots/dashboards-home.png" alt="The boards list, each card previewing its tiles" width="820">
+  <img src="docs/screenshots/dashboard-commitments.png" alt="The Commitments lens — promises and reminders resolved by this board" width="820">
+  <br/><em>Left: the boards list. Right: the <b>Commitments</b> lens — every promise and reminder this
+  board can resolve, and only those.</em>
+</p>
+
+### 📥 Imports — bring the notes you already have
+
+<p align="center">
+  <img src="docs/screenshots/settings-imports.png" alt="Settings → Imports — Notion, Obsidian and Apple Notes, entirely offline" width="860">
+  <br/><em>Three sources, zero network. "Everything happens on this Mac. Nothing is uploaded."</em>
+</p>
+
+- **Three sources** — a **Notion export** (`.zip` or an unpacked folder), an **Obsidian vault**, or
+  **Apple Notes** (`ImportSource` in `src-tauri/src/import/mod.rs`; an unknown value fails closed rather
+  than defaulting to one).
+- **Entirely offline.** No account, no key, no network call. Apple Notes asks macOS for permission the
+  first time.
+- **Dry run first.** Every import reports what it *would* write — new versus already imported — before
+  anything is written, and an unfiled import lands in its own named, badged container.
+- **Imported notes join the same brain**: chunked, indexed, `[[link]]`-able, and gated by the same
+  per-Space lock as everything else.
+
+### ✅ Tasks & reminders
+
+<p align="center">
+  <img src="docs/screenshots/tasks.png" alt="A shared task with status, due date, assignee, permissions and subtasks" width="820">
+  <img src="docs/screenshots/reminders.png" alt="The reminders inbox — overdue, upcoming and completed, each linked to its source" width="820">
+  <br/><em>Left: <b>Tasks</b> — shared work owned by one organization (assignees, due dates, subtasks,
+  per-document permissions). Right: <b>Reminders</b> — private to this Mac, each one linked back to the
+  recording or note that produced it.</em>
+</p>
+
+- **Tasks belong to an org**, so they need a signed-in account — they are the one collaborative surface
+  here. Everything else on this page works with no account at all.
+- **Reminders are local.** They carry their source, so a follow-up always says which meeting or note it
+  came from, and the brain can propose them from a transcript for you to accept or dismiss.
+
+---
+
 ## 📝 Notes
 
 A full standalone Markdown note-taking product that lives next to your meetings — not a byproduct of
 recording. Same store, same lock model, same brain.
 
 <p align="center">
-  <img src="docs/screenshots/notes-editor-brain-menu.png" alt="Note editor with AI assistant" width="820">
+  <img src="docs/screenshots/notes-editor-brain-menu.png" alt="The note editor with a selection and the Brain command menu open" width="860">
+  <br/><em>Select any passage and the Brain menu appears — 19 actions, or type what you want done.</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/notes-home.png" alt="The notes list with tags, shared badges and last-modified dates" width="860">
+  <br/><em>Every note, with its tags, its sharing state, and the Shared Brains it appears in.</em>
 </p>
 
 - **A real editor** at its own route, with collapsible YAML front-matter, a formatting toolbar, markdown
@@ -297,8 +419,8 @@ An opt-in, **free**, end-to-end-encrypted way for your org to build one shared k
 everyone's notes and meetings — without anyone's plaintext ever touching a server.
 
 <p align="center">
-  <img src="docs/screenshots/shared-brain-rail.png" alt="Shared brains rail in Library" width="820">
-  <img src="docs/screenshots/settings-privacy.png" alt="Org sharing settings" width="820">
+  <img src="docs/screenshots/shared-brains.png" alt="The Shared Brains view — meetings and notes your organizations have shared with you" width="820">
+  <br/><em>Everything your organizations have shared with you, filterable by org and by kind.</em>
 </p>
 
 - **Free, no seats, no paid tier.** A free account (opt-in login) is all that's required — Shared Brain
@@ -382,9 +504,13 @@ Murmur runs a **read-only [Model Context Protocol](https://modelcontextprotocol.
 `127.0.0.1:8765` so **Claude Desktop / Claude Code** (or any MCP client) can query your meeting and note
 memory **with zero egress** — your notes stay on your Mac, and the client reads them locally.
 
-- **Seven tools** — `search_meetings`, `get_meeting`, `list_recent_meetings`, `search_semantic`,
-  `get_open_commitments`, `get_entity_dossier`, and `org_search` (searches your Shared Brain, if you've
-  opted in).
+- **Twenty tools**, covering meetings, documents, the graph and the 2.0 surfaces:
+  `search_meetings`, `search_transcript`, `get_meeting`, `get_meeting_chapters`, `get_document`,
+  `get_document_outline`, `list_recent_meetings`, `search_semantic`, `get_open_commitments`,
+  `get_entity_dossier`, `knowledge_diff`, `list_entities`, `list_note_folders`,
+  `list_workspace_hierarchy`, `list_dashboards`, `get_dashboard`, `list_tasks`, `get_task`,
+  `org_search` (your Shared Brain, if you've opted in) and `query_database`. The registry is the
+  `tools` array in `src-tauri/src/mcp.rs` — count it there rather than trusting this sentence.
 - **Same visibility gates as the app** — sealed-and-not-unlocked meetings are **invisible** here too, routed
   through the exact `visibility_clause` the UI uses.
 - **Token-protected by default** — a bearer token is **required** unless you turn it off.
@@ -419,6 +545,7 @@ to run **without a network**, and every network path Murmur *does* have is opt-i
 | **On-device brain** (Bielik / Qwen GGUF) | Fully local | **No.** Grounded reasoning + the in-meeting assistant, on-device. |
 | **Ollama** | Fully local | **No.** Nothing leaves the device (loopback only — a remote Ollama host is treated as cloud). |
 | **Claude Code** (default summarizer) | Local CLI → Anthropic's cloud | **Yes** — the *redacted* transcript is sent to Anthropic. |
+| **Codex** (OpenAI's CLI, run tool-free) | Local CLI → OpenAI's cloud | **Yes** — the *redacted* transcript is sent to OpenAI. |
 | **Anthropic API** (BYO key) | Direct HTTPS → Anthropic | **Yes** — the *redacted* transcript is sent to Anthropic. |
 | **AI Gateway** (BYO OpenAI-chat-compatible endpoint) | HTTPS → your endpoint | **Yes** — the *redacted* transcript is sent to your endpoint. |
 
@@ -453,17 +580,19 @@ to run **without a network**, and every network path Murmur *does* have is opt-i
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/settings.png" alt="Provider seam — on-device and redacted-first cloud connections"></td>
-    <td width="50%"><img src="docs/screenshots/settings-brain.png" alt="On-device brain model registry — Bielik / Qwen download cards"></td>
+    <td width="50%"><img src="docs/screenshots/settings-ai.png" alt="Where your AI runs — the Cloud / Hybrid / Fully local posture picker and the default engine"></td>
+    <td width="50%"><img src="docs/screenshots/settings-models.png" alt="The engine registry — the built-in on-device models plus every cloud engine, each marked redacted-first"></td>
   </tr>
   <tr>
-    <td align="center"><em>One provider seam — set a connection up once, then pick per feature.</em></td>
-    <td align="center"><em>The on-device brain registry + on-device intelligence toggles.</em></td>
+    <td align="center"><em>Pick how much runs on this Mac — the rest of the page adapts to the choice.</em></td>
+    <td align="center"><em>Every engine a model can run on, with what leaves the Mac stated per engine.</em></td>
   </tr>
 </table>
 
-The **summarizer / brain assistant** is one `SummarizerProvider` trait with swappable backends —
-**`claude_code`** (default), **`anthropic`** (BYO Keychain key), **`ollama`** (local), and a BYO
+The **summarizer / brain assistant** is one `SummarizerProvider` trait with five swappable backends —
+**`claude_code`** (default), **`codex_cli`** (OpenAI's agent CLI, run as a deliberately tool-free text
+transformer: no ambient config, an empty tool registry, and a deny-everything pre-tool hook),
+**`anthropic`** (BYO Keychain key), **`ollama`** (local), and a BYO
 **OpenAI-chat-compatible gateway** (works with LiteLLM, Portkey, vLLM, LM Studio, and others — the UI
 label "Kong AI Gateway" is just a display name for this generic connector, not a Kong partnership). Per-feature
 **roles** (Notes / Ask / Live) can each point at a different connection. Separately, the heavy on-device
@@ -543,6 +672,7 @@ murmur/
 │  └─ src/           commands.rs · pipeline.rs · agent.rs · tools.rs · router.rs · embed/ · mcp.rs · crypto.rs ·
 │                      audio/ · transcribe/ · summarize/ · share/ · storage/ · secrets/ · export/
 └─ docs/            design notes, research, branding, screenshots
+                    (see docs/README.md — it says which of it is current)
 ```
 
 `../murmur-server/` (a sibling checkout, not part of this repo) holds the accounts + sharing backend —
