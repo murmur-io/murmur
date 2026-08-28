@@ -79,6 +79,59 @@
   text-transform: capitalize;
 }
 
+.destination-field {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.destination-picker {
+  width: 100%;
+  min-width: 0;
+  height: var(--space-6);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--type-command-label);
+  cursor: pointer;
+  text-overflow: ellipsis;
+}
+
+.destination-picker:hover:not(:disabled) {
+  border-color: var(--border-strong);
+}
+
+.destination-picker:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 var(--space-1) var(--accent-ring);
+}
+
+.destination-picker:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.destination-picker option {
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+}
+
 .kbd {
   display: inline-flex;
   align-items: center;

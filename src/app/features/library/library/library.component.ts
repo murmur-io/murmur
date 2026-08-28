@@ -865,9 +865,12 @@ export class LibraryComponent implements OnInit {
 
   /** Begin a row drag: stash the meeting id on the transfer + the shared signal. */
   onRowDragStart(event: DragEvent, m: Meeting): void {
-    // A locked-and-not-unlocked note is masked; dragging it is still fine (the
-    // move runs through the same load-bearing confirm at the destination), so we
-    // allow it. The transfer carries the id under our private MIME type.
+    if (this.folders.isLocked(m.folderId)) {
+      event.preventDefault();
+      this.drag.end();
+      this.toast.danger("Remove the folder lock before moving this recording.");
+      return;
+    }
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData(NoteDragService.MIME, m.id);

@@ -1,55 +1,101 @@
-<!-- Scrim carries the dialog semantics + keyboard escape alongside the
-     backdrop-click dismiss, so the (click) handler has a keyboard equivalent
-     (a11y) — mirrors the quick-search spotlight scrim. -->
 <div
   class="scrim"
   role="dialog"
   aria-modal="true"
   aria-label="Review the auto-organize plan"
+  [attr.aria-busy]="busy()"
   tabindex="-1"
   (click)="onScrimClick($event)"
-  (keydown.escape)="cancelled.emit()"
+  (keydown.escape)="busy() ? null : cancelled.emit()"
 >
   <div #panel class="sheet" tabindex="-1">
-    @if (isEmpty()) {
-      <!-- Null or empty plan: nothing to move. -->
-      <div class="empty-state organize-empty">
-        <h3 class="empty-title">Everything's already well organized</h3>
-        <p class="empty-body text-secondary">
-          No notes need moving — the folders already match their content.
+    <header class="sheet-head">
+      <div class="sheet-head-copy">
+        <h3 class="sheet-title">Auto-organize notes</h3>
+        <p class="sheet-summary text-secondary">
+          Review every proposal before anything moves.
         </p>
-        <button type="button" class="btn btn-primary" (click)="cancelled.emit()">
-          Close
-        </button>
       </div>
-    } @else {
-      <header class="sheet-head">
-        <div class="sheet-head-copy">
-          <h3 class="sheet-title">Auto-organize notes</h3>
-          <p class="sheet-summary text-secondary">
-            {{ selectedCount() }}
-            {{ selectedCount() === 1 ? "note" : "notes" }} →
-            {{ targetFolderCount() }}
-            {{ targetFolderCount() === 1 ? "folder" : "folders" }}
-          </p>
-        </div>
+    </header>
+
+    <div class="coverage" aria-label="Organization coverage">
+      <span><strong>{{ plan()?.totalScanned ?? 0 }}</strong> scanned</span>
+      <span><strong>{{ plan()?.plannedProposedCount ?? moves().length }}</strong> proposed</span>
+      <span><strong>{{ plan()?.alreadyOrganized ?? 0 }}</strong> already organized</span>
+      <span><strong>{{ plan()?.deferred ?? 0 }}</strong> deferred</span>
+    </div>
+
+    @if (guidanceEnabled()) {
+    <section class="guidance" aria-labelledby="organize-guidance-title">
+      <label id="organize-guidance-title" for="organize-guidance">
+        Filing guidance <span>Optional</span>
+      </label>
+      <div class="guidance-row">
+        <textarea
+          id="organize-guidance"
+          maxlength="600"
+          rows="2"
+          placeholder="Example: Group by client, then by recurring meeting"
+          [value]="guidance()"
+          [disabled]="busy()"
+          (input)="guidance.set($any($event.target).value)"
+        ></textarea>
         <button
           type="button"
-          class="btn btn-ghost select-all-btn"
-          (click)="toggleSelectAll()"
+          class="btn btn-ghost"
+          [disabled]="busy()"
+          (click)="onReplan()"
         >
-          {{ allSelected() ? "Select none" : "Select all" }}
+          {{ planning() ? "Planning…" : "Replan" }}
         </button>
-      </header>
+      </div>
+      <small>Guidance influences grouping only; you still approve every move.</small>
+    </section>
+    }
+
+    @if (plan()?.applyError; as error) {
+      <div class="apply-error" role="alert">{{ error }}</div>
+    }
+
+    @if (receipt(); as result) {
+      <div class="apply-result" aria-live="polite">
+        <strong>{{ result.appliedIds.length }} moved.</strong>
+        <span>{{ result.failures.length }} still need attention.</span>
+      </div>
+    }
+
+    @if (moves().length === 0) {
+      <div class="empty-state organize-empty">
+        <h3 class="empty-title">No moves proposed</h3>
+        <p class="empty-body text-secondary">
+          Every scanned note is already organized or was explicitly deferred.
+        </p>
+      </div>
+    } @else {
+      <div class="review-head">
+        <span>{{ selectedCount() }} selected</span>
+        <span class="review-actions">
+          <button type="button" class="btn btn-ghost" [disabled]="busy()" (click)="clearAll()">Clear all</button>
+          @if (!allSelected()) {
+            <button type="button" class="btn btn-ghost" [disabled]="busy()" (click)="selectAll()">Select all</button>
+          }
+        </span>
+      </div>
 
       <ul class="move-list">
         @for (move of moves(); track move.noteId) {
-          <li class="move-row" [class.is-excluded]="!isIncluded(move.noteId)">
+          <li
+            class="move-row"
+            [class.is-excluded]="!isIncluded(move.noteId)"
+            [class.is-applied]="appliedIds().has(move.noteId)"
+            [class.is-failed]="failureFor(move.noteId)"
+          >
             <label class="move-toggle">
               <input
                 type="checkbox"
                 class="switch"
-                [checked]="isIncluded(move.noteId)"
+                [checked]="isIncluded(move.noteId) && !appliedIds().has(move.noteId)"
+                [disabled]="busy() || appliedIds().has(move.noteId) || failureFor(move.noteId)?.retryable === false"
                 [attr.aria-label]="'Include ' + move.title"
                 (change)="toggleMove(move.noteId)"
               />
@@ -60,41 +106,59 @@
               <span class="move-path">
                 <span class="move-from">{{ move.fromFolder }}</span>
                 <span class="move-arrow" aria-hidden="true">→</span>
-                <span class="move-to">{{ move.toFolder }}</span>
-                @if (move.toFolderId === null) {
-                  <span class="pill is-accent move-new">NEW</span>
-                }
+                <label>
+                  <span class="sr-only">Destination for {{ move.title }}</span>
+                  <select
+                    [value]="selectedTarget(move)"
+                    [disabled]="busy() || appliedIds().has(move.noteId) || failureFor(move.noteId)?.retryable === false"
+                    (change)="chooseTarget(move.noteId, $event)"
+                  >
+                    @if (move.toFolderId === null) {
+                      <option value="">New folder: {{ move.toFolder }}</option>
+                    }
+                    @for (target of plan()?.targets ?? []; track target.id) {
+                      <option [value]="target.id">{{ target.label }}</option>
+                    }
+                  </select>
+                </label>
+                <span class="pill confidence" [attr.data-confidence]="move.confidence">
+                  {{ move.confidence }} confidence
+                </span>
               </span>
               <span class="move-reason text-secondary">{{ move.reason }}</span>
+              @if (appliedIds().has(move.noteId)) {
+                <span class="row-status is-applied">Moved successfully</span>
+              } @else if (failureFor(move.noteId); as failure) {
+                <span class="row-status is-failed">{{ failure.reason }}</span>
+                @if (!failure.retryable) {
+                  <span class="row-status">A fresh plan is required.</span>
+                }
+              }
             </div>
           </li>
         }
       </ul>
+    }
 
-      <footer class="sheet-actions">
-        <button
-          type="button"
-          class="btn btn-ghost"
-          (click)="cancelled.emit()"
-          [disabled]="busy()"
-        >
-          Cancel
-        </button>
+    <footer class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        (click)="cancelled.emit()"
+        [disabled]="busy()"
+      >
+        Close
+      </button>
+      @if (selectedCount() > 0) {
         <button
           type="button"
           class="btn btn-primary"
           (click)="onApply()"
-          [disabled]="busy() || selectedCount() === 0"
+          [disabled]="busy()"
         >
-          @if (busy()) {
-            <span class="spin-ring" aria-hidden="true"></span>
-            Applying…
-          } @else {
-            Apply
-            {{ selectedCount() > 0 ? "(" + selectedCount() + ")" : "" }}
-          }
+          {{ applying() ? "Applying…" : "Apply (" + selectedCount() + ")" }}
         </button>
-      </footer>
-    }
+      }
+    </footer>
   </div>
 </div>

@@ -1566,6 +1566,7 @@ impl Db {
         // migrate() stays idempotent. Runs LAST so the companion backfill can read the (now-migrated)
         // `documents.meeting_id` column. See `migrate_links`.
         Self::migrate_links(&conn)?;
+        Self::migrate_filing_projection_journal(&conn)?;
         // Durable exact-body witness for marker cleanup of session-unlocked sealed notes. The
         // filesystem publish happens after the seal transaction; this hash lets its acknowledgement
         // advance the export-integrity baseline without pretending blank at-rest plaintext is the

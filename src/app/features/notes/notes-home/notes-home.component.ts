@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   OnInit,
   computed,
   effect,
@@ -13,6 +14,7 @@ import { TabsService } from "../../../core/tabs.service";
 import type {
   NoteFolder,
   NotesListItem,
+  OrganizeFailure,
   OrganizeMove,
   OrganizePlan,
   OrgItemHeader,
@@ -27,9 +29,16 @@ import { NotesSavedViewsService } from "../../../services/notes-saved-views.serv
 import { NotesViewEngine } from "../../../services/notes-view-engine";
 import { OrgBrainService } from "../../../services/org-brain.service";
 import { ToastService } from "../../../services/toast.service";
-import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
+import {
+  OrganizeSheetComponent,
+  type OrganizeAttemptReceipt,
+  type OrganizeViewPlan,
+} from "../organize-sheet/organize-sheet.component";
 import { NotesViewSwitcherComponent } from "../notes-view-switcher/notes-view-switcher.component";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+
+const MAX_ORGANIZE_FAILURE_REASON_LENGTH = 240;
 
 /**
  * The Notes landing view — NOW a normal in-flow route beside the ALWAYS-VISIBLE
@@ -73,6 +82,8 @@ export class NotesHomeComponent implements OnInit {
   private readonly toast = inject(ToastService);
   private readonly tabsService = inject(TabsService);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly destroyRef = inject(DestroyRef);
 
   /** The note list from the store (gated — masked rows carry no snippet/tags). */
   readonly noteList = this.notes.notes;
@@ -266,6 +277,24 @@ export class NotesHomeComponent implements OnInit {
     return !!f?.locked && !f?.unlocked;
   });
 
+  /**
+   * The organizer's scoped backend reader requires a raw-open folder. A
+   * session unlock is sufficient for ordinary gated reads, but deliberately
+   * not for this AI classification path. Shared Brain rows are a different
+   * dataset entirely and cannot be planned through `activeFolderId`.
+   */
+  readonly canOrganizeActiveScope = computed(() => {
+    if (this.activeOrgId() !== null) {
+      return false;
+    }
+    const folderId = this.activeFolderId();
+    if (folderId === null) {
+      return true;
+    }
+    const folder = this.activeFolder();
+    return folder !== null && !folder.locked;
+  });
+
   // --- Saved Views (mirrors Meetings; ported 2026-07-14) -------------------
   /** The active NOTES saved view (null ⇒ the plain List default). */
   readonly activeSavedView = this.notesSavedViews.activeView;
@@ -335,13 +364,47 @@ export class NotesHomeComponent implements OnInit {
 
   // --- Auto-organize ------------------------------------------------------
   /** The proposed organize plan under review (null = sheet closed). */
-  readonly organizePlan = signal<OrganizePlan | null>(null);
+  readonly organizePlan = signal<OrganizeViewPlan | null>(null);
   /** True while `plan_organize_notes` is being fetched (header button spinner). */
   readonly organizePlanning = signal(false);
   /** True while `apply_organize_plan` is in flight (sheet Apply spinner). */
   readonly organizeApplying = signal(false);
   /** True when the review sheet is showing (a plan has been fetched). */
   readonly organizeOpen = computed(() => this.organizePlan() !== null);
+  /** Invalidates a late planner response after close or a newer request. */
+  private organizePlanGeneration = 0;
+  /** `undefined` means no active review; `null` is the valid global Notes scope. */
+  private organizeScopeFolderId: string | null | undefined;
+
+  /**
+   * A pending response belongs to the exact folder scope it started in. Drop
+   * it synchronously when the shared sidebar selects another folder, before
+   * any old content-bearing plan can render in the new scope.
+   */
+  private readonly _scrubOrganizerOnFolderChange = effect(() => {
+    const folderId = this.activeFolderId();
+    untracked(() => {
+      if (
+        this.organizeScopeFolderId !== undefined &&
+        this.organizeScopeFolderId !== folderId
+      ) {
+        this.scrubOrganizeReview();
+      }
+    });
+  });
+
+  constructor() {
+    // Register before any organizer read. Tauri privacy events are not replayed,
+    // so a relock in the listener gap could otherwise leave cached note titles,
+    // destinations, reasons, or guidance visible in this mounted WebView.
+    const unregister = this.privacyBarrier.registerInvalidator(() =>
+      this.scrubOrganizeReview(),
+    );
+    this.destroyRef.onDestroy(() => {
+      unregister();
+      this.scrubOrganizeReview();
+    });
+  }
 
   /**
    * Picking a DIFFERENT note-folder in the main sidebar's tree exits any active
@@ -408,11 +471,13 @@ export class NotesHomeComponent implements OnInit {
   /** Select an org (chip row) — its shared items become the sole content-pane scope. */
   selectOrg(orgId: string): void {
     this.movePopoverId.set(null);
+    this.scrubOrganizeReview();
     this.activeOrgId.set(orgId);
   }
 
   /** Clear the org selection back to the current note-folder scope. */
   clearOrg(): void {
+    this.scrubOrganizeReview();
     this.activeOrgId.set(null);
   }
 
@@ -533,46 +598,282 @@ export class NotesHomeComponent implements OnInit {
    * organized"). A fetch failure surfaces a toast and leaves the sheet closed.
    */
   async startOrganize(): Promise<void> {
-    if (this.organizePlanning() || this.organizeOpen()) {
+    if (
+      !this.canOrganizeActiveScope() ||
+      this.organizePlanning() ||
+      this.organizeOpen()
+    ) {
       return;
     }
+    const scopeFolderId = this.activeFolderId();
+    this.organizeScopeFolderId = scopeFolderId;
+    await this.planOrganize(scopeFolderId, null);
+  }
+
+  /** Replan the reviewed scope; sidebar navigation cannot silently retarget it. */
+  async replanOrganize(guidance: string): Promise<void> {
+    const viewPlan = this.organizePlan();
+    const scopeFolderId = this.organizeScopeFolderId;
+    if (
+      !viewPlan ||
+      scopeFolderId === undefined ||
+      viewPlan.scopeFolderId !== scopeFolderId ||
+      !this.organizerScopeIsCurrent(scopeFolderId) ||
+      this.organizePlanning() ||
+      this.organizeApplying()
+    ) {
+      return;
+    }
+    await this.planOrganize(scopeFolderId, guidance || null);
+  }
+
+  private async planOrganize(
+    scopeFolderId: string | null,
+    guidance: string | null,
+  ): Promise<void> {
+    const generation = ++this.organizePlanGeneration;
     this.organizePlanning.set(true);
     try {
-      const plan = await this.notes.planOrganize(this.activeFolderId());
-      this.organizePlan.set(plan);
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (
+        generation !== this.organizePlanGeneration ||
+        !this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        return;
+      }
+      if (!privacyReady) {
+        this.scrubOrganizeReview();
+        return;
+      }
+      const plan = await this.notes.planOrganize(scopeFolderId, guidance);
+      if (
+        generation !== this.organizePlanGeneration ||
+        !this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        return;
+      }
+      this.organizePlan.set({
+        ...plan,
+        plannedProposedCount: plan.moves.length,
+        receipt: null,
+        applyError: null,
+      });
     } catch {
-      this.toast.danger("Couldn’t plan an auto-organize. Please try again.");
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        this.toast.danger("Couldn’t plan an auto-organize. Please try again.");
+      }
     } finally {
-      this.organizePlanning.set(false);
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        this.organizePlanning.set(false);
+      }
     }
   }
 
-  /** Apply the user-selected moves, then refresh + confirm. */
+  /** Apply the selected moves and keep every unresolved row available for review/retry. */
   async applyOrganize(moves: OrganizeMove[]): Promise<void> {
-    if (this.organizeApplying()) {
+    if (this.organizePlanning() || this.organizeApplying()) {
+      return;
+    }
+    const viewPlan = this.organizePlan();
+    if (!viewPlan || moves.length === 0) {
+      return;
+    }
+    const generation = this.organizePlanGeneration;
+    const scopeFolderId = this.organizeScopeFolderId;
+    if (
+      scopeFolderId === undefined ||
+      viewPlan.scopeFolderId !== scopeFolderId ||
+      !this.organizerScopeIsCurrent(scopeFolderId)
+    ) {
       return;
     }
     this.organizeApplying.set(true);
     try {
-      await this.notes.applyOrganize(moves);
+      // Strip frontend-only receipt/error state at the service boundary. The
+      // backend receives exactly the plan the user reviewed, with only the
+      // currently selected moves.
+      const plan: OrganizePlan = {
+        scopeFolderId: viewPlan.scopeFolderId,
+        moves,
+        totalScanned: viewPlan.totalScanned,
+        alreadyOrganized: viewPlan.alreadyOrganized,
+        deferred: viewPlan.deferred,
+        targets: viewPlan.targets,
+      };
+      const result = await this.notes.applyOrganize(plan);
+      if (
+        generation !== this.organizePlanGeneration ||
+        !this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        return;
+      }
       // Re-apply the active-folder filter after the store's all-notes reload.
       await this.notes.loadNotes(this.activeFolderId());
-      this.organizePlan.set(null);
-      const n = moves.length;
-      this.toast.success(`Moved ${n} ${n === 1 ? "note" : "notes"}`);
+      if (
+        generation !== this.organizePlanGeneration ||
+        !this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        return;
+      }
+      const receipt = this.mergeOrganizeReceipt(
+        viewPlan.receipt,
+        moves,
+        result.appliedIds,
+        result.failures,
+      );
+      const appliedIds = new Set(receipt.appliedIds);
+      const remainingMoves = viewPlan.moves.filter(
+        (move) => !appliedIds.has(move.noteId),
+      );
+      const moved = new Set(result.appliedIds).size;
+      const unresolved = receipt.failures.length;
+
+      if (unresolved === 0 && remainingMoves.length === 0) {
+        this.organizePlan.set(null);
+        this.toast.success(
+          `${moved} ${moved === 1 ? "note" : "notes"} organized`,
+        );
+      } else {
+        this.organizePlan.set({
+          ...viewPlan,
+          moves: remainingMoves,
+          receipt,
+          applyError: null,
+        });
+        if (unresolved > 0) {
+          this.toast.danger(
+            `${moved} moved; ${unresolved} still need attention.`,
+          );
+        } else {
+          this.toast.success(
+            `${moved} ${moved === 1 ? "note" : "notes"} organized; ${remainingMoves.length} still awaiting your choice.`,
+          );
+        }
+      }
     } catch {
-      this.toast.danger("Couldn’t apply the plan. Please try again.");
+      if (
+        generation !== this.organizePlanGeneration ||
+        !this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        return;
+      }
+      this.organizePlan.update((plan) =>
+        plan
+          ? {
+              ...plan,
+              applyError:
+                "The filing request did not finish. Review the selected moves and retry.",
+            }
+          : plan,
+      );
+      this.toast.danger("Couldn’t finish applying the plan.");
     } finally {
-      this.organizeApplying.set(false);
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizerScopeIsCurrent(scopeFolderId)
+      ) {
+        this.organizeApplying.set(false);
+      }
     }
+  }
+
+  /** A late async result must still belong to the scope visible right now. */
+  private organizerScopeIsCurrent(scopeFolderId: string | null): boolean {
+    return (
+      this.organizeScopeFolderId === scopeFolderId &&
+      this.activeOrgId() === null &&
+      this.activeFolderId() === scopeFolderId
+    );
   }
 
   /** Close the organize review sheet without applying. */
   closeOrganize(): void {
-    if (this.organizeApplying()) {
+    if (this.organizePlanning() || this.organizeApplying()) {
       return;
     }
+    ++this.organizePlanGeneration;
+    this.organizePlanning.set(false);
     this.organizePlan.set(null);
+    this.organizeScopeFolderId = undefined;
+  }
+
+  /** Synchronous privacy boundary: no content-bearing organizer cache survives it. */
+  private scrubOrganizeReview(): void {
+    ++this.organizePlanGeneration;
+    this.organizePlanning.set(false);
+    this.organizeApplying.set(false);
+    this.organizePlan.set(null);
+    this.organizeScopeFolderId = undefined;
+  }
+
+  private mergeOrganizeReceipt(
+    previous: OrganizeAttemptReceipt | null | undefined,
+    attemptedMoves: readonly OrganizeMove[],
+    appliedIds: readonly string[],
+    failures: readonly OrganizeFailure[],
+  ): OrganizeAttemptReceipt {
+    const moves = new Map(
+      (previous?.moves ?? []).map((move) => [move.noteId, move]),
+    );
+    const applied = new Set(previous?.appliedIds ?? []);
+    const unresolved = new Map(
+      (previous?.failures ?? []).map((failure) => [failure.noteId, failure]),
+    );
+    for (const move of attemptedMoves) {
+      moves.set(move.noteId, move);
+      unresolved.delete(move.noteId);
+    }
+    for (const id of appliedIds) {
+      applied.add(id);
+      unresolved.delete(id);
+    }
+    for (const failure of failures) {
+      if (!applied.has(failure.noteId)) {
+        unresolved.set(failure.noteId, {
+          ...failure,
+          reason: this.boundedFailureReason(failure.reason),
+        });
+      }
+    }
+    return {
+      moves: [...moves.values()],
+      appliedIds: [...applied],
+      failures: [...unresolved.values()],
+    };
+  }
+
+  /** Match the workspace organizer's bounded, actionable failure copy. */
+  private boundedFailureReason(reason: string): string {
+    const normalized = reason.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      return "Review the destination and try again.";
+    }
+    const hadInvalidArgumentPrefix = /^invalid argument\s*:/i.test(normalized);
+    const detail = normalized.replace(/^invalid argument\s*:\s*/i, "").trim();
+    let actionable = detail || "Review the destination and try again.";
+    if (hadInvalidArgumentPrefix && /lock|seal/i.test(detail)) {
+      actionable = "Unlock or choose an open destination, then retry.";
+    } else if (hadInvalidArgumentPrefix) {
+      actionable = `${this.sentenceCase(detail)} Review the destination and try again.`;
+    }
+    if (actionable.length <= MAX_ORGANIZE_FAILURE_REASON_LENGTH) {
+      return actionable;
+    }
+    return `${actionable.slice(0, MAX_ORGANIZE_FAILURE_REASON_LENGTH - 1)}…`;
+  }
+
+  private sentenceCase(value: string): string {
+    const withoutTrailingPunctuation = value.replace(/[.!?]+$/, "");
+    if (!withoutTrailingPunctuation) {
+      return "";
+    }
+    return `${withoutTrailingPunctuation[0].toLocaleUpperCase()}${withoutTrailingPunctuation.slice(1)}.`;
   }
 
   // --- Presentational -----------------------------------------------------

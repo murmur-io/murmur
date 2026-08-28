@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   computed,
   inject,
   input,
@@ -24,11 +25,18 @@ import type {
   ContainerNode,
   ItemKind,
   ItemRow,
+  OrganizeFailure,
   OrganizeMove,
   OrganizePlan,
 } from "../../../core/models";
 import { IpcService } from "../../../core/ipc.service";
-import { OrganizeSheetComponent } from "../../notes/organize-sheet/organize-sheet.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
+import {
+  type OrganizeAttemptReceipt,
+  OrganizeSheetComponent,
+  type OrganizeViewPlan,
+} from "../../notes/organize-sheet/organize-sheet.component";
 import { ToastService } from "../../../services/toast.service";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { FoldersService } from "../../../services/folders.service";
@@ -106,7 +114,10 @@ const KIND_ROUTE: Record<ItemKind, string> = {
 export class WorkspaceTreeComponent {
   private readonly router = inject(Router);
   private readonly ipc = inject(IpcService);
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
   protected readonly workspace = inject(WorkspaceService);
   private readonly drag = inject(NoteDragService);
   private readonly folders = inject(FoldersService);
@@ -130,6 +141,13 @@ export class WorkspaceTreeComponent {
    * refetch of its own; the header's toggle owns the deliberate refresh.
    */
   constructor() {
+    const unregisterPrivacy = this.privacyBarrier.registerInvalidator(() =>
+      this.scrubOrganizeReview(),
+    );
+    this.destroyRef.onDestroy(() => {
+      unregisterPrivacy();
+      this.scrubOrganizeReview();
+    });
     if (this.workspace.workspaceEmpty()) {
       void this.workspace.reload();
     }
@@ -158,7 +176,11 @@ export class WorkspaceTreeComponent {
     return out;
   });
 
-  private pushContainer(out: TreeLine[], container: ContainerNode, depth: number): void {
+  private pushContainer(
+    out: TreeLine[],
+    container: ContainerNode,
+    depth: number,
+  ): void {
     out.push({ key: `c:${container.id}`, depth, container });
     if (this.isSealed(container) || !this.isContainerExpanded(container)) {
       return;
@@ -170,7 +192,8 @@ export class WorkspaceTreeComponent {
     const selectedItem = allItems.find((item) => this.isItemSelected(item));
     const selectedIsNewest = selectedItem
       ? newestItems.some(
-          (item) => item.kind === selectedItem.kind && item.id === selectedItem.id,
+          (item) =>
+            item.kind === selectedItem.kind && item.id === selectedItem.id,
         )
       : false;
     const items =
@@ -179,7 +202,8 @@ export class WorkspaceTreeComponent {
             ...allItems
               .filter(
                 (item) =>
-                  item.kind !== selectedItem.kind || item.id !== selectedItem.id,
+                  item.kind !== selectedItem.kind ||
+                  item.id !== selectedItem.id,
               )
               .slice(0, MAX_VISIBLE_ITEMS - 1),
             selectedItem,
@@ -236,7 +260,7 @@ export class WorkspaceTreeComponent {
     if (container.locked && !container.unlocked) {
       return "locked";
     }
-    return container.level === "project" ? "project" : "folder";
+    return container.level === "project" ? "space" : "folder";
   }
 
   protected itemTitle(item: ItemRow): string {
@@ -286,9 +310,10 @@ export class WorkspaceTreeComponent {
     ) {
       return true;
     }
-    return container.folders.some((folder) =>
-      this.isContainerSelected(folder) ||
-      this.containerContainsCurrentSelection(folder),
+    return container.folders.some(
+      (folder) =>
+        this.isContainerSelected(folder) ||
+        this.containerContainsCurrentSelection(folder),
     );
   }
 
@@ -296,7 +321,7 @@ export class WorkspaceTreeComponent {
     this.workspace.toggleContainer(container.id);
   }
 
-  protected isContainerSelected(container: ContainerNode): boolean {
+  protected isContainerSelected(container: Pick<ContainerNode, "id">): boolean {
     return this.currentPath() === `/container/${container.id}`;
   }
 
@@ -358,9 +383,15 @@ export class WorkspaceTreeComponent {
     }
   }
 
-  protected onDragStart(event: DragEvent, item: ItemRow): void {
+  protected onDragStart(
+    event: DragEvent,
+    item: ItemRow,
+    current: ContainerNode | null,
+  ): void {
     const kind = this.draggableKind(item);
-    if (!kind) {
+    if (!kind || (kind === "meeting" && current?.locked)) {
+      event.preventDefault();
+      this.drag.end();
       return;
     }
     this.drag.begin(item.id, kind);
@@ -400,6 +431,9 @@ export class WorkspaceTreeComponent {
     current: ContainerNode,
   ): WorkspaceDestination[] {
     const kind = this.draggableKind(item);
+    if (kind === "meeting" && current.locked) {
+      return [];
+    }
     return kind
       ? this.moveTargets().filter(
           (target) =>
@@ -468,8 +502,10 @@ export class WorkspaceTreeComponent {
       this.toast.success(
         `Moved “${this.itemTitle(request.item)}” to ${target.label}`,
       );
-    } catch {
-      const message = `Couldn’t move “${this.itemTitle(request.item)}” to ${target.label}.`;
+    } catch (error) {
+      const message = this.errorCopy.is(error, "recording-linked-note")
+        ? this.errorCopy.humanize(error)
+        : `Couldn’t move “${this.itemTitle(request.item)}” to ${target.label}.`;
       this.moveError.set(message);
       this.toast.danger(message);
     } finally {
@@ -504,8 +540,12 @@ export class WorkspaceTreeComponent {
     try {
       await this.workspace.moveItem(payload.kind, payload.id, container.id);
       this.toast.success(`Moved item to ${targetLabel}`);
-    } catch {
-      this.toast.danger(`Couldn’t move this item to ${targetLabel}.`);
+    } catch (error) {
+      this.toast.danger(
+        this.errorCopy.is(error, "recording-linked-note")
+          ? this.errorCopy.humanize(error)
+          : `Couldn’t move this item to ${targetLabel}.`,
+      );
     }
   }
 
@@ -679,7 +719,9 @@ export class WorkspaceTreeComponent {
     }
   }
 
-  protected containerNoun(container: ContainerNode): "space" | "folder" {
+  protected containerNoun(
+    container: Pick<ContainerNode, "level">,
+  ): "space" | "folder" {
     return container.level === "project" ? "space" : "folder";
   }
 
@@ -741,11 +783,14 @@ export class WorkspaceTreeComponent {
   // feature nobody could trust twice.
 
   /** The proposed plan; `null` means the sheet is closed. */
-  protected readonly organizePlan = signal<OrganizePlan | null>(null);
+  protected readonly organizePlan = signal<OrganizeViewPlan | null>(null);
+  /** Content-free identity of the reviewed container; never retain its item tree. */
+  private readonly organizeScopeId = signal<string | null>(null);
   /** True while the plan is being fetched (the menu entry says so). */
   protected readonly organizePlanning = signal(false);
   /** True while the apply is in flight (the sheet's own spinner). */
   protected readonly organizeApplying = signal(false);
+  private organizePlanGeneration = 0;
 
   /**
    * A sealed container cannot be organized, and the reason is the planner's:
@@ -754,7 +799,7 @@ export class WorkspaceTreeComponent {
    */
   protected canOrganize(container: ContainerNode): boolean {
     return (
-      (!container.locked || container.unlocked) &&
+      !container.locked &&
       container.groups.some((group) => group.kind === "note" && group.total > 0)
     );
   }
@@ -763,40 +808,211 @@ export class WorkspaceTreeComponent {
     if (this.organizePlanning() || this.organizePlan()) {
       return;
     }
+    this.organizeScopeId.set(container.id);
+    await this.planOrganize(container.id, null);
+  }
+
+  protected async replanOrganize(guidance: string): Promise<void> {
+    const scopeId = this.organizeScopeId();
+    if (!scopeId || this.organizePlanning() || this.organizeApplying()) {
+      return;
+    }
+    await this.planOrganize(scopeId, guidance || null);
+  }
+
+  private async planOrganize(
+    scopeId: string,
+    guidance: string | null,
+  ): Promise<void> {
+    const generation = ++this.organizePlanGeneration;
     this.organizePlanning.set(true);
     try {
-      const plan = await this.ipc.planOrganizeNotes(container.id);
-      if (plan.moves.length === 0) {
-        this.toast.info(`Nothing to re-file in ${container.name}.`);
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (
+        generation !== this.organizePlanGeneration ||
+        this.organizeScopeId() !== scopeId
+      ) {
         return;
       }
-      this.organizePlan.set(plan);
+      if (!privacyReady) {
+        this.scrubOrganizeReview();
+        return;
+      }
+      const plan = await this.ipc.planOrganizeNotes(scopeId, guidance);
+      if (
+        generation !== this.organizePlanGeneration ||
+        this.organizeScopeId() !== scopeId
+      ) {
+        return;
+      }
+      this.organizePlan.set({
+        ...plan,
+        plannedProposedCount: plan.moves.length,
+        receipt: null,
+        applyError: null,
+      });
     } catch {
-      this.toast.danger("Couldn't plan an auto-organize. Please try again.");
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizeScopeId() === scopeId
+      ) {
+        this.toast.danger("Couldn't plan an auto-organize. Please try again.");
+      }
     } finally {
-      this.organizePlanning.set(false);
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizeScopeId() === scopeId
+      ) {
+        this.organizePlanning.set(false);
+      }
     }
   }
 
   protected async applyOrganize(moves: OrganizeMove[]): Promise<void> {
+    if (this.organizePlanning() || this.organizeApplying()) {
+      return;
+    }
     if (moves.length === 0) {
       this.closeOrganize();
       return;
     }
+    const viewPlan = this.organizePlan();
+    const scopeId = this.organizeScopeId();
+    if (!viewPlan || !scopeId || viewPlan.scopeFolderId !== scopeId) {
+      return;
+    }
+    const generation = this.organizePlanGeneration;
     this.organizeApplying.set(true);
     try {
-      await this.ipc.applyOrganizePlan({ moves });
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (
+        generation !== this.organizePlanGeneration ||
+        this.organizeScopeId() !== scopeId
+      ) {
+        return;
+      }
+      if (!privacyReady) {
+        this.scrubOrganizeReview();
+        return;
+      }
+      const plan: OrganizePlan = {
+        scopeFolderId: viewPlan.scopeFolderId,
+        moves,
+        totalScanned: viewPlan.totalScanned,
+        alreadyOrganized: viewPlan.alreadyOrganized,
+        deferred: viewPlan.deferred,
+        targets: viewPlan.targets,
+      };
+      const result = await this.ipc.applyOrganizePlan(plan);
+      if (
+        generation !== this.organizePlanGeneration ||
+        this.organizeScopeId() !== scopeId
+      ) {
+        return;
+      }
       await this.workspace.reload();
-      this.closeOrganize();
+      if (
+        generation !== this.organizePlanGeneration ||
+        this.organizeScopeId() !== scopeId
+      ) {
+        return;
+      }
+      const receipt = this.mergeOrganizeReceipt(
+        viewPlan.receipt,
+        moves,
+        result.appliedIds,
+        result.failures,
+      );
+      if (receipt.failures.length === 0) {
+        this.toast.success(
+          `${result.appliedIds.length} ${result.appliedIds.length === 1 ? "note" : "notes"} organized`,
+        );
+        // A successful apply still owns the busy flag, so bypass the public
+        // close guard and synchronously evict the completed review.
+        this.scrubOrganizeReview();
+      } else {
+        this.organizePlan.set({
+          ...viewPlan,
+          receipt,
+          applyError: null,
+        });
+        this.toast.danger(
+          `${result.appliedIds.length} moved; ${receipt.failures.length} still need attention.`,
+        );
+      }
     } catch {
-      this.toast.danger("Couldn't apply the plan. Nothing was moved.");
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizeScopeId() === scopeId
+      ) {
+        this.organizePlan.update((plan) =>
+          plan
+            ? {
+                ...plan,
+                applyError:
+                  "The filing request did not finish. Review the selected moves and retry.",
+              }
+            : plan,
+        );
+        this.toast.danger("Couldn't finish applying the plan.");
+      }
     } finally {
-      this.organizeApplying.set(false);
+      if (
+        generation === this.organizePlanGeneration &&
+        this.organizeScopeId() === scopeId
+      ) {
+        this.organizeApplying.set(false);
+      }
     }
   }
 
   protected closeOrganize(): void {
+    if (this.organizePlanning() || this.organizeApplying()) {
+      return;
+    }
+    this.scrubOrganizeReview();
+  }
+
+  /** Synchronous privacy boundary for every copied organizer plaintext field. */
+  private scrubOrganizeReview(): void {
+    ++this.organizePlanGeneration;
+    this.organizePlanning.set(false);
+    this.organizeApplying.set(false);
     this.organizePlan.set(null);
+    this.organizeScopeId.set(null);
+  }
+
+  private mergeOrganizeReceipt(
+    previous: OrganizeAttemptReceipt | null | undefined,
+    attemptedMoves: readonly OrganizeMove[],
+    appliedIds: readonly string[],
+    failures: readonly OrganizeFailure[],
+  ): OrganizeAttemptReceipt {
+    const moves = new Map(
+      (previous?.moves ?? []).map((move) => [move.noteId, move]),
+    );
+    const applied = new Set(previous?.appliedIds ?? []);
+    const unresolved = new Map(
+      (previous?.failures ?? []).map((failure) => [failure.noteId, failure]),
+    );
+    for (const move of attemptedMoves) {
+      moves.set(move.noteId, move);
+      unresolved.delete(move.noteId);
+    }
+    for (const id of appliedIds) {
+      applied.add(id);
+      unresolved.delete(id);
+    }
+    for (const failure of failures) {
+      if (!applied.has(failure.noteId)) {
+        unresolved.set(failure.noteId, failure);
+      }
+    }
+    return {
+      moves: [...moves.values()],
+      appliedIds: [...applied],
+      failures: [...unresolved.values()],
+    };
   }
 
   protected openAll(container: ContainerNode): void {

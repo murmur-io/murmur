@@ -1089,14 +1089,48 @@ pub struct OrganizeMove {
     pub from_folder: String,
     pub to_folder: String,
     pub to_folder_id: Option<String>,
+    /// `high` | `medium` | `low`; informational only because every move is review-first.
+    pub confidence: String,
     pub reason: String,
 }
 
-/// The auto-organize plan (WP5) — the reviewable set of proposed moves.
+/// One existing, open direct-child destination offered by the note organizer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeTarget {
+    pub id: String,
+    pub label: String,
+}
+
+/// The auto-organize plan (WP5) — the reviewable set of proposed moves plus honest coverage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizePlan {
+    /// `None` keeps the legacy Notes-home all-visible scope; `Some` is one selected container.
+    pub scope_folder_id: Option<String>,
     pub moves: Vec<OrganizeMove>,
+    pub targets: Vec<OrganizeTarget>,
+    pub total_scanned: u32,
+    pub already_organized: u32,
+    pub deferred: u32,
+}
+
+/// One note that could not be applied after the plan was reviewed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeFailure {
+    pub note_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+/// Honest best-effort apply receipt. `appliedIds` and `failures.noteId` are disjoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeApplyResult {
+    pub applied_ids: Vec<String>,
+    pub failures: Vec<OrganizeFailure>,
 }
 
 /// One turn in a meeting chat conversation. `role` is "user" | "assistant".

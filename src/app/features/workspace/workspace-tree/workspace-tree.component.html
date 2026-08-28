@@ -45,7 +45,7 @@
               icon="meeting"
               [selected]="isItemSelected(item)"
               [attr.draggable]="true"
-              (dragstart)="onDragStart($event, item)"
+              (dragstart)="onDragStart($event, item, null)"
               (dragend)="onDragEnd()"
               (activate)="openItem(item)"
             >
@@ -94,8 +94,8 @@
           [depth]="line.depth"
           [icon]="kindIcon(item.kind)"
           [selected]="isItemSelected(item)"
-          [attr.draggable]="draggableKind(item) ? true : null"
-          (dragstart)="onDragStart($event, item)"
+          [attr.draggable]="draggableKind(item) && !(item.kind === 'meeting' && line.container.locked) ? true : null"
+          (dragstart)="onDragStart($event, item, line.container)"
           (dragend)="onDragEnd()"
           (activate)="openItem(item)"
         >
@@ -295,8 +295,12 @@
   <div class="workspace-overlay-host" appTeleportToBody>
     <app-organize-sheet
       [plan]="organizePlan()"
-      [busy]="organizeApplying()"
+      [busy]="organizeApplying() || organizePlanning()"
+      [planning]="organizePlanning()"
+      [applying]="organizeApplying()"
+      [guidanceEnabled]="true"
       (apply)="applyOrganize($event)"
+      (replan)="replanOrganize($event)"
       (cancelled)="closeOrganize()"
     />
   </div>

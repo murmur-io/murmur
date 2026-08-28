@@ -10,6 +10,7 @@ import {
 import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import type { FolderNode } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 import { LockBadgeComponent } from "../lock-badge/lock-badge.component";
 
 /** A flattened, indented folder option for the picker list. */
@@ -26,10 +27,9 @@ interface FolderOption {
  * Load-bearing confirm: a move that crosses an encryption boundary is destructive
  * to the on-disk plaintext, so it MUST be confirmed first:
  *  - INTO a locked folder  → "encrypts + removes the Markdown from your vault".
- *  - OUT OF a locked folder → "re-exports the plaintext Markdown to your vault".
- * A move between two open folders (or open↔root) needs no confirm and applies
- * immediately. The confirm copy names the exact consequence — never a bare
- * "Are you sure?".
+ * Moving OUT of a still-sealed folder is not offered: a session unlock keeps the
+ * retained ciphertext as relock authority and is not a permanent unseal. The user
+ * removes the folder lock first, then performs an ordinary open-domain move.
  */
 @Component({
   selector: "app-move-to-menu",
@@ -41,6 +41,7 @@ interface FolderOption {
 export class MoveToMenuComponent {
   readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The note being moved. */
   readonly meetingId = input.required<string>();
@@ -102,7 +103,7 @@ export class MoveToMenuComponent {
   }
 
   /** Whether the note currently lives in a sealed (locked) folder. */
-  private readonly sourceLocked = computed(() => {
+  readonly sourceLocked = computed(() => {
     const src = this.nodeById(this.currentFolderId());
     return src?.locked ?? false;
   });
@@ -112,14 +113,16 @@ export class MoveToMenuComponent {
    * locked folder) we open the load-bearing confirm; otherwise apply at once.
    */
   pick(targetId: string | null): void {
+    if (this.sourceLocked()) {
+      return;
+    }
     if (targetId === this.currentFolderId()) {
       return; // already here
     }
     const targetNode = this.nodeById(targetId);
     const intoLocked = targetNode?.locked ?? false;
-    const outOfLocked = this.sourceLocked();
 
-    if (intoLocked || outOfLocked) {
+    if (intoLocked) {
       this.moveError.set(null);
       this.pending.set({ id: targetId, node: targetNode });
       return;
@@ -178,8 +181,12 @@ export class MoveToMenuComponent {
       this.toast.success(`Moved to ${targetName}`);
       this.moved.emit(targetId);
       this.closed.emit();
-    } catch {
-      this.moveError.set("Couldn’t move this note. Please try again.");
+    } catch (error) {
+      this.moveError.set(
+        this.errorCopy.is(error, "recording-linked-note")
+          ? this.errorCopy.humanize(error)
+          : "Couldn’t move this note. Please try again.",
+      );
     } finally {
       this.moving.set(false);
     }

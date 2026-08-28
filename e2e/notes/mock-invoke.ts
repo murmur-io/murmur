@@ -255,8 +255,9 @@ export async function mockNotes(
       };
     },
 
-    // --- auto-organize (one proposed move to a NEW folder) ---
+    // --- auto-organize (current scoped plan DTO + honest apply receipt) ---
     plan_organize_notes: () => ({
+      scopeFolderId: null,
       moves: [
         {
           noteId: "n1",
@@ -266,10 +267,15 @@ export async function mockNotes(
           toFolder: "Ideas",
           toFolderId: null,
           reason: "Groups your idea notes",
+          confidence: "high",
         },
       ],
+      totalScanned: 3,
+      alreadyOrganized: 1,
+      deferred: 1,
+      targets: [],
     }),
-    apply_organize_plan: () => null,
+    apply_organize_plan: () => ({ appliedIds: ["n1"], failures: [] }),
 
     // --- folder management (benign) ---
     create_note_folder: (args: { name: string; parentId: string | null }) => ({
