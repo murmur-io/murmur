@@ -503,7 +503,9 @@ export class WorkspaceTreeComponent {
         `Moved “${this.itemTitle(request.item)}” to ${target.label}`,
       );
     } catch (error) {
-      const message = this.errorCopy.humanize(error);
+      const message = this.errorCopy.is(error, "recording-linked-note")
+        ? this.errorCopy.humanize(error)
+        : `Couldn’t move “${this.itemTitle(request.item)}” to ${target.label}.`;
       this.moveError.set(message);
       this.toast.danger(message);
     } finally {
@@ -539,7 +541,11 @@ export class WorkspaceTreeComponent {
       await this.workspace.moveItem(payload.kind, payload.id, container.id);
       this.toast.success(`Moved item to ${targetLabel}`);
     } catch (error) {
-      this.toast.danger(this.errorCopy.humanize(error));
+      this.toast.danger(
+        this.errorCopy.is(error, "recording-linked-note")
+          ? this.errorCopy.humanize(error)
+          : `Couldn’t move this item to ${targetLabel}.`,
+      );
     }
   }
 
