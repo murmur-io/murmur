@@ -21,7 +21,7 @@ import sys
 import time
 
 HARNESS_LIBRARY = (
-    Path(__file__).resolve().parent.parent / ".agents" / "harness"
+    Path(__file__).resolve().parent.parent / ".agents" / "h"
 )
 sys.path.insert(0, str(HARNESS_LIBRARY))
 import resource_lane

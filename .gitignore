@@ -40,3 +40,6 @@ meetnotes.db
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Loadout run artifacts (inne narzedzie, nie nalezy do repo)
+.loadout/
