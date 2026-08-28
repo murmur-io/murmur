@@ -93,9 +93,9 @@ const TASK_DOC_ID = "22222222-2222-4222-8222-222222222222";
 const TASK_ID = `${TASK_ORG_ID}:${TASK_DOC_ID}`;
 
 /**
- * A task id is copyable too, but the tooltip deliberately promises nothing about Claude here:
- * no MCP tool resolves a task id yet, so this control exists to let the user refer to the task
- * by hand. If a `get_task` tool ever lands, the copy is already in the right place.
+ * The task id is what the local MCP server's `get_task` takes, so this must copy the COMPOSITE
+ * `<orgId>:<docId>` verbatim — a task is addressed by both halves, and trimming either one gives
+ * the tool an id it cannot resolve.
  */
 test("the task header copies the task's composite id", async ({ page }) => {
   await stubClipboard(page, "resolve");
