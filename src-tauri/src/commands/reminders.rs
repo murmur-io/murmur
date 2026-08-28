@@ -2956,9 +2956,10 @@ fn read_reminder_audit_source_under_lifecycle(
     match source_kind {
         "meeting" => {
             if !super::meeting_is_unlocked(state, source_id)? {
-                return Err(AppError::Locked(
-                    "this meeting's folder is locked — unlock it and retry".into(),
-                ));
+                return Err(AppError::Locked(crate::errcode::tag(
+                        crate::errcode::MEETING_LOCKED,
+                        "this meeting's folder is locked — unlock it and retry",
+                    )));
             }
             let meeting = state
                 .db
