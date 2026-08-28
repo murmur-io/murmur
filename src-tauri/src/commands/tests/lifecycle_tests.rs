@@ -15276,11 +15276,11 @@
         );
     }
 
-    /// Public manual Move keeps the shipped `Re-export & move` capability for a source folder that
-    /// is sealed at rest but unlocked for this session. The stricter Brain organizer path has a
-    /// separate raw-open boundary and continues to reject this protection-domain crossing.
+    /// A session unlock is not a permanent unseal: retained blobs remain relock authority. Moving
+    /// out through the legacy seam would strand those blobs in an open domain and make the next
+    /// ordinary move fail. Refuse before mutation and require removing the folder lock first.
     #[test]
-    fn public_move_note_out_of_session_unlocked_folder_preserves_content() {
+    fn public_move_note_out_of_session_unlocked_folder_fails_before_mutation() {
         const MID: &str = "m-public-move-out-sealed";
         const SOURCE: &str = "f-public-move-out-sealed";
         const MD: &str = "# moving out\n\nthese bytes must survive the protection-domain move";
@@ -15315,9 +15315,14 @@
             .collect::<Vec<_>>()
             .join(" ");
 
-        move_note_public_inner_impl(&state, MID.into(), None).unwrap();
+        let error = move_note_public_inner_impl(&state, MID.into(), None)
+            .expect_err("session unlock must not become a partial permanent unseal");
 
-        assert_eq!(state.db.folder_for_meeting(MID).unwrap(), None);
+        assert!(matches!(error, AppError::Unavailable(_)), "{error:?}");
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap().as_deref(),
+            Some(SOURCE)
+        );
         assert_eq!(
             state
                 .db
@@ -15338,6 +15343,71 @@
                 .join(" "),
             transcript_before
         );
+    }
+
+    /// The legacy sealed-domain mover does not own the authored companion transaction. Refuse the
+    /// whole public move before touching either side instead of sealing only the meeting and leaving
+    /// the linked document or its attachments readable in the old open folder.
+    #[test]
+    fn public_locked_domain_move_with_companion_fails_before_mutation() {
+        const MID: &str = "m-public-locked-companion";
+        const TARGET: &str = "f-public-locked-companion";
+
+        let state = build_state("public-locked-companion");
+        make_open_folder(&state.db, TARGET, "Private target");
+        seed_meeting(&state.db, MID, "# Generated note", None);
+        let companion = get_or_create_companion_note_inner(&state, MID).unwrap();
+        update_note_doc_inner_with(
+            &state,
+            &companion.note_id,
+            "Authored note",
+            "# Authored note\n\nMust stay in its original domain.",
+            None,
+        )
+        .unwrap();
+        let meeting_before = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
+        let meeting_seals_before = state
+            .db
+            .sealable_notes_for_meeting(MID)
+            .unwrap()
+            .into_iter()
+            .map(|note| (note.provider_id, note.markdown, note.content_blob))
+            .collect::<Vec<_>>();
+        let companion_before = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+
+        lock_folder_inner(&state, TARGET.to_string()).unwrap();
+        session_unlock(&state, TARGET);
+        let error = move_note_public_inner_impl(&state, MID.into(), Some(TARGET.into()))
+            .expect_err("a partial meeting-only seal must be refused");
+
+        assert!(matches!(error, AppError::Unavailable(_)), "{error:?}");
+        assert_eq!(state.db.folder_for_meeting(MID).unwrap(), None);
+        let meeting_after = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
+        assert_eq!(meeting_after.markdown, meeting_before.markdown);
+        assert_eq!(meeting_after.exported_path, meeting_before.exported_path);
+        assert_eq!(
+            state
+                .db
+                .sealable_notes_for_meeting(MID)
+                .unwrap()
+                .into_iter()
+                .map(|note| (note.provider_id, note.markdown, note.content_blob))
+                .collect::<Vec<_>>(),
+            meeting_seals_before
+        );
+        let companion_after = state
+            .db
+            .get_note_row(&companion.note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(companion_after.folder_id, companion_before.folder_id);
+        assert_eq!(companion_after.text, companion_before.text);
+        assert_eq!(companion_after.sealed, companion_before.sealed);
+        assert_eq!(companion_after.exported_path, companion_before.exported_path);
     }
 
     /// Auto-organize seam: [`classify_auto_file_target`] maps a classifier-chosen subfolder to the
