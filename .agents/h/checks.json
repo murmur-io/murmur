@@ -2,6 +2,16 @@
   "_comment": "Zmienione sciezki -> checki. Kolejnosc = kolejnosc uruchomienia (najtansze pierwsze).",
   "rust_test_scope_limit": 6,
   "checks": {
+    "new-deps": {
+      "when": [
+        "Cargo.toml",
+        "src-tauri/Cargo.toml",
+        "crates/**/Cargo.toml",
+        "package.json"
+      ],
+      "cmd": "python3 .agents/h/new-deps.py",
+      "budget_s": 30
+    },
     "ng-lint": {
       "when": [
         "src/app/**",
