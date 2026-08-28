@@ -201,7 +201,9 @@ test("degraded filing recovery stays visible, refreshes on focus, and keeps one 
       const style = getComputedStyle(element);
       return {
         backgroundMatchesToken: style.backgroundColor === expectedBackground,
-        backdropFilter: style.backdropFilter,
+        backdropFilter:
+          style.backdropFilter ||
+          style.getPropertyValue("-webkit-backdrop-filter"),
       };
     }),
   ).toEqual({ backgroundMatchesToken: true, backdropFilter: "none" });
