@@ -1,0 +1,169 @@
+:host {
+  display: contents;
+}
+
+/* The shared warning banner supplies semantics/layout; this stronger selector
+   deliberately overrides its in-flow warning fill because a fixed overlay must
+   stay opaque (T3), never glass or translucent warning-soft. */
+mur-banner.recovery-card.banner {
+  position: fixed;
+  z-index: var(--z-account-session-banner);
+  bottom: var(--space-4);
+  left: calc(var(--space-8) + var(--space-4));
+  width: min(38rem, calc(100vw - 2 * var(--space-4)));
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: var(--shadow-lg);
+}
+
+.confirm-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-7);
+  height: var(--space-7);
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.confirm-mark mur-icon {
+  width: var(--space-5);
+  height: var(--space-5);
+}
+
+.recovery-content {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.recovery-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.recovery-copy strong {
+  font-size: var(--type-command-label);
+}
+
+.recovery-copy > span {
+  color: var(--text-muted);
+  font-size: var(--type-command-caption);
+  line-height: 1.4;
+}
+
+.recovery-copy .recovery-counts {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.recovery-copy .recovery-error {
+  color: var(--danger);
+}
+
+.recovery-actions,
+.confirm-sheet footer,
+.confirm-sheet header {
+  display: flex;
+}
+
+.recovery-actions {
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.recovery-actions .btn {
+  min-height: var(--control-height-sm);
+  padding-inline: var(--space-3);
+  white-space: nowrap;
+}
+
+.confirm-scrim {
+  position: fixed;
+  z-index: var(--z-overlay);
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: var(--scrim);
+}
+
+.confirm-sheet {
+  display: flex;
+  width: min(32rem, 100%);
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: var(--shadow-lg);
+}
+
+.confirm-sheet header {
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.confirm-sheet h3,
+.confirm-sheet p {
+  margin: 0;
+}
+
+.confirm-sheet h3 {
+  color: var(--text-primary);
+  font-size: var(--type-command-label);
+}
+
+.confirm-sheet header p {
+  margin-top: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--type-command-caption);
+  line-height: 1.5;
+}
+
+.vault-safety {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: var(--type-command-caption);
+  font-weight: 650;
+}
+
+.confirm-sheet footer {
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+@media (max-width: 760px) {
+  .recovery-card {
+    top: 50%;
+    right: var(--space-4);
+    bottom: auto;
+    left: var(--space-4);
+    width: auto;
+    transform: translateY(-50%);
+  }
+
+  .recovery-content {
+    flex-wrap: wrap;
+  }
+
+  .recovery-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}

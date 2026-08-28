@@ -98,6 +98,8 @@ import type {
   NoteTemplateSection,
   OrgAccess,
   OrganizePlan,
+  OrganizeApplyResult,
+  FilingRecoveryStatus,
   WorkspaceOrganizeApplyResult,
   WorkspaceOrganizeMove,
   WorkspaceOrganizePlan,
@@ -259,8 +261,8 @@ export class IpcService {
    */
   readonly workspaceMutationRevision =
     this._workspaceMutationRevision.asReadonly();
-  startRecording(): Promise<StartResult> {
-    return invoke<StartResult>("start_recording");
+  startRecording(folderId: string | null = null): Promise<StartResult> {
+    return invoke<StartResult>("start_recording", { folderId });
   }
 
   stopRecording(companionFlushCompleted?: boolean): Promise<StopResult> {
@@ -3019,21 +3021,92 @@ export class IpcService {
    * an {@link OrganizePlan} of moves with reasons; `folderId` (null ⇒ all notes)
    * scopes the run. Non-destructive — nothing moves until {@link applyOrganizePlan}.
    */
-  planOrganizeNotes(folderId: string | null): Promise<OrganizePlan> {
-    return invoke<OrganizePlan>("plan_organize_notes", { folderId });
+  async planOrganizeNotes(
+    folderId: string | null,
+    guidance: string | null = null,
+  ): Promise<OrganizePlan> {
+    const plan = await invoke<OrganizePlan>("plan_organize_notes", {
+      folderId,
+      guidance,
+    });
+    if (
+      !Object.prototype.hasOwnProperty.call(plan, "scopeFolderId") ||
+      plan.scopeFolderId !== folderId
+    ) {
+      throw new Error("The organizer returned a plan for a different scope.");
+    }
+    return {
+      ...plan,
+      moves: plan.moves.map((move) => ({
+        ...move,
+        reviewScopeFolderId: plan.scopeFolderId,
+      })),
+    };
   }
 
   /**
    * Apply an auto-organize plan (step 2): create the needed note-folders + move the
    * notes (gated; re-exports). Confirm-before-apply on the FE.
    */
-  applyOrganizePlan(plan: OrganizePlan): Promise<void> {
-    return invoke<void>("apply_organize_plan", { plan });
+  async applyOrganizePlan(
+    plan: OrganizePlan | Pick<OrganizePlan, "moves">,
+  ): Promise<OrganizeApplyResult> {
+    let scopeFolderId: string | null;
+    if ("scopeFolderId" in plan) {
+      scopeFolderId = plan.scopeFolderId;
+    } else if (plan.moves.length === 0) {
+      scopeFolderId = null;
+    } else {
+      const scopes = plan.moves.map((move) => {
+        if (
+          !Object.prototype.hasOwnProperty.call(move, "reviewScopeFolderId") ||
+          move.reviewScopeFolderId === undefined ||
+          move.reviewScopeFolderId === ""
+        ) {
+          throw new Error(
+            "The selected organizer move is missing its reviewed scope.",
+          );
+        }
+        return move.reviewScopeFolderId;
+      });
+      scopeFolderId = scopes[0];
+      if (scopes.some((scope) => scope !== scopeFolderId)) {
+        throw new Error(
+          "Selected organizer moves came from different review scopes.",
+        );
+      }
+    }
+    const wireMoves = plan.moves.map((move) => ({
+      noteId: move.noteId,
+      title: move.title,
+      fromFolderId: move.fromFolderId,
+      fromFolder: move.fromFolder,
+      toFolder: move.toFolder,
+      toFolderId: move.toFolderId,
+      confidence: move.confidence,
+      reason: move.reason,
+    }));
+    const normalized = {
+      scopeFolderId,
+      moves: wireMoves,
+      totalScanned:
+        "totalScanned" in plan ? plan.totalScanned : plan.moves.length,
+      alreadyOrganized: "alreadyOrganized" in plan ? plan.alreadyOrganized : 0,
+      deferred: "deferred" in plan ? plan.deferred : 0,
+      targets: "targets" in plan ? plan.targets : [],
+    };
+    return invoke<OrganizeApplyResult>("apply_organize_plan", {
+      plan: normalized,
+    });
   }
 
   /** Propose where unfiled recordings belong. Nothing moves until apply. */
-  planWorkspaceOrganization(): Promise<WorkspaceOrganizePlan> {
-    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization");
+  planWorkspaceOrganization(
+    guidance: string | null = null,
+  ): Promise<WorkspaceOrganizePlan> {
+    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization", {
+      guidance,
+    });
   }
 
   /** Apply only the recording moves the user kept selected in the review sheet. */
@@ -3044,6 +3117,27 @@ export class IpcService {
       "apply_workspace_organization",
       { moves },
     );
+  }
+
+  /** Content-free health for crash-safe filing recovery; no ids, paths, or titles. */
+  getFilingRecoveryStatus(): Promise<FilingRecoveryStatus> {
+    return invoke<FilingRecoveryStatus>("get_filing_recovery_status");
+  }
+
+  /** Retry exact-identity recovery after the user resolves a vault-side conflict. */
+  retryFilingRecovery(): Promise<FilingRecoveryStatus> {
+    return invoke<FilingRecoveryStatus>("retry_filing_recovery");
+  }
+
+  /** Preserve one external vault occupant after an explicit destructive confirmation. */
+  keepExistingFilingFile(
+    issueToken: string,
+    confirmed: true,
+  ): Promise<FilingRecoveryStatus> {
+    return invoke<FilingRecoveryStatus>("keep_existing_filing_file", {
+      issueToken,
+      confirmed,
+    });
   }
 
   // ── Feature C — typed note front-matter properties (folder-level schema +

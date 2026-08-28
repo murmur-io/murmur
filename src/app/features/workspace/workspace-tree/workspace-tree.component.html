@@ -295,8 +295,12 @@
   <div class="workspace-overlay-host" appTeleportToBody>
     <app-organize-sheet
       [plan]="organizePlan()"
-      [busy]="organizeApplying()"
+      [busy]="organizeApplying() || organizePlanning()"
+      [planning]="organizePlanning()"
+      [applying]="organizeApplying()"
+      [guidanceEnabled]="true"
       (apply)="applyOrganize($event)"
+      (replan)="replanOrganize($event)"
       (cancelled)="closeOrganize()"
     />
   </div>

@@ -8,7 +8,9 @@
      that and forced the surface ~--space-7 too tall (a permanent bottom overflow, worst
      on small screens). A negative bottom margin cancels app-main's bottom padding so the
      footer / last card can reach the window bottom. Mirrors the note-editor :host math. */
-  min-height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  min-height: calc(
+    100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7)
+  );
   margin-bottom: calc(-1 * var(--space-8));
   animation: rise 420ms var(--transition) both;
 }
@@ -16,8 +18,7 @@
 /* When the note is the ACTIVE writing surface (recording / an in-flight pipeline with
    the companion note visible — see boundToViewport), BOUND the height so the whole thing
    (top bar → notepad → footer HUD) fits with NO page scroll and the note scrolls
-   INTERNALLY. The "done" review state stays unbounded (min-height above) so its stacked
-   Brain-reveal / Re-Truth cards can scroll. */
+   INTERNALLY. The final review stays unbounded so its result + Re-Truth can scroll. */
 .record.is-bounded {
   height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
   min-height: 0;
@@ -207,6 +208,7 @@
   flex-wrap: wrap;
   gap: var(--space-3);
 }
+
 @keyframes bar-in {
   from {
     opacity: 0;
@@ -776,4 +778,3 @@
   border: 1px solid var(--border);
   color: var(--text-secondary);
 }
-    
