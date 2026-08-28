@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python3 -B "$(dirname "$0")/../.agents/h/h.py" "$@"

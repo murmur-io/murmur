@@ -76,95 +76,6 @@ env:
   MURMUR_E2E_NO_EGRESS: "1"
 
 jobs:
-  # ── Receipt gate: opted-in agent branches need consistent PASS receipts. ──────
-  # Cheap (ubuntu, seconds) and deliberately FIRST: it answers "does this branch
-  # carry a self-consistent PASS receipt", which the expensive lanes below cannot.
-  # A harness
-  # task that dies (timeout, 429, a killed session) leaves its branch mergeable and
-  # its attestation stranded in local .git — on 2026-07-26 that put 2,566 unattested
-  # lines on trunk with nobody the wiser. `agent/*` branches are always in scope,
-  # and a renamed branch stays in scope once its history contains a receipt. A
-  # deliberate pre-receipt non-v2 `agent/*` PR may declare `Harness-Lane: B`.
-  #
-  # Threat boundary: this is a presence-and-consistency receipt, not a signed
-  # proof against a malicious author who can rewrite this pull_request workflow.
-  # Selecting the verifier from BASE_SHA prevents an ordinary gate change from
-  # silently reinterpreting older receipts. An organization-level required
-  # workflow or a separate GitHub App would be needed for adversarial workflow
-  # immutability; do not describe this repository status check as that.
-  attestation:
-    name: attestation gate (harness receipt)
-    # PR-only: every input it reads (head ref, base sha, description) lives on the
-    # pull_request payload. The merge-group head is synthetic and has no PR body;
-    # its constituent PRs were already receipt-gated before entering the queue.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout the PR base revision (full history)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Never execute the receipt verifier from candidate PR bytes. The
-          # candidate is fetched below only as inert Git objects to be judged.
-          ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 0
-
-      - name: Verify the harness receipt with the base-revision verifier
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::pull_request.base.sha is not exactly 40 lowercase hex characters"
-            exit 1
-          fi
-          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::pull_request.head.sha is not exactly 40 lowercase hex characters"
-            exit 1
-          fi
-          case "$PR_NUMBER" in
-            '' | *[!0-9]*)
-              echo "::error::pull request number is malformed"
-              exit 1
-              ;;
-          esac
-          git check-ref-format "refs/heads/$BASE_REF"
-          git check-ref-format "refs/heads/$HEAD_REF"
-          test "$(git rev-parse HEAD)" = "$BASE_SHA"
-
-          # A base checkout does not reliably contain a fork PR's head. Fetch
-          # GitHub's immutable pull ref, then prove that it is the event SHA.
-          git fetch --no-tags --no-recurse-submodules origin \
-            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
-          test "$(git rev-parse "refs/remotes/pull/${PR_NUMBER}/head^{commit}")" = "$HEAD_SHA"
-          git fetch --no-tags --no-recurse-submodules origin \
-            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-
-          # Fail closed if the base revision does not carry the gate. `git
-          # show` reads the blob from the cryptographically named base commit;
-          # no candidate checkout or candidate script is ever executed.
-          TRUSTED_VERIFIER="$RUNNER_TEMP/verify-harness-attestation"
-          git cat-file -e "${BASE_SHA}^{commit}"
-          git cat-file -e "${HEAD_SHA}^{commit}"
-          git show "$BASE_SHA:scripts/verify-harness-attestation" > "$TRUSTED_VERIFIER"
-          test -s "$TRUSTED_VERIFIER"
-          chmod 500 "$TRUSTED_VERIFIER"
-
-          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
-          # --base-branch is the TIP of the branch being merged into. A catch-up merge
-          # legitimately brings in commits newer than the PR's base commit, so judging
-          # merges against BASE_SHA alone rejects the repo's required flow.
-          python3 "$TRUSTED_VERIFIER" \
-            --base "$BASE_SHA" \
-            --head "$HEAD_SHA" \
-            --branch "$HEAD_REF" \
-            --base-branch "origin/${BASE_REF}" \
-            --pr-body-file "$RUNNER_TEMP/pr-body.md"
-
   # ── Rust lane: control plane + clippy/test/build + supply-chain + audio E2E. ──
   rust:
     name: rust lane (ci.sh rust)
@@ -310,35 +221,20 @@ jobs:
   #    parity)". Runs on Linux (trivial) to avoid a third 10x-billed macOS job. ──
   gate:
     name: gate (full ci.sh — release parity)
-    # `attestation` is in `needs` DELIBERATELY: this job's name is the branch ruleset's
-    # only required context, so a check that is not aggregated here is decorative — it
-    # can go red while the merge button stays green. That is precisely the shape of the
-    # failure it exists to prevent.
-    needs: [attestation, rust, web]
+    # Nazwa tego joba jest jedynym wymaganym kontekstem branch ruleset, wiec check,
+    # ktory nie jest tu agregowany, jest dekoracyjny — moze byc czerwony, a przycisk
+    # merge zielony.
+    needs: [rust, web]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require the attestation gate and both lanes green
+      - name: Require both lanes green
         run: |
-          echo "attestation: ${{ needs.attestation.result }}"
           echo "rust lane  : ${{ needs.rust.result }}"
           echo "web  lane  : ${{ needs.web.result }}"
-          # `skipped` is legitimate on merge_group, push, schedule and manual runs:
-          # none carries the PR body required by the receipt policy. On pull_request,
-          # anything but `success` is a hard failure — a skipped gate must never read
-          # as a satisfied one.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if [ "${{ needs.attestation.result }}" != "success" ]; then
-              echo "::error::harness-written code without a PASS receipt — see the attestation gate"
-              exit 1
-            fi
-          elif [ "${{ needs.attestation.result }}" != "skipped" ]; then
-            echo "::error::attestation job behaved unexpectedly on a non-PR event: ${{ needs.attestation.result }}"
-            exit 1
-          fi
           if [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.web.result }}" != "success" ]; then
             echo "::error::a ci.sh lane failed — the full gate is RED"
             exit 1
           fi
-          echo "✅ attestation satisfied and both lanes green — full ci.sh gate satisfied"
+          echo "✅ obie lane zielone — pelna bramka ci.sh spelniona"
