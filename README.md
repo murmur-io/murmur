@@ -504,12 +504,13 @@ Murmur runs a **read-only [Model Context Protocol](https://modelcontextprotocol.
 `127.0.0.1:8765` so **Claude Desktop / Claude Code** (or any MCP client) can query your meeting and note
 memory **with zero egress** — your notes stay on your Mac, and the client reads them locally.
 
-- **Eighteen tools**, covering meetings, documents, the graph and the 2.0 surfaces:
+- **Twenty tools**, covering meetings, documents, the graph and the 2.0 surfaces:
   `search_meetings`, `search_transcript`, `get_meeting`, `get_meeting_chapters`, `get_document`,
   `get_document_outline`, `list_recent_meetings`, `search_semantic`, `get_open_commitments`,
   `get_entity_dossier`, `knowledge_diff`, `list_entities`, `list_note_folders`,
-  `list_workspace_hierarchy`, `list_dashboards`, `get_dashboard`, `org_search` (your Shared Brain, if
-  you've opted in) and `query_database`. Registered in `src-tauri/src/mcp.rs`.
+  `list_workspace_hierarchy`, `list_dashboards`, `get_dashboard`, `list_tasks`, `get_task`,
+  `org_search` (your Shared Brain, if you've opted in) and `query_database`. The registry is the
+  `tools` array in `src-tauri/src/mcp.rs` — count it there rather than trusting this sentence.
 - **Same visibility gates as the app** — sealed-and-not-unlocked meetings are **invisible** here too, routed
   through the exact `visibility_clause` the UI uses.
 - **Token-protected by default** — a bearer token is **required** unless you turn it off.
