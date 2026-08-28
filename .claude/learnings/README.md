@@ -11,13 +11,13 @@ the repo** so a lesson learned once is never re-paid.
 `murmur-curate-learnings` skills, and any extractor pass all write HERE.
 
 `.codex/learnings/` is a **generated, byte-identical mirror** — never edit it by hand. A hand-edit
-is destroyed by the next sync, and `scripts/agent-config-audit` fails on the drift in the meantime
-(`Claude/Codex learnings drift: <file> — run scripts/agent-sync-learnings`). After any change to
+is destroyed by the next sync, and `.agents/h/mirror-check` fails on the drift in the meantime
+(`Claude/Codex learnings drift: <file> — run .agents/h/mirror-check --fix`). After any change to
 the canonical tree:
 
 ```bash
-scripts/agent-sync-learnings          # regenerate the mirror
-scripts/agent-sync-learnings --check  # verify only; exit 1 lists every drifted file
+.agents/h/mirror-check --fix          # regenerate the mirror
+.agents/h/mirror-check --fix --check  # verify only; exit 1 lists every drifted file
 ```
 
 One file per agent (`<agent-name>.md`), each with two tiers:
@@ -26,10 +26,10 @@ One file per agent (`<agent-name>.md`), each with two tiers:
 Short binding imperatives ("Guard async effect results with a newest-request token").
 Keep it **≤ ~20 bullets**. This is not a vendor journal: every dispatched agent MUST read
 `.claude/learnings/<agent-name>.md` when it exists (binding rule in CLAUDE.md), and the parity of
-the generated mirror is enforced by `scripts/agent-config-audit`. A pattern earns a place here only
+the generated mirror is enforced by `.agents/h/mirror-check`. A pattern earns a place here only
 after it has bitten (or been confirmed) at least twice.
 
-This tier is literally executable: `.agents/harness/verifier.py::review_learnings_section` parses
+This tier is literally executable: `.agents/h/h.py::review_learnings_section` parses
 it out of the ONE file matching the reviewer's own role (`combined` → `adversarial-verifier`,
 otherwise `<kind>-reviewer`) and splices it into that reviewer's prompt. Four properties are
 load-bearing and are pinned by `v2_selftest.review_learnings_prompt_cases`:
@@ -59,7 +59,7 @@ fails the audit on a `## Recurring patterns` bullet that prescribes a construct
 `provideExperimentalZonelessChangeDetection`, `zone.js`) without marking it as banned. A bullet may
 still name one to tell a reviewer to flag it; it may not tell an agent to write one.
 
-Separately, `.agents/harness/runtime.py::instruction_paths` fingerprints **both** trees into
+Separately, `.agents/h/h.py::instruction_paths` fingerprints **both** trees into
 `MURMUR_HARNESS_INSTRUCTIONS_SHA256`, the instructions digest exported to every check environment.
 (That digest is observability for check runs; it is not `protocol_sha256` and does not by itself
 gate attestation — the reviewer binding comes from the base commit above.)
@@ -86,8 +86,7 @@ rule.
 
 The extractor does **not** write this tree, or any working tree. It renders candidates into the
 task's own store (`<task_dir>/learning-candidates.md`, under the Git common directory) and
-`scripts/agent-harness status` prints how many are waiting. That is deliberate: `verify` runs from
-the standalone `.murmur-agent-driver` clone, which `open` requires to be byte-clean and holds at a
+`the standalone `.murmur-agent-driver` clone, which `open` requires to be byte-clean and holds at a
 detached HEAD, so a git-tracked write there would make every `NEEDS_FIX` block the next `open` —
 and the only recovery available (`git restore`) would delete the lesson.
 
@@ -99,8 +98,8 @@ and the only recovery available (`git restore`) would delete the lesson.
 2. **Work** — the developer implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry citing the artifact that
    revealed it, then regenerate the mirror. A `NEEDS_FIX` verify drafts candidates for its own
-   severe findings into the task store (`.agents/harness/learning_extract.py`, enabled by
-   `learning_extract` in `.agents/harness/config.json`); `status` reports them, and you file them
+   severe findings into the task store (`.agents/h/learning_extract.py`, enabled by
+   `learning_extract` in `.agents/h/checks.json`); `status` reports them, and you file them
    with `/learn` **from your primary checkout, never the driver clone**. They land as
    `auto-candidate (uncurated)` and still need a human to turn them into a lesson.
 4. **Curate** — periodically, promote 2+ similar journal entries into `## Recurring patterns`,
@@ -114,7 +113,7 @@ and the only recovery available (`git restore`) would delete the lesson.
 - **Promote mature patterns** — `/curate-learnings <agent>`
   (Claude, `.claude/commands/curate-learnings.md`) or the `murmur-curate-learnings` skill
   (Codex, `.agents/skills/murmur-curate-learnings/SKILL.md`).
-- **Regenerate the mirror** — `scripts/agent-sync-learnings`.
+- **Regenerate the mirror** — `.agents/h/mirror-check --fix`.
 
 All of them write the canonical `.claude/learnings/` tree, whichever vendor is driving.
 
