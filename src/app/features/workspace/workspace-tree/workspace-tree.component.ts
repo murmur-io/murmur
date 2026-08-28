@@ -381,9 +381,15 @@ export class WorkspaceTreeComponent {
     }
   }
 
-  protected onDragStart(event: DragEvent, item: ItemRow): void {
+  protected onDragStart(
+    event: DragEvent,
+    item: ItemRow,
+    current: ContainerNode | null,
+  ): void {
     const kind = this.draggableKind(item);
-    if (!kind) {
+    if (!kind || (kind === "meeting" && current?.locked)) {
+      event.preventDefault();
+      this.drag.end();
       return;
     }
     this.drag.begin(item.id, kind);
@@ -423,6 +429,9 @@ export class WorkspaceTreeComponent {
     current: ContainerNode,
   ): WorkspaceDestination[] {
     const kind = this.draggableKind(item);
+    if (kind === "meeting" && current.locked) {
+      return [];
+    }
     return kind
       ? this.moveTargets().filter(
           (target) =>

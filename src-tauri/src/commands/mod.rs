@@ -9960,9 +9960,13 @@ fn manual_move_touches_locked_meeting_domain(
     Ok(false)
 }
 
-/// Compatibility path for the existing manual `Encrypt & move` / `Re-export & move` UI. It is
-/// entered only when the canonical meeting source or direct target is sealed, and preserves the
-/// established lock lifecycle semantics without weakening the organizer's raw-open filing rules.
+/// Compatibility path for the existing manual `Encrypt & move` UI. It is entered only when the
+/// canonical meeting source or direct target is sealed, and preserves the established lock
+/// lifecycle semantics without weakening the organizer's raw-open filing rules. Moving OUT of a
+/// still-sealed domain is refused: a session unlock keeps ciphertext authority for relock and is not
+/// a permanent unseal/re-export operation.
+/// A linked authored companion is refused because this legacy seam cannot atomically re-key its
+/// document, attachments, and managed export together with the meeting bundle.
 fn move_note_locked_domain_compat(
     state: &AppState,
     meeting_id: String,
@@ -9970,6 +9974,17 @@ fn move_note_locked_domain_compat(
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
     ensure_no_active_salvage_for_meeting(state, &meeting_id)?;
+    for source_folder_id in state.db.folders_for_meeting(&meeting_id)? {
+        if state
+            .db
+            .folder_by_id(&source_folder_id)?
+            .is_none_or(|folder| folder.locked)
+        {
+            return Err(AppError::Unavailable(
+                "remove the source folder lock before moving this recording out of it".into(),
+            ));
+        }
+    }
     if !meeting_is_unlocked(state, &meeting_id)? {
         return Err(AppError::Locked(
             "the source folder is locked — unlock it before moving the note".into(),
@@ -10011,6 +10026,12 @@ fn move_note_locked_domain_compat(
             "recording recovery is still active; retry after it finishes".into(),
         ));
     }
+    if state.db.companion_note_for_meeting(&meeting_id)?.is_some() {
+        return Err(AppError::Unavailable(
+            "this recording has a linked note; move it between open folders or remove the folder lock first"
+                .into(),
+        ));
+    }
 
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
     ensure_meeting_folder_target(&state.db, folder_id.as_deref())?;
@@ -10033,111 +10054,28 @@ fn move_note_locked_domain_compat(
         }
     }
 
-    if target_locked {
-        if note.is_none() {
-            return Err(AppError::Locked(
-                "this recording has no generated note yet; choose an open destination or finish processing before filing into a locked one".into(),
-            ));
-        }
-        let target_id = folder_id.as_deref().ok_or_else(|| {
-            AppError::Storage("locked meeting-folder target lost its folder id".into())
-        })?;
-        if state
-            .db
-            .source_has_active_remote_share(Some(&meeting_id), None)?
-        {
-            return Err(AppError::Unavailable(
-                "revoke this meeting's shares before moving it into a locked folder".into(),
-            ));
-        }
-        return move_into_locked_folder_under_lifecycle(state, &meeting_id, target_id);
+    if !target_locked {
+        return Err(AppError::Unavailable(
+            "remove the source folder lock before moving this recording out of it".into(),
+        ));
     }
-
-    let exported = note.as_ref().and_then(|note| note.exported_path.clone());
-    let attachment_rows = state.db.attachments_for_meeting(&meeting_id)?;
-    let mut attachment_plaintext =
-        std::collections::HashMap::with_capacity(attachment_rows.len());
-    for attachment in &attachment_rows {
-        attachment_plaintext.insert(
-            attachment.id.clone(),
-            plaintext_attachment_data(state, attachment)?,
-        );
+    if note.is_none() {
+        return Err(AppError::Locked(
+            "this recording has no generated note yet; choose an open destination or finish processing before filing into a locked one".into(),
+        ));
     }
-    state.db.move_meeting_with_attachments_open(
-        &meeting_id,
-        folder_id.as_deref(),
-        &attachment_plaintext,
-    )?;
-
-    if let Some(source_path) = exported {
-        if let Some(vault) = vault_path(state) {
-            let target_path = match folder_id.as_deref() {
-                Some(folder_id) => state.db.folder_by_id(folder_id)?.map(|folder| folder.path),
-                None => None,
-            };
-            move_note_file(
-                state,
-                &meeting_id,
-                &source_path,
-                &vault,
-                target_path.as_deref(),
-            )?;
-        }
+    let target_id = folder_id.as_deref().ok_or_else(|| {
+        AppError::Storage("locked meeting-folder target lost its folder id".into())
+    })?;
+    if state
+        .db
+        .source_has_active_remote_share(Some(&meeting_id), None)?
+    {
+        return Err(AppError::Unavailable(
+            "revoke this meeting's shares before moving it into a locked folder".into(),
+        ));
     }
-    Ok(())
-}
-
-/// Move an existing plaintext Markdown projection after a manual lock-domain move. The write is
-/// copy-then-remove and the destination is proven inside the configured vault before publication.
-fn move_note_file(
-    state: &AppState,
-    meeting_id: &str,
-    source_path: &str,
-    vault: &str,
-    target_path: Option<&str>,
-) -> Result<(), AppError> {
-    let source = std::path::Path::new(source_path);
-    let bytes = match std::fs::read_to_string(source) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(AppError::Export(format!(
-                "read note for move failed: {error}"
-            )))
-        }
-    };
-    let file_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| AppError::Export("note path has no filename".into()))?;
-    let vault_root = std::path::Path::new(vault);
-    let relative = match target_path.filter(|path| !path.is_empty()) {
-        Some(path) => std::path::Path::new(path).join(file_name),
-        None => std::path::PathBuf::from(file_name),
-    };
-    let destination = assert_in_vault(vault_root, &relative)?;
-    let destination_dir = destination
-        .parent()
-        .ok_or_else(|| AppError::Export("destination has no parent dir".into()))?
-        .to_path_buf();
-    let canonical_source = source
-        .canonicalize()
-        .unwrap_or_else(|_| source.to_path_buf());
-    if destination == canonical_source || destination == source {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&destination_dir)
-        .map_err(|error| AppError::Export(format!("create move dir failed: {error}")))?;
-    crate::export::overwrite_note(&destination, &bytes)?;
-    let _ = std::fs::remove_file(source);
-    if let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? {
-        state.db.set_note_exported_path(
-            meeting_id,
-            &existing.provider_id,
-            &destination.to_string_lossy(),
-        )?;
-    }
-    Ok(())
+    move_into_locked_folder_under_lifecycle(state, &meeting_id, target_id)
 }
 
 fn move_note_inner_impl(
