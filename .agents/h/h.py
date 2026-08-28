@@ -408,11 +408,10 @@ def cmd_clean(a) -> None:
     s = load_state(a.task_id)
     wt = s.get("worktree")
     if wt and Path(wt).exists():
-        # Zdejmij symlink PRZED usunieciem worktree — inaczej `worktree remove`
-        # poszedlby po nim i skasowal wspoldzielony, cieply target.
-        link = Path(wt) / "target"
-        if link.is_symlink():
-            link.unlink()
+        # Symlink `target` zostaje. Sprawdzone: ani `rm -rf`, ani `git worktree remove
+        # --force` nie ida po symlinku — usuwaja dowiazanie, nie cel. Wczesniejsza
+        # wersja zdejmowala go profilaktycznie i zostawiala worktree bez targetu, gdy
+        # remove odmowil z powodu niezacommitowanej pracy.
         git("worktree", "remove", wt, *(["--force"] if a.force else []))
         log(f"usunięto worktree {wt}")
     git("branch", "-D", f"h/{a.task_id}", check=False)
