@@ -3372,12 +3372,20 @@ fn persist_converted_companion_under_snapshot_with_attachment_verifier(
             );
         }
 
-        if state.db.source_has_active_remote_share(None, Some(&id))?
-            || state.db.folder_has_active_remote_share(&folder_id)?
-            || state.db.folder_has_active_remote_share(&destination.id)?
-        {
+        // ITEM-scoped, deliberately: the hazard is rewriting the managed block of a note whose OWN
+        // ciphertext is still readable on the relay, which would leave the shared copy diverged from
+        // the canonical one. A share on a SIBLING in either container is not that hazard — the
+        // sibling's server copy is untouched by re-homing a different, unshared note past it. This
+        // used to also ask `folder_has_active_remote_share` for the source AND destination
+        // containers, which made ONE shared note anywhere in a folder refuse "Convert to note" for
+        // EVERY meeting filed there (reported 2026-08-28 against live user data; the refusal
+        // carries no `errcode`, so all the user ever saw was "Please try again"). The folder-wide
+        // question belongs to folder-wide operations — `commands/lock.rs` asks it before SEALING a
+        // container, where every item including the shared one really does change state.
+        // `notes.rs::move_note_to_folder` is the canonical item-scoped precedent.
+        if state.db.source_has_active_remote_share(None, Some(&id))? {
             return Err(AppError::Unavailable(
-                "revoke active shares before filing this converted note".into(),
+                "revoke this note's shares before filing this converted note".into(),
             ));
         }
 
@@ -3479,6 +3487,12 @@ fn persist_converted_companion_under_snapshot_with_attachment_verifier(
 /// Birth the conversion companion in the meeting's exact destination. For a locked destination the
 /// non-empty body is encrypted and verified BEFORE the one atomic insert; no blob-less plaintext
 /// row and no vault export can exist behind the lock.
+///
+/// There is deliberately NO remote-share guard here. The note being born does not exist yet, so it
+/// cannot have server ciphertext of its own; a share on a SIBLING already in this container is not
+/// affected by a new, unshared note appearing beside it. The update path keeps the item-scoped
+/// check for the case that genuinely matters (rewriting a note whose own copy is still on the
+/// relay).
 fn create_generated_companion_under_lifecycle_authorized(
     state: &AppState,
     meeting_id: &str,
@@ -3500,11 +3514,6 @@ fn create_generated_companion_under_lifecycle_authorized(
         },
         markdown,
     )?;
-    if state.db.folder_has_active_remote_share(&destination.id)? {
-        return Err(AppError::Unavailable(
-            "revoke active shares before creating a converted note in this container".into(),
-        ));
-    }
     let text_blob = if destination.locked {
         Some(sealed_document_blob(state, &destination.id, &id, markdown)?)
     } else {
