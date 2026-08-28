@@ -35,5 +35,5 @@ mirror. Write the canonical tree, never the mirror, and regenerate the mirror wh
 4. Use `date +%F` for `<today>`.
 5. Do not touch `## Recurring patterns`; promotion belongs to `murmur-curate-learnings`.
 6. If the journal exceeds about 50 entries, drop the oldest `journal` entries only. Never drop `distilled` or `success-pattern` entries.
-7. Run `scripts/agent-sync-learnings` to regenerate the `.codex/learnings/` mirror. Skipping this leaves `scripts/agent-config-audit` red.
+7. Run `.agents/h/mirror-check --fix` to regenerate the `.codex/learnings/` mirror. Skipping this leaves `.agents/h/mirror-check` red.
 8. Confirm the one-line title added; do not restate the full file.
