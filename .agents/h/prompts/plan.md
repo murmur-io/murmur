@@ -13,5 +13,10 @@ bez szacowania czasu. Interesują mnie trzy rzeczy:
    logika (np. czysty refaktor, copy, konfiguracja), napisz `TEST: brak` i
    uzasadnij w jednym zdaniu.
 
+**Nowa zależność to decyzja, nie szczegół.** Jeśli plan wymaga dodania cratea
+albo pakietu npm, napisz to osobno jako `NOWA ZALEZNOSC: <nazwa> — <po co>` i
+podaj wariant bez niej. Repo domyślnie nie przyjmuje nowych zależności bez zgody
+człowieka; kilkanaście linii własnego kodu prawie zawsze bije nowy crate.
+
 Nie planuj zmian poza tym, o co proszę. Jeśli po drodze widzisz inny problem,
 dopisz go na końcu w jednej linii jako `POZA ZAKRESEM: ...` i nic z nim nie rób.
