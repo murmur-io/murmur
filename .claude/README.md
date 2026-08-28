@@ -1,7 +1,7 @@
 # `.claude/` — Murmur's Claude Code control surface
 
 Claude Code is one adapter to the vendor-neutral development harness in
-`.agents/harness/`; it is not a separate source of workflow truth.
+`.agents/h/`; it is not a separate source of workflow truth.
 
 | Path | Purpose |
 | --- | --- |
@@ -22,14 +22,14 @@ task contract -> isolated worktree -> developer edit -> exact-diff plan
               -> hash-bound receipt -> guarded commit -> required remote CI
 ```
 
-Run it with `scripts/agent-harness`; task evidence is stored once under the
-shared Git common directory at `.git/agent-harness/v2/tasks/<task-id>/`. Legacy
+Run it with `scripts/h`; task evidence is stored once under the
+shared Git common directory at `.git/h/<task-id>.json`. Legacy
 `.claude/tmp/` verdicts and trace helpers are historical evidence only and have
 no authority over commits.
 
 The finish guard is fail-closed. It accepts only a runner-created PASS bound to
 the exact staged diff, active instructions, dependency revisions, green checks,
-and independent review sessions. `scripts/agent-config-audit --ci` prevents the
+and independent review sessions. `.agents/h/mirror-check` prevents the
 Claude and Codex adapters from silently drifting.
 
 ## Local overrides (`settings.local.json`)
@@ -65,14 +65,14 @@ declares:
   rather than on the exact string, so `Read(~/.ssh/*)` and
   `Bash(cat ~/.ssh/id_rsa)` are caught as well as `Read(~/.ssh/**)`;
 - an `env` value that differs from the one `settings.json` declares — notably
-  `MURMUR_FINISH_GUARD`, which `hook_guard._finish_guard` disables outright when
+  `MURMUR_FINISH_GUARD` (usuniete wraz z receiptami; historyczne)
   it reads `off`.
 
 Every one of those comparisons is derived from `settings.json`, so a legitimate
 policy change moves the rule with it instead of leaving a stale second copy.
 
 **Local convenience must never widen the declared posture.** The harness does
-not borrow this file: `.agents/harness/runtime.py` provisions each review with
+not borrow this file: `.agents/h/h.py` provisions each review with
 its own sandbox, inlining `autoAllowBashIfSandboxed: false` /
 `allowUnsandboxedCommands: false` for Claude reviewers and the
 `murmur_harness_reviewer` permission profile with `network.enabled = false` for
@@ -104,9 +104,7 @@ audit run.
 Quick verification:
 
 ```bash
-scripts/agent-harness doctor
-scripts/agent-harness selftest --ci
-scripts/agent-config-audit --ci
+.agents/h/mirror-check
 ```
 
 Local hooks are defense in depth, not a remote security boundary. Merge safety

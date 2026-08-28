@@ -6,7 +6,7 @@
 # evidence stays a controlled signed-Mac lane (see measure-recording-ram.sh).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 # These four modules are ALREADY EXECUTED by the `rust-lib` check, which runs the whole

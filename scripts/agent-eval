@@ -1,6 +1,0 @@
-#!/bin/sh
-# Scaffold eval for Murmur's development agents. See eval/agents/README.md.
-set -eu
-
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$SCRIPT_DIR/../eval/agents/runner.py" "$@"
