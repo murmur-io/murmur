@@ -49,10 +49,11 @@ export class MurCopyIdComponent {
   /**
    * Accessible name AND tooltip.
    *
-   * Deliberately NOT "paste it to point Claude at it". That is true of a meeting, a note and a
-   * board — the MCP server has a tool for each — and it is NOT yet true of a task, which no tool
-   * resolves by id. One promise that is false on one of four surfaces is worse than four accurate
-   * labels, so the tooltip states what the button does and stops there.
+   * Deliberately NOT "paste it to point Claude at it". Every one of the four surfaces now has an
+   * MCP tool that takes its id (`get_meeting`, `get_document`, `get_dashboard`, `get_task`), so the
+   * promise would be true — but the tooltip is also the accessible name, and naming a downstream
+   * consumer inside it makes the control's own job harder to read for anyone not using MCP. The
+   * label says what the button does; the PR and the MCP catalog say what the id is for.
    */
   readonly hint = computed(() =>
     this.copied()
