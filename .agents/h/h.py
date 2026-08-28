@@ -181,6 +181,11 @@ def run_check(cid: str, cmd: str, cwd: str, budget: int, wt: Path) -> dict:
     dt = time.time() - t0
     ok = code == 0
     log(f"  {'OK ' if ok else 'FAIL'} {cid} ({dt:.0f}s)")
+    if not ok:
+        # Pokaz POWOD od razu. Bez tego patrzysz na "FAIL rust-clippy (35s)" i czekasz
+        # na weryfikatora, zeby sie dowiedziec, co sie stalo.
+        for line in out.strip().splitlines()[-25:]:
+            print(f"      {line}")
     return {"id": cid, "ok": ok, "cmd": cmd, "seconds": round(dt), "tail": out[-4000:] if not ok else ""}
 
 
