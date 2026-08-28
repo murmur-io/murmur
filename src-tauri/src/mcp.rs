@@ -1686,6 +1686,16 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": { "dashboardId": { "type": "string" } }, "required": ["dashboardId"] }
         },
         {
+            "name": "list_tasks",
+            "description": "List the user's SHARED ORG TASKS — the work items they and their colleagues track together inside an organization (title + id + status + due date + org). Tasks are NOT meeting notes: they are the explicit commitments the team is managing right now, so this is the right tool for 'what am I on the hook for', 'what is in progress', or 'what is overdue'. Use it to get the exact task id get_task takes. Only orgs the user has joined with context sharing enabled are listed; everything else is absent, id included.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "get_task",
+            "description": "Read ONE shared org task by id — title, description, status, due date, assignee, subtask checklist, and the shared org notes it points at. The id is the one the app's header copy control puts on the clipboard, or one from list_tasks. A task in an organization whose context sharing is off reads exactly like a task that does not exist. This device's own private links from a task to a local board or note are deliberately not included.",
+            "inputSchema": { "type": "object", "properties": { "taskId": { "type": "string" } }, "required": ["taskId"] }
+        },
+        {
             "name": "org_search",
             "description": "Fallback for when search_meetings / search_semantic find nothing relevant in your OWN vault and you have joined an org: search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
@@ -2007,6 +2017,20 @@ fn dispatch_tool(
         // Untrusted multi-writer content: `execute_tool` provenance-labels + fence-neutralizes it. Not
         // folder-lock gated (org items live outside the lock domain), so `unlocked_set` is irrelevant
         // to it; when no org is joined/consented the partition is empty ⇒ "no results" (never a leak).
+        // LOCAL_LOOPBACK ONLY, like `knowledge_diff` above: both task tools are absent from
+        // model-facing `tool_specs` and every GatedToolExecutor scope, so a colleague's shared work
+        // reaches a model only through this module's fixed 127.0.0.1 listener and its Host/Origin/
+        // token gates. The read gate itself is in SQL (`org_state.context_enabled = 1`).
+        "list_tasks" => ToolCall::ListTasks,
+        "get_task" => {
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
+            if task_id.trim().is_empty() {
+                return Err((-32602, "missing required argument: taskId".to_string()));
+            }
+            ToolCall::GetTask {
+                task_id: task_id.to_string(),
+            }
+        }
         "org_search" => ToolCall::OrgBrainSearch {
             query: args
                 .get("query")
@@ -2086,14 +2110,19 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eighteen_tools() {
+    fn tools_list_has_twenty_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        // Eighteen since `list_workspace_hierarchy` joined. The count is deliberately pinned: the
+        // Twenty since `list_tasks` + `get_task` joined. The count is deliberately pinned: the
         // MCP catalogue is the loopback surface's whole contract, and a tool arriving or leaving
         // it unnoticed is precisely what this guard exists to make impossible. It did its job
-        // here — the new tool was added and this test failed until the number was reconsidered.
-        assert_eq!(tools.len(), 18);
+        // here — the new tools were added and this test failed until the number was reconsidered.
+        assert_eq!(tools.len(), 20);
+        assert!(
+            tools.iter().any(|t| t["name"] == "list_tasks")
+                && tools.iter().any(|t| t["name"] == "get_task"),
+            "a task id copied from the app header must be resolvable over local MCP"
+        );
         assert!(
             tools.iter().any(|t| t["name"] == "list_workspace_hierarchy"),
             "the hierarchy must be discoverable over local MCP"
