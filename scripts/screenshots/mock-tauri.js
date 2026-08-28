@@ -779,6 +779,16 @@ scope to the GA-critical path only.
   // few plus the true total — so the sidebar preview and the container page can
   // never disagree, which is exactly the drift a hand-written mock invites.
   const CONTAINER_ITEMS = {
+    // containerId `null` is the UNFILED inbox — recordings that belong to no
+    // lockable container yet. It renders as the first section of the Spaces tree,
+    // above "File recordings with Brain", which is what that button acts on.
+    unfiled: {
+      meeting: [
+        IR("meeting", "m-unfiled-standup", "Monday standup", 0, 900),
+        IR("meeting", "m-unfiled-call", "Intro call — Redwood Labs", 1, 1620),
+        IR("meeting", "m-unfiled-1on1", "1:1 — Priya", 2, 1380),
+      ],
+    },
     "f-product": {
       meeting: [
         IR("meeting", "m-all-hands", "Weekly All-Hands", 7, 2040),
@@ -1733,7 +1743,10 @@ scope to the GA-critical path only.
       // from, so a container page and its sidebar preview always agree.
       case "list_container_items": {
         const kind = args.kind || "meeting";
-        const all = (CONTAINER_ITEMS[args.containerId] || {})[kind] || [];
+        // A null containerId is the unfiled inbox. It rides the same RICH() gate as
+        // the tree it renders inside of, so the e2e baseline stays untouched.
+        const key = args.containerId == null ? (RICH() ? "unfiled" : "__none__") : args.containerId;
+        const all = (CONTAINER_ITEMS[key] || {})[kind] || [];
         const offset = args.offset || 0;
         const limit = args.limit || all.length;
         return { kind, total: all.length, items: all.slice(offset, offset + limit) };
