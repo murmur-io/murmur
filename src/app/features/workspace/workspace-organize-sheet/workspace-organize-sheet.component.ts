@@ -5,6 +5,7 @@ import {
   Injector,
   afterNextRender,
   computed,
+  effect,
   inject,
   input,
   output,
@@ -13,12 +14,15 @@ import {
 } from "@angular/core";
 
 import type {
+  ContainerNode,
   WorkspaceOrganizeMove,
   WorkspaceOrganizeFailure,
   WorkspaceOrganizePlan,
   WorkspaceOrganizeSkip,
 } from "../../../core/models";
 import { MurIconComponent } from "../../../design-system/icon/icon.component";
+import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
+import { WorkspaceService } from "../workspace.service";
 
 interface SkipGroup {
   readonly code: WorkspaceOrganizeSkip["code"];
@@ -54,16 +58,20 @@ interface WorkspaceOrganizeResultRow {
 @Component({
   selector: "app-workspace-organize-sheet",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurIconComponent],
+  imports: [MurIconComponent, LockBadgeComponent],
   templateUrl: "./workspace-organize-sheet.component.html",
   styleUrl: "./workspace-organize-sheet.component.scss",
 })
 export class WorkspaceOrganizeSheetComponent {
   private readonly injector = inject(Injector);
+  private readonly workspace = inject(WorkspaceService);
 
   readonly plan = input.required<WorkspaceOrganizeViewPlan>();
   readonly busy = input(false);
+  readonly planning = input(false);
+  readonly applying = input(false);
   readonly apply = output<WorkspaceOrganizeMove[]>();
+  readonly replan = output<string>();
   readonly cancelled = output<void>();
 
   private readonly panel = viewChild<ElementRef<HTMLDivElement>>("panel");
@@ -71,8 +79,13 @@ export class WorkspaceOrganizeSheetComponent {
   private readonly manualTargets = signal<ReadonlyMap<string, string>>(
     new Map(),
   );
+  private readonly clearedManualTargets = signal<ReadonlySet<string>>(
+    new Set(),
+  );
   readonly showAllReview = signal(false);
   readonly expandedSkipCodes = signal<ReadonlySet<string>>(new Set());
+  readonly guidance = signal("");
+  private previousPlan: WorkspaceOrganizeViewPlan | null = null;
 
   readonly automaticMoves = computed(() => this.plan().moves ?? []);
   readonly reviewItems = computed(() => this.plan().review ?? []);
@@ -80,6 +93,52 @@ export class WorkspaceOrganizeSheetComponent {
   readonly skippedItems = computed(() => this.plan().skipped ?? []);
   readonly receipt = computed(() => this.plan().receipt ?? null);
   readonly applyError = computed(() => this.plan().applyError ?? null);
+  /**
+   * A raw-locked source stays sealed only when its destination is also sealed.
+   * The already-loaded workspace tree carries the authoritative raw lock flag
+   * for both ends of every reviewed move, so this warning needs no new content
+   * read and no duplicate lock contract on the planner DTO.
+   */
+  readonly deSealingMoveIds = computed<ReadonlySet<string>>(() => {
+    const containers = new Map<string, ContainerNode>();
+    const visit = (nodes: readonly ContainerNode[]): void => {
+      for (const node of nodes) {
+        containers.set(node.id, node);
+        visit(node.folders);
+      }
+    };
+    visit(this.workspace.forest());
+
+    return new Set(
+      this.automaticMoves()
+        .filter((move) => {
+          const source = move.fromContainerId
+            ? containers.get(move.fromContainerId)
+            : null;
+          const target = containers.get(move.toContainerId);
+          return source?.locked === true && target?.locked === false;
+        })
+        .map((move) => move.itemId),
+    );
+  });
+
+  private readonly _resetReviewForFreshPlan = effect(() => {
+    const plan = this.plan();
+    if (plan === this.previousPlan) {
+      return;
+    }
+    this.previousPlan = plan;
+    if (!plan.receipt && !plan.applyError) {
+      // Moving out of a session-unlocked sealed source into an open destination
+      // is an intentional de-seal. Keep those moves out of every bulk default;
+      // the row checkbox remains available for explicit individual consent.
+      this.excluded.set(new Set(this.deSealingMoveIds()));
+      this.manualTargets.set(new Map());
+      this.clearedManualTargets.set(new Set());
+      this.showAllReview.set(false);
+      this.expandedSkipCodes.set(new Set());
+    }
+  });
   readonly appliedIds = computed(
     () => new Set(this.receipt()?.appliedIds ?? []),
   );
@@ -159,7 +218,11 @@ export class WorkspaceOrganizeSheetComponent {
       this.targets().map((target) => [target.id, target]),
     );
     return this.pendingReviewItems().flatMap((item) => {
-      const targetId = choices.get(item.itemId);
+      const targetId =
+        choices.get(item.itemId) ??
+        (this.clearedManualTargets().has(item.itemId)
+          ? null
+          : item.suggestedTargetId);
       const target = targetId ? targets.get(targetId) : undefined;
       if (!target) {
         return [];
@@ -189,11 +252,10 @@ export class WorkspaceOrganizeSheetComponent {
       : [...this.includedAutomaticMoves(), ...this.manualMoves()],
   );
   readonly selectedCount = computed(() => this.selectedMoves().length);
-  readonly needsChoiceCount = computed(
-    () =>
-      this.hasAttemptResult()
-        ? 0
-        : this.pendingReviewItems().length - this.manualMoves().length,
+  readonly needsChoiceCount = computed(() =>
+    this.hasAttemptResult()
+      ? 0
+      : this.pendingReviewItems().length - this.manualMoves().length,
   );
   readonly unchangedAfterAttemptCount = computed(() =>
     this.hasAttemptResult()
@@ -211,11 +273,23 @@ export class WorkspaceOrganizeSheetComponent {
       this.pendingReviewItems().length - this.visibleReviewItems().length,
     ),
   );
-  readonly allSelected = computed(
+  readonly allSelected = computed(() => {
+    const deSealing = this.deSealingMoveIds();
+    const bulkMoves = this.pendingAutomaticMoves().filter(
+      (move) => !deSealing.has(move.itemId),
+    );
+    return (
+      bulkMoves.length > 0 &&
+      bulkMoves.every((move) => this.isIncluded(move.itemId))
+    );
+  });
+  readonly proposedCount = computed(
     () =>
-      this.includedAutomaticMoves().length > 0 &&
-      this.includedAutomaticMoves().length ===
-        this.pendingAutomaticMoves().length,
+      this.automaticMoves().length +
+      this.reviewItems().filter((item) => item.suggestedTargetId).length,
+  );
+  readonly needsUnassistedChoiceCount = computed(
+    () => this.reviewItems().filter((item) => !item.suggestedTargetId).length,
   );
   readonly skipGroups = computed<SkipGroup[]>(() => {
     const grouped = new Map<
@@ -245,6 +319,10 @@ export class WorkspaceOrganizeSheetComponent {
     return !this.excluded().has(itemId);
   }
 
+  isDeSealingMove(itemId: string): boolean {
+    return this.deSealingMoveIds().has(itemId);
+  }
+
   toggleMove(itemId: string): void {
     this.excluded.update((current) => {
       const next = new Set(current);
@@ -262,7 +340,38 @@ export class WorkspaceOrganizeSheetComponent {
       );
       return;
     }
-    this.excluded.set(new Set());
+    this.excluded.set(new Set(this.deSealingMoveIds()));
+  }
+
+  clearAll(): void {
+    this.excluded.set(
+      new Set(this.pendingAutomaticMoves().map((move) => move.itemId)),
+    );
+    this.manualTargets.set(new Map());
+    this.clearedManualTargets.set(
+      new Set(this.pendingReviewItems().map((item) => item.itemId)),
+    );
+  }
+
+  selectSuggestions(): void {
+    const targets = new Set(this.targets().map((target) => target.id));
+    this.excluded.set(new Set(this.deSealingMoveIds()));
+    this.clearedManualTargets.set(new Set());
+    this.manualTargets.set(
+      new Map(
+        this.pendingReviewItems().flatMap((item) =>
+          item.suggestedTargetId && targets.has(item.suggestedTargetId)
+            ? [[item.itemId, item.suggestedTargetId] as const]
+            : [],
+        ),
+      ),
+    );
+  }
+
+  onReplan(): void {
+    if (!this.busy()) {
+      this.replan.emit(this.guidance().trim());
+    }
   }
 
   chooseManualTarget(itemId: string, event: Event): void {
@@ -276,10 +385,29 @@ export class WorkspaceOrganizeSheetComponent {
       }
       return next;
     });
+    this.clearedManualTargets.update((current) => {
+      const next = new Set(current);
+      if (targetId) {
+        next.delete(itemId);
+      } else {
+        next.add(itemId);
+      }
+      return next;
+    });
   }
 
   selectedManualTarget(itemId: string): string {
-    return this.manualTargets().get(itemId) ?? "";
+    const explicit = this.manualTargets().get(itemId);
+    if (explicit) {
+      return explicit;
+    }
+    if (this.clearedManualTargets().has(itemId)) {
+      return "";
+    }
+    return (
+      this.reviewItems().find((item) => item.itemId === itemId)
+        ?.suggestedTargetId ?? ""
+    );
   }
 
   toggleSkipGroup(code: string): void {
@@ -348,7 +476,8 @@ export class WorkspaceOrganizeSheetComponent {
       case "emptyNote":
         return {
           label: "No usable content",
-          detail: "Brain needs a transcript or note before it can choose a destination.",
+          detail:
+            "Brain needs a transcript or note before it can choose a destination.",
         };
       case "noDestination":
         return {

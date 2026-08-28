@@ -496,6 +496,9 @@ pub fn run() {
             commands::rename_folder,
             commands::delete_folder,
             commands::move_note,
+            commands::get_filing_recovery_status,
+            commands::retry_filing_recovery,
+            commands::keep_existing_filing_file,
             // Notes feature — authored `documents(kind='note')` CRUD + note folders + vault export.
             commands::create_note,
             commands::suggest_note_title,

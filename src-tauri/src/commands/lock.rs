@@ -73,6 +73,10 @@ pub(crate) fn lock_container_subtree(
     for id in &subtree {
         ensure_unambiguous_meeting_governance(state, id)?;
     }
+    // The first container that crosses the logical privacy boundary owns the one FE/cache notice.
+    // In a cascade that is normally the deepest child. Keeping the callback only for the root meant
+    // a child's post-revocation reconcile error could return before the renderer was invalidated.
+    let visibility_notice = std::cell::RefCell::new(Some(visibility_revoked));
     for id in subtree {
         if id == folder_id {
             continue; // the target is sealed last, below, so its notice fires once at the end.
@@ -84,14 +88,22 @@ pub(crate) fn lock_container_subtree(
             state,
             id,
             allow_live_remote_shares,
-            || {},
+            || {
+                if let Some(notice) = visibility_notice.borrow_mut().take() {
+                    notice();
+                }
+            },
         )?;
     }
     lock_folder_inner_with_visibility_notice_policy(
         state,
         folder_id.to_string(),
         allow_live_remote_shares,
-        visibility_revoked,
+        || {
+            if let Some(notice) = visibility_notice.borrow_mut().take() {
+                notice();
+            }
+        },
     )
 }
 
@@ -403,9 +415,9 @@ pub(crate) fn wrapped_key_for_new_sealed_container(
             .master_kek
             .lock()
             .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
-        cached
-            .clone()
-            .ok_or_else(|| AppError::Locked("unlock the parent folder before creating inside it".into()))?
+        cached.clone().ok_or_else(|| {
+            AppError::Locked("unlock the parent folder before creating inside it".into())
+        })?
     };
     // The SAME mint `lock_folder` uses — not a second implementation of it. The content key
     // itself is dropped here, and zeroized with it: a container that did not exist a moment
@@ -422,7 +434,10 @@ pub(crate) fn wrapped_key_for_new_sealed_container(
 /// CK. Unlocking/removing either lock would then materialize only part of one logical meeting. The
 /// ambiguity must be resolved explicitly by filing the meeting, which synchronizes every provider
 /// row to the canonical owner.
-fn ensure_unambiguous_meeting_governance(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+fn ensure_unambiguous_meeting_governance(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
     if state
         .db
         .folder_has_ambiguous_meeting_governance(folder_id)?
@@ -439,10 +454,7 @@ fn ensure_unambiguous_meeting_governance(state: &AppState, folder_id: &str) -> R
 ///
 /// Kept as one testable seam so the command cannot accidentally validate only its root while a
 /// descendant later restores a mixed-key legacy meeting after the root has already materialized.
-pub(crate) fn preflight_unlock_subtree(
-    state: &AppState,
-    folder_id: &str,
-) -> Result<(), AppError> {
+pub(crate) fn preflight_unlock_subtree(state: &AppState, folder_id: &str) -> Result<(), AppError> {
     for id in container_subtree_deepest_first(state, folder_id)? {
         ensure_unambiguous_meeting_governance(state, &id)?;
     }
@@ -476,15 +488,34 @@ fn lock_folder_inner_with_visibility_notice_policy(
     // Must precede the already-locked repair branch too: that branch bumps epochs, revokes
     // renderer visibility, edits the session set and may repair plaintext at rest.
     ensure_unambiguous_meeting_governance(state, &folder_id)?;
+    if !folder.locked {
+        // A from-disk salvage may hold this folder's current CK across long ASR/provider awaits so
+        // a FRESH lock would mint a different CK and orphan that authority.
+        ensure_no_active_salvage_in_folder(state, &folder_id)?;
+        // Resume expired archived-generation cleanup before the final fail-closed reread. These
+        // checks precede logical revocation because they are ordinary preflight refusals, not filing
+        // recovery: the folder remains intentionally open when active capture still owns it.
+        for meeting_id in state
+            .db
+            .nonterminal_recording_meetings_in_folder(&folder_id)?
+        {
+            reconcile_released_generation_cleanup(state, &meeting_id)?;
+        }
+        if state
+            .db
+            .folder_has_nonterminal_recording_generation(&folder_id)?
+        {
+            return Err(AppError::Locked(
+                "this folder has a recording still being captured or recovered — wait for it to finish before locking"
+                    .into(),
+            ));
+        }
+    }
+
     if folder.locked {
-        // `locked=1` is the durable seal journal, not proof that its non-keyed cleanup tail finished.
-        // Always replay that idempotent tail. Only release the CK when primary plaintext/audio residue
-        // proves the keyed portion itself was interrupted.
+        // The durable gate is already closed. Revoke session visibility and invalidate renderer
+        // state before fallible journal/repair work so an interrupted retry remains fail-closed.
         bump_seal_epoch(state);
-        // The durable gate is already closed. Blank every renderer cache before attempting the
-        // fallible session-authority cleanup below; its canonical refresh waits on this lifecycle
-        // guard and therefore cannot observe the intermediate state.
-        visibility_revoked();
         {
             let mut unlocked = state
                 .unlocked_folders
@@ -492,9 +523,22 @@ fn lock_folder_inner_with_visibility_notice_policy(
                 .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
             unlocked.remove(&folder_id);
         }
+        visibility_revoked();
         if let Ok(mut cache) = state.verify_cache.lock() {
             cache.clear();
         }
+        if state.db.folder_has_pending_filing_sources(&folder_id)? {
+            return Err(AppError::Unavailable(
+                "resolve pending filing recovery before locking this folder".into(),
+            ));
+        }
+        reconcile_filing_projection_journal_for_folders(
+            &state.db,
+            &std::iter::once(folder_id.clone()).collect(),
+        )?;
+        // `locked=1` is the durable seal journal, not proof that its non-keyed cleanup tail finished.
+        // Always replay that idempotent tail. Only release the CK when primary plaintext/audio residue
+        // proves the keyed portion itself was interrupted.
         let exported_paths: Vec<String> = state
             .db
             .meeting_note_export_rows_in_folder(&folder_id)?
@@ -536,33 +580,25 @@ fn lock_folder_inner_with_visibility_notice_policy(
         clear_stale_live_transcript(state);
         return Ok(());
     }
-    // A from-disk salvage may hold this folder's current CK across long ASR/provider awaits so a
-    // session relock can seal the exact result. A FRESH lock would mint a different CK and orphan
-    // that authority. Session relock remains allowed above; only key rotation is refused here.
-    ensure_no_active_salvage_in_folder(state, &folder_id)?;
-    // An earlier stop may have durably archived the recording but failed part-way through the
-    // exact artifact cleanup. Claim and resume every expired ARCHIVED generation in this folder
-    // before the final fail-closed reread below. A transient cleanup failure releases its claim,
-    // so the next Lock attempt can retry in this same process; an active/non-ARCHIVED generation
-    // remains nonterminal and therefore still blocks sealing.
-    for meeting_id in state
-        .db
-        .nonterminal_recording_meetings_in_folder(&folder_id)?
-    {
-        reconcile_released_generation_cleanup(state, &meeting_id)?;
-    }
-    if state
-        .db
-        .folder_has_nonterminal_recording_generation(&folder_id)?
-    {
-        return Err(AppError::Locked(
-            "this folder has a recording still being captured or recovered — wait for it to finish before locking"
-                .into(),
+    // A source snapshot is plaintext recovery authority for its exact capture-time domain. Resolve
+    // it as a separate open-state operation; sealing must not restore-and-clear the row in the same
+    // transition because a companion can be governed by this folder while the attempt itself says
+    // Unfiled -> some unrelated target.
+    if state.db.folder_has_pending_filing_sources(&folder_id)? {
+        return Err(AppError::Unavailable(
+            "resolve pending filing recovery before locking this folder".into(),
         ));
     }
-    // R7: advance the seal epoch at ENTRY (before any seal work) — see `bump_seal_epoch`.
+    // A fresh folder is still accurately open. Resolve only its scoped target projections before
+    // starting the privacy transition; a collision must return with no false renderer revocation.
+    // Source authority was refused above and therefore cannot be restored implicitly here.
+    reconcile_filing_projection_journal_for_folders(
+        &state.db,
+        &std::iter::once(folder_id.clone()).collect(),
+    )?;
+    // R7: the seal epoch still advances before the first verified seal mutation, but only after
+    // ordinary open-state preflights that can leave the folder intentionally readable.
     bump_seal_epoch(state);
-
     // Prefer the SESSION-CACHED KEK (set by a successful unlock — possibly a RECOVERED key): it
     // keeps every folder sealed this session convergent on the key that demonstrably unwraps the
     // existing ones, and skips a redundant Touch ID prompt. Only fall through to the keychain when
@@ -690,9 +726,8 @@ fn lock_folder_inner_with_visibility_notice_policy(
     state
         .db
         .publish_fresh_folder_lock_and_purge_reminder_derived(&folder_id, &wrapped)?;
-    // `locked=1` is now a durable visibility gate. Notify before any subsequent fallible step,
-    // including the session-set mutex: a poisoned mutex must return an error with renderer caches
-    // already blanked (or the main window hidden if the event bus failed).
+    // `locked=1` is now the durable visibility gate. Notify before any subsequent fallible
+    // plaintext cleanup. A renderer refetch blocks on lifecycle until session authority is removed.
     visibility_revoked();
     {
         let mut unlocked = state
@@ -700,6 +735,9 @@ fn lock_folder_inner_with_visibility_notice_policy(
             .lock()
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         unlocked.remove(&folder_id);
+    }
+    if let Ok(mut cache) = state.verify_cache.lock() {
+        cache.clear();
     }
     for (meeting_id, provider_id, blob) in &sealed_rows {
         state.db.seal_note(meeting_id, provider_id, blob)?;
@@ -1253,6 +1291,17 @@ pub(crate) fn relock_folder_inner_with_visibility_notice(
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
+    for id in &targets {
+        if state.db.folder_has_pending_filing_sources(id)? {
+            return Err(AppError::Unavailable(
+                "filing recovery must be resolved before physical relock cleanup".into(),
+            ));
+        }
+    }
+    // Filing recovery is fallible filesystem work. It is scoped to this relock cascade and runs
+    // only after the epoch/session authority transition above, so neither a related conflict nor an
+    // unrelated stuck attempt can leave the selected subtree readable.
+    reconcile_filing_projection_journal_for_folders(&state.db, &targets.iter().cloned().collect())?;
     // Any interrupted-fresh-seal rows now receive only ciphertexts that the preflight already
     // decrypt-verified against their exact plaintext. This is after export cleanup and logical
     // revocation, but before the first broad reblank.
@@ -1336,7 +1385,7 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     relock_all_inner_with_visibility_notice(state, || {})
 }
 
-fn relock_all_inner_with_visibility_notice(
+pub(crate) fn relock_all_inner_with_visibility_notice(
     state: &AppState,
     visibility_revoked: impl FnOnce(),
 ) -> Result<(), AppError> {
@@ -1379,6 +1428,18 @@ fn relock_all_inner_with_visibility_notice(
     // an authenticated retry if any retained blob is corrupt or stale.
     let locked: std::collections::HashSet<String> =
         state.db.locked_folder_ids()?.into_iter().collect();
+    for id in &locked {
+        if state.db.folder_has_pending_filing_sources(id)? {
+            return Err(AppError::Unavailable(
+                "filing recovery must be resolved before global relock cleanup".into(),
+            ));
+        }
+    }
+    // Recovery is fallible filesystem work. Screen-share relock must first revoke every gated
+    // reader and advance the epoch; a hostile journal path can then block physical cleanup without
+    // ever restoring renderer/MCP visibility. Raw-locked source snapshots were refused above so
+    // this global pass cannot restore and then orphan stale plaintext inside a sealed folder.
+    reconcile_filing_projection_journal(&state.db)?;
     let mut verified_relocks = Vec::with_capacity(locked.len());
     for folder_id in &locked {
         verified_relocks.push((
@@ -1474,6 +1535,14 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     // Permanent unlock destroys this folder's wrapped-key generation. A salvage finalizer may
     // still need that exact CK to seal output produced after an immediate session relock.
     ensure_no_active_salvage_in_folder(state, &folder_id)?;
+    // A source snapshot is plaintext governed only by SQLCipher. Permanent unlock must never clear
+    // this folder's per-folder ciphertext generation while such a recovery authority remains.
+    // Refuse rather than restore here: opening is user-visible and a recovery decision is separate.
+    if state.db.folder_has_pending_filing_sources(&folder_id)? {
+        return Err(AppError::Unavailable(
+            "resolve pending filing recovery before removing this folder lock".into(),
+        ));
+    }
     // R7: advance the seal epoch at ENTRY — remove-lock rewrites the same lock-surface columns
     // the consolidation pass must not interleave with. See `bump_seal_epoch`.
     bump_seal_epoch(state);

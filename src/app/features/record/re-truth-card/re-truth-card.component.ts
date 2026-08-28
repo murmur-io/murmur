@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   computed,
   effect,
   inject,
@@ -11,6 +12,7 @@ import { IpcService } from "../../../core/ipc.service";
 import { FoldersService } from "../../../services/folders.service";
 import type { ApplyResult, SupersessionDto } from "../../../core/models";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import { AskHistoryPrivacyBarrierService } from "../../../core/ask-history-privacy-barrier.service";
 
 /**
  * Re-Truth — "the vault heals itself" (post-note surface, Tier-4-style reveal).
@@ -46,6 +48,8 @@ export class ReTruthCardComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly destroyRef = inject(DestroyRef);
 
   /**
    * Fires the preview only when the post-note surface is live — the record
@@ -68,6 +72,8 @@ export class ReTruthCardComponent {
   /** True while an apply/undo IPC call is in flight. */
   private readonly _busy = signal(false);
   private readonly _error = signal<string | null>(null);
+  /** Invalidates every preview/apply continuation from an older content epoch. */
+  private contentGeneration = 0;
 
   readonly items = this._items.asReadonly();
   readonly healed = this._healed.asReadonly();
@@ -111,6 +117,16 @@ export class ReTruthCardComponent {
     return n === 1 ? "1 sealed note" : `${n} sealed notes`;
   });
 
+  constructor() {
+    // Supersession rows contain entity names, old/new values, and source-note
+    // titles. Hiding the card is not a scrub: discard every derived cache at the
+    // process-wide privacy boundary and make all pre-lock continuations stale.
+    const unregister = this.privacyBarrier.registerInvalidator(() =>
+      this.invalidateContentState(),
+    );
+    this.destroyRef.onDestroy(unregister);
+  }
+
   /**
    * Preview the supersessions when the surface goes live, and re-preview whenever
    * the folder lock-state changes (a session unlock/relock shifts what is sealed)
@@ -119,24 +135,23 @@ export class ReTruthCardComponent {
    * (NG0600 guard). The `active`/`meetingId` guard runs FIRST, so no preview is
    * dispatched behind a lock or before a note.
    */
-  private readonly _load = effect(
-    () => {
-      const id = this.meetingId();
-      if (!this.active() || !id) {
-        return;
-      }
-      this.folders.tree();
-      void this.fetch(id);
-    },
-  );
+  private readonly _load = effect(() => {
+    const active = this.active();
+    const id = this.meetingId();
+    const generation = ++this.contentGeneration;
+    this.clearContentState();
+    if (!active || !id) return;
+    this.folders.tree();
+    void this.fetch(id, generation);
+  });
 
-  private async fetch(id: string): Promise<void> {
+  private async fetch(id: string, generation: number): Promise<void> {
     try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (!this.contentRequestIsCurrent(id, generation)) return;
+      if (!privacyReady) return;
       const rows = await this.ipc.previewSupersessions(id);
-      // Drop a response that resolved after the meeting moved on (stale guard).
-      if (this.meetingId() !== id) {
-        return;
-      }
+      if (!this.contentRequestIsCurrent(id, generation)) return;
       this._items.set(rows);
       // Fresh preview → select all by default and reset any prior heal state.
       const sel: Record<string, boolean> = {};
@@ -148,12 +163,10 @@ export class ReTruthCardComponent {
       this._appliedIds.set([]);
       this._error.set(null);
     } catch {
-      if (this.meetingId() !== id) {
-        return;
-      }
+      if (!this.contentRequestIsCurrent(id, generation)) return;
       this._items.set([]);
     } finally {
-      if (this.meetingId() === id) {
+      if (this.contentRequestIsCurrent(id, generation)) {
         this._loaded.set(true);
       }
     }
@@ -181,38 +194,79 @@ export class ReTruthCardComponent {
    */
   async heal(): Promise<void> {
     const ids = this.selectedIds();
-    if (ids.length === 0 || this._busy()) {
+    const id = this.meetingId();
+    if (ids.length === 0 || !id || this._busy()) {
       return;
     }
+    const generation = this.contentGeneration;
     this._busy.set(true);
     this._error.set(null);
     try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (!this.contentRequestIsCurrent(id, generation)) return;
+      if (!privacyReady) return;
       const res = await this.ipc.applySupersessions(ids);
+      if (!this.contentRequestIsCurrent(id, generation)) return;
       this._appliedIds.set(ids);
       this._healed.set(res);
     } catch (e) {
+      if (!this.contentRequestIsCurrent(id, generation)) return;
       this._error.set(this.errorCopy.humanize(e));
     } finally {
-      this._busy.set(false);
+      if (this.contentRequestIsCurrent(id, generation)) {
+        this._busy.set(false);
+      }
     }
   }
 
   /** Undo the heal — remove the appended callouts, restoring the originals. */
   async undo(): Promise<void> {
     const ids = this._appliedIds();
-    if (ids.length === 0 || this._busy()) {
+    const id = this.meetingId();
+    if (ids.length === 0 || !id || this._busy()) {
       return;
     }
+    const generation = this.contentGeneration;
     this._busy.set(true);
     this._error.set(null);
     try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (!this.contentRequestIsCurrent(id, generation)) return;
+      if (!privacyReady) return;
       await this.ipc.undoSupersessions(ids);
+      if (!this.contentRequestIsCurrent(id, generation)) return;
       this._healed.set(null);
       this._appliedIds.set([]);
     } catch (e) {
+      if (!this.contentRequestIsCurrent(id, generation)) return;
       this._error.set(this.errorCopy.humanize(e));
     } finally {
-      this._busy.set(false);
+      if (this.contentRequestIsCurrent(id, generation)) {
+        this._busy.set(false);
+      }
     }
+  }
+
+  private contentRequestIsCurrent(id: string, generation: number): boolean {
+    return (
+      generation === this.contentGeneration &&
+      this.active() &&
+      this.meetingId() === id
+    );
+  }
+
+  private invalidateContentState(): void {
+    ++this.contentGeneration;
+    this.clearContentState();
+  }
+
+  private clearContentState(): void {
+    this._items.set([]);
+    this._loaded.set(false);
+    this._selected.set({});
+    this._healed.set(null);
+    this._appliedIds.set([]);
+    this._busy.set(false);
+    this._error.set(null);
   }
 }
