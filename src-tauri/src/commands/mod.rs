@@ -9978,7 +9978,7 @@ fn move_note_locked_domain_compat(
         if state
             .db
             .folder_by_id(&source_folder_id)?
-            .is_none_or(|folder| folder.locked)
+            .map_or(true, |folder| folder.locked)
         {
             return Err(AppError::Unavailable(
                 "remove the source folder lock before moving this recording out of it".into(),
