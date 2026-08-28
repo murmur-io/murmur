@@ -40,6 +40,12 @@
           }
           {{ board()?.title ?? "Board" }}
         </button>
+        @if (board(); as b) {
+          <!-- The board's stable id, for pointing Claude at THIS board over the local MCP
+               server (`get_dashboard`). Inside the <h1> on purpose: `.head-text` is a column,
+               so a sibling of the heading drops onto its own line. -->
+          <mur-copy-id [id]="b.id" label="Board" />
+        }
       </h1>
     }
   </div>
