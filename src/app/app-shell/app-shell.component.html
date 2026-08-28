@@ -223,6 +223,7 @@
 }
 
 <app-account-session-banner />
+<app-filing-recovery-banner />
 
 @if (toasts().length > 0) {
   <div class="toast-viewport" aria-live="polite" aria-atomic="false">
@@ -280,8 +281,11 @@
 @if (workspaceOrganizePlan(); as plan) {
   <app-workspace-organize-sheet
     [plan]="plan"
-    [busy]="workspaceOrganizeApplying()"
+    [busy]="workspaceOrganizeApplying() || workspaceOrganizePlanning()"
+    [planning]="workspaceOrganizePlanning()"
+    [applying]="workspaceOrganizeApplying()"
     (apply)="applyWorkspaceOrganization($event)"
+    (replan)="replanWorkspaceOrganization($event)"
     (cancelled)="closeWorkspaceOrganization()"
   />
 }

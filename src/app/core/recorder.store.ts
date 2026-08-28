@@ -1,4 +1,10 @@
-import { Injectable, computed, inject, signal } from "@angular/core";
+import {
+  DestroyRef,
+  Injectable,
+  computed,
+  inject,
+  signal,
+} from "@angular/core";
 import { toObservable, toSignal } from "@angular/core/rxjs-interop";
 import {
   catchError,
@@ -15,6 +21,7 @@ import type { NoteDto, Stage, StatusPayload } from "./models";
 import { RecordingFlushService } from "./recording-flush.service";
 import { ToastService } from "../services/toast.service";
 import { ErrorCopyService } from "./copy/error-copy.service";
+import { AskHistoryPrivacyBarrierService } from "./ask-history-privacy-barrier.service";
 
 /**
  * Human byte label (binary), matching the Storage settings section's `mb()`:
@@ -37,6 +44,8 @@ export class RecorderStore {
   private readonly toast = inject(ToastService);
   private readonly flushService = inject(RecordingFlushService);
   private readonly errorCopy = inject(ErrorCopyService);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
+  private readonly destroyRef = inject(DestroyRef);
 
   private readonly _stage = signal<Stage>("idle");
   private readonly _message = signal<string>("");
@@ -76,10 +85,53 @@ export class RecorderStore {
 
   readonly isRecording = computed(() => this._stage() === "recording");
   readonly isBusy = computed(() =>
-    ["recording", "transcribing", "summarizing", "exporting"].includes(
-      this._stage(),
-    ),
+    [
+      "recording",
+      "transcribing",
+      "summarizing",
+      "exporting",
+      "saved",
+      "finalized",
+    ].includes(this._stage()),
   );
+
+  /**
+   * Clear only route-owned, terminal presentation state.
+   *
+   * The recorder is a root singleton, so `done` / `error` and the last meeting
+   * otherwise survive destruction of `/record` and reappear when the route is
+   * mounted again. Recording and pipeline stages are backend-owned work and are
+   * deliberately left untouched: navigating elsewhere must never stop capture
+   * or detach finalization. Returns whether a reset was safe, so the route can
+   * clear its matching assistant focus at the same boundary.
+   */
+  resetRoutePresentation(): boolean {
+    if (
+      [
+        "recording",
+        "transcribing",
+        "summarizing",
+        "exporting",
+        "saved",
+        "finalized",
+      ].includes(this._stage())
+    ) {
+      return false;
+    }
+    const terminalMeetingId = this._meetingId();
+    if (this._stage() === "done" && terminalMeetingId) {
+      this.ignoredTerminalMeetingId = terminalMeetingId;
+    }
+    this._stage.set("idle");
+    ++this.terminalStatusRequest;
+    this._message.set("");
+    this._lastNote.set(null);
+    this._error.set(null);
+    this._meetingId.set(null);
+    this._liveCaption.set("");
+    this._recStartMs = 0;
+    return true;
+  }
 
   /**
    * Mic peak level 0.0..=1.0 (PHASE0-PLAN §7 recording_level). Fully reactive:
@@ -133,6 +185,25 @@ export class RecorderStore {
    */
   private statusSeen = false;
 
+  /** Invalidates an older terminal detail read after any newer status. */
+  private terminalStatusRequest = 0;
+
+  /**
+   * `/record` is a presentation session, not the owner of capture or pipeline
+   * work. A terminal detail read may finish after that route was destroyed, so
+   * bind every read to the route epoch that requested it. Busy stages without a
+   * terminal hydration remain backend-owned and survive navigation unchanged.
+   */
+  private recordRouteActive = false;
+  private recordRouteEpoch = 0;
+  private terminalHydration: {
+    meetingId: string;
+    request: number;
+    routeEpoch: number;
+  } | null = null;
+  /** Content-free tombstone for command/status settlements retired by route exit. */
+  private ignoredTerminalMeetingId: string | null = null;
+
   private unlisten: UnlistenFn | null = null;
   private unlistenVoice: UnlistenFn | null = null;
   private unlistenToggle: UnlistenFn | null = null;
@@ -141,6 +212,47 @@ export class RecorderStore {
   private unlistenStoragePruned: UnlistenFn | null = null;
   private unlistenCapped: UnlistenFn | null = null;
   private unlistenCaptureFault: UnlistenFn | null = null;
+
+  constructor() {
+    // This root store retains the full NoteDto, including markdown and an
+    // exported path. Scrub it at the same synchronous process-wide privacy
+    // boundary used by mounted content readers, before any later render can
+    // expose a stale vault receipt or keep Re-Truth active.
+    const unregister = this.privacyBarrier.registerInvalidator(() =>
+      this.invalidateTerminalPrivacy(),
+    );
+    this.destroyRef.onDestroy(unregister);
+  }
+
+  /** Start a fresh `/record` presentation epoch. */
+  enterRecordRoute(): void {
+    this.recordRouteActive = true;
+    ++this.recordRouteEpoch;
+    if (this.terminalHydration && this._stage() === "saved") {
+      // Finalization already reached its terminal read in an older/absent
+      // presentation. Do not let its late response resurrect that result on a
+      // new visit. A plain `saved` stage without this marker is still genuine
+      // backend processing and remains visible.
+      ++this.terminalStatusRequest;
+      this.retireTerminalPresentation(this.terminalHydration.meetingId);
+    }
+  }
+
+  /** End the current `/record` presentation epoch without stopping work. */
+  leaveRecordRoute(): void {
+    this.recordRouteActive = false;
+    ++this.recordRouteEpoch;
+    if (this.terminalHydration) {
+      // A terminal read means the backend has already finalized this meeting;
+      // it is not genuine processing anymore. Retire its route-owned
+      // presentation immediately so a stale `finally` cannot erase the marker
+      // and leave `saved` wedged before the next visit.
+      ++this.terminalStatusRequest;
+      this.retireTerminalPresentation(this.terminalHydration.meetingId);
+    } else if (this._stage() === "done" && this._meetingId()) {
+      this.retireTerminalPresentation(this._meetingId()!);
+    }
+  }
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -230,9 +342,14 @@ export class RecorderStore {
         this._recStartMs = Number.isFinite(startedMs) ? startedMs : Date.now();
         this._stage.set("recording");
       } else if (
-        ["recording", "transcribing", "summarizing", "exporting"].includes(
-          this._stage(),
-        )
+        [
+          "recording",
+          "transcribing",
+          "summarizing",
+          "exporting",
+          "saved",
+          "finalized",
+        ].includes(this._stage())
       ) {
         this._stage.set("idle");
       }
@@ -244,9 +361,57 @@ export class RecorderStore {
   private applyStatus(p: StatusPayload): void {
     this.statusSeen = true;
     const wasRecording = this._stage() === "recording";
-    this._stage.set(p.stage);
+    if (
+      p.stage === "finalized" &&
+      p.meetingId &&
+      p.meetingId === this.ignoredTerminalMeetingId
+    ) {
+      return;
+    }
+    if (
+      p.stage === "finalized" &&
+      p.meetingId &&
+      p.meetingId === this._meetingId() &&
+      (this._stage() === "done" ||
+        this.terminalHydration?.meetingId === p.meetingId)
+    ) {
+      // Duplicate terminal events are expected across windows. Once this exact
+      // meeting is ready (or already hydrating), never clear its safe card or
+      // regress it to the processing stage for a redundant refetch.
+      return;
+    }
     this._message.set(p.message);
     this._meetingId.set(p.meetingId);
+    if (p.stage === "saved" || p.stage === "done") {
+      // Both are pre-final progress events. The backend emits `finalized` only
+      // after recording ownership and the model session are retired; until
+      // then filing must remain unavailable in every WebView.
+      this._lastNote.set(null);
+      this._stage.set("saved");
+      this._liveCaption.set("");
+      this._error.set(null);
+      ++this.terminalStatusRequest;
+      this.terminalHydration = null;
+      return;
+    }
+    if (p.stage === "finalized") {
+      // This WebView may never have called stop(). Hydrate only the exact gated
+      // meeting before exposing its final result; never reuse get_last_note.
+      this._lastNote.set(null);
+      this._stage.set("saved");
+      this._liveCaption.set("");
+      this._error.set(null);
+      if (p.meetingId) this.beginTerminalHydration(p.meetingId);
+      return;
+    }
+
+    ++this.terminalStatusRequest;
+    this.terminalHydration = null;
+    this._stage.set(p.stage);
+    if (p.stage === "recording") {
+      this.ignoredTerminalMeetingId = null;
+      this._lastNote.set(null);
+    }
     if (p.stage !== "recording") {
       this._liveCaption.set("");
     }
@@ -263,11 +428,15 @@ export class RecorderStore {
     }
   }
 
-  async start(): Promise<void> {
+  async start(folderId: string | null = null): Promise<void> {
+    ++this.terminalStatusRequest;
+    this.terminalHydration = null;
+    this.ignoredTerminalMeetingId = null;
     this._error.set(null);
     this._liveCaption.set("");
+    this._lastNote.set(null);
     try {
-      const res = await this.ipc.startRecording();
+      const res = await this.ipc.startRecording(folderId);
       this._meetingId.set(res.meetingId);
       this._recStartMs = Date.now();
       this._stage.set("recording");
@@ -287,6 +456,9 @@ export class RecorderStore {
     // StopResult then reconcile the exact stage.
     this._error.set(null);
     this._stage.set("transcribing");
+    const stoppingMeetingId = this._meetingId();
+    ++this.terminalStatusRequest;
+    this.terminalHydration = null;
     try {
       // FLUSH-BEFORE-FINALIZE (root-cause fix, 2026-07-17): the recording panel's
       // "Note" tab hosts the embedded companion note editor, which persists via a
@@ -304,17 +476,32 @@ export class RecorderStore {
         ? await this.flushService.flush()
         : false;
       const res = await this.ipc.stopRecording(companionFlushCompleted);
-      // Optimistic preview from the StopResult; then reconcile with the
-      // persisted note so the pane shows the canonical provider id / path.
-      this._lastNote.set({
-        meetingId: res.meetingId,
-        providerId: "",
-        markdown: res.markdown,
-        exportedPath: res.exportedPath,
-      });
-      this._stage.set("done");
-      await this.refreshLastNote();
+      if (res.meetingId === this.ignoredTerminalMeetingId) {
+        return;
+      }
+      if (
+        !stoppingMeetingId ||
+        res.meetingId !== stoppingMeetingId ||
+        this._meetingId() !== stoppingMeetingId
+      ) {
+        return;
+      }
+      if (this._meetingId() === res.meetingId && this._stage() === "done") {
+        return;
+      }
+      this._meetingId.set(res.meetingId);
+      this._lastNote.set(null);
+      this._stage.set("saved");
+      await this.beginTerminalHydration(res.meetingId);
     } catch (e) {
+      if (
+        !stoppingMeetingId ||
+        stoppingMeetingId === this.ignoredTerminalMeetingId ||
+        this._meetingId() !== stoppingMeetingId
+      ) {
+        return;
+      }
+      ++this.terminalStatusRequest;
       this._error.set(String(e));
       this._stage.set("error");
     }
@@ -326,19 +513,34 @@ export class RecorderStore {
    * "cloud egress not consented"). Mirrors stop()'s optimistic-then-reconcile flow.
    */
   async resummarize(meetingId: string): Promise<void> {
+    ++this.terminalStatusRequest;
+    this.terminalHydration = null;
+    this.ignoredTerminalMeetingId = null;
     this._error.set(null);
+    this._lastNote.set(null);
     this._stage.set("summarizing");
     try {
       const res = await this.ipc.resummarize(meetingId);
-      this._lastNote.set({
-        meetingId: res.meetingId,
-        providerId: "",
-        markdown: res.markdown,
-        exportedPath: res.exportedPath,
-      });
-      this._stage.set("done");
-      await this.refreshLastNote();
+      if (res.meetingId === this.ignoredTerminalMeetingId) {
+        return;
+      }
+      if (res.meetingId !== meetingId || this._meetingId() !== meetingId) {
+        return;
+      }
+      if (this._meetingId() === res.meetingId && this._stage() === "done") {
+        return;
+      }
+      this._meetingId.set(res.meetingId);
+      this._stage.set("saved");
+      await this.beginTerminalHydration(res.meetingId);
     } catch (e) {
+      if (
+        meetingId === this.ignoredTerminalMeetingId ||
+        this._meetingId() !== meetingId
+      ) {
+        return;
+      }
+      ++this.terminalStatusRequest;
       this._error.set(String(e));
       this._stage.set("error");
     }
@@ -355,11 +557,160 @@ export class RecorderStore {
   }
 
   async refreshLastNote(): Promise<void> {
+    const request = this.terminalStatusRequest;
+    const meetingId = this._meetingId();
+    const stage = this._stage();
     try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (
+        !privacyReady ||
+        request !== this.terminalStatusRequest ||
+        meetingId !== this._meetingId() ||
+        stage !== this._stage()
+      ) {
+        return;
+      }
       const note = await this.ipc.getLastNote();
+      if (
+        request !== this.terminalStatusRequest ||
+        meetingId !== this._meetingId() ||
+        stage !== this._stage()
+      ) {
+        return;
+      }
       this._lastNote.set(note);
     } catch (e) {
+      if (
+        request !== this.terminalStatusRequest ||
+        meetingId !== this._meetingId() ||
+        stage !== this._stage()
+      ) {
+        return;
+      }
       this._error.set(String(e));
     }
+  }
+
+  private beginTerminalHydration(meetingId: string): Promise<void> {
+    const request = ++this.terminalStatusRequest;
+    const routeEpoch = this.recordRouteEpoch;
+    this.terminalHydration = { meetingId, request, routeEpoch };
+    return this.reconcileTerminalMeeting(meetingId, request, routeEpoch);
+  }
+
+  /**
+   * Resolve a terminal event/command against the exact gated meeting. The
+   * request + meeting guards prevent a late response from restoring another
+   * meeting's note after a newer recording or privacy transition.
+   */
+  private async reconcileTerminalMeeting(
+    meetingId: string,
+    request: number,
+    routeEpoch: number,
+  ): Promise<void> {
+    try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (!this.terminalRequestIsCurrent(meetingId, request, routeEpoch)) {
+        return;
+      }
+      if (!privacyReady) {
+        this.settleTerminalWithoutContent(meetingId, request, routeEpoch);
+        return;
+      }
+      const detail = await this.ipc.getMeetingDetail(meetingId);
+      if (!this.terminalRequestIsCurrent(meetingId, request, routeEpoch)) {
+        return;
+      }
+      if (!detail || detail.meeting.id !== meetingId) {
+        this.settleTerminalWithoutContent(meetingId, request, routeEpoch);
+        return;
+      }
+      if (
+        detail.meeting.status !== "SUMMARIZED" &&
+        detail.meeting.status !== "EXPORTED"
+      ) {
+        this.settleTerminalWithoutContent(meetingId, request, routeEpoch);
+        return;
+      }
+      if (detail.note && detail.note.meetingId !== meetingId) {
+        this.settleTerminalWithoutContent(meetingId, request, routeEpoch);
+        return;
+      }
+      if (!this.recordRouteActive) {
+        this.retireTerminalPresentation(meetingId);
+        return;
+      }
+      this._lastNote.set(detail.locked ? null : detail.note);
+      this._stage.set("done");
+    } catch {
+      // The backend has already declared this exact meeting finalized. A failed
+      // gated read must not wedge the UI on "Saved" forever: expose only the
+      // content-free exact navigation card. Its placement reader has an
+      // explicit retry; never fall back to process-global get_last_note.
+      this.settleTerminalWithoutContent(meetingId, request, routeEpoch);
+    } finally {
+      if (this.terminalHydration?.request === request) {
+        this.terminalHydration = null;
+      }
+    }
+  }
+
+  private terminalRequestIsCurrent(
+    meetingId: string,
+    request: number,
+    routeEpoch: number,
+  ): boolean {
+    return (
+      request === this.terminalStatusRequest &&
+      meetingId === this._meetingId() &&
+      routeEpoch === this.recordRouteEpoch &&
+      this.terminalHydration?.request === request
+    );
+  }
+
+  private settleTerminalWithoutContent(
+    meetingId: string,
+    request: number,
+    routeEpoch: number,
+  ): void {
+    if (!this.terminalRequestIsCurrent(meetingId, request, routeEpoch)) return;
+    this._lastNote.set(null);
+    this._error.set(null);
+    if (this.recordRouteActive) {
+      this._stage.set("done");
+    } else {
+      this.retireTerminalPresentation(meetingId);
+    }
+  }
+
+  /** Synchronous content scrub for lock/delete/privacy transitions. */
+  private invalidateTerminalPrivacy(): void {
+    ++this.terminalStatusRequest;
+    this._lastNote.set(null);
+    const pending = this.terminalHydration;
+    if (pending && this._stage() === "saved") {
+      if (this.recordRouteActive) {
+        this.terminalHydration = null;
+        this._stage.set("done");
+      } else {
+        this.retireTerminalPresentation(pending.meetingId);
+      }
+    }
+  }
+
+  private retireTerminalPresentation(meetingId: string): void {
+    this.ignoredTerminalMeetingId = meetingId;
+    this.terminalHydration = null;
+    this.clearTerminalPresentationToIdle();
+  }
+
+  private clearTerminalPresentationToIdle(): void {
+    this._stage.set("idle");
+    this._message.set("");
+    this._lastNote.set(null);
+    this._error.set(null);
+    this._meetingId.set(null);
+    this._liveCaption.set("");
+    this._recStartMs = 0;
   }
 }
