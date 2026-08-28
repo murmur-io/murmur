@@ -542,9 +542,10 @@ pub(crate) fn capture_meeting_content_snapshot(
 ) -> Result<MeetingContentSnapshot, AppError> {
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it and retry".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it and retry",
+            )));
     }
     Ok(MeetingContentSnapshot {
         folder_id: state.db.folder_for_meeting(meeting_id)?,
@@ -2586,9 +2587,10 @@ pub(crate) fn update_note_inner_with(
     // plaintext markdown is blanked while sealed, so an edit here would overwrite the (sealed)
     // content with the blanked value and corrupt it. Fail closed.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to edit the note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to edit the note",
+            )));
     }
     let existing = state
         .db
@@ -2698,9 +2700,10 @@ pub(crate) fn save_manual_notes_inner(
     // concurrent relock/seal cannot land between the unlock check and the buffer write.
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to edit your notes".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to edit your notes",
+            )));
     }
     // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh buffer into
     // `manual_notes_blob` in the same write; open/rootless takes the plain update. Fail-closed on a
@@ -2789,9 +2792,10 @@ fn resolve_conversion_template(
             saved: Some(saved),
         });
     }
-    Err(AppError::InvalidArg(
-        "the selected note template no longer exists".into(),
-    ))
+    Err(AppError::InvalidArg(crate::errcode::tag(
+        crate::errcode::NOTE_TEMPLATE_MISSING,
+        "the selected note template no longer exists",
+    )))
 }
 
 /// Compose a generated conversion into the companion note without ever replacing user-authored
@@ -2808,9 +2812,10 @@ fn compose_converted_companion_markdown(
     let (generated_yaml, generated_body) = crate::storage::db::split_front_matter(generated);
     let generated_body = generated_body.trim();
     if generated_body.is_empty() {
-        return Err(AppError::Unavailable(
-            "the note provider returned an empty note".into(),
-        ));
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::NOTE_PROVIDER_EMPTY,
+            "the note provider returned an empty note",
+        )));
     }
     if generated_body.contains(CONVERTED_NOTE_START) || generated_body.contains(CONVERTED_NOTE_END)
     {
@@ -2923,19 +2928,22 @@ fn conversion_destination_under_lifecycle(
         .into_iter()
         .find(|container| container.id == id)
         .ok_or_else(|| {
-            AppError::InvalidArg(
-                "the meeting's container is unavailable; move the meeting and retry".into(),
-            )
+            AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::CONTAINER_UNAVAILABLE,
+                "the meeting's container is unavailable; move the meeting and retry",
+            ))
         })?;
     if state.db.org_folder_closure_exists(&id)? {
-        return Err(AppError::Unavailable(
-            "the destination is closing or locked for sharing; retry after reopening it".into(),
-        ));
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::FOLDER_CLOSING,
+            "the destination is closing or locked for sharing; retry after reopening it",
+        )));
     }
     if row.locked && !folder_is_unlocked(state, &id)? {
-        return Err(AppError::Locked(
-            "unlock the meeting's container before converting it to a note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock the meeting's container before converting it to a note",
+        )));
     }
     Ok(ConversionDestination {
         id,
@@ -2959,20 +2967,22 @@ fn reauthorize_conversion_source_under_lifecycle(
         .into_iter()
         .find(|container| container.id == folder_id)
         .ok_or_else(|| {
-            AppError::Unavailable(
-                "the companion note's source container is unavailable; reopen it and retry".into(),
-            )
+            AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::CONTAINER_UNAVAILABLE,
+                "the companion note's source container is unavailable; reopen it and retry",
+            ))
         })?;
     if state.db.org_folder_closure_exists(folder_id)? {
-        return Err(AppError::Unavailable(
-            "the companion note's source container is closing or unavailable; retry after reopening it"
-                .into(),
-        ));
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::FOLDER_CLOSING,
+            "the companion note's source container is closing or unavailable; retry after reopening it",
+        )));
     }
     if source.locked && !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "unlock the companion note's source container before converting this meeting".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock the companion note's source container before converting this meeting",
+        )));
     }
     Ok(())
 }
@@ -3384,9 +3394,10 @@ fn persist_converted_companion_under_snapshot_with_attachment_verifier(
         // container, where every item including the shared one really does change state.
         // `notes.rs::move_note_to_folder` is the canonical item-scoped precedent.
         if state.db.source_has_active_remote_share(None, Some(&id))? {
-            return Err(AppError::Unavailable(
-                "revoke this note's shares before filing this converted note".into(),
-            ));
+            return Err(AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::SHARE_ACTIVE,
+                "revoke this note's shares before filing this converted note",
+            )));
         }
 
         let (text_blob, attachment_seals) = if destination.locked {
@@ -3612,9 +3623,10 @@ async fn convert_meeting_to_note_inner_with(
             ))
         })?;
     if segments.is_empty() {
-        return Err(AppError::InvalidArg(
-            "this meeting has no transcript to convert".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::CONVERT_NO_TRANSCRIPT,
+            "this meeting has no transcript to convert",
+        )));
     }
     let selection = resolve_conversion_template(
         template_id.as_deref(),
@@ -5008,9 +5020,10 @@ fn meeting_provider_inputs_under_lifecycle(
         }
         None => {
             if !meeting_is_unlocked(state, meeting_id)? {
-                return Err(AppError::Locked(
-                    "this meeting's folder is locked — unlock it and retry".into(),
-                ));
+                return Err(AppError::Locked(crate::errcode::tag(
+                        crate::errcode::MEETING_LOCKED,
+                        "this meeting's folder is locked — unlock it and retry",
+                    )));
             }
             MeetingContentSnapshot {
                 folder_id: state.db.folder_for_meeting(meeting_id)?,
@@ -5214,9 +5227,10 @@ pub fn get_action_items(
     // D4 READ-GATE: a sealed-and-not-unlocked meeting's note markdown is blanked; refuse to parse
     // action items from it (would silently return none / leak a stale plaintext). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to see action items".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to see action items",
+            )));
     }
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
     Ok(match note {
@@ -5257,9 +5271,10 @@ pub fn pin_moment(
     // markdown is blanked, so appending a pin would persist the blanked value over the sealed
     // content AND re-export a plaintext `.md`. Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to pin a moment".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to pin a moment",
+            )));
     }
     let existing = state
         .db
@@ -7410,9 +7425,10 @@ pub async fn resummarize(
     // meeting that would (a) feed a cloud provider blank text and (b) leave plaintext markdown +
     // a vault `.md` in a locked folder. Fail closed — the FE must unlock first.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to re-summarize".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to re-summarize",
+            )));
     }
     // DETACHED, panic-mapped execution (the same #346 pattern as `stop_recording`): awaited
     // INLINE, a panic inside `resummarize_existing` would leave the invoke Promise unsettled
@@ -7532,9 +7548,10 @@ pub(crate) fn retry_transcription_prep(
     let _lifecycle = lifecycle_guard(state);
     // Lock gate: never re-pipeline (or decrypt) a sealed-and-not-session-unlocked meeting.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to retry transcription".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to retry transcription",
+            )));
     }
     reconcile_released_generation_cleanup(state, meeting_id)?;
     if state
