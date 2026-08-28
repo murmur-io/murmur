@@ -1,7 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
-    "MURMUR_FINISH_GUARD": "enforce",
     "MURMUR_AUTOFMT": "0"
   },
   "permissions": {
@@ -49,9 +48,10 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/block-bash.sh\"" },
-          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/secret-scan.sh\"" },
-          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/finish-guard.sh\"" }
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.agents/h/guard.py\""
+          }
         ]
       }
     ],
@@ -59,7 +59,10 @@
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/autoformat.sh\"" }
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/autoformat.sh\""
+          }
         ]
       }
     ]

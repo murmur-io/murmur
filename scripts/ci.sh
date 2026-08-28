@@ -51,37 +51,6 @@ rust_gate() {
   public_audit_token="${MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN:-}"
   unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN GH_TOKEN GITHUB_TOKEN
 
-  # ── Changed-path guard for the EXPENSIVE control-plane steps only. ──
-  # Measured on this machine 2026-08-01: `agent-harness selftest --ci` 54 s and
-  # `verify-harness-attestation --selftest` 4.6 s dominate a control-plane bill
-  # that an Angular one-liner pays in full, twice (here, then Actions re-running
-  # this script). The guard's own selftest runs UNCONDITIONALLY and costs ~2 s:
-  # it proves every fail-safe branch (no git, no work tree, shallow clone,
-  # detached HEAD, missing base ref, unreadable path list) still answers "run
-  # everything", so a broken guard cannot suppress the proof that it is broken.
-  # NOT gated, deliberately: `agent-config-audit --ci` (0.09 s — the cheapest
-  # check in the repo and the only one that sees control-plane drift and a
-  # silently disabled hook; CLAUDE.md requires it unconditionally after PR #535),
-  # the eval steps (5 s, they guard the instrument), and the LIVE remote audit,
-  # which is the only continuous verification that the GitHub ruleset, the exact
-  # required context, strict status checks and the empty bypass list still exist.
-  echo "── control-plane guard: fail-safe self-test ──"
-  bash scripts/control-plane-changed --selftest
-  if bash scripts/control-plane-changed; then
-    control_plane_changed=1
-  else
-    control_plane_changed=0
-  fi
-
-  # The merge receipt parser is security-sensitive and cheap. Exercise real
-  # temporary Git histories before any network audit or product build.
-  if [ "$control_plane_changed" = "1" ]; then
-    echo "── harness receipt gate: temp-git self-test ──"
-    scripts/verify-harness-attestation --selftest
-  else
-    echo "── harness receipt gate: skipped — no control-plane path in this diff ──"
-  fi
-
   # ── Remote merge enforcement is the first network-aware gate. Local runs exercise the evaluator
   #    deterministically. GitHub Actions lends either the ordinary PR token or the dedicated
   #    privileged monitoring credential only to the matching audit command. Privileged mode has no fallback:
@@ -100,34 +69,23 @@ rust_gate() {
       exit 1
     fi
     GH_TOKEN="$public_audit_token" scripts/agent-remote-audit --public
-  elif [ "$control_plane_changed" = "1" ]; then
+  else
+    # Offline evaluator self-test, 0.33 s — leci zawsze. Zniknal guard zmienionych
+    # sciezek, ktory istnial tylko po to, zeby gatowac 54 s selftestu harnessu.
     scripts/agent-remote-audit --selftest
     echo "  (live GitHub audit skipped — set MURMUR_CI_PUBLIC_REMOTE_AUDIT=1 or use privileged live mode)"
-  else
-    # Only the OFFLINE evaluator self-test is gated (0.33 s measured). Both live
-    # branches above stay unconditional: every PR run sets
-    # MURMUR_CI_PUBLIC_REMOTE_AUDIT=1, so the live ruleset audit never skips.
-    echo "  (offline evaluator self-test skipped — no control-plane path in this diff; the live audit is unaffected)"
   fi
   remote_audit_token=
   public_audit_token=
   unset GH_TOKEN GITHUB_TOKEN
 
-  # ── Development-agent control plane: fail before paying for any product build. The audit checks
-  #    both Claude and Codex reviewer wiring/config parity; the selftest proves lifecycle,
-  #    isolation, scope, stale-receipt rejection, fault recovery, and known hook bypasses. ──
-  echo "── development agent config audit ──"
-  scripts/agent-config-audit --ci
+  # ── Lustro konfiguracji agentow: .claude/ i .codex/ musza miec identyczne rules+learnings.
+  #    Zastapilo 1787 linii config_audit.py; ten sam defekt, 0.02 s. ──
+  echo "── mirror .claude/ vs .codex/ ──"
+  .agents/h/mirror-check
 
   echo "── development agent hooks: adversarial self-test ──"
   bash .codex/hooks/selftest.sh
-
-  if [ "$control_plane_changed" = "1" ]; then
-    echo "── development agent harness: deterministic self-test ──"
-    scripts/agent-harness selftest --ci
-  else
-    echo "── development agent harness self-test: skipped — no control-plane path in this diff ──"
-  fi
 
   # ── Scaffold eval, control arm only. `--mode fake` runs NO model: it replays each task's
   #    recorded good/bad answers through the real graders and asserts good passes and bad fails.

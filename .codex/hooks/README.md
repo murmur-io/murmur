@@ -1,7 +1,7 @@
 # `.codex/hooks/` — deterministic guardrail adapters
 
 Codex and Claude call the same parser and verifier in
-`.agents/harness/hook_guard.py`. The shell files here only translate the Codex hook
+`.agents/h/guard.py`. The shell files here only translate the Codex hook
 payload and exit contract; policy must not be reimplemented in an adapter.
 
 ## Active guards
@@ -14,14 +14,14 @@ payload and exit contract; policy must not be reimplemented in an adapter.
 | `autoformat.sh` | edits | Optional single-file Rust formatting when `MURMUR_AUTOFMT=1`. |
 
 The authoritative task state is under the shared Git common directory:
-`.git/agent-harness/v2/tasks/<task-id>/`. Task discovery matches the current linked
+`.git/h/<task-id>.json`. Task discovery matches the current linked
 worktree; there is no concurrency-unsafe global current-task pointer.
 
 ## Verification
 
 ```bash
 bash .codex/hooks/selftest.sh
-scripts/agent-config-audit --ci
+.agents/h/mirror-check
 ```
 
 The selftest runs the same canonical implementation against both Codex and Claude
@@ -35,7 +35,7 @@ override and must never be stored in project configuration.
 
 ## Adding a guardrail
 
-1. Change `.agents/harness/hook_guard.py`, not the vendor adapters.
+1. Change `.agents/h/guard.py`, not the vendor adapters.
 2. Add a RED assertion for the bypass plus an ALLOW assertion for the closest safe
    command, then make them GREEN.
 3. Run both commands above. Keep hooks fast; expensive proof belongs to the task
