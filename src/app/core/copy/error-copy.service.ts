@@ -124,6 +124,15 @@ export const ERROR_CODES = [
   "sharing-upgrade-required",
   "org-edit-conflict",
   "reminders-denied",
+  // Added 2026-08-28 with the meeting→note conversion refusals. Each of these was reachable in
+  // production while ANONYMOUS, so deny-by-default rendered "Couldn't convert this meeting. Please
+  // try again." for a failure the user could have fixed in one click.
+  "convert-no-transcript",
+  "note-template-missing",
+  "note-provider-empty",
+  "share-active",
+  "folder-closing",
+  "container-unavailable",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -148,6 +157,7 @@ export type ErrorContext =
   | "doc-note"
   | "unlock"
   | "account"
+  | "convert"
   | "tasks";
 
 /**
@@ -212,6 +222,20 @@ const BASE_COPY: Readonly<Record<ErrorCode, string>> = {
     "This shared note changed elsewhere. Your draft is still here — reload the latest version and try again.",
   "reminders-denied":
     "Grant Reminders access in System Settings ▸ Privacy & Security ▸ Reminders.",
+  "convert-no-transcript":
+    "This recording has no transcript yet, so there’s nothing to turn into a note.",
+  "note-template-missing":
+    "That note template no longer exists — pick another one in Settings ▸ Notes.",
+  "note-provider-empty":
+    "Your AI provider returned an empty note. Try again, or switch provider in Settings.",
+  // Names the ACTION, not the mechanism: "a share is active" tells the user nothing they can do.
+  // Both the link-share and the org-brain share reach this code, so the sentence covers both.
+  "share-active":
+    "This note is shared. Revoke its share first, then try again.",
+  "folder-closing":
+    "That folder is being prepared for sharing. Try again in a moment.",
+  "container-unavailable":
+    "This recording isn’t in a folder Murmur can add a note to. Move it, then try again.",
 };
 
 /**
@@ -297,6 +321,14 @@ const CONTEXT_COPY: Partial<
   recording: {
     "meeting-locked": "This meeting is locked — unlock its folder to finish the note.",
   },
+  convert: {
+    "meeting-locked": "This meeting is locked — unlock its folder to convert it.",
+    "folder-locked": "This meeting’s folder is locked — unlock it to convert it.",
+    "share-active":
+      "This meeting’s note is shared. Revoke its share first, then convert again.",
+    "cloud-consent":
+      "Converting needs your one-time permission to send a redacted transcript to your AI provider.",
+  },
   unlock: {
     "touch-id-cancelled": "Touch ID was cancelled — try again.",
     "touch-id-failed": "Touch ID didn’t recognise you — try again.",
@@ -316,6 +348,7 @@ const CONTEXT_FALLBACK: Partial<Record<ErrorContext, string>> = {
   unlock: "Couldn’t unlock. Please try again.",
   tasks: "Couldn’t load shared tasks. Please try again.",
   recording: "Couldn’t finish that recording. Please try again.",
+  convert: "Couldn’t convert this meeting. Please try again.",
 };
 
 /** Matches a leading `[kebab-code]` — strict, never a sniff. */
