@@ -7779,7 +7779,7 @@ pub struct ReindexResult {
     pub total: usize,
 }
 
-/// "Powiązane wg znaczenia": the up-to-5 meetings most semantically similar to `meeting_id`.
+/// "Related by meaning": the up-to-5 meetings most semantically similar to `meeting_id`.
 ///
 /// GATING: routes through `Db::related_meetings_visible`, which re-embeds the meeting's OWN plaintext
 /// chunks into a centroid and runs the gated `search_semantic_visible` (visibility_clause) — a

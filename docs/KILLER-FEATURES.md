@@ -1,4 +1,12 @@
+<!-- 2026-06-26 batch write-up. See docs/README.md for what in docs/ is current. -->
+
 # Murmur — Killer Features (mega-batch)
+
+> **Historical (2026-06-26), and read by the `research` skill as "what already shipped" — so be
+> precise about what it is.** Everything below did ship. But this is one batch's write-up from the
+> 0.5-era, not the shipped feature set: it predates Spaces, dashboards, imports, tasks, receipts, the
+> link graph, Shared Brain and the whole 2.0 shell. **For the current set, read
+> [`README.md` → Status](../README.md#%EF%B8%8F-status).**
 
 This batch turns Murmur from "record → summarize → save note" into a **meeting memory system**:
 your whole vault becomes queryable, self-organizing, and reachable from other AI tools — all

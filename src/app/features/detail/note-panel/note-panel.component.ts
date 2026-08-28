@@ -601,13 +601,13 @@ export class NotePanelComponent {
       case "needs_consent":
         return "Wymaga zgody";
       case "unavailable":
-        return "Niedostępne";
+        return "Unavailable";
       case "unrecognized":
         return "Nierozpoznane";
       case "nothing_heard":
-        return "Nic nie usłyszano";
+        return "Nothing was heard";
       case "error":
-        return "Błąd";
+        return "Error";
       default:
         return status;
     }
