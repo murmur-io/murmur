@@ -3721,3 +3721,107 @@ export interface ItemPage {
   items: ItemRow[];
   total: number;
 }
+
+// ── Shared containers: a whole Folder or Space published to an Org ────────────
+
+/**
+ * What sharing a container would publish — counts only, never content.
+ * Mirrors the Rust `ContainerSharePreview`.
+ */
+export interface ContainerSharePreview {
+  folderId: string;
+  name: string;
+  /** `"space"` or `"folder"`. */
+  level: string;
+  noteCount: number;
+  meetingCount: number;
+  /** Sub-folders whose own manifest will be published; the root is not counted. */
+  folderCount: number;
+  /** Sealed descendants deliberately left behind — their content is never read. */
+  skippedSealed: number;
+  /** Dashboards are not shared yet: one can reference items nobody shared. */
+  skippedDashboards: number;
+  totalItems: number;
+}
+
+/** The outcome of one container share. Mirrors the Rust `ContainerShareResult`. */
+export interface ContainerShareResult {
+  containerId: string;
+  published: number;
+  failed: number;
+}
+
+/**
+ * One container THIS user publishes, for the sidebar's shared marker.
+ * Mirrors the Rust `ContainerShareStatus`.
+ */
+export interface ContainerShareStatus {
+  orgId: string;
+  orgName: string;
+  /** The LOCAL `folders.id`. */
+  folderId: string;
+  containerId: string;
+  access: OrgAccess;
+  /** True for the container the user picked; false for a descendant carried along. */
+  isRoot: boolean;
+  /** `queued` | `published` | `failed` | `revoke_pending` | `revoked`. */
+  state: string;
+}
+
+/** One received document, as a sidebar row. Mirrors the Rust `SharedItemRow`. */
+export interface SharedItemRow {
+  itemId: string;
+  docId?: string | null;
+  title: string;
+  /**
+   * `"document"` | `"meeting"`, or absent when the sender's client predates the
+   * source-kind wire field. Absent means UNCLASSIFIED — never assume a bucket.
+   */
+  kind?: "document" | "meeting" | null;
+  authorHint: string;
+  createdAt: string;
+  orgId: string;
+  orgName: string;
+  access: OrgAccess;
+  position: number;
+}
+
+/**
+ * One node of the received forest: a shared Space, a shared Folder, or the
+ * synthetic Shared Brains root. Mirrors the Rust `SharedContainerNode`.
+ */
+export interface SharedContainerNode {
+  /** Absent only for the synthetic Shared Brains root, which nobody published. */
+  containerId?: string | null;
+  orgId: string;
+  orgName: string;
+  name: string;
+  level: "space" | "folder" | "virtual";
+  emoji?: string | null;
+  tint?: string | null;
+  access: OrgAccess;
+  authorHint: string;
+  folders: SharedContainerNode[];
+  items: SharedItemRow[];
+  /**
+   * This device's PRIVATE placement: the local `folders.id` the user filed this
+   * under, or absent for "wherever its owner put it". Never published — the
+   * owner and every other member see nothing of it.
+   */
+  localParentId?: string | null;
+  position: number;
+}
+
+/** Everything shared WITH this user. Mirrors the Rust `SharedWorkspace`. */
+export interface SharedWorkspace {
+  /** Received Spaces — each becomes its own top-level sidebar row. */
+  spaces: SharedContainerNode[];
+  /**
+   * Received Folders with no shared-Space parent, plus every received item with
+   * no container at all — one virtual Space so loose shared content has a home.
+   */
+  sharedBrains: SharedContainerNode;
+}
+
+/** What a private placement can point at. */
+export type SharedPlacementTarget = "container" | "doc";

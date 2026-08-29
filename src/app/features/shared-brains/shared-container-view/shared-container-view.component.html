@@ -1,0 +1,84 @@
+@if (node(); as container) {
+  <header class="head">
+    <span class="head-mark" aria-hidden="true">
+      <mur-icon [icon]="container.level === 'folder' ? 'folder' : 'spaces'" />
+    </span>
+    <div class="head-text">
+      <h1 class="head-title">
+        @if (container.emoji; as glyph) {
+          <span class="head-emoji" aria-hidden="true">{{ glyph }}</span>
+        }
+        {{ container.name }}
+      </h1>
+      <p class="head-sub">
+        Shared with you by {{ container.authorHint }} in {{ container.orgName }} ·
+        <span class="access-pill">{{ accessLabel() }}</span>
+      </p>
+    </div>
+  </header>
+
+  @if (container.folders.length === 0 && container.items.length === 0) {
+    <mur-empty-state>
+      <h2>Nothing here yet</h2>
+      <p>
+        This {{ noun() }} is shared with you, but its owner has not put anything
+        in it. Whatever they add appears here on its own.
+      </p>
+    </mur-empty-state>
+  } @else {
+    @if (container.folders.length > 0) {
+      <section class="group">
+        <h2 class="group-title">Folders</h2>
+        <ul class="rows">
+          @for (folder of container.folders; track folder.containerId) {
+            <li>
+              <button type="button" class="row" (click)="openFolder(folder)">
+                <span class="row-icon" aria-hidden="true">
+                  <mur-icon icon="folder" />
+                </span>
+                <span class="row-main">
+                  <span class="row-title">{{ folder.name }}</span>
+                  <span class="row-meta">
+                    {{ folder.items.length }}
+                    {{ folder.items.length === 1 ? "item" : "items" }}
+                  </span>
+                </span>
+              </button>
+            </li>
+          }
+        </ul>
+      </section>
+    }
+
+    @if (container.items.length > 0) {
+      <section class="group">
+        <h2 class="group-title">Notes</h2>
+        <ul class="rows">
+          @for (item of container.items; track item.itemId) {
+            <li>
+              <button type="button" class="row" (click)="openItem(item)">
+                <span class="row-icon" aria-hidden="true">
+                  <mur-icon [icon]="item.kind === 'meeting' ? 'meetings' : 'document'" />
+                </span>
+                <span class="row-main">
+                  <span class="row-title">{{ itemTitle(item) }}</span>
+                  <span class="row-meta">{{ itemMeta(item) }}</span>
+                </span>
+              </button>
+            </li>
+          }
+        </ul>
+      </section>
+    }
+  }
+} @else if (loading()) {
+  <p class="state">Loading…</p>
+} @else {
+  <mur-empty-state>
+    <h2>This shared container is no longer available</h2>
+    <p>
+      Its owner may have stopped sharing it, or you may have left the
+      organization.
+    </p>
+  </mur-empty-state>
+}

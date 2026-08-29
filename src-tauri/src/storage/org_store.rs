@@ -530,7 +530,7 @@ impl Db {
         Ok(())
     }
 
-    fn map_org_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::storage::OrgShareRow> {
+    pub(crate) fn map_org_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::storage::OrgShareRow> {
         Ok(crate::storage::OrgShareRow {
             id: r.get(0)?,
             org_id: r.get(1)?,
@@ -551,15 +551,19 @@ impl Db {
             expected_owner_user_id: r.get(16)?,
             source_version: r.get::<_, i64>(17)?.max(0) as u64,
             republish_dirty: r.get::<_, i64>(18)?.max(0) as u64,
-            created_at: r.get(19)?,
-            updated_at: r.get(20)?,
+            parent_container_id: r.get(19)?,
+            position: r.get(20)?,
+            explicit: r.get::<_, i64>(21)? != 0,
+            created_at: r.get(22)?,
+            updated_at: r.get(23)?,
         })
     }
 
-    const ORG_SHARE_COLS: &'static str =
+    pub(crate) const ORG_SHARE_COLS: &'static str =
         "id, org_id, meeting_id, document_id, kind, title, rev, generation,
          content_sha256, item_id, doc_id, access, scrub, state, last_error,
          expected_actor_user_id, expected_owner_user_id, source_version, republish_dirty,
+         parent_container_id, position, explicit,
          created_at, updated_at";
 
     /// One org share by its local id.

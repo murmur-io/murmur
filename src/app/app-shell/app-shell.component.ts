@@ -158,7 +158,12 @@ export class AppShellComponent {
       path.startsWith("/meeting/") ||
       (path.startsWith("/notes/") && path !== "/notes/new") ||
       (path.startsWith("/tasks/") && path !== "/tasks/new") ||
-      path.startsWith("/dashboards/")
+      path.startsWith("/dashboards/") ||
+      // Shared Brains and a received container are now ROWS in the Spaces
+      // sidebar rather than a separate destination, so opening one must keep
+      // the tree beside it — the same as opening any Space of the user's own.
+      path === "/shared-brains" ||
+      path.startsWith("/shared/")
     );
   });
 
@@ -168,11 +173,7 @@ export class AppShellComponent {
 
   readonly contextPanel = computed<ContextPanel>(() => {
     const path = this.currentPath();
-    if (
-      path.startsWith("/settings") ||
-      path.startsWith("/org-item/") ||
-      path === "/shared-brains"
-    ) {
+    if (path.startsWith("/settings") || path.startsWith("/org-item/")) {
       return "none";
     }
     const override = this._contextOverride();
@@ -244,9 +245,7 @@ export class AppShellComponent {
     const firstSpace = this.workspace.forest()[0];
     const path = this.currentPath();
     const fixedDrilldown =
-      path.startsWith("/settings") ||
-      path.startsWith("/org-item/") ||
-      path === "/shared-brains";
+      path.startsWith("/settings") || path.startsWith("/org-item/");
     const narrowViewport = window.matchMedia(NARROW_SHELL_QUERY).matches;
     this.setSpacesCollapsed(false);
     if ((fixedDrilldown || narrowViewport) && firstSpace) {
@@ -281,10 +280,6 @@ export class AppShellComponent {
 
   isSettingsActive(): boolean {
     return this.currentPath().startsWith("/settings");
-  }
-
-  isSharedBrainsActive(): boolean {
-    return this.currentPath() === "/shared-brains";
   }
 
   isBrowseItemActive(path: string): boolean {
