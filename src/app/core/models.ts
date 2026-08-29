@@ -818,6 +818,11 @@ export interface ImportScanReport {
    * notes back in as copies of themselves.
    */
   isMurmurVault: boolean;
+  /**
+   * Name of the container an unfiled import lands in, for THIS source ("Imported from Notion",
+   * ...). The picker's default option shows it, so the destination is stated before the run.
+   */
+  defaultDestination: string;
 }
 
 /** Where an import reads from. The value is the wire contract with the Rust side. */
@@ -836,6 +841,12 @@ export interface ImportReport {
   cancelled: boolean;
   /** Vectors were deferred - keyword search works now, semantic search after a Reindex. */
   embeddingDeferred: boolean;
+  /**
+   * The note-folder the notes actually landed in - the per-source container for an unfiled
+   * import, or whatever the user picked. Counters alone never answered "where did my pages go".
+   */
+  destinationId: string;
+  destinationName: string;
 }
 
 /**

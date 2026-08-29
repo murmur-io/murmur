@@ -14,7 +14,18 @@
      `margin-bottom` cancels that padding so the split (and its right pane) reaches the very bottom of
      the window instead of being cut off ~64px short. Total still nets to 100vh (top chrome + this
      host), so the PAGE never scrolls — `.editor-body` still owns the note scroll. */
-  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  /* DOCK TO THE CHROME (2026-08-28, user request "look how much space there is between
+     the tabs and the note — minimize it"): `.app-main` pays a generous `--space-7` (48px)
+     top padding on every route, which is right for a page that starts with content but
+     wrong here — this route's FIRST element is its own sticky header, which brings its own
+     padding and a full-width divider. Measured, the breadcrumb chip sat 67px below the tab
+     strip (48 app-main + 16 head), i.e. twice the height of the 32px chip in dead air.
+     Cancel app-main's top padding and keep a deliberate `--space-2` standoff instead, the
+     same way `margin-bottom` below already cancels its `--space-8` bottom padding. The
+     height gains back exactly what the margin removes, so the bottom edge — and the Ask
+     Brain column reaching it — is unchanged. */
+  margin-top: calc(var(--space-2) - var(--space-7));
+  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-2));
   margin-bottom: calc(-1 * var(--space-8));
   min-height: 0;
 }
@@ -38,7 +49,10 @@
   min-height: 0;
   height: 100%;
   /* Embedded (recording panel): fill the host panel exactly — NO negative bleed (that's a
-     routed-layout affordance for canceling app-main's bottom padding, which doesn't exist here). */
+     routed-layout affordance for canceling app-main's padding, which doesn't exist here).
+     The top margin matters as much as the bottom one: left alone it would drag the panel up
+     into the recording chrome above it. */
+  margin-top: 0;
   margin-bottom: 0;
 }
 .editor.is-embedded {
@@ -90,6 +104,12 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+  /* The 16/12 asymmetry is LOAD-BEARING, not leftover: `.chat-head` (note-chat, `is-bare`)
+     carries the same `var(--space-4) … var(--space-3)` and a `min-height: 66px`, so in the
+     Ask-Brain split view the two header bands end on ONE shared divider line. Evening this
+     out to 12/12 shortens this band by 4px and breaks that alignment — visibly, and against
+     note-chat-drawer.spec.ts's `chatHeadBottom - headBottom <= 3`. Docking the editor to the
+     tab strip is done on :host above; it does not need this padding to change. */
   padding: var(--space-4) var(--space-6) var(--space-3);
   /* A crisp full-width divider (mid-tier `--border`, not the faint `--border-subtle`): this is the
      seam the toolbar sits above — the note body AND the Ask Brain column both dock under it, so it

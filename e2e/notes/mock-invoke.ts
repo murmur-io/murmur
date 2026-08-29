@@ -297,3 +297,25 @@ export async function mockNotes(
     ...extra,
   }, {}, [], delayedEventListeners);
 }
+
+/**
+ * Put the ROUTED editor into Edit mode, and wait until the body textarea exists.
+ *
+ * A note that HAS a body now opens in Preview — the reading default, see
+ * `note-editor.component.ts` `opensInPreview`. `.body-area` only exists in the Edit
+ * branch of the template (`@if (previewActive()) { … } @else { … .body-area }`), so a
+ * spec that drives the textarea has to ask for Edit first, exactly as a user would.
+ * That is the honest encoding of the new default: the old suite silently assumed
+ * "opening a note lands in a textarea", which is no longer what the product does.
+ *
+ * Idempotent, so it is safe to call unconditionally on any routed note with a body:
+ * clicking Edit while Edit is already active hits `setPreview(false)`'s early return.
+ *
+ * Do NOT use it for a LOCKED note (the lock gate replaces the body entirely, so there
+ * is no `.body-area` to wait for) or for the EMBEDDED host (the recording panel's Note
+ * tab force-disables preview via `previewActive`, so it is already in Edit).
+ */
+export async function enterEditMode(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.locator(".body-area").waitFor({ state: "visible" });
+}
