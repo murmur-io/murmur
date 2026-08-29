@@ -569,6 +569,73 @@ export class WorkspaceTreeComponent {
   /** The container whose share sheet is open, if any. */
   protected readonly shareRequest = signal<ContainerShareTarget | null>(null);
 
+  // ── private arrangement of received content ────────────────────────────────
+
+  /**
+   * The received node the user is filing somewhere of their own, if any.
+   *
+   * Reuses the ordinary move sheet, deliberately: to the user this IS a move —
+   * "put that shared Space in my Clients Space". What differs is invisible to
+   * them and load-bearing underneath: nothing is published, the owner sees
+   * nothing, and the content keeps updating from the org feed.
+   */
+  protected readonly placeRequest = signal<SharedContainerNode | null>(null);
+  protected readonly placeBusy = signal(false);
+  protected readonly placeError = signal<string | null>(null);
+
+  /** Every local container this user could file a received node under. */
+  protected placeTargets(): WorkspaceDestination[] {
+    return workspaceDestinations(this.workspace.forest());
+  }
+
+  protected openPlace(node: SharedContainerNode): void {
+    this.placeError.set(null);
+    this.placeRequest.set(node);
+  }
+
+  protected closePlace(): void {
+    this.placeRequest.set(null);
+    this.placeBusy.set(false);
+    this.placeError.set(null);
+  }
+
+  protected async placeInto(destination: WorkspaceDestination): Promise<void> {
+    const node = this.placeRequest();
+    if (!node || !node.containerId) {
+      return;
+    }
+    this.placeBusy.set(true);
+    this.placeError.set(null);
+    try {
+      await this.sharedWorkspace.place(
+        node.orgId,
+        "container",
+        node.containerId,
+        destination.container.id,
+        0,
+      );
+      this.closePlace();
+      this.toast.success(`Filed under ${destination.label}`);
+    } catch (e) {
+      this.placeError.set(this.errorCopy.humanize(e));
+    } finally {
+      this.placeBusy.set(false);
+    }
+  }
+
+  /** Put a received node back wherever its owner filed it. */
+  protected async resetPlacement(node: SharedContainerNode): Promise<void> {
+    if (!node.containerId) {
+      return;
+    }
+    try {
+      await this.sharedWorkspace.unplace(node.orgId, "container", node.containerId);
+      this.toast.success("Moved back to Shared");
+    } catch (e) {
+      this.toast.danger(this.errorCopy.humanize(e));
+    }
+  }
+
   /**
    * A container that is sealed and not unlocked for this session cannot take a new
    * child: there is no key to seal it with, so the backend refuses. Hiding the
