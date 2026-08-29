@@ -528,6 +528,36 @@ pub fn emit_recording_capture_fault(
 /// ids, titles, or content) — it is purely a "something changed, re-fetch" ping.
 pub const EVENT_ORG_FEED_UPDATED: &str = "murmur://org-feed-updated";
 
+/// Progress of one CONTAINER share — a Space or Folder publishing N items. Counts only, NO PII (no
+/// folder name, item id, or title). The sheet renders a determinate bar from it, because a share of
+/// a whole Space is N sequential round-trips and a spinner cannot say how far it got.
+pub const EVENT_CONTAINER_SHARE_PROGRESS: &str = "murmur://container-share-progress";
+
+/// Payload for [`EVENT_CONTAINER_SHARE_PROGRESS`]. Two counts only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerShareProgressPayload {
+    /// Items attempted so far, published or failed.
+    pub done: u32,
+    /// Items the plan will attempt in total.
+    pub total: u32,
+}
+
+/// Emit [`EVENT_CONTAINER_SHARE_PROGRESS`] (best-effort). A failed emit only costs the progress
+/// bar an update; it must never affect the share itself.
+pub fn emit_container_share_progress(app: &AppHandle, done: u32, total: u32) {
+    if let Err(e) = app.emit(
+        EVENT_CONTAINER_SHARE_PROGRESS,
+        ContainerShareProgressPayload { done, total },
+    ) {
+        tracing::warn!(
+            target: "org",
+            error = %e,
+            "failed to emit container-share progress"
+        );
+    }
+}
+
 /// Payload for [`EVENT_ORG_FEED_UPDATED`]. A single count only — NO PII. `orgsChanged` is the number
 /// of joined orgs whose feed produced ≥1 ingest/tombstone this tick (the all-orgs background tick
 /// aggregates across orgs). The FE treats any arrival as "re-fetch the org lists".

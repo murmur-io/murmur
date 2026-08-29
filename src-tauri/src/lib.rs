@@ -320,6 +320,12 @@ pub fn run() {
             commands::org_update_item,
             commands::org_update_own_item,
             commands::org_set_item_access,
+            // Shared containers — publish a whole Folder or Space to an org (2026-08-29).
+            commands::preview_container_share,
+            commands::share_container_to_org,
+            commands::unshare_container,
+            commands::set_container_share_access,
+            commands::list_container_share_status,
             commands::delete_org_item_as_author,
             commands::org_resolve_source,
             commands::list_org_items,
