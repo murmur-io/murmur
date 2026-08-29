@@ -13,11 +13,9 @@
       "Read(~/.gnupg/**)",
       "Read(~/.codex/**)",
       "Read(~/.claude/**)",
-      "Read(~/.config/gh/**)",
       "Read(~/.docker/**)",
       "Read(~/.cargo/credentials*)",
       "Read(~/.npmrc)",
-      "Read(~/Library/Keychains/**)",
       "Read(**/*.pem)",
       "Read(**/*.p12)",
       "Read(**/id_rsa)",
@@ -32,7 +30,10 @@
     "allowUnsandboxedCommands": false,
     "filesystem": {
       "allowWrite": [
-        "../.murmur-agent-tasks"
+        "../.murmur-agent-tasks",
+        "~/.cargo/registry",
+        "~/.cargo/git",
+        "~/Library/Application Support/MeetNotes-dev"
       ],
       "denyWrite": [
         "../meetnotes/.git",
