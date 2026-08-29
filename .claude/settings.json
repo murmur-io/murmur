@@ -33,7 +33,10 @@
     "allowUnsandboxedCommands": false,
     "filesystem": {
       "allowWrite": [
-        "../.murmur-agent-tasks"
+        "../.murmur-agent-tasks",
+        "~/.cargo/registry",
+        "~/.cargo/git",
+        "~/Library/Application Support/MeetNotes-dev"
       ],
       "denyWrite": [
         "../meetnotes/.git",
