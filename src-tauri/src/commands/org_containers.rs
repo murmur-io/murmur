@@ -42,7 +42,7 @@ use crate::share::container_envelope::{ContainerEnvelope, ContainerLevel};
 use crate::share::org_dto::OrgItemAccess;
 use crate::share::org_envelope::{OrgItemKind, OrgSourceKind};
 use crate::state::AppState;
-use crate::storage::models::{ContainerShareRow, ItemKind, ItemRow};
+use crate::storage::models::{ContainerShareRow, ItemKind};
 
 /// The most items one container share may publish in a single action.
 ///
@@ -865,8 +865,543 @@ pub fn list_container_share_status(
         .collect())
 }
 
-/// One item row is unused today but keeps the planner honest about what it consumed.
-#[allow(dead_code)]
-fn _assert_item_row_shape(row: &ItemRow) -> &str {
-    &row.id
+// ── The sweep that keeps a shared container live ──────────────────────────────────────────────
+
+/// Rebuild the manifest envelope a share row LAST published, so a freshly-computed hash can be
+/// compared against the stored one.
+///
+/// Built at the row's OWN rev, never at the next one: `content_sha256` folds `source_rev` into the
+/// canonical bytes, so comparing across revs would report "changed" on every pass and republish
+/// the same container forever.
+fn manifest_content_sha(
+    state: &AppState,
+    planned: &PlannedContainer,
+    rev: u32,
+    scrub: bool,
+) -> Vec<u8> {
+    let name = if scrub {
+        scrub_org_text(&planned.name)
+    } else {
+        planned.name.clone()
+    };
+    let manifest = ContainerEnvelope {
+        v: crate::share::container_envelope::CONTAINER_ENVELOPE_VERSION,
+        container_id: planned.container_id.clone(),
+        level: planned.level,
+        name: name.clone(),
+        emoji: planned.emoji.clone(),
+        tint: planned.tint.clone(),
+        parent_container_id: planned.parent_container_id.clone(),
+        position: planned.position,
+    };
+    crate::share::org_envelope::OrgEnvelope::new(
+        OrgItemKind::Container,
+        name,
+        manifest.to_json(),
+        org_author_hint_for(state),
+        manifest_created_at(&planned.container_id),
+        rev,
+        OrgSourceKind::Container,
+    )
+    .content_sha256()
+}
+
+/// Bring every shared container back in line with the local tree.
+///
+/// Returns the number of MUTATIONS performed, which is what makes the sweep testable: a settled
+/// container must report zero, or the sweep is republishing on every tick.
+///
+/// The diff, in order:
+///
+/// | local change | action |
+/// |---|---|
+/// | root folder deleted or sealed | stop the share entirely |
+/// | folder renamed / re-tinted / re-ordered | republish that manifest only |
+/// | sub-folder added | publish a new manifest |
+/// | sub-folder deleted or sealed | withdraw its manifest and its documents |
+/// | note added to a shared folder | publish it, `explicit = 0` |
+/// | note moved out, or deleted | withdraw it when `explicit = 0`; unfile it when `explicit = 1` |
+pub(crate) async fn reconcile_container_shares(
+    state: &AppState,
+    app: Option<&AppHandle>,
+) -> Result<u32> {
+    let mut mutations = 0u32;
+    // A local folder can be deleted while a placement still points at it. Left alone, the merge
+    // would find no host for the received content and it would silently disappear from the sidebar.
+    mutations += state.db.prune_orphan_local_placements()?;
+
+    for root in state.db.list_container_share_roots()? {
+        mutations += reconcile_one_container_root(state, &root, app).await?;
+    }
+    Ok(mutations)
+}
+
+async fn reconcile_one_container_root(
+    state: &AppState,
+    root: &ContainerShareRow,
+    app: Option<&AppHandle>,
+) -> Result<u32> {
+    let containers = state.db.list_containers()?;
+    let local = containers.iter().find(|c| c.id == root.folder_id);
+
+    // Gone or sealed → stop sharing. Publishing what the user just sealed is not a coherent state,
+    // and there is nothing left to read from a folder that no longer exists.
+    let Some(local) = local else {
+        unshare_container_inner(state, &root.org_id, &root.folder_id, app).await?;
+        return Ok(1);
+    };
+    if local.locked {
+        unshare_container_inner(state, &root.org_id, &root.folder_id, app).await?;
+        return Ok(1);
+    }
+
+    let plan = plan_container_share(state, &root.org_id, &root.folder_id)?;
+    let mut mutations = 0u32;
+
+    // ── containers ────────────────────────────────────────────────────────────────────────────
+    let planned_folders: HashSet<String> =
+        plan.containers.iter().map(|c| c.folder_id.clone()).collect();
+
+    for planned in &plan.containers {
+        let existing = state.db.get_container_share(&root.org_id, &planned.folder_id)?;
+        let needs_publish = match existing.as_ref() {
+            None => true,
+            Some(row) if row.state != "published" => true,
+            Some(row) => {
+                row.content_sha256.as_deref()
+                    != Some(manifest_content_sha(state, planned, row.rev, row.scrub).as_slice())
+            }
+        };
+        if needs_publish {
+            let access = OrgItemAccess::parse(&root.access).unwrap_or(OrgItemAccess::View);
+            publish_container_manifest(state, &root.org_id, planned, access, root.scrub).await?;
+            mutations += 1;
+        }
+    }
+
+    // A folder that left the plan (deleted, moved out, or newly sealed) takes its subtree with it.
+    for share in descendant_container_shares(state, &root.org_id, root)? {
+        if share.is_root || planned_folders.contains(&share.folder_id) {
+            continue;
+        }
+        withdraw_container_documents(state, &root.org_id, &share.container_id, app).await?;
+        withdraw_container_manifest(state, &share.id).await?;
+        mutations += 1;
+    }
+
+    // ── documents ─────────────────────────────────────────────────────────────────────────────
+    let access = OrgItemAccess::parse(&root.access).unwrap_or(OrgItemAccess::View);
+    let live_containers: HashSet<String> = plan
+        .containers
+        .iter()
+        .map(|c| c.container_id.clone())
+        .collect();
+
+    let mut wanted: HashMap<(String, Option<String>, Option<String>), i64> = HashMap::new();
+    for document in &plan.documents {
+        wanted.insert(
+            (
+                document.parent_container_id.clone(),
+                document.meeting_id.clone(),
+                document.document_id.clone(),
+            ),
+            document.position,
+        );
+    }
+
+    // What is currently filed under this root's containers.
+    let mut filed: HashSet<(String, Option<String>, Option<String>)> = HashSet::new();
+    for container_id in &live_containers {
+        for row in state.db.org_shares_in_container(&root.org_id, container_id)? {
+            let key = (
+                container_id.clone(),
+                row.meeting_id.clone(),
+                row.document_id.clone(),
+            );
+            if wanted.contains_key(&key) {
+                filed.insert(key);
+                continue;
+            }
+            // Filed here but no longer in the plan: the note was deleted, moved out, or sealed.
+            unfile_or_withdraw(state, &row, app).await?;
+            mutations += 1;
+        }
+    }
+
+    for (key, position) in &wanted {
+        if filed.contains(key) {
+            continue;
+        }
+        let (parent_container_id, meeting_id, document_id) = key;
+        let placement = ContainerPlacement {
+            parent_container_id: parent_container_id.clone(),
+            position: *position,
+            explicit: false,
+        };
+        match share_to_org_placed_notifying(
+            state,
+            &root.org_id,
+            meeting_id.clone(),
+            document_id.clone(),
+            root.scrub,
+            access,
+            Some(placement),
+            app,
+        )
+        .await
+        {
+            Ok(_) => mutations += 1,
+            Err(AppError::Locked(_)) => {
+                // A sealed item is skipped, never read. It is not a sweep failure.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(mutations)
+}
+
+/// Withdraw every document filed under one container, honouring `explicit`.
+async fn withdraw_container_documents(
+    state: &AppState,
+    org_id: &str,
+    container_id: &str,
+    app: Option<&AppHandle>,
+) -> Result<()> {
+    for row in state.db.org_shares_in_container(org_id, container_id)? {
+        unfile_or_withdraw(state, &row, app).await?;
+    }
+    Ok(())
+}
+
+/// A document leaving a shared container: withdrawn when the container published it, merely
+/// unfiled when the user shared it themselves.
+async fn unfile_or_withdraw(
+    state: &AppState,
+    row: &crate::storage::OrgShareRow,
+    app: Option<&AppHandle>,
+) -> Result<()> {
+    if row.explicit {
+        state.db.set_org_share_placement(&row.id, None, 0, true)?;
+        return Ok(());
+    }
+    match row.item_id.clone() {
+        Some(item_id) => {
+            let _ = revoke_org_share_inner_with_policy(
+                state,
+                item_id,
+                OrgWorkPolicy::manual(),
+                app,
+            )
+            .await;
+        }
+        None => {
+            state
+                .db
+                .set_org_share_state(&row.id, "revoked", &chrono::Utc::now().to_rfc3339())?;
+        }
+    }
+    Ok(())
+}
+
+/// `reconcile_container_shares` as a command, for the FE's explicit "sync now".
+#[tauri::command]
+pub async fn sync_container_shares(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<u32> {
+    let changed = reconcile_container_shares(state.inner(), Some(&app)).await?;
+    if changed > 0 {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
+    Ok(changed)
+}
+
+// ── The shared-workspace read model ───────────────────────────────────────────────────────────
+//
+// This reads `org_*` tables ONLY. `workspace_store` and `visibility_clause` are untouched: merging
+// org content into `list_workspace_tree` would return content the folder gate does not govern from
+// the function every reviewer reads as governed. The frontend interleaves the two forests instead.
+//
+// Nothing here returns an on-disk path. `get_meeting_detail` nulls `audio_path` for a locked
+// meeting precisely because the frontend feeds any path it receives into `convertFileSrc`, the one
+// audio read that bypasses the gate. A shared row must never reopen that.
+
+/// One received document, as a sidebar row.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedItemRow {
+    pub item_id: String,
+    pub doc_id: Option<String>,
+    pub title: String,
+    /// `"document"` | `"meeting"`, or absent when the sender's client predates the source-kind wire
+    /// field. Absent means UNCLASSIFIED — never assume a bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub author_hint: String,
+    pub created_at: String,
+    pub org_id: String,
+    pub org_name: String,
+    /// `"view"` or `"edit"`.
+    pub access: String,
+    pub position: i64,
+}
+
+/// One node of the received forest: a shared Space, a shared Folder, or the synthetic Shared
+/// Brains root.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedContainerNode {
+    /// `None` only for the synthetic Shared Brains root, which no one published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    pub org_id: String,
+    pub org_name: String,
+    pub name: String,
+    /// `"space"` | `"folder"` | `"virtual"`.
+    pub level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tint: Option<String>,
+    pub access: String,
+    pub author_hint: String,
+    pub folders: Vec<SharedContainerNode>,
+    pub items: Vec<SharedItemRow>,
+    /// This device's PRIVATE placement: the local `folders.id` the user filed this under, or absent
+    /// for "wherever its owner put it". Never published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_parent_id: Option<String>,
+    pub position: i64,
+}
+
+/// Everything shared WITH this user, arranged for the sidebar.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedWorkspace {
+    /// Received SPACES — each becomes its own top-level sidebar row.
+    pub spaces: Vec<SharedContainerNode>,
+    /// Received FOLDERS with no shared-Space parent, plus every received item with no container at
+    /// all. One virtual Space, so loose shared content has a home instead of a separate tab.
+    pub shared_brains: SharedContainerNode,
+}
+
+#[tauri::command]
+pub fn list_shared_workspace(state: State<'_, AppState>) -> Result<SharedWorkspace> {
+    build_shared_workspace(state.inner())
+}
+
+pub(crate) fn build_shared_workspace(state: &AppState) -> Result<SharedWorkspace> {
+    let placements: HashMap<(String, String, String), (Option<String>, i64)> = state
+        .db
+        .list_local_placements()?
+        .into_iter()
+        .map(|row| {
+            (
+                (row.org_id, row.target_kind, row.target_id),
+                (row.local_parent_id, row.position),
+            )
+        })
+        .collect();
+
+    let mut spaces: Vec<SharedContainerNode> = Vec::new();
+    let mut loose_folders: Vec<SharedContainerNode> = Vec::new();
+    let mut loose_items: Vec<SharedItemRow> = Vec::new();
+
+    for org in state.db.list_org_states()? {
+        if !org.context_enabled {
+            continue;
+        }
+        let containers = state.db.list_org_containers(&org.org_id)?;
+        let known: HashSet<String> = containers
+            .iter()
+            .map(|c| c.container_id.clone())
+            .collect();
+
+        // Items grouped by the container their sender filed them under. An item whose parent has
+        // not arrived yet (or was withdrawn) is deliberately treated as LOOSE rather than dropped:
+        // it must stay reachable in Shared Brains, not vanish because a manifest is missing.
+        let mut items_by_container: HashMap<String, Vec<SharedItemRow>> = HashMap::new();
+        for header in state.db.list_org_items(&org.org_id)? {
+            let (parent, position) = state
+                .db
+                .org_item_container_placement(&header.item_id)?
+                .unwrap_or((None, 0));
+            let row = SharedItemRow {
+                item_id: header.item_id,
+                doc_id: header.doc_id,
+                title: header.title,
+                kind: header.kind,
+                author_hint: header.author_hint,
+                created_at: header.created_at,
+                org_id: org.org_id.clone(),
+                org_name: org.name.clone(),
+                access: "view".into(),
+                position,
+            };
+            match parent.filter(|id| known.contains(id)) {
+                Some(container_id) => items_by_container
+                    .entry(container_id)
+                    .or_default()
+                    .push(row),
+                None => loose_items.push(row),
+            }
+        }
+
+        let by_parent: HashMap<Option<String>, Vec<&crate::storage::models::OrgContainerRow>> =
+            containers.iter().fold(HashMap::new(), |mut acc, c| {
+                acc.entry(c.parent_container_id.clone()).or_default().push(c);
+                acc
+            });
+
+        for container in &containers {
+            // A ROOT is a container whose parent is not in this replica: either it genuinely has
+            // none, or its parent was never shared with this member.
+            let is_root = container
+                .parent_container_id
+                .as_ref()
+                .is_none_or(|parent| !known.contains(parent));
+            if !is_root {
+                continue;
+            }
+            let mut visited = HashSet::new();
+            let Some(node) = build_shared_node(
+                container,
+                &by_parent,
+                &items_by_container,
+                &placements,
+                &org,
+                &mut visited,
+            ) else {
+                // Only a cycle reaches this arm, and a cycle contributes no root rather than
+                // hanging the reader.
+                continue;
+            };
+            if container.level == "space" {
+                spaces.push(node);
+            } else {
+                loose_folders.push(node);
+            }
+        }
+    }
+
+    spaces.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+    loose_folders.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+    loose_items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(SharedWorkspace {
+        spaces,
+        shared_brains: SharedContainerNode {
+            container_id: None,
+            org_id: String::new(),
+            org_name: String::new(),
+            name: "Shared Brains".into(),
+            level: "virtual".into(),
+            emoji: None,
+            tint: None,
+            access: "view".into(),
+            author_hint: String::new(),
+            folders: loose_folders,
+            items: loose_items,
+            local_parent_id: None,
+            position: 0,
+        },
+    })
+}
+
+/// Depth-first assembly with an explicit visited set.
+///
+/// The replica is written from data another device sent. A parent chain that loops — through a bug
+/// or a hostile peer — must terminate here, not spin the sidebar.
+fn build_shared_node(
+    container: &crate::storage::models::OrgContainerRow,
+    by_parent: &HashMap<Option<String>, Vec<&crate::storage::models::OrgContainerRow>>,
+    items_by_container: &HashMap<String, Vec<SharedItemRow>>,
+    placements: &HashMap<(String, String, String), (Option<String>, i64)>,
+    org: &crate::storage::OrgState,
+    visited: &mut HashSet<String>,
+) -> Option<SharedContainerNode> {
+    if !visited.insert(container.container_id.clone()) {
+        return None;
+    }
+    let placement = placements.get(&(
+        org.org_id.clone(),
+        "container".to_string(),
+        container.container_id.clone(),
+    ));
+    let mut folders: Vec<SharedContainerNode> = by_parent
+        .get(&Some(container.container_id.clone()))
+        .map(|children| {
+            children
+                .iter()
+                .filter_map(|child| {
+                    build_shared_node(child, by_parent, items_by_container, placements, org, visited)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    folders.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+    let mut items = items_by_container
+        .get(&container.container_id)
+        .cloned()
+        .unwrap_or_default();
+    items.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.title.cmp(&b.title)));
+    let items = items
+        .into_iter()
+        .map(|mut row| {
+            row.access = container.access.clone();
+            row
+        })
+        .collect();
+
+    Some(SharedContainerNode {
+        container_id: Some(container.container_id.clone()),
+        org_id: org.org_id.clone(),
+        org_name: org.name.clone(),
+        name: container.name.clone(),
+        level: container.level.clone(),
+        emoji: container.emoji.clone(),
+        tint: container.tint.clone(),
+        access: container.access.clone(),
+        author_hint: container.author_hint.clone(),
+        folders,
+        items,
+        local_parent_id: placement.and_then(|(parent, _)| parent.clone()),
+        position: placement.map(|(_, position)| *position).unwrap_or(container.position),
+    })
+}
+
+/// File a received container or document somewhere in this user's own tree. Device-local; nothing
+/// is published and no one else sees it.
+#[tauri::command]
+pub fn set_shared_placement(
+    state: State<'_, AppState>,
+    org_id: String,
+    target_kind: String,
+    target_id: String,
+    local_parent_id: Option<String>,
+    position: i64,
+) -> Result<()> {
+    state.inner().db.set_local_placement(
+        &org_id,
+        &target_kind,
+        &target_id,
+        local_parent_id.as_deref(),
+        position,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+}
+
+/// Return a received object to wherever its owner filed it.
+#[tauri::command]
+pub fn clear_shared_placement(
+    state: State<'_, AppState>,
+    org_id: String,
+    target_kind: String,
+    target_id: String,
+) -> Result<()> {
+    state
+        .inner()
+        .db
+        .clear_local_placement(&org_id, &target_kind, &target_id)
 }

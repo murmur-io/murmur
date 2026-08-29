@@ -231,7 +231,7 @@ pub use org_commands::*;
 // it cannot ride the `org_shares` logical key every helper in that file is built around, and
 // `org.rs` is already a 12k-line god-file. The gate ORDER is identical (sealed refusal → consent →
 // scrub → journal-before-socket → seal + local open-verify → size cap → content-free ledger).
-mod org_containers;
+pub(crate) mod org_containers;
 pub use org_containers::*;
 
 // DOCUMENT-INGEST command surface (upload/import/list/read/delete of brain `documents` — a GATED
@@ -14247,6 +14247,11 @@ mod lock_read_gate_tests;
 #[cfg(test)]
 #[path = "tests/workspace_tree_tests.rs"]
 mod workspace_tree_tests;
+
+// ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
+#[cfg(test)]
+#[path = "tests/container_share_tests.rs"]
+mod container_share_tests;
 
 // ── BLK-1 lifecycle-race + BLK-2 move-into-locked + BLK-3/BLK-4 config tests ──────────────────────
 #[cfg(test)]

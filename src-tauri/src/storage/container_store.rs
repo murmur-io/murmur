@@ -453,6 +453,22 @@ impl Db {
         Ok(rows)
     }
 
+    /// One received item's raw placement pair, for the shared-workspace reader. Returns `None`
+    /// only when the item is unknown; a known item with no container returns `Some((None, 0))`.
+    pub fn org_item_container_placement(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(Option<String>, i64)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT parent_container_id, position FROM org_items WHERE item_id = ?1",
+            rusqlite::params![item_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     /// Record a received item's placement, taken straight off its v4 envelope.
     pub fn set_org_item_placement(
         &self,
