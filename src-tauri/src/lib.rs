@@ -329,6 +329,7 @@ pub fn run() {
             commands::list_container_share_status,
             commands::sync_container_shares,
             commands::list_shared_workspace,
+            commands::list_org_share_targets,
             commands::set_shared_placement,
             commands::clear_shared_placement,
             commands::delete_org_item_as_author,

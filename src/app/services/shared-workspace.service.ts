@@ -11,6 +11,7 @@ import { IpcService } from "../core/ipc.service";
 import type {
   ContainerShareStatus,
   OrgAccess,
+  OrgShareTargetRow,
   SharedContainerNode,
   SharedPlacementTarget,
   SharedWorkspace,
@@ -39,6 +40,7 @@ export class SharedWorkspaceService {
   private readonly _spaces = signal<SharedContainerNode[]>([]);
   private readonly _sharedBrains = signal<SharedContainerNode | null>(null);
   private readonly _containerShares = signal<ContainerShareStatus[]>([]);
+  private readonly _shareTargets = signal<OrgShareTargetRow[]>([]);
   private readonly _loading = signal(false);
 
   /** Received SPACES — each renders as its own top-level sidebar row. */
@@ -51,6 +53,8 @@ export class SharedWorkspaceService {
   readonly sharedBrains = this._sharedBrains.asReadonly();
   /** Containers THIS device publishes — drives the sidebar's shared marker. */
   readonly containerShares = this._containerShares.asReadonly();
+  /** Items published on their own, keyed for the row marker. */
+  readonly shareTargets = this._shareTargets.asReadonly();
   /** True while a (re)load is in flight. A hint, never a render gate. */
   readonly loading = this._loading.asReadonly();
 
@@ -62,6 +66,15 @@ export class SharedWorkspaceService {
       (brains === null ||
         (brains.folders.length === 0 && brains.items.length === 0))
     );
+  });
+
+  /** The org an item was published to on its own, keyed `<kind>:<id>`. */
+  readonly shareByItem = computed(() => {
+    const map = new Map<string, OrgShareTargetRow>();
+    for (const target of this._shareTargets()) {
+      map.set(`${target.kind}:${target.id}`, target);
+    }
+    return map;
   });
 
   /** The container share for one local folder, if this device publishes it. */
@@ -117,9 +130,10 @@ export class SharedWorkspaceService {
     const seq = ++this.loadSeq;
     this._loading.set(true);
     try {
-      const [workspace, shares] = await Promise.all([
+      const [workspace, shares, targets] = await Promise.all([
         this.ipc.listSharedWorkspace().catch(() => null),
         this.ipc.listContainerShareStatus().catch(() => [] as ContainerShareStatus[]),
+        this.ipc.listOrgShareTargets().catch(() => [] as OrgShareTargetRow[]),
       ]);
       if (seq !== this.loadSeq) {
         return;
@@ -128,6 +142,7 @@ export class SharedWorkspaceService {
         this.applyWorkspace(workspace);
       }
       this._containerShares.set(shares);
+      this._shareTargets.set(targets);
     } finally {
       if (seq === this.loadSeq) {
         this._loading.set(false);
