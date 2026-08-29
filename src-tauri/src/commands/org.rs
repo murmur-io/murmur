@@ -9232,6 +9232,17 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
     if !policy.is_current() {
         return false;
     }
+    // Keep every shared container in step with the local tree. Best-effort for the same reason the
+    // outbound sweep is: a container that cannot reconcile right now is retried next tick, and must
+    // never stop the feed pull that follows.
+    if let Err(e) =
+        crate::commands::org_containers::reconcile_container_shares(state, app.as_ref()).await
+    {
+        tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile tick failed");
+    }
+    if !policy.is_current() {
+        return false;
+    }
     let report = match org_sync_now_inner_with_policy(state, policy, app.clone()).await {
         Ok(r) => r,
         Err(e) => {
@@ -9865,6 +9876,14 @@ pub async fn org_sync_now(
             .await
         }
     }?;
+    // A manual "Sync now" should converge the containers too, not just the item feed — otherwise a
+    // user who just renamed a shared folder presses Sync and nothing happens. Best-effort: a
+    // container failure never turns a successful feed sync into an error.
+    if let Err(e) =
+        crate::commands::org_containers::reconcile_container_shares(state.inner(), Some(&app)).await
+    {
+        tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile after manual sync failed");
+    }
     Ok(report)
 }
 
@@ -10714,6 +10733,23 @@ async fn org_reconcile_one(
         },
         /// The feed says this item is withdrawn → evict the local replica.
         Evict { item_id: String, seq: u64 },
+        /// A CONTAINER manifest → write it into `org_containers`, not `org_items`.
+        ///
+        /// Kept a distinct action rather than a flag on `Ingest` so the apply arm cannot
+        /// accidentally run the note path's embed + chunk pipeline over a JSON manifest, which
+        /// would put container names into the retrieval index as if they were note text.
+        IngestContainer {
+            item_id: String,
+            seq: u64,
+            rev: u32,
+            generation: u32,
+            manifest: Box<crate::share::container_envelope::ContainerEnvelope>,
+            author_hint: String,
+            author_user_id: String,
+            access: crate::share::org_dto::OrgItemAccess,
+            document_owner_user_id: Option<String>,
+            created_at: String,
+        },
         /// Divergent live record → (re)write the opened envelope into the replica.
         Ingest {
             item_id: String,
@@ -10860,6 +10896,28 @@ async fn org_reconcile_one(
             actions.push(ReconcileAction::Skip { seq: item.seq });
             continue;
         }
+        if env.kind == crate::share::org_envelope::OrgItemKind::Container {
+            // A manifest is structure, not prose: it skips the attachment bundle, the chunker and
+            // the embedder entirely. A payload this device cannot parse is SKIPPED whole — never
+            // half-written — so a malformed or hostile manifest cannot leave a container row with
+            // no name behind.
+            match crate::share::container_envelope::ContainerEnvelope::from_json(&env.markdown) {
+                Ok(manifest) => actions.push(ReconcileAction::IngestContainer {
+                    item_id: item.item_id.clone(),
+                    seq: item.seq,
+                    rev: item.rev,
+                    generation: item.generation,
+                    manifest: Box::new(manifest),
+                    author_hint: env.author_hint.clone(),
+                    author_user_id: item.author_user_id.clone(),
+                    access: item.access,
+                    document_owner_user_id: item.document_owner_user_id.clone(),
+                    created_at: item.created_at.clone(),
+                }),
+                Err(_) => actions.push(ReconcileAction::Skip { seq: item.seq }),
+            }
+            continue;
+        }
         let (local_markdown, incoming_attachments) =
             match prepare_incoming_attachment_bundle(&env.markdown, &env.attachments) {
                 Ok(bundle) => bundle,
@@ -10965,9 +11023,52 @@ async fn org_reconcile_one(
                         else {
                             break;
                         };
-                        if evicted {
+                        // The same feed entry withdraws a CONTAINER, and only this device knows
+                        // which item ids were containers — the relay sees opaque documents.
+                        let container_evicted = policy
+                            .commit(|| db.tombstone_org_container_by_item(&item_id))?
+                            .unwrap_or(false);
+                        if evicted || container_evicted {
                             changed += 1;
                         }
+                        progress = seq;
+                    }
+                    ReconcileAction::IngestContainer {
+                        item_id,
+                        seq,
+                        rev,
+                        generation,
+                        manifest,
+                        author_hint,
+                        author_user_id,
+                        access,
+                        document_owner_user_id,
+                        created_at,
+                    } => {
+                        let manifest = *manifest;
+                        let row = crate::storage::models::OrgContainerRow {
+                            org_id: org_id.clone(),
+                            container_id: manifest.container_id.clone(),
+                            item_id: item_id.clone(),
+                            level: manifest.level.as_str().to_string(),
+                            name: manifest.name.clone(),
+                            emoji: manifest.emoji.clone(),
+                            tint: manifest.tint.clone(),
+                            parent_container_id: manifest.parent_container_id.clone(),
+                            position: manifest.position,
+                            access: access.as_str().to_string(),
+                            author_hint,
+                            author_user_id: (!author_user_id.is_empty()).then_some(author_user_id),
+                            document_owner_user_id,
+                            seq,
+                            rev,
+                            generation,
+                            created_at,
+                        };
+                        let Some(()) = policy.commit(|| db.upsert_org_container(&row))? else {
+                            break;
+                        };
+                        changed += 1;
                         progress = seq;
                     }
                     ReconcileAction::Ingest {
@@ -11055,6 +11156,15 @@ async fn org_reconcile_one(
                         if applied {
                             changed += 1;
                         }
+                        // Record WHERE the sender filed this document. Written after the item row
+                        // exists, and unconditionally: a document that LEAVES a shared folder
+                        // arrives with no placement, and clearing it is what makes it move.
+                        let placement = env.placement.as_ref();
+                        let _ = db.set_org_item_placement(
+                            &item_id,
+                            placement.map(|p| p.parent_container_id.as_str()),
+                            placement.map(|p| p.position).unwrap_or(0),
+                        );
                         progress = seq;
                     }
                 }
