@@ -883,6 +883,92 @@ scope to the GA-critical path only.
     CN("f-personal", "Personal", "project", { locked: true, groups: [] }),
   ];
 
+  // The RECEIVED forest — containers and items other members shared with this
+  // user. Shapes come from the Rust DTOs (`SharedWorkspace` / `SharedContainerNode`
+  // / `SharedItemRow` in commands/org_containers.rs), not from the frontend's own
+  // interface: a hand-written mock DEFINES a contract rather than verifying one,
+  // and the camelCase wire assertion lives on the producing side in
+  // `commands/tests/container_share_tests.rs`.
+  const SHARED_ITEM = (itemId, title, kind, extra = {}) => ({
+    itemId,
+    docId: `doc-${itemId}`,
+    title,
+    kind,
+    authorHint: "kgm004a",
+    createdAt: "2026-08-20T09:00:00Z",
+    orgId: "org-siema",
+    orgName: "Siema",
+    access: "view",
+    position: 0,
+    ...extra,
+  });
+
+  const SHARED_NODE = (containerId, name, level, extra = {}) => ({
+    containerId,
+    orgId: "org-siema",
+    orgName: "Siema",
+    name,
+    level,
+    emoji: null,
+    tint: null,
+    access: "view",
+    authorHint: "kgm004a",
+    folders: [],
+    items: [],
+    localParentId: null,
+    position: 0,
+    ...extra,
+  });
+
+  const SHARED_WORKSPACE = {
+    spaces: [
+      SHARED_NODE("c-partners", "Partners", "space", {
+        folders: [
+          SHARED_NODE("c-contracts", "Contracts", "folder", {
+            items: [SHARED_ITEM("si-contract", "Reseller agreement", "document")],
+          }),
+        ],
+        items: [SHARED_ITEM("si-kickoff", "Partner kickoff", "meeting")],
+      }),
+    ],
+    sharedBrains: {
+      ...SHARED_NODE(null, "Shared Brains", "virtual", {
+        folders: [
+          SHARED_NODE("c-loose", "Research", "folder", {
+            items: [SHARED_ITEM("si-research", "Market scan", "document")],
+          }),
+        ],
+        items: [SHARED_ITEM("si-loose", "Pricing thoughts", "document")],
+      }),
+      orgId: "",
+      orgName: "",
+      authorHint: "",
+    },
+  };
+
+  const EMPTY_SHARED_WORKSPACE = {
+    spaces: [],
+    sharedBrains: {
+      ...SHARED_NODE(null, "Shared Brains", "virtual"),
+      orgId: "",
+      orgName: "",
+      authorHint: "",
+    },
+  };
+
+  /** Containers THIS user publishes — drives the owner-side shared marker. */
+  const CONTAINER_SHARES = [
+    {
+      orgId: "org-siema",
+      orgName: "Siema",
+      folderId: "f-clients",
+      containerId: "c-clients",
+      access: "view",
+      isRoot: true,
+      state: "published",
+    },
+  ];
+
   /** Flat index so `get_container` and the item pager can answer by id. */
   const CONTAINERS_BY_ID = new Map();
   (function indexContainers(nodes, parent) {
@@ -1729,6 +1815,31 @@ scope to the GA-critical path only.
       case "org_refresh": return null;
       case "org_list_statuses": return ORGS;
       case "org_list_cached_statuses": return ORGS;
+      // Shared containers. Gated on RICH() for the same reason every other
+      // aggregate 2.0 list is: this file is the base fixture ~460 specs boot
+      // into, and new rows appearing unconditionally would move what "the first
+      // row" means for specs that never asked for them.
+      case "list_shared_workspace":
+        return RICH() ? SHARED_WORKSPACE : EMPTY_SHARED_WORKSPACE;
+      case "list_container_share_status": return RICH() ? CONTAINER_SHARES : [];
+      case "preview_container_share": return {
+        folderId: args?.folderId ?? "f-clients",
+        name: "Clients",
+        level: "space",
+        noteCount: 3,
+        meetingCount: 2,
+        folderCount: 1,
+        skippedSealed: 1,
+        skippedDashboards: 1,
+        totalItems: 6,
+      };
+      case "share_container_to_org":
+        return { containerId: "c-new", published: 6, failed: 0 };
+      case "unshare_container": return null;
+      case "set_container_share_access": return null;
+      case "sync_container_shares": return 0;
+      case "set_shared_placement": return null;
+      case "clear_shared_placement": return null;
       case "list_org_items": return ORG_ITEMS_BY_ORG[args.orgId] || [];
       case "org_resolve_source": return null;
       // Per-meeting (Detail header pill) / bulk (Library row badge) share

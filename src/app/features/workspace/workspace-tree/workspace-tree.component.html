@@ -173,6 +173,34 @@
           (toggleExpand)="toggleShared(shared)"
           (activate)="openShared(shared)"
         >
+          @if (shared.containerId) {
+            <!-- The user's OWN arrangement of received content. Nothing here
+                 publishes: the owner and every other member see none of it. -->
+            <mur-row-menu [label]="'Actions for shared ' + shared.name">
+              <span class="menu-group-label">Your arrangement</span>
+              <button
+                type="button"
+                class="menu-item"
+                role="menuitem"
+                (click)="openPlace(shared)"
+                data-testid="place-shared"
+              >
+                <mur-icon icon="move" />
+                Keep in my Space…
+              </button>
+              @if (shared.localParentId) {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="resetPlacement(shared)"
+                >
+                  <mur-icon icon="rename" />
+                  Move back to Shared
+                </button>
+              }
+            </mur-row-menu>
+          }
           @if (sharedMark(line); as mark) {
             <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
               <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
@@ -267,15 +295,7 @@
                   {{ lockLabel(container) }}
                 </button>
               }
-              @if (sharedMark(line); as mark) {
-            <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
-              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-                <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
-                <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-              </svg>
-            </span>
-          }
-          @if (container.locked && container.unlocked) {
+              @if (container.locked && container.unlocked) {
                 <button
                   type="button"
                   class="menu-item"
@@ -337,6 +357,17 @@
               }
             }
           </mur-row-menu>
+          @if (sharedMark(line); as mark) {
+            <!-- Same discipline as the unlocked mark below, for the same reason:
+                 one dim glyph, the sentence on hover and for a screen reader. A
+                 pill would take the row's spare width and truncate the name. -->
+            <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+                <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+                <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              </svg>
+            </span>
+          }
           @if (container.locked && container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's
                  spare width and truncated "Prywatne" to "P…". The state still
@@ -389,6 +420,23 @@
       [error]="moveError()"
       (move)="moveItemTo($event)"
       (cancelled)="closeMove()"
+    />
+  </div>
+}
+
+@if (placeRequest(); as request) {
+  <!-- Reuses the ordinary move sheet on purpose: to the user this IS a move.
+       What differs is invisible to them and load-bearing underneath — nothing
+       is published, and the content keeps updating from the org feed. -->
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-workspace-move-sheet
+      [item]="{ kind: 'note', title: request.name }"
+      [fromLabel]="'Shared by ' + request.authorHint"
+      [targets]="placeTargets()"
+      [busy]="placeBusy()"
+      [error]="placeError()"
+      (move)="placeInto($event)"
+      (cancelled)="closePlace()"
     />
   </div>
 }

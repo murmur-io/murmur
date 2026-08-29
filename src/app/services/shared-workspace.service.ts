@@ -1,4 +1,11 @@
-import { DestroyRef, Injectable, computed, inject, signal } from "@angular/core";
+import {
+  DestroyRef,
+  Injectable,
+  computed,
+  effect,
+  inject,
+  signal,
+} from "@angular/core";
 
 import { IpcService } from "../core/ipc.service";
 import type {
@@ -72,6 +79,16 @@ export class SharedWorkspaceService {
   private feedDestroyed = false;
 
   constructor() {
+    // A workspace mutation can change what a shared container HOLDS — a note
+    // created in it, moved out of it, or deleted. Reconcile straight away so
+    // "the folder is live" is true in seconds rather than at the next
+    // background tick. The backend runs the same sweep on that tick, so a
+    // missed bump costs latency, never correctness.
+    effect(() => {
+      if (this.ipc.workspaceMutationRevision() > 0) {
+        void this.syncAfterWorkspaceMutation();
+      }
+    });
     this.destroyRef.onDestroy(() => {
       // A root service is never actually destroyed in practice; honor the
       // contract in case a test harness tears it down.
