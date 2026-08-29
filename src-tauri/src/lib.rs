@@ -246,6 +246,7 @@ pub fn run() {
             commands::explain_audit_finding,
             commands::get_config,
             commands::get_mcp_config,
+            commands::get_mcp_status,
             commands::save_config,
             commands::get_storage_report,
             commands::free_up_space,
@@ -569,6 +570,9 @@ pub fn run() {
             // transport and every relock entrypoint. It contains socket clones and content-free
             // lease ids only; no meeting data or authentication material.
             app.manage(std::sync::Arc::new(crate::mcp::McpResponseGate::new()));
+            // Managed BEFORE `mcp::spawn` so the listener's first status write lands on a
+            // handle the `get_mcp_status` command can already read.
+            app.manage(std::sync::Arc::new(crate::mcp::McpListenerStatus::default()));
 
             // PRE-WINDOW legacy-recovery guard. Historical paired crash artifacts are plaintext and
             // cannot be honestly presented as protected by an already-locked folder. Publish their
