@@ -267,13 +267,13 @@ impl OrgEnvelopeReader {
 /// epoch from the beginning of its tick. Every background DB commit revalidates that epoch through
 /// the coordinator, while network/model work happens outside the short commit lease.
 #[derive(Clone, Copy)]
-struct OrgWorkPolicy {
+pub(crate) struct OrgWorkPolicy {
     background_epoch: Option<u64>,
     reader: OrgEnvelopeReader,
 }
 
 impl OrgWorkPolicy {
-    const fn manual() -> Self {
+    pub(crate) const fn manual() -> Self {
         Self {
             background_epoch: None,
             reader: OrgEnvelopeReader::Current,
@@ -2514,7 +2514,7 @@ pub(crate) fn org_item_nonce(content_sha256: &[u8]) -> String {
 }
 
 /// A display label for `author_hint` in the OrgEnvelope — the email local-part, NEVER note content.
-fn org_author_hint(email: &str) -> String {
+pub(crate) fn org_author_hint(email: &str) -> String {
     let e = email.trim();
     match e.split_once('@') {
         Some((local, _)) if !local.is_empty() => local.to_string(),
@@ -2526,6 +2526,14 @@ fn org_author_hint(email: &str) -> String {
 /// redaction policy). Returns `(scrubbed_markdown, counts)`. Reuses the SAME regex firewall
 /// primitive as the cloud path (`summarize::redact::redact`) so an org share is masked exactly like a
 /// cloud-bound prompt — minus the name layer (org peers keep names on purpose). Pure, no egress.
+/// Redact a short, non-markdown string — a container name — with the SAME redactor the note body
+/// passes through. A folder can be called "invoices for jan@acme.com", and a name that crosses to
+/// another member's device is egress like any other.
+pub(crate) fn scrub_org_text(text: &str) -> String {
+    let (scrubbed, _map) = crate::summarize::redact::redact(text);
+    scrubbed
+}
+
 fn scrub_org_markdown(markdown: &str) -> (String, OrgScrubCounts) {
     let (scrubbed, map) = crate::summarize::redact::redact(markdown);
     let mut counts = OrgScrubCounts::default();
@@ -2610,7 +2618,7 @@ fn rough_chunk_count(markdown: &str) -> u32 {
 /// (`AppState::org_ock_cache`) when present, else unwrapped from the caller's server-relayed grant
 /// (gated on the account MK session) and cached. NEVER persisted, NEVER logged. Fails closed
 /// (`Unavailable`) logged out, (`Auth`) on a forged/mismatched grant.
-async fn acquire_org_ock(
+pub(crate) async fn acquire_org_ock(
     state: &AppState,
     org_id: &str,
     generation: u32,
@@ -4231,6 +4239,7 @@ pub(crate) async fn share_to_org_with_access_inner(
         Some(document_id),
         scrub,
         access,
+        None,
         OrgWorkPolicy::manual(),
         None,
     )
@@ -4246,6 +4255,29 @@ async fn share_to_org_notifying(
     access: crate::share::org_dto::OrgItemAccess,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
+    share_to_org_placed_notifying(
+        state, org_id, meeting_id, document_id, scrub, access, None, app,
+    )
+    .await
+}
+
+/// The container-aware twin of [`share_to_org_notifying`]: the same gate order, plus WHERE the
+/// document is filed and whether the user asked for this share themselves.
+///
+/// A `placement` of `None` is exactly today's standalone share, down to the wire version — the
+/// envelope only reaches v4 when a real placement exists, so a member on an older client keeps
+/// receiving every share that is not container-owned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn share_to_org_placed_notifying(
+    state: &AppState,
+    org_id: &str,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+    access: crate::share::org_dto::OrgItemAccess,
+    placement: Option<ContainerPlacement>,
+    app: Option<&AppHandle>,
+) -> Result<OrgShareEntry, AppError> {
     let _mutation = state.org_share_mutation_lock.lock().await;
     share_to_org_inner_with_policy(
         state,
@@ -4254,6 +4286,7 @@ async fn share_to_org_notifying(
         document_id,
         scrub,
         access,
+        placement,
         OrgWorkPolicy::manual(),
         app,
     )
@@ -4270,6 +4303,7 @@ async fn share_to_org_inner_with_policy(
     document_id: Option<String>,
     scrub: bool,
     access: crate::share::org_dto::OrgItemAccess,
+    placement: Option<ContainerPlacement>,
     policy: OrgWorkPolicy,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
@@ -4342,10 +4376,33 @@ async fn share_to_org_inner_with_policy(
         scrub,
         1,
         access,
+        placement,
         policy,
         app,
     )
     .await
+}
+
+/// Where a document is filed inside a shared container, and whether the user asked for its share.
+///
+/// `explicit` is separate from the placement itself because the two answer different questions:
+/// the placement says WHERE the document sits, `explicit` says whether unsharing the container may
+/// withdraw it. A note the user shared deliberately and later dragged into a shared folder is
+/// placed but still explicit — unsharing the folder must leave it live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerPlacement {
+    pub(crate) parent_container_id: String,
+    pub(crate) position: i64,
+    pub(crate) explicit: bool,
+}
+
+impl ContainerPlacement {
+    fn envelope(&self) -> crate::share::org_envelope::OrgPlacement {
+        crate::share::org_envelope::OrgPlacement {
+            parent_container_id: self.parent_container_id.clone(),
+            position: self.position,
+        }
+    }
 }
 
 /// Collapse accidental DUPLICATE live (`uploaded`) org items for ONE (org, source) down to the earliest,
@@ -4700,7 +4757,7 @@ pub(crate) struct OrgDispatchPermit {
     operation: OrgDispatchOperation,
 }
 
-enum OrgDispatchOperation {
+pub(crate) enum OrgDispatchOperation {
     Publish {
         org_id: String,
         doc_id: Option<String>,
@@ -4916,7 +4973,7 @@ impl OrgDispatchPermit {
     }
 }
 
-fn org_dispatch_cell_sha256(cell: &[u8]) -> [u8; 32] {
+pub(crate) fn org_dispatch_cell_sha256(cell: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     Sha256::digest(cell).into()
@@ -5140,6 +5197,99 @@ fn persist_initial_org_publish_intent(
     };
     Ok((permit, dispatch_id))
 }
+
+/// Mint a publish permit for one CONTAINER manifest, CAS-ing its journal row out of `queued` and
+/// ledgering the dispatch in the SAME transaction.
+///
+/// This mirrors [`persist_initial_org_publish_intent`] and exists separately for one reason: a
+/// manifest has no local `meeting_id`/`document_id`, so it cannot ride `org_shares`'s logical key.
+/// Everything that makes that path crash-safe is preserved — the row is durably marked
+/// "dispatched, outcome unknown" BEFORE the socket, and the egress ledger row commits with it, so a
+/// crash mid-publish is recoverable rather than invisible.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_container_publish_intent(
+    state: &AppState,
+    share_id: &str,
+    org_id: &str,
+    doc_id: &str,
+    access: crate::share::org_dto::OrgItemAccess,
+    rev: u32,
+    generation: u32,
+    content_sha256: &[u8],
+    actor_user_id: &str,
+    updated_at: &str,
+    ledger_host: &str,
+    sealed_bytes: usize,
+    sealed_cell_sha256: [u8; 32],
+) -> Result<(OrgDispatchPermit, String), AppError> {
+    require_org_egress_consent(state)?;
+    let dispatch_id = uuid::Uuid::new_v4().to_string();
+    let mut conn = state.db.lock();
+    let tx = conn
+        .transaction()
+        .map_err(|_| AppError::Storage("start container publish dispatch".into()))?;
+    let changed = tx
+        .execute(
+            "UPDATE org_container_shares
+                SET state = 'failed', last_error = ?2, rev = ?4, content_sha256 = ?5,
+                    access = ?6, updated_at = ?3
+              WHERE id = ?1 AND org_id = ?7 AND container_id = ?8
+                AND state IN ('queued','failed')",
+            rusqlite::params![
+                share_id,
+                CONTAINER_SHARE_POST_PENDING,
+                updated_at,
+                rev as i64,
+                content_sha256,
+                access.as_str(),
+                org_id,
+                doc_id,
+            ],
+        )
+        .map_err(|_| AppError::Storage("persist container publish intent".into()))?;
+    if changed != 1 {
+        return Err(AppError::Unavailable(
+            "container publish changed before dispatch".into(),
+        ));
+    }
+    let ledger_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    crate::storage::db::insert_share_egress_dispatch_tx(
+        &tx,
+        ledger_ts,
+        ledger_host,
+        "org_share_publish",
+        sealed_bytes,
+        &dispatch_id,
+    )?;
+    tx.commit()
+        .map_err(|_| AppError::Storage("commit container publish dispatch".into()))?;
+    let permit = OrgDispatchPermit {
+        dispatch_id: dispatch_id.clone(),
+        host: ledger_host.to_string(),
+        operation: OrgDispatchOperation::Publish {
+            org_id: org_id.to_string(),
+            doc_id: Some(doc_id.to_string()),
+            access: Some(access),
+            rev,
+            generation,
+            content_sha256: content_sha256.to_vec(),
+            cell_len: sealed_bytes,
+            cell_sha256: sealed_cell_sha256,
+            owner_user_id: Some(actor_user_id.to_string()),
+        },
+    };
+    Ok((permit, dispatch_id))
+}
+
+/// The durable "dispatched, outcome unknown" marker for a container manifest publish. Named
+/// separately from the note path's constant so a reader can tell the two journals apart.
+pub(crate) const CONTAINER_SHARE_POST_PENDING: &str = "container_post_pending";
+
+/// The content-free reason a manifest publish failed before any egress.
+pub(crate) const CONTAINER_SHARE_SEAL_FAILED: &str = "container_seal_failed";
 
 #[allow(clippy::too_many_arguments)]
 fn fail_initial_org_publish_pre_dispatch_if_current(
@@ -5575,7 +5725,7 @@ fn permit_org_task_assignee_read(
     })
 }
 
-fn permit_simple_org_dispatch(
+pub(crate) fn permit_simple_org_dispatch(
     state: &AppState,
     host: &str,
     kind: &str,
@@ -5670,7 +5820,7 @@ fn persist_org_revoke_intent(
     Ok(())
 }
 
-fn require_org_egress_consent(state: &AppState) -> Result<(), AppError> {
+pub(crate) fn require_org_egress_consent(state: &AppState) -> Result<(), AppError> {
     let consented = state
         .config
         .lock()
@@ -6410,7 +6560,7 @@ async fn corroborate_legacy_org_item_absent_or_tombstoned(
     ))
 }
 
-async fn delete_legacy_org_item(
+pub(crate) async fn delete_legacy_org_item(
     state: &AppState,
     client: &crate::share::client::ShareClient,
     access_token: &str,
@@ -6616,6 +6766,7 @@ async fn publish_org_body_with_policy(
     scrub: bool,
     rev: u32,
     access: crate::share::org_dto::OrgItemAccess,
+    placement: Option<ContainerPlacement>,
     policy: OrgWorkPolicy,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
@@ -6714,7 +6865,8 @@ async fn publish_org_body_with_policy(
         rev,
         source_kind,
     )
-    .with_attachments(attachments);
+    .with_attachments(attachments)
+    .with_placement(placement.as_ref().map(ContainerPlacement::envelope));
     let content_sha = env.content_sha256();
     // SB-3 row-amplification fix: REUSE any existing retriable (`queued`/`failed`) row for this
     // logical share key (org + meeting-or-document) instead of minting a fresh row on every sweep
@@ -6836,6 +6988,16 @@ async fn publish_org_body_with_policy(
     state
         .db
         .set_org_share_document_metadata(&row_id, &doc_id, access.as_str())?;
+    // Record the placement on the journal row BEFORE dispatch, so the republish path — which reads
+    // the row, not the caller — rebuilds the identical envelope on every later revision.
+    if let Some(placement) = placement.as_ref() {
+        state.db.set_org_share_placement(
+            &row_id,
+            Some(&placement.parent_container_id),
+            placement.position,
+            placement.explicit,
+        )?;
+    }
     let (initial_row_version, initial_dirty_counter) =
         state.db.org_share_source_counters(&row_id)?;
 
@@ -7509,6 +7671,16 @@ async fn republish_org_shares_for_source_with_policy(
         // compared against a hash at the SAME rev — else every republish would look "changed" purely
         // because the rev bumped. Build the comparison envelope at `row.rev`; only the PUBLISH envelope
         // uses `new_rev`.
+        // The row's OWN placement, not the caller's: a republish must rebuild the envelope the
+        // last publish produced, or the comparison hash would differ for a reason that is not a
+        // content change and every save would mint a needless revision.
+        let row_placement =
+            row.parent_container_id
+                .as_ref()
+                .map(|parent| crate::share::org_envelope::OrgPlacement {
+                    parent_container_id: parent.clone(),
+                    position: row.position,
+                });
         let cmp_env = crate::share::org_envelope::OrgEnvelope::new(
             kind,
             title.clone(),
@@ -7518,7 +7690,8 @@ async fn republish_org_shares_for_source_with_policy(
             row.rev,
             source_kind,
         )
-        .with_attachments(attachments.clone());
+        .with_attachments(attachments.clone())
+        .with_placement(row_placement.clone());
         if recovered_put.is_some()
             && row.content_sha256.as_deref() != Some(cmp_env.content_sha256().as_slice())
         {
@@ -7666,7 +7839,8 @@ async fn republish_org_shares_for_source_with_policy(
             new_rev,
             source_kind,
         )
-        .with_attachments(attachments);
+        .with_attachments(attachments)
+        .with_placement(row_placement);
         let content_sha = env.content_sha256();
         if pending_post && row.content_sha256.as_deref() != Some(content_sha.as_slice()) {
             // Preserve the already-dispatched immutable witness. A newer local source is
@@ -8536,7 +8710,7 @@ pub(crate) async fn revoke_org_share_inner(
     revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual(), None).await
 }
 
-async fn revoke_org_share_inner_with_policy(
+pub(crate) async fn revoke_org_share_inner_with_policy(
     state: &AppState,
     item_id: String,
     policy: OrgWorkPolicy,
@@ -9058,6 +9232,17 @@ pub(crate) async fn org_background_sync_tick(state: &AppState, app: Option<AppHa
     if !policy.is_current() {
         return false;
     }
+    // Keep every shared container in step with the local tree. Best-effort for the same reason the
+    // outbound sweep is: a container that cannot reconcile right now is retried next tick, and must
+    // never stop the feed pull that follows.
+    if let Err(e) =
+        crate::commands::org_containers::reconcile_container_shares(state, app.as_ref()).await
+    {
+        tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile tick failed");
+    }
+    if !policy.is_current() {
+        return false;
+    }
     let report = match org_sync_now_inner_with_policy(state, policy, app.clone()).await {
         Ok(r) => r,
         Err(e) => {
@@ -9139,7 +9324,7 @@ pub(crate) async fn org_sweep_pending_background_once_inner(
 /// Snapshot the bearer and stable actor from one live session after refresh. If the account changes
 /// between refresh and this lock, fail closed rather than pairing one account's bearer with another
 /// account's durable recovery witness.
-async fn authenticated_org_actor(state: &AppState) -> Result<(String, String), AppError> {
+pub(crate) async fn authenticated_org_actor(state: &AppState) -> Result<(String, String), AppError> {
     valid_access_token(state).await?;
     let session = state
         .account_session
@@ -9628,6 +9813,16 @@ async fn org_sweep_pending_with_policy(
                 row.scrub,
                 crate::share::org_dto::OrgItemAccess::parse(&row.access)
                     .unwrap_or(crate::share::org_dto::OrgItemAccess::View),
+                // Replay the row's OWN placement. A retry that dropped it would publish the note
+                // outside the shared folder it was queued for, and the container sweep would then
+                // see a document it thought it had filed sitting loose in the org.
+                row.parent_container_id
+                    .clone()
+                    .map(|parent_container_id| ContainerPlacement {
+                        parent_container_id,
+                        position: row.position,
+                        explicit: row.explicit,
+                    }),
                 policy,
                 app,
             )
@@ -9681,6 +9876,14 @@ pub async fn org_sync_now(
             .await
         }
     }?;
+    // A manual "Sync now" should converge the containers too, not just the item feed — otherwise a
+    // user who just renamed a shared folder presses Sync and nothing happens. Best-effort: a
+    // container failure never turns a successful feed sync into an error.
+    if let Err(e) =
+        crate::commands::org_containers::reconcile_container_shares(state.inner(), Some(&app)).await
+    {
+        tracing::warn!(target: "org", error = %brief_err(&e), "container share reconcile after manual sync failed");
+    }
     Ok(report)
 }
 
@@ -10530,6 +10733,23 @@ async fn org_reconcile_one(
         },
         /// The feed says this item is withdrawn → evict the local replica.
         Evict { item_id: String, seq: u64 },
+        /// A CONTAINER manifest → write it into `org_containers`, not `org_items`.
+        ///
+        /// Kept a distinct action rather than a flag on `Ingest` so the apply arm cannot
+        /// accidentally run the note path's embed + chunk pipeline over a JSON manifest, which
+        /// would put container names into the retrieval index as if they were note text.
+        IngestContainer {
+            item_id: String,
+            seq: u64,
+            rev: u32,
+            generation: u32,
+            manifest: Box<crate::share::container_envelope::ContainerEnvelope>,
+            author_hint: String,
+            author_user_id: String,
+            access: crate::share::org_dto::OrgItemAccess,
+            document_owner_user_id: Option<String>,
+            created_at: String,
+        },
         /// Divergent live record → (re)write the opened envelope into the replica.
         Ingest {
             item_id: String,
@@ -10676,6 +10896,28 @@ async fn org_reconcile_one(
             actions.push(ReconcileAction::Skip { seq: item.seq });
             continue;
         }
+        if env.kind == crate::share::org_envelope::OrgItemKind::Container {
+            // A manifest is structure, not prose: it skips the attachment bundle, the chunker and
+            // the embedder entirely. A payload this device cannot parse is SKIPPED whole — never
+            // half-written — so a malformed or hostile manifest cannot leave a container row with
+            // no name behind.
+            match crate::share::container_envelope::ContainerEnvelope::from_json(&env.markdown) {
+                Ok(manifest) => actions.push(ReconcileAction::IngestContainer {
+                    item_id: item.item_id.clone(),
+                    seq: item.seq,
+                    rev: item.rev,
+                    generation: item.generation,
+                    manifest: Box::new(manifest),
+                    author_hint: env.author_hint.clone(),
+                    author_user_id: item.author_user_id.clone(),
+                    access: item.access,
+                    document_owner_user_id: item.document_owner_user_id.clone(),
+                    created_at: item.created_at.clone(),
+                }),
+                Err(_) => actions.push(ReconcileAction::Skip { seq: item.seq }),
+            }
+            continue;
+        }
         let (local_markdown, incoming_attachments) =
             match prepare_incoming_attachment_bundle(&env.markdown, &env.attachments) {
                 Ok(bundle) => bundle,
@@ -10781,9 +11023,52 @@ async fn org_reconcile_one(
                         else {
                             break;
                         };
-                        if evicted {
+                        // The same feed entry withdraws a CONTAINER, and only this device knows
+                        // which item ids were containers — the relay sees opaque documents.
+                        let container_evicted = policy
+                            .commit(|| db.tombstone_org_container_by_item(&item_id))?
+                            .unwrap_or(false);
+                        if evicted || container_evicted {
                             changed += 1;
                         }
+                        progress = seq;
+                    }
+                    ReconcileAction::IngestContainer {
+                        item_id,
+                        seq,
+                        rev,
+                        generation,
+                        manifest,
+                        author_hint,
+                        author_user_id,
+                        access,
+                        document_owner_user_id,
+                        created_at,
+                    } => {
+                        let manifest = *manifest;
+                        let row = crate::storage::models::OrgContainerRow {
+                            org_id: org_id.clone(),
+                            container_id: manifest.container_id.clone(),
+                            item_id: item_id.clone(),
+                            level: manifest.level.as_str().to_string(),
+                            name: manifest.name.clone(),
+                            emoji: manifest.emoji.clone(),
+                            tint: manifest.tint.clone(),
+                            parent_container_id: manifest.parent_container_id.clone(),
+                            position: manifest.position,
+                            access: access.as_str().to_string(),
+                            author_hint,
+                            author_user_id: (!author_user_id.is_empty()).then_some(author_user_id),
+                            document_owner_user_id,
+                            seq,
+                            rev,
+                            generation,
+                            created_at,
+                        };
+                        let Some(()) = policy.commit(|| db.upsert_org_container(&row))? else {
+                            break;
+                        };
+                        changed += 1;
                         progress = seq;
                     }
                     ReconcileAction::Ingest {
@@ -10871,6 +11156,15 @@ async fn org_reconcile_one(
                         if applied {
                             changed += 1;
                         }
+                        // Record WHERE the sender filed this document. Written after the item row
+                        // exists, and unconditionally: a document that LEAVES a shared folder
+                        // arrives with no placement, and clearing it is what makes it move.
+                        let placement = env.placement.as_ref();
+                        let _ = db.set_org_item_placement(
+                            &item_id,
+                            placement.map(|p| p.parent_container_id.as_str()),
+                            placement.map(|p| p.position).unwrap_or(0),
+                        );
                         progress = seq;
                     }
                 }
@@ -11487,7 +11781,11 @@ pub(crate) async fn org_update_own_item_notifying(
         new_rev,
         source_kind,
     )
-    .with_attachments(attachments);
+    .with_attachments(attachments)
+    // PRESERVE the placement this document already carries. An editor is changing the TEXT, not
+    // where the document lives — dropping the placement here would silently evict the note from
+    // its shared folder for every member the moment somebody else edited it.
+    .with_placement(state.db.org_item_placement(item_id)?);
     let content_sha = env.content_sha256();
 
     // (5) SEAL under the OCK + LOCAL OPEN-VERIFY (verify-before-egress). AAD nonce = hex(content_sha256),

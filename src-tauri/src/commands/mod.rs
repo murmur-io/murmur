@@ -226,6 +226,14 @@ pub use lock_commands::*;
 mod org_commands;
 pub use org_commands::*;
 
+// SHARED CONTAINERS — publishing a whole Folder or Space to an org (2026-08-29). A sibling of
+// `org_commands` rather than more of it: a container manifest has no local meeting/document id, so
+// it cannot ride the `org_shares` logical key every helper in that file is built around, and
+// `org.rs` is already a 12k-line god-file. The gate ORDER is identical (sealed refusal → consent →
+// scrub → journal-before-socket → seal + local open-verify → size cap → content-free ledger).
+pub(crate) mod org_containers;
+pub use org_containers::*;
+
 // DOCUMENT-INGEST command surface (upload/import/list/read/delete of brain `documents` — a GATED
 // domain: every write WRITE-GATES the folder + re-checks the gate before the plaintext INSERT, every
 // read masks a sealed-not-unlocked folder to empty/"", `delete_document` revokes org shares
@@ -14239,6 +14247,11 @@ mod lock_read_gate_tests;
 #[cfg(test)]
 #[path = "tests/workspace_tree_tests.rs"]
 mod workspace_tree_tests;
+
+// ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
+#[cfg(test)]
+#[path = "tests/container_share_tests.rs"]
+mod container_share_tests;
 
 // ── BLK-1 lifecycle-race + BLK-2 move-into-locked + BLK-3/BLK-4 config tests ──────────────────────
 #[cfg(test)]
