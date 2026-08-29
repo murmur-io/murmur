@@ -310,8 +310,24 @@ export class NoteEditorComponent {
   readonly properties = signal<Record<string, string>>({});
 
   // --- View state ----------------------------------------------------------
-  /** Edit vs Preview. */
+  /**
+   * Edit vs Preview. Starts false, but {@link hydrate} flips an OPENED note that
+   * already has a body into Preview — see {@link opensInPreview}. The initial
+   * value stays `false` so an empty/new note (and the embedded host) never begins
+   * in a read-only pane.
+   */
   readonly preview = signal(false);
+  /**
+   * `"<note id>:<locked>"` of the last document the open-in-Preview default was
+   * applied to.
+   *
+   * `hydrate` is NOT only "the user opened a note" — it also re-runs on a
+   * lock/unlock transition for the note already on screen (see the seal branch in
+   * the folder-tree lock effect). Keying the default means a re-hydrate cannot
+   * yank someone out of Edit mid-note, while a genuine open — or an unlock, which
+   * changes the `locked` half — still gets the default.
+   */
+  private previewDefaultedFor: string | null = null;
   /** Properties bar expanded. */
   readonly propsOpen = signal(false);
   /** The autosave indicator. */
@@ -1132,12 +1148,45 @@ export class NoteEditorComponent {
       Object.keys(doc.properties).length ? { ...doc.properties } : parsed.properties,
     );
     this.propsOpen.set(this.tags().length > 0 || this.propertyRows().length > 0);
+    this.applyPreviewDefault(doc, parsed.body);
     this.saveState.set("idle");
     this.dirtyFull = false;
     this.hydrating = false;
     // Adopt the loaded title into the tab strip (a no-op if this note isn't
     // tab-tracked, e.g. a direct routerLink open elsewhere in the app).
     this.tabsService.setTitle(tabKeyFor("note", doc.id), doc.title || "Untitled");
+  }
+
+  /**
+   * A note with something to read OPENS in Preview; anything else opens in Edit.
+   *
+   * Reading is the common case — an existing note was landing in a raw-markdown
+   * textarea, so every open began by showing source rather than the note. The
+   * three exclusions are not stylistic:
+   *
+   *  - **empty body** — a brand-new note (`/notes/new` creates one, then this
+   *    editor hydrates it) has nothing to render, and a read-only empty pane is a
+   *    dead end where the user meant to start typing.
+   *  - **locked** — a sealed note's body is masked server-side, so there is
+   *    nothing to preview; the template shows the lock gate instead, and
+   *    `setPreview` itself refuses while locked. Defaulting past that guard would
+   *    be the one place preview mode is reachable for a locked document.
+   *  - **embedded** — the recording panel's Note tab is a capture surface. It
+   *    already force-disables preview via `previewActive`; keeping the signal
+   *    false too honors that component's belt-and-braces contract.
+   */
+  private opensInPreview(doc: NoteDoc, body: string): boolean {
+    return !doc.locked && !this.embedded() && body.trim().length > 0;
+  }
+
+  /** Apply {@link opensInPreview} once per opened document — see {@link previewDefaultedFor}. */
+  private applyPreviewDefault(doc: NoteDoc, body: string): void {
+    const key = `${doc.id}:${doc.locked}`;
+    if (key === this.previewDefaultedFor) {
+      return;
+    }
+    this.previewDefaultedFor = key;
+    this.preview.set(this.opensInPreview(doc, body));
   }
 
   // ── Title ────────────────────────────────────────────────────────────────
