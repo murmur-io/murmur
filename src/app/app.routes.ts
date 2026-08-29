@@ -157,11 +157,22 @@ export const routes: Routes = [
           ),
       },
       {
+        // The virtual "Shared Brains" Space. No longer a rail destination: it is
+        // a ROW in the Spaces sidebar, and this is the page behind it.
         path: "shared-brains",
         loadComponent: () =>
           import("./features/shared-brains/shared-brains.component").then(
             (m) => m.SharedBrainsComponent,
           ),
+      },
+      {
+        // One RECEIVED container — a Space or folder somebody in the org shared.
+        // Read-only structure at every access level; its owner keeps the tree.
+        path: "shared/:orgId/:containerId",
+        loadComponent: () =>
+          import(
+            "./features/shared-brains/shared-container-view/shared-container-view.component"
+          ).then((m) => m.SharedContainerViewComponent),
       },
       {
         // Read-only org-brain item viewer — reached from an org-origin source
