@@ -3,6 +3,7 @@ pub(crate) mod ask_conversation_store;
 pub mod attachment_store;
 pub(crate) mod audit_store;
 pub(crate) mod brief_store;
+pub(crate) mod container_store;
 pub(crate) mod dashboards_store;
 pub mod db;
 pub(crate) mod egress_store;
