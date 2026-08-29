@@ -1,7 +1,7 @@
 # `.codex/` — Murmur's Codex control surface
 
 Codex is one adapter to the vendor-neutral development harness in
-`.agents/harness/`; it is not a separate source of workflow truth.
+`.agents/h/`; it is not a separate source of workflow truth.
 
 | Path | Purpose |
 | --- | --- |
@@ -10,7 +10,7 @@ Codex is one adapter to the vendor-neutral development harness in
 | `rules/` | Binding Rust, Angular, lock, and agent-loop rules |
 | `agents/` | Thin specialist role prompts |
 | `hooks.json` + `hooks/` | Codex wiring/adapters for the canonical hook guard |
-| `learnings/` | **Generated** byte mirror of the canonical `.claude/learnings/` — never hand-edit; run `scripts/agent-sync-learnings` |
+| `learnings/` | **Generated** byte mirror of the canonical `.claude/learnings/` — never hand-edit; run `.agents/h/mirror-check --fix` |
 | `../.agents/skills/` | Shared executable runbooks |
 
 The active development loop is:
@@ -21,22 +21,20 @@ task contract -> isolated worktree -> developer edit -> exact-diff plan
               -> hash-bound receipt -> guarded commit -> required remote CI
 ```
 
-Run it with `scripts/agent-harness`; task evidence is stored once under the
-shared Git common directory at `.git/agent-harness/v2/tasks/<task-id>/`. Legacy
+Run it with `scripts/h`; task evidence is stored once under the
+shared Git common directory at `.git/h/<task-id>.json`. Legacy
 `.codex/tmp/` verdicts and trace helpers are historical evidence only and have no
 authority over commits.
 
 The finish guard is fail-closed. It accepts only a runner-created PASS bound to
 the exact staged diff, active instructions, dependency revisions, green checks,
-and independent review sessions. `scripts/agent-config-audit --ci` prevents the
+and independent review sessions. `.agents/h/mirror-check` prevents the
 Codex and Claude adapters from silently drifting.
 
 Quick verification:
 
 ```bash
-scripts/agent-harness doctor
-scripts/agent-harness selftest --ci
-scripts/agent-config-audit --ci
+.agents/h/mirror-check
 ```
 
 Local hooks are defense in depth, not a remote security boundary. Merge safety

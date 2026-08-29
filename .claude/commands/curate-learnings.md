@@ -22,7 +22,7 @@ Steps:
      full, merge or drop the weakest existing bullet and say which.
    - Mark each source journal entry `**Status:** distilled (<today>)` (date from `date +%F`).
 4. Do NOT invent lessons that aren't in the journal. Curation promotes evidence, it doesn't author.
-5. Run `scripts/agent-sync-learnings` to regenerate the `.codex/learnings/` mirror — skipping it
-   leaves `scripts/agent-config-audit` red.
+5. Run `.agents/h/mirror-check --fix` to regenerate the `.codex/learnings/` mirror — skipping it
+   leaves `.agents/h/mirror-check` red.
 6. Report: which bullets you added/merged and which journal entries you marked distilled — concise,
    not a full file dump.

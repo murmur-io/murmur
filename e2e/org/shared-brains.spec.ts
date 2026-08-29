@@ -274,17 +274,20 @@ test("a local membership gate closing evicts previously rendered Shared Brain me
   expect(runtimeErrors).toEqual([]);
 });
 
-test("Shared Brains is a top-level org surface with org/type filters and explicit legacy rows", async ({
+test("Shared Brains keeps its org/type filters and explicit legacy rows beside the Spaces tree", async ({
   page,
 }) => {
   const runtimeErrors = watchRuntimeErrors(page);
   await boot(page);
 
-  const railLink = page.getByRole("link", { name: "Shared Brains" });
-  await expect(railLink).toHaveAttribute("aria-current", "page");
-  await expect(
-    page.getByRole("complementary", { name: "Spaces sidebar" }),
-  ).toHaveCount(0);
+  // Shared Brains stopped being a rail destination on 2026-08-29: it is now a
+  // ROW in the Spaces sidebar (a virtual Space holding everything shared with
+  // you that has no container of its own), so there is no rail link to be
+  // current, and the tree stays beside the page instead of being replaced by
+  // it. What the page itself does — the org and type filters, and the honest
+  // "Unclassified" row for a legacy item with no source kind — is unchanged,
+  // and that is what the rest of this test still pins.
+  await expect(page.getByRole("link", { name: "Shared Brains" })).toHaveCount(0);
   await expect(
     page.getByText("Customer review", { exact: true }),
   ).toBeVisible();

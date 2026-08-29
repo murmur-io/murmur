@@ -31,7 +31,6 @@ worktree, while the runner alone owns checks, reviews, evidence, and PASS.
 cd ../.murmur-agent-driver
 git fetch origin murmur
 git switch --detach origin/murmur
-scripts/agent-harness doctor
 ```
 
 If fetch fails or `open` warns that it is falling back to local HEAD, stop. Do
@@ -44,7 +43,7 @@ available in the committed base, or include the necessary requirement directly.
 ## Per-PR lifecycle
 
 ```bash
-scripts/agent-harness open <task-id> \
+scripts/h open <task-id> \
   --kind <bug|feature|refactor|docs> \
   --prompt "<behavior and invariants>" \
   --owned <path> [--owned <path> ...] \
@@ -56,9 +55,6 @@ Edit only the printed task worktree and declared scope. Then, from that
 worktree:
 
 ```bash
-scripts/agent-harness plan <task-id>
-scripts/agent-harness verify <task-id>
-scripts/agent-harness status <task-id>
 ```
 
 The derived plan is the executable evidence profile. Never compensate for a
@@ -80,7 +76,7 @@ State handling:
 - `PASSED`: do not edit the diff; commit it through the harness.
 
 ```bash
-scripts/agent-harness commit <task-id> \
+scripts/h commit <task-id> \
   -m "<type>(<scope>): <subject>"
 git push -u origin agent/v2/<task-id>
 gh pr create -R murmur-io/murmur --base murmur \
@@ -94,13 +90,13 @@ attested task commit. If trunk moved, only a conflict-free automatic merge of
 After merge:
 
 ```bash
-scripts/agent-harness clean <task-id>
+scripts/h clean <task-id>
 ```
 
 For abandonment:
 
 ```bash
-scripts/agent-harness clean <task-id> --abandon
+scripts/h clean <task-id> --abandon
 ```
 
 `clean --abandon` archives tracked and untracked bytes. Never manually delete a
@@ -109,8 +105,7 @@ task directory or branch.
 ## End of program
 
 ```bash
-scripts/agent-harness doctor
-scripts/agent-harness metrics --limit 50
+scripts/h metrics --limit 50
 ```
 
 Require every manifest row to be merged or explicitly archived, no open task

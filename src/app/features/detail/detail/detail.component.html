@@ -57,6 +57,11 @@
           <span class="meta-item">{{
             formatDuration(d.meeting.durationS)
           }}</span>
+          <!-- The recording's stable id, for pointing Claude at THIS meeting over the
+               local MCP server (`get_meeting`). Nothing about it is sensitive: it is an
+               opaque uuid, and every MCP read it enables is gated by the same
+               visibility clause the app uses, so a sealed meeting stays sealed. -->
+          <mur-copy-id [id]="d.meeting.id" label="Meeting" />
           <!-- Read-only folder + lock badge (where this note lives). -->
           @if (folderBadge(); as fb) {
             <span class="meta-sep" aria-hidden="true">·</span>

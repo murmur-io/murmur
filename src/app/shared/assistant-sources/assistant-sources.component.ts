@@ -7,7 +7,7 @@ import {
 } from "@angular/core";
 
 /**
- * One grounding source for the assistant-answer "🔗 Źródła" block. Both the live
+ * One grounding source for the assistant-answer "🔗 Sources" block. Both the live
  * record-surface card ({@link AssistantCitation}) and the persisted detail Q&A
  * ({@link ParsedCitation}) already parse the backend's flat citation strings into
  * a vault-vs-web shape — this is the common subset they both feed in.
@@ -29,7 +29,7 @@ interface RichSource extends AssistantSource {
 }
 
 /**
- * Compact, rich, deduped "🔗 Źródła" block shared by BOTH assistant surfaces
+ * Compact, rich, deduped "🔗 Sources" block shared by BOTH assistant surfaces
  * (the live `app-assistant-actions` card and the persisted detail Q&A section).
  * Replaces the old giant flat list of near-duplicate "VIA WEB" chips:
  *

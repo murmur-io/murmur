@@ -337,11 +337,75 @@ pub struct ReindexPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusPayload {
-    /// "idle" | "recording" | "transcribing" | "summarizing" | "exporting" | "done" | "error"
+    /// "idle" | "recording" | "transcribing" | "summarizing" | "exporting" | "done" |
+    /// "finalized" | "error". Pipeline `done` is progress; `finalized` is the command/recovery
+    /// owner's successful end-of-lifecycle boundary.
     pub stage: String,
     /// human-readable, NO PII
     pub message: String,
     pub meeting_id: Option<String>,
+}
+
+/// Emit the one truthful recording success boundary. Pipeline `saved`/`done` stages can precede
+/// command-owned model retirement or startup-recovery cleanup, so every owner calls this only after
+/// its full success tail has completed. Best-effort: an event-bus failure cannot undo a durable
+/// recovered note. Carries an opaque meeting id and fixed text only — no recording content.
+pub(crate) fn emit_recording_finalized(app: &AppHandle, meeting_id: &str) {
+    if let Err(error) = app.emit(EVENT_STATUS, recording_finalized_payload(meeting_id)) {
+        tracing::warn!(
+            target: "pipeline",
+            error = %error,
+            "failed to emit finalized recording status"
+        );
+    }
+}
+
+fn recording_finalized_payload(meeting_id: &str) -> StatusPayload {
+    StatusPayload {
+        stage: "finalized".into(),
+        message: "Recording finalized.".into(),
+        meeting_id: Some(meeting_id.to_string()),
+    }
+}
+
+/// Unblock recording renderers when the note pipeline succeeded but startup recovery's own
+/// cleanup tail did not. This is deliberately NOT `finalized`: the exact recovery artifacts remain
+/// owned for a later retry. Fixed text + opaque meeting id only; never includes an error string,
+/// source path, title, transcript, or note content.
+pub(crate) fn emit_recording_recovery_failed(app: &AppHandle, meeting_id: &str) {
+    if let Err(error) = app.emit(EVENT_STATUS, recording_recovery_failed_payload(meeting_id)) {
+        tracing::warn!(
+            target: "startup",
+            error = %error,
+            "failed to emit recording recovery error status"
+        );
+    }
+}
+
+fn recording_recovery_failed_payload(meeting_id: &str) -> StatusPayload {
+    StatusPayload {
+        stage: "error".into(),
+        message: "Recording recovery cleanup was incomplete.".into(),
+        meeting_id: Some(meeting_id.to_string()),
+    }
+}
+
+/// Content-free recording terminal capability. Production routes through the typed event helpers;
+/// headless lifecycle tests substitute a recorder so a late lock refusal can prove it emitted
+/// neither a false success nor a duplicate error.
+pub(crate) trait RecordingTerminalNotifier {
+    fn recording_finalized(&self, meeting_id: &str);
+    fn recording_cleanup_failed(&self, meeting_id: &str);
+}
+
+impl RecordingTerminalNotifier for AppHandle {
+    fn recording_finalized(&self, meeting_id: &str) {
+        emit_recording_finalized(self, meeting_id);
+    }
+
+    fn recording_cleanup_failed(&self, meeting_id: &str) {
+        emit_recording_recovery_failed(self, meeting_id);
+    }
 }
 
 /// Emitted once after transcription when the cross-stream echo dedup removed ≥1 mic-echo
@@ -463,6 +527,36 @@ pub fn emit_recording_capture_fault(
 /// picker, the Settings shared-brain list) refresh WITHOUT polling. Counts only, NO PII (no item
 /// ids, titles, or content) — it is purely a "something changed, re-fetch" ping.
 pub const EVENT_ORG_FEED_UPDATED: &str = "murmur://org-feed-updated";
+
+/// Progress of one CONTAINER share — a Space or Folder publishing N items. Counts only, NO PII (no
+/// folder name, item id, or title). The sheet renders a determinate bar from it, because a share of
+/// a whole Space is N sequential round-trips and a spinner cannot say how far it got.
+pub const EVENT_CONTAINER_SHARE_PROGRESS: &str = "murmur://container-share-progress";
+
+/// Payload for [`EVENT_CONTAINER_SHARE_PROGRESS`]. Two counts only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerShareProgressPayload {
+    /// Items attempted so far, published or failed.
+    pub done: u32,
+    /// Items the plan will attempt in total.
+    pub total: u32,
+}
+
+/// Emit [`EVENT_CONTAINER_SHARE_PROGRESS`] (best-effort). A failed emit only costs the progress
+/// bar an update; it must never affect the share itself.
+pub fn emit_container_share_progress(app: &AppHandle, done: u32, total: u32) {
+    if let Err(e) = app.emit(
+        EVENT_CONTAINER_SHARE_PROGRESS,
+        ContainerShareProgressPayload { done, total },
+    ) {
+        tracing::warn!(
+            target: "org",
+            error = %e,
+            "failed to emit container-share progress"
+        );
+    }
+}
 
 /// Payload for [`EVENT_ORG_FEED_UPDATED`]. A single count only — NO PII. `orgsChanged` is the number
 /// of joined orgs whose feed produced ≥1 ingest/tombstone this tick (the all-orgs background tick
@@ -684,6 +778,30 @@ pub fn emit_ask_history_invalidated(app: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `finalized` is the only terminal success stage consumed by the recording store. Bind its
+    /// exact camelCase wire payload so recovery cannot silently fall back to pipeline `done`.
+    #[test]
+    fn recording_finalized_status_payload_is_stable() {
+        assert_eq!(EVENT_STATUS, "meetnotes://status");
+        let json = serde_json::to_string(&recording_finalized_payload("meeting-42")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"stage":"finalized","message":"Recording finalized.","meetingId":"meeting-42"}"#
+        );
+    }
+
+    /// A cleanup-tail failure must unblock the renderer without claiming success or exposing the
+    /// underlying filesystem/error detail.
+    #[test]
+    fn recording_recovery_failed_status_payload_is_fixed_and_content_free() {
+        let json = serde_json::to_string(&recording_recovery_failed_payload("meeting-42")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"stage":"error","message":"Recording recovery cleanup was incomplete.","meetingId":"meeting-42"}"#
+        );
+        assert!(!json.contains("/"));
+    }
 
     /// The FE listens on this exact event name; a rename silently drops the live-refresh.
     #[test]

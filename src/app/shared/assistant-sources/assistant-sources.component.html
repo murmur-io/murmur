@@ -1,7 +1,7 @@
-<div class="src-block" aria-label="Źródła">
+<div class="src-block" aria-label="Sources">
   <div class="src-head">
     <span class="src-ico" aria-hidden="true">🔗</span>
-    <span class="src-title">Źródła</span>
+    <span class="src-title">Sources</span>
     <span class="count">{{ sources().length }}</span>
   </div>
 
@@ -48,9 +48,9 @@
       [attr.aria-expanded]="expanded()"
     >
       @if (expanded()) {
-        Pokaż mniej
+        Show fewer
       } @else {
-        Pokaż wszystkie ({{ sources().length }})
+        Show all ({{ sources().length }})
       }
     </button>
   }

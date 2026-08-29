@@ -39,6 +39,7 @@ use crate::storage::models::{ContainerRow, ItemKind, ItemRow};
 /// sidebar; touching it would abort the write. The path prefix is belt-and-braces for any future
 /// machine-owned container that forgets to pick a distinct kind.
 const USER_CONTAINER_KINDS: &str = "('meeting','note')";
+const SYSTEM_PATH_ROOT: &str = ".murmur";
 const SYSTEM_PATH_PREFIX: &str = ".murmur/%";
 
 /// SQL predicate: the `folders` row aliased `alias` is a container this reader RENDERS.
@@ -51,6 +52,7 @@ const SYSTEM_PATH_PREFIX: &str = ".murmur/%";
 fn renderable_container(alias: &str) -> String {
     format!(
         "COALESCE({alias}.kind, 'meeting') IN {USER_CONTAINER_KINDS}
+         AND {alias}.path <> '{SYSTEM_PATH_ROOT}'
          AND {alias}.path NOT LIKE '{SYSTEM_PATH_PREFIX}'"
     )
 }

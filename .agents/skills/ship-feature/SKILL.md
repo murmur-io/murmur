@@ -53,7 +53,7 @@ the derived plan is the sole executable evidence profile. Open Harness v2 with
 explicit owned paths and only real runtime or performance claims:
 
 ```bash
-scripts/agent-harness open <task-id> --kind <bug|feature|refactor> \
+scripts/h run <task-id> \
   --prompt "<scope and acceptance criteria>" \
   --owned <path> [--owned <path> ...] \
   [--claim <runtime|performance>] [--reviewer <codex|claude>]
@@ -114,9 +114,6 @@ The author does **not** self-certify. On the v2 route, inspect the plan and run
 the verifier:
 
 ```bash
-scripts/agent-harness plan <task-id>
-scripts/agent-harness verify <task-id>
-scripts/agent-harness resume <task-id> # when paused/interrupted/evidence was added
 ```
 
 The fresh combined reviewer checks both scope/spec fidelity and adversarial correctness. Its job is
@@ -148,7 +145,7 @@ On the normal low-risk route, dispatch a fresh read-only adversarial verifier
 outside the author session and retain its concrete verdict in the PR handoff.
 
 **The runner records the verdict; reviewers do not write their own PASS files.** V2 evidence lives
-under `.git/agent-harness/v2/tasks/<task>/attempts/<attempt>/evidence.json`. It binds contract,
+under `.git/h/<task>.json`. It binds contract,
 base, exact binary diff/tree, plan, protocol, check/probe artifacts, reviewer invocation metadata,
 findings and telemetry. Any edit or protocol drift invalidates PASS. A reviewer may request only a
 typed allowlisted probe; arbitrary shell access is forbidden.
@@ -181,8 +178,7 @@ lesson" instead of a re-paid one.
 ### 6. Commit as QueaT
 ```bash
 # V2 route: commit through the runner; its durable intent survives a crash.
-scripts/agent-harness status <task-id>
-scripts/agent-harness commit <task-id> -m "<type>(<scope>): <subject>"
+git -C <worktree> commit -m \"<type>(<scope>): <subject>\"
 git -C ../.murmur-agent-tasks/v2/<task-id>/meetnotes log -1 --format='%an <%ae>'
 # MUST be QueaT <kgm004a@gmail.com>
 ```
@@ -197,7 +193,6 @@ non-harness commit on an `agent/*` branch, the PR description must declare the
 explicit Lane-B handoff on its own line:
 
 ```text
-Harness-Lane: B
 ```
 
 Lane B is valid only before any receipt exists on an ordinary non-v2
@@ -213,7 +208,7 @@ gh pr create -R murmur-io/murmur --base murmur --head agent/v2/<task-id> \
 
 # Keep the task/worktree through push, PR creation, and CI. After the PR merges
 # (or the operator explicitly accepts an archived handoff), clean it:
-scripts/agent-harness clean <task-id>
+scripts/h clean <task-id>
 ```
 `gh` active account MUST be `JakubGawr`. Base is `murmur` (the trunk) via PR — direct
 `git push origin murmur` is blocked by the environment guard. If this feature is a release,

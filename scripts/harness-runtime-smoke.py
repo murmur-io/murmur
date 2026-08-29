@@ -804,7 +804,7 @@ def launch_guarded(
     child_start_deadline: float,
     inherited_fds: Iterable[int] = (),
 ) -> GuardedProcess:
-    guardian_path = root / ".agents" / "harness" / "process_guardian.py"
+    guardian_path = root / ".agents" / "h" / "process_guardian.py"
     if not guardian_path.is_file():
         raise RuntimeError("the pinned process guardian is missing")
     inherited = tuple(inherited_fds)

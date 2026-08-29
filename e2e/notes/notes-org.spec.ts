@@ -264,6 +264,7 @@ test("selecting the org chip shows ONLY that org's items", async ({ page }) => {
   // Select the org chip → the pane scopes to its items only.
   await page.locator(".org-chip", { hasText: "Siema" }).click();
   await expect(page.locator(".content-title")).toHaveText("Siema");
+  await expect(page.locator(".organize-btn")).toHaveCount(0);
   await expect(
     page.locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" }),
   ).toHaveCount(1);
@@ -271,6 +272,62 @@ test("selecting the org chip shows ONLY that org's items", async ({ page }) => {
   await expect(page.getByText("My First Note")).toHaveCount(0);
 
   expect(consoleErrors).toEqual([]);
+});
+
+test("switching to a Shared Brain invalidates a pending All Notes organize plan", async ({
+  page,
+}) => {
+  await mockNotes(page, {
+    ...ORG_MOCKS,
+    plan_organize_notes: () =>
+      new Promise((resolve) => {
+        (
+          globalThis as unknown as {
+            __releaseStaleNotesPlan?: () => void;
+          }
+        ).__releaseStaleNotesPlan = () =>
+          resolve({
+            scopeFolderId: null,
+            moves: [
+              {
+                noteId: "n1",
+                title: "STALE ALL NOTES PLAN",
+                fromFolderId: "nf1",
+                fromFolder: "Notes",
+                toFolder: "Ideas",
+                toFolderId: null,
+                reason: "STALE ALL NOTES REASON",
+                confidence: "high",
+              },
+            ],
+            totalScanned: 1,
+            alreadyOrganized: 0,
+            deferred: 0,
+            targets: [],
+          });
+      }),
+  });
+  await page.goto("/notes");
+  await page.locator(".organize-btn").click();
+  await expect(page.locator(".organize-btn")).toContainText("Planning");
+
+  await page.locator(".org-chip", { hasText: "Siema" }).click();
+  await expect(page.locator(".content-title")).toHaveText("Siema");
+  await page.evaluate(() => {
+    (
+      globalThis as unknown as { __releaseStaleNotesPlan?: () => void }
+    ).__releaseStaleNotesPlan?.();
+  });
+
+  await expect(
+    page.getByRole("dialog", { name: "Review the auto-organize plan" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("STALE ALL NOTES PLAN", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("STALE ALL NOTES REASON", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("a long org name truncates with an ellipsis, not a hard clip (matches .title-text/.note-author)", async ({

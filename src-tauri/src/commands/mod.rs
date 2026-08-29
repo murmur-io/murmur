@@ -15,8 +15,8 @@ use crate::storage::models::{
     CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo, EntityDetail,
     EntityDossierResult, Folder, FolderNode, FullGraphData, FullGraphOpts, GraphData, Meeting,
     MeetingActionSummary, MeetingStatus, MeetingTimeline, NoteAssistRequest, NoteAssistResult,
-    NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, OrganizeMove, OrganizePlan,
-    PeopleList, PinResult, PropertyKind, PropertySchemaField, SearchHit, TopicThread, TypedNoteRow,
+    NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, PeopleList, PinResult,
+    PropertyKind, PropertySchemaField, SearchHit, TopicThread, TypedNoteRow,
 };
 use crate::storage::Db;
 use crate::transcribe::types::Segment;
@@ -174,6 +174,12 @@ pub use meetings_commands::*;
 mod notes_commands;
 pub use notes_commands::*;
 
+// Review-first, bounded note filing. Kept separate from CRUD so its provider admission, exact
+// decision protocol and partial-apply receipt can be audited as one unit.
+#[path = "note_organize.rs"]
+mod note_organize_commands;
+pub use note_organize_commands::*;
+
 // Canonical note-image attachments: gated binary CRUD + validation and the shared bundle seam.
 #[path = "attachments.rs"]
 mod attachment_commands;
@@ -219,6 +225,14 @@ pub use lock_commands::*;
 #[path = "org.rs"]
 mod org_commands;
 pub use org_commands::*;
+
+// SHARED CONTAINERS — publishing a whole Folder or Space to an org (2026-08-29). A sibling of
+// `org_commands` rather than more of it: a container manifest has no local meeting/document id, so
+// it cannot ride the `org_shares` logical key every helper in that file is built around, and
+// `org.rs` is already a 12k-line god-file. The gate ORDER is identical (sealed refusal → consent →
+// scrub → journal-before-socket → seal + local open-verify → size cap → content-free ledger).
+pub(crate) mod org_containers;
+pub use org_containers::*;
 
 // DOCUMENT-INGEST command surface (upload/import/list/read/delete of brain `documents` — a GATED
 // domain: every write WRITE-GATES the folder + re-checks the gate before the plaintext INSERT, every
@@ -366,21 +380,24 @@ pub struct StartResult {
 #[serde(rename_all = "camelCase")]
 pub struct StopResult {
     pub meeting_id: String,
-    pub markdown: String,
-    /// Path of the exported Obsidian `.md`, or `None` when no vault is configured (the note
-    /// is still saved to the DB — the vault is export-only).
-    pub exported_path: Option<String>,
 }
 
-/// Final IPC content gate after a long pipeline await. A result may own a plaintext markdown copy
-/// even though screen-share/manual relock has already blanked the canonical rows and revoked every
-/// reader. Recheck under the short lock lifecycle guard immediately before building the DTO; never
-/// let the cached copy cross Tauri IPC after revocation.
+/// Final IPC visibility gate after a long pipeline await. Terminal command DTOs are content-free,
+/// and callers drop their pipeline markdown/path before this seam; the remaining meeting id still
+/// must not announce a navigable success after screen-share/manual relock has revoked every reader.
+/// Recheck under the short lock lifecycle guard immediately before emitting/returning success.
 pub(crate) fn ensure_post_await_result_visible(
     state: &AppState,
     meeting_id: &str,
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    ensure_post_await_result_visible_under_lifecycle(state, meeting_id)
+}
+
+fn ensure_post_await_result_visible_under_lifecycle(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
     if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting was relocked before its result could be shown — unlock it to view the note"
@@ -388,6 +405,43 @@ pub(crate) fn ensure_post_await_result_visible(
         ));
     }
     Ok(())
+}
+
+/// True outer success boundary for command-owned post-pipeline results. A manual/screen-share
+/// relock can win while the detached pipeline or an awaited command tail is finishing; run the
+/// final content gate first so another renderer never receives a false `finalized` before this
+/// command returns `Locked`.
+pub(crate) fn emit_recording_finalized_after_visibility<N>(
+    state: &AppState,
+    notifier: &N,
+    meeting_id: &str,
+) -> Result<(), AppError>
+where
+    N: crate::events::RecordingTerminalNotifier,
+{
+    // Keep the gate and event in one lifecycle interval. If relock wins first this refuses without
+    // emitting; if this wins first, the success event is linearized before that later relock.
+    let _lifecycle = lifecycle_guard(state);
+    ensure_post_await_result_visible_under_lifecycle(state, meeting_id)?;
+    notifier.recording_finalized(meeting_id);
+    Ok(())
+}
+
+/// Detached Stop's single true-success boundary. The owner reaches this only after the pipeline
+/// and model-retirement tail have both completed, then atomically revalidates visibility, emits the
+/// content-free terminal event and constructs the content-free IPC result.
+fn complete_stop_after_visibility<N>(
+    state: &AppState,
+    notifier: &N,
+    meeting_id: &str,
+) -> Result<StopResult, AppError>
+where
+    N: crate::events::RecordingTerminalNotifier,
+{
+    emit_recording_finalized_after_visibility(state, notifier, meeting_id)?;
+    Ok(StopResult {
+        meeting_id: meeting_id.to_string(),
+    })
 }
 
 /// Optimistic authorization token for work that derives a result from one or more visible content
@@ -496,9 +550,10 @@ pub(crate) fn capture_meeting_content_snapshot(
 ) -> Result<MeetingContentSnapshot, AppError> {
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it and retry".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it and retry",
+            )));
     }
     Ok(MeetingContentSnapshot {
         folder_id: state.db.folder_for_meeting(meeting_id)?,
@@ -1148,7 +1203,12 @@ impl Drop for RecordingStartGuard<'_> {
 pub async fn start_recording(
     app: AppHandle,
     state: State<'_, AppState>,
+    folder_id: Option<String>,
 ) -> Result<StartResult, AppError> {
+    // Reject a forged/missing/system/sealed/closing destination before setting even the transient
+    // `recording_starting` flag or stopping any listener/model. Session unlock is deliberately
+    // irrelevant: active recording content is plaintext, so every ancestor must be open on disk.
+    ensure_recording_folder_target(&state.db, folder_id.as_deref())?;
     // Reject if a recording is already in progress.
     {
         let recorder = state
@@ -1305,10 +1365,15 @@ pub async fn start_recording(
     // the note's managed title + link. Local time (matches how the user experiences "when").
     let provisional_title = provisional_meeting_title(&chrono::Local::now());
 
+    // Same lock order as the lock/share commands. The first check above makes invalid starts
+    // side-effect-free; this authoritative check closes reparent/lock/closure races after the long
+    // model-quiescence awaits and stays held through the canonical meeting insert.
+    let _org_mutation = state.org_share_mutation_lock.lock().await;
     let _recording_lifecycle = state
         .lifecycle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ensure_recording_folder_target(&state.db, folder_id.as_deref())?;
 
     // The optimistic check above intentionally happens before the listener-stop await, but it is
     // same lifecycle exclusion used by install/delete, before creating the meeting row or any
@@ -1348,16 +1413,19 @@ pub async fn start_recording(
     // (`Db::reconcile_stuck_recordings`, called from `lib.rs` setup) so it never lingers as a
     // "still recording" ghost. Full audio salvage of the abandoned capture is tracked separately
     // (mic-spill task).
-    state.db.insert_meeting(&Meeting {
-        id: meeting_id.clone(),
-        started_at,
-        ended_at: None,
-        title: Some(provisional_title),
-        duration_s: 0,
-        audio_path: None,
-        status: MeetingStatus::Recording,
-        folder_id: None,
-    })?;
+    insert_recording_meeting_under_guards(
+        state.inner(),
+        &Meeting {
+            id: meeting_id.clone(),
+            started_at,
+            ended_at: None,
+            title: Some(provisional_title),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: folder_id.clone(),
+        },
+    )?;
     let mut start_guard = RecordingStartGuard {
         db: &state.db,
         meeting_id: meeting_id.clone(),
@@ -1600,10 +1668,11 @@ fn signed_instant_offset_micros(
     }
 }
 
-/// Stop capture, then run the full pipeline (pipeline::run_after_stop). Returns the exported note
-/// path + markdown. `companion_flush_completed` is an optional FE durability witness: only explicit
-/// `Some(true)` permits deletion of an empty companion stub; missing/false preserves it. Emits
-/// status events throughout. Errors if not recording.
+/// Stop capture, then run the full pipeline (pipeline::run_after_stop). Returns only the opaque
+/// meeting id; the FE hydrates the exact note through the gated detail reader after `finalized`.
+/// `companion_flush_completed` is an optional FE durability witness: only explicit `Some(true)`
+/// permits deletion of an empty companion stub; missing/false preserves it. Emits status events
+/// throughout. Errors if not recording.
 #[tauri::command]
 pub async fn stop_recording(
     app: AppHandle,
@@ -1616,8 +1685,6 @@ pub async fn stop_recording(
     ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
     Ok(StopResult {
         meeting_id: result.meeting_id,
-        markdown: result.markdown,
-        exported_path: result.exported_path,
     })
 }
 
@@ -1685,8 +1752,6 @@ fn launch_recording_stop_flight(
             let outcome = match owner.await {
                 Ok(Ok(result)) => Ok(crate::state::RecordingStopResult {
                     meeting_id: result.meeting_id,
-                    markdown: result.markdown,
-                    exported_path: result.exported_path,
                 }),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(format!("recording Stop task crashed: {error}")),
@@ -2135,7 +2200,12 @@ async fn stop_recording_owner(
             duration_s,
             Some(recording_model_token),
         )
-        .await;
+        .await
+        // The pipeline result owns generated markdown + an exported vault path. From this point the
+        // Stop owner needs only the opaque id, so consume/drop those fields BEFORE the up-to-32s
+        // model-quiescence/sidecar tail. A relock during that await must not leave cached plaintext
+        // reachable from the detached owner task.
+        .map(|result| result.meeting_id);
         let lifecycle_result = match model_session
             .wait_for_quiescence_async(std::time::Duration::from_secs(30))
             .await
@@ -2173,14 +2243,13 @@ async fn stop_recording_owner(
         if result.is_ok() {
             restart_voice_listener(task_app.clone());
         }
-        let result = result?;
-        Ok(StopResult {
-            meeting_id: result.meeting_id,
-            markdown: result.note_markdown,
-            exported_path: result
-                .exported_path
-                .map(|path| path.to_string_lossy().to_string()),
-        })
+        let meeting_id = result?;
+        // `saved`/`done` are pipeline progress: the file-backed generation may still be retiring
+        // and the postprocess model session may still be draining when they fire. This is the one
+        // true success boundary, after BOTH `run_file_backed` and lifecycle finish succeeded.
+        // Keep it inside the detached owner so a reloaded WebView can recover via the event even
+        // when the original Stop invoke Promise no longer exists.
+        complete_stop_after_visibility(state.inner(), &task_app, &meeting_id)
     });
     await_pipeline_task(stop_task).await
 }
@@ -2526,9 +2595,10 @@ pub(crate) fn update_note_inner_with(
     // plaintext markdown is blanked while sealed, so an edit here would overwrite the (sealed)
     // content with the blanked value and corrupt it. Fail closed.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to edit the note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to edit the note",
+            )));
     }
     let existing = state
         .db
@@ -2638,9 +2708,10 @@ pub(crate) fn save_manual_notes_inner(
     // concurrent relock/seal cannot land between the unlock check and the buffer write.
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to edit your notes".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to edit your notes",
+            )));
     }
     // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh buffer into
     // `manual_notes_blob` in the same write; open/rootless takes the plain update. Fail-closed on a
@@ -2729,9 +2800,10 @@ fn resolve_conversion_template(
             saved: Some(saved),
         });
     }
-    Err(AppError::InvalidArg(
-        "the selected note template no longer exists".into(),
-    ))
+    Err(AppError::InvalidArg(crate::errcode::tag(
+        crate::errcode::NOTE_TEMPLATE_MISSING,
+        "the selected note template no longer exists",
+    )))
 }
 
 /// Compose a generated conversion into the companion note without ever replacing user-authored
@@ -2748,9 +2820,10 @@ fn compose_converted_companion_markdown(
     let (generated_yaml, generated_body) = crate::storage::db::split_front_matter(generated);
     let generated_body = generated_body.trim();
     if generated_body.is_empty() {
-        return Err(AppError::Unavailable(
-            "the note provider returned an empty note".into(),
-        ));
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::NOTE_PROVIDER_EMPTY,
+            "the note provider returned an empty note",
+        )));
     }
     if generated_body.contains(CONVERTED_NOTE_START) || generated_body.contains(CONVERTED_NOTE_END)
     {
@@ -2863,19 +2936,22 @@ fn conversion_destination_under_lifecycle(
         .into_iter()
         .find(|container| container.id == id)
         .ok_or_else(|| {
-            AppError::InvalidArg(
-                "the meeting's container is unavailable; move the meeting and retry".into(),
-            )
+            AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::CONTAINER_UNAVAILABLE,
+                "the meeting's container is unavailable; move the meeting and retry",
+            ))
         })?;
     if state.db.org_folder_closure_exists(&id)? {
-        return Err(AppError::Unavailable(
-            "the destination is closing or locked for sharing; retry after reopening it".into(),
-        ));
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::FOLDER_CLOSING,
+            "the destination is closing or locked for sharing; retry after reopening it",
+        )));
     }
     if row.locked && !folder_is_unlocked(state, &id)? {
-        return Err(AppError::Locked(
-            "unlock the meeting's container before converting it to a note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock the meeting's container before converting it to a note",
+        )));
     }
     Ok(ConversionDestination {
         id,
@@ -2899,20 +2975,22 @@ fn reauthorize_conversion_source_under_lifecycle(
         .into_iter()
         .find(|container| container.id == folder_id)
         .ok_or_else(|| {
-            AppError::Unavailable(
-                "the companion note's source container is unavailable; reopen it and retry".into(),
-            )
+            AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::CONTAINER_UNAVAILABLE,
+                "the companion note's source container is unavailable; reopen it and retry",
+            ))
         })?;
     if state.db.org_folder_closure_exists(folder_id)? {
-        return Err(AppError::Unavailable(
-            "the companion note's source container is closing or unavailable; retry after reopening it"
-                .into(),
-        ));
+        return Err(AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::FOLDER_CLOSING,
+            "the companion note's source container is closing or unavailable; retry after reopening it",
+        )));
     }
     if source.locked && !folder_is_unlocked(state, folder_id)? {
-        return Err(AppError::Locked(
-            "unlock the companion note's source container before converting this meeting".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::FOLDER_LOCKED,
+            "unlock the companion note's source container before converting this meeting",
+        )));
     }
     Ok(())
 }
@@ -2923,8 +3001,12 @@ fn reauthorize_conversion_source_under_lifecycle(
 /// later atomic DB transaction.
 struct RemovedConversionExport {
     path: std::path::PathBuf,
+    /// Present only for durable recording-filing snapshots. Ordinary conversion rollback remains
+    /// memory-only and does not need a persisted protection domain.
+    source_folder_id: Option<String>,
     bytes: Zeroizing<Vec<u8>>,
     permissions: std::fs::Permissions,
+    exact: crate::export::ExactFileLink,
 }
 
 #[derive(Default)]
@@ -2933,31 +3015,126 @@ struct RemovedConversionExports {
 }
 
 impl RemovedConversionExports {
-    fn capture_if_present(&mut self, path: &std::path::Path) -> Result<(), AppError> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(AppError::Export(format!(
-                    "could not snapshot converted-note export before filing: {error}"
-                )))
+    fn capture_if_present(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<Option<(u64, [u8; 32])>, AppError> {
+        self.capture_if_present_in_source_folder(path, None)
+    }
+
+    fn capture_if_present_in_source_folder(
+        &mut self,
+        path: &std::path::Path,
+        source_folder_id: Option<&str>,
+    ) -> Result<Option<(u64, [u8; 32])>, AppError> {
+        use sha2::Digest;
+        use std::os::unix::fs::MetadataExt;
+
+        if let Some(removed) = self.files.iter().find(|removed| removed.path == path) {
+            if removed.source_folder_id.as_deref() != source_folder_id {
+                return Err(AppError::Storage(
+                    "one filing source path spans different protection domains".into(),
+                ));
             }
+            return Ok(Some((
+                removed.bytes.len() as u64,
+                sha2::Sha256::digest(removed.bytes.as_slice()).into(),
+            )));
+        }
+        let Some(exact) = crate::export::open_exact_absolute_existing_file(path)? else {
+            return Ok(None);
         };
-        if !metadata.file_type().is_file() {
+        let (bytes, metadata) =
+            exact.read_stable_bytes(crate::export::MAX_MARKER_CLEANUP_NOTE_BYTES)?;
+        if metadata.nlink() != 1 {
             return Err(AppError::Export(
-                "converted-note export is not a regular file".into(),
+                "converted-note export has an unknown hard link".into(),
             ));
         }
-        let bytes = std::fs::read(path).map_err(|error| {
-            AppError::Export(format!(
-                "could not snapshot converted-note export before filing: {error}"
-            ))
-        })?;
+        let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+        let byte_len = bytes.len() as u64;
         self.files.push(RemovedConversionExport {
             path: path.to_path_buf(),
+            source_folder_id: source_folder_id.map(str::to_string),
             bytes: Zeroizing::new(bytes),
             permissions: metadata.permissions(),
+            exact,
         });
+        Ok(Some((byte_len, digest)))
+    }
+
+    fn remove_captured(&self) -> Result<(), AppError> {
+        use sha2::Digest;
+
+        let mut groups =
+            std::collections::HashMap::<(u64, u64), Vec<&RemovedConversionExport>>::new();
+        for removed in &self.files {
+            groups
+                .entry(removed.exact.identity())
+                .or_default()
+                .push(removed);
+        }
+        for files in groups.values() {
+            let first = files.first().ok_or_else(|| {
+                AppError::Storage("conversion export snapshot group is empty".into())
+            })?;
+            if files.iter().any(|file| file.bytes != first.bytes) {
+                return Err(AppError::Export(
+                    "conversion export hardlink group has inconsistent snapshots".into(),
+                ));
+            }
+            let digest: [u8; 32] = sha2::Sha256::digest(first.bytes.as_slice()).into();
+            let links = files.iter().map(|file| &file.exact).collect::<Vec<_>>();
+            crate::export::remove_exact_created_link_refs(
+                &links,
+                first.bytes.len() as u64,
+                &digest,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Persist the complete source projection in SQLCipher before unlinking its exact inode.
+    /// This is the restart authority for the crash window between source removal and the
+    /// canonical filing transaction.
+    fn remove_captured_for_filing(&self, db: &Db, attempt_id: &str) -> Result<(), AppError> {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut source_ids = Vec::with_capacity(self.files.len());
+        for removed in &self.files {
+            let source_id = uuid::Uuid::new_v4().to_string();
+            let source_folder_id = removed.source_folder_id.as_deref().ok_or_else(|| {
+                AppError::Storage("filing source is missing its exact protection domain".into())
+            })?;
+            let path = removed
+                .path
+                .to_str()
+                .ok_or_else(|| AppError::Export("filing source path is not valid UTF-8".into()))?;
+            let parent_identity = removed.exact.parent_identity()?;
+            db.reserve_filing_source(&crate::storage::FilingSourceReservation {
+                attempt_id,
+                source_id: &source_id,
+                source_folder_id,
+                path,
+                bytes: removed.bytes.as_slice(),
+                permissions_mode: removed.permissions.mode(),
+                device: removed.exact.identity().0,
+                inode: removed.exact.identity().1,
+                parent_device: parent_identity.0,
+                parent_inode: parent_identity.1,
+            })?;
+            source_ids.push(source_id);
+        }
+        for (removed, source_id) in self.files.iter().zip(&source_ids) {
+            let digest: [u8; 32] = sha2::Sha256::digest(removed.bytes.as_slice()).into();
+            crate::export::remove_exact_created_link_refs(
+                std::slice::from_ref(&&removed.exact),
+                removed.bytes.len() as u64,
+                &digest,
+            )?;
+            db.mark_filing_source_removed(attempt_id, source_id)?;
+        }
         Ok(())
     }
 
@@ -2965,66 +3142,86 @@ impl RemovedConversionExports {
     /// after removal is never overwritten. Every captured path is attempted even if a sibling was
     /// concurrently replaced, so one rollback conflict cannot strand the rest of the export set.
     fn restore(&self) -> Result<(), AppError> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
 
         let mut failures = Vec::new();
         for removed in &self.files {
             let restore_one = (|| -> Result<(), AppError> {
-                match std::fs::symlink_metadata(&removed.path) {
-                    Ok(metadata) => {
-                        if !metadata.file_type().is_file() {
-                            return Err(AppError::Export(format!(
-                                "refusing to follow a replaced conversion export at {}",
-                                removed.path.display()
-                            )));
-                        }
-                        let current = std::fs::read(&removed.path).map_err(|error| {
+                if removed.exact.is_present()? {
+                    let (current, _) = removed
+                        .exact
+                        .read_stable_bytes(removed.bytes.len() as u64)?;
+                    if current.as_slice() == removed.bytes.as_slice() {
+                        return Ok(());
+                    }
+                    return Err(AppError::Export(format!(
+                        "refusing to overwrite a changed conversion export at {}",
+                        removed.path.display()
+                    )));
+                }
+                let mut restored = removed.exact.create_replacement(0o600)?;
+                let restore = (|| -> Result<(), AppError> {
+                    restored
+                        .file_mut()
+                        .write_all(&removed.bytes)
+                        .and_then(|()| {
+                            restored
+                                .file_mut()
+                                .set_permissions(removed.permissions.clone())
+                        })
+                        .and_then(|()| restored.file_mut().sync_all())
+                        .map_err(|error| {
                             AppError::Export(format!(
-                                "could not verify a concurrently restored conversion export: {error}"
+                                "could not write conversion export rollback: {error}"
                             ))
                         })?;
-                        if current.as_slice() == removed.bytes.as_slice() {
-                            return Ok(());
-                        }
-                        return Err(AppError::Export(format!(
-                            "refusing to overwrite a changed conversion export at {}",
-                            removed.path.display()
-                        )));
+                    restored
+                        .file_mut()
+                        .seek(SeekFrom::Start(0))
+                        .map_err(|error| {
+                        AppError::Export(format!(
+                            "could not seek conversion export rollback: {error}"
+                        ))
+                    })?;
+                    let mut readback = Vec::with_capacity(removed.bytes.len());
+                    restored
+                        .file_mut()
+                        .read_to_end(&mut readback)
+                        .map_err(|error| {
+                        AppError::Export(format!(
+                            "could not read back conversion export rollback: {error}"
+                        ))
+                    })?;
+                    let metadata = restored.file_mut().metadata().map_err(|error| {
+                        AppError::Export(format!(
+                            "could not stat conversion export rollback: {error}"
+                        ))
+                    })?;
+                    if metadata.dev() != restored.identity().0
+                        || metadata.ino() != restored.identity().1
+                        || metadata.nlink() != 1
+                        || readback.as_slice() != removed.bytes.as_slice()
+                    {
+                        return Err(AppError::Export(
+                            "conversion export rollback failed exact readback".into(),
+                        ));
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(AppError::Export(format!(
-                            "could not inspect conversion export rollback target: {error}"
-                        )))
-                    }
+                    restored.sync_parent()
+                })();
+                if let Err(original) = restore {
+                    return Err(match crate::export::remove_exact_created_link(&restored, 1) {
+                        Ok(()) => original,
+                        Err(cleanup) => match restored.scrub_attempt_owned_plaintext() {
+                            Ok(()) => AppError::Storage(format!(
+                                "{original}; conversion restore unlink refused ({cleanup}); retained inode scrubbed"
+                            )),
+                            Err(scrub) => AppError::Storage(format!(
+                                "{original}; conversion restore cleanup failed: {cleanup}; retained-inode scrub failed: {scrub}"
+                            )),
+                        },
+                    });
                 }
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&removed.path)
-                    .map_err(|error| {
-                        AppError::Export(format!(
-                            "could not recreate conversion export during rollback: {error}"
-                        ))
-                    })?;
-                file.write_all(&removed.bytes).map_err(|error| {
-                    AppError::Export(format!(
-                        "could not write conversion export rollback: {error}"
-                    ))
-                })?;
-                file.set_permissions(removed.permissions.clone())
-                    .map_err(|error| {
-                        AppError::Export(format!(
-                            "could not restore conversion export permissions: {error}"
-                        ))
-                    })?;
-                file.sync_all().map_err(|error| {
-                    AppError::Export(format!(
-                        "could not sync conversion export rollback: {error}"
-                    ))
-                })?;
                 Ok(())
             })();
             if let Err(error) = restore_one {
@@ -3042,11 +3239,17 @@ impl RemovedConversionExports {
     }
 }
 
-fn attachment_export_twin_path(
-    path: &std::path::Path,
-    attachment_id: &str,
-) -> std::path::PathBuf {
+fn attachment_export_twin_path(path: &std::path::Path, attachment_id: &str) -> std::path::PathBuf {
     path.with_file_name(format!(".{attachment_id}.murmur.tmp"))
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn remove_converted_companion_exports_before_rehome(
@@ -3055,44 +3258,38 @@ fn remove_converted_companion_exports_before_rehome(
     attachments: &[crate::storage::AttachmentRecord],
 ) -> Result<RemovedConversionExports, AppError> {
     let expected = state.db.get_note_doc_exported_hash(&row.id)?;
-    if let Some(path) = row.exported_path.as_deref() {
-        verify_note_export_unchanged(
-            path,
-            expected.as_deref(),
-            "verify converted-note export before filing",
-        )?;
-    }
-    verify_attachment_exports(
-        attachments,
-        "could not verify an exported image before filing the converted note",
-    )?;
     let mut removed = RemovedConversionExports::default();
     if let Some(path) = row.exported_path.as_deref() {
-        removed.capture_if_present(std::path::Path::new(path))?;
+        if let (Some(expected), Some((_, digest))) = (
+            expected.as_deref(),
+            removed.capture_if_present(std::path::Path::new(path))?,
+        ) {
+            if digest_hex(&digest) != expected {
+                return Err(AppError::Export(
+                    "converted-note export changed before exact capture".into(),
+                ));
+            }
+        }
     }
     for attachment in attachments {
         let Some(path) = attachment.exported_path.as_deref() else {
             continue;
         };
         let path = std::path::Path::new(path);
-        removed.capture_if_present(path)?;
-        removed.capture_if_present(&attachment_export_twin_path(path, &attachment.id))?;
-    }
-    if let Some(path) = row.exported_path.as_deref() {
-        if let Err(error) = remove_note_export_if_unchanged(
-            path,
-            expected.as_deref(),
-            "remove converted-note export before filing",
-        ) {
-            return match removed.restore() {
-                Ok(()) => Err(error),
-                Err(restore) => Err(AppError::Storage(format!(
-                    "{error}; conversion export rollback also failed: {restore}"
-                ))),
-            };
+        for candidate in [
+            path.to_path_buf(),
+            attachment_export_twin_path(path, &attachment.id),
+        ] {
+            if let Some((byte_len, digest)) = removed.capture_if_present(&candidate)? {
+                if byte_len != attachment.byte_len || digest != attachment.sha256 {
+                    return Err(AppError::Export(
+                        "converted-note attachment export changed before exact capture".into(),
+                    ));
+                }
+            }
         }
     }
-    if let Err(error) = remove_attachment_exports_before_move(attachments) {
+    if let Err(error) = removed.remove_captured() {
         return match removed.restore() {
             Ok(()) => Err(error),
             Err(restore) => Err(AppError::Storage(format!(
@@ -3193,13 +3390,22 @@ fn persist_converted_companion_under_snapshot_with_attachment_verifier(
             );
         }
 
-        if state.db.source_has_active_remote_share(None, Some(&id))?
-            || state.db.folder_has_active_remote_share(&folder_id)?
-            || state.db.folder_has_active_remote_share(&destination.id)?
-        {
-            return Err(AppError::Unavailable(
-                "revoke active shares before filing this converted note".into(),
-            ));
+        // ITEM-scoped, deliberately: the hazard is rewriting the managed block of a note whose OWN
+        // ciphertext is still readable on the relay, which would leave the shared copy diverged from
+        // the canonical one. A share on a SIBLING in either container is not that hazard — the
+        // sibling's server copy is untouched by re-homing a different, unshared note past it. This
+        // used to also ask `folder_has_active_remote_share` for the source AND destination
+        // containers, which made ONE shared note anywhere in a folder refuse "Convert to note" for
+        // EVERY meeting filed there (reported 2026-08-28 against live user data; the refusal
+        // carries no `errcode`, so all the user ever saw was "Please try again"). The folder-wide
+        // question belongs to folder-wide operations — `commands/lock.rs` asks it before SEALING a
+        // container, where every item including the shared one really does change state.
+        // `notes.rs::move_note_to_folder` is the canonical item-scoped precedent.
+        if state.db.source_has_active_remote_share(None, Some(&id))? {
+            return Err(AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::SHARE_ACTIVE,
+                "revoke this note's shares before filing this converted note",
+            )));
         }
 
         let (text_blob, attachment_seals) = if destination.locked {
@@ -3300,6 +3506,12 @@ fn persist_converted_companion_under_snapshot_with_attachment_verifier(
 /// Birth the conversion companion in the meeting's exact destination. For a locked destination the
 /// non-empty body is encrypted and verified BEFORE the one atomic insert; no blob-less plaintext
 /// row and no vault export can exist behind the lock.
+///
+/// There is deliberately NO remote-share guard here. The note being born does not exist yet, so it
+/// cannot have server ciphertext of its own; a share on a SIBLING already in this container is not
+/// affected by a new, unshared note appearing beside it. The update path keeps the item-scoped
+/// check for the case that genuinely matters (rewriting a note whose own copy is still on the
+/// relay).
 fn create_generated_companion_under_lifecycle_authorized(
     state: &AppState,
     meeting_id: &str,
@@ -3321,11 +3533,6 @@ fn create_generated_companion_under_lifecycle_authorized(
         },
         markdown,
     )?;
-    if state.db.folder_has_active_remote_share(&destination.id)? {
-        return Err(AppError::Unavailable(
-            "revoke active shares before creating a converted note in this container".into(),
-        ));
-    }
     let text_blob = if destination.locked {
         Some(sealed_document_blob(state, &destination.id, &id, markdown)?)
     } else {
@@ -3424,9 +3631,10 @@ async fn convert_meeting_to_note_inner_with(
             ))
         })?;
     if segments.is_empty() {
-        return Err(AppError::InvalidArg(
-            "this meeting has no transcript to convert".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::CONVERT_NO_TRANSCRIPT,
+            "this meeting has no transcript to convert",
+        )));
     }
     let selection = resolve_conversion_template(
         template_id.as_deref(),
@@ -3601,8 +3809,8 @@ pub fn get_or_create_companion_note(
 /// Inner of [`get_or_create_companion_note`] taking `&AppState` (unit-testable gate + lazy-create).
 /// Factored OUT of [`append_to_companion_note_inner`] so both the document-first editor mount and the
 /// append path share ONE lazy get-or-create (gate → `companion_note_for_meeting` → else
-/// `create_note_inner(None, meeting_name)` + `set_document_meeting_id` + front-matter `[[Meeting]]`
-/// link). Returns the note id + the display wikilink; writes NO body.
+/// lifecycle-atomic note birth + `set_document_meeting_id` + front-matter `[[Meeting]]` link).
+/// Returns the note id + the display wikilink; writes NO body.
 pub(crate) fn get_or_create_companion_note_inner(
     state: &AppState,
     meeting_id: &str,
@@ -3619,42 +3827,74 @@ pub(crate) fn get_or_create_companion_note_inner(
         ));
     }
 
-    // The meeting's current display title drives the managed note title + the `[[<name>]]` link.
+    let (note_id, meeting_name, created) =
+        companion_note_birth_with_hook(state, meeting_id, |_| {})?;
+    let meeting_wikilink = format!("[[{meeting_name}]]");
+
+    if created {
+        // Stamp the front-matter `meeting: "[[…]]"` link on the fresh (empty) note so the
+        // document-first editor mounts on a note that already carries the link (no body added).
+        if let Some(row) = visible_authored_note_row_snapshot(state, &note_id)? {
+            let new_markdown = compose_companion_markdown(&row.text, &meeting_name, "");
+            update_note_doc_inner(state, &note_id, &meeting_name, &new_markdown)?;
+        }
+        tracing::info!(target: "notes", note_id = %note_id, meeting_id = %meeting_id, "companion note created");
+    }
+
+    Ok(CompanionAppendResult {
+        note_id,
+        meeting_wikilink,
+    })
+}
+
+/// Birth/reuse seam for the structurally linked meeting companion. The callback is a deterministic
+/// concurrency-test observation point after row birth and before the `meeting_id` link is written.
+fn companion_note_birth_with_hook<F>(
+    state: &AppState,
+    meeting_id: &str,
+    after_insert_before_link: F,
+) -> Result<(String, String, bool), AppError>
+where
+    F: FnOnce(&str),
+{
+    // The authoritative meeting gate, placement snapshot, note insert, and structural companion
+    // linkage are one lifecycle interval. In particular, the organizer can never observe a freshly
+    // inserted companion as a movable standalone note between INSERT and `meeting_id` assignment.
+    let lifecycle = lifecycle_guard(state);
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting is locked — unlock it to save a note".into(),
+        ));
+    }
     let Some(meeting) = state.db.get_meeting(meeting_id)? else {
         return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
     };
     let meeting_name = meeting_display_name(meeting.title.as_deref());
-    let meeting_wikilink = format!("[[{meeting_name}]]");
-
-    // GET-OR-CREATE the companion note in the always-open Notes ROOT (folder_id = None). A new
-    // companion note is birthed with the managed title = the meeting name, structurally linked by
-    // `meeting_id`, and its front-matter `[[Meeting]]` link stamped (empty-block compose — no body
-    // is written). `create_note_inner`/`update_note_doc_inner` each hold their own lifecycle guard.
-    let note_id = match state.db.companion_note_for_meeting(meeting_id)? {
-        Some(id) => id,
+    match state.db.companion_note_for_meeting(meeting_id)? {
+        Some(id) => Ok((id, meeting_name, false)),
         None => {
-            let id = create_note_inner(state, None, &meeting_name)?;
+            // A session unlock makes a sealed meeting readable, but it does not make its folder a
+            // safe plaintext birth destination. Recording-created companions are open-at-rest
+            // documents, so refuse locked/closing ancestry before inserting even the empty row.
+            ensure_recording_folder_target(&state.db, meeting.folder_id.as_deref())?;
+            // Recording-start placement is canonical on `meetings.folder_id`, so the companion
+            // inherits it from birth instead of appearing in Unfiled and requiring a second move.
+            let id = create_note_under_lifecycle(
+                state,
+                &lifecycle,
+                meeting.folder_id.as_deref(),
+                &meeting_name,
+            )?;
+            after_insert_before_link(&id);
             state.db.set_document_meeting_id(&id, meeting_id)?;
             // Brain v3 PR-3 — record the structured `companion` edge (note → meeting) alongside the
             // `documents.meeting_id` column, so the link graph carries it beyond the migrate backfill.
             if let Err(e) = state.db.set_companion_link(&id, meeting_id) {
                 tracing::warn!(target: "links", error = %e, "companion link edge failed (note linked)");
             }
-            // Stamp the front-matter `meeting: "[[…]]"` link on the fresh (empty) note so the
-            // document-first editor mounts on a note that already carries the link (no body added).
-            if let Some(row) = visible_authored_note_row_snapshot(state, &id)? {
-                let new_markdown = compose_companion_markdown(&row.text, &meeting_name, "");
-                update_note_doc_inner(state, &id, &meeting_name, &new_markdown)?;
-            }
-            tracing::info!(target: "notes", note_id = %id, meeting_id = %meeting_id, "companion note created");
-            id
+            Ok((id, meeting_name, true))
         }
-    };
-
-    Ok(CompanionAppendResult {
-        note_id,
-        meeting_wikilink,
-    })
+    }
 }
 
 /// Snapshot a visible authored-note row for cross-domain companion helpers. The lifecycle mutex and
@@ -4256,157 +4496,6 @@ fn index_note_body_chunks(
     state.db.index_note_chunks(id, title, &body, embedder)
 }
 
-// ── NOTES — auto-organize (WP5) ──────────────────────────────────────────────────────────────────
-//
-// Two-step, non-destructive. `plan_organize_notes` PROPOSES a target note-folder per visible note
-// (via `organize::classify_subfolder` on the Notes-role provider); `apply_organize_plan` creates
-// the needed note-folders and MOVES notes (reusing the gated `move_note_doc_inner`). The user
-// reviews the plan before applying.
-
-/// Propose folder assignments for the VISIBLE notes (`folder_id = Some` scopes to one note-folder,
-/// `None` = all visible notes). Non-destructive: returns an [`OrganizePlan`] the FE reviews. A note
-/// already correctly filed (proposed folder == its current folder) is SKIPPED.
-#[tauri::command]
-pub async fn plan_organize_notes(
-    state: State<'_, AppState>,
-    folder_id: Option<String>,
-) -> Result<OrganizePlan, AppError> {
-    let visibility = capture_content_visibility_snapshot(state.inner());
-    let config = {
-        state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
-            .clone()
-    };
-    let unlocked = unlocked_snapshot(state.inner())?;
-    let notes = state
-        .db
-        .list_notes_visible(folder_id.as_deref(), &unlocked)?;
-    if notes.is_empty() {
-        return Ok(OrganizePlan { moves: Vec::new() });
-    }
-
-    // The existing note-folder names (for reuse-preference) + a name→id map for resolving toFolderId.
-    let note_folders = state.db.list_note_folders()?;
-    let existing_names: Vec<String> = note_folders.iter().map(|f| f.name.clone()).collect();
-    let name_to_id: std::collections::HashMap<String, String> = note_folders
-        .iter()
-        .map(|f| (f.name.clone(), f.id.clone()))
-        .collect();
-    let id_to_name: std::collections::HashMap<String, String> = note_folders
-        .iter()
-        .map(|f| (f.id.clone(), f.name.clone()))
-        .collect();
-
-    let provider = crate::summarize::provider_for(
-        crate::summarize::roles::Role::Notes,
-        &config,
-        &state.heavy_inference,
-    )?;
-
-    let mut moves = Vec::new();
-    for n in &notes {
-        // The classifier reads the note's TITLE + a body excerpt (the summary passed to
-        // classify_subfolder). The list DTO carries a leak-free snippet already (visible content).
-        let target = crate::summarize::organize::classify_subfolder(
-            provider.as_ref(),
-            &n.title,
-            &n.snippet,
-            &existing_names,
-        )
-        .await;
-        require_current_content_visibility_snapshot(state.inner(), visibility)?;
-        let Some(to_folder) = target else {
-            continue; // model declined / unusable → leave this note where it is.
-        };
-        let from_folder = id_to_name
-            .get(&n.folder_id)
-            .cloned()
-            .unwrap_or_else(|| "Notes".to_string());
-        // Skip a note already filed under the proposed folder (no-op move).
-        if to_folder == from_folder {
-            continue;
-        }
-        let to_folder_id = name_to_id.get(&to_folder).cloned();
-        moves.push(OrganizeMove {
-            note_id: n.id.clone(),
-            title: n.title.clone(),
-            from_folder_id: n.folder_id.clone(),
-            from_folder,
-            to_folder,
-            to_folder_id,
-            reason: "content-based filing".to_string(),
-        });
-    }
-    require_current_content_visibility_snapshot(state.inner(), visibility)?;
-    Ok(OrganizePlan { moves })
-}
-
-/// Apply an auto-organize plan: per move, ensure the target note-folder exists (create it under the
-/// Notes root when `toFolderId` is null), then MOVE the note (reusing the gated `move_note_doc_inner`
-/// — both-sides folder gate + re-export). Non-destructive + best-effort per move (a single failure
-/// logs IDs/stage and continues; the rest still apply). Idempotent on an already-filed note.
-#[tauri::command]
-pub async fn apply_organize_plan(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    plan: OrganizePlan,
-) -> Result<(), AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
-    let may_reduce_visibility = plan.moves.iter().any(|mv| {
-        mv.to_folder_id
-            .as_deref()
-            .and_then(|id| state.db.folder_by_id(id).ok().flatten())
-            .is_some_and(|folder| folder.locked)
-    });
-    if may_reduce_visibility {
-        emit_ask_history_invalidated_fail_closed(&app);
-    }
-    apply_organize_plan_inner(state.inner(), plan)
-}
-
-/// Inner of [`apply_organize_plan`] taking `&AppState`.
-pub(crate) fn apply_organize_plan_inner(
-    state: &AppState,
-    plan: OrganizePlan,
-) -> Result<(), AppError> {
-    // Cache newly-created folder ids by NAME so several notes routed to the same NEW folder create it
-    // exactly once.
-    let mut created: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for mv in &plan.moves {
-        // Resolve or create the target note-folder id.
-        let target_id = if let Some(id) = mv.to_folder_id.as_deref() {
-            // Must still be a note-folder (defensive — the plan could be stale).
-            if state.db.note_folder_by_id(id)?.is_none() {
-                tracing::warn!(target: "notes", "organize: stale target folder id, skipping a move");
-                continue;
-            }
-            id.to_string()
-        } else if let Some(id) = created.get(&mv.to_folder) {
-            id.clone()
-        } else {
-            // Create a new note-folder under the Notes root.
-            match create_note_folder_inner(state, &mv.to_folder, None) {
-                Ok(f) => {
-                    created.insert(mv.to_folder.clone(), f.id.clone());
-                    f.id
-                }
-                Err(e) => {
-                    tracing::warn!(target: "notes", error = %e, "organize: create target folder failed, skipping a move");
-                    continue;
-                }
-            }
-        };
-        // Move the note (gated both sides + re-export). Best-effort per move.
-        if let Err(e) = move_note_doc_inner(state, &mv.note_id, &target_id) {
-            tracing::warn!(target: "notes", note_id = %mv.note_id, error = %e, "organize: move failed");
-        }
-    }
-    tracing::info!(target: "notes", moves = plan.moves.len(), "organize plan applied");
-    Ok(())
-}
-
 // ── CROSS-MEETING USER MEMORY (Phase 3) ────────────────────────────────────────
 //
 // The auditable "what the brain knows about you" surface: list the current user-scoped memory facts
@@ -4939,9 +5028,10 @@ fn meeting_provider_inputs_under_lifecycle(
         }
         None => {
             if !meeting_is_unlocked(state, meeting_id)? {
-                return Err(AppError::Locked(
-                    "this meeting's folder is locked — unlock it and retry".into(),
-                ));
+                return Err(AppError::Locked(crate::errcode::tag(
+                        crate::errcode::MEETING_LOCKED,
+                        "this meeting's folder is locked — unlock it and retry",
+                    )));
             }
             MeetingContentSnapshot {
                 folder_id: state.db.folder_for_meeting(meeting_id)?,
@@ -5145,9 +5235,10 @@ pub fn get_action_items(
     // D4 READ-GATE: a sealed-and-not-unlocked meeting's note markdown is blanked; refuse to parse
     // action items from it (would silently return none / leak a stale plaintext). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to see action items".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to see action items",
+            )));
     }
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
     Ok(match note {
@@ -5188,9 +5279,10 @@ pub fn pin_moment(
     // markdown is blanked, so appending a pin would persist the blanked value over the sealed
     // content AND re-export a plaintext `.md`. Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to pin a moment".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to pin a moment",
+            )));
     }
     let existing = state
         .db
@@ -6667,6 +6759,36 @@ pub fn get_mcp_config(state: State<'_, AppState>) -> Result<String, AppError> {
     get_mcp_config_inner(state.inner())
 }
 
+/// What Settings must say about the local server for Claude, instead of asserting it is running.
+///
+/// Serialized keys are camelCase and asserted by a test (`rust-tauri.md` §2b): the FE reads
+/// `state` and `port`, and a snake_case field here would arrive as `undefined` and silently render
+/// the healthy branch — the exact failure this command exists to prevent.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatusDto {
+    /// `starting` | `listening` | `portInUse` | `unavailable`.
+    pub state: String,
+    /// The fixed loopback port, so the copy can name it without hardcoding it twice.
+    pub port: u16,
+}
+
+/// The listener's REAL state. Settings used to claim, in the present tense, that the server was
+/// running at `127.0.0.1:8765` and hand over a config to paste — with no way to find out that the
+/// bind had failed. Reads the status the listener thread publishes; a missing handle (the probe
+/// process that never starts MCP) reports `unavailable` rather than pretending.
+#[tauri::command]
+pub fn get_mcp_status(app: AppHandle) -> McpStatusDto {
+    let state = app
+        .try_state::<std::sync::Arc<crate::mcp::McpListenerStatus>>()
+        .map(|handle| handle.get())
+        .unwrap_or(crate::mcp::McpListenerState::Unavailable);
+    McpStatusDto {
+        state: state.as_wire().to_string(),
+        port: crate::mcp::MCP_PORT,
+    }
+}
+
 /// Headless core of [`get_mcp_config`] — testable without a Tauri `State`.
 pub(crate) fn get_mcp_config_inner(state: &AppState) -> Result<String, AppError> {
     // Read the flag the same way lib.rs does: fail CLOSED (require the token) on a poisoned lock,
@@ -7341,9 +7463,10 @@ pub async fn resummarize(
     // meeting that would (a) feed a cloud provider blank text and (b) leave plaintext markdown +
     // a vault `.md` in a locked folder. Fail closed — the FE must unlock first.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to re-summarize".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to re-summarize",
+            )));
     }
     // DETACHED, panic-mapped execution (the same #346 pattern as `stop_recording`): awaited
     // INLINE, a panic inside `resummarize_existing` would leave the invoke Promise unsettled
@@ -7360,6 +7483,10 @@ pub async fn resummarize(
         pipeline::resummarize_existing(&task_app, &state, &task_meeting_id).await
     });
     let result = await_pipeline_task(resummarize_task).await?;
+    // The org tail and final visibility gate need only identity. Drop generated markdown/export
+    // path before either await/relock window; the gated detail reader is the sole content channel.
+    let result_meeting_id = result.meeting_id.clone();
+    drop(result);
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
     // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
     // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
@@ -7370,13 +7497,9 @@ pub async fn resummarize(
     {
         crate::events::emit_org_feed_updated(&app, 1);
     }
-    ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
+    emit_recording_finalized_after_visibility(state.inner(), &app, &result_meeting_id)?;
     Ok(StopResult {
-        meeting_id: result.meeting_id,
-        markdown: result.note_markdown,
-        exported_path: result
-            .exported_path
-            .map(|p| p.to_string_lossy().to_string()),
+        meeting_id: result_meeting_id,
     })
 }
 
@@ -7422,15 +7545,13 @@ pub async fn retry_transcription(
         result
     });
     let result = await_pipeline_task(pipeline_task).await?;
+    // Discard the pipeline's cached markdown/export path before the final lock gate.
+    let result_meeting_id = result.meeting_id.clone();
+    drop(result);
 
-    ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
-
+    emit_recording_finalized_after_visibility(state.inner(), &app, &result_meeting_id)?;
     Ok(StopResult {
-        meeting_id: result.meeting_id,
-        markdown: result.note_markdown,
-        exported_path: result
-            .exported_path
-            .map(|p| p.to_string_lossy().to_string()),
+        meeting_id: result_meeting_id,
     })
 }
 
@@ -7465,9 +7586,10 @@ pub(crate) fn retry_transcription_prep(
     let _lifecycle = lifecycle_guard(state);
     // Lock gate: never re-pipeline (or decrypt) a sealed-and-not-session-unlocked meeting.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to retry transcription".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to retry transcription",
+            )));
     }
     reconcile_released_generation_cleanup(state, meeting_id)?;
     if state
@@ -7695,7 +7817,7 @@ pub struct ReindexResult {
     pub total: usize,
 }
 
-/// "Powiązane wg znaczenia": the up-to-5 meetings most semantically similar to `meeting_id`.
+/// "Related by meaning": the up-to-5 meetings most semantically similar to `meeting_id`.
 ///
 /// GATING: routes through `Db::related_meetings_visible`, which re-embeds the meeting's OWN plaintext
 /// chunks into a centroid and runs the gated `search_semantic_visible` (visibility_clause) — a
@@ -8235,17 +8357,1571 @@ fn ensure_meeting_folder_target(
     Ok(())
 }
 
-/// Move a note into a folder (or to the root with `folder_id = None`).
-///
-/// Three cases by TARGET:
-/// - **open / root:** if the note has an exported `.md` the file is moved on disk (copy-then-remove,
-///   best-effort, never loses bytes).
-/// - **locked + SESSION-UNLOCKED (CK available):** reassign, then SEAL the moved note to the
-///   folder's at-rest sealed shape (encrypt markdown/transcript/timeline into blobs, blank the
-///   plaintext, remove the vault `.md`, encrypt the WAV) so plaintext never lands in a locked
-///   folder (BLK-2). Verify-before-destroy throughout.
-/// - **locked + NOT session-unlocked:** REJECTED with [`AppError::Locked`] — there is no CK to seal
-///   with, so we refuse rather than leave plaintext in a locked folder. The FE must unlock first.
+/// Recording placement is stricter than an ordinary reviewed move: active audio/transcript is
+/// plaintext, so a raw `locked=1` target or ancestor is refused even when session-unlocked.
+fn ensure_recording_folder_target(
+    db: &crate::storage::db::Db,
+    folder_id: Option<&str>,
+) -> Result<(), AppError> {
+    if let Some(folder_id) = folder_id {
+        let containers = db.list_containers()?;
+        let selected = containers
+            .iter()
+            .find(|row| row.id == folder_id)
+            .ok_or_else(|| {
+                AppError::InvalidArg("the destination is not a user Space or folder".into())
+            })?;
+        // `kind` is a legacy creation namespace, not a content capability: both meeting and note
+        // folders accept recordings in the unified hierarchy. The reserved Notes home may be an
+        // ancestor of a valid note folder, but it is structural and must never be selected itself.
+        if selected.is_root || !matches!(selected.kind.as_str(), "meeting" | "note") {
+            return Err(AppError::InvalidArg(
+                "the destination is not a selectable user Space or folder".into(),
+            ));
+        }
+        ensure_open_recording_container_chain(db, folder_id)?;
+    }
+    Ok(())
+}
+
+/// Recording placement normally terminates at a user Space. Legacy databases whose hierarchy
+/// adoption was declined may instead have the exact storage-owned canonical Notes root parentless;
+/// its note-folder descendants remain valid, but the root itself and arbitrary roots never are.
+fn ensure_open_recording_container_chain(
+    db: &crate::storage::db::Db,
+    container_id: &str,
+) -> Result<(), AppError> {
+    let containers = db.list_containers()?;
+    let canonical_notes_root_id = db.note_root_id()?;
+    let by_id = containers
+        .iter()
+        .map(|row| (row.id.as_str(), row))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut cursor = Some(container_id);
+    let mut seen = std::collections::HashSet::new();
+    let mut reached_allowed_root = false;
+    while let Some(id) = cursor {
+        if !seen.insert(id.to_string()) {
+            return Err(AppError::InvalidArg(
+                "the destination hierarchy contains a parent cycle".into(),
+            ));
+        }
+        let row = by_id.get(id).ok_or_else(|| {
+            AppError::InvalidArg("the destination is not a user Space or folder".into())
+        })?;
+        if row.locked {
+            return Err(AppError::Locked(
+                "the destination or one of its parents is locked".into(),
+            ));
+        }
+        if db.org_folder_closure_exists(id)? {
+            return Err(AppError::Unavailable(
+                "the destination or one of its parents is closing for sharing".into(),
+            ));
+        }
+        if row.parent_id.is_none() {
+            let user_space = row.level == LEVEL_PROJECT && row.kind == "meeting" && !row.is_root;
+            let canonical_parentless_notes_root =
+                canonical_notes_root_id.as_deref() == Some(id) && row.is_root && row.kind == "note";
+            reached_allowed_root = user_space || canonical_parentless_notes_root;
+        }
+        cursor = row.parent_id.as_deref();
+    }
+    if !reached_allowed_root {
+        return Err(AppError::InvalidArg(
+            "the destination is not reachable from a user Space or canonical Notes root".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Canonical birth write. The production caller holds `org_share_mutation_lock` then lifecycle;
+/// keeping validation in this helper pins the test oracle to the exact insert seam rather than a
+/// lookalike preflight.
+fn insert_recording_meeting_under_guards(
+    state: &AppState,
+    meeting: &Meeting,
+) -> Result<(), AppError> {
+    ensure_recording_folder_target(&state.db, meeting.folder_id.as_deref())?;
+    state.db.insert_meeting(meeting)
+}
+
+fn ensure_open_canonical_notes_root(state: &AppState) -> Result<String, AppError> {
+    let root_id = state
+        .db
+        .note_root_id()?
+        .ok_or_else(|| AppError::Storage("the canonical Notes root is missing".into()))?;
+    let root = state
+        .db
+        .list_containers()?
+        .into_iter()
+        .find(|row| row.id == root_id)
+        .ok_or_else(|| AppError::Storage("the canonical Notes root is unavailable".into()))?;
+    if !root.is_root || root.kind != "note" {
+        return Err(AppError::InvalidArg(
+            "the canonical Notes root has an invalid hierarchy shape".into(),
+        ));
+    }
+    if root.locked {
+        return Err(AppError::Locked(
+            "the canonical Notes root is locked".into(),
+        ));
+    }
+    if state.db.org_folder_closure_exists(&root.id)? {
+        return Err(AppError::Unavailable(
+            "the canonical Notes root is closing for sharing".into(),
+        ));
+    }
+    if let Some(parent_id) = root.parent_id.as_deref() {
+        ensure_open_user_container_chain(&state.db, parent_id)?;
+    }
+    Ok(root.id)
+}
+
+type RecordingProviderSourceDomains = std::collections::HashMap<String, Option<String>>;
+
+/// Filing never changes a live per-folder protection domain. A session unlock makes content
+/// readable, but the folder remains raw-locked and its retained blobs are still the durable copy
+/// relock depends on. Gate both meeting-wide governance and every provider row's exact
+/// `notes.folder_id` before any Markdown, attachment, or managed-export read. Returning the
+/// witnesses pins those same domains through staging and the terminal transaction.
+fn ensure_raw_open_recording_source(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<RecordingProviderSourceDomains, AppError> {
+    for folder_id in state.db.folders_for_meeting(meeting_id)? {
+        ensure_recording_folder_target(&state.db, Some(&folder_id))?;
+    }
+    let mut provider_domains = RecordingProviderSourceDomains::new();
+    for (provider_id, folder_id) in state.db.filing_note_source_domains(meeting_id)? {
+        if provider_domains
+            .insert(provider_id, folder_id.clone())
+            .is_some()
+        {
+            return Err(AppError::Storage(
+                "recording filing found duplicate provider protection domains".into(),
+            ));
+        }
+        if let Some(folder_id) = folder_id.as_deref() {
+            ensure_raw_open_companion_source(state, folder_id)?;
+        }
+    }
+    Ok(provider_domains)
+}
+
+fn provider_source_domain<'a>(
+    provider_domains: &'a RecordingProviderSourceDomains,
+    provider_id: &str,
+) -> Result<Option<&'a str>, AppError> {
+    provider_domains
+        .get(provider_id)
+        .map(|folder_id| folder_id.as_deref())
+        .ok_or_else(|| {
+            AppError::Unavailable(
+                "the recording provider set changed while filing; refresh and retry".into(),
+            )
+        })
+}
+
+/// An unfiled recording's authored companion legitimately lives in the canonical Notes root,
+/// which is structural rather than selectable. Apart from that one raw-open root, companion
+/// sources obey the same raw-open user-container policy as recording placement.
+fn ensure_raw_open_companion_source(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    if state.db.note_root_id()?.as_deref() == Some(folder_id) {
+        let root_id = ensure_open_canonical_notes_root(state)?;
+        if root_id == folder_id {
+            return Ok(());
+        }
+    }
+    ensure_recording_folder_target(&state.db, Some(folder_id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordingExportStage {
+    MeetingProvider(String),
+    MeetingProviderAfterAttachments(String),
+    MeetingProviderAfterExport(String),
+    Companion,
+    CompanionAfterAttachments,
+    CompanionAfterExport,
+    BeforePersist,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FilingRecoveryIssue {
+    pub(crate) token: String,
+    pub(crate) issue_kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilingReconcileOutcome {
+    Clean,
+    UserCollision(FilingRecoveryIssue),
+}
+
+/// Drain every surviving SQLCipher filing projection before startup or a seal/relock can claim
+/// plaintext is governed solely by canonical rows. Exact external occupancy is the only nonfatal
+/// degraded outcome; malformed identity/path/SQL state remains a hard error.
+pub(crate) fn reconcile_filing_projection_journal(db: &Db) -> Result<(), AppError> {
+    match reconcile_filing_projection_journal_for_startup(db)? {
+        FilingReconcileOutcome::Clean => Ok(()),
+        FilingReconcileOutcome::UserCollision(_) => Err(AppError::Unavailable(
+            "filing recovery needs user attention before this operation".into(),
+        )),
+    }
+}
+
+pub(crate) fn reconcile_filing_projection_journal_for_startup(
+    db: &Db,
+) -> Result<FilingReconcileOutcome, AppError> {
+    let attempts = db.pending_filing_attempt_ids()?;
+    reconcile_filing_projection_attempts(db, &attempts)
+}
+
+/// Drain only filing attempts whose durable source/target scope intersects `folder_ids`.
+/// Per-folder seal/relock entrypoints use this seam so an unrelated synced-vault conflict cannot
+/// indefinitely deny the privacy transition for the folder the user actually selected.
+pub(crate) fn reconcile_filing_projection_journal_for_folders(
+    db: &Db,
+    folder_ids: &std::collections::HashSet<String>,
+) -> Result<(), AppError> {
+    let mut attempts = std::collections::HashSet::new();
+    for folder_id in folder_ids {
+        attempts.extend(db.pending_filing_attempt_ids_for_folder(folder_id)?);
+    }
+    let mut attempts = attempts.into_iter().collect::<Vec<_>>();
+    attempts.sort();
+    match reconcile_filing_projection_attempts(db, &attempts)? {
+        FilingReconcileOutcome::Clean => Ok(()),
+        FilingReconcileOutcome::UserCollision(_) => Err(AppError::Unavailable(
+            "filing recovery needs user attention before this privacy transition".into(),
+        )),
+    }
+}
+
+fn reconcile_filing_projection_attempts(
+    db: &Db,
+    attempts: &[String],
+) -> Result<FilingReconcileOutcome, AppError> {
+    if attempts.is_empty() {
+        return Ok(FilingReconcileOutcome::Clean);
+    }
+    let selected = attempts
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let pending = db.pending_filing_projections()?;
+    let mut reconciled = 0usize;
+    let mut projection_collision: Option<FilingRecoveryIssue> = None;
+    'projections: for row in pending
+        .into_iter()
+        .filter(|row| selected.contains(row.attempt_id.as_str()))
+    {
+        if row.phase == "keep_external" {
+            ensure_filing_projection_domains_raw_open(db, &row)?;
+            db.acknowledge_kept_filing_projection(&row.attempt_id, &row.projection_id)?;
+            reconciled += 1;
+            continue;
+        }
+        let promoted = db.filing_projection_is_promoted(&row)?;
+        let mut paths = vec![std::path::PathBuf::from(&row.temp_path)];
+        if let Some(final_path) = row.final_path.as_deref() {
+            let final_path = std::path::PathBuf::from(final_path);
+            if !paths.contains(&final_path) {
+                paths.push(final_path);
+            }
+        }
+        let identity = match (row.device, row.inode) {
+            (Some(device), Some(inode)) => Some((device, inode)),
+            (None, None) => None,
+            _ => {
+                return Err(AppError::Storage(
+                    "filing projection has an incomplete exact identity".into(),
+                ))
+            }
+        };
+        match identity {
+            None => {
+                // A scrubbed ordinary conflict can be waived. Once canonical metadata proves it
+                // was promoted, persist a non-waivable marker before exposing the issue; later
+                // collision-suffixed exports must not make the old occupant untracked.
+                if matches!(row.phase.as_str(), "conflict" | "published") {
+                    // `published + NULL identity` is the schema-compatible durable promoted
+                    // conflict marker; ordinary published rows are always bound.
+                    let durable_promoted_conflict = row.phase == "published";
+                    if promoted && !durable_promoted_conflict {
+                        db.mark_filing_projection_promoted_conflict(
+                            &row.attempt_id,
+                            &row.projection_id,
+                        )?;
+                    }
+                    if promoted || durable_promoted_conflict {
+                        // Gate before even returning a collision: otherwise startup could continue
+                        // while canonical replacement plaintext remains below a raw-locked domain.
+                        ensure_filing_projection_domains_raw_open(db, &row)?;
+                    }
+                    let mut occupied = false;
+                    for path in &paths {
+                        if crate::export::open_exact_absolute_existing_file(path)?.is_some() {
+                            occupied = true;
+                            break;
+                        }
+                    }
+                    if occupied {
+                        if projection_collision.is_none() {
+                            projection_collision = Some(FilingRecoveryIssue {
+                                token: row.projection_id.clone(),
+                                issue_kind: "externalTargetOccupant",
+                            });
+                        }
+                        continue 'projections;
+                    }
+                    db.clear_filing_projection(&row.attempt_id, &row.projection_id)?;
+                    reconciled += 1;
+                    continue;
+                }
+                if promoted {
+                    ensure_filing_projection_domains_raw_open(db, &row)?;
+                    db.clear_filing_projection(&row.attempt_id, &row.projection_id)?;
+                    reconciled += 1;
+                    continue;
+                }
+                for path in paths {
+                    if crate::export::open_exact_absolute_existing_file(&path)?.is_some() {
+                        db.mark_filing_projection_conflict(&row.attempt_id, &row.projection_id)?;
+                        if projection_collision.is_none() {
+                            projection_collision = Some(FilingRecoveryIssue {
+                                token: row.projection_id.clone(),
+                                issue_kind: "externalTargetOccupant",
+                            });
+                        }
+                        continue 'projections;
+                    }
+                }
+                db.clear_filing_projection(&row.attempt_id, &row.projection_id)?;
+                reconciled += 1;
+            }
+            Some(expected) => {
+                let mut matching = Vec::new();
+                let mut has_different_occupant = false;
+                let mut final_matches = false;
+                for path in paths {
+                    let current = crate::export::open_exact_absolute_existing_file(&path)?;
+                    match current {
+                        Some(observed) if observed.identity() == expected => {
+                            let link =
+                                crate::export::open_exact_absolute_existing_attempt_file(&path)?
+                                    .ok_or_else(|| {
+                                        AppError::Unavailable(
+                                            "bound filing pathname disappeared during exact reopen"
+                                                .into(),
+                                        )
+                                    })?;
+                            if link.identity() != expected {
+                                return Err(AppError::Unavailable(
+                                    "bound filing pathname changed during exact reopen".into(),
+                                ));
+                            }
+                            if row
+                                .final_path
+                                .as_deref()
+                                .is_some_and(|final_path| std::path::Path::new(final_path) == path)
+                            {
+                                final_matches = true;
+                            }
+                            matching.push(link);
+                        }
+                        Some(_) => has_different_occupant = true,
+                        None => {}
+                    }
+                }
+
+                if promoted {
+                    if has_different_occupant {
+                        if final_matches {
+                            // The exact final inode is canonical user content. Never scrub or
+                            // unlink it merely because another recorded name is occupied.
+                            return Err(AppError::Unavailable(
+                                "promoted filing projection has a conflicting recorded occupant"
+                                    .into(),
+                            ));
+                        }
+                        if let Some(link) = matching.first() {
+                            // Canonical metadata points at the different-inode final occupant. The
+                            // displaced matching inode is attempt-owned, so scrub it and atomically
+                            // persist a non-waivable promoted conflict before returning any issue.
+                            link.scrub_attempt_owned_plaintext()?;
+                            db.mark_bound_filing_projection_promoted_conflict_scrubbed(
+                                &row.attempt_id,
+                                &row.projection_id,
+                            )?;
+                            let refs = matching.iter().collect::<Vec<_>>();
+                            let _ = crate::export::remove_exact_attempt_link_refs(&refs);
+                            ensure_filing_projection_domains_raw_open(db, &row)?;
+                            if projection_collision.is_none() {
+                                projection_collision = Some(FilingRecoveryIssue {
+                                    token: row.projection_id.clone(),
+                                    issue_kind: "externalTargetOccupant",
+                                });
+                            }
+                            continue 'projections;
+                        }
+                        return Err(AppError::Unavailable(
+                            "promoted filing recovery cannot locate its displaced exact inode"
+                                .into(),
+                        ));
+                    }
+                    let exact_single_final = final_matches
+                        && matching.len() == 1
+                        && matching[0].exact_link_count()? == 1;
+                    if !exact_single_final {
+                        return Err(AppError::Unavailable(
+                            "promoted filing projection has ambiguous exact-link ownership".into(),
+                        ));
+                    }
+                    ensure_filing_projection_domains_raw_open(db, &row)?;
+                    db.clear_filing_projection(&row.attempt_id, &row.projection_id)?;
+                    reconciled += 1;
+                    continue;
+                }
+
+                if has_different_occupant {
+                    if let Some(link) = matching.first() {
+                        // The exact attempt-created inode remains an affine capability even when
+                        // another name was hard-linked or an expected name was replaced. Scrub
+                        // first so every alias loses plaintext, then persist that fact before any
+                        // best-effort namespace cleanup or returned collision error.
+                        link.scrub_attempt_owned_plaintext()?;
+                        db.mark_bound_filing_projection_conflict_scrubbed(
+                            &row.attempt_id,
+                            &row.projection_id,
+                        )?;
+                        let refs = matching.iter().collect::<Vec<_>>();
+                        // Namespace cleanup is best-effort after the exact inode was scrubbed and
+                        // that fact became durable. An unknown hardlink may keep zero-byte names
+                        // alive, but it can no longer keep filing plaintext alive.
+                        let _ = crate::export::remove_exact_attempt_link_refs(&refs);
+                        if projection_collision.is_none() {
+                            projection_collision = Some(FilingRecoveryIssue {
+                                token: row.projection_id.clone(),
+                                issue_kind: "externalTargetOccupant",
+                            });
+                        }
+                        continue 'projections;
+                    }
+                    // With no surviving recorded name there is no safe inode locator. Missing can
+                    // mean deletion or a rename outside the two committed names, so retain the
+                    // bound identity and fail hard instead of forgetting possible plaintext.
+                    return Err(AppError::Unavailable(
+                        "bound filing recovery cannot locate its displaced exact inode".into(),
+                    ));
+                }
+
+                if matching.is_empty() {
+                    return Err(AppError::Unavailable(
+                        "bound filing projection has no known exact pathname".into(),
+                    ));
+                }
+                let refs = matching.iter().collect::<Vec<_>>();
+                match crate::export::remove_exact_attempt_link_refs(&refs) {
+                    Ok(()) => {
+                        db.clear_filing_projection(&row.attempt_id, &row.projection_id)?;
+                        reconciled += 1;
+                    }
+                    Err(_) => {
+                        // Removal refusal (most importantly an unknown hardlink) must not leave
+                        // attempt-created plaintext. Scrub through the exact writable descriptor,
+                        // persist the safe unbound conflict state, then require an explicit retry
+                        // or keep decision before journal authority can disappear.
+                        matching[0].scrub_attempt_owned_plaintext()?;
+                        db.mark_bound_filing_projection_conflict_scrubbed(
+                            &row.attempt_id,
+                            &row.projection_id,
+                        )?;
+                        let _ = crate::export::remove_exact_attempt_link_refs(&refs);
+                        if projection_collision.is_none() {
+                            projection_collision = Some(FilingRecoveryIssue {
+                                token: row.projection_id.clone(),
+                                issue_kind: "externalTargetOccupant",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Every authenticated attempt-owned target projection above has now been removed or promoted.
+    // Only at that point is an unbound external occupant safe to expose as a nonfatal user choice.
+    if let Some(issue) = projection_collision {
+        return Ok(FilingReconcileOutcome::UserCollision(issue));
+    }
+    for source in db
+        .pending_filing_sources()?
+        .into_iter()
+        .filter(|source| selected.contains(source.attempt_id.as_str()))
+    {
+        // Even an explicit keep-existing resolution cannot erase the sole exact-domain witness
+        // while that domain or an ancestor is raw-locked. The external occupant would remain
+        // readable and the attempt would disappear from future lock/recovery scope. Missing-source
+        // restoration is gated at the same point so SQLCipher snapshots never recreate plaintext
+        // below a locked ancestor.
+        ensure_filing_source_domains_raw_open(db, &source)?;
+        if source.phase == "keep_existing" {
+            db.acknowledge_kept_filing_source(&source.attempt_id, &source.source_id)?;
+            reconciled += 1;
+            continue;
+        }
+        let path = std::path::Path::new(&source.path);
+        match crate::export::open_exact_absolute_existing_file(path)? {
+            Some(link) => {
+                if link.identity() != (source.device, source.inode) {
+                    db.mark_filing_source_conflict(&source.attempt_id, &source.source_id)?;
+                    return Ok(FilingReconcileOutcome::UserCollision(FilingRecoveryIssue {
+                        token: source.source_id,
+                        issue_kind: "externalSourceReplacement",
+                    }));
+                }
+                let (bytes, _) = link.read_stable_bytes(source.bytes.len() as u64)?;
+                if bytes != source.bytes {
+                    db.mark_filing_source_conflict(&source.attempt_id, &source.source_id)?;
+                    return Ok(FilingReconcileOutcome::UserCollision(FilingRecoveryIssue {
+                        token: source.source_id,
+                        issue_kind: "externalSourceReplacement",
+                    }));
+                }
+                // Exact attempt-owned plaintext in a raw-locked source domain must remain journaled
+                // for an authenticated/manual recovery path. Clearing its row here would bless a
+                // readable vault file after the folder's at-rest gate already closed.
+            }
+            None => {
+                // Never materialize SQLCipher snapshot bytes into a raw-locked domain. The row and
+                // payload stay authoritative so a later safe resolution cannot lose content.
+                use std::io::{Read, Seek, SeekFrom, Write};
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+                let mut restored = crate::export::create_exact_absolute_file(
+                    path,
+                    (source.parent_device, source.parent_inode),
+                    0o600,
+                )?;
+                let restore =
+                    (|| -> Result<(), AppError> {
+                    restored
+                        .file_mut()
+                        .write_all(&source.bytes)
+                        .and_then(|()| {
+                            restored.file_mut().set_permissions(
+                                std::fs::Permissions::from_mode(source.permissions_mode),
+                            )
+                        })
+                        .and_then(|()| restored.file_mut().sync_all())
+                        .map_err(|error| {
+                            AppError::Export(format!(
+                                "write durable filing source recovery failed: {error}"
+                            ))
+                        })?;
+                        restored
+                            .file_mut()
+                            .seek(SeekFrom::Start(0))
+                            .map_err(|error| {
+                        AppError::Export(format!(
+                            "seek durable filing source recovery failed: {error}"
+                        ))
+                    })?;
+                    let mut readback = Vec::with_capacity(source.bytes.len());
+                        restored
+                            .file_mut()
+                            .read_to_end(&mut readback)
+                            .map_err(|error| {
+                        AppError::Export(format!(
+                            "read durable filing source recovery failed: {error}"
+                        ))
+                    })?;
+                    let metadata = restored.file_mut().metadata().map_err(|error| {
+                        AppError::Export(format!(
+                            "stat durable filing source recovery failed: {error}"
+                        ))
+                    })?;
+                    if metadata.dev() != restored.identity().0
+                        || metadata.ino() != restored.identity().1
+                        || metadata.nlink() != 1
+                        || readback != source.bytes
+                    {
+                        return Err(AppError::Export(
+                            "durable filing source recovery failed exact readback".into(),
+                        ));
+                    }
+                    restored.sync_parent()
+                })();
+                if let Err(original) = restore {
+                    let cleanup = crate::export::remove_exact_created_link(&restored, 1);
+                    return Err(match cleanup {
+                        Ok(()) => original,
+                        Err(cleanup) => match restored.scrub_attempt_owned_plaintext() {
+                            Ok(()) => AppError::Storage(format!(
+                                "{original}; filing source recovery unlink refused ({cleanup}); retained inode scrubbed"
+                            )),
+                            Err(scrub) => AppError::Storage(format!(
+                                "{original}; filing source recovery cleanup failed: {cleanup}; retained-inode scrub failed: {scrub}"
+                            )),
+                        },
+                    });
+                }
+            }
+        }
+        db.clear_filing_source(&source.attempt_id, &source.source_id)?;
+        reconciled += 1;
+    }
+    for attempt_id in attempts {
+        db.clear_empty_filing_attempt(attempt_id)?;
+    }
+    if reconciled > 0 {
+        tracing::info!(target: "recording_filing", reconciled, "reconciled durable filing projections");
+    }
+    Ok(FilingReconcileOutcome::Clean)
+}
+
+/// Projection shortcuts can remove the last durable attempt witness while an external occupant
+/// stays readable. Gate both the authoritative attempt domains and the exact artifact domains
+/// before keep/conflict/promoted handling is allowed to acknowledge anything.
+fn ensure_filing_projection_domains_raw_open(
+    db: &Db,
+    row: &crate::storage::FilingProjectionJournalRow,
+) -> Result<(), AppError> {
+    let (attempt_source, attempt_target) = db
+        .filing_attempt_domains(&row.attempt_id)?
+        .ok_or_else(|| AppError::Storage("filing projection lost its parent attempt".into()))?;
+    ensure_filing_domains_raw_open(db, [
+        attempt_source.as_str(),
+        attempt_target.as_str(),
+        row.source_folder_id.as_str(),
+        row.target_folder_id.as_str(),
+    ])
+}
+
+fn ensure_filing_source_domains_raw_open(
+    db: &Db,
+    row: &crate::storage::FilingSourceJournalRow,
+) -> Result<(), AppError> {
+    ensure_filing_source_scope_domains_raw_open(db, &row.attempt_id, &row.source_folder_id)
+}
+
+fn ensure_filing_source_scope_domains_raw_open(
+    db: &Db,
+    attempt_id: &str,
+    source_folder_id: &str,
+) -> Result<(), AppError> {
+    let (attempt_source, attempt_target) = db
+        .filing_attempt_domains(attempt_id)?
+        .ok_or_else(|| AppError::Storage("filing source lost its parent attempt".into()))?;
+    ensure_filing_domains_raw_open(
+        db,
+        [
+            attempt_source.as_str(),
+            attempt_target.as_str(),
+            source_folder_id,
+        ],
+    )
+}
+
+fn ensure_filing_domains_raw_open<'a>(
+    db: &Db,
+    domains: impl IntoIterator<Item = &'a str>,
+) -> Result<(), AppError> {
+    let containers = db.list_containers()?;
+    let by_id = containers
+        .iter()
+        .map(|row| (row.id.as_str(), row))
+        .collect::<std::collections::HashMap<_, _>>();
+    let domains = domains.into_iter().collect::<std::collections::HashSet<_>>();
+    for folder_id in domains {
+        if folder_id.is_empty() {
+            continue;
+        }
+        let mut cursor = Some(folder_id);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = cursor {
+            if !seen.insert(id.to_string()) {
+                return Err(AppError::Storage(
+                    "filing recovery protection-domain hierarchy contains a cycle".into(),
+                ));
+            }
+            let folder = by_id.get(id).ok_or_else(|| {
+                AppError::Storage(
+                    "filing recovery protection domain disappeared during recovery".into(),
+                )
+            })?;
+            if folder.locked {
+                return Err(AppError::Unavailable(
+                    "filing recovery is blocked by a locked protection domain".into(),
+                ));
+            }
+            cursor = folder.parent_id.as_deref();
+        }
+    }
+    Ok(())
+}
+
+/// Content-free startup/UI health for a filing recovery that could not safely resolve an external
+/// vault conflict. No ids, paths, titles, or payload bytes cross IPC.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilingRecoveryStatusDto {
+    pub degraded: bool,
+    pub attempt_count: u64,
+    pub projection_count: u64,
+    pub source_snapshot_count: u64,
+    pub remaining_count: u64,
+    pub issue_token: Option<String>,
+    pub issue_kind: Option<String>,
+    pub can_keep_existing: bool,
+}
+
+fn filing_recovery_status(db: &Db) -> Result<FilingRecoveryStatusDto, AppError> {
+    let (attempt_count, projection_count, source_snapshot_count) = db.filing_recovery_counts()?;
+    let issue = db.first_filing_recovery_issue()?;
+    Ok(FilingRecoveryStatusDto {
+        degraded: attempt_count > 0,
+        attempt_count,
+        projection_count,
+        source_snapshot_count,
+        remaining_count: attempt_count,
+        issue_token: issue.as_ref().map(|(token, _, _)| token.clone()),
+        issue_kind: issue.as_ref().map(|(_, kind, _)| kind.clone()),
+        can_keep_existing: issue.as_ref().is_some_and(|(_, _, can_keep)| *can_keep),
+    })
+}
+
+#[tauri::command]
+pub fn get_filing_recovery_status(
+    state: State<'_, AppState>,
+) -> Result<FilingRecoveryStatusDto, AppError> {
+    filing_recovery_status(&state.db)
+}
+
+/// Retry the exact-identity recovery after the user resolves a vault-side collision. Failure keeps
+/// every journal row and occupant intact; the UI can continue presenting the degraded-state card.
+#[tauri::command]
+pub fn retry_filing_recovery(
+    state: State<'_, AppState>,
+) -> Result<FilingRecoveryStatusDto, AppError> {
+    let _lifecycle = lifecycle_guard(state.inner());
+    match reconcile_filing_projection_journal_for_startup(&state.db) {
+        Ok(FilingReconcileOutcome::Clean) => {}
+        Ok(FilingReconcileOutcome::UserCollision(_)) => {
+            let (attempts, projections, source_snapshots) =
+                state.db.filing_recovery_counts().unwrap_or((0, 0, 0));
+            tracing::warn!(
+                target: "recording_filing",
+                attempts,
+                projections,
+                source_snapshots,
+                "user-requested filing recovery remains degraded"
+            );
+        }
+        Err(_) => {
+            return Err(AppError::Unavailable(
+                "filing recovery could not be retried safely".into(),
+            ));
+        }
+    }
+    filing_recovery_status(&state.db)
+}
+
+/// Resolve one exact external-file collision after explicit user confirmation. The opaque token
+/// identifies only a durable conflict row; false/stale tokens are no-ops. The waiver is persisted
+/// before cleanup so a crash resumes without ever overwriting the external occupant.
+#[tauri::command]
+pub fn keep_existing_filing_file(
+    state: State<'_, AppState>,
+    issue_token: String,
+    confirmed: bool,
+) -> Result<FilingRecoveryStatusDto, AppError> {
+    keep_existing_filing_file_inner(state.inner(), &issue_token, confirmed)
+}
+
+pub(crate) fn keep_existing_filing_file_inner(
+    state: &AppState,
+    issue_token: &str,
+    confirmed: bool,
+) -> Result<FilingRecoveryStatusDto, AppError> {
+    if !confirmed {
+        return filing_recovery_status(&state.db);
+    }
+    let _lifecycle = lifecycle_guard(state);
+    let source_scope = state.db.filing_source_scope(issue_token)?;
+    let kept_source = if let Some((attempt_id, source_folder_id)) = source_scope.as_ref() {
+        // A rejected keep must not leave a durable waiver which silently activates after unlock.
+        ensure_filing_source_scope_domains_raw_open(
+            &state.db,
+            attempt_id,
+            source_folder_id,
+        )?;
+        state.db.keep_existing_filing_source(issue_token)?
+    } else {
+        false
+    };
+    let kept_projection = if kept_source {
+        false
+    } else {
+        let projection = state
+            .db
+            .pending_filing_projections()?
+            .into_iter()
+            .find(|row| row.projection_id == issue_token);
+        if let Some(projection) = projection.as_ref() {
+            ensure_filing_projection_domains_raw_open(&state.db, projection)?;
+            let promoted = state.db.filing_projection_is_promoted(projection)?;
+            let durable_promoted_conflict = projection.phase == "published"
+                && projection.device.is_none()
+                && projection.inode.is_none();
+            if durable_promoted_conflict || promoted {
+                if promoted && projection.phase == "conflict" {
+                    state.db.mark_filing_projection_promoted_conflict(
+                        &projection.attempt_id,
+                        &projection.projection_id,
+                    )?;
+                }
+                return Err(AppError::Unavailable(
+                    "promoted filing conflict is retry-only and cannot be kept".into(),
+                ));
+            }
+            state.db.keep_external_filing_projection(issue_token)?
+        } else {
+            false
+        }
+    };
+    if !kept_source && !kept_projection {
+        return filing_recovery_status(&state.db);
+    }
+    tracing::warn!(
+        target: "recording_filing",
+        "user confirmed preservation of an external filing occupant"
+    );
+    match reconcile_filing_projection_journal_for_startup(&state.db) {
+        Ok(FilingReconcileOutcome::Clean | FilingReconcileOutcome::UserCollision(_)) => {}
+        Err(_) => {
+            return Err(AppError::Unavailable(
+                "filing recovery could not finish safely".into(),
+            ));
+        }
+    }
+    filing_recovery_status(&state.db)
+}
+
+struct RecordingSourceExport {
+    path: std::path::PathBuf,
+    expected_hash: Option<String>,
+    source_folder_id: String,
+}
+
+struct StagedRecordingExport {
+    projection_id: String,
+    path: std::path::PathBuf,
+    path_string: String,
+    hash: String,
+    bytes: Zeroizing<Vec<u8>>,
+    created: bool,
+    cleanup: Option<crate::export::CreatedNoteCleanup>,
+    verification: crate::export::ExactFileObservation,
+}
+
+struct StagedRecordingNoteExport {
+    provider_id: String,
+    source_folder_id: Option<String>,
+    file: Option<StagedRecordingExport>,
+}
+
+struct PendingRecordingNoteCleanup {
+    projection_id: String,
+    cleanup: crate::export::CreatedNoteCleanup,
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+struct RecordingTargetCleanupOutcome {
+    verified_projection_ids: Vec<String>,
+    failures: Vec<String>,
+}
+
+impl RecordingTargetCleanupOutcome {
+    fn error(&self) -> Option<AppError> {
+        (!self.failures.is_empty()).then(|| {
+            AppError::Export(format!(
+                "one or more staged recording exports could not be rolled back: {}",
+                self.failures.join("; ")
+            ))
+        })
+    }
+}
+
+struct StagedRecordingBundleExports {
+    attempt_id: String,
+    notes: Vec<StagedRecordingNoteExport>,
+    companion: Option<StagedRecordingExport>,
+    attachment_journal: AttachmentExportRollbackJournal,
+    pending_note_cleanups: Vec<PendingRecordingNoteCleanup>,
+}
+
+impl Default for StagedRecordingBundleExports {
+    fn default() -> Self {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        Self {
+            attachment_journal: AttachmentExportRollbackJournal::with_attempt_id(
+                attempt_id.clone(),
+            ),
+            attempt_id,
+            notes: Vec::new(),
+            companion: None,
+            pending_note_cleanups: Vec::new(),
+        }
+    }
+}
+
+struct RecordingNoteWriteJournal<'a> {
+    db: &'a Db,
+    attempt_id: &'a str,
+    projection_id: String,
+    owner_kind: &'a str,
+    owner_id: &'a str,
+    provider_id: &'a str,
+    source_folder_id: &'a str,
+    target_folder_id: &'a str,
+    source_path: Option<&'a str>,
+}
+
+impl crate::export::ExactNoteWriteJournal for RecordingNoteWriteJournal<'_> {
+    fn reserve(
+        &mut self,
+        temp_path: &std::path::Path,
+        expected_len: u64,
+        digest: &[u8; 32],
+    ) -> Result<(), AppError> {
+        let temp_path = temp_path
+            .to_str()
+            .ok_or_else(|| AppError::Export("filing note temp path is not valid UTF-8".into()))?;
+        self.db
+            .reserve_filing_projection(&crate::storage::FilingProjectionReservation {
+                attempt_id: self.attempt_id,
+                projection_id: &self.projection_id,
+                operation_kind: "recording_filing",
+                owner_kind: self.owner_kind,
+                owner_id: self.owner_id,
+                provider_id: self.provider_id,
+                source_folder_id: self.source_folder_id,
+                target_folder_id: self.target_folder_id,
+                source_path: self.source_path,
+                temp_path,
+                final_path: None,
+                expected_len,
+                expected_sha256: digest,
+            })
+    }
+
+    fn bind(&mut self, _temp_path: &std::path::Path, identity: (u64, u64)) -> Result<(), AppError> {
+        self.db.bind_filing_projection_identity(
+            self.attempt_id,
+            &self.projection_id,
+            identity.0,
+            identity.1,
+        )
+    }
+
+    fn reserve_publish(
+        &mut self,
+        _temp_path: &std::path::Path,
+        final_path: &std::path::Path,
+    ) -> Result<(), AppError> {
+        let final_path = final_path
+            .to_str()
+            .ok_or_else(|| AppError::Export("filing note final path is not valid UTF-8".into()))?;
+        self.db
+            .reserve_filing_projection_publish(self.attempt_id, &self.projection_id, final_path)
+    }
+
+    fn published(&mut self, _final_path: &std::path::Path) -> Result<(), AppError> {
+        self.db
+            .mark_filing_projection_published(self.attempt_id, &self.projection_id)
+    }
+
+    fn rollback_verified(&mut self) -> Result<(), AppError> {
+        self.db
+            .clear_filing_projection(self.attempt_id, &self.projection_id)
+    }
+}
+
+impl StagedRecordingBundleExports {
+    fn target_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.notes
+            .iter()
+            .filter_map(|note| note.file.as_ref())
+            .map(|file| file.path.clone())
+            .chain(self.companion.iter().map(|file| file.path.clone()))
+            .collect()
+    }
+
+    fn verify_all(&self) -> Result<(), AppError> {
+        for file in self
+            .notes
+            .iter()
+            .filter_map(|note| note.file.as_ref())
+            .chain(self.companion.iter())
+        {
+            let current = file
+                .verification
+                .read_stable_bytes(file.bytes.len() as u64)?;
+            if current.as_slice() != file.bytes.as_slice() {
+                return Err(AppError::Export(
+                    "a staged recording export changed before the canonical transaction".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove only target files whose receipt proves this attempt created them, and only while
+    /// their bytes remain exactly the staged bytes. Every target is attempted even after a sibling
+    /// conflict so rollback cannot strand unrelated files.
+    fn remove_created(&self) -> RecordingTargetCleanupOutcome {
+        let mut seen = std::collections::HashSet::new();
+        let mut failures = Vec::new();
+        let mut verified_projection_ids = Vec::new();
+        for pending in &self.pending_note_cleanups {
+            let digest: [u8; 32] =
+                <sha2::Sha256 as sha2::Digest>::digest(pending.bytes.as_slice()).into();
+            let verified = match pending
+                .cleanup
+                .remove_if_unchanged(pending.bytes.len() as u64, &digest)
+            {
+                Ok(()) => true,
+                Err(error) => match pending
+                    .cleanup
+                    .scrub_plaintext_if_unchanged(pending.bytes.len() as u64, &digest) {
+                        Ok(()) => true,
+                        Err(scrub) => {
+                            failures.push(format!(
+                                "{error}; exact plaintext scrub also failed: {scrub}"
+                            ));
+                            false
+                        }
+                    },
+            };
+            if verified {
+                verified_projection_ids.push(pending.projection_id.clone());
+            }
+        }
+        for file in self
+            .notes
+            .iter()
+            .filter_map(|note| note.file.as_ref())
+            .chain(self.companion.iter())
+            .filter(|file| file.created && seen.insert(file.path.clone()))
+        {
+            let remove_one = (|| -> Result<(), AppError> {
+                let cleanup = file.cleanup.as_ref().ok_or_else(|| {
+                    AppError::Export(
+                        "attempt-created staged note is missing its exact-inode receipt".into(),
+                    )
+                })?;
+                let digest: [u8; 32] =
+                    <sha2::Sha256 as sha2::Digest>::digest(file.bytes.as_slice()).into();
+                match cleanup.remove_if_unchanged(file.bytes.len() as u64, &digest) {
+                    Ok(()) => Ok(()),
+                    Err(remove) => cleanup
+                        .scrub_plaintext_if_unchanged(file.bytes.len() as u64, &digest)
+                        .map_err(|scrub| {
+                            AppError::Export(format!(
+                                "{remove}; exact staged-note plaintext scrub also failed: {scrub}"
+                            ))
+                        }),
+                }
+            })();
+            match remove_one {
+                Ok(()) => verified_projection_ids.push(file.projection_id.clone()),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        RecordingTargetCleanupOutcome {
+            verified_projection_ids,
+            failures,
+        }
+    }
+}
+
+fn retain_pending_note_cleanup(
+    staged: &mut StagedRecordingBundleExports,
+    receipt: &mut crate::export::WriteNoteReceipt,
+    markdown: &str,
+    projection_id: &str,
+) -> Result<(), AppError> {
+    let Some(error) = receipt.pending_error.take() else {
+        return Ok(());
+    };
+    let cleanup = receipt.cleanup.take().ok_or_else(|| {
+        AppError::Export("post-write note failure lost exact cleanup authority".into())
+    })?;
+    staged
+        .pending_note_cleanups
+        .push(PendingRecordingNoteCleanup {
+            projection_id: projection_id.to_string(),
+            cleanup,
+            bytes: Zeroizing::new(markdown.as_bytes().to_vec()),
+        });
+    Err(error)
+}
+
+fn collect_and_verify_recording_source_exports(
+    state: &AppState,
+    generated_notes: &[crate::storage::db::SealableNote],
+    provider_domains: &RecordingProviderSourceDomains,
+    companion: Option<&crate::storage::db::NoteRow>,
+    vault_configured: bool,
+) -> Result<Vec<RecordingSourceExport>, AppError> {
+    let mut exports = Vec::new();
+    for note in generated_notes {
+        let expected = state
+            .db
+            .get_note_exported_hash(&note.meeting_id, &note.provider_id)?;
+        if !vault_configured && (note.exported_path.is_some() || expected.is_some()) {
+            return Err(AppError::Export(
+                "recording has a managed vault export but no vault is configured".into(),
+            ));
+        }
+        if let Some(path) = note.exported_path.as_deref() {
+            let source_folder_id = provider_source_domain(provider_domains, &note.provider_id)?
+                .unwrap_or_default()
+                .to_string();
+            verify_note_export_unchanged(
+                path,
+                expected.as_deref(),
+                "verify recording-note export before filing",
+            )?;
+            exports.push(RecordingSourceExport {
+                path: std::path::PathBuf::from(path),
+                expected_hash: expected,
+                source_folder_id,
+            });
+        } else if expected.is_some() {
+            return Err(AppError::Storage(
+                "a recording-note export has a hash without a path".into(),
+            ));
+        }
+    }
+    if let Some(companion) = companion {
+        let expected = state.db.get_note_doc_exported_hash(&companion.id)?;
+        if !vault_configured && (companion.exported_path.is_some() || expected.is_some()) {
+            return Err(AppError::Export(
+                "the recording companion has a managed vault export but no vault is configured"
+                    .into(),
+            ));
+        }
+        if let Some(path) = companion.exported_path.as_deref() {
+            verify_note_export_unchanged(
+                path,
+                expected.as_deref(),
+                "verify companion-note export before filing",
+            )?;
+            exports.push(RecordingSourceExport {
+                path: std::path::PathBuf::from(path),
+                expected_hash: expected,
+                source_folder_id: companion.folder_id.clone(),
+            });
+        } else if expected.is_some() {
+            return Err(AppError::Storage(
+                "a companion-note export has a hash without a path".into(),
+            ));
+        }
+    }
+    Ok(exports)
+}
+
+struct RecordingBundleExportContext<'a> {
+    meeting: &'a crate::storage::models::Meeting,
+    target_folder_id: Option<&'a str>,
+    generated_notes: &'a [crate::storage::db::SealableNote],
+    provider_domains: &'a RecordingProviderSourceDomains,
+    companion: Option<&'a crate::storage::db::NoteRow>,
+    companion_target_folder_id: Option<&'a str>,
+    staged: &'a mut StagedRecordingBundleExports,
+}
+
+fn stage_recording_bundle_exports(
+    state: &AppState,
+    context: RecordingBundleExportContext<'_>,
+    checkpoint: &mut impl FnMut(RecordingExportStage) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let RecordingBundleExportContext {
+        meeting,
+        target_folder_id,
+        generated_notes,
+        provider_domains,
+        companion,
+        companion_target_folder_id,
+        staged,
+    } = context;
+    let Some(vault) = vault_path(state) else {
+        staged.notes = generated_notes
+            .iter()
+            .map(|note| {
+                Ok(StagedRecordingNoteExport {
+                provider_id: note.provider_id.clone(),
+                    source_folder_id: provider_source_domain(provider_domains, &note.provider_id)?
+                        .map(str::to_string),
+                file: None,
+            })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        return Ok(());
+    };
+    let filing_attempt_id = staged.attempt_id.clone();
+    let vault_root = std::path::Path::new(&vault);
+    let exact_vault = staged.attachment_journal.configure_vault(vault_root)?;
+    let meeting_subfolder = match target_folder_id {
+        Some(folder_id) => Some(
+            state
+                .db
+                .folder_by_id(folder_id)?
+                .ok_or_else(|| AppError::Storage("the filing destination disappeared".into()))?
+                .path,
+        ),
+        None => None,
+    };
+    if let Some(path) = meeting_subfolder.as_deref() {
+        assert_in_vault(vault_root, std::path::Path::new(path))?;
+    }
+    let title = meeting
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(crate::storage::db::UNTITLED_TITLE);
+    let latest_provider = if generated_notes.is_empty() {
+        None
+    } else {
+        Some(
+            state
+                .db
+                .get_latest_note_for_meeting(&meeting.id)?
+                .map(|note| note.provider_id)
+                .ok_or_else(|| {
+                    AppError::Unavailable("the recording note set changed while filing".into())
+                })?,
+        )
+    };
+    let mut notes = generated_notes.iter().collect::<Vec<_>>();
+    notes.sort_by(|left, right| {
+        let left_latest = latest_provider.as_deref() == Some(left.provider_id.as_str());
+        let right_latest = latest_provider.as_deref() == Some(right.provider_id.as_str());
+        right_latest
+            .cmp(&left_latest)
+            .then_with(|| left.provider_id.cmp(&right.provider_id))
+    });
+    for note in notes {
+        let source_folder_id =
+            provider_source_domain(provider_domains, &note.provider_id)?.unwrap_or_default();
+        checkpoint(RecordingExportStage::MeetingProvider(
+            note.provider_id.clone(),
+        ))?;
+        if note.markdown.is_empty() {
+            return Err(AppError::Storage(
+                "a recording note has no readable plaintext".into(),
+            ));
+        }
+        let owner = crate::storage::AttachmentOwner::Meeting {
+            meeting_id: meeting.id.clone(),
+            provider_id: note.provider_id.clone(),
+        };
+        let markdown = render_markdown_with_attachments_for_export_with_rollback_journal(
+            state,
+            &owner,
+            &note.markdown,
+            vault_root,
+            &mut staged.attachment_journal,
+        )?;
+        checkpoint(RecordingExportStage::MeetingProviderAfterAttachments(
+            note.provider_id.clone(),
+        ))?;
+        let provider_title = if latest_provider.as_deref() == Some(note.provider_id.as_str()) {
+            title.to_string()
+        } else {
+            let provider_hash = crate::export::note_content_hash(&note.provider_id);
+            format!("{title} [{}-{}]", note.provider_id, &provider_hash[..10])
+        };
+        let mut journal = RecordingNoteWriteJournal {
+            db: &state.db,
+            attempt_id: &filing_attempt_id,
+            projection_id: uuid::Uuid::new_v4().to_string(),
+            owner_kind: "meeting_note",
+            owner_id: &meeting.id,
+            provider_id: &note.provider_id,
+            source_folder_id,
+            target_folder_id: target_folder_id.unwrap_or(""),
+            source_path: note.exported_path.as_deref(),
+        };
+        let mut receipt = crate::export::write_note_with_receipt_in_exact_vault_journaled(
+            &exact_vault,
+            meeting_subfolder.as_deref(),
+            &provider_title,
+            &meeting.started_at,
+            &markdown,
+            &mut journal,
+        )?;
+        retain_pending_note_cleanup(
+            staged,
+            &mut receipt,
+            &markdown,
+            &journal.projection_id,
+        )?;
+        let path_string = receipt.path.to_string_lossy().to_string();
+        staged.notes.push(StagedRecordingNoteExport {
+            provider_id: note.provider_id.clone(),
+            source_folder_id: provider_source_domain(provider_domains, &note.provider_id)?
+                .map(str::to_string),
+            file: Some(StagedRecordingExport {
+                projection_id: journal.projection_id,
+                path: receipt.path,
+                path_string,
+                hash: crate::export::note_content_hash(&markdown),
+                bytes: Zeroizing::new(markdown.into_bytes()),
+                created: receipt.created,
+                cleanup: receipt.cleanup,
+                verification: receipt.verification,
+            }),
+        });
+        checkpoint(RecordingExportStage::MeetingProviderAfterExport(
+            note.provider_id.clone(),
+        ))?;
+    }
+
+    if let Some(companion) = companion.filter(|row| !row.text.is_empty()) {
+        checkpoint(RecordingExportStage::Companion)?;
+        let target_folder_id = companion_target_folder_id.ok_or_else(|| {
+            AppError::Storage("the companion filing destination is missing".into())
+        })?;
+        let companion_subfolder = state
+            .db
+            .folder_by_id(target_folder_id)?
+            .ok_or_else(|| {
+                AppError::Storage("the companion filing destination disappeared".into())
+            })?
+            .path;
+        assert_in_vault(vault_root, std::path::Path::new(&companion_subfolder))?;
+        let owner = crate::storage::AttachmentOwner::Document {
+            document_id: companion.id.clone(),
+        };
+        let markdown = render_markdown_with_attachments_for_export_with_rollback_journal(
+            state,
+            &owner,
+            &companion.text,
+            vault_root,
+            &mut staged.attachment_journal,
+        )?;
+        checkpoint(RecordingExportStage::CompanionAfterAttachments)?;
+        let created_iso =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(companion.created_at)
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339();
+        let mut journal = RecordingNoteWriteJournal {
+            db: &state.db,
+            attempt_id: &filing_attempt_id,
+            projection_id: uuid::Uuid::new_v4().to_string(),
+            owner_kind: "document",
+            owner_id: &companion.id,
+            provider_id: "",
+            source_folder_id: &companion.folder_id,
+            target_folder_id,
+            source_path: companion.exported_path.as_deref(),
+        };
+        let mut receipt = crate::export::write_note_with_receipt_in_exact_vault_journaled(
+            &exact_vault,
+            Some(&companion_subfolder),
+            &note_display_title(companion),
+            &created_iso,
+            &markdown,
+            &mut journal,
+        )?;
+        retain_pending_note_cleanup(
+            staged,
+            &mut receipt,
+            &markdown,
+            &journal.projection_id,
+        )?;
+        let mut staged_projection_id = journal.projection_id;
+        if staged
+            .notes
+            .iter()
+            .filter_map(|note| note.file.as_ref())
+            .any(|file| file.path == receipt.path)
+        {
+            // Identical companion/provider markdown can make the idempotent writer reuse the same
+            // base path. Keep every canonical row independently addressable by retrying with a
+            // stable companion-qualified stem; the reused first receipt has `created=false`.
+            let companion_hash = crate::export::note_content_hash(&companion.id);
+            let title = format!(
+                "{} [companion-{}]",
+                note_display_title(companion),
+                &companion_hash[..10]
+            );
+            let mut retry_journal = RecordingNoteWriteJournal {
+                db: &state.db,
+                attempt_id: &filing_attempt_id,
+                projection_id: uuid::Uuid::new_v4().to_string(),
+                owner_kind: "document",
+                owner_id: &companion.id,
+                provider_id: "",
+                source_folder_id: &companion.folder_id,
+                target_folder_id,
+                source_path: companion.exported_path.as_deref(),
+            };
+            receipt = crate::export::write_note_with_receipt_in_exact_vault_journaled(
+                &exact_vault,
+                Some(&companion_subfolder),
+                &title,
+                &created_iso,
+                &markdown,
+                &mut retry_journal,
+            )?;
+            retain_pending_note_cleanup(
+                staged,
+                &mut receipt,
+                &markdown,
+                &retry_journal.projection_id,
+            )?;
+            staged_projection_id = retry_journal.projection_id;
+        }
+        let path_string = receipt.path.to_string_lossy().to_string();
+        staged.companion = Some(StagedRecordingExport {
+            projection_id: staged_projection_id,
+            path: receipt.path,
+            path_string,
+            hash: crate::export::note_content_hash(&markdown),
+            bytes: Zeroizing::new(markdown.into_bytes()),
+            created: receipt.created,
+            cleanup: receipt.cleanup,
+            verification: receipt.verification,
+        });
+        checkpoint(RecordingExportStage::CompanionAfterExport)?;
+    }
+    Ok(())
+}
+
+/// Capture and then remove only source projections that are not also one of the staged target
+/// paths. Same-path/idempotent receipts stay in place and are atomically re-stamped by the DB tx.
+fn remove_recording_source_exports(
+    db: &Db,
+    attempt_id: &str,
+    sources: &[RecordingSourceExport],
+    target_paths: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<RemovedConversionExports, AppError> {
+    let mut unique =
+        std::collections::HashMap::<std::path::PathBuf, (Option<String>, String)>::new();
+    for source in sources {
+        if target_paths.contains(&source.path) {
+            continue;
+        }
+        match unique.get(&source.path) {
+            Some((existing_hash, existing_folder))
+                if existing_hash != &source.expected_hash
+                    || existing_folder != &source.source_folder_id =>
+            {
+                return Err(AppError::Storage(
+                    "two recording export rows disagree about one source path or protection domain"
+                        .into(),
+                ))
+            }
+            Some(_) => {}
+            None => {
+                unique.insert(
+                    source.path.clone(),
+                    (
+                        source.expected_hash.clone(),
+                        source.source_folder_id.clone(),
+                    ),
+                );
+            }
+        }
+    }
+    let mut removed = RemovedConversionExports::default();
+    for (path, (expected, source_folder_id)) in &unique {
+        if let (Some(expected), Some((_, digest))) = (
+            expected.as_deref(),
+            removed.capture_if_present_in_source_folder(path, Some(source_folder_id))?,
+        ) {
+            if digest_hex(&digest) != expected {
+                return Err(AppError::Export(
+                    "recording source export changed before exact capture".into(),
+                ));
+            }
+        }
+    }
+    removed.remove_captured_for_filing(db, attempt_id)?;
+    Ok(removed)
+}
+
+fn recording_filing_rollback_error(
+    state: &AppState,
+    original: AppError,
+    staged: &StagedRecordingBundleExports,
+    _removed: Option<&RemovedConversionExports>,
+) -> AppError {
+    let target_cleanup_outcome = staged.remove_created();
+    let target_cleanup = target_cleanup_outcome.error();
+    let attachment_restore = staged.attachment_journal.rollback(state).err();
+    // Filing source snapshots are durable SQLCipher recovery authority. Restoring through the
+    // memory-only exact handle would create a new inode while the durable row still binds the old
+    // one, causing the subsequent restart-safe reconcile to reject our own replacement.
+    let source_restore: Option<AppError> = None;
+    let rollback_ack = acknowledge_verified_recording_rollback_projections(
+        &state.db,
+        &staged.attempt_id,
+        &target_cleanup_outcome.verified_projection_ids,
+        attachment_restore.is_none(),
+    )
+    .err();
+    let durable_reconcile = rollback_ack
+        .or_else(|| reconcile_filing_projection_journal(&state.db).err());
+    match (
+        target_cleanup,
+        attachment_restore,
+        source_restore,
+        durable_reconcile,
+    ) {
+        (None, None, None, None) => original,
+        (target, attachment, source, durable) => AppError::Storage(format!(
+            "{original}; recording filing rollback failures: target={}; attachment={}; source={}; durable={}",
+            target
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".into()),
+            attachment
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".into()),
+            source
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".into()),
+            durable
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".into())
+        )),
+    }
+}
+
+fn acknowledge_verified_recording_rollback_projections(
+    db: &Db,
+    attempt_id: &str,
+    verified_note_projection_ids: &[String],
+    attachments_verified: bool,
+) -> Result<(), AppError> {
+    for projection_id in verified_note_projection_ids {
+        db.clear_filing_projection(attempt_id, projection_id)?;
+    }
+    if attachments_verified {
+        db.clear_filing_attachment_projections_after_verified_rollback(attempt_id)?;
+    }
+    Ok(())
+}
+
+/// Move one terminal recording into a user Space/folder (or Unfiled with `folder_id = None`).
+/// Raw-open moves use the complete atomic recording-bundle filing path. Existing manual moves that
+/// cross a session-unlocked sealed meeting domain retain the lock lifecycle's seal/unseal path; a
+/// sealed-but-not-unlocked source or destination is still rejected before content is read.
 #[tauri::command]
 pub async fn move_note(
     app: AppHandle,
@@ -8253,14 +9929,25 @@ pub async fn move_note(
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
-    let _share_mutation = state.org_share_mutation_lock.lock().await;
-    move_note_command_body(&app, state.inner(), meeting_id, folder_id)
+    move_note_under_org_share_mutation_lock(state.inner(), |state| {
+        move_note_command_body(&app, state, meeting_id, folder_id)
+    })
+    .await
 }
 
-/// Body of [`move_note`], split so the audit-inbox ping fires once after EVERY successful move
-/// (a move INTO a locked folder seals + purges ALL pending findings via
-/// `purge_chunks_for_meetings`; an open-target move purges nothing — the count-only ping is
-/// correct either way).
+/// Public filing boundary: every authoritative source/target check and the bundle transaction run
+/// while the shared organization/share mutation lock is held. The synchronous operation then takes
+/// lifecycle, preserving the global `org_share_mutation_lock -> lifecycle` order without letting
+/// internal callers re-enter the non-reentrant outer mutex.
+async fn move_note_under_org_share_mutation_lock<T>(
+    state: &AppState,
+    operation: impl FnOnce(&AppState) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let _share_mutation = state.org_share_mutation_lock.lock().await;
+    operation(state)
+}
+
+/// Body of [`move_note`], split so the audit-inbox ping fires once after every successful filing.
 fn move_note_command_body(
     app: &AppHandle,
     state: &AppState,
@@ -8277,38 +9964,149 @@ fn move_note_command_body(
     if target_locked {
         emit_ask_history_invalidated_fail_closed(app);
     }
+    move_note_public_inner_impl(state, meeting_id, folder_id)?;
+    emit_audit_updated_after_purge(app, state);
+    Ok(())
+}
+
+/// Organizer apply is deliberately raw-open-only even though the public manual Move command keeps
+/// supporting already-unlocked sealed folders. The reviewed plan never proposes a locked target;
+/// if privacy changes between review and apply, the raw-open witnesses fail closed.
+fn file_recording_command_body(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
     move_note_inner_impl(state, meeting_id, folder_id)?;
     emit_audit_updated_after_purge(app, state);
     Ok(())
 }
 
-fn move_note_inner_impl(
+fn move_note_public_inner_impl(
+    state: &AppState,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
+    if manual_move_touches_locked_meeting_domain(state, &meeting_id, folder_id.as_deref())? {
+        move_note_locked_domain_compat(state, meeting_id, folder_id)
+    } else {
+        move_note_inner_impl(state, meeting_id, folder_id)
+    }
+}
+
+/// Content-free router for the legacy manual move capability. Only the canonical meeting domain
+/// participates: skewed provider/companion domains remain on the stricter atomic bundle path and
+/// are refused by its exact source witnesses. Every branch revalidates after taking lifecycle, so
+/// a lock-state race can only fail closed.
+fn manual_move_touches_locked_meeting_domain(
+    state: &AppState,
+    meeting_id: &str,
+    folder_id: Option<&str>,
+) -> Result<bool, AppError> {
+    if let Some(folder_id) = folder_id {
+        if state
+            .db
+            .folder_by_id(folder_id)?
+            .is_some_and(|folder| folder.locked)
+        {
+            return Ok(true);
+        }
+    }
+    for source_folder_id in state.db.folders_for_meeting(meeting_id)? {
+        let Some(folder) = state.db.folder_by_id(&source_folder_id)? else {
+            return Ok(true);
+        };
+        if folder.locked {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Compatibility path for the existing manual `Encrypt & move` UI. It is entered only when the
+/// canonical meeting source or direct target is sealed, and preserves the established lock
+/// lifecycle semantics without weakening the organizer's raw-open filing rules. Moving OUT of a
+/// still-sealed domain is refused: a session unlock keeps ciphertext authority for relock and is not
+/// a permanent unseal/re-export operation.
+/// A linked authored companion is refused because this legacy seam cannot atomically re-key its
+/// document, attachments, and managed export together with the meeting bundle.
+fn move_note_locked_domain_compat(
     state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
-    // The salvage finalizer is folder/CK-bound. Reassignment while it is awaiting ASR/provider
-    // work would either apply that key to the wrong folder or leave fresh plaintext ungoverned.
     ensure_no_active_salvage_for_meeting(state, &meeting_id)?;
-    // Resolve current + target folder lock state.
+    for source_folder_id in state.db.folders_for_meeting(&meeting_id)? {
+        if state
+            .db
+            .folder_by_id(&source_folder_id)?
+            .map_or(true, |folder| folder.locked)
+        {
+            return Err(AppError::Unavailable(
+                "remove the source folder lock before moving this recording out of it".into(),
+            ));
+        }
+    }
     if !meeting_is_unlocked(state, &meeting_id)? {
         return Err(AppError::Locked(
             "the source folder is locked — unlock it before moving the note".into(),
         ));
     }
+    // A canonical source must not mask a sealed legacy/provider row. This path may read generated
+    // Markdown and attachments, so every provider protection domain must be visible in-session.
+    for (_provider_id, source_folder_id) in state.db.filing_note_source_domains(&meeting_id)? {
+        if let Some(source_folder_id) = source_folder_id.as_deref() {
+            if !folder_is_unlocked(state, source_folder_id)? {
+                return Err(AppError::Locked(
+                    "one of the recording's note folders is locked — unlock it before moving the note"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let meeting = state
+        .db
+        .get_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no meeting {meeting_id}")))?;
+    if !matches!(
+        meeting.status,
+        MeetingStatus::Transcribed
+            | MeetingStatus::Summarized
+            | MeetingStatus::Exported
+            | MeetingStatus::Error
+    ) {
+        return Err(AppError::Unavailable(
+            "the recording must finish processing before it can be filed".into(),
+        ));
+    }
+    if state
+        .db
+        .meeting_has_recording_recovery_ownership(&meeting_id)?
+    {
+        return Err(AppError::Unavailable(
+            "recording recovery is still active; retry after it finishes".into(),
+        ));
+    }
+    if state.db.companion_note_for_meeting(&meeting_id)?.is_some() {
+        return Err(AppError::Unavailable(
+            crate::errcode::tag(
+                crate::errcode::RECORDING_LINKED_NOTE,
+                "this recording has a linked note; move it between open folders or remove the folder lock first",
+            ),
+        ));
+    }
+
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
-
-    // Canonical placement lives on `meetings.folder_id`, so an open-target move remains durable
-    // before a provider note exists; a later note inherits it in the storage upsert.
     ensure_meeting_folder_target(&state.db, folder_id.as_deref())?;
-
     let target_locked = match folder_id.as_deref() {
-        Some(fid) => {
+        Some(folder_id) => {
             state
                 .db
-                .folder_by_id(fid)?
-                .ok_or_else(|| AppError::InvalidArg(format!("no folder {fid}")))?
+                .folder_by_id(folder_id)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?
                 .locked
         }
         None => false,
@@ -8322,59 +10120,290 @@ fn move_note_inner_impl(
         }
     }
 
-    // ── Target is a LOCKED folder: seal-or-reject (BLK-2) ───────────────────────────────────────
-    if target_locked {
-        if note.is_none() {
-            return Err(AppError::Locked(
-                "this recording has no generated note yet; choose an open destination or finish processing before filing into a locked one".into(),
-            ));
-        }
-        let fid = folder_id.as_deref().ok_or_else(|| {
-            AppError::Storage("locked meeting-folder target lost its folder id".into())
-        })?;
-        if state
-            .db
-            .source_has_active_remote_share(Some(&meeting_id), None)?
-        {
-            return Err(AppError::Unavailable(
-                "revoke this meeting's shares before moving it into a locked folder".into(),
-            ));
-        }
-        return move_into_locked_folder_under_lifecycle(state, &meeting_id, fid);
+    if !target_locked {
+        return Err(AppError::Unavailable(
+            "remove the source folder lock before moving this recording out of it".into(),
+        ));
+    }
+    if note.is_none() {
+        return Err(AppError::Locked(
+            "this recording has no generated note yet; choose an open destination or finish processing before filing into a locked one".into(),
+        ));
+    }
+    let target_id = folder_id.as_deref().ok_or_else(|| {
+        AppError::Storage("locked meeting-folder target lost its folder id".into())
+    })?;
+    if state
+        .db
+        .source_has_active_remote_share(Some(&meeting_id), None)?
+    {
+        return Err(AppError::Unavailable(
+            "revoke this meeting's shares before moving it into a locked folder".into(),
+        ));
+    }
+    move_into_locked_folder_under_lifecycle(state, &meeting_id, target_id)
+}
+
+fn move_note_inner_impl(
+    state: &AppState,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
+    move_note_inner_impl_with_staging(
+        state,
+        meeting_id,
+        folder_id,
+        |_| Ok(()),
+        |db, move_| db.move_open_recording_bundle(move_),
+    )
+}
+
+#[cfg(test)]
+fn move_note_inner_impl_with(
+    state: &AppState,
+    meeting_id: String,
+    folder_id: Option<String>,
+    persist: impl FnOnce(
+        &crate::storage::Db,
+        &crate::storage::OpenRecordingBundleMove<'_>,
+    ) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    move_note_inner_impl_with_staging(state, meeting_id, folder_id, |_| Ok(()), persist)
+}
+
+fn move_note_inner_impl_with_staging(
+    state: &AppState,
+    meeting_id: String,
+    folder_id: Option<String>,
+    mut stage_checkpoint: impl FnMut(RecordingExportStage) -> Result<(), AppError>,
+    persist: impl FnOnce(
+        &crate::storage::Db,
+        &crate::storage::OpenRecordingBundleMove<'_>,
+    ) -> Result<(), AppError>,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    // The salvage finalizer is folder/CK-bound. Reassignment while it is awaiting ASR/provider
+    // work would either apply that key to the wrong folder or leave fresh plaintext ungoverned.
+    ensure_no_active_salvage_for_meeting(state, &meeting_id)?;
+    // Resolve both protection domains before reading content or touching governed exports.
+    // Session-unlocked is NOT open: its retained blobs remain the relock authority, so filing must
+    // refuse it byte-identically rather than clear or re-key those blobs.
+    let provider_domains = ensure_raw_open_recording_source(state, &meeting_id)?;
+    ensure_recording_folder_target(&state.db, folder_id.as_deref())?;
+    let meeting = state
+        .db
+        .get_meeting(&meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no meeting {meeting_id}")))?;
+    if !matches!(
+        meeting.status,
+        MeetingStatus::Transcribed
+            | MeetingStatus::Summarized
+            | MeetingStatus::Exported
+            | MeetingStatus::Error
+    ) {
+        return Err(AppError::Unavailable(
+            "the recording must finish processing before it can be filed".into(),
+        ));
+    }
+    if state
+        .db
+        .meeting_has_recording_recovery_ownership(&meeting_id)?
+    {
+        return Err(AppError::Unavailable(
+            "recording recovery is still active; retry after it finishes".into(),
+        ));
+    }
+    let generated_notes = state.db.sealable_notes_for_meeting(&meeting_id)?;
+    let generated_provider_ids = generated_notes
+        .iter()
+        .map(|note| note.provider_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if generated_provider_ids.len() != provider_domains.len()
+        || !provider_domains
+            .keys()
+            .all(|provider_id| generated_provider_ids.contains(provider_id.as_str()))
+    {
+        return Err(AppError::Unavailable(
+            "the recording provider set changed while filing; refresh and retry".into(),
+        ));
     }
 
-    // ── Target is OPEN / root: existing reassign + best-effort FS move ──────────────────────────
-    // The source folder's lock state: derive from the note's exported_path being present
-    // (sealed notes have exported_path = NULL). If exported_path is None we treat the source as
-    // "no movable file" and skip the FS move entirely.
-    let exported = note.as_ref().and_then(|n| n.exported_path.clone());
-
-    // Recover every attachment under the SOURCE gate before clearing a source-folder seal. Folder
-    // reassignment + plaintext restore + blob clear then commit atomically, so a crash cannot leave
-    // a stale source-CK blob attached to the open target.
-    let attachment_rows = state.db.attachments_for_meeting(&meeting_id)?;
-    let mut attachment_plaintext = std::collections::HashMap::with_capacity(attachment_rows.len());
-    for attachment in &attachment_rows {
-        attachment_plaintext.insert(
+    let meeting_attachments = state.db.attachments_for_meeting(&meeting_id)?;
+    let mut meeting_attachment_plaintext =
+        std::collections::HashMap::with_capacity(meeting_attachments.len());
+    for attachment in &meeting_attachments {
+        meeting_attachment_plaintext.insert(
             attachment.id.clone(),
             plaintext_attachment_data(state, attachment)?,
         );
     }
-    state.db.move_meeting_with_attachments_open(
-        &meeting_id,
-        folder_id.as_deref(),
-        &attachment_plaintext,
-    )?;
 
-    // Best-effort FS move only when a plaintext .md exists (target is open here).
-    if let Some(src_path) = exported {
-        if let Some(vault) = vault_path(state) {
-            let target_rel = match folder_id.as_deref() {
-                Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
-                None => None,
+    let companion_id = state.db.companion_note_for_meeting(&meeting_id)?;
+    let (companion_row, companion_attachment_plaintext, companion_target_folder_id) =
+        if let Some(companion_id) = companion_id.as_deref() {
+            let (source_folder_id, _created_at, _updated_at) = state
+                .db
+                .note_gate_anchor(companion_id)?
+                .ok_or_else(|| AppError::Storage("the linked companion disappeared".into()))?;
+            ensure_raw_open_companion_source(state, &source_folder_id)?;
+            let row = state
+                .db
+                .get_note_row(companion_id)?
+                .ok_or_else(|| AppError::Storage("the linked companion disappeared".into()))?;
+            let owner = crate::storage::AttachmentOwner::Document {
+                document_id: companion_id.to_string(),
             };
-            move_note_file(state, &meeting_id, &src_path, &vault, target_rel.as_deref())?;
+            let companion_attachments = state.db.list_attachments(&owner)?;
+            let mut companion_attachment_plaintext =
+                std::collections::HashMap::with_capacity(companion_attachments.len());
+            for attachment in &companion_attachments {
+                companion_attachment_plaintext.insert(
+                    attachment.id.clone(),
+                    plaintext_attachment_data(state, attachment)?,
+                );
+            }
+            let target = match folder_id.as_deref() {
+                Some(target) => target.to_string(),
+                None => ensure_open_canonical_notes_root(state)?,
+            };
+            (Some(row), companion_attachment_plaintext, Some(target))
+        } else {
+            (None, std::collections::HashMap::new(), None)
+        };
+
+    let vault_configured = vault_path(state).is_some();
+    let source_exports = collect_and_verify_recording_source_exports(
+        state,
+        &generated_notes,
+        &provider_domains,
+        companion_row.as_ref(),
+        vault_configured,
+    )?;
+    let mut staged_exports = StagedRecordingBundleExports::default();
+    state.db.reserve_filing_attempt(
+        &staged_exports.attempt_id,
+        &meeting_id,
+        meeting.folder_id.as_deref().unwrap_or(""),
+        folder_id.as_deref().unwrap_or(""),
+        companion_id.as_deref(),
+    )?;
+    if let Err(error) = stage_recording_bundle_exports(
+        state,
+        RecordingBundleExportContext {
+            meeting: &meeting,
+            target_folder_id: folder_id.as_deref(),
+            generated_notes: &generated_notes,
+            provider_domains: &provider_domains,
+            companion: companion_row.as_ref(),
+            companion_target_folder_id: companion_target_folder_id.as_deref(),
+            staged: &mut staged_exports,
+        },
+        &mut stage_checkpoint,
+    ) {
+        return Err(recording_filing_rollback_error(
+            state,
+            error,
+            &staged_exports,
+            None,
+        ));
+    }
+    if let Err(error) = staged_exports.verify_all() {
+        return Err(recording_filing_rollback_error(
+            state,
+            error,
+            &staged_exports,
+            None,
+        ));
+    }
+    let target_paths = staged_exports.target_paths();
+    let removed_exports = match remove_recording_source_exports(
+        &state.db,
+        &staged_exports.attempt_id,
+        &source_exports,
+        &target_paths,
+    ) {
+        Ok(removed) => removed,
+        Err(error) => {
+            return Err(recording_filing_rollback_error(
+                state,
+                error,
+                &staged_exports,
+                None,
+            ))
         }
+    };
+    // Source capture/removal performs filesystem IO and therefore opens another external-editor
+    // interleaving window. Reverify every target receipt once more immediately before the atomic
+    // metadata transaction; on conflict restore sources and remove only attempt-created targets.
+    if let Err(error) = staged_exports.verify_all() {
+        return Err(recording_filing_rollback_error(
+            state,
+            error,
+            &staged_exports,
+            Some(&removed_exports),
+        ));
+    }
+    if let Err(error) = stage_checkpoint(RecordingExportStage::BeforePersist) {
+        return Err(recording_filing_rollback_error(
+            state,
+            error,
+            &staged_exports,
+            Some(&removed_exports),
+        ));
+    }
+
+    let projection_values = staged_exports
+        .notes
+        .iter()
+        .map(|note| {
+            (
+                note.provider_id.clone(),
+                note.source_folder_id.clone(),
+                note.file.as_ref().map(|file| file.path_string.clone()),
+                note.file.as_ref().map(|file| file.hash.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let note_exports = projection_values
+        .iter()
+        .map(|(provider_id, source_folder_id, path, hash)| {
+            crate::storage::RecordingNoteExportProjection {
+                provider_id,
+                expected_source_folder_id: source_folder_id.as_deref(),
+                path: path.as_deref(),
+                hash: hash.as_deref(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let move_ = crate::storage::OpenRecordingBundleMove {
+        filing_attempt_id: &staged_exports.attempt_id,
+        meeting_id: &meeting_id,
+        expected_source_folder_id: meeting.folder_id.as_deref(),
+        target_folder_id: folder_id.as_deref(),
+        companion_id: companion_id.as_deref(),
+        expected_companion_source_folder_id: companion_row
+            .as_ref()
+            .map(|row| row.folder_id.as_str()),
+        companion_target_folder_id: companion_target_folder_id.as_deref(),
+        note_exports: &note_exports,
+        companion_export_path: staged_exports
+            .companion
+            .as_ref()
+            .map(|file| file.path_string.as_str()),
+        companion_export_hash: staged_exports
+            .companion
+            .as_ref()
+            .map(|file| file.hash.as_str()),
+        meeting_attachment_plaintext: &meeting_attachment_plaintext,
+        companion_attachment_plaintext: &companion_attachment_plaintext,
+    };
+    if let Err(error) = persist(&state.db, &move_) {
+        return Err(recording_filing_rollback_error(
+            state,
+            error,
+            &staged_exports,
+            Some(&removed_exports),
+        ));
     }
     Ok(())
 }
@@ -8838,69 +10867,6 @@ fn seal_moved_note(
         .db
         .purge_chunks_for_meetings(&[meeting_id.to_string()])?;
     remove_rollup_export_files(&rollup_exports);
-    Ok(())
-}
-
-/// Move the exported `.md` to the target folder's vault subdir, preserving content. Re-points
-/// the note's `exported_path`. Copy-then-remove so a failure never loses bytes.
-fn move_note_file(
-    state: &AppState,
-    meeting_id: &str,
-    src_path: &str,
-    vault: &str,
-    target_rel: Option<&str>,
-) -> Result<(), AppError> {
-    let src = std::path::Path::new(src_path);
-    let bytes = match std::fs::read_to_string(src) {
-        Ok(b) => b,
-        // Source file already gone → nothing to move; leave DB association as set.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(AppError::Export(format!("read note for move failed: {e}"))),
-    };
-    let file_name = src
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| AppError::Export("note path has no filename".into()))?;
-    let vault_root = std::path::Path::new(vault);
-    // D5: the destination (vault root + target folder rel-path + filename) must stay inside the
-    // vault. Compose the vault-relative candidate and canonicalize+assert containment before any FS
-    // write. `file_name` is derived from the real source path, but we still re-check it carries no
-    // traversal segment.
-    let rel_candidate = match target_rel.filter(|p| !p.is_empty()) {
-        Some(rel) => std::path::Path::new(rel).join(file_name),
-        None => std::path::PathBuf::from(file_name),
-    };
-    let dest = assert_in_vault(vault_root, &rel_candidate)?;
-    let dest_dir = dest
-        .parent()
-        .ok_or_else(|| AppError::Export("destination has no parent dir".into()))?
-        .to_path_buf();
-    // Same-location no-op. `dest` is canonicalized (absolute, symlinks resolved) but `src` from the
-    // DB is not — compare the CANONICALIZED source so a move to the same underlying file is detected
-    // even when the path strings differ (e.g. /var vs /private/var on macOS). Skipping this would let
-    // the copy-then-remove below delete the file it just wrote (data loss).
-    let src_canon = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
-    if dest == src_canon || dest == src {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
-    // Write the destination atomically, THEN remove the source (never lose bytes).
-    // Export-collision guard: a move copies the CURRENT file bytes verbatim (external edits ride
-    // along), so it is NOT a Murmur-authored write — the stored `exported_hash` baseline is
-    // deliberately LEFT ALONE. It still describes what Murmur last authored, so an external edit
-    // made before the move is still detected (and preserved) by the next DB-derived overwrite at
-    // the new path. Re-stamping from the moved bytes would erase that signal.
-    crate::export::overwrite_note(&dest, &bytes)?;
-    let _ = std::fs::remove_file(src);
-    // Re-point the exported path for every provider row of this meeting.
-    if let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? {
-        state.db.set_note_exported_path(
-            meeting_id,
-            &existing.provider_id,
-            &dest.to_string_lossy(),
-        )?;
-    }
     Ok(())
 }
 
@@ -10150,9 +12116,8 @@ fn unseal_dashboards_in_folder(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Resul
         let cosmetics = match &title_blob {
             Some(blob) => {
                 let bytes = crate::crypto::decrypt(ck, blob, &aad_document(folder_id, &board_id))?;
-                let text = String::from_utf8(bytes).map_err(|_| {
-                    AppError::Storage("sealed dashboard title is not UTF-8".into())
-                })?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| AppError::Storage("sealed dashboard title is not UTF-8".into()))?;
                 let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
                     AppError::Storage("sealed dashboard cosmetics are not valid JSON".into())
                 })?;
@@ -12312,6 +14277,11 @@ mod lock_read_gate_tests;
 #[cfg(test)]
 #[path = "tests/workspace_tree_tests.rs"]
 mod workspace_tree_tests;
+
+// ── Shared containers: the share plan's leak oracles + the received-forest read model ────────────
+#[cfg(test)]
+#[path = "tests/container_share_tests.rs"]
+mod container_share_tests;
 
 // ── BLK-1 lifecycle-race + BLK-2 move-into-locked + BLK-3/BLK-4 config tests ──────────────────────
 #[cfg(test)]

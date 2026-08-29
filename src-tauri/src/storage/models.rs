@@ -1089,14 +1089,48 @@ pub struct OrganizeMove {
     pub from_folder: String,
     pub to_folder: String,
     pub to_folder_id: Option<String>,
+    /// `high` | `medium` | `low`; informational only because every move is review-first.
+    pub confidence: String,
     pub reason: String,
 }
 
-/// The auto-organize plan (WP5) — the reviewable set of proposed moves.
+/// One existing, open direct-child destination offered by the note organizer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeTarget {
+    pub id: String,
+    pub label: String,
+}
+
+/// The auto-organize plan (WP5) — the reviewable set of proposed moves plus honest coverage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizePlan {
+    /// `None` keeps the legacy Notes-home all-visible scope; `Some` is one selected container.
+    pub scope_folder_id: Option<String>,
     pub moves: Vec<OrganizeMove>,
+    pub targets: Vec<OrganizeTarget>,
+    pub total_scanned: u32,
+    pub already_organized: u32,
+    pub deferred: u32,
+}
+
+/// One note that could not be applied after the plan was reviewed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeFailure {
+    pub note_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+/// Honest best-effort apply receipt. `appliedIds` and `failures.noteId` are disjoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeApplyResult {
+    pub applied_ids: Vec<String>,
+    pub failures: Vec<OrganizeFailure>,
 }
 
 /// One turn in a meeting chat conversation. `role` is "user" | "assistant".
@@ -1945,6 +1979,15 @@ pub struct OrgShareRow {
     pub expected_owner_user_id: Option<String>,
     pub source_version: u64,
     pub republish_dirty: u64,
+    /// The shared container this document was published under, when the container sweep owns it.
+    /// `None` for a standalone share — never guessed.
+    pub parent_container_id: Option<String>,
+    /// Ordering inside that container.
+    pub position: i64,
+    /// True when the user shared this document THEMSELVES; false when it exists only because its
+    /// container is shared. This is what makes unsharing a container safe: only `explicit == false`
+    /// rows are withdrawn with it.
+    pub explicit: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2524,6 +2567,72 @@ pub struct ContainerDto {
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
 }
+
+/// One row of the OUTBOUND container-share journal (`org_container_shares`) — a Space or Folder
+/// this device publishes to an org.
+///
+/// Not an IPC DTO: the frontend never sees this shape, it sees `ContainerShareStatus`. Keeping the
+/// journal row and the wire row distinct is what lets the journal carry crash-recovery fields
+/// (`content_sha256`, `last_error`) that have no business crossing to the renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerShareRow {
+    pub id: String,
+    pub org_id: String,
+    /// The LOCAL `folders.id`. Never leaves the device.
+    pub folder_id: String,
+    /// The stable, client-generated manifest identity published as the org `docId`.
+    pub container_id: String,
+    pub access: String,
+    pub scrub: bool,
+    /// True for the container the user actually picked; false for a descendant folder that is
+    /// shared only because its root is.
+    pub is_root: bool,
+    pub state: String,
+    pub item_id: Option<String>,
+    pub rev: u32,
+    pub generation: u32,
+    pub content_sha256: Option<Vec<u8>>,
+    pub position: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One decrypted container manifest received from an org feed (`org_containers`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgContainerRow {
+    pub org_id: String,
+    pub container_id: String,
+    pub item_id: String,
+    /// `"space"` or `"folder"` — the wire level, already validated by `ContainerLevel::parse`.
+    pub level: String,
+    pub name: String,
+    pub emoji: Option<String>,
+    pub tint: Option<String>,
+    pub parent_container_id: Option<String>,
+    pub position: i64,
+    pub access: String,
+    pub author_hint: String,
+    pub author_user_id: Option<String>,
+    pub document_owner_user_id: Option<String>,
+    pub seq: u64,
+    pub rev: u32,
+    pub generation: u32,
+    pub created_at: String,
+}
+
+/// One private, device-local placement of a received org object (`org_local_placements`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPlacementRow {
+    pub org_id: String,
+    /// `"container"` or `"doc"`.
+    pub target_kind: String,
+    pub target_id: String,
+    /// The local `folders.id` the user filed it under; `None` means the Shared Brains root.
+    pub local_parent_id: Option<String>,
+    pub position: i64,
+}
+
 
 #[cfg(test)]
 mod tests {

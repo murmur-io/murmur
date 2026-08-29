@@ -1566,6 +1566,7 @@ impl Db {
         // migrate() stays idempotent. Runs LAST so the companion backfill can read the (now-migrated)
         // `documents.meeting_id` column. See `migrate_links`.
         Self::migrate_links(&conn)?;
+        Self::migrate_filing_projection_journal(&conn)?;
         // Durable exact-body witness for marker cleanup of session-unlocked sealed notes. The
         // filesystem publish happens after the seal transaction; this hash lets its acknowledgement
         // advance the export-integrity baseline without pretending blank at-rest plaintext is the
@@ -2527,6 +2528,141 @@ impl Db {
                    VALUES ('delete', old.id, old.text);
                  INSERT INTO fts_org_chunks(rowid, text) VALUES (new.id, new.text);
              END;",
+        )
+        .map_err(map_err)?;
+        Self::migrate_shared_containers(conn)
+    }
+
+    /// SHARED CONTAINERS (2026-08-29) — publishing a whole Folder or Space to an org.
+    ///
+    /// Container structure is CONTENT: it travels inside the OCK-sealed envelope as a
+    /// `ContainerEnvelope` manifest (`share/container_envelope.rs`), so the relay stores one more
+    /// opaque blob and learns nothing about the shape of anyone's vault. That is why this whole
+    /// feature is client-side and needs no server table, endpoint or authorization rule.
+    ///
+    /// These tables join the SAME lock domain the rest of `org_*` already occupies: org items are
+    /// deliberately org-disclosed content living OUTSIDE the folder-seal domain, protected at rest
+    /// by whole-DB SQLCipher. Nothing here adds a gate, and nothing here is sealed.
+    ///
+    /// All additive + guarded, so `migrate()` stays idempotent and no existing row is read or
+    /// rewritten.
+    fn migrate_shared_containers(conn: &Connection) -> Result<()> {
+        // OUTBOUND journal — one row per (org, local container) this device publishes.
+        //
+        // `is_root = 1` marks the container the user actually picked; descendants get their own
+        // rows with `is_root = 0`. That is what lets unsharing the root cascade, and what stops a
+        // descendant from being unshared on its own while its root is still live.
+        //
+        // Mirrors `org_shares`'s state vocabulary on purpose: the launch sweep already knows how to
+        // read `queued`/`failed` as "retry me", and a manifest publish is recoverable the same way
+        // a note publish is.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_container_shares (
+               id             TEXT PRIMARY KEY,
+               org_id         TEXT NOT NULL,
+               folder_id      TEXT NOT NULL,
+               container_id   TEXT NOT NULL,
+               access         TEXT NOT NULL DEFAULT 'view' CHECK(access IN ('view','edit')),
+               scrub          INTEGER NOT NULL DEFAULT 1 CHECK(scrub IN (0,1)),
+               is_root        INTEGER NOT NULL DEFAULT 0 CHECK(is_root IN (0,1)),
+               state          TEXT NOT NULL DEFAULT 'queued'
+                              CHECK (state IN ('queued','published','failed','revoke_pending','revoked')),
+               item_id        TEXT,
+               rev            INTEGER NOT NULL DEFAULT 1,
+               generation     INTEGER NOT NULL DEFAULT 1,
+               content_sha256 BLOB,
+               position       INTEGER NOT NULL DEFAULT 0,
+               last_error     TEXT,
+               created_at     TEXT NOT NULL,
+               updated_at     TEXT NOT NULL,
+               UNIQUE(org_id, folder_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_container_shares_org
+               ON org_container_shares(org_id);
+             CREATE INDEX IF NOT EXISTS idx_org_container_shares_container
+               ON org_container_shares(org_id, container_id);",
+        )
+        .map_err(map_err)?;
+
+        // INBOUND replica — the decrypted manifest of a container someone shared with this user.
+        // Keyed by the CLIENT-generated `container_id` (stable across revisions), not the server
+        // item id, because a rename publishes a new item under the same document.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_containers (
+               org_id                 TEXT NOT NULL,
+               container_id           TEXT NOT NULL,
+               item_id                TEXT NOT NULL,
+               level                  TEXT NOT NULL CHECK(level IN ('space','folder')),
+               name                   TEXT NOT NULL DEFAULT '',
+               emoji                  TEXT,
+               tint                   TEXT,
+               parent_container_id    TEXT,
+               position               INTEGER NOT NULL DEFAULT 0,
+               access                 TEXT NOT NULL DEFAULT 'view' CHECK(access IN ('view','edit')),
+               author_hint            TEXT NOT NULL DEFAULT '',
+               author_user_id         TEXT,
+               document_owner_user_id TEXT,
+               seq                    INTEGER NOT NULL DEFAULT 0,
+               rev                    INTEGER NOT NULL DEFAULT 1,
+               generation             INTEGER NOT NULL DEFAULT 1,
+               created_at             TEXT NOT NULL DEFAULT '',
+               tombstoned             INTEGER NOT NULL DEFAULT 0 CHECK(tombstoned IN (0,1)),
+               PRIMARY KEY (org_id, container_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_containers_parent
+               ON org_containers(org_id, parent_container_id);
+             CREATE INDEX IF NOT EXISTS idx_org_containers_item
+               ON org_containers(item_id);",
+        )
+        .map_err(map_err)?;
+
+        // The recipient's PRIVATE arrangement. A row here changes where a received object is DRAWN
+        // in this user's sidebar and nothing else: it never leaves the device, never reaches the
+        // relay, and never alters ownership — the content keeps updating from the org feed exactly
+        // as before. It gives an org item no `folder_id`, so it cannot pull org content into a
+        // local folder's seal domain.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_local_placements (
+               placement_key   TEXT PRIMARY KEY,
+               org_id          TEXT NOT NULL,
+               target_kind     TEXT NOT NULL CHECK(target_kind IN ('container','doc')),
+               target_id       TEXT NOT NULL,
+               local_parent_id TEXT,
+               position        INTEGER NOT NULL DEFAULT 0,
+               updated_at      TEXT NOT NULL,
+               UNIQUE(org_id, target_kind, target_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_local_placements_parent
+               ON org_local_placements(local_parent_id);",
+        )
+        .map_err(map_err)?;
+
+        // A received document's placement, opened straight off the v4 envelope. NULL means "no
+        // container" — the honest state for every item published before containers existed and for
+        // every standalone share. It is never guessed into a container.
+        Self::add_column_if_missing(conn, "org_items", "parent_container_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "org_items", "position", "INTEGER NOT NULL DEFAULT 0")?;
+
+        // The outbound twin: which container this device published the document under, and whether
+        // the user asked for this share themselves.
+        //
+        // `explicit` is what makes unsharing a container safe. Rows the container sweep created
+        // (`explicit = 0`) are withdrawn with it; rows the user shared deliberately (`explicit = 1`)
+        // merely lose their `parent_container_id` and stay live. DEFAULT 1 is correct for every
+        // pre-existing row — each of them came from someone pressing "Add to Org Brain".
+        Self::add_column_if_missing(conn, "org_shares", "parent_container_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "org_shares", "position", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(
+            conn,
+            "org_shares",
+            "explicit",
+            "INTEGER NOT NULL DEFAULT 1 CHECK(explicit IN (0,1))",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_org_items_container
+               ON org_items(org_id, parent_container_id);
+             CREATE INDEX IF NOT EXISTS idx_org_shares_container
+               ON org_shares(org_id, parent_container_id);",
         )
         .map_err(map_err)
     }

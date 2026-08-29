@@ -81,6 +81,13 @@ export class FoldersService {
     return node.unlocked ? "session" : "locked";
   }
 
+  /** Whether an item currently belongs to a still-sealed folder, including session-unlocked. */
+  isLocked(folderId: string | null | undefined): boolean {
+    return folderId !== null && folderId !== undefined
+      ? this.allNodes().some((node) => node.id === folderId && node.locked)
+      : false;
+  }
+
   /** True once a `load()` has SUCCEEDED at least once (an empty tree is a
    *  legitimate success — a user with no folders). Drives `ensureLoaded`. */
   private loadedOnce = false;
