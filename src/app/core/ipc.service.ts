@@ -13,6 +13,9 @@ import type {
   ApplyResult,
   AskConversation,
   AskConversationScope,
+  ContainerSharePreview,
+  ContainerShareResult,
+  ContainerShareStatus,
   AskConversationSendResult,
   AskConversationSummary,
   AskVaultResult,
@@ -142,6 +145,8 @@ import type {
   SearchHit,
   Segment,
   ShareInboxItem,
+  SharedPlacementTarget,
+  SharedWorkspace,
   ShareToUserResult,
   SourceKind,
   SourceRef,
@@ -216,6 +221,9 @@ export const EVENT_AUDIT_UPDATED = "murmur://audit-updated";
 // Shared Brain — the background org-sync loop INGESTED/TOMBSTONED ≥1 org item this tick
 // (content-free "something changed, re-fetch" ping; drives the Notes org picker live refresh).
 export const EVENT_ORG_FEED_UPDATED = "murmur://org-feed-updated";
+/** Progress of one container share. Counts only — no folder name, no item id. */
+export const EVENT_CONTAINER_SHARE_PROGRESS =
+  "murmur://container-share-progress";
 // Delete fan-out fix — a note/meeting delete FULLY succeeded (local rows gone + any org shares
 // revoked); lets OTHER open surfaces (the tab-strip) prune themselves. Content-free (id + kind only).
 export const EVENT_CONTENT_DELETED = "murmur://content-deleted";
@@ -3617,5 +3625,129 @@ export class IpcService {
    */
   onAskHistoryInvalidated(cb: () => void): Promise<UnlistenFn> {
     return listen<void>(EVENT_ASK_HISTORY_INVALIDATED, () => cb());
+  }
+
+  // ── Shared containers ──────────────────────────────────────────────────────
+
+  /**
+   * What sharing this Space or Folder would publish — counts only, no egress.
+   * Refuses a SEALED container: its content is not readable, and letting the
+   * user "share" it and see nothing arrive would be a silent failure.
+   */
+  previewContainerShare(
+    orgId: string,
+    folderId: string,
+  ): Promise<ContainerSharePreview> {
+    return invoke<ContainerSharePreview>("preview_container_share", {
+      orgId,
+      folderId,
+    });
+  }
+
+  /**
+   * Publish a whole Space or Folder to an Org: every manifest, then every
+   * eligible document, all under one inherited `access`. Emits
+   * {@link onContainerShareProgress} after each item.
+   */
+  shareContainerToOrg(
+    orgId: string,
+    folderId: string,
+    access: OrgAccess,
+    scrub: boolean,
+  ): Promise<ContainerShareResult> {
+    return invoke<ContainerShareResult>("share_container_to_org", {
+      orgId,
+      folderId,
+      access,
+      scrub,
+    });
+  }
+
+  /**
+   * Stop sharing a container. Withdraws every document the container itself
+   * published; a note the user shared deliberately keeps its own share and
+   * merely loses its placement.
+   */
+  unshareContainer(orgId: string, folderId: string): Promise<void> {
+    return invoke<void>("unshare_container", { orgId, folderId });
+  }
+
+  /** Re-permission a container AND every document filed under it. */
+  setContainerShareAccess(
+    orgId: string,
+    folderId: string,
+    access: OrgAccess,
+  ): Promise<void> {
+    return invoke<void>("set_container_share_access", {
+      orgId,
+      folderId,
+      access,
+    });
+  }
+
+  /** Every container THIS device publishes — drives the sidebar's shared marker. */
+  listContainerShareStatus(): Promise<ContainerShareStatus[]> {
+    return invoke<ContainerShareStatus[]>("list_container_share_status");
+  }
+
+  /**
+   * Bring every shared container back in line with the local tree, returning the
+   * number of mutations. Call it after a workspace mutation so a note added to a
+   * shared folder publishes right away; a background tick is the safety net.
+   */
+  syncContainerShares(): Promise<number> {
+    return invoke<number>("sync_container_shares");
+  }
+
+  /** The forest of containers and items other members shared with this user. */
+  listSharedWorkspace(): Promise<SharedWorkspace> {
+    return invoke<SharedWorkspace>("list_shared_workspace");
+  }
+
+  /**
+   * File a received container or document somewhere in this user's own tree.
+   * DEVICE-LOCAL: nothing is published, the owner sees nothing, and the content
+   * keeps updating from the org feed exactly as before.
+   */
+  setSharedPlacement(
+    orgId: string,
+    targetKind: SharedPlacementTarget,
+    targetId: string,
+    localParentId: string | null,
+    position: number,
+  ): Promise<void> {
+    return invoke<void>("set_shared_placement", {
+      orgId,
+      targetKind,
+      targetId,
+      localParentId,
+      position,
+    });
+  }
+
+  /** Return a received object to wherever its owner filed it. */
+  clearSharedPlacement(
+    orgId: string,
+    targetKind: SharedPlacementTarget,
+    targetId: string,
+  ): Promise<void> {
+    return invoke<void>("clear_shared_placement", {
+      orgId,
+      targetKind,
+      targetId,
+    });
+  }
+
+  /**
+   * Progress of a running container share. Counts only — never a folder name or
+   * an item id.
+   */
+  onContainerShareProgress(
+    cb: (done: number, total: number) => void,
+  ): Promise<UnlistenFn> {
+    return listen<{ done: number; total: number }>(
+      EVENT_CONTAINER_SHARE_PROGRESS,
+      (e) => cb(e.payload.done, e.payload.total),
+    );
   }
 }

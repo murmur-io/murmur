@@ -512,6 +512,52 @@ impl ContentDispatchAdmission {
 }
 
 impl AppState {
+    /// An [`AppState`] backed by a caller-supplied temp SQLCipher DB: no Keychain, no Tauri, no
+    /// recorder, default config (no vault, so nothing touches the filesystem).
+    ///
+    /// Lives here rather than in each test module because the struct has forty-odd fields and every
+    /// suite that duplicated the literal had to be edited whenever one was added — which is how a
+    /// test file ends up pinned to a stale shape.
+    #[cfg(test)]
+    pub(crate) fn for_tests(db: Db) -> Self {
+        use std::collections::HashSet;
+        Self {
+            recorder: Mutex::new(None),
+            recording_stop: Mutex::new(None),
+            voice_listener: Mutex::new(None),
+            voice_listener_lifecycle: Mutex::new(()),
+            recording_starting: AtomicBool::new(false),
+            voice_command_capture: Mutex::new(None),
+            pending_manual_command: Mutex::new(None),
+            live_running: AtomicBool::new(false),
+            db: Arc::new(db),
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
+            current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
+            capped_notified: AtomicBool::new(false),
+            capture_fault_notified: AtomicBool::new(false),
+            reactions_shadow_count: AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
+            in_flight_turns: Mutex::new(std::collections::HashMap::new()),
+            user_turn_in_progress: AtomicBool::new(false),
+            verify_cache: Mutex::new(std::collections::HashMap::new()),
+            unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
+            master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(std::collections::HashMap::new()),
+            account_session: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            active_salvages: Mutex::new(HashSet::new()),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
+            seal_epoch: AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
     /// Return the exact Live-session token only when `meeting_id` names the capture currently held
     /// in the recorder slot. Transitional Starting/Draining/Postprocess phases and mismatched or
     /// stale meeting ids fail closed instead of borrowing recording priority for unrelated work.

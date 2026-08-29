@@ -84,101 +84,182 @@
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
-             and its icon aligns with every other row at this depth. -->
+             and its icon aligns with every other row at this depth. The
+             container is narrowed rather than asserted: `container` is optional
+             on a line because a RECEIVED row has none, and a lie here would
+             surface as a runtime read of `undefined.locked`. -->
+        @if (line.container; as owner) {
+          <mur-tree-row
+            class="line line--item"
+            role="treeitem"
+            [attr.aria-level]="line.depth + 1"
+            [attr.aria-selected]="isItemSelected(item)"
+            [label]="itemTitle(item)"
+            [depth]="line.depth"
+            [icon]="kindIcon(item.kind)"
+            [selected]="isItemSelected(item)"
+            [attr.draggable]="draggableKind(item) && !(item.kind === 'meeting' && owner.locked) ? true : null"
+            (dragstart)="onDragStart($event, item, owner)"
+            (dragend)="onDragEnd()"
+            (activate)="openItem(item)"
+          >
+            @if (moveTargetsFor(item, owner); as targets) {
+              <mur-row-menu [label]="'Actions for ' + item.kind + ' ' + itemTitle(item)">
+                <span class="menu-group-label">{{ itemKindLabel(item.kind) }} actions</span>
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  [disabled]="targets.length === 0"
+                  (click)="openMove(item, owner, targets)"
+                >
+                  <mur-icon icon="move" />
+                  {{ targets.length > 0 ? "Move to Space or folder…" : "No other open destination" }}
+                </button>
+              </mur-row-menu>
+            }
+          </mur-tree-row>
+        }
+      } @else if (line.seeAll) {
+        @if (line.container; as owner) {
+          <button
+            type="button"
+            class="see-all"
+            role="treeitem"
+            aria-selected="false"
+            [attr.aria-level]="line.depth + 1"
+            [style.padding-left]="
+              'calc(' + line.depth + ' * var(--tree-indent) + 20px)'
+            "
+            (click)="openAll(owner)"
+          >
+            {{ viewAllLabel(line.total!) }}
+          </button>
+        }
+      } @else if (line.sharedItem; as sharedItem) {
+        <!-- A RECEIVED item: someone else's note or meeting note. Read-only —
+             its owner keeps the structure, so no move, rename or delete. -->
         <mur-tree-row
-          class="line line--item"
+          class="line line--item line--shared-item"
           role="treeitem"
           [attr.aria-level]="line.depth + 1"
-          [attr.aria-selected]="isItemSelected(item)"
-          [label]="itemTitle(item)"
+          [attr.aria-selected]="isSharedItemSelected(sharedItem)"
+          [label]="sharedItem.title || 'Untitled'"
           [depth]="line.depth"
-          [icon]="kindIcon(item.kind)"
-          [selected]="isItemSelected(item)"
-          [attr.draggable]="draggableKind(item) && !(item.kind === 'meeting' && line.container.locked) ? true : null"
-          (dragstart)="onDragStart($event, item, line.container)"
-          (dragend)="onDragEnd()"
-          (activate)="openItem(item)"
+          [icon]="sharedItem.kind === 'meeting' ? 'meeting' : 'note'"
+          [selected]="isSharedItemSelected(sharedItem)"
+          (activate)="openSharedItem(sharedItem)"
+        />
+      } @else if (line.shared; as shared) {
+        <!-- A RECEIVED container: a shared Space, a shared folder, or the
+             virtual Shared Brains Space. Structure belongs to whoever shared it,
+             so this row offers no rename, delete or create-here at ANY access
+             level — "Can edit" is about a document's text, not the tree. -->
+        <mur-tree-row
+          class="line line--shared"
+          [class.line--project]="shared.level !== 'folder'"
+          role="treeitem"
+          [attr.aria-level]="line.depth + 1"
+          [attr.aria-selected]="isSharedSelected(shared)"
+          [attr.aria-expanded]="sharedExpandable(shared) ? isSharedExpanded(shared) : null"
+          [attr.data-tint]="shared.tint ?? null"
+          [label]="shared.name"
+          [depth]="line.depth"
+          [icon]="sharedIcon(shared)"
+          [emoji]="shared.emoji ?? null"
+          [selected]="isSharedSelected(shared)"
+          [expandable]="sharedExpandable(shared)"
+          [expanded]="isSharedExpanded(shared)"
+          (toggleExpand)="toggleShared(shared)"
+          (activate)="openShared(shared)"
         >
-          @if (moveTargetsFor(item, line.container); as targets) {
-            <mur-row-menu [label]="'Actions for ' + item.kind + ' ' + itemTitle(item)">
-              <span class="menu-group-label">{{ itemKindLabel(item.kind) }} actions</span>
+          @if (shared.containerId) {
+            <!-- The user's OWN arrangement of received content. Nothing here
+                 publishes: the owner and every other member see none of it. -->
+            <mur-row-menu [label]="'Actions for shared ' + shared.name">
+              <span class="menu-group-label">Your arrangement</span>
               <button
                 type="button"
                 class="menu-item"
                 role="menuitem"
-                [disabled]="targets.length === 0"
-                (click)="openMove(item, line.container, targets)"
+                (click)="openPlace(shared)"
+                data-testid="place-shared"
               >
                 <mur-icon icon="move" />
-                {{ targets.length > 0 ? "Move to Space or folder…" : "No other open destination" }}
+                Keep in my Space…
               </button>
+              @if (shared.localParentId) {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="resetPlacement(shared)"
+                >
+                  <mur-icon icon="rename" />
+                  Move back to Shared
+                </button>
+              }
             </mur-row-menu>
           }
+          @if (sharedMark(line); as mark) {
+            <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+                <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+                <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              </svg>
+            </span>
+          }
         </mur-tree-row>
-      } @else if (line.seeAll) {
-        <button
-          type="button"
-          class="see-all"
-          role="treeitem"
-          aria-selected="false"
-          [attr.aria-level]="line.depth + 1"
-          [style.padding-left]="
-            'calc(' + line.depth + ' * var(--tree-indent) + 20px)'
-          "
-          (click)="openAll(line.container)"
-        >
-          {{ viewAllLabel(line.total!) }}
-        </button>
-      } @else {
+      } @else if (line.container; as container) {
         <!-- A CONTAINER row: a Project or a Folder. A sealed-and-not-unlocked
              one carries no groups at all, so it is not expandable and shows no
              counts — we know it exists, not what is inside it. -->
         <mur-tree-row
           class="line"
-          [class.line--project]="line.container.level === 'project'"
+          [class.line--project]="container.level === 'project'"
           role="treeitem"
           [attr.aria-level]="line.depth + 1"
-          [attr.aria-selected]="isContainerSelected(line.container)"
-          [attr.aria-expanded]="containerExpandable(line.container) ? isContainerExpanded(line.container) : null"
-          [attr.data-tint]="line.container.tint"
-          [label]="line.container.name"
+          [attr.aria-selected]="isContainerSelected(container)"
+          [attr.aria-expanded]="containerExpandable(container) ? isContainerExpanded(container) : null"
+          [attr.data-tint]="container.tint"
+          [label]="container.name"
           [depth]="line.depth"
-          [icon]="containerIcon(line.container)"
-          [emoji]="line.container.emoji"
-          [selected]="isContainerSelected(line.container)"
-          [expandable]="containerExpandable(line.container)"
-          [expanded]="isContainerExpanded(line.container)"
+          [icon]="containerIcon(container)"
+          [emoji]="container.emoji"
+          [selected]="isContainerSelected(container)"
+          [expandable]="containerExpandable(container)"
+          [expanded]="isContainerExpanded(container)"
           appFolderDrop
-          [dropFolderId]="line.container.id"
-          (dropItem)="onDropItem(line.container, $event)"
-          (toggleExpand)="toggleContainer(line.container)"
-          (activate)="openContainer(line.container)"
+          [dropFolderId]="container.id"
+          (dropItem)="onDropItem(container, $event)"
+          (toggleExpand)="toggleContainer(container)"
+          (activate)="openContainer(container)"
         >
           <mur-row-menu
             class="row-actions"
-            [label]="'Actions for ' + line.container.name"
+            [label]="'Actions for ' + container.name"
           >
             <span class="menu-group-label">
-              {{ line.container.level === "project" ? "Space" : "Folder" }} actions
+              {{ container.level === "project" ? "Space" : "Folder" }} actions
             </span>
-            @if (isSealed(line.container)) {
+            @if (isSealed(container)) {
               <button
                 type="button"
                 class="menu-item"
                 role="menuitem"
-                (click)="unlock(line.container)"
+                (click)="unlock(container)"
               >
                 <mur-icon icon="unlock" />
-                {{ unlockLabel(line.container) }}
+                {{ unlockLabel(container) }}
               </button>
             } @else {
-              @if (canCreateIn(line.container)) {
-              @if (canCreateNote(line.container)) {
+              @if (canCreateIn(container)) {
+              @if (canCreateNote(container)) {
                 <button
                   type="button"
                   class="menu-item"
                   role="menuitem"
-                  (click)="newNote(line.container)"
+                  (click)="newNote(container)"
                 >
                   <mur-icon icon="note-add" />
                   Create note here
@@ -188,7 +269,7 @@
                 type="button"
                 class="menu-item"
                 role="menuitem"
-                (click)="newFolder(line.container)"
+                (click)="newFolder(container)"
               >
                 <mur-icon icon="folder-add" />
                 Create folder here
@@ -197,41 +278,41 @@
                 type="button"
                 class="menu-item"
                 role="menuitem"
-                (click)="newDashboard(line.container)"
+                (click)="newDashboard(container)"
               >
                 <mur-icon icon="dashboards" />
                 Create dashboard here
               </button>
               }
-              @if (canLock(line.container)) {
+              @if (canLock(container)) {
                 <button
                   type="button"
                   class="menu-item"
                   role="menuitem"
-                  (click)="lock(line.container)"
+                  (click)="lock(container)"
                 >
                   <mur-icon icon="lock" />
-                  {{ lockLabel(line.container) }}
+                  {{ lockLabel(container) }}
                 </button>
               }
-              @if (line.container.locked && line.container.unlocked) {
+              @if (container.locked && container.unlocked) {
                 <button
                   type="button"
                   class="menu-item"
                   role="menuitem"
-                  (click)="relock(line.container)"
+                  (click)="relock(container)"
                 >
                   <mur-icon icon="lock" />
                   Lock again
                 </button>
               }
-              @if (canOrganize(line.container)) {
+              @if (canOrganize(container)) {
                 <button
                   type="button"
                   class="menu-item"
                   role="menuitem"
                   [disabled]="organizePlanning()"
-                  (click)="organize(line.container)"
+                  (click)="organize(container)"
                   data-testid="organize-container"
                 >
                   <mur-icon icon="brain" />
@@ -242,29 +323,52 @@
                   }}
                 </button>
               }
-              @if (canManage(line.container)) {
+              @if (canShare(container)) {
                 <button
                   type="button"
                   class="menu-item"
                   role="menuitem"
-                  (click)="startRename(line.container)"
+                  (click)="openShareSheet(container)"
+                  data-testid="share-container"
+                >
+                  <mur-icon icon="shared-brains" />
+                  {{ isShared(container) ? "Sharing…" : "Share to Org…" }}
+                </button>
+              }
+              @if (canManage(container)) {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="startRename(container)"
                 >
                   <mur-icon icon="rename" />
-                  Rename {{ containerNoun(line.container) }}
+                  Rename {{ containerNoun(container) }}
                 </button>
                 <button
                   type="button"
                   class="menu-item menu-item-danger"
                   role="menuitem"
-                  (click)="startDelete(line.container)"
+                  (click)="startDelete(container)"
                 >
                   <mur-icon icon="trash" />
-                  Delete {{ containerNoun(line.container) }}
+                  Delete {{ containerNoun(container) }}
                 </button>
               }
             }
           </mur-row-menu>
-          @if (line.container.locked && line.container.unlocked) {
+          @if (sharedMark(line); as mark) {
+            <!-- Same discipline as the unlocked mark below, for the same reason:
+                 one dim glyph, the sentence on hover and for a screen reader. A
+                 pill would take the row's spare width and truncate the name. -->
+            <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
+              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+                <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+                <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+              </svg>
+            </span>
+          }
+          @if (container.locked && container.unlocked) {
             <!-- A WORD here cost the project its name: the pill took the row's
                  spare width and truncated "Prywatne" to "P…". The state still
                  needs saying — this container is decrypted right now — so it
@@ -316,6 +420,36 @@
       [error]="moveError()"
       (move)="moveItemTo($event)"
       (cancelled)="closeMove()"
+    />
+  </div>
+}
+
+@if (placeRequest(); as request) {
+  <!-- Reuses the ordinary move sheet on purpose: to the user this IS a move.
+       What differs is invisible to them and load-bearing underneath — nothing
+       is published, and the content keeps updating from the org feed. -->
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-workspace-move-sheet
+      [item]="{ kind: 'note', title: request.name }"
+      [fromLabel]="'Shared by ' + request.authorHint"
+      [targets]="placeTargets()"
+      [busy]="placeBusy()"
+      [error]="placeError()"
+      (move)="placeInto($event)"
+      (cancelled)="closePlace()"
+    />
+  </div>
+}
+
+@if (shareRequest(); as request) {
+  <!-- ONE instance for the whole tree, not one per row: only one container is
+       ever being shared, and a per-row instance would build a dialog for every
+       container in the vault. Its own opaque overlay (T3). -->
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-container-share-sheet
+      [target]="request"
+      (sharedOut)="onContainerShared()"
+      (cancelled)="closeShareSheet()"
     />
   </div>
 }
