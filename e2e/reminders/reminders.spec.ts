@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
+import { enterEditMode } from "../notes/mock-invoke";
 
 const REMINDER_VISIBILITY_EVENT = "murmur://reminder-visibility-invalidated";
 const REMINDERS_UPDATED_EVENT = "murmur://reminders-updated";
@@ -2431,6 +2432,8 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
           call.command === "audit" && call.args.sourceKind === "note",
       ).length,
   );
+  // "Atlas — PRD v3" carries a body, so the routed editor opens in Preview now.
+  await enterEditMode(page);
   const noteBody = page.locator(".body-area");
   await noteBody.evaluate((element) => {
     const textarea = element as HTMLTextAreaElement;
