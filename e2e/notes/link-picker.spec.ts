@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mockNotes } from "./mock-invoke";
+import { enterEditMode, mockNotes } from "./mock-invoke";
 
 /**
  * Fix 1 — a rendered `[[Wikilink]]` pill in Preview mode opens the resolved
@@ -81,6 +81,7 @@ test("slash menu 'Link to note' opens the autocomplete popover and inserts [[Tit
     ],
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await expect(body).toBeVisible();
@@ -150,6 +151,7 @@ test("scrolling the picker to the bottom loads further candidate pages", async (
     },
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await expect(body).toBeVisible();
@@ -203,6 +205,7 @@ test("typing [[ also opens the link-picker autocomplete", async ({ page }) => {
     ],
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await expect(body).toBeVisible();
