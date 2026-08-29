@@ -267,3 +267,100 @@ test("the share sheet names what is left behind before anything leaves", async (
     sheet.getByRole("button", { name: /View only/ }),
   ).toHaveAttribute("aria-pressed", "true");
 });
+
+test("a received Space can be filed under a local Space, privately", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {
+      set_shared_placement: (args: unknown) => {
+        (
+          window as unknown as { __placements?: unknown[] }
+        ).__placements ??= [];
+        (window as unknown as { __placements: unknown[] }).__placements.push(
+          args,
+        );
+        return null;
+      },
+    },
+    {
+      list_workspace_tree: LOCAL_FOREST,
+      list_shared_workspace: SHARED_WORKSPACE,
+      list_container_share_status: CONTAINER_SHARES,
+    },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
+
+  const partners = page.getByRole("treeitem", { name: /Partners/ });
+  await partners.getByRole("button", { name: /Actions for shared/ }).click();
+  await page.getByTestId("place-shared").click();
+
+  const sheet = page.getByRole("dialog");
+  await expect(sheet).toBeVisible();
+  await sheet.getByRole("button", { name: /Move to Acme/ }).click();
+
+  // Device-local: the placement is recorded, and NOTHING is published.
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __placements?: unknown[] }).__placements ??
+          [],
+      ),
+    )
+    .toEqual([
+      {
+        orgId: "org-siema",
+        targetKind: "container",
+        targetId: "c-partners",
+        localParentId: "p-acme",
+        position: 0,
+      },
+    ]);
+});
+
+test("a nested received folder can be filed too, and renders in exactly one place", async ({
+  page,
+}) => {
+  // The "Keep in my Space…" action is offered on EVERY received container, so
+  // the merge must find a nested one's placement as well — and must not then
+  // render it under BOTH its shared parent and its new local host.
+  const placed = {
+    ...SHARED_WORKSPACE,
+    spaces: [
+      {
+        ...SHARED_WORKSPACE.spaces[0],
+        folders: [
+          {
+            ...SHARED_WORKSPACE.spaces[0].folders[0],
+            localParentId: "p-acme",
+          },
+        ],
+      },
+    ],
+  };
+  await mockTauri(
+    page,
+    {},
+    {
+      list_workspace_tree: LOCAL_FOREST,
+      list_shared_workspace: placed,
+      list_container_share_status: CONTAINER_SHARES,
+    },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
+
+  // Expand both possible hosts, then assert the row exists exactly once.
+  await page
+    .getByRole("treeitem", { name: /Acme/ })
+    .getByRole("button", { name: /Expand/ })
+    .click();
+  await page
+    .getByRole("treeitem", { name: /Partners/ })
+    .getByRole("button", { name: /Expand/ })
+    .click();
+  await expect(page.getByRole("treeitem", { name: /Contracts/ })).toHaveCount(1);
+});
