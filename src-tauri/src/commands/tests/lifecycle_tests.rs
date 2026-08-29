@@ -485,6 +485,49 @@
     /// emitted (no stale/placeholder header). Runs in a debug/test build, so `get_or_create_mcp_token`
     /// mints into the dev-secrets file store — no Keychain, no `security` CLI.
     #[test]
+    /// The wire contract for the status Settings branches on.
+    ///
+    /// `rust-tauri.md` §2b exists because a snake_case field arrives as `undefined` on the FE and
+    /// the template silently takes the other branch. Here that branch is "the server is running" —
+    /// so a naming slip would restore the exact lie this command was added to remove.
+    fn mcp_status_dto_is_camel_case_on_the_wire() {
+        let dto = super::McpStatusDto {
+            state: crate::mcp::McpListenerState::PortInUse.as_wire().to_string(),
+            port: crate::mcp::MCP_PORT,
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        let object = value.as_object().unwrap();
+        for key in object.keys() {
+            assert!(
+                !key.contains('_'),
+                "IPC DTO key {key} must be camelCase, never snake_case"
+            );
+        }
+        assert_eq!(object["state"], "portInUse");
+        assert_eq!(object["port"], crate::mcp::MCP_PORT);
+    }
+
+    /// Each listener state has a DISTINCT wire value, and the round-trip through the atomic
+    /// encoding preserves it.
+    ///
+    /// `portInUse` and `unavailable` must never collapse into one: they carry different
+    /// instructions ("quit the other app" vs "restart Murmur"), and the first one recovers by
+    /// itself while the second does not.
+    #[test]
+    fn every_mcp_listener_state_has_its_own_wire_value() {
+        use crate::mcp::McpListenerState::*;
+        let all = [Starting, Listening, PortInUse, Unavailable];
+        let wires: Vec<&str> = all.iter().map(|s| s.as_wire()).collect();
+        let mut unique = wires.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "wire values collided: {wires:?}");
+
+        let status = crate::mcp::McpListenerStatus::default();
+        assert_eq!(status.get(), Starting, "an unwritten status is never Listening");
+    }
+
+    #[test]
     fn get_mcp_config_carries_token_when_required_and_omits_it_when_off() {
         let state = build_state("mcp-config");
 

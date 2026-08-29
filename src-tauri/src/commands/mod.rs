@@ -6759,6 +6759,36 @@ pub fn get_mcp_config(state: State<'_, AppState>) -> Result<String, AppError> {
     get_mcp_config_inner(state.inner())
 }
 
+/// What Settings must say about the local server for Claude, instead of asserting it is running.
+///
+/// Serialized keys are camelCase and asserted by a test (`rust-tauri.md` §2b): the FE reads
+/// `state` and `port`, and a snake_case field here would arrive as `undefined` and silently render
+/// the healthy branch — the exact failure this command exists to prevent.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatusDto {
+    /// `starting` | `listening` | `portInUse` | `unavailable`.
+    pub state: String,
+    /// The fixed loopback port, so the copy can name it without hardcoding it twice.
+    pub port: u16,
+}
+
+/// The listener's REAL state. Settings used to claim, in the present tense, that the server was
+/// running at `127.0.0.1:8765` and hand over a config to paste — with no way to find out that the
+/// bind had failed. Reads the status the listener thread publishes; a missing handle (the probe
+/// process that never starts MCP) reports `unavailable` rather than pretending.
+#[tauri::command]
+pub fn get_mcp_status(app: AppHandle) -> McpStatusDto {
+    let state = app
+        .try_state::<std::sync::Arc<crate::mcp::McpListenerStatus>>()
+        .map(|handle| handle.get())
+        .unwrap_or(crate::mcp::McpListenerState::Unavailable);
+    McpStatusDto {
+        state: state.as_wire().to_string(),
+        port: crate::mcp::MCP_PORT,
+    }
+}
+
 /// Headless core of [`get_mcp_config`] — testable without a Tauri `State`.
 pub(crate) fn get_mcp_config_inner(state: &AppState) -> Result<String, AppError> {
     // Read the flag the same way lib.rs does: fail CLOSED (require the token) on a poisoned lock,

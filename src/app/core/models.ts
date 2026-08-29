@@ -3825,3 +3825,22 @@ export interface SharedWorkspace {
 
 /** What a private placement can point at. */
 export type SharedPlacementTarget = "container" | "doc";
+
+/**
+ * What the local server for Claude is actually doing.
+ *
+ * `portInUse` is deliberately its own state, not folded into a generic failure: the user action
+ * that fixes it (quit whatever else holds the port) is completely different from the one that
+ * fixes `unavailable`, and the listener retries a `portInUse` on its own, so the copy can promise
+ * recovery without a restart.
+ */
+export type McpListenerState =
+  | "starting"
+  | "listening"
+  | "portInUse"
+  | "unavailable";
+
+export interface McpStatus {
+  state: McpListenerState;
+  port: number;
+}
