@@ -244,6 +244,12 @@ test("a terminal source race stays visible while only the locked target can be r
   const runtimeErrors = await openOrganizer(page, "mixed-failures");
   const sheet = page.getByRole("dialog", { name: "Review Brain filing plan" });
 
+  // Guidance-aware plans now preselect Brain's suggested target. Keep this
+  // scenario scoped to the two canonical moves whose distinct retry classes it
+  // is meant to prove; Gamma's manual-review path is covered by the test above.
+  await sheet
+    .getByLabel("Destination for Gamma planning")
+    .selectOption("");
   await sheet.getByRole("button", { name: "Move 2 recordings" }).click();
 
   await expect(sheet.locator(".result-row.is-failed")).toHaveCount(2);

@@ -463,7 +463,7 @@ def main() -> int:
             ["git", "rev-parse", "--show-toplevel"], text=True
         ).strip()
     )
-    policy = json.loads((root / ".agents/harness/remote-policy.json").read_text())
+    policy = json.loads((root / ".agents/h/remote-policy.json").read_text())
     repo = policy["repository"]
     branch = policy["branch"]
     try:

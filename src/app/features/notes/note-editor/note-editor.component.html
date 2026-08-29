@@ -61,6 +61,14 @@
               <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
           </button>
+          <!-- The note's stable id, for pointing Claude at THIS note over the local MCP
+               server (`get_document` / `get_document_outline`). It sits INSIDE `.head-crumb`,
+               not beside it: `.editor-head` is `flex-wrap: wrap` and with the Ask Brain column
+               open the toolbar has under 30px of slack, so a seventh top-level flex item pushed
+               the `⋯` menu onto a second line and broke the one-shared-divider alignment the split
+               view depends on (`e2e/notes/note-chat-drawer.spec.ts`). Inside the crumb, the folder
+               name truncates instead. -->
+          <mur-copy-id [id]="doc.id" label="Note" />
           @if (menu() === "move") {
             <div class="menu head-menu" role="menu" aria-label="Move to folder">
               <p class="menu-group-label">Move to…</p>

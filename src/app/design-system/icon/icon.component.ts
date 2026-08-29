@@ -2,6 +2,10 @@ import { ChangeDetectionStrategy, Component, input } from "@angular/core";
 
 /** Every glyph the shell chrome can render (nav + quick actions + chrome). */
 export type ShellIcon =
+  // The Murmur brand mark itself — the five-bar waveform from
+  // `src-tauri/icons/icon.svg`, drawn in `currentColor` so the rail tile paints
+  // it in the user's accent instead of shipping a second, fixed-gradient copy.
+  | "murmur"
   | "record"
   | "meetings"
   | "notes"

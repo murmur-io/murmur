@@ -6,31 +6,61 @@
     <header class="content-head">
       <h2 class="content-title">{{ listHeading() }}</h2>
       <div class="content-actions">
-        <button
-          type="button"
-          class="btn btn-ghost organize-btn"
-          [disabled]="organizePlanning() || organizeOpen()"
-          (click)="startOrganize()"
-        >
-          @if (organizePlanning()) {
-            <span class="spin-ring" aria-hidden="true"></span>
-            Planning…
-          } @else {
-            <svg viewBox="0 0 20 20" width="15" height="15" fill="none" aria-hidden="true">
-              <path d="M4 5.5h12M4 10h12M4 14.5h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-              <circle cx="15.5" cy="14.5" r="2.4" stroke="currentColor" stroke-width="1.3" />
-            </svg>
-            Auto-organize
-          }
-        </button>
+        @if (canOrganizeActiveScope()) {
+          <button
+            type="button"
+            class="btn btn-ghost organize-btn"
+            [disabled]="organizePlanning() || organizeOpen()"
+            (click)="startOrganize()"
+          >
+            @if (organizePlanning()) {
+              <span class="spin-ring" aria-hidden="true"></span>
+              Planning…
+            } @else {
+              <svg
+                viewBox="0 0 20 20"
+                width="15"
+                height="15"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M4 5.5h12M4 10h12M4 14.5h7"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+                <circle
+                  cx="15.5"
+                  cy="14.5"
+                  r="2.4"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                />
+              </svg>
+              Auto-organize
+            }
+          </button>
+        }
         <button
           type="button"
           class="btn btn-primary new-note-btn"
           [disabled]="creating()"
           (click)="newNote()"
         >
-          <svg viewBox="0 0 20 20" width="16" height="16" fill="none" aria-hidden="true">
-            <path d="M10 4.5v11M4.5 10h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+          <svg
+            viewBox="0 0 20 20"
+            width="16"
+            height="16"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="M10 4.5v11M4.5 10h11"
+              stroke="currentColor"
+              stroke-width="1.7"
+              stroke-linecap="round"
+            />
           </svg>
           New note
         </button>
@@ -65,11 +95,31 @@
             class="pill org-chip"
             [class.is-selected]="activeOrgId() === org.orgId"
             [attr.aria-pressed]="activeOrgId() === org.orgId"
-            (click)="activeOrgId() === org.orgId ? clearOrg() : selectOrg(org.orgId)"
+            (click)="
+              activeOrgId() === org.orgId ? clearOrg() : selectOrg(org.orgId)
+            "
           >
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-              <circle cx="5" cy="6" r="1.8" stroke="currentColor" stroke-width="1.2" />
-              <circle cx="11" cy="6" r="1.8" stroke="currentColor" stroke-width="1.2" />
+            <svg
+              viewBox="0 0 16 16"
+              width="13"
+              height="13"
+              fill="none"
+              aria-hidden="true"
+            >
+              <circle
+                cx="5"
+                cy="6"
+                r="1.8"
+                stroke="currentColor"
+                stroke-width="1.2"
+              />
+              <circle
+                cx="11"
+                cy="6"
+                r="1.8"
+                stroke="currentColor"
+                stroke-width="1.2"
+              />
               <path
                 d="M2.3 12.5c0-1.6 1.2-2.7 2.7-2.7s2.7 1.1 2.7 2.7M8.3 12.5c0-1.6 1.2-2.7 2.7-2.7s2.7 1.1 2.7 2.7"
                 stroke="currentColor"
@@ -91,8 +141,20 @@
           title="Choose which organizations are active on this device"
           aria-label="Manage organizations in Settings"
         >
-          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+          <svg
+            viewBox="0 0 16 16"
+            width="13"
+            height="13"
+            fill="none"
+            aria-hidden="true"
+          >
+            <circle
+              cx="8"
+              cy="8"
+              r="2.1"
+              stroke="currentColor"
+              stroke-width="1.3"
+            />
             <path
               d="M8 2.2v1.4M8 12.4v1.4M13.8 8h-1.4M3.6 8H2.2M12.1 3.9l-1 1M4.9 11.1l-1 1M12.1 12.1l-1-1M4.9 4.9l-1-1"
               stroke="currentColor"
@@ -108,14 +170,32 @@
       @if (activeFolderLocked()) {
         <!-- Sealed folder: notes come back masked; offer to unlock. -->
         <div class="empty-state lock-gate">
-          <svg class="lock-glyph" viewBox="0 0 24 24" width="34" height="34" fill="none" aria-hidden="true">
-            <rect x="5" y="11" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.6" />
-            <path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          <svg
+            class="lock-glyph"
+            viewBox="0 0 24 24"
+            width="34"
+            height="34"
+            fill="none"
+            aria-hidden="true"
+          >
+            <rect
+              x="5"
+              y="11"
+              width="14"
+              height="9"
+              rx="2"
+              stroke="currentColor"
+              stroke-width="1.6"
+            />
+            <path
+              d="M8 11V8a4 4 0 0 1 8 0v3"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
           </svg>
           <h3 class="empty-title">This folder is locked</h3>
-          <p class="empty-body">
-            Unlock it to read and edit the notes inside.
-          </p>
+          <p class="empty-body">Unlock it to read and edit the notes inside.</p>
           @if (activeFolder(); as folder) {
             <button
               type="button"
@@ -148,8 +228,8 @@
           <div class="empty-state">
             <h3 class="empty-title">No notes yet</h3>
             <p class="empty-body">
-              Author a standalone note — it becomes first-class brain context, right
-              alongside your recordings.
+              Author a standalone note — it becomes first-class brain context,
+              right alongside your recordings.
             </p>
             <button
               type="button"
@@ -167,8 +247,8 @@
         <div class="empty-state">
           <h3 class="empty-title">No notes match this view</h3>
           <p class="empty-body">
-            No notes match this view’s filters. Adjust the filters, or switch back
-            to List.
+            No notes match this view’s filters. Adjust the filters, or switch
+            back to List.
           </p>
         </div>
       } @else {
@@ -181,7 +261,11 @@
              reading column: this view is a dense list to scan, not
              prose. Rows are `viewItems()` = `listItems()` filtered/sorted by
              the active saved view (List default = unchanged). -->
-        <mur-table [rows]="viewItems()" [trackBy]="trackByItemId" [rowClass]="rowClassFor">
+        <mur-table
+          [rows]="viewItems()"
+          [trackBy]="trackByItemId"
+          [rowClass]="rowClassFor"
+        >
           <mur-table-column key="title" header="Title">
             <ng-template let-row>
               @switch (row.kind) {
@@ -189,12 +273,34 @@
                   <button
                     type="button"
                     class="title-btn"
-                    (click)="openNote(row.note.id, row.note.locked, row.note.title)"
+                    (click)="
+                      openNote(row.note.id, row.note.locked, row.note.title)
+                    "
                   >
                     @if (row.note.locked) {
-                      <svg class="note-lock" viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                        <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
-                        <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                      <svg
+                        class="note-lock"
+                        viewBox="0 0 16 16"
+                        width="13"
+                        height="13"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <rect
+                          x="3.5"
+                          y="7"
+                          width="9"
+                          height="6"
+                          rx="1.4"
+                          stroke="currentColor"
+                          stroke-width="1.3"
+                        />
+                        <path
+                          d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
+                          stroke="currentColor"
+                          stroke-width="1.3"
+                          stroke-linecap="round"
+                        />
                       </svg>
                     }
                     <!-- Title ONLY — no body-snippet preview (2026-07-12: the
@@ -204,7 +310,9 @@
                          a fixed row height regardless of title length. -->
                     <span class="title-text">{{ row.note.title }}</span>
                     @if (row.note.shared) {
-                      <span class="pill is-accent note-shared" title="Shared">Shared</span>
+                      <span class="pill is-accent note-shared" title="Shared"
+                        >Shared</span
+                      >
                     }
                     @if (row.note.tags.length > 0) {
                       <span class="note-tags">
@@ -226,16 +334,45 @@
                     (click)="openOrgCard(row.item)"
                   >
                     <span class="title-text">{{ row.item.title }}</span>
-                    <span class="pill org-badge" [title]="'Shared brain · ' + row.orgName">
-                      <svg class="org-badge-glyph" viewBox="0 0 16 16" width="11" height="11" fill="none" aria-hidden="true">
-                        <circle cx="5" cy="6" r="1.6" stroke="currentColor" stroke-width="1.2" />
-                        <circle cx="11" cy="6" r="1.6" stroke="currentColor" stroke-width="1.2" />
-                        <path d="M2.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5M8.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+                    <span
+                      class="pill org-badge"
+                      [title]="'Shared brain · ' + row.orgName"
+                    >
+                      <svg
+                        class="org-badge-glyph"
+                        viewBox="0 0 16 16"
+                        width="11"
+                        height="11"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <circle
+                          cx="5"
+                          cy="6"
+                          r="1.6"
+                          stroke="currentColor"
+                          stroke-width="1.2"
+                        />
+                        <circle
+                          cx="11"
+                          cy="6"
+                          r="1.6"
+                          stroke="currentColor"
+                          stroke-width="1.2"
+                        />
+                        <path
+                          d="M2.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5M8.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5"
+                          stroke="currentColor"
+                          stroke-width="1.2"
+                          stroke-linecap="round"
+                        />
                       </svg>
                       {{ row.orgName }}
                     </span>
                     @if (row.item.authorHint) {
-                      <span class="note-author text-muted">{{ row.item.authorHint }}</span>
+                      <span class="note-author text-muted">{{
+                        row.item.authorHint
+                      }}</span>
                     }
                   </button>
                 }
@@ -243,7 +380,12 @@
             </ng-template>
           </mur-table-column>
 
-          <mur-table-column key="date" header="Last modified" width="160px" [alignEnd]="true">
+          <mur-table-column
+            key="date"
+            header="Last modified"
+            width="160px"
+            [alignEnd]="true"
+          >
             <ng-template let-row>
               @switch (row.kind) {
                 @case ("note") {
@@ -256,7 +398,12 @@
             </ng-template>
           </mur-table-column>
 
-          <mur-table-column key="actions" header="Actions" [hideHeader]="true" width="44px">
+          <mur-table-column
+            key="actions"
+            header="Actions"
+            [hideHeader]="true"
+            width="44px"
+          >
             <ng-template let-row>
               <!-- Per-note "Move to…" affordance (hidden for masked rows + org rows). -->
               @if (row.kind === "note" && !row.note.locked) {
@@ -269,7 +416,13 @@
                     title="Move to…"
                     (click)="toggleMovePopover(row.note.id, $event)"
                   >
-                    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                    <svg
+                      viewBox="0 0 16 16"
+                      width="16"
+                      height="16"
+                      fill="none"
+                      aria-hidden="true"
+                    >
                       <circle cx="8" cy="3.5" r="1.2" fill="currentColor" />
                       <circle cx="8" cy="8" r="1.2" fill="currentColor" />
                       <circle cx="8" cy="12.5" r="1.2" fill="currentColor" />
@@ -321,8 +474,12 @@
   @if (organizeOpen()) {
     <app-organize-sheet
       [plan]="organizePlan()"
-      [busy]="organizeApplying()"
+      [busy]="organizePlanning() || organizeApplying()"
+      [planning]="organizePlanning()"
+      [applying]="organizeApplying()"
+      [guidanceEnabled]="true"
       (apply)="applyOrganize($event)"
+      (replan)="replanOrganize($event)"
       (cancelled)="closeOrganize()"
     />
   }
