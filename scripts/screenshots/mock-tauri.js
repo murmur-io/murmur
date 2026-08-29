@@ -1828,6 +1828,7 @@ scope to the GA-critical path only.
       case "list_shared_workspace":
         return RICH() ? SHARED_WORKSPACE : EMPTY_SHARED_WORKSPACE;
       case "list_container_share_status": return RICH() ? CONTAINER_SHARES : [];
+      case "list_org_share_targets": return [];
       case "preview_container_share": return {
         folderId: args?.folderId ?? "f-clients",
         name: "Clients",

@@ -154,6 +154,14 @@
             (dragend)="onDragEnd()"
             (activate)="openItem(item)"
           >
+            @if (sharedMark(line); as mark) {
+              <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+                  <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+                  <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                </svg>
+              </span>
+            }
             @if (moveTargetsFor(item, owner); as targets) {
               <mur-row-menu [label]="'Actions for ' + item.kind + ' ' + itemTitle(item)">
                 <span class="menu-group-label">{{ itemKindLabel(item.kind) }} actions</span>
@@ -200,7 +208,16 @@
           [icon]="sharedItem.kind === 'meeting' ? 'meeting' : 'note'"
           [selected]="isSharedItemSelected(sharedItem)"
           (activate)="openSharedItem(sharedItem)"
-        />
+        >
+            @if (sharedMark(line); as mark) {
+              <span class="shared-mark" role="img" [attr.aria-label]="mark" [title]="mark">
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+                  <circle cx="8" cy="4.8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+                  <path d="M3.6 12.4a4.5 4.5 0 0 1 8.8 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                </svg>
+              </span>
+            }
+        </mur-tree-row>
       } @else if (line.shared; as shared) {
         <!-- A RECEIVED container: a shared Space, a shared folder, or the
              virtual Shared Brains Space. Structure belongs to whoever shared it,

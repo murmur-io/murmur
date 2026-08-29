@@ -16,6 +16,7 @@ import type {
   ContainerSharePreview,
   ContainerShareResult,
   ContainerShareStatus,
+  OrgShareTargetRow,
   AskConversationSendResult,
   AskConversationSummary,
   AskVaultResult,
@@ -3694,6 +3695,14 @@ export class IpcService {
       folderId,
       access,
     });
+  }
+
+  /**
+   * Items this device publishes to an org on their own (not via a container).
+   * Read-gated: a sealed source discloses no share status.
+   */
+  listOrgShareTargets(): Promise<OrgShareTargetRow[]> {
+    return invoke<OrgShareTargetRow[]>("list_org_share_targets");
   }
 
   /** Every container THIS device publishes — drives the sidebar's shared marker. */

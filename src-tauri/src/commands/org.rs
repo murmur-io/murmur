@@ -10217,6 +10217,25 @@ async fn org_sync_one(
             document_owner_user_id: Option<String>,
             is_current: bool,
         },
+        /// A CONTAINER manifest → `org_containers`, never `org_items`.
+        ///
+        /// This arm exists because the feed has TWO ingest paths — this live pull and the
+        /// anti-entropy reconcile sweep — and 2.1.0 shipped the container branch on only the
+        /// sweep. A manifest arriving through the live pull was therefore written as an ordinary
+        /// note, so a shared Space showed up in Shared Brains as a note named after the folder
+        /// instead of appearing in the sidebar as a Space.
+        IngestContainer {
+            item_id: String,
+            seq: u64,
+            rev: u32,
+            generation: u32,
+            manifest: Box<crate::share::container_envelope::ContainerEnvelope>,
+            author_hint: String,
+            author_user_id: String,
+            access: crate::share::org_dto::OrgItemAccess,
+            document_owner_user_id: Option<String>,
+            created_at: String,
+        },
     }
     let mut actions: Vec<FeedAction> = Vec::new();
     let cursor = state.db.org_last_seq_for(&org.org_id)?;
@@ -10348,6 +10367,32 @@ async fn org_sync_one(
                 .errors
                 .push(format!("item {}: content hash mismatch", item.item_id));
             actions.push(FeedAction::SkipTerminal { seq: item.seq });
+            continue;
+        }
+        if env.kind == crate::share::org_envelope::OrgItemKind::Container {
+            // Structure, not prose: a manifest skips the attachment bundle, the chunker and the
+            // embedder entirely. A payload this device cannot parse is terminal for that seq —
+            // never half-written, so a malformed manifest cannot leave a nameless container behind.
+            match crate::share::container_envelope::ContainerEnvelope::from_json(&env.markdown) {
+                Ok(manifest) => actions.push(FeedAction::IngestContainer {
+                    item_id: item.item_id.clone(),
+                    seq: item.seq,
+                    rev: item.rev,
+                    generation: item.generation,
+                    manifest: Box::new(manifest),
+                    author_hint: env.author_hint.clone(),
+                    author_user_id: item.author_user_id.clone(),
+                    access: item.access,
+                    document_owner_user_id: item.document_owner_user_id.clone(),
+                    created_at: item.created_at.clone(),
+                }),
+                Err(_) => {
+                    report
+                        .errors
+                        .push(format!("item {}: container manifest invalid", item.item_id));
+                    actions.push(FeedAction::SkipTerminal { seq: item.seq });
+                }
+            }
             continue;
         }
         // Validate the complete authenticated bundle before any local write, then replace wire ids
@@ -10540,6 +10585,61 @@ async fn org_sync_one(
                                 if applied {
                                     ingested += 1;
                                 }
+                                // WHERE the sender filed this document. Written after the item row
+                                // exists, and unconditionally: a document that LEAVES a shared
+                                // folder arrives with no placement, and clearing it is what makes
+                                // it move. 2.1.0 wrote this only on the reconcile-sweep path, so a
+                                // document arriving through the live pull was never filed at all.
+                                let placement = env.placement.as_ref();
+                                let _ = db.set_org_item_placement(
+                                    &item_id,
+                                    placement.map(|p| p.parent_container_id.as_str()),
+                                    placement.map(|p| p.position).unwrap_or(0),
+                                );
+                            }
+                            FeedAction::IngestContainer {
+                                item_id,
+                                seq,
+                                rev,
+                                generation,
+                                manifest,
+                                author_hint,
+                                author_user_id,
+                                access,
+                                document_owner_user_id,
+                                created_at,
+                            } => {
+                                let manifest = *manifest;
+                                let row = crate::storage::models::OrgContainerRow {
+                                    org_id: org_id.clone(),
+                                    container_id: manifest.container_id.clone(),
+                                    item_id: item_id.clone(),
+                                    level: manifest.level.as_str().to_string(),
+                                    name: manifest.name.clone(),
+                                    emoji: manifest.emoji.clone(),
+                                    tint: manifest.tint.clone(),
+                                    parent_container_id: manifest.parent_container_id.clone(),
+                                    position: manifest.position,
+                                    access: access.as_str().to_string(),
+                                    author_hint,
+                                    author_user_id: (!author_user_id.is_empty())
+                                        .then_some(author_user_id),
+                                    document_owner_user_id,
+                                    seq,
+                                    rev,
+                                    generation,
+                                    created_at,
+                                };
+                                // The cursor must advance with the write, or the same manifest is
+                                // replayed on every pull.
+                                let Some(()) = policy.commit(|| {
+                                    db.upsert_org_container(&row)?;
+                                    db.set_org_last_seq(&org_id, seq as i64)
+                                })?
+                                else {
+                                    break;
+                                };
+                                ingested += 1;
                             }
                         }
                     }
