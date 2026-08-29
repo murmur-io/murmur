@@ -37,17 +37,6 @@
   </button>
   <a
     class="rail-item"
-    [class.active]="isSharedBrainsActive()"
-    [attr.aria-current]="isSharedBrainsActive() ? 'page' : null"
-    routerLink="/shared-brains"
-    (click)="clearContextOverride()"
-    aria-label="Shared Brains"
-    title="Shared Brains"
-  >
-    <mur-icon icon="shared-brains" />
-  </a>
-  <a
-    class="rail-item"
     [class.active]="isAskActive()"
     [attr.aria-current]="isAskActive() ? 'page' : null"
     routerLink="/ask"

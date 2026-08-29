@@ -51,6 +51,10 @@ import {
 } from "../workspace-destination";
 import { WorkspaceMoveSheetComponent } from "../workspace-move-sheet/workspace-move-sheet.component";
 import {
+  ContainerShareSheetComponent,
+  type ContainerShareTarget,
+} from "../container-share-sheet/container-share-sheet.component";
+import {
   WorkspaceManageSheetComponent,
   type WorkspaceManageMode,
 } from "../workspace-manage-sheet/workspace-manage-sheet.component";
@@ -116,6 +120,7 @@ const KIND_ROUTE: Record<ItemKind, string> = {
   selector: "app-workspace-tree",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
+    ContainerShareSheetComponent,
     FolderDropDirective,
     MurIconComponent,
     MurRowMenuComponent,
@@ -544,7 +549,11 @@ export class WorkspaceTreeComponent {
   }
 
   protected openShareSheet(container: ContainerNode): void {
-    this.shareRequest.set(container);
+    this.shareRequest.set({
+      id: container.id,
+      name: container.name,
+      level: container.level,
+    });
   }
 
   protected closeShareSheet(): void {
@@ -558,7 +567,7 @@ export class WorkspaceTreeComponent {
   }
 
   /** The container whose share sheet is open, if any. */
-  protected readonly shareRequest = signal<ContainerNode | null>(null);
+  protected readonly shareRequest = signal<ContainerShareTarget | null>(null);
 
   /**
    * A container that is sealed and not unlocked for this session cannot take a new
