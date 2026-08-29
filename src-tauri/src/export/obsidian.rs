@@ -3,6 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
@@ -35,6 +37,8 @@ const NOTE_O_DIRECTORY: i32 = 0x0010_0000;
 const NOTE_O_CLOEXEC: i32 = 0x0100_0000;
 #[cfg(target_os = "macos")]
 const NOTE_RENAME_SWAP: u32 = 0x0000_0002;
+#[cfg(target_os = "macos")]
+const NOTE_RENAME_EXCL: u32 = 0x0000_0004;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -47,6 +51,14 @@ extern "C" {
         flags: u32,
     ) -> i32;
     fn unlinkat(directory: i32, path: *const std::ffi::c_char, flags: i32) -> i32;
+    fn linkat(
+        from_directory: i32,
+        from: *const std::ffi::c_char,
+        to_directory: i32,
+        to: *const std::ffi::c_char,
+        flags: i32,
+    ) -> i32;
+    fn mkdirat(directory: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
 }
 
 fn marker_cleanup_error(message: impl std::fmt::Display) -> AppError {
@@ -54,6 +66,1598 @@ fn marker_cleanup_error(message: impl std::fmt::Display) -> AppError {
 }
 
 pub(crate) const MAX_MARKER_CLEANUP_NOTE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A vault root resolved once and then held as a directory capability. Target paths are accepted
+/// only when they are lexically below `configured`; every ancestor below the retained root is
+/// opened component-by-component with `openat(O_NOFOLLOW | O_DIRECTORY)`. No exact-file operation
+/// independently canonicalizes a target parent.
+#[derive(Debug, Clone)]
+pub(crate) struct ExactVault {
+    configured: PathBuf,
+    canonical: PathBuf,
+    root_device: u64,
+    root_inode: u64,
+    #[cfg(target_os = "macos")]
+    root: Arc<File>,
+}
+
+#[cfg(target_os = "macos")]
+impl ExactVault {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        if !absolute_normal_path(path) {
+            return Err(AppError::Export(
+                "exact vault root must be an absolute path without dot components".into(),
+            ));
+        }
+        // Resolve only the configured trust root. `/var` is a normal macOS alias for
+        // `/private/var`; descendants are never canonicalized and therefore cannot escape by an
+        // ancestor swap after this capability is opened.
+        let canonical = std::fs::canonicalize(path).map_err(|error| {
+            AppError::Export(format!("resolve exact vault root failed: {error}"))
+        })?;
+        if !absolute_normal_path(&canonical) {
+            return Err(AppError::Export(
+                "resolved exact vault root is not an absolute normal path".into(),
+            ));
+        }
+        let root = open_absolute_directory_nofollow(&canonical)?;
+        if !root
+            .metadata()
+            .map_err(|error| AppError::Export(format!("stat exact vault root failed: {error}")))?
+            .is_dir()
+        {
+            return Err(AppError::Export(
+                "configured exact vault root is not a directory".into(),
+            ));
+        }
+        Ok(Self {
+            configured: path.to_path_buf(),
+            canonical,
+            root_device: root
+                .metadata()
+                .map_err(|error| {
+                    AppError::Export(format!("restat exact vault root failed: {error}"))
+                })?
+                .dev(),
+            root_inode: root
+                .metadata()
+                .map_err(|error| {
+                    AppError::Export(format!("restat exact vault root failed: {error}"))
+                })?
+                .ino(),
+            root: Arc::new(root),
+        })
+    }
+
+    fn parent_and_name(&self, path: &Path) -> Result<(Arc<File>, CString)> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::Export("exact vault target has no parent".into()))?;
+        let parent = self.open_directory(parent, false)?;
+        let name = CString::new(
+            path.file_name()
+                .ok_or_else(|| AppError::Export("exact vault target has no file name".into()))?
+                .as_bytes(),
+        )
+        .map_err(|_| AppError::Export("exact vault file name contains NUL".into()))?;
+        Ok((parent, name))
+    }
+
+    fn open_directory(&self, path: &Path, create: bool) -> Result<Arc<File>> {
+        if !absolute_normal_path(path) {
+            return Err(AppError::Export(
+                "exact vault directory must be an absolute path without dot components".into(),
+            ));
+        }
+        let relative = path
+            .strip_prefix(&self.configured)
+            .or_else(|_| path.strip_prefix(&self.canonical))
+            .map_err(|_| {
+                AppError::Export(
+                    "exact vault directory is outside the configured vault root".into(),
+                )
+            })?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(AppError::Export(
+                "exact vault directory is not a normal vault path".into(),
+            ));
+        }
+        let mut parent = Arc::clone(&self.root);
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(AppError::Export(
+                    "exact vault parent is not a normal vault path".into(),
+                ));
+            };
+            let component = CString::new(component.as_bytes())
+                .map_err(|_| AppError::Export("exact vault parent contains NUL".into()))?;
+            let open = || {
+                openat_file(
+                    parent.as_raw_fd(),
+                    &component,
+                    NOTE_O_RDONLY | NOTE_O_DIRECTORY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                    0,
+                )
+            };
+            let next = match open() {
+                Ok(next) => next,
+                Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                    // SAFETY: `component` is one NUL-terminated normal component below the live
+                    // retained directory descriptor. `mkdirat` cannot follow it outside.
+                    let created = unsafe { mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o755) };
+                    if created != 0 {
+                        let mkdir_error = std::io::Error::last_os_error();
+                        if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(AppError::Export(format!(
+                                "create anchored exact-vault directory failed: {mkdir_error}"
+                            )));
+                        }
+                    }
+                    open().map_err(|open_error| {
+                        AppError::Export(format!(
+                            "open created exact-vault directory failed: {open_error}"
+                        ))
+                    })?
+                }
+                Err(error) => {
+                    return Err(AppError::Export(format!(
+                        "open anchored exact-vault directory failed: {error}"
+                    )))
+                }
+            };
+            if !next
+                .metadata()
+                .map_err(|error| {
+                    AppError::Export(format!("stat anchored exact-vault parent failed: {error}"))
+                })?
+                .is_dir()
+            {
+                return Err(AppError::Export(
+                    "anchored exact-vault parent is not a directory".into(),
+                ));
+            }
+            parent = Arc::new(next);
+        }
+        Ok(parent)
+    }
+
+    pub(crate) fn ensure_directory(&self, path: &Path) -> Result<()> {
+        self.open_directory(path, true).map(|_| ())
+    }
+
+    pub(crate) fn directory_identity(&self, path: &Path) -> Result<(u64, u64)> {
+        self.verify_root_identity()?;
+        let directory = self.open_directory(path, false)?;
+        let metadata = directory.metadata().map_err(|error| {
+            AppError::Export(format!("stat exact-vault directory failed: {error}"))
+        })?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    pub(crate) fn verify_directory_identity(
+        &self,
+        path: &Path,
+        expected: (u64, u64),
+    ) -> Result<()> {
+        if self.directory_identity(path)? != expected {
+            return Err(AppError::Export(
+                "exact target directory changed during publication".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_root_identity(&self) -> Result<()> {
+        let current = std::fs::canonicalize(&self.configured).map_err(|error| {
+            AppError::Export(format!("re-resolve configured exact vault failed: {error}"))
+        })?;
+        let root = open_absolute_directory_nofollow(&current)?;
+        let metadata = root.metadata().map_err(|error| {
+            AppError::Export(format!("re-stat configured exact vault failed: {error}"))
+        })?;
+        if metadata.dev() != self.root_device || metadata.ino() != self.root_inode {
+            return Err(AppError::Export(
+                "configured vault root changed during exact publication".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_file(&self, path: &Path, mode: u32) -> Result<ExactFileLink> {
+        create_exact_file(self, path, mode)
+    }
+
+    pub(crate) fn open_existing_file(&self, path: &Path) -> Result<Option<ExactFileLink>> {
+        let (parent, name) = self.parent_and_name(path)?;
+        let file = match openat_file(
+            parent.as_raw_fd(),
+            &name,
+            NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AppError::Export(format!(
+                    "open anchored exact-vault file failed: {error}"
+                )))
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            AppError::Export(format!("stat anchored exact-vault file failed: {error}"))
+        })?;
+        if !metadata.is_file() {
+            return Err(AppError::Export(
+                "anchored exact-vault target is not a regular file".into(),
+            ));
+        }
+        Ok(Some(ExactFileLink {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            parent,
+            name,
+            file,
+        }))
+    }
+
+    fn inspect_existing(&self, path: &Path, expected: &[u8]) -> Result<ExactExisting> {
+        let (parent, name) = self.parent_and_name(path)?;
+        let mut file = match openat_file(
+            parent.as_raw_fd(),
+            &name,
+            NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExactExisting::Missing)
+            }
+            // `O_NOFOLLOW` reports a final-component symlink as ELOOP. It occupies the collision
+            // slot but can never be adopted as an identical note.
+            Err(error) if error.raw_os_error() == Some(62) => return Ok(ExactExisting::Different),
+            Err(error) => {
+                return Err(AppError::Export(format!(
+                    "open anchored existing note failed: {error}"
+                )))
+            }
+        };
+        let before = file.metadata().map_err(|error| {
+            AppError::Export(format!("stat anchored existing note failed: {error}"))
+        })?;
+        if !before.is_file() {
+            return Ok(ExactExisting::Different);
+        }
+        let mut bytes =
+            Vec::with_capacity(expected.len().min(MAX_MARKER_CLEANUP_NOTE_BYTES as usize));
+        Read::take(&mut file, MAX_MARKER_CLEANUP_NOTE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                AppError::Export(format!("read anchored existing note failed: {error}"))
+            })?;
+        let after = file.metadata().map_err(|error| {
+            AppError::Export(format!("restat anchored existing note failed: {error}"))
+        })?;
+        if after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || after.nlink() != before.nlink()
+        {
+            return Err(AppError::Export(
+                "existing note changed while it was inspected for adoption".into(),
+            ));
+        }
+        if bytes.as_slice() != expected {
+            return Ok(ExactExisting::Different);
+        }
+        Ok(ExactExisting::Identical(ExactFileObservation {
+            device: before.dev(),
+            inode: before.ino(),
+            parent,
+            name,
+        }))
+    }
+
+    pub(crate) fn existing_bytes_match(
+        &self,
+        path: &Path,
+        expected: &[u8],
+    ) -> Result<Option<bool>> {
+        match self.inspect_existing(path, expected)? {
+            ExactExisting::Missing => Ok(None),
+            ExactExisting::Different => Ok(Some(false)),
+            ExactExisting::Identical(_) => Ok(Some(true)),
+        }
+    }
+}
+
+impl ExactFileObservation {
+    pub(crate) fn read_stable_bytes(&self, max_bytes: u64) -> Result<Vec<u8>> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut file = openat_file(
+                self.parent.as_raw_fd(),
+                &self.name,
+                NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                0,
+            )
+            .map_err(|error| {
+                AppError::Export(format!("open observed exact file failed: {error}"))
+            })?;
+            let before = file.metadata().map_err(|error| {
+                AppError::Export(format!("stat observed exact file failed: {error}"))
+            })?;
+            if !before.is_file()
+                || before.dev() != self.device
+                || before.ino() != self.inode
+                || before.len() > max_bytes
+            {
+                return Err(AppError::Export(
+                    "observed exact file no longer has the bound identity".into(),
+                ));
+            }
+            let capacity = usize::try_from(before.len())
+                .map_err(|_| AppError::Export("observed exact file is too large".into()))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            Read::take(&mut file, max_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    AppError::Export(format!("read observed exact file failed: {error}"))
+                })?;
+            let after = file.metadata().map_err(|error| {
+                AppError::Export(format!("restat observed exact file failed: {error}"))
+            })?;
+            if bytes.len() as u64 != before.len()
+                || after.dev() != before.dev()
+                || after.ino() != before.ino()
+                || after.len() != before.len()
+                || after.nlink() != before.nlink()
+            {
+                return Err(AppError::Export(
+                    "observed exact file changed while it was read".into(),
+                ));
+            }
+            Ok(bytes)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = max_bytes;
+            Err(AppError::Export(
+                "exact observations require macOS file APIs".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum ExactExisting {
+    Missing,
+    Different,
+    Identical(ExactFileObservation),
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ExactVault {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let _ = path;
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn verify_root_identity(&self) -> Result<()> {
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn directory_identity(&self, path: &Path) -> Result<(u64, u64)> {
+        let _ = path;
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn verify_directory_identity(
+        &self,
+        path: &Path,
+        expected: (u64, u64),
+    ) -> Result<()> {
+        let _ = (path, expected);
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn create_file(&self, path: &Path, mode: u32) -> Result<ExactFileLink> {
+        let _ = (self, path, mode);
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn open_existing_file(&self, path: &Path) -> Result<Option<ExactFileLink>> {
+        let _ = (self, path);
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn ensure_directory(&self, path: &Path) -> Result<()> {
+        let _ = (self, path);
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn existing_bytes_match(
+        &self,
+        path: &Path,
+        expected: &[u8],
+    ) -> Result<Option<bool>> {
+        let _ = (self, path, expected);
+        Err(AppError::Export(
+            "exact vault capabilities require macOS file APIs".into(),
+        ))
+    }
+}
+
+/// One directory entry whose ownership was bound from the already-open inode at `create_new` or
+/// `linkat` time. Rollback never decides ownership from a later pathname stat: it atomically swaps
+/// the name with a private sibling below the retained parent descriptor, then verifies this exact
+/// device/inode before unlinking the quarantined entry.
+#[derive(Debug)]
+pub(crate) struct ExactFileLink {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    #[cfg(target_os = "macos")]
+    parent: Arc<File>,
+    #[cfg(target_os = "macos")]
+    name: CString,
+    /// Retained affine handle to app-created/owned plaintext. It lets a failed uncommitted write
+    /// scrub the exact inode even if its directory entry is concurrently replaced.
+    file: File,
+}
+
+/// Read-only identity capability. Unlike [`ExactFileLink`], cloning this value cannot duplicate
+/// destructive rollback authority.
+#[derive(Debug, Clone)]
+pub(crate) struct ExactFileObservation {
+    device: u64,
+    inode: u64,
+    #[cfg(target_os = "macos")]
+    parent: Arc<File>,
+    #[cfg(target_os = "macos")]
+    name: CString,
+}
+
+impl ExactFileLink {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+
+    /// Revalidate the retained exact inode and return its current hardlink count. Promoted filing
+    /// recovery uses this without unlinking the canonical final name.
+    pub(crate) fn exact_link_count(&self) -> Result<u64> {
+        let metadata = self.file.metadata().map_err(|error| {
+            AppError::Export(format!("stat exact-file link count failed: {error}"))
+        })?;
+        if !metadata.is_file()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            return Err(AppError::Export(
+                "exact-file identity changed before link-count validation".into(),
+            ));
+        }
+        Ok(metadata.nlink())
+    }
+
+    pub(crate) fn parent_identity(&self) -> Result<(u64, u64)> {
+        #[cfg(target_os = "macos")]
+        {
+            let metadata = self.parent.metadata().map_err(|error| {
+                AppError::Export(format!("stat exact-file parent failed: {error}"))
+            })?;
+            Ok((metadata.dev(), metadata.ino()))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppError::Export(
+                "exact parent identity requires macOS file APIs".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn is_present(&self) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            self.named_metadata().map(|metadata| metadata.is_some())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppError::Export(
+                "exact rollback ownership requires macOS file APIs".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn observation(&self) -> ExactFileObservation {
+        ExactFileObservation {
+            device: self.device,
+            inode: self.inode,
+            #[cfg(target_os = "macos")]
+            parent: Arc::clone(&self.parent),
+            #[cfg(target_os = "macos")]
+            name: self.name.clone(),
+        }
+    }
+
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+impl ExactVault {
+    pub(crate) fn configured_path(&self) -> &Path {
+        &self.configured
+    }
+}
+
+/// Create a no-clobber file below a stable parent capability and bind rollback ownership before
+/// the caller performs its first fallible write/chmod/fsync operation.
+#[cfg(target_os = "macos")]
+pub(crate) fn create_exact_file(
+    vault: &ExactVault,
+    path: &Path,
+    mode: u32,
+) -> Result<ExactFileLink> {
+    let (parent, name) = vault.parent_and_name(path)?;
+    let file = openat_file(
+        parent.as_raw_fd(),
+        &name,
+        NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+        mode as i32,
+    )
+    .map_err(|error| AppError::Export(format!("create exact file failed: {error}")))?;
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            // Ownership metadata could not be bound, but the stable parent, unpredictable note
+            // temp / deterministic attachment temp name, and retained open file still narrow the
+            // cleanup to this just-created entry. Adjacent unlinkat is the unavoidable same-uid
+            // namespace residual; it never re-resolves an ancestor pathname.
+            // SAFETY: `name` is one NUL-terminated component below the live parent fd.
+            let unlinked = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+            let unlink_result = if unlinked == 0 {
+                "attempted".to_string()
+            } else {
+                std::io::Error::last_os_error().to_string()
+            };
+            let sync_result = parent
+                .sync_all()
+                .map(|()| "attempted".to_string())
+                .unwrap_or_else(|sync| sync.to_string());
+            return Err(AppError::Export(format!(
+                "stat exact file failed: {error}; adjacent cleanup={unlink_result}; sync={sync_result}"
+            )));
+        }
+    };
+    let link = ExactFileLink {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        parent,
+        name,
+        file,
+    };
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != 0 {
+        let cleanup = remove_exact_created_link(&link, 1);
+        return Err(AppError::Export(format!(
+            "new exact file is not a private empty regular file; cleanup: {}",
+            cleanup
+                .map(|()| "verified".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        )));
+    }
+    if let Err(original) = link.sync_parent() {
+        let cleanup = remove_exact_created_link(&link, 1);
+        return Err(AppError::Export(format!(
+            "{original}; exact create cleanup: {}",
+            cleanup
+                .map(|()| "verified".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        )));
+    }
+    Ok(link)
+}
+
+/// Bind an already-existing tracked source through an absolute component walk from `/`. This is
+/// intentionally separate from [`ExactVault`]: a canonical row may still point into the previous
+/// configured vault and must remain restorable, while all new destination creation stays confined
+/// to the current vault capability.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_exact_absolute_existing_file(path: &Path) -> Result<Option<ExactFileLink>> {
+    open_exact_absolute_existing_file_with_flags(path, NOTE_O_RDONLY)
+}
+
+/// Reopen a SQLCipher-bound attempt inode with write authority so crash recovery can scrub the
+/// exact inode (and therefore every hardlink to it) before retaining a bound collision journal.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_exact_absolute_existing_attempt_file(
+    path: &Path,
+) -> Result<Option<ExactFileLink>> {
+    open_exact_absolute_existing_file_with_flags(path, NOTE_O_RDWR)
+}
+
+#[cfg(target_os = "macos")]
+fn open_exact_absolute_existing_file_with_flags(
+    path: &Path,
+    access_flags: i32,
+) -> Result<Option<ExactFileLink>> {
+    let (parent, name) = exact_absolute_parent_and_name(path)?;
+    let file = match openat_file(
+        parent.as_raw_fd(),
+        &name,
+        access_flags | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+        0,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Export(format!(
+                "open tracked exact source failed: {error}"
+            )))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| AppError::Export(format!("stat tracked exact source failed: {error}")))?;
+    if !metadata.is_file() {
+        return Err(AppError::Export(
+            "tracked exact source is not a regular file".into(),
+        ));
+    }
+    Ok(Some(ExactFileLink {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        parent,
+        name,
+        file,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn exact_absolute_parent_and_name(path: &Path) -> Result<(Arc<File>, CString)> {
+    if !absolute_normal_path(path) {
+        return Err(AppError::Export(
+            "tracked exact source must be an absolute path without dot components".into(),
+        ));
+    }
+    let walked = if path.starts_with("/var") {
+        Path::new("/private/var").join(
+            path.strip_prefix("/var")
+                .map_err(|_| AppError::Export("invalid macOS /var source alias".into()))?,
+        )
+    } else {
+        path.to_path_buf()
+    };
+    let parent_path = walked
+        .parent()
+        .ok_or_else(|| AppError::Export("tracked exact source has no parent".into()))?;
+    let parent = Arc::new(open_absolute_directory_nofollow(parent_path)?);
+    let name = CString::new(
+        walked
+            .file_name()
+            .ok_or_else(|| AppError::Export("tracked exact source has no file name".into()))?
+            .as_bytes(),
+    )
+    .map_err(|_| AppError::Export("tracked exact source file name contains NUL".into()))?;
+    Ok((parent, name))
+}
+
+/// Recreate a captured source only below the same parent directory identity that was committed
+/// before unlink. Rewalking from `/` is fail-closed: a symlink or different-real-directory swap
+/// cannot redirect recovery outside the original protection domain.
+#[cfg(target_os = "macos")]
+pub(crate) fn create_exact_absolute_file(
+    path: &Path,
+    expected_parent: (u64, u64),
+    mode: u32,
+) -> Result<ExactFileLink> {
+    let (parent, name) = exact_absolute_parent_and_name(path)?;
+    let parent_metadata = parent.metadata().map_err(|error| {
+        AppError::Export(format!("stat filing source parent failed: {error}"))
+    })?;
+    if !parent_metadata.is_dir()
+        || (parent_metadata.dev(), parent_metadata.ino()) != expected_parent
+    {
+        return Err(AppError::Export(
+            "filing source parent identity changed before recovery".into(),
+        ));
+    }
+    let file = openat_file(
+        parent.as_raw_fd(),
+        &name,
+        NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+        mode as i32,
+    )
+    .map_err(|error| AppError::Export(format!("create filing source recovery failed: {error}")))?;
+    let metadata = file.metadata().map_err(|error| {
+        AppError::Export(format!("stat filing source recovery failed: {error}"))
+    })?;
+    let link = ExactFileLink {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        parent,
+        name,
+        file,
+    };
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != 0 {
+        let cleanup = remove_exact_created_link(&link, 1);
+        return Err(AppError::Export(format!(
+            "new filing source recovery is not a private empty file; cleanup: {}",
+            cleanup
+                .map(|()| "verified".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        )));
+    }
+    if let Err(original) = link.sync_parent() {
+        let cleanup = remove_exact_created_link(&link, 1);
+        return Err(AppError::Export(format!(
+            "{original}; filing source recovery cleanup: {}",
+            cleanup
+                .map(|()| "verified".to_string())
+                .unwrap_or_else(|error| error.to_string())
+        )));
+    }
+    Ok(link)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn open_exact_absolute_existing_file(path: &Path) -> Result<Option<ExactFileLink>> {
+    let _ = path;
+    Err(AppError::Export(
+        "tracked exact sources require macOS file APIs".into(),
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn open_exact_absolute_existing_attempt_file(
+    path: &Path,
+) -> Result<Option<ExactFileLink>> {
+    let _ = path;
+    Err(AppError::Export(
+        "exact attempt recovery requires macOS file APIs".into(),
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn create_exact_absolute_file(
+    path: &Path,
+    expected_parent: (u64, u64),
+    mode: u32,
+) -> Result<ExactFileLink> {
+    let _ = (path, expected_parent, mode);
+    Err(AppError::Export(
+        "exact source recovery requires macOS file APIs".into(),
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn create_exact_file(
+    vault: &ExactVault,
+    path: &Path,
+    mode: u32,
+) -> Result<ExactFileLink> {
+    let _ = (vault, path, mode);
+    Err(AppError::Export(
+        "exact rollback ownership requires macOS file APIs".into(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+impl ExactFileLink {
+    fn open_named(&self, name: &CString) -> std::io::Result<File> {
+        openat_file(
+            self.parent.as_raw_fd(),
+            name,
+            NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0,
+        )
+    }
+
+    pub(crate) fn sync_parent(&self) -> Result<()> {
+        self.parent
+            .sync_all()
+            .map_err(|error| AppError::Export(format!("sync exact-file parent failed: {error}")))
+    }
+
+    fn named_metadata(&self) -> Result<Option<std::fs::Metadata>> {
+        let file = match self.open_named(&self.name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AppError::Export(format!(
+                    "open exact rollback name failed: {error}"
+                )))
+            }
+        };
+        let metadata = file.metadata().map_err(|error| {
+            AppError::Export(format!("stat exact rollback name failed: {error}"))
+        })?;
+        if !metadata.is_file() || metadata.dev() != self.device || metadata.ino() != self.inode {
+            return Err(AppError::Export(
+                "refusing exact rollback because the directory entry was replaced".into(),
+            ));
+        }
+        Ok(Some(metadata))
+    }
+
+    pub(crate) fn read_stable_bytes(&self, max_bytes: u64) -> Result<(Vec<u8>, std::fs::Metadata)> {
+        let mut file = self.open_named(&self.name).map_err(|error| {
+            AppError::Export(format!("open exact file for stable read failed: {error}"))
+        })?;
+        let before = file.metadata().map_err(|error| {
+            AppError::Export(format!("stat exact file for stable read failed: {error}"))
+        })?;
+        if !before.is_file()
+            || before.dev() != self.device
+            || before.ino() != self.inode
+            || before.len() > max_bytes
+        {
+            return Err(AppError::Export(
+                "exact file is not a bounded regular file with the bound identity".into(),
+            ));
+        }
+        let capacity = usize::try_from(before.len())
+            .map_err(|_| AppError::Export("exact file is too large to address".into()))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::take(&mut file, max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| AppError::Export(format!("read exact file failed: {error}")))?;
+        let after = file.metadata().map_err(|error| {
+            AppError::Export(format!("restat exact file after read failed: {error}"))
+        })?;
+        if bytes.len() as u64 != before.len()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || after.nlink() != before.nlink()
+        {
+            return Err(AppError::Export(
+                "exact file changed while its bytes were read".into(),
+            ));
+        }
+        Ok((bytes, before))
+    }
+
+    /// Terminal fallback for an inode created by the current attempt. Namespace ownership can be
+    /// lost to a same-uid hardlink or name replacement, but the retained file descriptor remains
+    /// an affine capability for the exact app-created inode. Such an uncommitted inode is never
+    /// user-owned, so clearing it does not depend on its current length or hash.
+    pub(crate) fn scrub_attempt_owned_plaintext(&self) -> Result<()> {
+        let before = self.file.metadata().map_err(|error| {
+            AppError::Export(format!(
+                "stat attempt-owned plaintext scrub failed: {error}"
+            ))
+        })?;
+        if !before.is_file() || before.dev() != self.device || before.ino() != self.inode {
+            return Err(AppError::Export(
+                "refusing attempt-owned plaintext scrub because exact identity changed".into(),
+            ));
+        }
+        self.file
+            .set_len(0)
+            .and_then(|()| self.file.sync_all())
+            .map_err(|error| {
+                AppError::Export(format!("scrub attempt-owned plaintext failed: {error}"))
+            })?;
+        let after = self.file.metadata().map_err(|error| {
+            AppError::Export(format!(
+                "verify attempt-owned plaintext scrub failed: {error}"
+            ))
+        })?;
+        if !after.is_file()
+            || after.dev() != self.device
+            || after.ino() != self.inode
+            || after.len() != 0
+        {
+            return Err(AppError::Export(
+                "attempt-owned plaintext scrub did not verify empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Atomically publish this single owned name to a free sibling slot. On success the same
+    /// destructive authority is updated in place; no second temp/final authority exists and no
+    /// post-success temp unlink can strand plaintext.
+    pub(crate) fn publish_exclusive(&mut self, path: &Path) -> std::io::Result<()> {
+        if path.parent() != self.path.parent() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact publish destination must share the retained parent",
+            ));
+        }
+        let name = CString::new(
+            path.file_name()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "exact publish path has no file name",
+                    )
+                })?
+                .as_bytes(),
+        )
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact publish file name contains NUL",
+            )
+        })?;
+        // SAFETY: both names are one NUL-terminated component under the same retained directory
+        // descriptor. RENAME_EXCL refuses rather than replacing an occupied destination.
+        let result = unsafe {
+            renameatx_np(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                NOTE_RENAME_EXCL,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.path = path.to_path_buf();
+        self.name = name;
+        Ok(())
+    }
+
+    pub(crate) fn create_replacement(&self, mode: u32) -> Result<ExactFileLink> {
+        self.verify_absolute_parent_reachable()?;
+        let file = openat_file(
+            self.parent.as_raw_fd(),
+            &self.name,
+            NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            mode as i32,
+        )
+        .map_err(|error| AppError::Export(format!("create exact replacement failed: {error}")))?;
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // SAFETY: the final name remains one component below the retained source parent.
+                let cleanup = unsafe { unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+                return Err(AppError::Export(format!(
+                    "stat exact replacement failed: {error}; adjacent cleanup={}",
+                    if cleanup == 0 {
+                        "attempted".to_string()
+                    } else {
+                        std::io::Error::last_os_error().to_string()
+                    }
+                )));
+            }
+        };
+        let link = ExactFileLink {
+            path: self.path.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            parent: Arc::clone(&self.parent),
+            name: self.name.clone(),
+            file,
+        };
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != 0 {
+            let cleanup = remove_exact_created_link(&link, 1);
+            return Err(AppError::Export(format!(
+                "new exact replacement is not a private empty regular file; cleanup: {}",
+                cleanup
+                    .map(|()| "verified".to_string())
+                    .unwrap_or_else(|error| error.to_string())
+            )));
+        }
+        Ok(link)
+    }
+
+    fn verify_absolute_parent_reachable(&self) -> Result<()> {
+        let walked = if self.path.starts_with("/var") {
+            Path::new("/private/var").join(
+                self.path
+                    .strip_prefix("/var")
+                    .map_err(|_| AppError::Export("invalid macOS /var link alias".into()))?,
+            )
+        } else {
+            self.path.clone()
+        };
+        let parent_path = walked
+            .parent()
+            .ok_or_else(|| AppError::Export("exact link has no absolute parent".into()))?;
+        let current = open_absolute_directory_nofollow(parent_path)?;
+        let current_meta = current.metadata().map_err(|error| {
+            AppError::Export(format!("stat rewalked absolute parent failed: {error}"))
+        })?;
+        let retained_meta = self.parent.metadata().map_err(|error| {
+            AppError::Export(format!("stat retained absolute parent failed: {error}"))
+        })?;
+        if current_meta.dev() != retained_meta.dev() || current_meta.ino() != retained_meta.ino() {
+            return Err(AppError::Export(
+                "tracked source parent changed before exact restore".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Add a no-clobber hard-link below the same retained parent capability. The returned receipt
+    /// is bound to the source descriptor's inode, not to a later stat of the destination path.
+    pub(crate) fn hard_link_sibling(&self, path: &Path) -> std::io::Result<ExactFileLink> {
+        if path.parent() != self.path.parent() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact hard-link destination must share the retained parent",
+            ));
+        }
+        let name = CString::new(
+            path.file_name()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "exact hard-link path has no file name",
+                    )
+                })?
+                .as_bytes(),
+        )
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exact hard-link file name contains NUL",
+            )
+        })?;
+        // Build the destination receipt completely before mutating the namespace. A post-link
+        // allocation/descriptor-clone failure would otherwise strand a created name with no
+        // cleanup authority.
+        let parent = Arc::clone(&self.parent);
+        let file = self.file.try_clone()?;
+        // SAFETY: both names are one NUL-terminated component under the same live directory fd.
+        let result = unsafe {
+            linkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ExactFileLink {
+            path: path.to_path_buf(),
+            device: self.device,
+            inode: self.inode,
+            parent,
+            name,
+            file,
+        })
+    }
+
+    fn exchange(&self, first: &CString, second: &CString) -> std::io::Result<()> {
+        // SAFETY: both names are one NUL-terminated component under the same live directory fd.
+        let result = unsafe {
+            renameatx_np(
+                self.parent.as_raw_fd(),
+                first.as_ptr(),
+                self.parent.as_raw_fd(),
+                second.as_ptr(),
+                NOTE_RENAME_SWAP,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn unlink(&self, name: &CString) -> std::io::Result<()> {
+        // SAFETY: `name` is one component below the retained parent descriptor.
+        let result = unsafe { unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn unlink_unpredictable_if_identity(
+        &self,
+        name: &CString,
+        device: u64,
+        inode: u64,
+        expected_nlink: u64,
+    ) -> Result<()> {
+        self.unlink_unpredictable_if_identity_no_sync(name, device, inode, expected_nlink)?;
+        self.sync_parent()
+    }
+
+    fn unlink_unpredictable_if_identity_no_sync(
+        &self,
+        name: &CString,
+        device: u64,
+        inode: u64,
+        expected_nlink: u64,
+    ) -> Result<()> {
+        let metadata = self
+            .open_named(name)
+            .and_then(|file| file.metadata())
+            .map_err(|error| {
+                AppError::Export(format!("reopen exact quarantine failed: {error}"))
+            })?;
+        if !metadata.is_file()
+            || metadata.dev() != device
+            || metadata.ino() != inode
+            || metadata.nlink() != expected_nlink
+        {
+            return Err(AppError::Export(
+                "exact quarantine identity changed immediately before unlink".into(),
+            ));
+        }
+        self.unlink(name)
+            .map_err(|error| AppError::Export(format!("unlink exact quarantine failed: {error}")))
+    }
+
+    /// Remove this exact directory entry through an atomic exchange with an unpredictable private
+    /// sibling. A deterministic same-byte replacement or symlink is displaced, detected by inode,
+    /// and exchanged back before either entry is unlinked. Darwin has no identity-conditional
+    /// unlink; the final reopen+unlink of UUID quarantine/placeholder names is adjacent. A process
+    /// already able to mutate this same-uid namespace between those syscalls is outside Murmur's
+    /// lock boundary, matching `MarkerCleanupNote::remove_authenticated_stage`.
+    fn remove_after_preflight(
+        &self,
+        expected_nlink: u64,
+        expected_content: Option<(u64, &[u8; 32])>,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let quarantine = CString::new(format!(
+            ".murmur-exact-cleanup-{}.pending",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .map_err(|_| AppError::Export("exact quarantine name contains NUL".into()))?;
+        let placeholder = openat_file(
+            self.parent.as_raw_fd(),
+            &quarantine,
+            NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0o600,
+        )
+        .map_err(|error| AppError::Export(format!("create exact quarantine failed: {error}")))?;
+        let placeholder_meta = match placeholder.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // The name is an unpredictable UUID created under the retained descriptor and the
+                // file handle is still live. Metadata failure prevents stronger inode binding, so
+                // adjacent anchored unlink is the narrow same-uid residual used by MarkerCleanup.
+                let cleanup = self.unlink(&quarantine);
+                let _ = self.sync_parent();
+                return Err(AppError::Export(format!(
+                    "stat exact quarantine failed: {error}; UUID cleanup: {}",
+                    cleanup
+                        .map(|()| "attempted".to_string())
+                        .unwrap_or_else(|cleanup| cleanup.to_string())
+                )));
+            }
+        };
+        let cleanup_placeholder = || -> Result<()> {
+            self.unlink_unpredictable_if_identity(
+                &quarantine,
+                placeholder_meta.dev(),
+                placeholder_meta.ino(),
+                1,
+            )
+        };
+        if !placeholder_meta.is_file()
+            || placeholder_meta.nlink() != 1
+            || placeholder_meta.len() != 0
+        {
+            let cleanup = cleanup_placeholder();
+            return Err(AppError::Export(format!(
+                "exact quarantine placeholder is not a private empty file; cleanup: {}",
+                cleanup
+                    .map(|()| "verified".to_string())
+                    .unwrap_or_else(|cleanup| cleanup.to_string())
+            )));
+        }
+        if let Err(error) = self.sync_parent() {
+            let cleanup = cleanup_placeholder();
+            return Err(AppError::Export(format!(
+                "{error}; exact placeholder cleanup: {}",
+                cleanup
+                    .map(|()| "verified".to_string())
+                    .unwrap_or_else(|cleanup| cleanup.to_string())
+            )));
+        }
+        if let Err(error) = self.exchange(&self.name, &quarantine) {
+            let cleanup = cleanup_placeholder();
+            return Err(AppError::Export(format!(
+                "exchange exact rollback target failed: {error}; placeholder cleanup: {}",
+                cleanup
+                    .map(|()| "verified".to_string())
+                    .unwrap_or_else(|cleanup| cleanup.to_string())
+            )));
+        }
+
+        let restore_swapped = |reason: String| -> Result<()> {
+            let swap = self.exchange(&self.name, &quarantine);
+            let sync = if swap.is_ok() {
+                self.sync_parent()
+            } else {
+                Ok(())
+            };
+            let cleanup = if swap.is_ok() {
+                cleanup_placeholder()
+            } else {
+                Ok(())
+            };
+            Err(AppError::Export(format!(
+                "{reason}; swap-back={}; sync={}; placeholder-cleanup={}",
+                swap.map(|()| "verified".to_string())
+                    .unwrap_or_else(|error| error.to_string()),
+                sync.map(|()| "verified".to_string())
+                    .unwrap_or_else(|error| error.to_string()),
+                cleanup
+                    .map(|()| "verified".to_string())
+                    .unwrap_or_else(|error| error.to_string())
+            )))
+        };
+        if let Err(error) = self.sync_parent() {
+            return restore_swapped(format!("sync exact exchange failed: {error}"));
+        }
+
+        let displaced = self.open_named(&quarantine);
+        let mut displaced = displaced.ok();
+        let displaced_meta = displaced.as_ref().and_then(|file| file.metadata().ok());
+        let identity_exact = displaced_meta.as_ref().is_some_and(|metadata| {
+            metadata.is_file()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+                && metadata.nlink() == expected_nlink
+        });
+        let content_exact = match (identity_exact, expected_content, displaced.as_mut()) {
+            (true, Some((expected_len, expected_sha256)), Some(file)) => {
+                let mut bytes = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+                file.read_to_end(&mut bytes).is_ok()
+                    && bytes.len() as u64 == expected_len
+                    && Sha256::digest(&bytes).as_slice() == expected_sha256
+                    && file.metadata().is_ok_and(|metadata| {
+                        metadata.dev() == self.device
+                            && metadata.ino() == self.inode
+                            && metadata.nlink() == expected_nlink
+                            && metadata.len() == expected_len
+                    })
+            }
+            (true, None, _) => true,
+            _ => false,
+        };
+        let exact = identity_exact && content_exact;
+        if !exact {
+            return restore_swapped(
+                "refusing exact rollback because identity or bytes changed before exchange".into(),
+            );
+        }
+        drop(displaced);
+
+        if let Err(error) = self.unlink_unpredictable_if_identity_no_sync(
+            &quarantine,
+            self.device,
+            self.inode,
+            expected_nlink,
+        ) {
+            return restore_swapped(format!("remove exact displaced inode failed: {error}"));
+        }
+        if let Err(error) = self.sync_parent() {
+            // The owned target is already gone, so swap-back is impossible. Remove the exact
+            // placeholder now; fail-closed DB tracking then points at absence rather than partial
+            // placeholder bytes.
+            drop(placeholder);
+            let placeholder_cleanup = self.unlink_unpredictable_if_identity(
+                &self.name,
+                placeholder_meta.dev(),
+                placeholder_meta.ino(),
+                1,
+            );
+            return Err(AppError::Export(format!(
+                "sync exact displaced-inode removal failed: {error}; placeholder cleanup: {}",
+                placeholder_cleanup
+                    .map(|()| "verified".to_string())
+                    .unwrap_or_else(|cleanup| cleanup.to_string())
+            )));
+        }
+        drop(placeholder);
+        self.unlink_unpredictable_if_identity(
+            &self.name,
+            placeholder_meta.dev(),
+            placeholder_meta.ino(),
+            1,
+        )
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl ExactFileLink {
+    pub(crate) fn hard_link_sibling(&self, path: &Path) -> std::io::Result<ExactFileLink> {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exact rollback ownership requires macOS file APIs",
+        ))
+    }
+
+    pub(crate) fn publish_exclusive(&mut self, path: &Path) -> std::io::Result<()> {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exact publication requires macOS file APIs",
+        ))
+    }
+
+    pub(crate) fn create_replacement(&self, mode: u32) -> Result<ExactFileLink> {
+        let _ = mode;
+        Err(AppError::Export(
+            "exact replacement requires macOS file APIs".into(),
+        ))
+    }
+
+    pub(crate) fn scrub_attempt_owned_plaintext(&self) -> Result<()> {
+        Err(AppError::Export(
+            "exact plaintext scrub requires macOS file APIs".into(),
+        ))
+    }
+}
+
+/// Remove one attempt-owned link whose exact identity was bound at creation. This variant is used
+/// for partial-file cleanup before bytes are complete, so identity+nlink are the authorization.
+pub(crate) fn remove_exact_created_link(link: &ExactFileLink, expected_nlink: u64) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let metadata = match link.named_metadata()? {
+            Some(metadata) => metadata,
+            None => return Ok(()),
+        };
+        if metadata.nlink() != expected_nlink {
+            return Err(AppError::Export(
+                "refusing exact rollback because the inode has an unknown hard link".into(),
+            ));
+        }
+        link.remove_after_preflight(expected_nlink, None)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (link, expected_nlink);
+        Err(AppError::Export(
+            "exact rollback ownership requires macOS file APIs".into(),
+        ))
+    }
+}
+
+pub(crate) fn remove_exact_verified_link(
+    link: &ExactFileLink,
+    expected_nlink: u64,
+    expected_len: u64,
+    expected_sha256: &[u8; 32],
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use sha2::{Digest, Sha256};
+
+        let metadata = match link.named_metadata()? {
+            Some(metadata) => metadata,
+            None => return Ok(()),
+        };
+        if metadata.nlink() != expected_nlink || metadata.len() != expected_len {
+            return Err(AppError::Export(
+                "refusing exact verified removal because identity or link count changed".into(),
+            ));
+        }
+        let mut file = link.open_named(&link.name).map_err(|error| {
+            AppError::Export(format!("open exact verified removal failed: {error}"))
+        })?;
+        let mut bytes = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+        file.read_to_end(&mut bytes).map_err(|error| {
+            AppError::Export(format!("read exact verified removal failed: {error}"))
+        })?;
+        let after = file.metadata().map_err(|error| {
+            AppError::Export(format!("restat exact verified removal failed: {error}"))
+        })?;
+        if after.dev() != link.device
+            || after.ino() != link.inode
+            || after.nlink() != expected_nlink
+            || after.len() != expected_len
+            || Sha256::digest(&bytes).as_slice() != expected_sha256
+        {
+            return Err(AppError::Export(
+                "refusing exact verified removal because identity or bytes changed".into(),
+            ));
+        }
+        link.remove_after_preflight(expected_nlink, Some((expected_len, expected_sha256)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (link, expected_nlink, expected_len, expected_sha256);
+        Err(AppError::Export(
+            "exact rollback ownership requires macOS file APIs".into(),
+        ))
+    }
+}
+
+/// Verify and remove a complete set of attempt-created names for one inode. Every replacement,
+/// symlink, in-place byte edit, or unknown hard link refuses before the first destructive step.
+pub(crate) fn remove_exact_created_links(
+    links: &[ExactFileLink],
+    expected_len: u64,
+    expected_sha256: &[u8; 32],
+) -> Result<()> {
+    let refs = links.iter().collect::<Vec<_>>();
+    remove_exact_created_link_refs(&refs, expected_len, expected_sha256)
+}
+
+pub(crate) fn remove_exact_created_link_refs(
+    links: &[&ExactFileLink],
+    expected_len: u64,
+    expected_sha256: &[u8; 32],
+) -> Result<()> {
+    let present = verify_exact_created_links(links, expected_len, expected_sha256)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut remaining = present.len() as u64;
+        for link in present.into_iter().rev() {
+            link.remove_after_preflight(remaining, Some((expected_len, expected_sha256)))?;
+            remaining -= 1;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = present;
+        Err(AppError::Export(
+            "exact rollback ownership requires macOS file APIs".into(),
+        ))
+    }
+}
+
+/// Crash-recovery deletion for names whose inode identity was committed to SQLCipher before the
+/// first plaintext byte, but whose write may have stopped before its final length/hash existed.
+pub(crate) fn remove_exact_attempt_link_refs(links: &[&ExactFileLink]) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut present = Vec::new();
+        for &link in links {
+            if link.named_metadata()?.is_some() {
+                present.push(link);
+            }
+        }
+        if present.is_empty() {
+            return Ok(());
+        }
+        let identity = present[0].identity();
+        if present.iter().any(|link| link.identity() != identity) {
+            return Err(AppError::Export(
+                "filing recovery group contains more than one inode".into(),
+            ));
+        }
+        let expected_links = present.len() as u64;
+        for link in &present {
+            let metadata = link.named_metadata()?.ok_or_else(|| {
+                AppError::Export("filing recovery name disappeared during preflight".into())
+            })?;
+            if metadata.nlink() != expected_links {
+                return Err(AppError::Export(
+                    "filing recovery inode has an unknown hard link".into(),
+                ));
+            }
+        }
+        let mut remaining = expected_links;
+        for link in present.into_iter().rev() {
+            link.remove_after_preflight(remaining, None)?;
+            remaining -= 1;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = links;
+        Err(AppError::Export(
+            "filing recovery requires macOS exact-file APIs".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_exact_created_links<'a>(
+    links: &[&'a ExactFileLink],
+    expected_len: u64,
+    expected_sha256: &[u8; 32],
+) -> Result<Vec<&'a ExactFileLink>> {
+    use sha2::{Digest, Sha256};
+
+    let mut present = Vec::new();
+    for &link in links {
+        let Some(metadata) = link.named_metadata()? else {
+            continue;
+        };
+        if metadata.len() != expected_len {
+            return Err(AppError::Export(
+                "refusing exact rollback because attempt-created bytes changed".into(),
+            ));
+        }
+        let mut file = link.open_named(&link.name).map_err(|error| {
+            AppError::Export(format!("open exact rollback bytes failed: {error}"))
+        })?;
+        let mut bytes = Vec::with_capacity(expected_len.min(64 * 1024 * 1024) as usize);
+        file.read_to_end(&mut bytes).map_err(|error| {
+            AppError::Export(format!("read exact rollback bytes failed: {error}"))
+        })?;
+        let after = file.metadata().map_err(|error| {
+            AppError::Export(format!("restat exact rollback bytes failed: {error}"))
+        })?;
+        if after.dev() != link.device
+            || after.ino() != link.inode
+            || after.len() != metadata.len()
+            || after.nlink() != metadata.nlink()
+            || Sha256::digest(&bytes).as_slice() != expected_sha256
+        {
+            return Err(AppError::Export(
+                "refusing exact rollback because attempt-created identity or bytes changed".into(),
+            ));
+        }
+        present.push(link);
+    }
+    if present.is_empty() {
+        return Ok(present);
+    }
+    let expected_identity = present[0].identity();
+    if present
+        .iter()
+        .any(|link| link.identity() != expected_identity)
+    {
+        return Err(AppError::Export(
+            "exact rollback group contains more than one inode".into(),
+        ));
+    }
+    let expected_links = present.len() as u64;
+    for link in &present {
+        let metadata = link.named_metadata()?.ok_or_else(|| {
+            AppError::Export("exact rollback name disappeared during preflight".into())
+        })?;
+        if metadata.nlink() != expected_links {
+            return Err(AppError::Export(
+                "refusing exact rollback because the inode has an unknown hard link".into(),
+            ));
+        }
+    }
+    Ok(present)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_exact_created_links<'a>(
+    links: &[&'a ExactFileLink],
+    expected_len: u64,
+    expected_sha256: &[u8; 32],
+) -> Result<Vec<&'a ExactFileLink>> {
+    let _ = (links, expected_len, expected_sha256);
+    Err(AppError::Export(
+        "exact rollback ownership requires macOS file APIs".into(),
+    ))
+}
 
 /// A configured vault root held open as a directory capability. Marker cleanup never resolves an
 /// outbox pathname from the process cwd and never follows a symlink in the configured root or any
@@ -1037,7 +2641,134 @@ fn base_stem(title: &str, date_iso: &str) -> Result<String> {
 
 /// Atomically write `markdown` into `vault_dir` (optionally `subfolder`) as a uniquely
 /// named .md file derived from `title` + `date_iso`. Writes to a dotfile `.tmp` then
-/// renames. On name collision appends " (N)". Returns the final path written.
+/// publishes it no-clobber. On name collision appends " (N)". Returns the final path written.
+#[derive(Debug)]
+pub struct WriteNoteReceipt {
+    pub path: PathBuf,
+    /// `false` means the exact byte-identical file already existed and was reused. Rollback code
+    /// must never delete such a path because it is not owned by the attempted write.
+    pub created: bool,
+    /// Exact directory-entry receipts bound from the already-open temp inode inside the
+    /// publication seam. `None` is mandatory for an idempotently reused file.
+    pub(crate) cleanup: Option<CreatedNoteCleanup>,
+    /// Stable anchored identity used to reverify either a newly-published or idempotently adopted
+    /// note without reopening its pathname.
+    pub(crate) verification: ExactFileObservation,
+    /// A post-write failure whose exact cleanup authority is carried by this receipt. Filing must
+    /// journal the receipt before surfacing the error so rollback/recovery never loses the inode.
+    pub(crate) pending_error: Option<AppError>,
+}
+
+pub(crate) trait ExactNoteWriteJournal {
+    fn reserve(&mut self, temp_path: &Path, expected_len: u64, digest: &[u8; 32]) -> Result<()>;
+    fn bind(&mut self, temp_path: &Path, identity: (u64, u64)) -> Result<()>;
+    fn reserve_publish(&mut self, temp_path: &Path, final_path: &Path) -> Result<()>;
+    fn published(&mut self, final_path: &Path) -> Result<()>;
+    fn rollback_verified(&mut self) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub(crate) struct CreatedNoteCleanup {
+    links: Vec<ExactFileLink>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestNotePostWriteFault {
+    Metadata,
+    UnknownHardlink,
+    PartialWriteUnknownHardlinkAndReplacement,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NOTE_POST_WRITE_FAULT: std::cell::Cell<Option<TestNotePostWriteFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_note_post_write_fault(fault: TestNotePostWriteFault) {
+    TEST_NOTE_POST_WRITE_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_note_partial_write_fault() {
+    set_test_note_post_write_fault(
+        TestNotePostWriteFault::PartialWriteUnknownHardlinkAndReplacement,
+    );
+}
+
+#[cfg(test)]
+fn take_test_note_post_write_fault() -> Option<TestNotePostWriteFault> {
+    TEST_NOTE_POST_WRITE_FAULT.with(|slot| slot.take())
+}
+
+fn note_write_failure(
+    link: &ExactFileLink,
+    error: impl std::fmt::Display,
+    journal: &mut Option<&mut dyn ExactNoteWriteJournal>,
+) -> AppError {
+    let (failure, cleanup_verified) = match remove_exact_created_link(link, 1) {
+        Ok(()) => (
+            AppError::Export(format!("write exact note temp failed: {error}")),
+            true,
+        ),
+        Err(cleanup) => match link.scrub_attempt_owned_plaintext() {
+            Ok(()) => (
+                AppError::Export(format!(
+                    "write exact note temp failed: {error}; exact unlink refused ({cleanup}); retained inode scrubbed"
+                )),
+                true,
+            ),
+            Err(scrub) => (
+                AppError::Export(format!(
+                    "write exact note temp failed: {error}; exact cleanup failed: {cleanup}; retained-inode scrub failed: {scrub}"
+                )),
+                false,
+            ),
+        },
+    };
+    if cleanup_verified {
+        if let Some(journal) = journal.as_deref_mut() {
+            if let Err(acknowledge) = journal.rollback_verified() {
+                return AppError::Storage(format!(
+                    "{failure}; verified note rollback journal acknowledgement failed: {acknowledge}"
+                ));
+            }
+        }
+    }
+    failure
+}
+
+impl CreatedNoteCleanup {
+    pub(crate) fn remove_if_unchanged(
+        &self,
+        expected_len: u64,
+        expected_sha256: &[u8; 32],
+    ) -> Result<()> {
+        remove_exact_created_links(&self.links, expected_len, expected_sha256)
+    }
+
+    /// Terminal privacy fallback when namespace deletion refuses (for example an unknown
+    /// hardlink). Scrubbing the exact inode and fsyncing it removes plaintext from every surviving
+    /// hardlink before destructive authority is allowed to drop.
+    pub(crate) fn scrub_plaintext_if_unchanged(
+        &self,
+        _expected_len: u64,
+        _expected_sha256: &[u8; 32],
+    ) -> Result<()> {
+        let link = self
+            .links
+            .first()
+            .ok_or_else(|| AppError::Export("created note receipt has no link to scrub".into()))?;
+        link.scrub_attempt_owned_plaintext()?;
+        for link in &self.links {
+            let _ = remove_exact_created_link(link, 1);
+        }
+        Ok(())
+    }
+}
+
 pub fn write_note(
     vault_dir: &Path,
     subfolder: Option<&str>,
@@ -1045,6 +2776,76 @@ pub fn write_note(
     date_iso: &str,
     markdown: &str,
 ) -> Result<PathBuf> {
+    let receipt = write_note_with_receipt(vault_dir, subfolder, title, date_iso, markdown)?;
+    if let Some(error) = receipt.pending_error {
+        let cleanup = receipt
+            .cleanup
+            .ok_or_else(|| AppError::Export("pending note cleanup lost its receipt".into()))?;
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(markdown.as_bytes()).into();
+        let removal = cleanup.remove_if_unchanged(markdown.len() as u64, &digest);
+        if removal.is_err() {
+            cleanup.scrub_plaintext_if_unchanged(markdown.len() as u64, &digest)?;
+        }
+        return Err(error);
+    }
+    Ok(receipt.path)
+}
+
+/// Receipt-bearing twin of [`write_note`]. The `created` bit is decided inside the same collision
+/// resolution/write seam, so callers can roll back only files this exact attempt created without a
+/// racy pre-stat that could misclassify a concurrently-created identical user file.
+pub fn write_note_with_receipt(
+    vault_dir: &Path,
+    subfolder: Option<&str>,
+    title: &str,
+    date_iso: &str,
+    markdown: &str,
+) -> Result<WriteNoteReceipt> {
+    write_note_with_receipt_core(vault_dir, subfolder, title, date_iso, markdown, |_| {})
+}
+
+pub(crate) fn write_note_with_receipt_in_exact_vault_journaled(
+    vault: &ExactVault,
+    subfolder: Option<&str>,
+    title: &str,
+    date_iso: &str,
+    markdown: &str,
+    journal: &mut dyn ExactNoteWriteJournal,
+) -> Result<WriteNoteReceipt> {
+    let target_dir = target_note_directory(vault.configured_path(), subfolder)?;
+    write_note_with_receipt_in_exact_vault_core(
+        vault,
+        &target_dir,
+        title,
+        date_iso,
+        markdown,
+        |_| {},
+        Some(journal),
+    )
+}
+
+fn write_note_with_receipt_core(
+    vault_dir: &Path,
+    subfolder: Option<&str>,
+    title: &str,
+    date_iso: &str,
+    markdown: &str,
+    before_publish: impl FnMut(&Path),
+) -> Result<WriteNoteReceipt> {
+    let target_dir = target_note_directory(vault_dir, subfolder)?;
+    let vault = ExactVault::open(vault_dir)?;
+    write_note_with_receipt_in_exact_vault_core(
+        &vault,
+        &target_dir,
+        title,
+        date_iso,
+        markdown,
+        before_publish,
+        None,
+    )
+}
+
+fn target_note_directory(vault_dir: &Path, subfolder: Option<&str>) -> Result<PathBuf> {
     if vault_dir.as_os_str().is_empty() {
         return Err(AppError::Export("empty vault_dir".to_string()));
     }
@@ -1054,53 +2855,298 @@ pub fn write_note(
         Some(sub) if !sub.trim().is_empty() => vault_dir.join(sub),
         _ => vault_dir.to_path_buf(),
     };
-    std::fs::create_dir_all(&target_dir)
-        .map_err(|e| AppError::Export(format!("create vault dir failed: {e}")))?;
+    Ok(target_dir)
+}
 
+fn write_note_with_receipt_in_exact_vault_core(
+    vault: &ExactVault,
+    target_dir: &Path,
+    title: &str,
+    date_iso: &str,
+    markdown: &str,
+    mut before_publish: impl FnMut(&Path),
+    mut journal: Option<&mut dyn ExactNoteWriteJournal>,
+) -> Result<WriteNoteReceipt> {
+    vault.ensure_directory(target_dir)?;
+    let target_identity = vault.directory_identity(target_dir)?;
     let stem = base_stem(title, date_iso)?;
 
-    // Find a non-colliding final path. The note is idempotent for identical
-    // (date, title, content): if a file with the exact base name already exists
-    // and its content is byte-identical to `markdown`, return it without writing
-    // a duplicate. Otherwise, suffix " (N)".
-    let final_path = resolve_unique_path(&target_dir, &stem, markdown.as_bytes())?;
-
-    // If resolve returned an existing identical file, we're done (idempotent).
-    if final_path_is_existing_identical(&final_path, markdown)? {
-        return Ok(final_path);
+    // Idempotent adoption happens only before plaintext temp creation, through one anchored open
+    // and stable read. Once publication starts, an EEXIST race keeps the same affine temp
+    // authority and moves to another free suffix; it never enters a cleanup-then-adopt seam.
+    let initial = resolve_unique_path_exact(vault, target_dir, &stem, markdown.as_bytes())?;
+    if let ExactExisting::Identical(verification) =
+        vault.inspect_existing(&initial, markdown.as_bytes())?
+    {
+        return Ok(WriteNoteReceipt {
+            path: initial,
+            created: false,
+            cleanup: None,
+            verification,
+            pending_error: None,
+        });
     }
 
-    // Atomic write: write to a hidden temp dotfile in the SAME directory (so the
-    // rename is a same-filesystem atomic operation), fsync, then rename over the
-    // final path. The temp name is unique to avoid clobbering a concurrent write.
     let tmp_name = format!(
-        ".{}.{}.murmur.tmp",
+        ".{}.{}.{}.murmur.tmp",
         sanitize_for_tmp(&stem),
+        uuid::Uuid::new_v4(),
         std::process::id()
     );
     let tmp_path = target_dir.join(tmp_name);
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(markdown.as_bytes()).into();
+    if let Some(journal) = journal.as_deref_mut() {
+        journal.reserve(&tmp_path, markdown.len() as u64, &digest)?;
+    }
+    if let Err(error) = vault.verify_directory_identity(target_dir, target_identity) {
+        if let Some(journal) = journal.as_deref_mut() {
+            if let Err(acknowledge) = journal.rollback_verified() {
+                return Err(AppError::Storage(format!(
+                    "{error}; verified pre-create note rollback acknowledgement failed: {acknowledge}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    let mut tmp_link = match vault.create_file(&tmp_path, 0o600) {
+        Ok(link) => link,
+        Err(error) => {
+            if let Some(journal) = journal.as_deref_mut() {
+                journal.rollback_verified()?;
+            }
+            return Err(error);
+        }
+    };
+    if let Some(journal) = journal.as_deref_mut() {
+        if let Err(error) = journal.bind(&tmp_path, tmp_link.identity()) {
+            let cleanup = remove_exact_created_link(&tmp_link, 1);
+            return Err(match cleanup {
+                Ok(()) => match journal.rollback_verified() {
+                    Ok(()) => error,
+                    Err(acknowledge) => AppError::Storage(format!(
+                        "{error}; verified unbound note rollback acknowledgement failed: {acknowledge}"
+                    )),
+                },
+                Err(cleanup) => AppError::Storage(format!(
+                    "{error}; unbound exact note temp cleanup failed: {cleanup}"
+                )),
+            });
+        }
+    }
 
-    write_and_sync(&tmp_path, markdown).inspect_err(|_| {
-        // Best-effort cleanup of the temp file on failure.
-        let _ = std::fs::remove_file(&tmp_path);
-    })?;
+    #[cfg(test)]
+    let post_write_fault = take_test_note_post_write_fault();
+    #[cfg(test)]
+    if matches!(
+        post_write_fault,
+        Some(TestNotePostWriteFault::PartialWriteUnknownHardlinkAndReplacement)
+    ) {
+        let prefix_len = markdown.len().max(1).div_ceil(2).min(markdown.len());
+        if let Err(error) = tmp_link
+            .file_mut()
+            .write_all(&markdown.as_bytes()[..prefix_len])
+            .and_then(|()| tmp_link.file_mut().sync_all())
+        {
+            return Err(note_write_failure(
+                &tmp_link,
+                error,
+                &mut journal,
+            ));
+        }
+        let unknown = target_dir.join(format!(
+            ".murmur-test-partial-hardlink-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let unknown_authority = match tmp_link.hard_link_sibling(&unknown) {
+            Ok(authority) => authority,
+            Err(error) => return Err(note_write_failure(
+                &tmp_link,
+                format!("inject partial hardlink failed: {error}"),
+                &mut journal,
+            )),
+        };
+        drop(unknown_authority);
+        if let Err(error) = std::fs::remove_file(&tmp_path) {
+            return Err(note_write_failure(
+                &tmp_link,
+                format!("inject partial name removal failed: {error}"),
+                &mut journal,
+            ));
+        }
+        if let Err(error) = std::fs::write(&tmp_path, b"concurrent replacement") {
+            return Err(note_write_failure(
+                &tmp_link,
+                format!("inject partial name replacement failed: {error}"),
+                &mut journal,
+            ));
+        }
+        return Err(note_write_failure(
+            &tmp_link,
+            "injected partial note write failure",
+            &mut journal,
+        ));
+    }
 
-    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        AppError::Export(format!("atomic rename failed: {e}"))
-    })?;
-
-    Ok(final_path)
-}
-
-/// Returns true if `path` already exists and its bytes equal `markdown`.
-fn final_path_is_existing_identical(path: &Path, markdown: &str) -> Result<bool> {
-    final_path_is_existing_identical_bytes(path, markdown.as_bytes())
+    if let Err(error) = tmp_link
+        .file_mut()
+        .write_all(markdown.as_bytes())
+        .and_then(|()| tmp_link.file_mut().sync_all())
+    {
+        return Err(note_write_failure(
+            &tmp_link,
+            error,
+            &mut journal,
+        ));
+    }
+    #[cfg(test)]
+    match post_write_fault {
+        Some(TestNotePostWriteFault::Metadata) => {
+            let verification = tmp_link.observation();
+            return Ok(WriteNoteReceipt {
+                path: tmp_path,
+                created: true,
+                cleanup: Some(CreatedNoteCleanup {
+                    links: vec![tmp_link],
+                }),
+                verification,
+                pending_error: Some(AppError::Export(
+                    "injected stat exact note temp failure after plaintext write".into(),
+                )),
+            });
+        }
+        Some(TestNotePostWriteFault::UnknownHardlink) => {
+            let unknown = target_dir.join(format!(
+                ".murmur-test-unknown-hardlink-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let _unknown_authority = tmp_link.hard_link_sibling(&unknown).map_err(|error| {
+                AppError::Export(format!("inject unknown hardlink failed: {error}"))
+            })?;
+        }
+        Some(TestNotePostWriteFault::PartialWriteUnknownHardlinkAndReplacement) => unreachable!(),
+        None => {}
+    }
+    let tmp_metadata = match tmp_link.file_mut().metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let verification = tmp_link.observation();
+            return Ok(WriteNoteReceipt {
+                path: tmp_path,
+                created: true,
+                cleanup: Some(CreatedNoteCleanup {
+                    links: vec![tmp_link],
+                }),
+                verification,
+                pending_error: Some(AppError::Export(format!(
+                    "stat exact note temp failed after plaintext write: {error}"
+                ))),
+            });
+        }
+    };
+    if tmp_metadata.dev() != tmp_link.device
+        || tmp_metadata.ino() != tmp_link.inode
+        || tmp_metadata.nlink() != 1
+        || tmp_metadata.len() != markdown.len() as u64
+    {
+        let verification = tmp_link.observation();
+        return Ok(WriteNoteReceipt {
+            path: tmp_path,
+            created: true,
+            cleanup: Some(CreatedNoteCleanup {
+                links: vec![tmp_link],
+            }),
+            verification,
+            pending_error: Some(AppError::Export(
+                "exact note temp failed identity verification after plaintext write".into(),
+            )),
+        });
+    }
+    for _ in 0..32 {
+        let final_path = resolve_free_path_exact(vault, target_dir, &stem)?;
+        before_publish(&final_path);
+        if let Some(journal) = journal.as_deref_mut() {
+            journal.reserve_publish(tmp_link.path(), &final_path)?;
+        }
+        match tmp_link.publish_exclusive(&final_path) {
+            Ok(()) => {
+                if let Some(journal) = journal.as_deref_mut() {
+                    if let Err(original) = journal.published(&final_path) {
+                        let verification = tmp_link.observation();
+                        return Ok(WriteNoteReceipt {
+                            path: final_path,
+                            created: true,
+                            cleanup: Some(CreatedNoteCleanup {
+                                links: vec![tmp_link],
+                            }),
+                            verification,
+                            pending_error: Some(original),
+                        });
+                    }
+                }
+                if let Err(original) = vault.verify_directory_identity(target_dir, target_identity)
+                {
+                    let verification = tmp_link.observation();
+                    return Ok(WriteNoteReceipt {
+                        path: final_path,
+                        created: true,
+                        cleanup: Some(CreatedNoteCleanup {
+                            links: vec![tmp_link],
+                        }),
+                        verification,
+                        pending_error: Some(original),
+                    });
+                }
+                let links = vec![tmp_link];
+                let _ = links[0].sync_parent();
+                let verification = links[0].observation();
+                return Ok(WriteNoteReceipt {
+                    path: final_path,
+                    created: true,
+                    cleanup: Some(CreatedNoteCleanup { links }),
+                    verification,
+                    pending_error: None,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let verification = tmp_link.observation();
+                return Ok(WriteNoteReceipt {
+                    path: tmp_link.path().to_path_buf(),
+                    created: true,
+                    cleanup: Some(CreatedNoteCleanup {
+                        links: vec![tmp_link],
+                    }),
+                    verification,
+                    pending_error: Some(AppError::Export(format!(
+                        "atomic no-clobber publish failed: {error}"
+                    ))),
+                });
+            }
+        }
+    }
+    let verification = tmp_link.observation();
+    Ok(WriteNoteReceipt {
+        path: tmp_link.path().to_path_buf(),
+        created: true,
+        cleanup: Some(CreatedNoteCleanup {
+            links: vec![tmp_link],
+        }),
+        verification,
+        pending_error: Some(AppError::Export(
+            "note path kept changing during collision-safe publication".into(),
+        )),
+    })
 }
 
 /// Byte-slice core of [`final_path_is_existing_identical`] (the external-edit preservation path
 /// compares RAW bytes — an externally-edited file is not guaranteed to be UTF-8).
 fn final_path_is_existing_identical_bytes(path: &Path, content: &[u8]) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(AppError::Export(format!("stat existing note failed: {e}"))),
+    }
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes == content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1113,23 +3159,56 @@ fn final_path_is_existing_identical_bytes(path: &Path, content: &[u8]) -> Result
 /// (idempotent re-export). If it exists with DIFFERENT content, we look for an
 /// identical sibling `<stem> (N).md`; if found, return it; else allocate the next
 /// free `(N)` slot.
-fn resolve_unique_path(dir: &Path, stem: &str, content: &[u8]) -> Result<PathBuf> {
+fn resolve_unique_path_exact(
+    vault: &ExactVault,
+    dir: &Path,
+    stem: &str,
+    content: &[u8],
+) -> Result<PathBuf> {
     let base = dir.join(format!("{stem}.md"));
-    if !path_exists(&base)? {
-        return Ok(base);
-    }
-    if final_path_is_existing_identical_bytes(&base, content)? {
-        return Ok(base);
+    match vault.inspect_existing(&base, content)? {
+        ExactExisting::Missing | ExactExisting::Identical(_) => return Ok(base),
+        ExactExisting::Different => {}
     }
 
     // Base is taken by different content; scan/allocate a "(N)" variant.
     for n in 1..=10_000 {
         let candidate = dir.join(format!("{stem} ({n}).md"));
-        if !path_exists(&candidate)? {
+        match vault.inspect_existing(&candidate, content)? {
+            ExactExisting::Missing | ExactExisting::Identical(_) => return Ok(candidate),
+            ExactExisting::Different => {}
+        }
+    }
+    Err(AppError::Export(
+        "exhausted collision suffixes (>10000) for note name".to_string(),
+    ))
+}
+
+fn resolve_free_path_exact(vault: &ExactVault, dir: &Path, stem: &str) -> Result<PathBuf> {
+    for n in 0..=10_000 {
+        let candidate = if n == 0 {
+            dir.join(format!("{stem}.md"))
+        } else {
+            dir.join(format!("{stem} ({n}).md"))
+        };
+        if vault.existing_bytes_match(&candidate, &[])?.is_none() {
             return Ok(candidate);
         }
-        if final_path_is_existing_identical_bytes(&candidate, content)? {
-            // Identical content already exported under this suffix → idempotent.
+    }
+    Err(AppError::Export(
+        "exhausted collision suffixes (>10000) for note name".into(),
+    ))
+}
+
+fn resolve_unique_path(dir: &Path, stem: &str, content: &[u8]) -> Result<PathBuf> {
+    let base = dir.join(format!("{stem}.md"));
+    if !path_exists(&base)? || final_path_is_existing_identical_bytes(&base, content)? {
+        return Ok(base);
+    }
+    for n in 1..=10_000 {
+        let candidate = dir.join(format!("{stem} ({n}).md"));
+        if !path_exists(&candidate)? || final_path_is_existing_identical_bytes(&candidate, content)?
+        {
             return Ok(candidate);
         }
     }
@@ -1160,7 +3239,7 @@ fn sanitize_for_tmp(stem: &str) -> String {
 }
 
 /// Write `contents` to `path` and fsync both the file and its parent directory so
-/// the subsequent rename is durable.
+/// the subsequent same-directory atomic publication is durable.
 fn write_and_sync(path: &Path, contents: &str) -> Result<()> {
     write_and_sync_bytes(path, contents.as_bytes())
 }
@@ -1394,9 +3473,9 @@ pub fn overwrite_note(path: &Path, markdown: &str) -> Result<()> {
 const STALE_EXPORT_TMP_AGE_SECS: u64 = 3600;
 
 /// R2 — best-effort startup sweep of orphaned export temp DOTFILES in the vault. `write_note` writes
-/// `.<stem>.<pid>.murmur.tmp` and `overwrite_note` writes `.edit.<pid>.murmur.tmp`, renaming
-/// atomically over the final `.md`; `remove_file` fires only on the ERROR branch, so a SIGKILL
-/// between the fsync and the rename orphans the dotfile in the user's vault (`collect_md_stems` skips
+/// `.<stem>.<uuid>.<pid>.murmur.tmp` and `overwrite_note` writes `.edit.<pid>.murmur.tmp`, publishing
+/// atomically as the final `.md`; `remove_file` fires only after publication/error, so a SIGKILL
+/// between the fsync and publication orphans the dotfile in the user's vault (`collect_md_stems` skips
 /// dotfiles but never deletes them). This reclaims that residue. The `.murmur.tmp` marker makes the
 /// sweep provably OURS-only — a foreign third-party dotfile is never touched.
 ///
@@ -1461,7 +3540,7 @@ fn sweep_export_tmp_dir(dir: &Path, now: std::time::SystemTime) -> u32 {
 }
 
 /// Parse the PID out of an export temp dotfile name, or `None` if it is not our shape. Matches both
-/// `write_note`'s `.<stem>.<pid>.tmp` and `overwrite_note`'s `.edit.<pid>.tmp`: a name that STARTS
+/// `write_note`'s `.<stem>.<uuid>.<pid>.tmp` and `overwrite_note`'s `.edit.<pid>.tmp`: a name that STARTS
 /// with `.`, ENDS with `.tmp`, and whose token immediately before `.tmp` parses as a u32 pid. A
 /// stem may itself contain dots, so we key off the LAST two dot-segments only.
 fn export_tmp_pid(name: &str) -> Option<u32> {
@@ -2276,6 +4355,327 @@ mod tests {
         // A third identical-to-second export reuses the (1) file.
         let p3 = write_note(&dir, None, "Sync", "2026-06-24", "second").unwrap();
         assert_eq!(p2, p3);
+    }
+
+    #[test]
+    fn write_note_receipt_publish_never_clobbers_a_raced_user_file() {
+        let dir = tmp_dir("publish-race");
+        let mut injected = false;
+        let receipt = write_note_with_receipt_core(
+            &dir,
+            None,
+            "Sync",
+            "2026-06-24",
+            "murmur bytes",
+            |chosen| {
+                if !injected {
+                    std::fs::write(chosen, b"concurrent user bytes").unwrap();
+                    injected = true;
+                }
+            },
+        )
+        .unwrap();
+
+        let base = dir.join("2026-06-24 0000 - Sync.md");
+        assert_eq!(std::fs::read(&base).unwrap(), b"concurrent user bytes");
+        assert_ne!(receipt.path, base);
+        assert!(receipt.created);
+        assert_eq!(std::fs::read(&receipt.path).unwrap(), b"murmur bytes");
+    }
+
+    #[test]
+    fn already_exists_race_keeps_affine_temp_until_suffix_publish() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tmp_dir("publish-race-affine");
+        let hostile_link = dir.join("hostile-temp-hardlink");
+        let mut injected = false;
+        let receipt = write_note_with_receipt_core(
+            &dir,
+            None,
+            "Sync",
+            "2026-06-24",
+            "murmur bytes",
+            |chosen| {
+                if !injected {
+                    std::fs::write(chosen, b"concurrent user bytes").unwrap();
+                    let temp = std::fs::read_dir(&dir)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| path.to_string_lossy().ends_with(".murmur.tmp"))
+                        .unwrap();
+                    std::fs::hard_link(temp, &hostile_link).unwrap();
+                    injected = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(receipt.pending_error.is_none());
+        assert_ne!(receipt.path, dir.join("2026-06-24 0000 - Sync.md"));
+        let digest: [u8; 32] = Sha256::digest(b"murmur bytes").into();
+        let cleanup = receipt.cleanup.unwrap();
+        assert!(cleanup.remove_if_unchanged(12, &digest).is_err());
+        cleanup.scrub_plaintext_if_unchanged(12, &digest).unwrap();
+        assert_eq!(std::fs::read(&hostile_link).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(dir.join("2026-06-24 0000 - Sync.md")).unwrap(),
+            b"concurrent user bytes"
+        );
+    }
+
+    #[test]
+    fn post_write_metadata_failure_removes_plaintext_before_error() {
+        let dir = tmp_dir("post-write-metadata-fault");
+        set_test_note_post_write_fault(TestNotePostWriteFault::Metadata);
+        let error = write_note(&dir, None, "Sync", "2026-06-24", "private bytes")
+            .expect_err("injected post-write metadata failure must surface");
+        assert!(matches!(error, AppError::Export(_)));
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn unknown_hardlink_cleanup_refusal_scrubs_every_surviving_link() {
+        let dir = tmp_dir("post-write-unknown-hardlink");
+        set_test_note_post_write_fault(TestNotePostWriteFault::UnknownHardlink);
+        let error = write_note(&dir, None, "Sync", "2026-06-24", "private bytes")
+            .expect_err("unknown post-write hardlink must fail publication");
+        assert!(matches!(error, AppError::Export(_)));
+        let files = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert!(
+            !files.is_empty(),
+            "the hostile hardlink may keep empty names alive"
+        );
+        for path in files {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"",
+                "no surviving link may retain failed-write plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_write_name_replacement_scrubs_original_hardlinks_and_surfaces_error() {
+        let dir = tmp_dir("partial-write-name-replacement");
+        set_test_note_post_write_fault(
+            TestNotePostWriteFault::PartialWriteUnknownHardlinkAndReplacement,
+        );
+        let error = write_note(&dir, None, "Sync", "2026-06-24", "private partial bytes")
+            .expect_err("injected partial write failure must surface");
+        assert!(matches!(error, AppError::Export(_)), "{error:?}");
+        let files = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        let hostile = files
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".murmur-test-partial-hardlink-"))
+            })
+            .expect("the injected unknown hardlink survives for verification");
+        assert_eq!(std::fs::read(hostile).unwrap(), b"");
+        let replacement = files
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".murmur.tmp"))
+            .expect("the concurrent replacement remains user-owned");
+        assert_eq!(
+            std::fs::read(replacement).unwrap(),
+            b"concurrent replacement"
+        );
+    }
+
+    #[test]
+    fn ancestor_symlink_swap_creates_nothing_outside_and_retains_cleanup() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+
+        let vault = tmp_dir("ancestor-symlink-vault");
+        let target = vault.join("Space");
+        std::fs::create_dir(&target).unwrap();
+        let moved = vault.join("Space-moved");
+        let outside = tmp_dir("ancestor-symlink-outside");
+        let mut swapped = false;
+        let mut receipt = write_note_with_receipt_core(
+            &vault,
+            Some("Space"),
+            "Sync",
+            "2026-06-24",
+            "private bytes",
+            |_| {
+                if !swapped {
+                    std::fs::rename(&target, &moved).unwrap();
+                    symlink(&outside, &target).unwrap();
+                    swapped = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(receipt.pending_error.take().is_some());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        let digest: [u8; 32] = Sha256::digest(b"private bytes").into();
+        receipt
+            .cleanup
+            .unwrap()
+            .remove_if_unchanged(13, &digest)
+            .unwrap();
+    }
+
+    #[test]
+    fn ancestor_real_directory_swap_refuses_and_cleans_retained_parent() {
+        use sha2::{Digest, Sha256};
+
+        let vault = tmp_dir("ancestor-real-vault");
+        let target = vault.join("Space");
+        std::fs::create_dir(&target).unwrap();
+        let moved = vault.join("Space-moved");
+        let mut swapped = false;
+        let mut receipt = write_note_with_receipt_core(
+            &vault,
+            Some("Space"),
+            "Sync",
+            "2026-06-24",
+            "private bytes",
+            |_| {
+                if !swapped {
+                    std::fs::rename(&target, &moved).unwrap();
+                    std::fs::create_dir(&target).unwrap();
+                    swapped = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(receipt.pending_error.take().is_some());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+        let digest: [u8; 32] = Sha256::digest(b"private bytes").into();
+        receipt
+            .cleanup
+            .unwrap()
+            .remove_if_unchanged(13, &digest)
+            .unwrap();
+        assert!(std::fs::read_dir(&moved).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn exact_vault_attachment_directory_symlink_never_creates_outside() {
+        use std::os::unix::fs::symlink;
+
+        let vault = tmp_dir("attachment-dir-symlink-vault");
+        let outside = tmp_dir("attachment-dir-symlink-outside");
+        symlink(&outside, vault.join("Murmur Attachments")).unwrap();
+        let exact = ExactVault::open(&vault).unwrap();
+        let error = exact
+            .ensure_directory(&vault.join("Murmur Attachments"))
+            .expect_err("a symlinked attachment directory must fail closed");
+        assert!(matches!(error, AppError::Export(_)));
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn old_vault_parent_swap_refuses_restore_and_preserves_outside() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+
+        let old_vault = tmp_dir("old-vault-parent");
+        let parent = old_vault.join("Murmur Attachments");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("image.png");
+        std::fs::write(&path, b"canonical bytes").unwrap();
+        let link = open_exact_absolute_existing_file(&path).unwrap().unwrap();
+        let digest: [u8; 32] = Sha256::digest(b"canonical bytes").into();
+        remove_exact_verified_link(&link, 1, 15, &digest).unwrap();
+
+        let moved = old_vault.join("Attachments-moved");
+        std::fs::rename(&parent, &moved).unwrap();
+        let outside = tmp_dir("old-vault-parent-outside");
+        symlink(&outside, &parent).unwrap();
+        let error = link
+            .create_replacement(0o600)
+            .expect_err("restore must not follow a swapped old-vault parent");
+        assert!(matches!(error, AppError::Export(_)));
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn exact_note_cleanup_preserves_same_byte_replacement_symlink_and_unknown_hardlink() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+
+        let expected = b"murmur bytes";
+        let digest: [u8; 32] = Sha256::digest(expected).into();
+
+        let replacement_dir = tmp_dir("exact-cleanup-replacement");
+        let replacement_receipt = write_note_with_receipt(
+            &replacement_dir,
+            None,
+            "Sync",
+            "2026-06-24",
+            std::str::from_utf8(expected).unwrap(),
+        )
+        .unwrap();
+        let replacement_path = replacement_receipt.path.clone();
+        std::fs::remove_file(&replacement_path).unwrap();
+        let replacement_source = replacement_dir.join("same-bytes-different-inode");
+        std::fs::write(&replacement_source, expected).unwrap();
+        std::fs::hard_link(&replacement_source, &replacement_path).unwrap();
+        let error = replacement_receipt
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .remove_if_unchanged(expected.len() as u64, &digest)
+            .expect_err("same bytes on a different inode must not transfer cleanup ownership");
+        assert!(matches!(error, AppError::Export(_)));
+        assert_eq!(std::fs::read(&replacement_path).unwrap(), expected);
+
+        let symlink_dir = tmp_dir("exact-cleanup-symlink");
+        let symlink_receipt = write_note_with_receipt(
+            &symlink_dir,
+            None,
+            "Sync",
+            "2026-06-24",
+            std::str::from_utf8(expected).unwrap(),
+        )
+        .unwrap();
+        let symlink_path = symlink_receipt.path.clone();
+        std::fs::remove_file(&symlink_path).unwrap();
+        let symlink_target = symlink_dir.join("user-target");
+        std::fs::write(&symlink_target, expected).unwrap();
+        symlink(&symlink_target, &symlink_path).unwrap();
+        symlink_receipt
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .remove_if_unchanged(expected.len() as u64, &digest)
+            .expect_err("a symlink must never be deleted as an attempt-created note");
+        assert!(std::fs::symlink_metadata(&symlink_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&symlink_target).unwrap(), expected);
+
+        let hardlink_dir = tmp_dir("exact-cleanup-hardlink");
+        let hardlink_receipt = write_note_with_receipt(
+            &hardlink_dir,
+            None,
+            "Sync",
+            "2026-06-24",
+            std::str::from_utf8(expected).unwrap(),
+        )
+        .unwrap();
+        let unknown_link = hardlink_dir.join("unknown-user-link");
+        std::fs::hard_link(&hardlink_receipt.path, &unknown_link).unwrap();
+        hardlink_receipt
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .remove_if_unchanged(expected.len() as u64, &digest)
+            .expect_err("an unknown hardlink must preserve every name");
+        assert_eq!(std::fs::read(&hardlink_receipt.path).unwrap(), expected);
+        assert_eq!(std::fs::read(&unknown_link).unwrap(), expected);
     }
 
     #[test]

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Murmur — README banner</title>
+    <!--
+      The README/landing banner, rendered rather than hand-drawn, so the brand
+      mark and the palette come from the SAME source as the app.
+
+      Colours are the literal values from src/design-tokens/colors.css and the
+      mark is the five-bar waveform from the shell's `mur-icon "murmur"` glyph
+      (src/app/design-system/icon/icon.component.html) — the previous banner
+      predated that mark and still showed the old orb.
+
+      Captured by ./capture.mjs as the `banner` shot; not part of the app build.
+    -->
+    <style>
+      /* The app self-hosts its type (src/styles.css @font-face). Load the SAME
+         woff2 by relative path so the banner's wordmark is the product's
+         typeface, not whatever the system falls back to. */
+      @font-face {
+        font-family: "Hanken Grotesk";
+        font-style: normal;
+        font-weight: 100 900;
+        src: url("../../src/assets/fonts/hanken-grotesk.woff2") format("woff2");
+      }
+      :root {
+        --surface-base: #07070b;
+        --text-primary: #f6f6fa;
+        --text-secondary: #a6a6b6;
+        --text-muted: #6c6c7d;
+        --accent: #6e76ff;
+        --accent-hover: #8a90ff;
+        --accent-soft: rgba(110, 118, 255, 0.16);
+        --border: rgba(255, 255, 255, 0.09);
+        --radius-pill: 999px;
+        --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, system-ui,
+          "Segoe UI", Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; margin: 0; }
+      html, body { width: 1280px; height: 448px; }
+      body {
+        background: var(--surface-base);
+        color: var(--text-primary);
+        font-family: var(--font-sans);
+        display: grid;
+        place-items: center;
+        position: relative;
+        overflow: hidden;
+        -webkit-font-smoothing: antialiased;
+      }
+      /* The aurora field the app's chrome rides on — a static vignette, not a gradient wash. */
+      body::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(42% 58% at 6% 12%, rgba(110, 118, 255, 0.20), transparent 60%),
+          radial-gradient(38% 50% at 96% 92%, rgba(157, 123, 255, 0.14), transparent 62%);
+      }
+      .wrap {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 56px;
+      }
+      .mark {
+        width: 132px;
+        height: 132px;
+        display: grid;
+        place-items: center;
+        border-radius: 34px;
+        background: var(--accent-soft);
+        border: 1px solid var(--border);
+        color: var(--accent-hover);
+        flex: none;
+      }
+      .mark svg { width: 82px; height: 82px; }
+      h1 {
+        font-size: 68px;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        line-height: 1;
+        margin-bottom: 14px;
+      }
+      .tag {
+        font-size: 25px;
+        font-weight: 500;
+        color: var(--text-primary);
+        margin-bottom: 12px;
+      }
+      .sub {
+        font-size: 18px;
+        line-height: 1.5;
+        color: var(--text-secondary);
+        max-width: 620px;
+        margin-bottom: 26px;
+      }
+      .sub b { color: var(--text-primary); font-weight: 600; }
+      .pills { display: flex; gap: 10px; flex-wrap: wrap; }
+      .pill {
+        font-size: 14px;
+        font-weight: 500;
+        color: var(--text-secondary);
+        padding: 8px 15px;
+        border-radius: var(--radius-pill);
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.045);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="mark">
+        <!-- Identical geometry to the shell's brand tile. -->
+        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+          <rect x="2.4" y="7.9" width="2" height="4.2" rx="1" />
+          <rect x="5.7" y="5.8" width="2" height="8.4" rx="1" />
+          <rect x="9" y="3.7" width="2" height="12.6" rx="1" />
+          <rect x="12.3" y="5.8" width="2" height="8.4" rx="1" />
+          <rect x="15.6" y="7.9" width="2" height="4.2" rx="1" />
+        </svg>
+      </div>
+      <div>
+        <h1>Murmur</h1>
+        <p class="tag">Your meetings, with a brain — on your Mac.</p>
+        <p class="sub">
+          Record → transcribe on-device → <b>ask your AI live, in the meeting</b> — and
+          across everything you've ever recorded. Your archive stays in plain Markdown
+          you own.
+        </p>
+        <div class="pills">
+          <span class="pill">macOS 13.4+</span>
+          <span class="pill">Local-first</span>
+          <span class="pill">On-device brain</span>
+          <span class="pill">Whisper</span>
+          <span class="pill">Touch ID lock</span>
+          <span class="pill">MCP</span>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

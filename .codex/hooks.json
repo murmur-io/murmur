@@ -6,21 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/block-bash.sh\"",
-            "timeout": 30,
-            "statusMessage": "Checking Bash guardrails"
-          },
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/secret-scan.sh\"",
-            "timeout": 30,
-            "statusMessage": "Scanning staged secrets"
-          },
-          {
-            "type": "command",
-            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/finish-guard.sh\"",
-            "timeout": 30,
-            "statusMessage": "Checking task verification gates"
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.agents/h/guard.py\"",
+            "timeout": 15,
+            "statusMessage": "Skan sekretow + ochrona brancha"
           }
         ]
       }

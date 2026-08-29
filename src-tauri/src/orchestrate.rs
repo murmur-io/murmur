@@ -239,6 +239,8 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::GetDashboard { .. } => "Dashboard",
         // Brain v3 PR-6 — knowledge diff / decision ledger (explicit tool; label for completeness).
         ToolCall::KnowledgeDiff { .. } => "Knowledge diff",
+        ToolCall::ListTasks => "Shared tasks",
+        ToolCall::GetTask { .. } => "Shared task",
         ToolCall::GetOpenCommitments { .. } => "Open commitments",
         ToolCall::GetMeeting { .. } => "Meeting",
         // MCP-only variants: `map_to_tool_call` never constructs these. Exhaustive labels keep the

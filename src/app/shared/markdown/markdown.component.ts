@@ -138,11 +138,11 @@ export class MarkdownComponent {
       }
       // No such note/meeting/org-item (or it is locked) — offer to create it, Obsidian-style.
       this.toast.push(`Notatka „${title}" jeszcze nie istnieje`, "info", 0, {
-        label: "Utwórz",
+        label: "Create",
         run: () => void this.createAndOpen(title),
       });
     } catch {
-      this.toast.danger(`Nie udało się otworzyć „${title}"`);
+      this.toast.danger(`Couldn't open “${title}”`);
     }
   }
 
@@ -151,7 +151,7 @@ export class MarkdownComponent {
       const id = await this.ipc.createNote(null, title);
       await this.tabsService.openNote(id, title);
     } catch {
-      this.toast.danger(`Nie udało się utworzyć „${title}"`);
+      this.toast.danger(`Couldn't create “${title}”`);
     }
   }
 

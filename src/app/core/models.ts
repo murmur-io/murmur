@@ -6,6 +6,8 @@ export type Stage =
   | "transcribing"
   | "summarizing"
   | "exporting"
+  | "saved"
+  | "finalized"
   | "done"
   | "error";
 
@@ -1082,10 +1084,6 @@ export interface StartResult {
 
 export interface StopResult {
   meetingId: string;
-  markdown: string;
-  /** Path of the exported Obsidian `.md`, or `null` when no vault is configured (the note is
-   *  still saved to Murmur — the vault is export-only). */
-  exportedPath: string | null;
 }
 
 export type MeetingStatus =
@@ -1180,7 +1178,7 @@ export interface ClaimAlignment {
 /**
  * One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken
  * command, the assistant's answer, the grounding citations, and the dispatch
- * status. Surfaced in the meeting detail's "Asystent — Q&A" section. EMPTY when
+ * status. Surfaced in the meeting detail's "Assistant — Q&A" section. EMPTY when
  * the meeting is locked-and-not-session-unlocked (gated, like note/segments) and
  * also empty for a sealed meeting at rest (the rows are PURGED on seal). Mirrors
  * the Rust `AssistantInteraction` (serde camelCase).
@@ -1210,7 +1208,7 @@ export interface MeetingDetail {
   /**
    * Persisted in-meeting assistant Q&A for this meeting. Present (gated) only
    * when the meeting is unlocked; empty otherwise. The FE renders these in the
-   * "🎙 Asystent — Q&A" detail section.
+   * "🎙 Assistant — Q&A" detail section.
    */
   assistantInteractions: AssistantInteraction[];
   /**
@@ -2777,11 +2775,37 @@ export interface OrganizeMove {
   toFolderId: string | null;
   /** One-line why (shown to the user). */
   reason: string;
+  /** Brain's review confidence. Every proposal still requires confirmation. */
+  confidence: "high" | "medium" | "low";
+  /**
+   * Frontend review receipt copied from the plan that produced this move.
+   * NotesHome applies only selected moves, so the IPC boundary uses this to
+   * preserve the reviewed scope without trusting current UI state.
+   */
+  reviewScopeFolderId: string | null;
 }
 
 /** An auto-organize plan (`plan_organize_notes`). Mirrors the Rust `OrganizePlan`. */
 export interface OrganizePlan {
+  scopeFolderId: string | null;
   moves: OrganizeMove[];
+  totalScanned: number;
+  alreadyOrganized: number;
+  deferred: number;
+  targets: WorkspaceOrganizeTarget[];
+}
+
+/** One per-note refusal returned by `apply_organize_plan`. */
+export interface OrganizeFailure {
+  noteId: string;
+  reason: string;
+  retryable: boolean;
+}
+
+/** Honest auto-organize apply receipt. */
+export interface OrganizeApplyResult {
+  appliedIds: string[];
+  failures: OrganizeFailure[];
 }
 
 /** One reviewed recording move proposed by `plan_workspace_organization`. */
@@ -2840,6 +2864,19 @@ export interface WorkspaceOrganizeFailure {
 export interface WorkspaceOrganizeApplyResult {
   appliedIds: string[];
   failures: WorkspaceOrganizeFailure[];
+}
+
+/** Content-free filing-journal health shown when crash recovery needs attention. */
+export interface FilingRecoveryStatus {
+  degraded: boolean;
+  attemptCount: number;
+  projectionCount: number;
+  sourceSnapshotCount: number;
+  /** Opaque, single-issue confirmation token. It contains no id, path, or title. */
+  issueToken: string | null;
+  /** Content-free reason category; copy only, never recovery authority. */
+  issueKind: "externalTargetOccupant" | "externalSourceReplacement" | null;
+  canKeepExisting: boolean;
 }
 
 /**
@@ -3694,4 +3731,127 @@ export interface ItemPage {
   kind: ItemKind;
   items: ItemRow[];
   total: number;
+}
+
+// ── Shared containers: a whole Folder or Space published to an Org ────────────
+
+/**
+ * What sharing a container would publish — counts only, never content.
+ * Mirrors the Rust `ContainerSharePreview`.
+ */
+export interface ContainerSharePreview {
+  folderId: string;
+  name: string;
+  /** `"space"` or `"folder"`. */
+  level: string;
+  noteCount: number;
+  meetingCount: number;
+  /** Sub-folders whose own manifest will be published; the root is not counted. */
+  folderCount: number;
+  /** Sealed descendants deliberately left behind — their content is never read. */
+  skippedSealed: number;
+  /** Dashboards are not shared yet: one can reference items nobody shared. */
+  skippedDashboards: number;
+  totalItems: number;
+}
+
+/** The outcome of one container share. Mirrors the Rust `ContainerShareResult`. */
+export interface ContainerShareResult {
+  containerId: string;
+  published: number;
+  failed: number;
+}
+
+/**
+ * One container THIS user publishes, for the sidebar's shared marker.
+ * Mirrors the Rust `ContainerShareStatus`.
+ */
+export interface ContainerShareStatus {
+  orgId: string;
+  orgName: string;
+  /** The LOCAL `folders.id`. */
+  folderId: string;
+  containerId: string;
+  access: OrgAccess;
+  /** True for the container the user picked; false for a descendant carried along. */
+  isRoot: boolean;
+  /** `queued` | `published` | `failed` | `revoke_pending` | `revoked`. */
+  state: string;
+}
+
+/** One received document, as a sidebar row. Mirrors the Rust `SharedItemRow`. */
+export interface SharedItemRow {
+  itemId: string;
+  docId?: string | null;
+  title: string;
+  /**
+   * `"document"` | `"meeting"`, or absent when the sender's client predates the
+   * source-kind wire field. Absent means UNCLASSIFIED — never assume a bucket.
+   */
+  kind?: "document" | "meeting" | null;
+  authorHint: string;
+  createdAt: string;
+  orgId: string;
+  orgName: string;
+  access: OrgAccess;
+  position: number;
+}
+
+/**
+ * One node of the received forest: a shared Space, a shared Folder, or the
+ * synthetic Shared Brains root. Mirrors the Rust `SharedContainerNode`.
+ */
+export interface SharedContainerNode {
+  /** Absent only for the synthetic Shared Brains root, which nobody published. */
+  containerId?: string | null;
+  orgId: string;
+  orgName: string;
+  name: string;
+  level: "space" | "folder" | "virtual";
+  emoji?: string | null;
+  tint?: string | null;
+  access: OrgAccess;
+  authorHint: string;
+  folders: SharedContainerNode[];
+  items: SharedItemRow[];
+  /**
+   * This device's PRIVATE placement: the local `folders.id` the user filed this
+   * under, or absent for "wherever its owner put it". Never published — the
+   * owner and every other member see nothing of it.
+   */
+  localParentId?: string | null;
+  position: number;
+}
+
+/** Everything shared WITH this user. Mirrors the Rust `SharedWorkspace`. */
+export interface SharedWorkspace {
+  /** Received Spaces — each becomes its own top-level sidebar row. */
+  spaces: SharedContainerNode[];
+  /**
+   * Received Folders with no shared-Space parent, plus every received item with
+   * no container at all — one virtual Space so loose shared content has a home.
+   */
+  sharedBrains: SharedContainerNode;
+}
+
+/** What a private placement can point at. */
+export type SharedPlacementTarget = "container" | "doc";
+
+/**
+ * What the local server for Claude is actually doing.
+ *
+ * `portInUse` is deliberately its own state, not folded into a generic failure: the user action
+ * that fixes it (quit whatever else holds the port) is completely different from the one that
+ * fixes `unavailable`, and the listener retries a `portInUse` on its own, so the copy can promise
+ * recovery without a restart.
+ */
+export type McpListenerState =
+  | "starting"
+  | "listening"
+  | "portInUse"
+  | "unavailable";
+
+export interface McpStatus {
+  state: McpListenerState;
+  port: number;
 }

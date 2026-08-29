@@ -1,0 +1,28 @@
+#!/bin/sh
+# .claude/ i .codex/ musza miec identyczne rules/ i learnings/ (hooks roznia sie zasadnie
+# — kazdy vendor ma wlasny protokol). Zastapilo 1787 linii config_audit.py + agent-sync-learnings.
+#
+#   .agents/h/mirror-check         sprawdz (exit 1 przy driftcie)
+#   .agents/h/mirror-check --fix   zsynchronizuj .codex/ z .claude/
+set -e
+cd "$(dirname "$0")/../.."
+
+if [ "$1" = "--fix" ]; then
+  for d in rules learnings; do
+    rm -rf ".codex/$d"
+    cp -R ".claude/$d" ".codex/$d"
+  done
+  echo "zsynchronizowano .codex/{rules,learnings} z .claude/"
+  exit 0
+fi
+
+rc=0
+for d in rules learnings; do
+  if ! diff -rq ".claude/$d" ".codex/$d" >/dev/null 2>&1; then
+    echo "DRIFT: .claude/$d != .codex/$d  (napraw: .agents/h/mirror-check --fix)" >&2
+    diff -rq ".claude/$d" ".codex/$d" >&2 || true
+    rc=1
+  fi
+done
+[ $rc -eq 0 ] && echo "mirror OK (.claude/ == .codex/ w rules+learnings)"
+exit $rc

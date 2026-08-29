@@ -2,7 +2,7 @@
 
 <nav class="global-rail" aria-label="Global navigation">
   <div class="rail-drag" data-tauri-drag-region></div>
-  <div class="rail-brand" aria-hidden="true">M</div>
+  <div class="rail-brand" aria-hidden="true"><mur-icon icon="murmur" /></div>
 
   <a
     class="rail-item"
@@ -35,17 +35,6 @@
   >
     <mur-icon icon="spaces" />
   </button>
-  <a
-    class="rail-item"
-    [class.active]="isSharedBrainsActive()"
-    [attr.aria-current]="isSharedBrainsActive() ? 'page' : null"
-    routerLink="/shared-brains"
-    (click)="clearContextOverride()"
-    aria-label="Shared Brains"
-    title="Shared Brains"
-  >
-    <mur-icon icon="shared-brains" />
-  </a>
   <a
     class="rail-item"
     [class.active]="isAskActive()"
@@ -223,6 +212,7 @@
 }
 
 <app-account-session-banner />
+<app-filing-recovery-banner />
 
 @if (toasts().length > 0) {
   <div class="toast-viewport" aria-live="polite" aria-atomic="false">
@@ -280,8 +270,11 @@
 @if (workspaceOrganizePlan(); as plan) {
   <app-workspace-organize-sheet
     [plan]="plan"
-    [busy]="workspaceOrganizeApplying()"
+    [busy]="workspaceOrganizeApplying() || workspaceOrganizePlanning()"
+    [planning]="workspaceOrganizePlanning()"
+    [applying]="workspaceOrganizeApplying()"
     (apply)="applyWorkspaceOrganization($event)"
+    (replan)="replanWorkspaceOrganization($event)"
     (cancelled)="closeWorkspaceOrganization()"
   />
 }
