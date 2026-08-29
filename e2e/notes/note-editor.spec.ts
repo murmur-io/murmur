@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { mockNotes } from "./mock-invoke";
+import { enterEditMode, mockNotes } from "./mock-invoke";
 
 /** Linux WebKit lacks the codec; this test seam exercises the post-encode UI/IPC flow. */
 async function mockCanvasWebpEncoder(page: Page): Promise<void> {
@@ -38,6 +38,7 @@ test("note editor loads a note, floats the formatting bubble on selection, and P
 
   await mockNotes(page);
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   // Title hydrated from the mocked get_note.
   await expect(page.locator(".note-title-input")).toHaveValue("My First Note");
@@ -129,6 +130,7 @@ test("Cmd-V keeps mixed text and a normalized image at the exact caret while typ
     },
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await body.evaluate((el: HTMLTextAreaElement) => {
@@ -245,6 +247,7 @@ test("image-only Cmd-V inserts one internal image block and no filename text", a
   await mockCanvasWebpEncoder(page);
   await mockNotes(page);
   await page.goto("/notes/n1");
+  await enterEditMode(page);
   const body = page.locator(".body-area");
   await body.evaluate((el: HTMLTextAreaElement) => {
     const at = el.value.indexOf("Some body");
@@ -297,6 +300,7 @@ test("a compressed dimension bomb is rejected before the browser image decoder r
     },
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
   const body = page.locator(".body-area");
   await body.evaluate((el: HTMLTextAreaElement) => {
     const png = Uint8Array.from(

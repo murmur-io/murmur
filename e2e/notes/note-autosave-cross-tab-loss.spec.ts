@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mockNotes } from "./mock-invoke";
+import { enterEditMode, mockNotes } from "./mock-invoke";
 
 /**
  * Regression for a HIGH-severity finding from adversarial review of PR #332
@@ -135,6 +135,7 @@ test.describe("Note editor — concurrent open tabs never cancel each other's PE
     // Open Note A and edit its BODY (drives onBodyInput → scheduleSave, a
     // 600ms-debounced autosave — the AUTOSAVE_MS constant in the component).
     await page.locator(".title-btn", { hasText: "My First Note" }).click();
+    await enterEditMode(page);
     const bodyArea = page.locator(".body-area");
     await expect(bodyArea).toBeVisible();
     await bodyArea.fill("# Heading\n\nNote A's edit that must not be lost.");
@@ -146,6 +147,7 @@ test.describe("Note editor — concurrent open tabs never cancel each other's PE
     await page.goBack();
     await expect(page.locator(".notes-content")).toBeVisible();
     await page.locator(".title-btn", { hasText: "Weekly plan" }).click();
+    await enterEditMode(page);
     const bodyAreaB = page.locator(".body-area");
     await expect(bodyAreaB).toBeVisible();
     await bodyAreaB.fill("# Weekly plan\n\nNote B's edit.");
