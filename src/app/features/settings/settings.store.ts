@@ -36,6 +36,7 @@ import type {
   StorageReport,
   VoiceprintInfo,
   ModelCatalog,
+  McpStatus,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { NOTE_ASSIST_NEW_ACTION_IDS } from "../notes/note-brain-popover/note-assist-catalog";
@@ -496,6 +497,24 @@ export class SettingsStore {
    */
   private readonly _mcpConfig = signal<string>("");
   readonly mcpConfig = this._mcpConfig.asReadonly();
+
+  /**
+   * Whether the local server actually came up. Starts optimistic ONLY until the first read
+   * resolves — `refreshMcpStatus()` runs in `load()` alongside the config fetch.
+   */
+  private readonly _mcpStatus = signal<McpStatus>({
+    state: "starting",
+    port: 8765,
+  });
+  readonly mcpStatus = this._mcpStatus.asReadonly();
+  /** True while the server is genuinely serving — the ONLY state the healthy copy may claim. */
+  readonly mcpRunning = computed(() => this._mcpStatus().state === "listening");
+  /**
+   * True when another process on this Mac holds the port. Its own branch because the listener
+   * retries this case on its own, so the copy can tell the user to just quit the other app —
+   * no Murmur restart.
+   */
+  readonly mcpPortInUse = computed(() => this._mcpStatus().state === "portInUse");
 
   /** Flips true for ~1.6s after copying the MCP config — drives the button's confirmed state. */
   private readonly _configCopied = signal(false);
@@ -2569,6 +2588,32 @@ export class SettingsStore {
   /** Re-fetch the token-bearing MCP config into its signal (after load / config save). */
   private async refreshMcpConfig(): Promise<void> {
     this._mcpConfig.set(await this.ipc.getMcpConfig().catch(() => ""));
+    await this.refreshMcpStatus();
+  }
+
+  /**
+   * Re-read the listener's real state.
+   *
+   * A failed read degrades to `unavailable`, never to `listening`: the whole point of this signal
+   * is that the screen must not assert a running server it has not confirmed.
+   */
+  private async refreshMcpStatus(): Promise<void> {
+    // NORMALIZED, not trusted. A backend that predates this command (or a test harness that does
+    // not stub it) resolves `undefined` rather than rejecting, and `mcpStatus().port` on an
+    // undefined value throws while rendering — the T6 failure mode where one absent field takes
+    // the whole view down. A shape we cannot read degrades to `unavailable`, never to running.
+    const raw = await this.ipc.getMcpStatus().catch(() => null);
+    const state = raw?.state;
+    this._mcpStatus.set({
+      state:
+        state === "listening" ||
+        state === "portInUse" ||
+        state === "starting" ||
+        state === "unavailable"
+          ? state
+          : "unavailable",
+      port: typeof raw?.port === "number" ? raw.port : 8765,
+    });
   }
 
   async saveKey(): Promise<void> {

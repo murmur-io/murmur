@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   computed,
   effect,
   inject,
@@ -16,6 +17,7 @@ import {
 import { filter, map } from "rxjs";
 
 import { TabsService } from "../core/tabs.service";
+import { AskHistoryPrivacyBarrierService } from "../core/ask-history-privacy-barrier.service";
 import { IpcService } from "../core/ipc.service";
 import type {
   WorkspaceOrganizeFailure,
@@ -34,6 +36,7 @@ import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialo
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
+import { FilingRecoveryBannerComponent } from "../features/workspace/filing-recovery-banner/filing-recovery-banner.component";
 import { WorkspaceService } from "../features/workspace/workspace.service";
 import {
   WorkspaceCreateSheetComponent,
@@ -106,6 +109,7 @@ const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
     ReminderComposerComponent,
     TilePaletteComponent,
     AccountSessionBannerComponent,
+    FilingRecoveryBannerComponent,
   ],
   host: {
     "[class.context-visible]": "contextPanel() !== 'none'",
@@ -118,6 +122,8 @@ const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
 export class AppShellComponent {
   private readonly folders = inject(FoldersService);
   private readonly ipc = inject(IpcService);
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly privacyBarrier = inject(AskHistoryPrivacyBarrierService);
   private readonly notesService = inject(NotesService);
   private readonly toast = inject(ToastService);
   private readonly router = inject(Router);
@@ -152,7 +158,12 @@ export class AppShellComponent {
       path.startsWith("/meeting/") ||
       (path.startsWith("/notes/") && path !== "/notes/new") ||
       (path.startsWith("/tasks/") && path !== "/tasks/new") ||
-      path.startsWith("/dashboards/")
+      path.startsWith("/dashboards/") ||
+      // Shared Brains and a received container are now ROWS in the Spaces
+      // sidebar rather than a separate destination, so opening one must keep
+      // the tree beside it — the same as opening any Space of the user's own.
+      path === "/shared-brains" ||
+      path.startsWith("/shared/")
     );
   });
 
@@ -162,11 +173,7 @@ export class AppShellComponent {
 
   readonly contextPanel = computed<ContextPanel>(() => {
     const path = this.currentPath();
-    if (
-      path.startsWith("/settings") ||
-      path.startsWith("/org-item/") ||
-      path === "/shared-brains"
-    ) {
+    if (path.startsWith("/settings") || path.startsWith("/org-item/")) {
       return "none";
     }
     const override = this._contextOverride();
@@ -193,6 +200,7 @@ export class AppShellComponent {
   readonly workspaceOrganizePlan = signal<WorkspaceOrganizeViewPlan | null>(
     null,
   );
+  private workspaceOrganizePlanGeneration = 0;
   readonly workspaceCreateOpen = signal(false);
   readonly workspaceCreateBusy = signal(false);
   readonly workspaceCreateError = signal<string | null>(null);
@@ -217,6 +225,16 @@ export class AppShellComponent {
   });
 
   constructor() {
+    const unregisterPrivacy = this.privacyBarrier.registerInvalidator(() =>
+      this.scrubWorkspaceOrganization(),
+    );
+    // Listener installation stays demand-driven in plan/apply below. Starting
+    // it from the always-mounted shell would turn later route consumers into
+    // implicit retries after a registration failure.
+    this.destroyRef.onDestroy(() => {
+      unregisterPrivacy();
+      this.scrubWorkspaceOrganization();
+    });
     void this.reminders.initSummary();
   }
 
@@ -227,9 +245,7 @@ export class AppShellComponent {
     const firstSpace = this.workspace.forest()[0];
     const path = this.currentPath();
     const fixedDrilldown =
-      path.startsWith("/settings") ||
-      path.startsWith("/org-item/") ||
-      path === "/shared-brains";
+      path.startsWith("/settings") || path.startsWith("/org-item/");
     const narrowViewport = window.matchMedia(NARROW_SHELL_QUERY).matches;
     this.setSpacesCollapsed(false);
     if ((fixedDrilldown || narrowViewport) && firstSpace) {
@@ -264,10 +280,6 @@ export class AppShellComponent {
 
   isSettingsActive(): boolean {
     return this.currentPath().startsWith("/settings");
-  }
-
-  isSharedBrainsActive(): boolean {
-    return this.currentPath() === "/shared-brains";
   }
 
   isBrowseItemActive(path: string): boolean {
@@ -346,7 +358,8 @@ export class AppShellComponent {
     } catch (error) {
       const detail = this.workspaceErrorMessage(error);
       this.workspaceCreateError.set(
-        detail || `Couldn’t create this ${request.kind}. Please check the name and try again.`,
+        detail ||
+          `Couldn’t create this ${request.kind}. Please check the name and try again.`,
       );
     } finally {
       this.workspaceCreateBusy.set(false);
@@ -374,19 +387,29 @@ export class AppShellComponent {
     writeStoredBoolean(SPACES_COLLAPSED_KEY, collapsed);
   }
 
-  async planWorkspaceOrganization(): Promise<void> {
-    if (this.workspaceOrganizeDisabled() || this.workspaceOrganizePlan()) {
+  async planWorkspaceOrganization(
+    guidance: string | null = null,
+    replace = false,
+  ): Promise<void> {
+    if (
+      this.workspaceOrganizeDisabled() ||
+      (this.workspaceOrganizePlan() && !replace)
+    ) {
       return;
     }
+    const generation = ++this.workspaceOrganizePlanGeneration;
     this.workspaceOrganizePlanning.set(true);
     try {
-      const plan = await this.ipc.planWorkspaceOrganization();
-      if (
-        plan.moves.length === 0 &&
-        (plan.review?.length ?? 0) === 0 &&
-        plan.skipped.length === 0
-      ) {
-        this.toast.info("Brain found no unfiled recordings to organize.");
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (generation !== this.workspaceOrganizePlanGeneration) {
+        return;
+      }
+      if (!privacyReady) {
+        this.scrubWorkspaceOrganization();
+        return;
+      }
+      const plan = await this.ipc.planWorkspaceOrganization(guidance);
+      if (generation !== this.workspaceOrganizePlanGeneration) {
         return;
       }
       this.workspaceOrganizePlan.set({
@@ -395,34 +418,62 @@ export class AppShellComponent {
         applyError: null,
       });
     } catch {
-      this.toast.danger(
-        "Brain couldn’t plan the organization. Please try again.",
-      );
+      if (generation === this.workspaceOrganizePlanGeneration) {
+        this.toast.danger(
+          "Brain couldn’t plan the organization. Please try again.",
+        );
+      }
     } finally {
-      this.workspaceOrganizePlanning.set(false);
+      if (generation === this.workspaceOrganizePlanGeneration) {
+        this.workspaceOrganizePlanning.set(false);
+      }
     }
+  }
+
+  async replanWorkspaceOrganization(guidance: string): Promise<void> {
+    await this.planWorkspaceOrganization(guidance || null, true);
   }
 
   async applyWorkspaceOrganization(
     moves: WorkspaceOrganizeMove[],
   ): Promise<void> {
-    if (moves.length === 0 || this.workspaceOrganizeApplying()) {
+    if (
+      moves.length === 0 ||
+      this.workspaceOrganizePlanning() ||
+      this.workspaceOrganizeApplying()
+    ) {
       return;
     }
+    const plan = this.workspaceOrganizePlan();
+    if (!plan) {
+      return;
+    }
+    const generation = this.workspaceOrganizePlanGeneration;
     this.workspaceOrganizeApplying.set(true);
     try {
+      const privacyReady = await this.privacyBarrier.ensureReady();
+      if (generation !== this.workspaceOrganizePlanGeneration) {
+        return;
+      }
+      if (!privacyReady) {
+        this.scrubWorkspaceOrganization();
+        return;
+      }
       const result = await this.ipc.applyWorkspaceOrganization(moves);
+      if (generation !== this.workspaceOrganizePlanGeneration) {
+        return;
+      }
       await this.workspace.reload();
-      const plan = this.workspaceOrganizePlan();
-      const receipt = plan
-        ? this.mergeWorkspaceOrganizeReceipt(
-            plan.receipt,
-            moves,
-            result.appliedIds,
-            result.failures,
-          )
-        : null;
-      if (!plan || !receipt || receipt.failures.length === 0) {
+      if (generation !== this.workspaceOrganizePlanGeneration) {
+        return;
+      }
+      const receipt = this.mergeWorkspaceOrganizeReceipt(
+        plan.receipt,
+        moves,
+        result.appliedIds,
+        result.failures,
+      );
+      if (receipt.failures.length === 0) {
         this.workspaceOrganizePlan.set(null);
       } else {
         this.workspaceOrganizePlan.set({
@@ -447,7 +498,13 @@ export class AppShellComponent {
         );
       }
     } catch {
+      if (generation !== this.workspaceOrganizePlanGeneration) {
+        return;
+      }
       await this.workspace.reload();
+      if (generation !== this.workspaceOrganizePlanGeneration) {
+        return;
+      }
       this.workspaceOrganizePlan.update((plan) =>
         plan
           ? {
@@ -461,14 +518,25 @@ export class AppShellComponent {
         "Couldn’t finish applying the Brain plan. Refresh to see what moved.",
       );
     } finally {
-      this.workspaceOrganizeApplying.set(false);
+      if (generation === this.workspaceOrganizePlanGeneration) {
+        this.workspaceOrganizeApplying.set(false);
+      }
     }
   }
 
   closeWorkspaceOrganization(): void {
-    if (!this.workspaceOrganizeApplying()) {
-      this.workspaceOrganizePlan.set(null);
+    if (this.workspaceOrganizePlanning() || this.workspaceOrganizeApplying()) {
+      return;
     }
+    this.scrubWorkspaceOrganization();
+  }
+
+  /** Synchronous privacy boundary for the global Brain organizer review. */
+  private scrubWorkspaceOrganization(): void {
+    ++this.workspaceOrganizePlanGeneration;
+    this.workspaceOrganizePlanning.set(false);
+    this.workspaceOrganizeApplying.set(false);
+    this.workspaceOrganizePlan.set(null);
   }
 
   private mergeWorkspaceOrganizeReceipt(

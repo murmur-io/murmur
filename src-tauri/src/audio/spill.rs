@@ -43,6 +43,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::audio::recorder::SampleReader;
 use crate::error::{AppError, Result};
+use crate::events::RecordingTerminalNotifier;
 use crate::state::AppState;
 use crate::storage::{Db, MeetingStatus};
 
@@ -2014,6 +2015,48 @@ fn run_salvage_jobs(
     }
 }
 
+/// Content-free completion capability for startup recovery. Keeping the success gate observable in
+/// headless tests prevents a future recovery path from treating pipeline `saved`/`done` as terminal
+/// or emitting `finalized` after a partial cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryFailureNotice {
+    /// The pipeline already emitted its terminal `error`; do not duplicate it.
+    PipelineAlreadyReported,
+    /// The pipeline emitted only success-progress, but the recovery-owned cleanup tail failed.
+    CleanupTail,
+}
+
+/// Publish the terminal renderer boundary only after the recovery owner's complete lifecycle has
+/// succeeded. `completion` includes the pipeline and any owner-specific tail (legacy exact-source
+/// cleanup). Success revalidates visibility and publishes `finalized` within the shared lock
+/// lifecycle interval. Pipeline failures have already emitted `error`; a cleanup-tail failure emits
+/// one fixed terminal error here instead, while neither failure class can claim `finalized`.
+fn complete_recovery_lifecycle<T, N>(
+    state: &AppState,
+    notifier: &N,
+    meeting_id: &str,
+    completion: Result<T>,
+    failure_notice: RecoveryFailureNotice,
+) -> Result<T>
+where
+    N: RecordingTerminalNotifier,
+{
+    match completion {
+        Ok(value) => {
+            crate::commands::emit_recording_finalized_after_visibility(
+                state, notifier, meeting_id,
+            )?;
+            Ok(value)
+        }
+        Err(error) => {
+            if failure_notice == RecoveryFailureNotice::CleanupTail {
+                notifier.recording_cleanup_failed(meeting_id);
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn salvage_ledger_one(app: &AppHandle, job: crate::audio::source::RecoveredRecordingJob) {
     let state = app.state::<AppState>();
     // Claim-time state is not authority to read raw audio later. Repeat the session-aware lock
@@ -2052,8 +2095,19 @@ async fn salvage_ledger_one(app: &AppHandle, job: crate::audio::source::Recovere
     )
     .await;
     terminal_guard.disarm();
-    if let Err(error) = result {
-        tracing::warn!(target: "startup", meeting_id = %job.meeting_id, error = %error, "ledger recovery pipeline failed; verified audio retained");
+    match complete_recovery_lifecycle(
+        &state,
+        app,
+        &job.meeting_id,
+        result,
+        RecoveryFailureNotice::PipelineAlreadyReported,
+    ) {
+        Ok(_) => {
+            tracing::info!(target: "startup", meeting_id = %job.meeting_id, "salvaged a durable crashed recording into a note")
+        }
+        Err(error) => {
+            tracing::warn!(target: "startup", meeting_id = %job.meeting_id, error = %error, "ledger recovery pipeline failed; verified audio retained")
+        }
     }
 }
 
@@ -2111,13 +2165,20 @@ async fn salvage_one(app: &AppHandle, job: SalvageJob) {
         Ok(_) => {
             let cleanup =
                 complete_legacy_salvage_cleanup(&state.db, &job, &job.spill_path, &mic_proof);
-            match cleanup {
-                Ok(()) => {}
+            match complete_recovery_lifecycle(
+                &state,
+                app,
+                &job.meeting_id,
+                cleanup,
+                RecoveryFailureNotice::CleanupTail,
+            ) {
+                Ok(()) => {
+                    tracing::info!(target: "startup", meeting_id = %job.meeting_id, "salvaged a crashed recording into a note")
+                }
                 Err(error) => {
                     tracing::warn!(target: "startup", meeting_id = %job.meeting_id, error = %error, "legacy salvage succeeded but exact source cleanup was incomplete; durable recovery ownership retained")
                 }
             }
-            tracing::info!(target: "startup", meeting_id = %job.meeting_id, "salvaged a crashed recording into a note")
         }
         Err(e) => {
             tracing::warn!(target: "startup", meeting_id = %job.meeting_id, error = %e, "legacy salvage pipeline failed; full mic/system sources and sidecar preserved for retry")
@@ -2310,7 +2371,13 @@ async fn salvage_disk_one(app: &AppHandle, job: DiskSalvageJob) {
     let result =
         crate::pipeline::run_salvage_from_disk(app, &state, &job.meeting_id, &job.wav_path).await;
     terminal_guard.disarm();
-    match result {
+    match complete_recovery_lifecycle(
+        &state,
+        app,
+        &job.meeting_id,
+        result,
+        RecoveryFailureNotice::PipelineAlreadyReported,
+    ) {
         Ok(_) => {
             tracing::info!(target: "startup", meeting_id = %job.meeting_id, "re-transcribed a crashed recording from its on-disk archive")
         }
@@ -2475,6 +2542,174 @@ mod tests {
             SalvagePlan::NoSpill,
             "no spill ⇒ nothing to reconstruct"
         );
+    }
+
+    #[derive(Default)]
+    struct TerminalRecorder {
+        finalized: std::cell::RefCell<Vec<String>>,
+        cleanup_failed: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RecordingTerminalNotifier for TerminalRecorder {
+        fn recording_finalized(&self, meeting_id: &str) {
+            self.finalized.borrow_mut().push(meeting_id.to_string());
+        }
+
+        fn recording_cleanup_failed(&self, meeting_id: &str) {
+            self.cleanup_failed
+                .borrow_mut()
+                .push(meeting_id.to_string());
+        }
+    }
+
+    fn recovery_test_state(db: Db) -> AppState {
+        AppState {
+            recorder: std::sync::Mutex::new(None),
+            recording_stop: std::sync::Mutex::new(None),
+            voice_listener: std::sync::Mutex::new(None),
+            voice_listener_lifecycle: std::sync::Mutex::new(()),
+            recording_starting: std::sync::atomic::AtomicBool::new(false),
+            voice_command_capture: std::sync::Mutex::new(None),
+            pending_manual_command: std::sync::Mutex::new(None),
+            live_running: std::sync::atomic::AtomicBool::new(false),
+            db: std::sync::Arc::new(db),
+            config: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::settings::AppConfig::default(),
+            )),
+            reasoner: crate::reason::ReasonerCell::fixed(std::sync::Arc::new(
+                crate::reason::StubReasoner,
+            )),
+            current_meeting: std::sync::Mutex::new(None),
+            focus_meeting: std::sync::Mutex::new(None),
+            live_transcript: std::sync::Mutex::new(String::new()),
+            live_bullets: std::sync::Mutex::new(String::new()),
+            live_bullets_tracker: std::sync::Mutex::new(
+                crate::transcribe::bullets::BulletsTracker::default(),
+            ),
+            capped_notified: std::sync::atomic::AtomicBool::new(false),
+            capture_fault_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: std::sync::Mutex::new(HashSet::new()),
+            in_flight_turns: std::sync::Mutex::new(HashMap::new()),
+            user_turn_in_progress: std::sync::atomic::AtomicBool::new(false),
+            verify_cache: std::sync::Mutex::new(HashMap::new()),
+            unlocked_folders: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+            master_kek: std::sync::Mutex::new(None),
+            org_ock_cache: std::sync::Mutex::new(HashMap::new()),
+            account_session: std::sync::Mutex::new(None),
+            lifecycle: std::sync::Mutex::new(()),
+            active_salvages: std::sync::Mutex::new(HashSet::new()),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
+            seal_epoch: std::sync::atomic::AtomicU64::new(0),
+            heavy_inference: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    fn file_recovery_test_meeting(state: &AppState, meeting_id: &str, folder_id: &str) {
+        insert_meeting(&state.db, meeting_id, MeetingStatus::Summarized);
+        state
+            .db
+            .insert_folder(&crate::storage::Folder {
+                id: folder_id.into(),
+                name: folder_id.into(),
+                path: folder_id.into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-08-28T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder(meeting_id, Some(folder_id))
+            .unwrap();
+    }
+
+    /// Startup recovery must not inherit the pipeline's early `done` semantics. Only a fully
+    /// successful pipeline + owner tail publishes one terminal `finalized`; a cleanup-tail failure
+    /// returns the original error and emits one terminal `error`, while an already-reported pipeline
+    /// failure stays silent here.
+    #[test]
+    fn recording_recovery_terminal_events_require_complete_success() {
+        let (db, db_path) = tmp_db();
+        let state = recovery_test_state(db);
+        let recorder = TerminalRecorder::default();
+
+        file_recovery_test_meeting(&state, "recovered-meeting", "open-folder");
+
+        let recovered = complete_recovery_lifecycle(
+            &state,
+            &recorder,
+            "recovered-meeting",
+            Ok::<_, AppError>("durable-result"),
+            RecoveryFailureNotice::PipelineAlreadyReported,
+        )
+        .unwrap();
+        assert_eq!(recovered, "durable-result");
+        assert_eq!(
+            recorder.finalized.borrow().as_slice(),
+            ["recovered-meeting"]
+        );
+        assert!(recorder.cleanup_failed.borrow().is_empty());
+
+        file_recovery_test_meeting(&state, "relocked-meeting", "relocked-folder");
+        state
+            .db
+            .set_folder_locked("relocked-folder", true, Some(b"wrapped-folder-key"))
+            .unwrap();
+        let relocked = complete_recovery_lifecycle(
+            &state,
+            &recorder,
+            "relocked-meeting",
+            Ok::<_, AppError>("must-stay-hidden"),
+            RecoveryFailureNotice::PipelineAlreadyReported,
+        );
+        assert!(matches!(relocked, Err(AppError::Locked(_))));
+        assert_eq!(
+            recorder.finalized.borrow().as_slice(),
+            ["recovered-meeting"],
+            "a relock before the final visibility boundary must suppress finalized"
+        );
+        assert!(
+            recorder.cleanup_failed.borrow().is_empty(),
+            "a visibility refusal must preserve cleanup-tail error semantics"
+        );
+
+        let failure = complete_recovery_lifecycle(
+            &state,
+            &recorder,
+            "partial-meeting",
+            Err::<(), _>(AppError::Audio("cleanup incomplete".into())),
+            RecoveryFailureNotice::CleanupTail,
+        );
+        assert!(matches!(failure, Err(AppError::Audio(_))));
+        assert_eq!(
+            recorder.finalized.borrow().as_slice(),
+            ["recovered-meeting"],
+            "a partial recovery must not publish finalized"
+        );
+        assert_eq!(
+            recorder.cleanup_failed.borrow().as_slice(),
+            ["partial-meeting"],
+            "a cleanup-tail failure must publish exactly one terminal error"
+        );
+
+        let pipeline_failure = complete_recovery_lifecycle(
+            &state,
+            &recorder,
+            "pipeline-error",
+            Err::<(), _>(AppError::Audio("pipeline already reported this".into())),
+            RecoveryFailureNotice::PipelineAlreadyReported,
+        );
+        assert!(matches!(pipeline_failure, Err(AppError::Audio(_))));
+        assert_eq!(
+            recorder.cleanup_failed.borrow().as_slice(),
+            ["partial-meeting"],
+            "a pipeline failure must not receive a duplicate error event"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_file(db_path);
     }
 
     // ── incremental mirror (flush_step, no thread) ───────────────────────────────────────────

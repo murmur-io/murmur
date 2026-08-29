@@ -790,6 +790,73 @@ test("renders one flat mixed stream below each expanded container", async ({
   await expect(page.getByRole("treeitem", { name: /Q3/ })).toBeVisible();
 });
 
+test("renders distinct, type-colored Space and content glyphs without washing out selection", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {},
+    {
+      list_workspace_tree: [{ ...FOREST[0], emoji: null }, FOREST[1]],
+    },
+  );
+  await page.goto("/meeting/m-standup");
+
+  const spaceIcon = page
+    .getByRole("treeitem", { name: /Acme/ })
+    .locator(".row-icon");
+  const folderIcon = page
+    .getByRole("treeitem", { name: /Q3/ })
+    .locator(".row-icon");
+  const selectedMeeting = page.getByRole("treeitem", { name: "Standup" });
+  const selectedMeetingIcon = selectedMeeting.locator(".row-icon");
+  const unselectedMeetingIcon = page
+    .getByRole("treeitem", { name: "Untitled" })
+    .locator(".row-icon");
+  const noteIcon = page
+    .getByRole("treeitem", { name: "Launch brief" })
+    .locator(".row-icon");
+  const taskIcon = page
+    .getByRole("treeitem", { name: "Ship release" })
+    .locator(".row-icon");
+  const dashboardIcon = page
+    .getByRole("treeitem", { name: "Release dashboard" })
+    .locator(".row-icon");
+  const lockedIcon = page
+    .getByRole("treeitem", { name: /Private/ })
+    .locator(".row-icon");
+
+  await expect(spaceIcon).toHaveAttribute("data-icon", "space");
+  await expect(folderIcon).toHaveAttribute("data-icon", "folder");
+  await expect(spaceIcon.locator("svg rect")).toHaveCount(4);
+  await expect(folderIcon.locator("svg path")).toHaveCount(1);
+  await expect(lockedIcon).toHaveAttribute("data-icon", "locked");
+
+  const typeIcons = [
+    spaceIcon,
+    folderIcon,
+    selectedMeetingIcon,
+    noteIcon,
+    taskIcon,
+    dashboardIcon,
+    lockedIcon,
+  ];
+  const typeColors = await Promise.all(
+    typeIcons.map((icon) =>
+      icon.evaluate((element) => getComputedStyle(element).color),
+    ),
+  );
+  expect(new Set(typeColors).size).toBe(typeColors.length);
+
+  await expect(selectedMeeting).toHaveAttribute("aria-selected", "true");
+  await expect(unselectedMeetingIcon).toHaveAttribute("data-icon", "meeting");
+  expect(typeColors[2]).toBe(
+    await unselectedMeetingIcon.evaluate(
+      (element) => getComputedStyle(element).color,
+    ),
+  );
+});
+
 test("keeps an older selected leaf within the eight-row cap", async ({
   page,
 }) => {

@@ -246,6 +246,7 @@ pub fn run() {
             commands::explain_audit_finding,
             commands::get_config,
             commands::get_mcp_config,
+            commands::get_mcp_status,
             commands::save_config,
             commands::get_storage_report,
             commands::free_up_space,
@@ -320,6 +321,16 @@ pub fn run() {
             commands::org_update_item,
             commands::org_update_own_item,
             commands::org_set_item_access,
+            // Shared containers — publish a whole Folder or Space to an org (2026-08-29).
+            commands::preview_container_share,
+            commands::share_container_to_org,
+            commands::unshare_container,
+            commands::set_container_share_access,
+            commands::list_container_share_status,
+            commands::sync_container_shares,
+            commands::list_shared_workspace,
+            commands::set_shared_placement,
+            commands::clear_shared_placement,
             commands::delete_org_item_as_author,
             commands::org_resolve_source,
             commands::list_org_items,
@@ -496,6 +507,9 @@ pub fn run() {
             commands::rename_folder,
             commands::delete_folder,
             commands::move_note,
+            commands::get_filing_recovery_status,
+            commands::retry_filing_recovery,
+            commands::keep_existing_filing_file,
             // Notes feature — authored `documents(kind='note')` CRUD + note folders + vault export.
             commands::create_note,
             commands::suggest_note_title,
@@ -556,6 +570,9 @@ pub fn run() {
             // transport and every relock entrypoint. It contains socket clones and content-free
             // lease ids only; no meeting data or authentication material.
             app.manage(std::sync::Arc::new(crate::mcp::McpResponseGate::new()));
+            // Managed BEFORE `mcp::spawn` so the listener's first status write lands on a
+            // handle the `get_mcp_status` command can already read.
+            app.manage(std::sync::Arc::new(crate::mcp::McpListenerStatus::default()));
 
             // PRE-WINDOW legacy-recovery guard. Historical paired crash artifacts are plaintext and
             // cannot be honestly presented as protected by an already-locked folder. Publish their
