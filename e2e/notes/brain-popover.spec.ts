@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mockNotes } from "./mock-invoke";
+import { enterEditMode, mockNotes } from "./mock-invoke";
 
 /**
  * NOTE (2026-07-18 teleport): the floating bubble + Brain popover boxes are
@@ -36,6 +36,7 @@ test("selecting body text floats the bubble; Ask Brain → Refine → Accept upd
 
   await mockNotes(page);
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await expect(body).toBeVisible();
@@ -144,6 +145,7 @@ test("Find related: an org-kind citation routes to the read-only /org-item viewe
     }),
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await expect(body).toBeVisible();
@@ -218,6 +220,7 @@ test("Find related: Insert link drops a [[Title]] wikilink into the body instead
     }),
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   const body = page.locator(".body-area");
   await expect(body).toBeVisible();
