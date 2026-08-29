@@ -89,6 +89,9 @@ const MAX_VISIBLE_ITEMS = 8;
 /** Persisted disclosure state for received containers, keyed like the local one. */
 const EXPANDED_SHARED_KEY = "murmur.workspace.expandedShared";
 
+/** Persisted disclosure state for the unfiled-notes inbox. */
+const UNFILED_NOTES_EXPANDED_KEY = "murmur.workspace.unfiledNotesExpanded";
+
 /**
  * Where activating an item navigates. These MUST name real entries in
  * `app.routes.ts`: an unmatched path hits the router'''s catch-all and redirects to
@@ -177,6 +180,65 @@ export class WorkspaceTreeComponent {
     if (this.sharedWorkspace.sharedBrains() === null) {
       void this.sharedWorkspace.load();
     }
+  }
+
+  /**
+   * Notes that live in the reserved note root — the ones the user never filed.
+   *
+   * Found anywhere in the forest rather than at a fixed position: the root is
+   * created inside the workspace project (`ensure_notes_root`), so its depth is
+   * an implementation detail of that migration, not something to hard-code.
+   */
+  protected readonly unfiledNotes = computed<{
+    items: ItemRow[];
+    total: number;
+  }>(() => {
+    const find = (nodes: readonly ContainerNode[]): ContainerNode | null => {
+      for (const node of nodes) {
+        if (node.isRoot) {
+          return node;
+        }
+        const inChild = find(node.folders);
+        if (inChild) {
+          return inChild;
+        }
+      }
+      return null;
+    };
+    const root = find(this.workspace.forest());
+    if (!root) {
+      return { items: [], total: 0 };
+    }
+    const items = root.groups
+      .flatMap((group) => group.items)
+      .sort((left, right) => right.sortAt - left.sortAt)
+      .slice(0, MAX_VISIBLE_ITEMS);
+    const total = root.groups.reduce((sum, group) => sum + group.total, 0);
+    return { items, total };
+  });
+
+  private readonly _unfiledNotesExpanded = signal(
+    readStoredBoolean(UNFILED_NOTES_EXPANDED_KEY, true),
+  );
+  protected readonly unfiledNotesExpanded =
+    this._unfiledNotesExpanded.asReadonly();
+
+  protected toggleUnfiledNotes(): void {
+    const next = !this._unfiledNotesExpanded();
+    this._unfiledNotesExpanded.set(next);
+    try {
+      localStorage.setItem(UNFILED_NOTES_EXPANDED_KEY, JSON.stringify(next));
+    } catch {
+      /* a private window or blocked site data: the tree still works */
+    }
+  }
+
+  protected viewAllNotesLabel(total: number): string {
+    return `View all (${total})`;
+  }
+
+  protected openAllNotes(): void {
+    void this.router.navigate(["/notes"]);
   }
 
   protected readonly loading = this.workspace.loading;
@@ -365,6 +427,24 @@ export class WorkspaceTreeComponent {
     container: ContainerNode,
     depth: number,
   ): void {
+    if (container.isRoot) {
+      // The reserved note root is the "Notes" SECTION, not a folder — the
+      // migration that introduced `is_root` says so, and every management
+      // affordance is already disabled on it (rename, delete, lock, share). The
+      // old notes tree hid it; the 2026-08-22 hierarchy rebuild renders every
+      // container from `list_containers`, whose predicate filters on kind and
+      // path but not `is_root`, so it came back as a folder-shaped row nobody
+      // can do anything with. Its notes render as an inbox instead — symmetric
+      // with unfiled recordings.
+      //
+      // Its child folders are still hoisted to this depth: a container the user
+      // created must never become unreachable because its parent stopped being
+      // drawn.
+      for (const child of container.folders) {
+        this.pushContainer(out, child, depth);
+      }
+      return;
+    }
     out.push({ key: `c:${container.id}`, depth, container });
     if (this.isSealed(container) || !this.isContainerExpanded(container)) {
       return;
@@ -1365,5 +1445,15 @@ function readStoredSharedSet(): ReadonlySet<string> {
       : new Set();
   } catch {
     return new Set();
+  }
+}
+
+/** Read a persisted boolean, tolerating a blocked or empty store. */
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : JSON.parse(raw) === true;
+  } catch {
+    return fallback;
   }
 }
