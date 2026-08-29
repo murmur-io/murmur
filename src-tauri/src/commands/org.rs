@@ -267,13 +267,13 @@ impl OrgEnvelopeReader {
 /// epoch from the beginning of its tick. Every background DB commit revalidates that epoch through
 /// the coordinator, while network/model work happens outside the short commit lease.
 #[derive(Clone, Copy)]
-struct OrgWorkPolicy {
+pub(crate) struct OrgWorkPolicy {
     background_epoch: Option<u64>,
     reader: OrgEnvelopeReader,
 }
 
 impl OrgWorkPolicy {
-    const fn manual() -> Self {
+    pub(crate) const fn manual() -> Self {
         Self {
             background_epoch: None,
             reader: OrgEnvelopeReader::Current,
@@ -2514,7 +2514,7 @@ pub(crate) fn org_item_nonce(content_sha256: &[u8]) -> String {
 }
 
 /// A display label for `author_hint` in the OrgEnvelope — the email local-part, NEVER note content.
-fn org_author_hint(email: &str) -> String {
+pub(crate) fn org_author_hint(email: &str) -> String {
     let e = email.trim();
     match e.split_once('@') {
         Some((local, _)) if !local.is_empty() => local.to_string(),
@@ -2526,6 +2526,14 @@ fn org_author_hint(email: &str) -> String {
 /// redaction policy). Returns `(scrubbed_markdown, counts)`. Reuses the SAME regex firewall
 /// primitive as the cloud path (`summarize::redact::redact`) so an org share is masked exactly like a
 /// cloud-bound prompt — minus the name layer (org peers keep names on purpose). Pure, no egress.
+/// Redact a short, non-markdown string — a container name — with the SAME redactor the note body
+/// passes through. A folder can be called "invoices for jan@acme.com", and a name that crosses to
+/// another member's device is egress like any other.
+pub(crate) fn scrub_org_text(text: &str) -> String {
+    let (scrubbed, _map) = crate::summarize::redact::redact(text);
+    scrubbed
+}
+
 fn scrub_org_markdown(markdown: &str) -> (String, OrgScrubCounts) {
     let (scrubbed, map) = crate::summarize::redact::redact(markdown);
     let mut counts = OrgScrubCounts::default();
@@ -2610,7 +2618,7 @@ fn rough_chunk_count(markdown: &str) -> u32 {
 /// (`AppState::org_ock_cache`) when present, else unwrapped from the caller's server-relayed grant
 /// (gated on the account MK session) and cached. NEVER persisted, NEVER logged. Fails closed
 /// (`Unavailable`) logged out, (`Auth`) on a forged/mismatched grant.
-async fn acquire_org_ock(
+pub(crate) async fn acquire_org_ock(
     state: &AppState,
     org_id: &str,
     generation: u32,
@@ -4749,7 +4757,7 @@ pub(crate) struct OrgDispatchPermit {
     operation: OrgDispatchOperation,
 }
 
-enum OrgDispatchOperation {
+pub(crate) enum OrgDispatchOperation {
     Publish {
         org_id: String,
         doc_id: Option<String>,
@@ -4965,7 +4973,7 @@ impl OrgDispatchPermit {
     }
 }
 
-fn org_dispatch_cell_sha256(cell: &[u8]) -> [u8; 32] {
+pub(crate) fn org_dispatch_cell_sha256(cell: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
     Sha256::digest(cell).into()
@@ -5189,6 +5197,99 @@ fn persist_initial_org_publish_intent(
     };
     Ok((permit, dispatch_id))
 }
+
+/// Mint a publish permit for one CONTAINER manifest, CAS-ing its journal row out of `queued` and
+/// ledgering the dispatch in the SAME transaction.
+///
+/// This mirrors [`persist_initial_org_publish_intent`] and exists separately for one reason: a
+/// manifest has no local `meeting_id`/`document_id`, so it cannot ride `org_shares`'s logical key.
+/// Everything that makes that path crash-safe is preserved — the row is durably marked
+/// "dispatched, outcome unknown" BEFORE the socket, and the egress ledger row commits with it, so a
+/// crash mid-publish is recoverable rather than invisible.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_container_publish_intent(
+    state: &AppState,
+    share_id: &str,
+    org_id: &str,
+    doc_id: &str,
+    access: crate::share::org_dto::OrgItemAccess,
+    rev: u32,
+    generation: u32,
+    content_sha256: &[u8],
+    actor_user_id: &str,
+    updated_at: &str,
+    ledger_host: &str,
+    sealed_bytes: usize,
+    sealed_cell_sha256: [u8; 32],
+) -> Result<(OrgDispatchPermit, String), AppError> {
+    require_org_egress_consent(state)?;
+    let dispatch_id = uuid::Uuid::new_v4().to_string();
+    let mut conn = state.db.lock();
+    let tx = conn
+        .transaction()
+        .map_err(|_| AppError::Storage("start container publish dispatch".into()))?;
+    let changed = tx
+        .execute(
+            "UPDATE org_container_shares
+                SET state = 'failed', last_error = ?2, rev = ?4, content_sha256 = ?5,
+                    access = ?6, updated_at = ?3
+              WHERE id = ?1 AND org_id = ?7 AND container_id = ?8
+                AND state IN ('queued','failed')",
+            rusqlite::params![
+                share_id,
+                CONTAINER_SHARE_POST_PENDING,
+                updated_at,
+                rev as i64,
+                content_sha256,
+                access.as_str(),
+                org_id,
+                doc_id,
+            ],
+        )
+        .map_err(|_| AppError::Storage("persist container publish intent".into()))?;
+    if changed != 1 {
+        return Err(AppError::Unavailable(
+            "container publish changed before dispatch".into(),
+        ));
+    }
+    let ledger_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    crate::storage::db::insert_share_egress_dispatch_tx(
+        &tx,
+        ledger_ts,
+        ledger_host,
+        "org_share_publish",
+        sealed_bytes,
+        &dispatch_id,
+    )?;
+    tx.commit()
+        .map_err(|_| AppError::Storage("commit container publish dispatch".into()))?;
+    let permit = OrgDispatchPermit {
+        dispatch_id: dispatch_id.clone(),
+        host: ledger_host.to_string(),
+        operation: OrgDispatchOperation::Publish {
+            org_id: org_id.to_string(),
+            doc_id: Some(doc_id.to_string()),
+            access: Some(access),
+            rev,
+            generation,
+            content_sha256: content_sha256.to_vec(),
+            cell_len: sealed_bytes,
+            cell_sha256: sealed_cell_sha256,
+            owner_user_id: Some(actor_user_id.to_string()),
+        },
+    };
+    Ok((permit, dispatch_id))
+}
+
+/// The durable "dispatched, outcome unknown" marker for a container manifest publish. Named
+/// separately from the note path's constant so a reader can tell the two journals apart.
+pub(crate) const CONTAINER_SHARE_POST_PENDING: &str = "container_post_pending";
+
+/// The content-free reason a manifest publish failed before any egress.
+pub(crate) const CONTAINER_SHARE_SEAL_FAILED: &str = "container_seal_failed";
 
 #[allow(clippy::too_many_arguments)]
 fn fail_initial_org_publish_pre_dispatch_if_current(
@@ -5624,7 +5725,7 @@ fn permit_org_task_assignee_read(
     })
 }
 
-fn permit_simple_org_dispatch(
+pub(crate) fn permit_simple_org_dispatch(
     state: &AppState,
     host: &str,
     kind: &str,
@@ -5719,7 +5820,7 @@ fn persist_org_revoke_intent(
     Ok(())
 }
 
-fn require_org_egress_consent(state: &AppState) -> Result<(), AppError> {
+pub(crate) fn require_org_egress_consent(state: &AppState) -> Result<(), AppError> {
     let consented = state
         .config
         .lock()
@@ -6459,7 +6560,7 @@ async fn corroborate_legacy_org_item_absent_or_tombstoned(
     ))
 }
 
-async fn delete_legacy_org_item(
+pub(crate) async fn delete_legacy_org_item(
     state: &AppState,
     client: &crate::share::client::ShareClient,
     access_token: &str,
@@ -8609,7 +8710,7 @@ pub(crate) async fn revoke_org_share_inner(
     revoke_org_share_inner_with_policy(state, item_id, OrgWorkPolicy::manual(), None).await
 }
 
-async fn revoke_org_share_inner_with_policy(
+pub(crate) async fn revoke_org_share_inner_with_policy(
     state: &AppState,
     item_id: String,
     policy: OrgWorkPolicy,
@@ -9212,7 +9313,7 @@ pub(crate) async fn org_sweep_pending_background_once_inner(
 /// Snapshot the bearer and stable actor from one live session after refresh. If the account changes
 /// between refresh and this lock, fail closed rather than pairing one account's bearer with another
 /// account's durable recovery witness.
-async fn authenticated_org_actor(state: &AppState) -> Result<(String, String), AppError> {
+pub(crate) async fn authenticated_org_actor(state: &AppState) -> Result<(String, String), AppError> {
     valid_access_token(state).await?;
     let session = state
         .account_session
