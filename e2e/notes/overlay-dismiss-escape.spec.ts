@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { mockNotes } from "./mock-invoke";
+import { enterEditMode, mockNotes } from "./mock-invoke";
 
 async function selectBodyText(page: import("@playwright/test").Page): Promise<void> {
   const body = page.locator(".body-area");
@@ -50,6 +50,7 @@ test("note selection overlays stay interactive and dismiss when the pointer leav
 }) => {
   await mockNotes(page);
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   await selectBodyText(page);
   const toolbar = page.locator(".sel-bar");
@@ -98,6 +99,7 @@ test("a cached note route clears every editing overlay and never resurrects it o
     ],
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   // Brain is teleported to <body>; pointer-free backgrounding must detach it.
   await selectBodyText(page);
@@ -147,6 +149,7 @@ test("outside-dismiss pointerdown does not consume header or slash-menu actions"
     ],
   });
   await page.goto("/notes/n1");
+  await enterEditMode(page);
 
   await page.getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menuitem", { name: /Share/ }).click();
