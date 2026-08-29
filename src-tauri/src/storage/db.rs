@@ -2664,7 +2664,131 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_org_shares_container
                ON org_shares(org_id, parent_container_id);",
         )
-        .map_err(map_err)
+        .map_err(map_err)?;
+        Self::repair_containers_mis_ingested_as_items(conn)
+    }
+
+    /// REPAIR (2.1.1): move container manifests that 2.1.0 wrote into `org_items` into
+    /// `org_containers`, where they belong.
+    ///
+    /// 2.1.0 added the container branch to the anti-entropy reconcile sweep but NOT to the live
+    /// feed pull, and the live pull is the path that actually runs on a healthy replica. A manifest
+    /// arriving that way was written as an ordinary note, so a shared Space appeared in Shared
+    /// Brains as a note named after the folder instead of appearing in the sidebar as a Space.
+    ///
+    /// This is data-preserving in both directions: the manifest becomes the container it was always
+    /// meant to be, and the mis-ingested row is TOMBSTONED rather than deleted, so a later feed
+    /// replay of the same server item is idempotent instead of resurrecting the note. A row whose
+    /// markdown will not parse is left exactly as it is — a repair that cannot understand a row has
+    /// no business rewriting it.
+    fn repair_containers_mis_ingested_as_items(conn: &Connection) -> Result<()> {
+        // A named record rather than a ten-wide tuple: the tuple is unreadable at the call site and
+        // is exactly the `clippy::type_complexity` this repo has paid for before.
+        struct MisIngested {
+            item_id: String,
+            org_id: String,
+            markdown: String,
+            author_hint: String,
+            seq: i64,
+            access: String,
+            created_at: String,
+            rev: i64,
+            generation: i64,
+            owner: String,
+        }
+        let rows: Vec<MisIngested> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT item_id, org_id, markdown, COALESCE(author_hint,''),
+                            COALESCE(seq,0), COALESCE(access,'view'),
+                            COALESCE(created_at,''), COALESCE(rev,1), COALESCE(generation,1),
+                            COALESCE(document_owner_user_id,'')
+                       FROM org_items
+                      WHERE source_kind = 'container' AND tombstoned = 0",
+                )
+                .map_err(map_err)?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok(MisIngested {
+                        item_id: r.get(0)?,
+                        org_id: r.get(1)?,
+                        markdown: r.get(2)?,
+                        author_hint: r.get(3)?,
+                        seq: r.get(4)?,
+                        access: r.get(5)?,
+                        created_at: r.get(6)?,
+                        rev: r.get(7)?,
+                        generation: r.get(8)?,
+                        owner: r.get(9)?,
+                    })
+                })
+                .map_err(map_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?;
+            mapped
+        };
+        for row in rows {
+            let MisIngested {
+                item_id,
+                org_id,
+                markdown,
+                author_hint,
+                seq,
+                access,
+                created_at,
+                rev,
+                generation,
+                owner,
+            } = row;
+            let Ok(manifest) =
+                crate::share::container_envelope::ContainerEnvelope::from_json(&markdown)
+            else {
+                continue;
+            };
+            conn.execute(
+                "INSERT INTO org_containers
+                   (org_id, container_id, item_id, level, name, emoji, tint, parent_container_id,
+                    position, access, author_hint, author_user_id, document_owner_user_id, seq, rev,
+                    generation, created_at, tombstoned)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13,?14,?15,?16,0)
+                 ON CONFLICT(org_id, container_id) DO UPDATE SET
+                   item_id=excluded.item_id, level=excluded.level, name=excluded.name,
+                   emoji=excluded.emoji, tint=excluded.tint,
+                   parent_container_id=excluded.parent_container_id, position=excluded.position,
+                   access=excluded.access, seq=excluded.seq, rev=excluded.rev,
+                   generation=excluded.generation, tombstoned=0",
+                rusqlite::params![
+                    org_id,
+                    manifest.container_id,
+                    item_id,
+                    manifest.level.as_str(),
+                    manifest.name,
+                    manifest.emoji,
+                    manifest.tint,
+                    manifest.parent_container_id,
+                    manifest.position,
+                    access,
+                    author_hint,
+                    (!owner.is_empty()).then_some(owner),
+                    seq,
+                    rev,
+                    generation,
+                    created_at,
+                ],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "UPDATE org_items SET tombstoned = 1 WHERE item_id = ?1",
+                rusqlite::params![item_id],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "DELETE FROM org_chunks WHERE item_id = ?1",
+                rusqlite::params![item_id],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
     }
 
     /// Add `column` to `table` if it is not already present (idempotent migration guard).
