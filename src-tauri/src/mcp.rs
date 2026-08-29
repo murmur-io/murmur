@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,86 @@ const MCP_BIND_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 fn mcp_listener_addr() -> SocketAddrV4 {
     SocketAddrV4::new(MCP_BIND_IP, MCP_PORT)
+}
+
+/// How long to wait before re-attempting a bind that lost the port to another process.
+///
+/// The port is FIXED (it is baked into [`ALLOWED_HOSTS`], the `Origin` allowlist, and the config
+/// the user pastes into Claude), so "pick another port" is not available — the only recovery is to
+/// take 8765 once whoever else has it lets go. Thirty seconds is far below a user's patience for
+/// "I quit that app, why is it still broken" and far above anything that would show up as load.
+const BIND_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What the MCP listener is actually doing, for the one screen that tells the user about it.
+///
+/// # Why this exists
+///
+/// A bind failure used to be a `tracing::warn!` and a dead thread. Nothing else in the app knew,
+/// so Settings kept saying "Murmur runs a small server on this Mac … at 127.0.0.1:8765" in the
+/// present tense and kept offering a config to paste — while the user's Claude was talking to
+/// whatever else held the port. Found 2026-08-28 on a real machine where an unrelated
+/// `python -m http.server 8765` from another project had held it for two days: the SHIPPED app's
+/// log carried the same warning, and nothing on screen said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpListenerState {
+    /// The thread is up but has not bound yet (the first attempt is in flight).
+    Starting,
+    /// Bound and serving.
+    Listening,
+    /// Another process on this Mac holds the port. Retried every [`BIND_RETRY_INTERVAL`].
+    PortInUse,
+    /// A terminal failure that retrying cannot fix (no token, no response gate, a bind error that
+    /// is not `AddrInUse`). Deliberately distinct from [`Self::PortInUse`]: the user action is
+    /// different, and telling someone to close another app when the real cause is a Keychain
+    /// refusal sends them hunting for a process that does not exist.
+    Unavailable,
+}
+
+impl McpListenerState {
+    fn as_code(self) -> u8 {
+        match self {
+            Self::Starting => 0,
+            Self::Listening => 1,
+            Self::PortInUse => 2,
+            Self::Unavailable => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Listening,
+            2 => Self::PortInUse,
+            3 => Self::Unavailable,
+            _ => Self::Starting,
+        }
+    }
+
+    /// The wire value the frontend branches on. camelCase to match every other IPC payload.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Listening => "listening",
+            Self::PortInUse => "portInUse",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Tauri-managed handle to [`McpListenerState`], written by the listener thread and read by
+/// `commands::get_mcp_status`. An atomic rather than a mutex: the listener writes it from its own
+/// thread while the command reads it from the IPC thread, and a lock here could only ever add a
+/// way for the status read to block behind the retry loop.
+#[derive(Debug, Default)]
+pub struct McpListenerStatus(AtomicU8);
+
+impl McpListenerStatus {
+    pub fn get(&self) -> McpListenerState {
+        McpListenerState::from_code(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, state: McpListenerState) {
+        self.0.store(state.as_code(), Ordering::Relaxed);
+    }
 }
 
 /// Max request body we will read (E5). The MCP JSON-RPC requests are tiny; cap hard so a
@@ -525,11 +605,35 @@ pub fn spawn(app: AppHandle, require_token: bool) {
 
 fn run(app: AppHandle, require_token: bool) {
     let addr = mcp_listener_addr();
-    let listener = match TcpListener::bind(addr) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(target: "mcp", error = %e, "MCP server failed to bind {addr}");
-            return;
+    let status = app
+        .try_state::<Arc<McpListenerStatus>>()
+        .map(|handle| Arc::clone(handle.inner()));
+    let report = |state: McpListenerState| {
+        if let Some(status) = status.as_ref() {
+            status.set(state);
+        }
+    };
+    report(McpListenerState::Starting);
+    // RETRY, don't give up. The port is fixed, so losing it to another local process is not a
+    // permanent condition — it lasts exactly as long as that process does. Before this loop the
+    // thread returned on the first `AddrInUse` and MCP stayed dead until the user restarted
+    // Murmur, which nothing on screen ever told them to do.
+    let listener = loop {
+        match TcpListener::bind(addr) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                report(McpListenerState::PortInUse);
+                tracing::warn!(
+                    target: "mcp",
+                    "MCP server port {MCP_PORT} is held by another process on this Mac; retrying"
+                );
+                std::thread::sleep(BIND_RETRY_INTERVAL);
+            }
+            Err(e) => {
+                report(McpListenerState::Unavailable);
+                tracing::warn!(target: "mcp", error = %e, "MCP server failed to bind {addr}");
+                return;
+            }
         }
     };
     // The expected token, if enforcement is on. Minted/persisted in the Keychain on first use.
@@ -541,6 +645,7 @@ fn run(app: AppHandle, require_token: bool) {
                 // Do NOT fall back to an unauthenticated server — that would serve the whole tool
                 // surface ungated. Refuse to start the MCP listener so the gate can never be
                 // bypassed by a transient Keychain failure.
+                report(McpListenerState::Unavailable);
                 tracing::error!(target: "mcp", error = %e, "MCP token required but unavailable — refusing to start the MCP server (fail closed)");
                 return;
             }
@@ -549,12 +654,14 @@ fn run(app: AppHandle, require_token: bool) {
         None
     };
     let Some(gate) = app.try_state::<Arc<McpResponseGate>>() else {
+        report(McpListenerState::Unavailable);
         tracing::error!(target: "mcp", "MCP response gate is unavailable — refusing to start");
         return;
     };
     let gate = Arc::clone(gate.inner());
     let expected_token = expected_token.map(Arc::new);
     let active_connections = Arc::new(AtomicUsize::new(0));
+    report(McpListenerState::Listening);
     tracing::info!(target: "mcp", "MCP server listening on http://{addr}");
     loop {
         let app = app.clone();

@@ -34,6 +34,9 @@ export class SettingsPrivacySectionComponent {
   readonly configCopied = this.store.configCopied;
   readonly mcpUrl = this.store.mcpUrl;
   readonly mcpConfig = this.store.mcpConfig;
+  readonly mcpRunning = this.store.mcpRunning;
+  readonly mcpPortInUse = this.store.mcpPortInUse;
+  readonly mcpStatus = this.store.mcpStatus;
 
   // Phase D — on-device name-redaction (NER) model affordance.
   readonly nerModelPresent = this.store.nerModelPresent;
