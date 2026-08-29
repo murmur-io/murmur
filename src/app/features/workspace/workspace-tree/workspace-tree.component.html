@@ -81,6 +81,57 @@
         }
       }
     }
+    @if (unfiledNotes(); as inbox) {
+      @if (inbox.total > 0) {
+        <!-- The reserved note root rendered as an honest INBOX, not a folder:
+             it is the "Notes" section itself, so it carries no lock, manage or
+             create affordance and accepts no drops — exactly like the unfiled
+             recordings row above it. -->
+        <mur-tree-row
+          class="line line--unfiled"
+          role="treeitem"
+          aria-level="1"
+          [attr.aria-selected]="currentPath() === '/notes'"
+          [attr.aria-expanded]="unfiledNotesExpanded()"
+          label="Unfiled notes"
+          [depth]="0"
+          icon="note"
+          [count]="inbox.total"
+          [selected]="currentPath() === '/notes'"
+          [expandable]="true"
+          [expanded]="unfiledNotesExpanded()"
+          (toggleExpand)="toggleUnfiledNotes()"
+          (activate)="openAllNotes()"
+        />
+        @if (unfiledNotesExpanded()) {
+          @for (item of inbox.items; track item.id) {
+            <mur-tree-row
+              class="line line--item line--unfiled-item"
+              role="treeitem"
+              aria-level="2"
+              [attr.aria-selected]="isItemSelected(item)"
+              [label]="itemTitle(item)"
+              [depth]="1"
+              [icon]="kindIcon(item.kind)"
+              [selected]="isItemSelected(item)"
+              (activate)="openItem(item)"
+            />
+          }
+          @if (inbox.total > inbox.items.length) {
+            <button
+              type="button"
+              class="see-all see-all--unfiled"
+              role="treeitem"
+              aria-selected="false"
+              aria-level="2"
+              (click)="openAllNotes()"
+            >
+              {{ viewAllNotesLabel(inbox.total) }}
+            </button>
+          }
+        }
+      }
+    }
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
