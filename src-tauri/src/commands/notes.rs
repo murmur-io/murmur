@@ -57,7 +57,19 @@ pub(crate) fn create_note_inner(
 ) -> Result<String, AppError> {
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+insert so a
     // concurrent lock/relock cannot land between the unlock check and the row insert.
-    let _lifecycle = lifecycle_guard(state);
+    let lifecycle = lifecycle_guard(state);
+    create_note_under_lifecycle(state, &lifecycle, folder_id, title)
+}
+
+/// [`create_note_inner`] after the caller has already acquired the lifecycle guard. Companion-note
+/// birth uses this so the sealed/open insert and structural `meeting_id` linkage share one
+/// authorization interval. Calling it without the supplied live guard is a bug.
+pub(crate) fn create_note_under_lifecycle(
+    state: &AppState,
+    lifecycle: &std::sync::MutexGuard<'_, ()>,
+    folder_id: Option<&str>,
+    title: &str,
+) -> Result<String, AppError> {
     // Resolve the anchor note-folder. A None/empty selection ⇒ the reserved always-open Notes ROOT
     // (unfiled), NOT the old default "Notes" folder — so "New note" can NEVER fail because the default
     // folder is sealed (the 2026-07-14 "Couldn't create the note" dead-end). `ensure_notes_root` is
@@ -120,7 +132,7 @@ pub(crate) fn create_note_inner(
     // No semantic pass on birth (no vectors yet). Best-effort.
     index_wikilinks_best_effort_under_lifecycle(
         state,
-        &_lifecycle,
+        lifecycle,
         crate::links::LinkKind::Note,
         &id,
         "",
@@ -219,7 +231,8 @@ pub(crate) async fn suggest_note_title_inner(
     // placeholder, never the stored title.
     let (folder_id, current, row_updated_at, row_text) = {
         let _lifecycle = lifecycle_guard(state);
-        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)?
+        else {
             return Err(AppError::InvalidArg(crate::errcode::tag(
                 crate::errcode::NOTE_MISSING,
                 format!("no note {note_id}"),
@@ -341,12 +354,7 @@ fn get_note_under_lifecycle_authorized(state: &AppState, id: &str) -> Result<Not
         )));
     };
     if !folder_is_unlocked(state, &folder_id)? {
-        return Ok(masked_note_doc(
-            id,
-            &folder_id,
-            created_at,
-            updated_at,
-        ));
+        return Ok(masked_note_doc(id, &folder_id, created_at, updated_at));
     }
     let Some(row) = state.db.get_note_row(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
@@ -593,15 +601,7 @@ pub(crate) fn save_note_text_inner(
     // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh text into
     // `text_blob` in the same write; an open folder takes the plain update. Fail-closed on a
     // missing session KEK.
-    reseal_document_if_locked_with_mode(
-        state,
-        &folder_id,
-        id,
-        title,
-        markdown,
-        now,
-        false,
-    )?;
+    reseal_document_if_locked_with_mode(state, &folder_id, id, title, markdown, now, false)?;
     prune_unreferenced_attachments(state, &attachment_owner, markdown)?;
     Ok(now)
 }
@@ -639,7 +639,19 @@ pub(crate) fn move_note_doc_inner(
 ) -> Result<(), AppError> {
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across the double gate + the
     // reassign/seal writes so a concurrent lock/relock cannot land mid-move.
-    let _lifecycle = lifecycle_guard(state);
+    let lifecycle = lifecycle_guard(state);
+    move_note_doc_under_lifecycle(state, &lifecycle, id, folder_id)
+}
+
+/// [`move_note_doc_inner`] after the caller has already acquired the lifecycle guard. This is used
+/// by reviewed batch filing so its scope/target revalidation and the canonical move share one
+/// indivisible authorization interval. Calling it without that guard is a bug.
+pub(crate) fn move_note_doc_under_lifecycle(
+    state: &AppState,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
     let Some((source_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(crate::errcode::tag(
             crate::errcode::NOTE_MISSING,
@@ -714,8 +726,7 @@ pub(crate) fn move_note_doc_inner(
         document_id: id.to_string(),
     };
     let attachment_rows = state.db.list_attachments(&attachment_owner)?;
-    let mut attachment_plaintext =
-        std::collections::HashMap::with_capacity(attachment_rows.len());
+    let mut attachment_plaintext = std::collections::HashMap::with_capacity(attachment_rows.len());
     for attachment in &attachment_rows {
         attachment_plaintext.insert(
             attachment.id.clone(),
@@ -1078,6 +1089,18 @@ pub(crate) fn create_note_folder_inner(
     name: &str,
     parent_id: Option<&str>,
 ) -> Result<NoteFolder, AppError> {
+    let lifecycle = lifecycle_guard(state);
+    create_note_folder_under_lifecycle(state, &lifecycle, name, parent_id)
+}
+
+/// [`create_note_folder_inner`] after the caller has acquired the lifecycle guard. Reviewed batch
+/// filing uses this so final source admission, destination birth and the move are indivisible.
+pub(crate) fn create_note_folder_under_lifecycle(
+    state: &AppState,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+    name: &str,
+    parent_id: Option<&str>,
+) -> Result<NoteFolder, AppError> {
     let clean = crate::summarize::organize::sanitize_folder(name)
         .ok_or_else(|| AppError::InvalidArg("folder name is empty or invalid".into()))?;
 
@@ -1154,7 +1177,9 @@ pub(crate) fn create_note_folder_inner(
         // "insert, then lock": the window between those two writes is the state this guard
         // exists to prevent, and no undo can close it.
         let wrapped = wrapped_key_for_new_sealed_container(state, &folder.id)?;
-        state.db.insert_sealed_note_folder(&folder, &now, &wrapped)?;
+        state
+            .db
+            .insert_sealed_note_folder(&folder, &now, &wrapped)?;
         create_container_dir_or_undo(state, &folder.id, dir.as_deref())?;
         return Ok(NoteFolder {
             locked: true,

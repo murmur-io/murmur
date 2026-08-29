@@ -130,12 +130,12 @@ pub type OrgOckCache = std::collections::HashMap<(String, u32), zeroize::Zeroizi
 #[derive(Clone, Debug)]
 pub struct RecordingStopResult {
     pub meeting_id: String,
-    pub markdown: String,
-    pub exported_path: Option<String>,
 }
 
-/// Shared result cell for idempotent Stop. Every concurrent caller observes the same detached
-/// operation; no caller can steal/drop ActiveRecording or receive a misleading "not recording".
+/// Shared content-free result cell for idempotent Stop. Every concurrent caller observes the same
+/// detached operation; no caller can steal/drop ActiveRecording or receive a misleading "not
+/// recording". The flight intentionally retains only the opaque meeting id — never generated
+/// markdown or an exported vault path — because waiter-owned `Arc`s may outlive a later relock.
 pub struct RecordingStopFlight {
     result: Mutex<Option<std::result::Result<RecordingStopResult, String>>>,
     notify: tokio::sync::Notify,
@@ -512,6 +512,52 @@ impl ContentDispatchAdmission {
 }
 
 impl AppState {
+    /// An [`AppState`] backed by a caller-supplied temp SQLCipher DB: no Keychain, no Tauri, no
+    /// recorder, default config (no vault, so nothing touches the filesystem).
+    ///
+    /// Lives here rather than in each test module because the struct has forty-odd fields and every
+    /// suite that duplicated the literal had to be edited whenever one was added — which is how a
+    /// test file ends up pinned to a stale shape.
+    #[cfg(test)]
+    pub(crate) fn for_tests(db: Db) -> Self {
+        use std::collections::HashSet;
+        Self {
+            recorder: Mutex::new(None),
+            recording_stop: Mutex::new(None),
+            voice_listener: Mutex::new(None),
+            voice_listener_lifecycle: Mutex::new(()),
+            recording_starting: AtomicBool::new(false),
+            voice_command_capture: Mutex::new(None),
+            pending_manual_command: Mutex::new(None),
+            live_running: AtomicBool::new(false),
+            db: Arc::new(db),
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
+            current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
+            capped_notified: AtomicBool::new(false),
+            capture_fault_notified: AtomicBool::new(false),
+            reactions_shadow_count: AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
+            in_flight_turns: Mutex::new(std::collections::HashMap::new()),
+            user_turn_in_progress: AtomicBool::new(false),
+            verify_cache: Mutex::new(std::collections::HashMap::new()),
+            unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
+            master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(std::collections::HashMap::new()),
+            account_session: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            active_salvages: Mutex::new(HashSet::new()),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
+            org_share_mutation_lock: tokio::sync::Mutex::new(()),
+            seal_epoch: AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
     /// Return the exact Live-session token only when `meeting_id` names the capture currently held
     /// in the recorder slot. Transitional Starting/Draining/Postprocess phases and mismatched or
     /// stale meeting ids fail closed instead of borrowing recording priority for unrelated work.
@@ -585,6 +631,29 @@ impl AppState {
         // the StubReasoner.
         let reasoner =
             crate::reason::ReasonerCell::new(Arc::clone(&config), Arc::clone(&heavy_inference));
+
+        // A previous process may have died after publishing a filing target but before the
+        // canonical bundle transaction. Drain its SQLCipher identities before any lock repair or
+        // app surface can treat those plaintext paths as governed.
+        match crate::commands::reconcile_filing_projection_journal_for_startup(&db)? {
+            crate::commands::FilingReconcileOutcome::Clean => {}
+            crate::commands::FilingReconcileOutcome::UserCollision(issue) => {
+                // Exact external occupancy is not database corruption and must not brick Murmur.
+                // Every malformed identity/path/SQL state still propagated through `?` above.
+                // The conflicting occupant is never overwritten and the durable row remains for an
+                // explicit token-bound decision. Log only counts + fixed kind, never token/path.
+                let (attempts, projections, source_snapshots) =
+                    db.filing_recovery_counts().unwrap_or((0, 0, 0));
+                tracing::warn!(
+                    target: "recording_filing",
+                    attempts,
+                    projections,
+                    source_snapshots,
+                    issue_kind = issue.issue_kind,
+                    "startup filing recovery is degraded; journal retained for user resolution"
+                );
+            }
+        }
 
         // Re-assert the at-rest sealed shape before any AppState/window/MCP surface exists. A crash
         // during an initial seal can leave hidden plaintext without a blob; that shape must be
@@ -1492,5 +1561,29 @@ mod tests {
             flight.wait().await.unwrap_err(),
             "durable finalization failed"
         );
+    }
+
+    /// Successful Stop is replayable to concurrent and late waiters without retaining generated
+    /// markdown or a vault path in any waiter-owned `Arc`. The exhaustive pattern is intentional:
+    /// adding another field to the internal result makes this oracle fail to compile.
+    #[tokio::test]
+    async fn recording_stop_flight_replays_content_free_success_to_all_waiters() {
+        let flight = Arc::new(RecordingStopFlight::new());
+        let first = flight.clone();
+        let second = flight.clone();
+        let first_waiter = tokio::spawn(async move { first.wait().await });
+        let second_waiter = tokio::spawn(async move { second.wait().await });
+        flight.complete(Ok(RecordingStopResult {
+            meeting_id: "meeting-42".into(),
+        }));
+
+        for result in [
+            first_waiter.await.unwrap(),
+            second_waiter.await.unwrap(),
+            flight.wait().await,
+        ] {
+            let RecordingStopResult { meeting_id } = result.unwrap();
+            assert_eq!(meeting_id, "meeting-42");
+        }
     }
 }

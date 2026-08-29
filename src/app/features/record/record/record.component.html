@@ -1,5 +1,5 @@
 <section class="record" [class.is-bounded]="boundToViewport()">
-  @if (modelPresent() === false) {
+  @if (store.stage() !== "done" && modelPresent() === false) {
     <div class="banner is-accent model-banner" role="alert">
       <span class="banner-icon" aria-hidden="true">↓</span>
       <div class="model-banner-body">
@@ -20,15 +20,15 @@
         </button>
       </div>
     </div>
-  } @else if (showVaultNotice()) {
+  } @else if (store.stage() !== "done" && showVaultNotice()) {
     <!-- Calm, NON-blocking notice: notes are always saved in Murmur (the DB is the
          canonical store). A vault is optional and export-only — never a recording blocker. -->
     <div class="banner is-accent vault-notice" role="note">
       <span class="banner-icon" aria-hidden="true">i</span>
       <span class="vault-notice-body">
         No Obsidian vault set — your notes are saved in
-        <strong>Murmur</strong>. Add a vault folder in Settings to also
-        export them as Markdown.
+        <strong>Murmur</strong>. Add a vault folder in Settings to also export
+        them as Markdown.
       </span>
       <span class="vault-notice-actions">
         <a class="btn btn-ghost btn-sm" routerLink="/settings">Settings</a>
@@ -49,20 +49,21 @@
        to live ONLY in a backend log line; recording + the full post-Stop transcript are
        unaffected either way. Independent of the banners above (it never stacks with the
        model-download one — it requires a present transcription model). ─────────────────────── -->
-  @if (showLiveCaptionsNotice()) {
+  @if (store.stage() !== "done" && showLiveCaptionsNotice()) {
     <div class="banner is-accent cc-notice" role="note">
       <span class="banner-icon" aria-hidden="true">◌</span>
       <span class="cc-notice-body">
         <strong>Live captions are off.</strong>
         @if (liveCaptionsHeavyPin()) {
-          Your live-caption model is a large one and isn't downloaded — Murmur never runs a
-          large model live, to keep your Mac cool. Choose a small live-caption model in
-          Settings.
+          Your live-caption model is a large one and isn't downloaded — Murmur
+          never runs a large model live, to keep your Mac cool. Choose a small
+          live-caption model in Settings.
         } @else {
-          The small live-caption model isn't on this Mac — its download may have failed.
+          The small live-caption model isn't on this Mac — its download may have
+          failed.
         }
-        Recording is unaffected: the full <strong>Me / Others</strong> transcript still runs
-        after you stop.
+        Recording is unaffected: the full
+        <strong>Me / Others</strong> transcript still runs after you stop.
         @if (liveCompanionError(); as cerr) {
           <span class="cc-notice-error">{{ cerr }}</span>
         }
@@ -94,12 +95,12 @@
 
   <!-- Headphones hint — a separate banner only when NOT recording; while recording it
        folds into the single coherent top bar below (no stacked bands). -->
-  @if (headphonesHint() && !store.isRecording()) {
+  @if (store.stage() !== "done" && headphonesHint() && !store.isRecording()) {
     <div class="banner is-accent" role="note">
       <span class="banner-icon" aria-hidden="true">🎧</span>
       <span>
-        Capturing system audio — use <strong>headphones</strong> so the
-        other participants' voices don't echo back into your microphone.
+        Capturing system audio — use <strong>headphones</strong> so the other
+        participants' voices don't echo back into your microphone.
       </span>
     </div>
   }
@@ -120,7 +121,8 @@
           title="Capturing system audio — use headphones so the other participants' voices don't echo back into your microphone."
         >
           <span class="rt-hint-ico" aria-hidden="true">🎧</span>
-          Use <strong>headphones</strong> so others' voices don't echo into your mic
+          Use <strong>headphones</strong> so others' voices don't echo into your
+          mic
         </span>
       }
       <span class="rt-spacer"></span>
@@ -129,6 +131,11 @@
         <span class="kbd-inline">⌘⇧R</span>
       </button>
     </div>
+  } @else if (store.stage() === "done") {
+    <app-recording-placement
+      [meetingId]="store.meetingId()"
+      [exportedPath]="store.lastNote()?.exportedPath ?? null"
+    />
   } @else {
     <!-- Not recording — a compact start header (nudge + brief + the start
          control). Still calm; the thread remains the main surface. -->
@@ -144,7 +151,7 @@
             <button
               type="button"
               class="btn btn-primary btn-sm"
-              (click)="startFromNudge()"
+              (click)="startRecording()"
             >
               Start recording
             </button>
@@ -171,15 +178,11 @@
         <button
           type="button"
           class="start-btn"
-          (click)="store.start()"
+          (click)="startRecording()"
           [disabled]="!canRecord()"
         >
           <span class="orb ready" aria-hidden="true"></span>
-          <span class="start-text">
-            {{
-              store.stage() === "done" ? "Record again" : "Start recording"
-            }}
-          </span>
+          <span class="start-text">Start recording</span>
           <span class="kbd" aria-hidden="true">⌘R</span>
         </button>
       }
@@ -192,16 +195,9 @@
     </div>
   }
 
-  <!-- ── Brain reveal + Re-Truth — surfaced ABOVE the note (2026-07-19, user request):
-       once a meeting resolves, show the already-alive brain (people + open commitments)
-       and the facts this note supersedes at the TOP, beside the "Saved ✓ in Murmur"
-       strip — not buried below a full-height note. Gated on stage = done. ─────────── -->
+  <!-- The final visit stays focused: the result card above owns navigation + filing;
+       Re-Truth is the only optional follow-up surfaced beside it. -->
   @if (store.stage() === "done") {
-    <!-- A meeting is the one kind that cannot be created INTO a container: it
-         creates itself when recording stops. The placement decision therefore
-         happens here or not at all. -->
-    <app-recording-placement [meetingId]="store.meetingId()" />
-    <app-brain-reveal-card [active]="!!store.lastNote()" />
     <app-re-truth-card
       [active]="!!store.lastNote()"
       [meetingId]="store.meetingId()"
@@ -347,8 +343,8 @@
           <span>
             {{ providerLabel() }} sends your transcript (redacted first) to
             {{ cloudDestination() }} to write the summary — your data leaves
-            this Mac. Allow it once to finish this note, or switch to a
-            local provider in Settings to stay fully on-device.
+            this Mac. Allow it once to finish this note, or switch to a local
+            provider in Settings to stay fully on-device.
           </span>
         </div>
         <div class="cloud-consent-actions">
@@ -373,7 +369,7 @@
 
   <!-- ── Minimal stats strip — hidden once the conversation thread is the
        hero (recording / a live ask), so the thread fills the screen. ───── -->
-  @if (!showAssistant() && analytics(); as a) {
+  @if (store.stage() !== "done" && !showAssistant() && analytics(); as a) {
     @if (a.totalMeetings > 0) {
       <div class="card stats" role="group" aria-label="Your stats">
         <dl class="figures">

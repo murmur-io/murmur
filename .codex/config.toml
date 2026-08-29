@@ -4,7 +4,7 @@ max_threads = 4
 max_depth = 1
 job_max_runtime_seconds = 1800
 
-# This profile is selected explicitly by scripts/agent-harness. It retains
+# This profile is selected explicitly by scripts/h. It retains
 # read access needed by the local Rust/Node toolchains and the pinned sibling
 # murmur-server checkout, but carve credentials and production Murmur data out
 # of that read boundary. The reviewer receives no write access or tool surface.

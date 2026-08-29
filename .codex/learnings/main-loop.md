@@ -269,7 +269,7 @@ this file is the CROSS-CUTTING orchestration/git/deploy/crypto-process loop.
   non-terminal, and a non-terminal task is what blocks primary-checkout branch surgery.
 - **Caught by:** the harness refusing; recovery was `git worktree add --force <same path> <branch>`
   to recreate an empty worktree, then `clean --abandon`, which then archived and closed all three.
-- **Lesson:** Reclaiming space from task worktrees is `scripts/agent-harness clean <id> --abandon`,
+- **Lesson:** Reclaiming space from task worktrees is `scripts/h clean <id> --abandon`,
   never `git worktree remove`. `clean` refuses while ignored build bytes are unarchived — delete
   `target/`, `.angular/`, `dist/`, `test-results/` and any duplicated `src-tauri/binaries` first
   (all regenerable), then let it run. 8.1 GB -> 28 MB this way.

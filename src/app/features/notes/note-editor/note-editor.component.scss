@@ -131,6 +131,17 @@
 .head-more {
   position: relative;
 }
+/* The crumb ABSORBS a cramped toolbar instead of letting the row wrap: it hosts the copy-ID
+   control and may shrink, so the folder name truncates rather than the `⋯` menu dropping to a
+   second line. A flex item only shrinks below its min-content width when `min-width: 0` says it
+   may — without this the row had no choice but to wrap, which misaligns the note header's bottom
+   from the Ask Brain pane's `.chat-head` bottom (they share ONE horizontal divider). */
+.head-crumb {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
 /* Privacy hint for an unfiled (always-open) note — a small 🔒-off glyph folded
    INTO the breadcrumb (2026-07-19 header slim), tooltip-only, muted + non-alarming. */
 .crumb-unsealed {
@@ -144,7 +155,10 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
+  min-width: 0;
   height: 32px;
+  overflow: hidden;
+  white-space: nowrap;
   padding: 0 var(--space-2);
   border: 1px solid transparent;
   border-radius: var(--radius-md);

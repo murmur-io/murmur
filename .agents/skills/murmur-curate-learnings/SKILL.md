@@ -19,5 +19,5 @@ mirror. Promote into the canonical tree, never the mirror, and regenerate the mi
 4. For each promotion, add one tight imperative bullet to `## Recurring patterns`. Match the existing terse style and keep the section to about 20 bullets; if full, merge or drop the weakest existing bullet and say which.
 5. Mark each source journal entry `**Status:** distilled (<today>)`, using `date +%F`.
 6. Do not invent lessons that are not in the journal.
-7. Run `scripts/agent-sync-learnings` to regenerate the `.codex/learnings/` mirror. Skipping this leaves `scripts/agent-config-audit` red.
+7. Run `.agents/h/mirror-check --fix` to regenerate the `.codex/learnings/` mirror. Skipping this leaves `.agents/h/mirror-check` red.
 8. Report which bullets you added or merged and which journal entries you marked distilled.

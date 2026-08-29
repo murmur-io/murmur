@@ -28,6 +28,6 @@ Steps:
 3. Do NOT touch `## Recurring patterns` — promotion is `/curate-learnings`'s job.
 4. If the journal now exceeds ~50 entries, drop the oldest `journal`-status entries (never drop
    `distilled`/`success-pattern`).
-5. Run `scripts/agent-sync-learnings` to regenerate the `.codex/learnings/` mirror — skipping it
-   leaves `scripts/agent-config-audit` red.
+5. Run `.agents/h/mirror-check --fix` to regenerate the `.codex/learnings/` mirror — skipping it
+   leaves `.agents/h/mirror-check` red.
 6. Confirm the one-line title you added; do not restate the whole file.

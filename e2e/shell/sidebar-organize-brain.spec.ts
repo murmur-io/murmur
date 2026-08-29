@@ -128,22 +128,27 @@ async function openWorkspace(page: Page): Promise<string[]> {
     page,
     {
       create_folder: () => ({ id: "f-new" }),
-      plan_workspace_organization: () => {
+      plan_workspace_organization: (args: unknown) => {
         const target = window as unknown as {
           __workspacePlanCalls?: number;
+          __workspacePlanArgs?: unknown[];
           __plan: unknown;
         };
         target.__workspacePlanCalls = (target.__workspacePlanCalls ?? 0) + 1;
+        (target.__workspacePlanArgs ??= []).push(args);
         return target.__plan;
       },
       apply_workspace_organization: (args: unknown) => {
         const target = window as unknown as {
           __workspaceApplyArgs?: unknown[];
           __workspaceApplyResult?: unknown;
+          __deferWorkspaceApply?: boolean;
+          __releaseWorkspaceApply?: () => void;
         };
         (target.__workspaceApplyArgs ??= []).push(args);
-        return (
-          target.__workspaceApplyResult ?? {
+        const result =
+          target.__workspaceApplyResult ??
+          ({
             appliedIds: ["meeting-1"],
             failures: [
               {
@@ -152,8 +157,16 @@ async function openWorkspace(page: Page): Promise<string[]> {
                 retryable: true,
               },
             ],
-          }
-        );
+          } as const);
+        if (target.__deferWorkspaceApply) {
+          return new Promise((resolve) => {
+            target.__releaseWorkspaceApply = () => {
+              target.__deferWorkspaceApply = false;
+              resolve(result);
+            };
+          });
+        }
+        return result;
       },
     },
     {
@@ -198,9 +211,9 @@ test("workspace menus use the shared menu primitive and close after an action", 
   });
 
   await item.click();
-  await expect(page.getByRole("menuitem", { name: "Create folder here" })).toHaveCount(
-    0,
-  );
+  await expect(
+    page.getByRole("menuitem", { name: "Create folder here" }),
+  ).toHaveCount(0);
   expect(runtimeErrors).toEqual([]);
 });
 
@@ -259,9 +272,46 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
   await expect(
     sheet.getByText("Brain's best match: Space 3 / Research"),
   ).toBeVisible();
+  await expect(sheet.getByLabel("Destination for Audio only")).toHaveValue(
+    "space-3",
+  );
+  await sheet.getByLabel("Destination for Audio only").selectOption("space-2");
+  await sheet
+    .getByRole("checkbox", {
+      name: "Move Platform standup to Acme / Standups",
+    })
+    .uncheck();
+
+  await sheet
+    .getByRole("textbox", { name: "Filing guidance Optional" })
+    .fill("Prefer client Spaces over general folders");
+  await sheet.getByRole("button", { name: "Replan" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __workspacePlanArgs?: unknown[] })
+            .__workspacePlanArgs ?? [],
+      ),
+    )
+    .toEqual([
+      { guidance: null },
+      { guidance: "Prefer client Spaces over general folders" },
+    ]);
+  await expect(sheet.getByLabel("Destination for Audio only")).toHaveValue(
+    "space-3",
+  );
+  await expect(
+    sheet.getByRole("checkbox", {
+      name: "Move Platform standup to Acme / Standups",
+    }),
+  ).toBeChecked();
+  await expect(
+    sheet.getByRole("textbox", { name: "Filing guidance Optional" }),
+  ).toHaveValue("Prefer client Spaces over general folders");
 
   // Zero selection is an honest close-only state, never a dead "Apply (0)".
-  await sheet.getByRole("button", { name: "Clear" }).click();
+  await sheet.getByRole("button", { name: "Clear all" }).click();
   await expect(sheet.getByRole("button", { name: "Close" })).toBeVisible();
   await expect(
     sheet.getByRole("button", { name: /Move 0|Apply \(0\)/ }),
@@ -364,6 +414,71 @@ test("the visible Brain action exposes its planning state while the plan is pend
   await expect(organize).toContainText("File recordings with Brain");
 });
 
+test("privacy invalidation closes the global Brain organizer and rejects its late apply receipt", async ({
+  page,
+}) => {
+  await openWorkspace(page);
+  const privatePlan = {
+    ...PLAN,
+    moves: [
+      {
+        ...PLAN.moves[0],
+        title: "SEALED GLOBAL ORGANIZER TITLE",
+        reason: "SEALED GLOBAL ORGANIZER REASON",
+      },
+    ],
+    review: [],
+    skipped: [],
+    totalScanned: 1,
+  };
+  await page.evaluate((plan) => {
+    (window as unknown as { __plan: unknown }).__plan = plan;
+  }, privatePlan);
+  await page
+    .getByRole("button", { name: "Review filing moves with Brain" })
+    .click();
+
+  const sheet = page.getByRole("dialog", { name: "Review Brain filing plan" });
+  await expect(
+    sheet.getByText("SEALED GLOBAL ORGANIZER TITLE", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    sheet.getByText("SEALED GLOBAL ORGANIZER REASON", { exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    (
+      window as unknown as { __deferWorkspaceApply?: boolean }
+    ).__deferWorkspaceApply = true;
+  });
+  await sheet.getByRole("button", { name: "Move 1 recording" }).click();
+  await expect(sheet.getByRole("button", { name: "Moving…" })).toBeDisabled();
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __demoEmit: (event: string, payload: unknown) => void;
+      }
+    ).__demoEmit("murmur://reminder-visibility-invalidated", null);
+  });
+  await expect(sheet).toHaveCount(0);
+  await expect(
+    page.getByText("SEALED GLOBAL ORGANIZER TITLE", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("SEALED GLOBAL ORGANIZER REASON", { exact: true }),
+  ).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __releaseWorkspaceApply?: () => void }
+    ).__releaseWorkspaceApply?.();
+  });
+  await expect(sheet).toHaveCount(0);
+  await expect(
+    page.getByText("Destination was locked", { exact: true }),
+  ).toHaveCount(0);
+});
+
 test("a completely successful filing closes the completed plan", async ({
   page,
 }) => {
@@ -385,7 +500,7 @@ test("a completely successful filing closes the completed plan", async ({
   const sheet = page.getByRole("dialog", {
     name: "Review Brain filing plan",
   });
-  await sheet.getByRole("button", { name: "Move 2 recordings" }).click();
+  await sheet.getByRole("button", { name: "Move 3 recordings" }).click();
 
   await expect(sheet).toHaveCount(0);
   await expect(page.locator(".toast.is-success .toast-msg")).toContainText(

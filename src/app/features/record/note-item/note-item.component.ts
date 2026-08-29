@@ -169,7 +169,7 @@ export class NoteItemComponent {
   protected emptyNote(status: ThreadTurn["status"]): string {
     switch (status) {
       case "nothing_heard":
-        return "Nie usłyszałem — spróbuj jeszcze raz";
+        return "Didn't catch that — try again";
       case "needs_consent":
         return "Needs consent to answer.";
       case "unavailable":

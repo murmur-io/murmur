@@ -13,6 +13,9 @@ import type {
   ApplyResult,
   AskConversation,
   AskConversationScope,
+  ContainerSharePreview,
+  ContainerShareResult,
+  ContainerShareStatus,
   AskConversationSendResult,
   AskConversationSummary,
   AskVaultResult,
@@ -98,6 +101,8 @@ import type {
   NoteTemplateSection,
   OrgAccess,
   OrganizePlan,
+  OrganizeApplyResult,
+  FilingRecoveryStatus,
   WorkspaceOrganizeApplyResult,
   WorkspaceOrganizeMove,
   WorkspaceOrganizePlan,
@@ -140,6 +145,8 @@ import type {
   SearchHit,
   Segment,
   ShareInboxItem,
+  SharedPlacementTarget,
+  SharedWorkspace,
   ShareToUserResult,
   SourceKind,
   SourceRef,
@@ -166,6 +173,7 @@ import type {
   WhisperCard,
   WhisperRecommendationDto,
   WikiTarget,
+  McpStatus,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -214,6 +222,9 @@ export const EVENT_AUDIT_UPDATED = "murmur://audit-updated";
 // Shared Brain — the background org-sync loop INGESTED/TOMBSTONED ≥1 org item this tick
 // (content-free "something changed, re-fetch" ping; drives the Notes org picker live refresh).
 export const EVENT_ORG_FEED_UPDATED = "murmur://org-feed-updated";
+/** Progress of one container share. Counts only — no folder name, no item id. */
+export const EVENT_CONTAINER_SHARE_PROGRESS =
+  "murmur://container-share-progress";
 // Delete fan-out fix — a note/meeting delete FULLY succeeded (local rows gone + any org shares
 // revoked); lets OTHER open surfaces (the tab-strip) prune themselves. Content-free (id + kind only).
 export const EVENT_CONTENT_DELETED = "murmur://content-deleted";
@@ -259,8 +270,8 @@ export class IpcService {
    */
   readonly workspaceMutationRevision =
     this._workspaceMutationRevision.asReadonly();
-  startRecording(): Promise<StartResult> {
-    return invoke<StartResult>("start_recording");
+  startRecording(folderId: string | null = null): Promise<StartResult> {
+    return invoke<StartResult>("start_recording", { folderId });
   }
 
   stopRecording(companionFlushCompleted?: boolean): Promise<StopResult> {
@@ -400,6 +411,16 @@ export class IpcService {
    */
   getMcpConfig(): Promise<string> {
     return invoke<string>("get_mcp_config");
+  }
+
+  /**
+   * Whether the local server for Claude actually came up.
+   *
+   * Settings used to assert it was running and hand over a config regardless; a bind failure was
+   * a log line nobody reads. This is the read that lets the screen tell the truth.
+   */
+  getMcpStatus(): Promise<McpStatus> {
+    return invoke<McpStatus>("get_mcp_status");
   }
 
   saveConfig(config: AppConfigDto): Promise<void> {
@@ -3019,21 +3040,92 @@ export class IpcService {
    * an {@link OrganizePlan} of moves with reasons; `folderId` (null ⇒ all notes)
    * scopes the run. Non-destructive — nothing moves until {@link applyOrganizePlan}.
    */
-  planOrganizeNotes(folderId: string | null): Promise<OrganizePlan> {
-    return invoke<OrganizePlan>("plan_organize_notes", { folderId });
+  async planOrganizeNotes(
+    folderId: string | null,
+    guidance: string | null = null,
+  ): Promise<OrganizePlan> {
+    const plan = await invoke<OrganizePlan>("plan_organize_notes", {
+      folderId,
+      guidance,
+    });
+    if (
+      !Object.prototype.hasOwnProperty.call(plan, "scopeFolderId") ||
+      plan.scopeFolderId !== folderId
+    ) {
+      throw new Error("The organizer returned a plan for a different scope.");
+    }
+    return {
+      ...plan,
+      moves: plan.moves.map((move) => ({
+        ...move,
+        reviewScopeFolderId: plan.scopeFolderId,
+      })),
+    };
   }
 
   /**
    * Apply an auto-organize plan (step 2): create the needed note-folders + move the
    * notes (gated; re-exports). Confirm-before-apply on the FE.
    */
-  applyOrganizePlan(plan: OrganizePlan): Promise<void> {
-    return invoke<void>("apply_organize_plan", { plan });
+  async applyOrganizePlan(
+    plan: OrganizePlan | Pick<OrganizePlan, "moves">,
+  ): Promise<OrganizeApplyResult> {
+    let scopeFolderId: string | null;
+    if ("scopeFolderId" in plan) {
+      scopeFolderId = plan.scopeFolderId;
+    } else if (plan.moves.length === 0) {
+      scopeFolderId = null;
+    } else {
+      const scopes = plan.moves.map((move) => {
+        if (
+          !Object.prototype.hasOwnProperty.call(move, "reviewScopeFolderId") ||
+          move.reviewScopeFolderId === undefined ||
+          move.reviewScopeFolderId === ""
+        ) {
+          throw new Error(
+            "The selected organizer move is missing its reviewed scope.",
+          );
+        }
+        return move.reviewScopeFolderId;
+      });
+      scopeFolderId = scopes[0];
+      if (scopes.some((scope) => scope !== scopeFolderId)) {
+        throw new Error(
+          "Selected organizer moves came from different review scopes.",
+        );
+      }
+    }
+    const wireMoves = plan.moves.map((move) => ({
+      noteId: move.noteId,
+      title: move.title,
+      fromFolderId: move.fromFolderId,
+      fromFolder: move.fromFolder,
+      toFolder: move.toFolder,
+      toFolderId: move.toFolderId,
+      confidence: move.confidence,
+      reason: move.reason,
+    }));
+    const normalized = {
+      scopeFolderId,
+      moves: wireMoves,
+      totalScanned:
+        "totalScanned" in plan ? plan.totalScanned : plan.moves.length,
+      alreadyOrganized: "alreadyOrganized" in plan ? plan.alreadyOrganized : 0,
+      deferred: "deferred" in plan ? plan.deferred : 0,
+      targets: "targets" in plan ? plan.targets : [],
+    };
+    return invoke<OrganizeApplyResult>("apply_organize_plan", {
+      plan: normalized,
+    });
   }
 
   /** Propose where unfiled recordings belong. Nothing moves until apply. */
-  planWorkspaceOrganization(): Promise<WorkspaceOrganizePlan> {
-    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization");
+  planWorkspaceOrganization(
+    guidance: string | null = null,
+  ): Promise<WorkspaceOrganizePlan> {
+    return invoke<WorkspaceOrganizePlan>("plan_workspace_organization", {
+      guidance,
+    });
   }
 
   /** Apply only the recording moves the user kept selected in the review sheet. */
@@ -3044,6 +3136,27 @@ export class IpcService {
       "apply_workspace_organization",
       { moves },
     );
+  }
+
+  /** Content-free health for crash-safe filing recovery; no ids, paths, or titles. */
+  getFilingRecoveryStatus(): Promise<FilingRecoveryStatus> {
+    return invoke<FilingRecoveryStatus>("get_filing_recovery_status");
+  }
+
+  /** Retry exact-identity recovery after the user resolves a vault-side conflict. */
+  retryFilingRecovery(): Promise<FilingRecoveryStatus> {
+    return invoke<FilingRecoveryStatus>("retry_filing_recovery");
+  }
+
+  /** Preserve one external vault occupant after an explicit destructive confirmation. */
+  keepExistingFilingFile(
+    issueToken: string,
+    confirmed: true,
+  ): Promise<FilingRecoveryStatus> {
+    return invoke<FilingRecoveryStatus>("keep_existing_filing_file", {
+      issueToken,
+      confirmed,
+    });
   }
 
   // ── Feature C — typed note front-matter properties (folder-level schema +
@@ -3523,5 +3636,129 @@ export class IpcService {
    */
   onAskHistoryInvalidated(cb: () => void): Promise<UnlistenFn> {
     return listen<void>(EVENT_ASK_HISTORY_INVALIDATED, () => cb());
+  }
+
+  // ── Shared containers ──────────────────────────────────────────────────────
+
+  /**
+   * What sharing this Space or Folder would publish — counts only, no egress.
+   * Refuses a SEALED container: its content is not readable, and letting the
+   * user "share" it and see nothing arrive would be a silent failure.
+   */
+  previewContainerShare(
+    orgId: string,
+    folderId: string,
+  ): Promise<ContainerSharePreview> {
+    return invoke<ContainerSharePreview>("preview_container_share", {
+      orgId,
+      folderId,
+    });
+  }
+
+  /**
+   * Publish a whole Space or Folder to an Org: every manifest, then every
+   * eligible document, all under one inherited `access`. Emits
+   * {@link onContainerShareProgress} after each item.
+   */
+  shareContainerToOrg(
+    orgId: string,
+    folderId: string,
+    access: OrgAccess,
+    scrub: boolean,
+  ): Promise<ContainerShareResult> {
+    return invoke<ContainerShareResult>("share_container_to_org", {
+      orgId,
+      folderId,
+      access,
+      scrub,
+    });
+  }
+
+  /**
+   * Stop sharing a container. Withdraws every document the container itself
+   * published; a note the user shared deliberately keeps its own share and
+   * merely loses its placement.
+   */
+  unshareContainer(orgId: string, folderId: string): Promise<void> {
+    return invoke<void>("unshare_container", { orgId, folderId });
+  }
+
+  /** Re-permission a container AND every document filed under it. */
+  setContainerShareAccess(
+    orgId: string,
+    folderId: string,
+    access: OrgAccess,
+  ): Promise<void> {
+    return invoke<void>("set_container_share_access", {
+      orgId,
+      folderId,
+      access,
+    });
+  }
+
+  /** Every container THIS device publishes — drives the sidebar's shared marker. */
+  listContainerShareStatus(): Promise<ContainerShareStatus[]> {
+    return invoke<ContainerShareStatus[]>("list_container_share_status");
+  }
+
+  /**
+   * Bring every shared container back in line with the local tree, returning the
+   * number of mutations. Call it after a workspace mutation so a note added to a
+   * shared folder publishes right away; a background tick is the safety net.
+   */
+  syncContainerShares(): Promise<number> {
+    return invoke<number>("sync_container_shares");
+  }
+
+  /** The forest of containers and items other members shared with this user. */
+  listSharedWorkspace(): Promise<SharedWorkspace> {
+    return invoke<SharedWorkspace>("list_shared_workspace");
+  }
+
+  /**
+   * File a received container or document somewhere in this user's own tree.
+   * DEVICE-LOCAL: nothing is published, the owner sees nothing, and the content
+   * keeps updating from the org feed exactly as before.
+   */
+  setSharedPlacement(
+    orgId: string,
+    targetKind: SharedPlacementTarget,
+    targetId: string,
+    localParentId: string | null,
+    position: number,
+  ): Promise<void> {
+    return invoke<void>("set_shared_placement", {
+      orgId,
+      targetKind,
+      targetId,
+      localParentId,
+      position,
+    });
+  }
+
+  /** Return a received object to wherever its owner filed it. */
+  clearSharedPlacement(
+    orgId: string,
+    targetKind: SharedPlacementTarget,
+    targetId: string,
+  ): Promise<void> {
+    return invoke<void>("clear_shared_placement", {
+      orgId,
+      targetKind,
+      targetId,
+    });
+  }
+
+  /**
+   * Progress of a running container share. Counts only — never a folder name or
+   * an item id.
+   */
+  onContainerShareProgress(
+    cb: (done: number, total: number) => void,
+  ): Promise<UnlistenFn> {
+    return listen<{ done: number; total: number }>(
+      EVENT_CONTAINER_SHARE_PROGRESS,
+      (e) => cb(e.payload.done, e.payload.total),
+    );
   }
 }

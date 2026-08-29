@@ -142,9 +142,10 @@ pub(crate) fn apply_note_verify_markers_inner(
     // concurrent relock/seal cannot land between the unlock check and the upsert.
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to edit the note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to edit the note",
+            )));
     }
     for f in &findings {
         let ok = crate::verify::extract_issue_keys(&f.key)
@@ -321,9 +322,10 @@ pub(crate) fn apply_note_enrichment_inner(
     // `link_related_notes_inner` guards). Lock order `lifecycle ⊃ db`.
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to edit the note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to edit the note",
+            )));
     }
     // SEAL-SAFETY GATE (mirrors Lane A): a SEALED note (any provider row carries a content_blob) has a
     // TRANSIENT `markdown` column — blanked on relock, restored from `content_blob` on unlock. Writing
@@ -1409,9 +1411,10 @@ pub fn patch_note_tasks(
     // D4 WRITE-GATE: refuse to rewrite a sealed-and-not-unlocked meeting's note (its plaintext is
     // blanked; patching would persist the blanked value over the sealed content). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to rewrite the note's tasks".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+                crate::errcode::MEETING_LOCKED,
+                "this meeting's folder is locked — unlock it to rewrite the note's tasks",
+            )));
     }
     let existing = state
         .db
