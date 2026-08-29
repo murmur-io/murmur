@@ -390,3 +390,110 @@ fn orphan_placements_are_pruned_when_their_local_folder_is_gone() {
     );
     assert!(!remaining.contains(&"c-dead".to_string()));
 }
+
+// ── the 2.1.0 regression: a manifest ingested as a note ───────────────────────────────────────
+
+#[test]
+fn a_manifest_mis_ingested_as_a_note_is_repaired_into_a_container() {
+    // 2.1.0 added the container branch to the anti-entropy sweep but NOT to the live feed pull,
+    // and the live pull is the path a healthy replica actually uses. A shared Space therefore
+    // arrived as a note named after the folder. Existing databases hold those rows, so the
+    // migration has to heal them rather than only stopping new ones.
+    let db = file_db("repair-mis-ingested");
+    seed_org(&db, "o1");
+    let manifest = crate::share::container_envelope::ContainerEnvelope {
+        v: crate::share::container_envelope::CONTAINER_ENVELOPE_VERSION,
+        container_id: "c-space".into(),
+        level: crate::share::container_envelope::ContainerLevel::Space,
+        name: "Pomysły".into(),
+        emoji: None,
+        tint: None,
+        parent_container_id: None,
+        position: 0,
+    };
+    {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO org_items(item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                   rev, generation, is_current, tombstoned, source_kind, access)
+             VALUES ('item-1','o1',7,'kgm004a','Pomysły',?1,'2026-08-29T10:00:00Z',1,1,1,0,
+                     'container','edit')",
+            rusqlite::params![manifest.to_json()],
+        )
+        .unwrap();
+    }
+
+    db.migrate().unwrap();
+
+    let containers = db.list_org_containers("o1").unwrap();
+    assert_eq!(containers.len(), 1, "the manifest became a container");
+    assert_eq!(containers[0].container_id, "c-space");
+    assert_eq!(containers[0].name, "Pomysły");
+    assert_eq!(containers[0].level, "space");
+    assert_eq!(containers[0].access, "edit", "the access it arrived with is kept");
+    assert_eq!(containers[0].seq, 7);
+
+    assert!(
+        db.list_org_items("o1").unwrap().is_empty(),
+        "the mis-ingested row no longer renders as a note"
+    );
+
+    // Tombstoned, not deleted: a later feed replay of the same server item must be idempotent
+    // rather than resurrect the note.
+    let conn = db.lock();
+    let tombstoned: i64 = conn
+        .query_row(
+            "SELECT tombstoned FROM org_items WHERE item_id='item-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tombstoned, 1);
+}
+
+#[test]
+fn the_repair_leaves_a_row_it_cannot_parse_exactly_as_it_is() {
+    // A repair that cannot understand a row has no business rewriting it.
+    let db = file_db("repair-unparseable");
+    seed_org(&db, "o1");
+    {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO org_items(item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                   rev, generation, is_current, tombstoned, source_kind)
+             VALUES ('item-bad','o1',1,'h','t','{not json','now',1,1,1,0,'container')",
+            [],
+        )
+        .unwrap();
+    }
+    db.migrate().unwrap();
+    assert!(db.list_org_containers("o1").unwrap().is_empty());
+    let conn = db.lock();
+    let tombstoned: i64 = conn
+        .query_row(
+            "SELECT tombstoned FROM org_items WHERE item_id='item-bad'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tombstoned, 0, "an unparseable row is left untouched");
+}
+
+#[test]
+fn a_container_row_never_renders_as_an_item_even_if_one_survives() {
+    // Belt-and-braces for the reader itself: whatever the repair did or did not do, a row marked
+    // as a container must not come back from the item list.
+    let db = file_db("reader-excludes-container");
+    seed_org(&db, "o1");
+    {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO org_items(item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                   rev, generation, is_current, tombstoned, source_kind)
+             VALUES ('item-c','o1',1,'h','Pomysły','{not json','now',1,1,1,0,'container')",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(db.list_org_items("o1").unwrap().is_empty());
+}
