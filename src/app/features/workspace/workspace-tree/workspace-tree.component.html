@@ -393,6 +393,19 @@
   </div>
 }
 
+@if (shareRequest(); as request) {
+  <!-- ONE instance for the whole tree, not one per row: only one container is
+       ever being shared, and a per-row instance would build a dialog for every
+       container in the vault. Its own opaque overlay (T3). -->
+  <div class="workspace-overlay-host" appTeleportToBody>
+    <app-container-share-sheet
+      [target]="request"
+      (sharedOut)="onContainerShared()"
+      (cancelled)="closeShareSheet()"
+    />
+  </div>
+}
+
 @if (manageRequest(); as request) {
   <div class="workspace-overlay-host" appTeleportToBody>
     <app-workspace-manage-sheet

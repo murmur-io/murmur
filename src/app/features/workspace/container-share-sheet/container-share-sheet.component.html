@@ -1,0 +1,219 @@
+<div class="scrim">
+  <!-- OPAQUE overlay (trap T3): it floats OVER the sidebar, so never the frosted
+       .card. Dismissal is Cancel or Escape on the panel — no scrim-click
+       handler, matching the sibling sheets and keeping the a11y lint clean. -->
+  <div
+    #panel
+    class="sheet"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="container-share-title"
+    tabindex="-1"
+    (keydown.escape)="cancel()"
+  >
+    <div class="sheet-head">
+      <span class="org-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="8" r="3.2" />
+          <path d="M5 20a7 7 0 0 1 14 0" />
+          <circle cx="4.5" cy="10" r="2" />
+          <circle cx="19.5" cy="10" r="2" />
+        </svg>
+      </span>
+      <div class="sheet-headings">
+        <h2 id="container-share-title" class="sheet-title">
+          Share this {{ noun() }}
+        </h2>
+        <p class="sheet-copy">
+          An <strong>end-to-end-encrypted</strong> copy of
+          <strong>{{ target().name }}</strong> and everything in it — every member
+          sees the same structure and can search it; the server can't read it.
+        </p>
+      </div>
+    </div>
+
+    <div class="org-pick">
+      <span class="section-label" id="container-org-label">Publish to</span>
+      @if (orgsLoading()) {
+        <p class="pick-status text-muted">Loading your organizations…</p>
+      } @else if (orgsError(); as oerr) {
+        <p class="sheet-error" role="alert">{{ oerr }}</p>
+      } @else if (singleOrg()) {
+        @if (selectedOrg(); as org) {
+          <p class="pick-single">
+            <span class="pick-name">{{ org.name }}</span>
+            <span class="pick-members text-muted">{{ audienceLabel() }}</span>
+          </p>
+        }
+      } @else {
+        <mur-select
+          class="pick-select"
+          ariaLabel="Choose an organization"
+          [ngModel]="selectedOrgId()"
+          (ngModelChange)="selectedOrgId.set($event)"
+        >
+          @for (o of orgs(); track o.orgId) {
+            <option [value]="o.orgId">{{ o.name }}</option>
+          }
+        </mur-select>
+        @if (audienceLabel(); as label) {
+          <p class="pick-members text-muted">{{ label }}</p>
+        }
+      }
+    </div>
+
+    @if (previewError(); as err) {
+      <p class="sheet-error" role="alert">{{ err }}</p>
+    }
+
+    <fieldset class="access-pick" [disabled]="sharing()">
+      <legend class="section-label">Member access</legend>
+      <div class="access-options">
+        <button
+          type="button"
+          class="access-option"
+          [class.is-selected]="access() === 'view'"
+          [attr.aria-pressed]="access() === 'view'"
+          (click)="setAccess('view')"
+        >
+          <span class="access-title">View only</span>
+          <span class="access-copy">
+            Members can read and search everything in this {{ noun() }}.
+          </span>
+        </button>
+        <button
+          type="button"
+          class="access-option"
+          [class.is-selected]="access() === 'edit'"
+          [attr.aria-pressed]="access() === 'edit'"
+          (click)="setAccess('edit')"
+        >
+          <span class="access-title">Can edit</span>
+          <span class="access-copy">
+            Members can also edit the notes inside it. Only you can rename, move
+            or remove them.
+          </span>
+        </button>
+      </div>
+      <p class="access-note">
+        Whatever you choose applies to everything in this {{ noun() }}.
+      </p>
+    </fieldset>
+
+    <div class="preview-block">
+      <span class="section-label">Exactly what leaves your Mac</span>
+      @if (loading() && !preview()) {
+        <p class="pick-status text-muted">Reading this {{ noun() }}…</p>
+      } @else if (preview(); as p) {
+        <p class="contents-line">{{ contentsLabel() }}</p>
+        @if (p.skippedSealed > 0) {
+          <p class="contents-note is-warn">
+            {{ p.skippedSealed }} locked
+            {{ p.skippedSealed === 1 ? "folder stays" : "folders stay" }} behind —
+            nothing inside them is read or shared.
+          </p>
+        }
+        @if (p.skippedDashboards > 0) {
+          <p class="contents-note is-muted">
+            {{ p.skippedDashboards }}
+            {{ p.skippedDashboards === 1 ? "dashboard is" : "dashboards are" }} not
+            shared yet — a dashboard can point at items nobody shared.
+          </p>
+        }
+        @if (isEmpty()) {
+          <p class="contents-note is-muted">
+            This {{ noun() }} has nothing to publish yet. Sharing it now still lets
+            members see it, and anything you add later appears for them
+            automatically.
+          </p>
+        }
+      }
+    </div>
+
+    <div class="scrub-row">
+      <label class="check">
+        <input
+          type="checkbox"
+          [checked]="scrub()"
+          (change)="onScrubChange($event)"
+          [disabled]="loading() || sharing()"
+        />
+        <span>Scrub personal info (emails, phone numbers, card numbers)</span>
+      </label>
+      <p class="scrub-note hint">
+        Person names are kept. Transcripts and audio are never shared — a meeting
+        travels as its note. Referenced images are encrypted with each note, but
+        their pixels are not text-redacted.
+      </p>
+    </div>
+
+    @if (sharing() && progressTotal() > 0) {
+      <div class="share-progress">
+        <div
+          class="progress-track"
+          role="progressbar"
+          [attr.aria-valuenow]="progressDone()"
+          aria-valuemin="0"
+          [attr.aria-valuemax]="progressTotal()"
+          [attr.aria-label]="'Sharing ' + target().name"
+        >
+          <span class="progress-fill" [style.width.%]="progressPercent()"></span>
+        </div>
+        <p class="progress-label text-muted">
+          {{ progressDone() }} of {{ progressTotal() }} published
+        </p>
+      </div>
+    }
+
+    @if (shareError(); as err) {
+      <p class="sheet-error" role="alert">{{ err }}</p>
+    }
+
+    @if (existingShare(); as share) {
+      <p class="pick-status text-muted" role="status">
+        This {{ noun() }} is already shared with
+        {{ selectedOrg()?.name ?? "this organization" }} as
+        <strong>{{ share.access === "edit" ? "Can edit" : "View only" }}</strong>.
+        Anything you add to it appears for members automatically.
+      </p>
+    }
+
+    <div class="sheet-actions">
+      <button
+        type="button"
+        class="btn btn-ghost"
+        (click)="cancel()"
+        [disabled]="sharing()"
+      >
+        {{ alreadyShared() ? "Close" : "Cancel" }}
+      </button>
+      @if (alreadyShared()) {
+        <button
+          type="button"
+          class="btn btn-ghost btn-danger"
+          (click)="stopSharing()"
+          [disabled]="sharing()"
+        >
+          Stop sharing
+        </button>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="applyAccess()"
+          [disabled]="sharing() || access() === existingShare()?.access"
+        >
+          {{ sharing() ? "Updating…" : "Update access" }}
+        </button>
+      } @else {
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="confirm()"
+          [disabled]="sharing() || loading() || !preview() || !selectedOrgId()"
+        >
+          {{ sharing() ? "Sharing…" : "Share this " + noun() }}
+        </button>
+      }
+    </div>
+  </div>
+</div>
