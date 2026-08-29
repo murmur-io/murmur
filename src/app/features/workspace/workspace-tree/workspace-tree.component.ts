@@ -28,6 +28,8 @@ import type {
   OrganizeFailure,
   OrganizeMove,
   OrganizePlan,
+  SharedContainerNode,
+  SharedItemRow,
 } from "../../../core/models";
 import { IpcService } from "../../../core/ipc.service";
 import { ErrorCopyService } from "../../../core/copy/error-copy.service";
@@ -41,6 +43,7 @@ import { ToastService } from "../../../services/toast.service";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
+import { SharedWorkspaceService } from "../../../services/shared-workspace.service";
 import { WorkspaceService } from "../workspace.service";
 import {
   workspaceDestinations,
@@ -57,16 +60,30 @@ export interface TreeLine {
   /** Stable identity for `track` — unique across every line kind. */
   key: string;
   depth: number;
-  container: ContainerNode;
+  /**
+   * The LOCAL container this line belongs to. Absent on a shared line: content
+   * another member published has no local container, and inventing a
+   * placeholder one would put a row the folder gate does not govern behind a
+   * type every reader takes as governed.
+   */
+  container?: ContainerNode;
   /** Present only on an item line. */
   item?: ItemRow;
   /** Present only on the shared continuation line. */
   seeAll?: boolean;
   /** Full visible item count across every kind in this container. */
   total?: number;
+  /** Present only on a RECEIVED container row (a shared Space, folder, or the
+   * virtual Shared Brains Space). */
+  shared?: SharedContainerNode;
+  /** Present only on a RECEIVED item row. */
+  sharedItem?: SharedItemRow;
 }
 
 const MAX_VISIBLE_ITEMS = 8;
+
+/** Persisted disclosure state for received containers, keyed like the local one. */
+const EXPANDED_SHARED_KEY = "murmur.workspace.expandedShared";
 
 /**
  * Where activating an item navigates. These MUST name real entries in
@@ -123,6 +140,7 @@ export class WorkspaceTreeComponent {
   private readonly folders = inject(FoldersService);
   private readonly lockFlow = inject(FolderLockFlowService);
   private readonly notes = inject(NotesService);
+  protected readonly sharedWorkspace = inject(SharedWorkspaceService);
 
   /** Current route path, used to select a container or leaf row. */
   readonly currentPath = input("");
@@ -151,6 +169,9 @@ export class WorkspaceTreeComponent {
     if (this.workspace.workspaceEmpty()) {
       void this.workspace.reload();
     }
+    if (this.sharedWorkspace.sharedBrains() === null) {
+      void this.sharedWorkspace.load();
+    }
   }
 
   protected readonly loading = this.workspace.loading;
@@ -173,8 +194,136 @@ export class WorkspaceTreeComponent {
     for (const project of this.workspace.forest()) {
       this.pushContainer(out, project, 0);
     }
+    // Received content comes LAST at the top level: a shared Space is the
+    // user's colleague's, not theirs, and it should not push their own Spaces
+    // down the sidebar. Anything they have privately filed under a local
+    // container was already emitted inside `pushContainer`.
+    for (const space of this.unplacedSharedRoots()) {
+      this.pushShared(out, space, 0);
+    }
+    const brains = this.sharedWorkspace.sharedBrains();
+    if (brains && (brains.folders.length > 0 || brains.items.length > 0)) {
+      this.pushShared(out, brains, 0);
+    }
     return out;
   });
+
+  /**
+   * Received Spaces the user has NOT filed anywhere of their own — those render
+   * at the top level. A placed one is emitted under its host container instead.
+   */
+  private readonly unplacedSharedRoots = computed(() =>
+    this.sharedWorkspace.spaces().filter((node) => !node.localParentId),
+  );
+
+  /** Received nodes this user privately filed under a given local container. */
+  private readonly sharedByLocalParent = computed(() => {
+    const map = new Map<string, SharedContainerNode[]>();
+    const add = (node: SharedContainerNode): void => {
+      if (!node.localParentId) {
+        return;
+      }
+      const bucket = map.get(node.localParentId) ?? [];
+      bucket.push(node);
+      map.set(node.localParentId, bucket);
+    };
+    this.sharedWorkspace.spaces().forEach(add);
+    this.sharedWorkspace.sharedBrains()?.folders.forEach(add);
+    return map;
+  });
+
+  private readonly _expandedShared = signal<ReadonlySet<string>>(
+    readStoredSharedSet(),
+  );
+
+  protected sharedKey(node: SharedContainerNode): string {
+    return `${node.orgId}:${node.containerId ?? "shared-brains"}`;
+  }
+
+  protected isSharedExpanded(node: SharedContainerNode): boolean {
+    return this._expandedShared().has(this.sharedKey(node));
+  }
+
+  protected toggleShared(node: SharedContainerNode): void {
+    const key = this.sharedKey(node);
+    const next = new Set(this._expandedShared());
+    if (!next.delete(key)) {
+      next.add(key);
+    }
+    this._expandedShared.set(next);
+    try {
+      localStorage.setItem(EXPANDED_SHARED_KEY, JSON.stringify([...next]));
+    } catch {
+      /* a private window or blocked site data: the tree still works */
+    }
+  }
+
+  protected sharedExpandable(node: SharedContainerNode): boolean {
+    return node.folders.length > 0 || node.items.length > 0;
+  }
+
+  /** Received containers are read-only structure: no rename, delete or create. */
+  protected sharedIcon(node: SharedContainerNode): TreeRowIcon {
+    return node.level === "folder" ? "folder" : "space";
+  }
+
+  protected sharedAccessLabel(node: SharedContainerNode): string {
+    return node.access === "edit" ? "Can edit" : "View only";
+  }
+
+  /**
+   * The sentence behind the shared glyph — one dim mark, the words on hover and
+   * for a screen reader. A pill here would take the row's spare width and
+   * truncate the name, which is the lesson the unlocked mark already records.
+   */
+  protected sharedMark(line: TreeLine): string | null {
+    if (line.shared) {
+      const node = line.shared;
+      if (node.level === "virtual") {
+        return null;
+      }
+      return `From ${node.orgName} · ${node.authorHint} · ${this.sharedAccessLabel(node)}`;
+    }
+    if (line.sharedItem) {
+      return null;
+    }
+    const container = line.container;
+    if (!container) {
+      return null;
+    }
+    const share = this.sharedWorkspace.shareByFolder().get(container.id);
+    if (!share) {
+      return null;
+    }
+    const access = share.access === "edit" ? "Can edit" : "View only";
+    return `Shared to ${share.orgName} · ${access}`;
+  }
+
+  /** True when THIS user publishes this local container. */
+  protected isShared(container: ContainerNode): boolean {
+    return this.sharedWorkspace.shareByFolder().has(container.id);
+  }
+
+  private pushShared(
+    out: TreeLine[],
+    node: SharedContainerNode,
+    depth: number,
+  ): void {
+    out.push({ key: `s:${this.sharedKey(node)}`, depth, shared: node });
+    if (!this.isSharedExpanded(node)) {
+      return;
+    }
+    for (const child of node.folders) {
+      this.pushShared(out, child, depth + 1);
+    }
+    for (const item of node.items) {
+      out.push({
+        key: `si:${item.itemId}`,
+        depth: depth + 1,
+        sharedItem: item,
+      });
+    }
+  }
 
   private pushContainer(
     out: TreeLine[],
@@ -184,6 +333,11 @@ export class WorkspaceTreeComponent {
     out.push({ key: `c:${container.id}`, depth, container });
     if (this.isSealed(container) || !this.isContainerExpanded(container)) {
       return;
+    }
+    // Anything the user privately filed here. Their arrangement, their device —
+    // the owner and every other member see nothing of it.
+    for (const placed of this.sharedByLocalParent().get(container.id) ?? []) {
+      this.pushShared(out, placed, depth + 1);
     }
     const allItems = container.groups
       .flatMap((group) => group.items)
@@ -346,6 +500,65 @@ export class WorkspaceTreeComponent {
   protected openItem(item: ItemRow): void {
     void this.router.navigate([KIND_ROUTE[item.kind], item.id]);
   }
+
+  // ── received content ───────────────────────────────────────────────────────
+
+  protected isSharedSelected(node: SharedContainerNode): boolean {
+    if (!node.containerId) {
+      return this.currentPath() === "/shared-brains";
+    }
+    return this.currentPath() === `/shared/${node.orgId}/${node.containerId}`;
+  }
+
+  protected isSharedItemSelected(item: SharedItemRow): boolean {
+    return this.currentPath() === `/org-item/${item.itemId}`;
+  }
+
+  /**
+   * Open a received container. The virtual Shared Brains Space has no container
+   * of its own — it is a view over everything loose — so it opens the list route
+   * with its per-org filter.
+   */
+  protected openShared(node: SharedContainerNode): void {
+    if (!node.containerId) {
+      void this.router.navigate(["/shared-brains"]);
+      return;
+    }
+    void this.router.navigate(["/shared", node.orgId, node.containerId]);
+  }
+
+  /** A received item opens read-only in the org viewer, never the local editor. */
+  protected openSharedItem(item: SharedItemRow): void {
+    void this.router.navigate(["/org-item", item.itemId]);
+  }
+
+  /**
+   * A container can be offered to an Org when it is not sealed and is not the
+   * reserved Notes root.
+   *
+   * Sealed is refused by the backend too — this only avoids offering an action
+   * that always errors.
+   */
+  protected canShare(container: ContainerNode): boolean {
+    return !container.isRoot && !(container.locked && !container.unlocked);
+  }
+
+  protected openShareSheet(container: ContainerNode): void {
+    this.shareRequest.set(container);
+  }
+
+  protected closeShareSheet(): void {
+    this.shareRequest.set(null);
+  }
+
+  protected async onContainerShared(): Promise<void> {
+    this.shareRequest.set(null);
+    await this.sharedWorkspace.load();
+    this.toast.success("Shared to your organization");
+  }
+
+  /** The container whose share sheet is open, if any. */
+  protected readonly shareRequest = signal<ContainerNode | null>(null);
 
   /**
    * A container that is sealed and not unlocked for this session cannot take a new
@@ -1023,5 +1236,21 @@ export class WorkspaceTreeComponent {
     void this.notes.selectFolder(null);
     this.folders.selectFolder(null);
     void this.router.navigate(["/library"]);
+  }
+}
+
+/** Read the persisted shared-container disclosure set, tolerating a blocked store. */
+function readStoredSharedSet(): ReadonlySet<string> {
+  try {
+    const raw = localStorage.getItem(EXPANDED_SHARED_KEY);
+    if (!raw) {
+      return new Set();
+    }
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((v): v is string => typeof v === "string"))
+      : new Set();
+  } catch {
+    return new Set();
   }
 }
