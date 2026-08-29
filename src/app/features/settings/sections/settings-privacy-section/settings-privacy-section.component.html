@@ -225,6 +225,32 @@
                 >.
               </p>
 
+              <!--
+                The sentence above is written in the present tense, so it MUST NOT stand alone
+                when the server did not come up. A bind failure used to be a log line nobody
+                reads while this screen kept promising a running server AND handed over a config
+                to paste — found on a real machine where an unrelated process had held the port
+                for two days, in the SHIPPED app.
+                `portInUse` gets its own branch because the listener retries it on its own: the
+                user quits the other app and Murmur reconnects, with no restart to instruct.
+              -->
+              @if (mcpPortInUse()) {
+                <div class="banner is-warning" role="status">
+                  <span>
+                    Not running: another app on this Mac is using port
+                    {{ mcpStatus().port }}. Quit it and Murmur will connect on its
+                    own — no restart needed.
+                  </span>
+                </div>
+              } @else if (!mcpRunning()) {
+                <div class="banner is-warning" role="status">
+                  <span>
+                    Not running yet. If this doesn't clear on its own, restart
+                    Murmur — Claude can't read your meetings until it does.
+                  </span>
+                </div>
+              }
+
               <div class="mcp-config">
                 <div class="mcp-config-head">
                   <span class="mcp-config-label text-muted">Config</span>
@@ -232,7 +258,7 @@
                     type="button"
                     class="btn mcp-copy-btn"
                     [class.is-copied]="configCopied()"
-                    [disabled]="!mcpConfig()"
+                    [disabled]="!mcpConfig() || !mcpRunning()"
                     (click)="copyMcpConfig()"
                     [attr.aria-label]="
                       configCopied() ? 'Copied' : 'Copy config to clipboard'
@@ -298,6 +324,13 @@
                 }
               </div>
 
+              <!--
+                Gated on the CONFIG only, never on listener status. The config block above is on
+                screen whenever there is a config, and this is the sentence that says the text
+                carries a credential and what leaking it costs — hiding it behind "is the server
+                up" would trade a security disclosure for a status banner.
+                `e2e/settings/privacy-honesty.spec.ts` caught exactly that mistake here.
+              -->
               @if (mcpConfig()) {
                 <span class="mcp-hint text-muted">
                   Add this to your Claude config, then restart Claude. It contains
