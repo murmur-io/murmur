@@ -601,6 +601,10 @@ pub(crate) async fn share_container_to_org_inner(
     scrub: bool,
     app: Option<&AppHandle>,
 ) -> Result<ContainerShareResult> {
+    // Consent BEFORE enumeration. A refusal that arrives after walking the whole Space is the same
+    // refusal, but it reads as "we looked at everything, then decided" — and the gate exists
+    // precisely so nothing is looked at on behalf of an upload the user has not agreed to.
+    require_org_egress_consent(state)?;
     let plan = plan_container_share(state, org_id, folder_id)?;
     let total = plan.total_items() as u32;
     let mut done = 0u32;
