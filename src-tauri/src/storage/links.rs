@@ -153,7 +153,7 @@ fn link_endpoint_sealed_at_rest_tx(
                       JOIN org_state os ON os.org_id = oi.org_id
                      WHERE oi.org_id = ?1 AND oi.doc_id = ?2
                         AND oi.tombstoned = 0 AND oi.is_current = 1
-                        AND COALESCE(oi.source_kind, '') != 'task'
+                        AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                         AND os.context_enabled = 1
                       LIMIT 1",
                     rusqlite::params![org_id, doc_id],
@@ -428,7 +428,7 @@ impl Db {
                        FROM org_items oi
                        JOIN org_state os ON os.org_id = oi.org_id
                       WHERE oi.tombstoned = 0
-                        AND COALESCE(oi.source_kind, '') != 'task'
+                        AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                         AND os.context_enabled = 1
                         AND ((oi.doc_id IS NOT NULL AND oi.is_current = 1)
                              OR oi.doc_id IS NULL)
@@ -1425,7 +1425,7 @@ impl Db {
                        JOIN org_state os ON os.org_id = oi.org_id
                       WHERE oi.org_id = ?1 AND oi.doc_id = ?2
                         AND oi.tombstoned = 0 AND oi.is_current = 1
-                        AND COALESCE(oi.source_kind, '') != 'task'
+                        AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                         AND os.context_enabled = 1
                       LIMIT 1",
                     rusqlite::params![org_id, doc_id],
@@ -3215,7 +3215,7 @@ impl Db {
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.org_id = ?1 AND oi.doc_id = ?2
                 AND oi.tombstoned = 0 AND oi.is_current = 1 AND os.context_enabled = 1
-                AND COALESCE(oi.source_kind, '') != 'task'
+                AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
               LIMIT 1",
             rusqlite::params![org_id, doc_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -3235,7 +3235,7 @@ impl Db {
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
-                AND COALESCE(oi.source_kind, '') != 'task'
+                AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                 AND oi.doc_id IS NOT NULL AND oi.is_current = 1
               LIMIT 1",
                 rusqlite::params![item_id],

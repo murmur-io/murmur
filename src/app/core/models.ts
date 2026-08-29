@@ -3855,3 +3855,16 @@ export interface McpStatus {
   state: McpListenerState;
   port: number;
 }
+
+/**
+ * One LOCAL item this user publishes to an org on its own — not because a
+ * container carries it. Drives the sidebar marker on the user's own rows.
+ * Mirrors the Rust `OrgShareTargetRow`.
+ */
+export interface OrgShareTargetRow {
+  kind: "meeting" | "note";
+  id: string;
+  orgId: string;
+  orgName: string;
+  access: OrgAccess;
+}

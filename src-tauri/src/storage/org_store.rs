@@ -2984,7 +2984,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.tombstoned = 0
-                    AND COALESCE(oi.source_kind, '') != 'task'
+                    AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND (?1 IS NULL OR oi.item_id > ?1)
                     AND EXISTS (SELECT 1 FROM org_chunks oc WHERE oc.item_id = oi.item_id)
@@ -3051,7 +3051,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.tombstoned = 0
-                    AND COALESCE(oi.source_kind, '') != 'task'
+                    AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND (?1 IS NULL OR oi.item_id > ?1)
                     AND EXISTS (
@@ -3124,7 +3124,7 @@ impl Db {
                    FROM org_items oi
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.item_id = ?1 AND oi.tombstoned = 0
-                    AND COALESCE(oi.source_kind, '') != 'task'
+                    AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)",
                 rusqlite::params![item_id],
                 |r| {
@@ -3199,7 +3199,7 @@ impl Db {
             .query_row(
                 "SELECT seq, rev, generation, content_sha256
                    FROM org_items WHERE item_id = ?1 AND tombstoned = 0
-                    AND COALESCE(source_kind, '') != 'task'
+                    AND COALESCE(source_kind, '') NOT IN ('task','container')
                     AND (doc_id IS NULL OR is_current = 1)",
                 rusqlite::params![batch.item_id],
                 |r| {
@@ -3704,7 +3704,7 @@ impl Db {
                JOIN org_items oi ON oi.item_id = oc.item_id
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.tombstoned = 0 AND os.context_enabled = 1
-                AND COALESCE(oi.source_kind, '') != 'task'
+                AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)
               ORDER BY knn.distance ASC, oi.item_id ASC";
         let blob = crate::embed::vec_to_int8_blob(query_vec);
@@ -3766,7 +3766,7 @@ impl Db {
                JOIN org_items oi ON oi.item_id = oc.item_id
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
-                AND COALESCE(oi.source_kind, '') != 'task'
+                AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)
               ORDER BY rank ASC, oi.item_id ASC
               LIMIT ?2";
@@ -3838,7 +3838,7 @@ impl Db {
                       WHERE fts_org_chunks MATCH ?
                         AND oi.tombstoned = 0
                         AND os.context_enabled = 1
-                        AND COALESCE(oi.source_kind, '') != 'task'
+                        AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                         AND (oi.doc_id IS NULL OR oi.is_current = 1)
                       ORDER BY rank ASC, oi.item_id ASC
                       LIMIT ?"
@@ -3908,7 +3908,7 @@ impl Db {
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
-                AND COALESCE(oi.source_kind, '') != 'task'
+                AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)",
             rusqlite::params![item_id],
             |r| {
@@ -4301,7 +4301,7 @@ impl Db {
                 "SELECT item_id, doc_id, title, author_hint, created_at, seq, source_kind
                    FROM org_items
                   WHERE org_id = ?1 AND tombstoned = 0
-                    AND COALESCE(source_kind, '') != 'task'
+                    AND COALESCE(source_kind, '') NOT IN ('task','container')
                     AND (doc_id IS NULL OR is_current = 1)
                   ORDER BY seq DESC
                   LIMIT 500",
@@ -4347,7 +4347,7 @@ impl Db {
                FROM org_items oi
                JOIN org_state os ON os.org_id = oi.org_id
               WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
-                AND COALESCE(oi.source_kind, '') != 'task'
+                AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                 AND (oi.doc_id IS NULL OR oi.is_current = 1)",
             rusqlite::params![org_id],
             |r| r.get::<_, i64>(0),
@@ -4387,7 +4387,7 @@ impl Db {
                    JOIN org_items oi ON oi.item_id = oc.item_id
                    JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.org_id = ?1 AND oi.tombstoned = 0
-                    AND COALESCE(oi.source_kind, '') != 'task'
+                    AND COALESCE(oi.source_kind, '') NOT IN ('task','container')
                     AND (oi.doc_id IS NULL OR oi.is_current = 1)
                     AND NOT EXISTS (SELECT 1 FROM org_vec_chunks v WHERE v.chunk_id = oc.id)
                   LIMIT ?2",

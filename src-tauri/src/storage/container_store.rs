@@ -485,6 +485,19 @@ impl Db {
         Ok(())
     }
 
+
+    /// The folder one document lives in, for the share-marker read gate.
+    pub fn document_folder_id(&self, document_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT folder_id FROM documents WHERE id = ?1",
+            rusqlite::params![document_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     // ── PRIVATE: this device's own arrangement of received objects ────────────────────────────
 
     /// File a received container or document somewhere in this user's own tree.
