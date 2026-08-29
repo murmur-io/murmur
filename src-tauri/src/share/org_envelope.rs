@@ -1055,4 +1055,18 @@ mod tests {
         let back = OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap();
         assert_eq!(back.placement.unwrap().position, -3);
     }
+
+    #[test]
+    fn the_republish_comparison_envelope_must_include_placement() {
+        // The republish path compares a freshly-built envelope's hash against the stored one to
+        // decide whether anything changed. If placement were left out of that comparison envelope,
+        // a note DRAGGED between two shared folders would hash equal to its own published revision
+        // and would never move for anybody else.
+        let base = plain_env();
+        let placed = base.clone().with_placement(Some(OrgPlacement {
+            parent_container_id: "c-1".into(),
+            position: 0,
+        }));
+        assert_ne!(base.content_sha256(), placed.content_sha256());
+    }
 }

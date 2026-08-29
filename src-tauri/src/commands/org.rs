@@ -4231,6 +4231,7 @@ pub(crate) async fn share_to_org_with_access_inner(
         Some(document_id),
         scrub,
         access,
+        None,
         OrgWorkPolicy::manual(),
         None,
     )
@@ -4246,6 +4247,29 @@ async fn share_to_org_notifying(
     access: crate::share::org_dto::OrgItemAccess,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
+    share_to_org_placed_notifying(
+        state, org_id, meeting_id, document_id, scrub, access, None, app,
+    )
+    .await
+}
+
+/// The container-aware twin of [`share_to_org_notifying`]: the same gate order, plus WHERE the
+/// document is filed and whether the user asked for this share themselves.
+///
+/// A `placement` of `None` is exactly today's standalone share, down to the wire version — the
+/// envelope only reaches v4 when a real placement exists, so a member on an older client keeps
+/// receiving every share that is not container-owned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn share_to_org_placed_notifying(
+    state: &AppState,
+    org_id: &str,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+    access: crate::share::org_dto::OrgItemAccess,
+    placement: Option<ContainerPlacement>,
+    app: Option<&AppHandle>,
+) -> Result<OrgShareEntry, AppError> {
     let _mutation = state.org_share_mutation_lock.lock().await;
     share_to_org_inner_with_policy(
         state,
@@ -4254,6 +4278,7 @@ async fn share_to_org_notifying(
         document_id,
         scrub,
         access,
+        placement,
         OrgWorkPolicy::manual(),
         app,
     )
@@ -4270,6 +4295,7 @@ async fn share_to_org_inner_with_policy(
     document_id: Option<String>,
     scrub: bool,
     access: crate::share::org_dto::OrgItemAccess,
+    placement: Option<ContainerPlacement>,
     policy: OrgWorkPolicy,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
@@ -4342,10 +4368,33 @@ async fn share_to_org_inner_with_policy(
         scrub,
         1,
         access,
+        placement,
         policy,
         app,
     )
     .await
+}
+
+/// Where a document is filed inside a shared container, and whether the user asked for its share.
+///
+/// `explicit` is separate from the placement itself because the two answer different questions:
+/// the placement says WHERE the document sits, `explicit` says whether unsharing the container may
+/// withdraw it. A note the user shared deliberately and later dragged into a shared folder is
+/// placed but still explicit — unsharing the folder must leave it live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerPlacement {
+    pub(crate) parent_container_id: String,
+    pub(crate) position: i64,
+    pub(crate) explicit: bool,
+}
+
+impl ContainerPlacement {
+    fn envelope(&self) -> crate::share::org_envelope::OrgPlacement {
+        crate::share::org_envelope::OrgPlacement {
+            parent_container_id: self.parent_container_id.clone(),
+            position: self.position,
+        }
+    }
 }
 
 /// Collapse accidental DUPLICATE live (`uploaded`) org items for ONE (org, source) down to the earliest,
@@ -6616,6 +6665,7 @@ async fn publish_org_body_with_policy(
     scrub: bool,
     rev: u32,
     access: crate::share::org_dto::OrgItemAccess,
+    placement: Option<ContainerPlacement>,
     policy: OrgWorkPolicy,
     app: Option<&AppHandle>,
 ) -> Result<OrgShareEntry, AppError> {
@@ -6714,7 +6764,8 @@ async fn publish_org_body_with_policy(
         rev,
         source_kind,
     )
-    .with_attachments(attachments);
+    .with_attachments(attachments)
+    .with_placement(placement.as_ref().map(ContainerPlacement::envelope));
     let content_sha = env.content_sha256();
     // SB-3 row-amplification fix: REUSE any existing retriable (`queued`/`failed`) row for this
     // logical share key (org + meeting-or-document) instead of minting a fresh row on every sweep
@@ -6836,6 +6887,16 @@ async fn publish_org_body_with_policy(
     state
         .db
         .set_org_share_document_metadata(&row_id, &doc_id, access.as_str())?;
+    // Record the placement on the journal row BEFORE dispatch, so the republish path — which reads
+    // the row, not the caller — rebuilds the identical envelope on every later revision.
+    if let Some(placement) = placement.as_ref() {
+        state.db.set_org_share_placement(
+            &row_id,
+            Some(&placement.parent_container_id),
+            placement.position,
+            placement.explicit,
+        )?;
+    }
     let (initial_row_version, initial_dirty_counter) =
         state.db.org_share_source_counters(&row_id)?;
 
@@ -7509,6 +7570,16 @@ async fn republish_org_shares_for_source_with_policy(
         // compared against a hash at the SAME rev — else every republish would look "changed" purely
         // because the rev bumped. Build the comparison envelope at `row.rev`; only the PUBLISH envelope
         // uses `new_rev`.
+        // The row's OWN placement, not the caller's: a republish must rebuild the envelope the
+        // last publish produced, or the comparison hash would differ for a reason that is not a
+        // content change and every save would mint a needless revision.
+        let row_placement =
+            row.parent_container_id
+                .as_ref()
+                .map(|parent| crate::share::org_envelope::OrgPlacement {
+                    parent_container_id: parent.clone(),
+                    position: row.position,
+                });
         let cmp_env = crate::share::org_envelope::OrgEnvelope::new(
             kind,
             title.clone(),
@@ -7518,7 +7589,8 @@ async fn republish_org_shares_for_source_with_policy(
             row.rev,
             source_kind,
         )
-        .with_attachments(attachments.clone());
+        .with_attachments(attachments.clone())
+        .with_placement(row_placement.clone());
         if recovered_put.is_some()
             && row.content_sha256.as_deref() != Some(cmp_env.content_sha256().as_slice())
         {
@@ -7666,7 +7738,8 @@ async fn republish_org_shares_for_source_with_policy(
             new_rev,
             source_kind,
         )
-        .with_attachments(attachments);
+        .with_attachments(attachments)
+        .with_placement(row_placement);
         let content_sha = env.content_sha256();
         if pending_post && row.content_sha256.as_deref() != Some(content_sha.as_slice()) {
             // Preserve the already-dispatched immutable witness. A newer local source is
@@ -9628,6 +9701,16 @@ async fn org_sweep_pending_with_policy(
                 row.scrub,
                 crate::share::org_dto::OrgItemAccess::parse(&row.access)
                     .unwrap_or(crate::share::org_dto::OrgItemAccess::View),
+                // Replay the row's OWN placement. A retry that dropped it would publish the note
+                // outside the shared folder it was queued for, and the container sweep would then
+                // see a document it thought it had filed sitting loose in the org.
+                row.parent_container_id
+                    .clone()
+                    .map(|parent_container_id| ContainerPlacement {
+                        parent_container_id,
+                        position: row.position,
+                        explicit: row.explicit,
+                    }),
                 policy,
                 app,
             )
@@ -11487,7 +11570,11 @@ pub(crate) async fn org_update_own_item_notifying(
         new_rev,
         source_kind,
     )
-    .with_attachments(attachments);
+    .with_attachments(attachments)
+    // PRESERVE the placement this document already carries. An editor is changing the TEXT, not
+    // where the document lives — dropping the placement here would silently evict the note from
+    // its shared folder for every member the moment somebody else edited it.
+    .with_placement(state.db.org_item_placement(item_id)?);
     let content_sha = env.content_sha256();
 
     // (5) SEAL under the OCK + LOCAL OPEN-VERIFY (verify-before-egress). AAD nonce = hex(content_sha256),

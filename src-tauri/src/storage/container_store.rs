@@ -359,6 +359,116 @@ impl Db {
         Ok(rows)
     }
 
+    // ── PLACEMENT: where a published or received document sits inside a container ─────────────
+
+    /// The container placement one OUTBOUND share row carries, if any.
+    pub fn org_share_placement(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<crate::share::org_envelope::OrgPlacement>> {
+        let conn = self.lock();
+        let row: Option<(Option<String>, i64)> = conn
+            .query_row(
+                "SELECT parent_container_id, position FROM org_shares WHERE id = ?1",
+                rusqlite::params![share_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(row.and_then(|(parent, position)| {
+            parent.map(|parent_container_id| crate::share::org_envelope::OrgPlacement {
+                parent_container_id,
+                position,
+            })
+        }))
+    }
+
+    /// The container placement one RECEIVED item carries, if any.
+    ///
+    /// Read before an editor republishes a document they do not own: without it, one edit would
+    /// drop the placement and silently evict the note from the shared folder for everyone.
+    pub fn org_item_placement(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<crate::share::org_envelope::OrgPlacement>> {
+        let conn = self.lock();
+        let row: Option<(Option<String>, i64)> = conn
+            .query_row(
+                "SELECT parent_container_id, position FROM org_items WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(row.and_then(|(parent, position)| {
+            parent.map(|parent_container_id| crate::share::org_envelope::OrgPlacement {
+                parent_container_id,
+                position,
+            })
+        }))
+    }
+
+    /// File (or unfile) one outbound share inside a container, and record whether the user asked
+    /// for the share themselves.
+    pub fn set_org_share_placement(
+        &self,
+        share_id: &str,
+        parent_container_id: Option<&str>,
+        position: i64,
+        explicit: bool,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET parent_container_id=?2, position=?3, explicit=?4 WHERE id=?1",
+            rusqlite::params![share_id, parent_container_id, position, i64::from(explicit)],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Every LIVE-or-recoverable outbound share filed under one container.
+    ///
+    /// Deliberately excludes rows the sweep already withdrew, so a settled container reports no
+    /// work and the sweep stays idempotent.
+    pub fn org_shares_in_container(
+        &self,
+        org_id: &str,
+        container_id: &str,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                  WHERE org_id = ?1 AND parent_container_id = ?2
+                    AND state NOT IN ('revoked')
+                  ORDER BY position, created_at",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id, container_id], Self::map_org_share)
+            .map_err(map_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_err)?;
+        Ok(rows)
+    }
+
+    /// Record a received item's placement, taken straight off its v4 envelope.
+    pub fn set_org_item_placement(
+        &self,
+        item_id: &str,
+        parent_container_id: Option<&str>,
+        position: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_items SET parent_container_id=?2, position=?3 WHERE item_id=?1",
+            rusqlite::params![item_id, parent_container_id, position],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     // ── PRIVATE: this device's own arrangement of received objects ────────────────────────────
 
     /// File a received container or document somewhere in this user's own tree.

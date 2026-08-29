@@ -1979,6 +1979,15 @@ pub struct OrgShareRow {
     pub expected_owner_user_id: Option<String>,
     pub source_version: u64,
     pub republish_dirty: u64,
+    /// The shared container this document was published under, when the container sweep owns it.
+    /// `None` for a standalone share — never guessed.
+    pub parent_container_id: Option<String>,
+    /// Ordering inside that container.
+    pub position: i64,
+    /// True when the user shared this document THEMSELVES; false when it exists only because its
+    /// container is shared. This is what makes unsharing a container safe: only `explicit == false`
+    /// rows are withdrawn with it.
+    pub explicit: bool,
     pub created_at: String,
     pub updated_at: String,
 }
