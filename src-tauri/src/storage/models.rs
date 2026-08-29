@@ -2604,7 +2604,7 @@ pub struct OrgContainerRow {
     pub org_id: String,
     pub container_id: String,
     pub item_id: String,
-    /// `"space"` or `"folder"` — the wire level, already validated by `ContainerLevel::from_str`.
+    /// `"space"` or `"folder"` — the wire level, already validated by `ContainerLevel::parse`.
     pub level: String,
     pub name: String,
     pub emoji: Option<String>,

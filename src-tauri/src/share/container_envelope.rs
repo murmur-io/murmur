@@ -54,7 +54,10 @@ impl ContainerLevel {
     /// Parse the stored/wire label. Unknown input fails closed rather than defaulting to a level,
     /// because guessing would silently promote a folder to a top-level Space in another member's
     /// sidebar.
-    pub fn from_str(s: &str) -> Result<Self> {
+    ///
+    /// Named `parse`, not `from_str`, to stay clear of `std::str::FromStr` — the same name
+    /// `OrgItemAccess::parse` already uses in this tree.
+    pub fn parse(s: &str) -> Result<Self> {
         match s {
             "space" => Ok(Self::Space),
             "folder" => Ok(Self::Folder),
@@ -260,10 +263,10 @@ mod tests {
         assert_eq!(ContainerLevel::Space.as_str(), "space");
         assert_eq!(ContainerLevel::Folder.as_str(), "folder");
         assert_eq!(
-            ContainerLevel::from_str("space").unwrap(),
+            ContainerLevel::parse("space").unwrap(),
             ContainerLevel::Space
         );
-        assert!(ContainerLevel::from_str("project").is_err());
+        assert!(ContainerLevel::parse("project").is_err());
     }
 
     #[test]
