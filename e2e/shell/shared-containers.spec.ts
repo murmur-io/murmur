@@ -1,0 +1,269 @@
+import { expect, test, type Page } from "@playwright/test";
+
+import { mockTauri } from "../settings-ai/mock-invoke";
+
+/**
+ * Shared containers in the Spaces sidebar: a received Space as its own
+ * top-level row, loose received content inside the virtual "Shared Brains"
+ * Space, the shared marker on both sides, and the read-only structure a
+ * received container keeps at every access level.
+ *
+ * Every fixture key below was copied from the RUST DTOs
+ * (`SharedWorkspace` / `SharedContainerNode` / `SharedItemRow` /
+ * `ContainerShareStatus` in `commands/org_containers.rs`), not from the
+ * frontend's own interface. A hand-written mock DEFINES a shape; it does not
+ * verify one — the serialized-key oracle in
+ * `commands/tests/container_share_tests.rs` is what proves the backend agrees.
+ */
+const LOCAL_FOREST = [
+  {
+    id: "p-acme",
+    name: "Acme",
+    kind: "note",
+    level: "project",
+    emoji: null,
+    tint: null,
+    locked: false,
+    unlocked: false,
+    isRoot: false,
+    folders: [],
+    groups: [],
+  },
+  {
+    id: "p-clients",
+    name: "Clients",
+    kind: "note",
+    level: "project",
+    emoji: null,
+    tint: null,
+    locked: false,
+    unlocked: false,
+    isRoot: false,
+    folders: [],
+    groups: [],
+  },
+  {
+    id: "p-sealed",
+    name: "Personal",
+    kind: "note",
+    level: "project",
+    emoji: null,
+    tint: null,
+    locked: true,
+    unlocked: false,
+    isRoot: false,
+    folders: [],
+    groups: [],
+  },
+];
+
+const sharedItem = (itemId: string, title: string, kind: string) => ({
+  itemId,
+  docId: `doc-${itemId}`,
+  title,
+  kind,
+  authorHint: "kgm004a",
+  createdAt: "2026-08-20T09:00:00Z",
+  orgId: "org-siema",
+  orgName: "Siema",
+  access: "view",
+  position: 0,
+});
+
+const sharedNode = (
+  containerId: string | null,
+  name: string,
+  level: string,
+  extra: Record<string, unknown> = {},
+) => ({
+  containerId,
+  orgId: "org-siema",
+  orgName: "Siema",
+  name,
+  level,
+  emoji: null,
+  tint: null,
+  access: "view",
+  authorHint: "kgm004a",
+  folders: [],
+  items: [],
+  localParentId: null,
+  position: 0,
+  ...extra,
+});
+
+const SHARED_WORKSPACE = {
+  spaces: [
+    sharedNode("c-partners", "Partners", "space", {
+      folders: [
+        sharedNode("c-contracts", "Contracts", "folder", {
+          items: [sharedItem("si-contract", "Reseller agreement", "document")],
+        }),
+      ],
+      items: [sharedItem("si-kickoff", "Partner kickoff", "meeting")],
+    }),
+  ],
+  sharedBrains: {
+    ...sharedNode(null, "Shared Brains", "virtual", {
+      folders: [sharedNode("c-loose", "Research", "folder")],
+      items: [sharedItem("si-loose", "Pricing thoughts", "document")],
+    }),
+    orgId: "",
+    orgName: "",
+    authorHint: "",
+  },
+};
+
+const CONTAINER_SHARES = [
+  {
+    orgId: "org-siema",
+    orgName: "Siema",
+    folderId: "p-clients",
+    containerId: "c-clients",
+    access: "view",
+    isRoot: true,
+    state: "published",
+  },
+];
+
+async function openSidebar(
+  page: Page,
+  constants: Record<string, unknown> = {},
+): Promise<void> {
+  await mockTauri(
+    page,
+    {},
+    {
+      list_workspace_tree: LOCAL_FOREST,
+      list_shared_workspace: SHARED_WORKSPACE,
+      list_container_share_status: CONTAINER_SHARES,
+      ...constants,
+    },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await expect(
+    page.getByRole("complementary", { name: "Spaces sidebar" }),
+  ).toBeVisible();
+}
+
+test("a received Space is its own top-level sidebar row", async ({ page }) => {
+  await openSidebar(page);
+  const partners = page.getByRole("treeitem", { name: /Partners/ });
+  await expect(partners).toBeVisible();
+  // Top level, beside the user's own Spaces — not buried inside Shared Brains.
+  await expect(partners).toHaveAttribute("aria-level", "1");
+});
+
+test("loose received content lives inside the virtual Shared Brains Space", async ({
+  page,
+}) => {
+  await openSidebar(page);
+  const brains = page.getByRole("treeitem", { name: /Shared Brains/ });
+  await expect(brains).toBeVisible();
+  await expect(brains).toHaveAttribute("aria-level", "1");
+
+  // Its contents appear only once expanded — a received folder and a loose note.
+  await expect(page.getByRole("treeitem", { name: /Research/ })).toHaveCount(0);
+  await brains.getByRole("button", { name: /Expand/ }).click();
+  await expect(page.getByRole("treeitem", { name: /Research/ })).toBeVisible();
+  await expect(
+    page.getByRole("treeitem", { name: /Pricing thoughts/ }),
+  ).toBeVisible();
+});
+
+test("the shared marker names the organization on both sides", async ({
+  page,
+}) => {
+  await openSidebar(page);
+
+  // RECEIVED: who shared it, and at what access.
+  const received = page.getByRole("img", {
+    name: /From Siema · kgm004a · View only/,
+  });
+  await expect(received).toHaveCount(1);
+
+  // SENT: where it goes, and at what access. One glyph, the sentence on hover.
+  const sent = page.getByRole("img", { name: /Shared to Siema · View only/ });
+  await expect(sent).toHaveCount(1);
+});
+
+test("a received container offers arrangement but never structure", async ({
+  page,
+}) => {
+  await openSidebar(page);
+  const partners = page.getByRole("treeitem", { name: /Partners/ });
+  await partners.getByRole("button", { name: /Actions for shared/ }).click();
+
+  // The user may file it in their OWN tree — that is device-local.
+  await expect(page.getByRole("menuitem", { name: /Keep in my Space/ })).toBeVisible();
+
+  // But its structure belongs to whoever shared it, at ANY access level.
+  await expect(page.getByRole("menuitem", { name: /^Rename/ })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: /^Delete/ })).toHaveCount(0);
+  await expect(
+    page.getByRole("menuitem", { name: /Create (note|folder|dashboard) here/ }),
+  ).toHaveCount(0);
+});
+
+test("a local Space offers Share to Org, and a sealed one does not", async ({
+  page,
+}) => {
+  await openSidebar(page);
+
+  const acme = page.getByRole("treeitem", { name: /Acme/ });
+  await acme.getByRole("button", { name: /Actions for Acme/ }).click();
+  await expect(page.getByTestId("share-container")).toHaveText(/Share to Org/);
+  await page.keyboard.press("Escape");
+
+  // An already-shared container says so instead of offering to share again.
+  const clients = page.getByRole("treeitem", { name: /Clients/ });
+  await clients.getByRole("button", { name: /Actions for Clients/ }).click();
+  await expect(page.getByTestId("share-container")).toHaveText(/Sharing/);
+  await page.keyboard.press("Escape");
+
+  // A SEALED container cannot be shared: its content is not readable, so
+  // offering the action would promise something the backend refuses.
+  const sealed = page.getByRole("treeitem", { name: /Personal/ });
+  await sealed.getByRole("button", { name: /Actions for Personal/ }).click();
+  await expect(page.getByTestId("share-container")).toHaveCount(0);
+});
+
+test("the share sheet names what is left behind before anything leaves", async ({
+  page,
+}) => {
+  await openSidebar(page, {
+    org_list_statuses: [
+      {
+        orgId: "org-siema",
+        name: "Siema",
+        role: "owner",
+        memberCount: 3,
+        consented: true,
+        lastSeq: 4,
+        itemCount: 2,
+        receivedCount: 5,
+        pendingShares: 0,
+        contextEnabled: true,
+      },
+    ],
+  });
+
+  const acme = page.getByRole("treeitem", { name: /Acme/ });
+  await acme.getByRole("button", { name: /Actions for Acme/ }).click();
+  await page.getByTestId("share-container").click();
+
+  const sheet = page.getByRole("dialog", { name: /Share this Space/ });
+  await expect(sheet).toBeVisible();
+  // The counts, and — the honesty invariant — what is deliberately NOT going.
+  await expect(sheet.getByText(/3 notes/)).toBeVisible();
+  await expect(sheet.getByText(/locked folder stays behind/)).toBeVisible();
+  await expect(sheet.getByText(/dashboard is not shared yet/)).toBeVisible();
+  await expect(
+    sheet.getByText(/Transcripts and audio are never shared/),
+  ).toBeVisible();
+  // View only is the fail-closed default.
+  await expect(
+    sheet.getByRole("button", { name: /View only/ }),
+  ).toHaveAttribute("aria-pressed", "true");
+});
