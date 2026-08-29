@@ -19,6 +19,7 @@
 //! on drop). The link key `L` never leaves the device and is never persisted or logged.
 
 pub mod client;
+pub mod container_envelope;
 pub mod envelope;
 pub mod opaque_client;
 pub mod org_dto;

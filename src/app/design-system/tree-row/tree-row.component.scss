@@ -29,8 +29,7 @@
   background: var(--shell-active-bg);
   box-shadow: var(--shell-active-shadow);
 }
-:host(.is-selected) .row-main,
-:host(.is-selected) .row-icon {
+:host(.is-selected) .row-main {
   color: var(--shell-active-text);
 }
 
@@ -117,6 +116,27 @@
   display: inline-flex;
   flex: none;
   color: var(--text-muted);
+}
+.row-icon[data-icon="space"] {
+  color: var(--accent);
+}
+.row-icon[data-icon="folder"] {
+  color: var(--warning);
+}
+.row-icon[data-icon="meeting"] {
+  color: var(--graph-meeting);
+}
+.row-icon[data-icon="note"] {
+  color: var(--graph-note);
+}
+.row-icon[data-icon="task"] {
+  color: var(--success);
+}
+.row-icon[data-icon="dashboard"] {
+  color: var(--graph-document);
+}
+.row-icon[data-icon="locked"] {
+  color: var(--danger);
 }
 .row-label {
   overflow: hidden;

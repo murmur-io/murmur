@@ -50,15 +50,42 @@
       data-tauri-drag-region
       aria-hidden="true"
     ></span>
-    <span class="label ready-label" data-tauri-drag-region>
-      Ready to record
-    </span>
+    <label class="destination-field">
+      <span class="sr-only">Save recording in</span>
+      <select
+        class="destination-picker"
+        aria-label="Recording destination"
+        data-testid="bar-recording-destination"
+        [value]="selectedDestinationId() ?? ''"
+        [disabled]="store.isBusy()"
+        (change)="selectDestination($event)"
+      >
+        <option value="">— Unfiled · Default</option>
+        @for (destination of destinations(); track destination.id) {
+          <option
+            [value]="destination.id"
+            [disabled]="destination.blocked"
+            [attr.data-testid]="'bar-destination-' + destination.id"
+          >
+            @if (destination.emoji) {
+              {{ destination.emoji }}
+            } @else if (destination.level === "project") {
+              ▦
+            } @else {
+              ▱
+            }
+            {{ destination.level === "project" ? "Space" : "Folder" }} ·
+            {{ destination.label }}{{ destination.blocked ? " · Locked" : "" }}
+          </option>
+        }
+      </select>
+    </label>
     <span class="kbd" data-tauri-drag-region aria-hidden="true">⌘⇧R</span>
     <button
       type="button"
       class="circle rec"
-      (click)="store.start()"
-      [disabled]="store.isBusy()"
+      (click)="startSelected()"
+      [disabled]="store.isBusy() || !destinationReady()"
       aria-label="Start recording"
     >
       <span class="dot" aria-hidden="true"></span>

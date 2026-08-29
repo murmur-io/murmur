@@ -25,14 +25,23 @@ const ORG_ITEM_AAD_V1: &str = "murmur-org/v1|org-item";
 /// The envelope wire version. Bump only for a breaking canonical-format change (readers reject an
 /// unknown version fail-closed).
 ///
-/// v1 → v2 appends `source_kind`; v2 → v3 appends a canonical attachment manifest. Readers retain
-/// byte-identical parsing/re-serialization of already-published v1 and v2 envelopes.
-pub const ORG_ENVELOPE_VERSION: u16 = 3;
+/// v1 → v2 appends `source_kind`; v2 → v3 appends a canonical attachment manifest; v3 → v4 appends
+/// an optional container PLACEMENT. Readers retain byte-identical parsing/re-serialization of
+/// already-published v1, v2 and v3 envelopes.
+///
+/// v4 IS CONDITIONAL, and that is load-bearing. [`OrgEnvelope::new`] still stamps v2 and
+/// [`OrgEnvelope::with_attachments`] still stamps v3; only [`OrgEnvelope::with_placement`] reaches
+/// v4. A reader that cannot parse a version SKIPS the item, so if every republish suddenly emitted
+/// v4 a member on an older build would stop receiving updates to notes they already hold. Confining
+/// the new version to content that is genuinely new — a document filed inside a shared container —
+/// keeps every standalone share working exactly as it does today.
+pub const ORG_ENVELOPE_VERSION: u16 = 4;
 
-/// The PREVIOUS wire version, still accepted on read for backward compatibility with envelopes
+/// The PREVIOUS wire versions, still accepted on read for backward compatibility with envelopes
 /// already published to org feeds before this device upgraded. See `ORG_ENVELOPE_VERSION` doc.
 const ORG_ENVELOPE_VERSION_V1: u16 = 1;
 const ORG_ENVELOPE_VERSION_V2: u16 = 2;
+const ORG_ENVELOPE_VERSION_V3: u16 = 3;
 
 /// The kind of authored content an org item carries. Serialized as a single tag byte in the canonical
 /// form (stable across versions).
@@ -48,6 +57,11 @@ pub enum OrgItemKind {
     /// claims only that exact sequence, so older clients continue to later Note/Summary cells rather
     /// than stalling or mis-parsing Task plaintext.
     Task,
+    /// A shared CONTAINER manifest — a Space or Folder published to the org. The canonical
+    /// `ContainerEnvelope` JSON lives in `markdown`. Tag 4 is reader-first compatible for the same
+    /// reason Task's tag 3 is: a client that predates containers terminal-skips the cell it cannot
+    /// decode and goes on to the next item rather than stalling.
+    Container,
 }
 
 impl OrgItemKind {
@@ -56,6 +70,7 @@ impl OrgItemKind {
             OrgItemKind::Note => 1,
             OrgItemKind::Summary => 2,
             OrgItemKind::Task => 3,
+            OrgItemKind::Container => 4,
         }
     }
     fn from_tag(t: u8) -> Result<Self> {
@@ -63,6 +78,7 @@ impl OrgItemKind {
             1 => Ok(OrgItemKind::Note),
             2 => Ok(OrgItemKind::Summary),
             3 => Ok(OrgItemKind::Task),
+            4 => Ok(OrgItemKind::Container),
             _ => Err(AppError::InvalidArg("unknown org item kind tag".into())),
         }
     }
@@ -72,6 +88,7 @@ impl OrgItemKind {
             OrgItemKind::Note => "note",
             OrgItemKind::Summary => "summary",
             OrgItemKind::Task => "task",
+            OrgItemKind::Container => "container",
         }
     }
 }
@@ -89,6 +106,9 @@ pub enum OrgSourceKind {
     Meeting,
     /// Org-only Task source. Stored in the local SQLCipher replica, never exported to the vault.
     Task,
+    /// A container manifest source (a local Space or Folder). Stored in `org_containers`, never in
+    /// `org_items`, and never exported to the vault.
+    Container,
 }
 
 impl OrgSourceKind {
@@ -97,6 +117,7 @@ impl OrgSourceKind {
             OrgSourceKind::Document => 1,
             OrgSourceKind::Meeting => 2,
             OrgSourceKind::Task => 3,
+            OrgSourceKind::Container => 4,
         }
     }
     fn from_tag(t: u8) -> Result<Self> {
@@ -104,6 +125,7 @@ impl OrgSourceKind {
             1 => Ok(OrgSourceKind::Document),
             2 => Ok(OrgSourceKind::Meeting),
             3 => Ok(OrgSourceKind::Task),
+            4 => Ok(OrgSourceKind::Container),
             _ => Err(AppError::InvalidArg("unknown org source kind tag".into())),
         }
     }
@@ -114,8 +136,20 @@ impl OrgSourceKind {
             OrgSourceKind::Document => "document",
             OrgSourceKind::Meeting => "meeting",
             OrgSourceKind::Task => "task",
+            OrgSourceKind::Container => "container",
         }
     }
+}
+
+/// WHERE a published document sits inside a shared container. Carried only by a v4 envelope; every
+/// standalone share leaves it `None` and stays on the wire version it uses today.
+///
+/// `parent_container_id` names a `ContainerEnvelope::container_id`, never a local `folders.id` —
+/// the relay must not receive a stable identifier from the owner's vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgPlacement {
+    pub parent_container_id: String,
+    pub position: i64,
 }
 
 /// The plaintext an org item carries (spec `OrgEnvelope v1`/`v2`). `author_hint` is a display label only
@@ -137,6 +171,11 @@ pub struct OrgEnvelope {
     pub source_kind: Option<OrgSourceKind>,
     /// Image bytes authenticated inside the OCK-sealed v3 envelope. Empty for parsed v1/v2 data.
     pub attachments: Vec<ShareAttachment>,
+    /// The shared container this document is filed under. `Some(..)` only on a v4 envelope; `None`
+    /// on every standalone share and on all parsed v1/v2/v3 data. It participates in
+    /// `content_sha256`, so MOVING a note between shared folders is a real content change and the
+    /// republish path sees it — without that, a moved note would compare equal and never republish.
+    pub placement: Option<OrgPlacement>,
 }
 
 impl OrgEnvelope {
@@ -163,6 +202,7 @@ impl OrgEnvelope {
             source_rev,
             source_kind: Some(source_kind),
             attachments: Vec::new(),
+            placement: None,
         }
     }
 
@@ -174,8 +214,22 @@ impl OrgEnvelope {
             return self;
         }
         attachments.sort_by(|a, b| a.id.cmp(&b.id));
-        self.version = ORG_ENVELOPE_VERSION;
+        self.version = self.version.max(ORG_ENVELOPE_VERSION_V3);
         self.attachments = attachments;
+        self
+    }
+
+    /// File this document inside a shared container, upgrading to v4 only when a placement really
+    /// exists. Calling it with `None` deliberately preserves the lower wire version, so a
+    /// standalone share keeps reaching members on older clients (see `ORG_ENVELOPE_VERSION`).
+    pub fn with_placement(mut self, placement: Option<OrgPlacement>) -> Self {
+        match placement {
+            Some(placement) => {
+                self.version = ORG_ENVELOPE_VERSION;
+                self.placement = Some(placement);
+            }
+            None => self.placement = None,
+        }
         self
     }
 
@@ -221,7 +275,7 @@ impl OrgEnvelope {
             let tag = self.source_kind.map(OrgSourceKind::tag).unwrap_or(0);
             out.push(tag);
         }
-        if self.version >= ORG_ENVELOPE_VERSION {
+        if self.version >= ORG_ENVELOPE_VERSION_V3 {
             out.extend_from_slice(&(self.attachments.len() as u32).to_le_bytes());
             for attachment in &self.attachments {
                 push_bytes(&mut out, attachment.id.as_bytes());
@@ -230,6 +284,19 @@ impl OrgEnvelope {
                 out.extend_from_slice(&attachment.height.to_le_bytes());
                 push_bytes(&mut out, &attachment.sha256);
                 push_bytes(&mut out, &attachment.data);
+            }
+        }
+        if self.version >= ORG_ENVELOPE_VERSION {
+            // v4 appends `has_placement(u8)` and, when set, the length-prefixed parent id + an
+            // i64 position. Nothing before this point moves, so v1/v2/v3 bytes re-serialize
+            // byte-identically and their `content_sha256` never shifts.
+            match &self.placement {
+                Some(placement) => {
+                    out.push(1);
+                    push_bytes(&mut out, placement.parent_container_id.as_bytes());
+                    out.extend_from_slice(&placement.position.to_le_bytes());
+                }
+                None => out.push(0),
             }
         }
         out
@@ -247,6 +314,7 @@ impl OrgEnvelope {
         let version = cur.take_u16()?;
         if version != ORG_ENVELOPE_VERSION_V1
             && version != ORG_ENVELOPE_VERSION_V2
+            && version != ORG_ENVELOPE_VERSION_V3
             && version != ORG_ENVELOPE_VERSION
         {
             return Err(AppError::InvalidArg(format!(
@@ -264,7 +332,7 @@ impl OrgEnvelope {
         } else {
             None
         };
-        let attachments = if version >= ORG_ENVELOPE_VERSION {
+        let attachments = if version >= ORG_ENVELOPE_VERSION_V3 {
             let count = cur.take_u32()? as usize;
             if count > murmur_protocol::caps::MAX_NOTE_ATTACHMENTS {
                 return Err(AppError::InvalidArg(
@@ -299,6 +367,33 @@ impl OrgEnvelope {
         } else {
             Vec::new()
         };
+        let placement = if version >= ORG_ENVELOPE_VERSION {
+            match cur.take_u8()? {
+                0 => None,
+                1 => {
+                    let parent_container_id = cur.take_str()?;
+                    if parent_container_id.trim().is_empty()
+                        || parent_container_id.len()
+                            > crate::share::container_envelope::MAX_CONTAINER_NAME_BYTES
+                    {
+                        return Err(AppError::InvalidArg(
+                            "org envelope placement parent is malformed".into(),
+                        ));
+                    }
+                    Some(OrgPlacement {
+                        parent_container_id,
+                        position: cur.take_i64()?,
+                    })
+                }
+                _ => {
+                    return Err(AppError::InvalidArg(
+                        "org envelope placement flag is malformed".into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         if cur.i != bytes.len() {
             return Err(AppError::InvalidArg(
                 "trailing bytes after org envelope".into(),
@@ -314,6 +409,7 @@ impl OrgEnvelope {
             source_rev,
             source_kind,
             attachments,
+            placement,
         })
     }
 
@@ -410,6 +506,12 @@ impl Cursor<'_> {
     fn take_u32(&mut self) -> Result<u32> {
         let s = self.take(4)?;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn take_i64(&mut self) -> Result<i64> {
+        let s = self.take(8)?;
+        Ok(i64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
     fn take_str(&mut self) -> Result<String> {
         let len = self.take_u32()? as usize;
@@ -595,7 +697,9 @@ mod tests {
             attachment("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2),
             attachment("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1),
         ]);
-        assert_eq!(e.version, ORG_ENVELOPE_VERSION);
+        // Attachments stamp v3, not the newest version: v4 is reserved for a container placement,
+        // and emitting it here would push an image-only share past clients that can read it today.
+        assert_eq!(e.version, ORG_ENVELOPE_VERSION_V3);
         assert_eq!(e.attachments[0].id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
         let bytes = e.to_canonical_bytes();
         let back = OrgEnvelope::from_canonical_bytes(&bytes).unwrap();
@@ -742,5 +846,227 @@ mod tests {
         let opened = open_org_envelope(&ock, &ct, "org-1", "item-2").unwrap();
         assert_eq!(opened, e);
         assert_eq!(opened.source_kind, Some(OrgSourceKind::Document));
+    }
+
+    // ── v4: container kind + document placement ──────────────────────────────────────────────
+
+    fn plain_env() -> OrgEnvelope {
+        OrgEnvelope::new(
+            OrgItemKind::Note,
+            "t",
+            "m",
+            "hint",
+            "2026-08-29T10:00:00Z",
+            1,
+            OrgSourceKind::Document,
+        )
+    }
+
+    #[test]
+    fn v2_bytes_round_trip_unchanged_after_v4_exists() {
+        let env = plain_env();
+        assert_eq!(
+            env.version, ORG_ENVELOPE_VERSION_V2,
+            "a text-only publish must stay on the v2 wire shape"
+        );
+        assert!(env.placement.is_none());
+        let bytes = env.to_canonical_bytes();
+        assert_eq!(OrgEnvelope::from_canonical_bytes(&bytes).unwrap(), env);
+    }
+
+    #[test]
+    fn placement_upgrades_to_v4_and_round_trips() {
+        let env = plain_env().with_placement(Some(OrgPlacement {
+            parent_container_id: "c-1".into(),
+            position: 7,
+        }));
+        assert_eq!(env.version, ORG_ENVELOPE_VERSION);
+        let back = OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap();
+        assert_eq!(back, env);
+        assert_eq!(back.placement.unwrap().position, 7);
+    }
+
+    #[test]
+    fn with_placement_none_keeps_the_lower_wire_version() {
+        let env = plain_env().with_placement(None);
+        assert_eq!(env.version, ORG_ENVELOPE_VERSION_V2);
+        assert!(env.placement.is_none());
+    }
+
+    #[test]
+    fn attachments_still_stamp_v3_not_v4() {
+        let attachment = ShareAttachment {
+            id: "a".into(),
+            mime_type: "image/png".into(),
+            width: 2,
+            height: 2,
+            sha256: vec![1; 32],
+            data: vec![9; 4],
+        };
+        let env = plain_env().with_attachments(vec![attachment]);
+        assert_eq!(env.version, ORG_ENVELOPE_VERSION_V3);
+        assert_eq!(
+            OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap(),
+            env
+        );
+    }
+
+    #[test]
+    fn attachments_and_placement_together_round_trip_at_v4() {
+        let attachment = ShareAttachment {
+            id: "a".into(),
+            mime_type: "image/png".into(),
+            width: 2,
+            height: 2,
+            sha256: vec![1; 32],
+            data: vec![9; 4],
+        };
+        let env = plain_env()
+            .with_attachments(vec![attachment])
+            .with_placement(Some(OrgPlacement {
+                parent_container_id: "c-1".into(),
+                position: 2,
+            }));
+        assert_eq!(env.version, ORG_ENVELOPE_VERSION);
+        let back = OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap();
+        assert_eq!(back, env);
+        assert_eq!(back.attachments.len(), 1);
+        assert!(back.placement.is_some());
+    }
+
+    #[test]
+    fn placement_applied_before_attachments_still_reaches_v4() {
+        // Builder order must not decide the wire version: `with_attachments` may run after
+        // `with_placement`, and dropping back to v3 would silently strip the placement block.
+        let attachment = ShareAttachment {
+            id: "a".into(),
+            mime_type: "image/png".into(),
+            width: 2,
+            height: 2,
+            sha256: vec![1; 32],
+            data: vec![9; 4],
+        };
+        let env = plain_env()
+            .with_placement(Some(OrgPlacement {
+                parent_container_id: "c-1".into(),
+                position: 2,
+            }))
+            .with_attachments(vec![attachment]);
+        assert_eq!(env.version, ORG_ENVELOPE_VERSION);
+        let back = OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap();
+        assert_eq!(back, env);
+    }
+
+    #[test]
+    fn container_kind_and_source_kind_round_trip() {
+        let env = OrgEnvelope::new(
+            OrgItemKind::Container,
+            "Klienci",
+            "{}",
+            "hint",
+            "now",
+            1,
+            OrgSourceKind::Container,
+        );
+        let back = OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap();
+        assert_eq!(back.kind, OrgItemKind::Container);
+        assert_eq!(back.source_kind, Some(OrgSourceKind::Container));
+        assert_eq!(OrgItemKind::Container.as_str(), "container");
+        assert_eq!(OrgSourceKind::Container.as_str(), "container");
+    }
+
+    #[test]
+    fn unknown_kind_tag_and_version_still_fail_closed() {
+        assert!(OrgItemKind::from_tag(5).is_err());
+        assert!(OrgSourceKind::from_tag(5).is_err());
+        let mut bytes = plain_env().to_canonical_bytes();
+        bytes[0] = 99;
+        assert!(OrgEnvelope::from_canonical_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn truncated_placement_fails_closed() {
+        let env = plain_env().with_placement(Some(OrgPlacement {
+            parent_container_id: "c".into(),
+            position: 1,
+        }));
+        let bytes = env.to_canonical_bytes();
+        assert!(OrgEnvelope::from_canonical_bytes(&bytes[..bytes.len() - 3]).is_err());
+    }
+
+    #[test]
+    fn a_malformed_placement_flag_fails_closed() {
+        let env = plain_env().with_placement(Some(OrgPlacement {
+            parent_container_id: "c".into(),
+            position: 1,
+        }));
+        let mut bytes = env.to_canonical_bytes();
+        // The placement flag is the byte right after the (empty) attachment count.
+        let flag = bytes.len() - (4 + 1 + 8);
+        bytes[flag] = 7;
+        assert!(OrgEnvelope::from_canonical_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn an_empty_placement_parent_fails_closed() {
+        let env = plain_env().with_placement(Some(OrgPlacement {
+            parent_container_id: " ".into(),
+            position: 1,
+        }));
+        assert!(OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).is_err());
+    }
+
+    #[test]
+    fn moving_a_note_between_containers_changes_the_content_hash() {
+        // Placement rides `content_sha256`, so the republish path sees a MOVE as a real change.
+        // Without this, a note dragged between two shared folders would compare equal to its own
+        // published revision and silently never move for anyone else.
+        let hash_for = |container: &str| {
+            plain_env()
+                .with_placement(Some(OrgPlacement {
+                    parent_container_id: container.into(),
+                    position: 0,
+                }))
+                .content_sha256()
+        };
+        assert_ne!(hash_for("c-1"), hash_for("c-2"));
+        assert_ne!(plain_env().content_sha256(), hash_for("c-1"));
+    }
+
+    #[test]
+    fn reordering_within_a_container_changes_the_content_hash() {
+        let hash_for = |position: i64| {
+            plain_env()
+                .with_placement(Some(OrgPlacement {
+                    parent_container_id: "c-1".into(),
+                    position,
+                }))
+                .content_sha256()
+        };
+        assert_ne!(hash_for(0), hash_for(1));
+    }
+
+    #[test]
+    fn a_negative_position_round_trips() {
+        let env = plain_env().with_placement(Some(OrgPlacement {
+            parent_container_id: "c-1".into(),
+            position: -3,
+        }));
+        let back = OrgEnvelope::from_canonical_bytes(&env.to_canonical_bytes()).unwrap();
+        assert_eq!(back.placement.unwrap().position, -3);
+    }
+
+    #[test]
+    fn the_republish_comparison_envelope_must_include_placement() {
+        // The republish path compares a freshly-built envelope's hash against the stored one to
+        // decide whether anything changed. If placement were left out of that comparison envelope,
+        // a note DRAGGED between two shared folders would hash equal to its own published revision
+        // and would never move for anybody else.
+        let base = plain_env();
+        let placed = base.clone().with_placement(Some(OrgPlacement {
+            parent_container_id: "c-1".into(),
+            position: 0,
+        }));
+        assert_ne!(base.content_sha256(), placed.content_sha256());
     }
 }

@@ -138,3 +138,21 @@ mur-tree-row:has(mur-row-menu.is-open) {
 .row-actions {
   margin-left: auto;
 }
+
+/* The shared marker. One dim glyph, the sentence in `title` and `aria-label`:
+   a pill would take the row's spare width and truncate the container name,
+   which is exactly the lesson the unlocked mark already records. */
+.shared-mark {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  margin-left: var(--space-1);
+  color: var(--text-muted);
+}
+
+/* Received rows read as slightly quieter than the user's own: the content is
+   someone else's, and the sidebar should say so without shouting. */
+.line--shared .row-label,
+.line--shared-item .row-label {
+  color: var(--text-secondary);
+}

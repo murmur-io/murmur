@@ -84,6 +84,8 @@ pub const MEETING_LOCKED: &str = "meeting-locked";
 pub const DOC_LOCKED: &str = "doc-locked";
 /// The target folder itself is locked (accepting a share into it, moving into it, …).
 pub const FOLDER_LOCKED: &str = "folder-locked";
+/// A recording with a linked companion note cannot cross into the sealed storage domain.
+pub const RECORDING_LINKED_NOTE: &str = "recording-linked-note";
 
 // ── Missing rows ────────────────────────────────────────────────────────────────────────────
 
@@ -143,6 +145,25 @@ pub const SHARING_UPGRADE_REQUIRED: &str = "sharing-upgrade-required";
 /// The Reminders app refused the write — the user has not granted Reminders access.
 pub const REMINDERS_DENIED: &str = "reminders-denied";
 
+// ── Meeting → note conversion ───────────────────────────────────────────────────────────────────
+// Every refusal below was reachable in production while carrying NO code, so `ErrorCopyService`'s
+// deny-by-default rendered "Couldn't convert this meeting. Please try again." for all of them.
+// That is how a precise, actionable refusal ("a note in this folder is shared") stayed invisible
+// long enough to need a SQLCipher session against the user's own database to diagnose.
+
+/// The meeting has no transcript rows, so there is nothing to summarize into a note.
+pub const CONVERT_NO_TRANSCRIPT: &str = "convert-no-transcript";
+/// The chosen (or configured-default) note template no longer exists.
+pub const NOTE_TEMPLATE_MISSING: &str = "note-template-missing";
+/// The provider returned an empty body; nothing is written rather than blanking a note.
+pub const NOTE_PROVIDER_EMPTY: &str = "note-provider-empty";
+/// A live remote share on this exact item blocks the mutation until it is revoked.
+pub const SHARE_ACTIVE: &str = "share-active";
+/// The container is mid-close for org sharing — a transient state the user can wait out.
+pub const FOLDER_CLOSING: &str = "folder-closing";
+/// The meeting's container is not a container Murmur can write a note into.
+pub const CONTAINER_UNAVAILABLE: &str = "container-unavailable";
+
 /// Every code this crate emits, in declaration order. The frontend's allowlist mirrors it;
 /// `error_codes_are_unique_and_kebab_case` keeps the shape a machine can rely on.
 pub const ALL: &[&str] = &[
@@ -153,6 +174,7 @@ pub const ALL: &[&str] = &[
     MEETING_LOCKED,
     DOC_LOCKED,
     FOLDER_LOCKED,
+    RECORDING_LINKED_NOTE,
     NOTE_MISSING,
     NOTE_FOLDER_MISSING,
     DOC_UNSUPPORTED,
@@ -171,6 +193,12 @@ pub const ALL: &[&str] = &[
     SHARING_ACCOUNT_REQUIRED,
     SHARING_UPGRADE_REQUIRED,
     REMINDERS_DENIED,
+    CONVERT_NO_TRANSCRIPT,
+    NOTE_TEMPLATE_MISSING,
+    NOTE_PROVIDER_EMPTY,
+    SHARE_ACTIVE,
+    FOLDER_CLOSING,
+    CONTAINER_UNAVAILABLE,
 ];
 
 #[cfg(test)]
@@ -234,6 +262,7 @@ mod tests {
             "meeting-locked",
             "doc-locked",
             "folder-locked",
+            "recording-linked-note",
             "note-missing",
             "note-folder-missing",
             "doc-unsupported",
@@ -257,6 +286,15 @@ mod tests {
             "sharing-account-required",
             "sharing-upgrade-required",
             "reminders-denied",
+            // Added 2026-08-28: the meeting→note conversion refusals. Every one of these was
+            // reachable while anonymous, so the user got the generic sentence for a failure they
+            // could have fixed in one click.
+            "convert-no-transcript",
+            "note-template-missing",
+            "note-provider-empty",
+            "share-active",
+            "folder-closing",
+            "container-unavailable",
         ];
         assert_eq!(ALL, expected);
     }

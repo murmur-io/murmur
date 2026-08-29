@@ -1,0 +1,135 @@
+@if (recovery.statusCheckFailed() && !recovery.status()?.degraded) {
+  <mur-banner
+    class="recovery-card"
+    kind="warning"
+    aria-label="Filing recovery status unavailable"
+    [attr.aria-busy]="recovery.loading()"
+  >
+    <div class="recovery-content">
+      <div class="recovery-copy">
+        <strong>Filing recovery status unavailable</strong>
+        <span>{{ recovery.error() }}</span>
+      </div>
+      <div class="recovery-actions">
+        <button
+          type="button"
+          class="btn btn-primary"
+          [disabled]="recovery.loading()"
+          (click)="recovery.refresh()"
+        >
+          {{ recovery.loading() ? "Checking…" : "Check again" }}
+        </button>
+      </div>
+    </div>
+  </mur-banner>
+} @else if (recovery.status(); as status) {
+  @if (status.degraded) {
+    <mur-banner
+      class="recovery-card"
+      kind="warning"
+      aria-label="Filing recovery needs attention"
+      [attr.aria-busy]="recovery.action() !== null || recovery.loading()"
+    >
+      <div class="recovery-content">
+        <div class="recovery-copy">
+          <strong>Filing recovery needs attention</strong>
+          @if (status.issueKind === "externalTargetOccupant") {
+            <span>A vault file now occupies a planned destination.</span>
+          } @else if (status.issueKind === "externalSourceReplacement") {
+            <span>A source file changed while Murmur was filing it.</span>
+          } @else {
+            <span
+              >Murmur paused recovery to protect an existing vault file.</span
+            >
+          }
+          <span class="recovery-counts">
+            {{ status.attemptCount }}
+            {{ status.attemptCount === 1 ? "attempt" : "attempts" }} ·
+            {{ status.projectionCount }}
+            {{ status.projectionCount === 1 ? "projection" : "projections" }} ·
+            {{ status.sourceSnapshotCount }}
+            {{ status.sourceSnapshotCount === 1 ? "snapshot" : "snapshots" }}
+          </span>
+          @if (recovery.error(); as error) {
+            <span class="recovery-error" role="alert">{{ error }}</span>
+          }
+        </div>
+        <div class="recovery-actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            [disabled]="recovery.action() !== null"
+            (click)="recovery.retry()"
+          >
+            {{ recovery.action() === "retry" ? "Retrying…" : "Retry" }}
+          </button>
+          @if (status.canKeepExisting && status.issueToken) {
+            <button
+              #keepExistingButton
+              type="button"
+              class="btn btn-danger"
+              [disabled]="recovery.action() !== null"
+              (click)="openConfirmation()"
+            >
+              Keep existing vault file…
+            </button>
+          }
+        </div>
+      </div>
+    </mur-banner>
+  }
+}
+
+@if (confirming()) {
+  <div
+    class="confirm-scrim"
+    role="alertdialog"
+    aria-modal="true"
+    aria-label="Confirm keeping the existing vault file"
+    [attr.aria-busy]="recovery.action() === 'keepExisting'"
+    (click)="onScrimClick($event)"
+    (keydown.escape)="closeConfirmation()"
+  >
+    <section class="confirm-sheet">
+      <header>
+        <span class="confirm-mark" aria-hidden="true">
+          <mur-icon icon="trash" />
+        </span>
+        <div>
+          <h3>Keep the existing vault file?</h3>
+          <p>
+            Recovery snapshots may be the only remaining copy of content Murmur
+            could not restore. Keeping the existing vault file abandons this
+            recovery item and cannot be undone.
+          </p>
+        </div>
+      </header>
+      <p class="vault-safety">
+        Existing vault files are never overwritten or deleted.
+      </p>
+      <footer>
+        <button
+          type="button"
+          class="btn btn-ghost"
+          [disabled]="recovery.action() !== null"
+          (click)="closeConfirmation()"
+        >
+          Cancel
+        </button>
+        <button
+          #confirmButton
+          type="button"
+          class="btn btn-danger"
+          [disabled]="recovery.action() !== null"
+          (click)="confirmKeepExisting()"
+        >
+          {{
+            recovery.action() === "keepExisting"
+              ? "Keeping existing…"
+              : "Keep existing and discard this recovery"
+          }}
+        </button>
+      </footer>
+    </section>
+  </div>
+}

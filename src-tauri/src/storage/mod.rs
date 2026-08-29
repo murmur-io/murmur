@@ -3,10 +3,12 @@ pub(crate) mod ask_conversation_store;
 pub mod attachment_store;
 pub(crate) mod audit_store;
 pub(crate) mod brief_store;
+pub(crate) mod container_store;
 pub(crate) mod dashboards_store;
 pub mod db;
 pub(crate) mod egress_store;
 pub(crate) mod facts_store;
+pub(crate) mod filing_journal;
 pub(crate) mod folders_store;
 pub(crate) mod graph_store;
 pub(crate) mod links;
@@ -26,4 +28,5 @@ pub(crate) mod workspace_store;
 
 pub use db::*;
 pub use attachment_store::*;
+pub(crate) use filing_journal::*;
 pub use models::*;
