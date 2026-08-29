@@ -173,6 +173,7 @@ import type {
   WhisperCard,
   WhisperRecommendationDto,
   WikiTarget,
+  McpStatus,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -410,6 +411,16 @@ export class IpcService {
    */
   getMcpConfig(): Promise<string> {
     return invoke<string>("get_mcp_config");
+  }
+
+  /**
+   * Whether the local server for Claude actually came up.
+   *
+   * Settings used to assert it was running and hand over a config regardless; a bind failure was
+   * a log line nobody reads. This is the read that lets the screen tell the truth.
+   */
+  getMcpStatus(): Promise<McpStatus> {
+    return invoke<McpStatus>("get_mcp_status");
   }
 
   saveConfig(config: AppConfigDto): Promise<void> {

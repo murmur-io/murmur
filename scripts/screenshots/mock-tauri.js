@@ -1801,6 +1801,12 @@ scope to the GA-critical path only.
       // doesn't match the `list_`/`get_`/`has_`/`is_` fallback prefixes below, so
       // an unhandled case would previously resolve `null` — which the FE now
       // treats as a real signed-out status, never a permanent "Loading…" state).
+      // The demo world is a HEALTHY app: the local server for Claude is up. Specs that care
+      // about a failed bind override this explicitly (`e2e/settings/mcp-status.spec.ts`).
+      // Without it the unknown-command fallback returns `[]`, and Settings correctly — but
+      // unhelpfully for every unrelated spec — renders the "not running" branch.
+      case "get_mcp_status":
+        return { state: "listening", port: 8765 };
       case "account_status":
         return {
           loggedIn: false,
