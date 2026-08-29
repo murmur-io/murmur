@@ -176,7 +176,7 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![org_id], |r| container_share_from_row(r))
+            .query_map(rusqlite::params![org_id], container_share_from_row)
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
@@ -194,7 +194,7 @@ impl Db {
             ))
             .map_err(map_err)?;
         let rows = stmt
-            .query_map([], |r| container_share_from_row(r))
+            .query_map([], container_share_from_row)
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;
@@ -271,7 +271,7 @@ impl Db {
     /// Write one decrypted manifest into the replica. Re-ingesting the same container (a rename,
     /// a re-pull) updates it in place, which is what keeps a feed replay idempotent.
     pub fn upsert_org_container(&self, row: &OrgContainerRow) -> Result<()> {
-        if crate::share::container_envelope::ContainerLevel::from_str(&row.level).is_err() {
+        if crate::share::container_envelope::ContainerLevel::parse(&row.level).is_err() {
             return Err(AppError::InvalidArg("unknown container level".into()));
         }
         let conn = self.lock();
@@ -352,7 +352,7 @@ impl Db {
             ))
             .map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![org_id], |r| org_container_from_row(r))
+            .query_map(rusqlite::params![org_id], org_container_from_row)
             .map_err(map_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(map_err)?;

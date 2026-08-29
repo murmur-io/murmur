@@ -1264,10 +1264,12 @@ pub(crate) fn build_shared_workspace(state: &AppState) -> Result<SharedWorkspace
         for container in &containers {
             // A ROOT is a container whose parent is not in this replica: either it genuinely has
             // none, or its parent was never shared with this member.
+            // `map_or(true, ..)` rather than `is_none_or`: the latter is stable only since 1.82 and
+            // this crate's MSRV is 1.77.
             let is_root = container
                 .parent_container_id
                 .as_ref()
-                .is_none_or(|parent| !known.contains(parent));
+                .map_or(true, |parent| !known.contains(parent));
             if !is_root {
                 continue;
             }
