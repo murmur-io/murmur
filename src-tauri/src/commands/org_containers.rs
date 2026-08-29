@@ -142,9 +142,12 @@ pub(crate) fn plan_container_share(
         });
 
     let mut plan = ContainerPlan::default();
-    // Breadth-first from the root, so a parent's manifest is always planned before its children's.
-    // A recipient that receives them out of order still reassembles the tree (structure is a parent
-    // pointer), but publishing in tree order means a partial share is never a forest of orphans.
+    // Depth-first from the root. What matters is not the traversal order but the INVARIANT it
+    // guarantees: a child is only queued when its parent is popped, so a parent's manifest is
+    // always planned before its children's. A recipient that receives them out of order still
+    // reassembles the tree (structure is a parent pointer), but publishing in tree order means a
+    // partial share is never a forest of orphans. Children are pushed reversed so `pop` yields
+    // them in display order.
     let mut queue = vec![(root, None::<String>, true)];
     while let Some((container, parent_container_id, is_root)) = queue.pop() {
         if container.locked && !is_root {

@@ -221,20 +221,45 @@ export class WorkspaceTreeComponent {
     this.sharedWorkspace.spaces().filter((node) => !node.localParentId),
   );
 
-  /** Received nodes this user privately filed under a given local container. */
+  /**
+   * Received nodes this user privately filed under a local container, indexed by
+   * that container.
+   *
+   * Walks the WHOLE received forest, not just its roots: the "Keep in my Space…"
+   * action is offered on every received container, including a nested one, and a
+   * placement the merge could not find would be an affordance that silently does
+   * nothing.
+   */
   private readonly sharedByLocalParent = computed(() => {
     const map = new Map<string, SharedContainerNode[]>();
-    const add = (node: SharedContainerNode): void => {
-      if (!node.localParentId) {
-        return;
+    const walk = (node: SharedContainerNode): void => {
+      if (node.localParentId) {
+        const bucket = map.get(node.localParentId) ?? [];
+        bucket.push(node);
+        map.set(node.localParentId, bucket);
       }
-      const bucket = map.get(node.localParentId) ?? [];
-      bucket.push(node);
-      map.set(node.localParentId, bucket);
+      node.folders.forEach(walk);
     };
-    this.sharedWorkspace.spaces().forEach(add);
-    this.sharedWorkspace.sharedBrains()?.folders.forEach(add);
+    this.sharedWorkspace.spaces().forEach(walk);
+    this.sharedWorkspace.sharedBrains()?.folders.forEach(walk);
     return map;
+  });
+
+  /**
+   * Container ids that render under a LOCAL host instead of where their owner
+   * filed them. A node listed here is skipped by `pushShared` at its original
+   * position, so it appears exactly once.
+   */
+  private readonly placedSharedIds = computed(() => {
+    const ids = new Set<string>();
+    for (const bucket of this.sharedByLocalParent().values()) {
+      for (const node of bucket) {
+        if (node.containerId) {
+          ids.add(node.containerId);
+        }
+      }
+    }
+    return ids;
   });
 
   private readonly _expandedShared = signal<ReadonlySet<string>>(
@@ -319,6 +344,11 @@ export class WorkspaceTreeComponent {
       return;
     }
     for (const child of node.folders) {
+      // A child the user has filed somewhere of their own renders THERE, not
+      // here, or it would appear twice under two different parents.
+      if (child.containerId && this.placedSharedIds().has(child.containerId)) {
+        continue;
+      }
       this.pushShared(out, child, depth + 1);
     }
     for (const item of node.items) {
@@ -443,7 +473,14 @@ export class WorkspaceTreeComponent {
   protected containerExpandable(container: ContainerNode): boolean {
     return (
       !this.isSealed(container) &&
-      (container.groups.length > 0 || container.folders.length > 0)
+      (container.groups.length > 0 ||
+        container.folders.length > 0 ||
+        // Received content the user has privately filed here counts as content
+        // for the purpose of the caret. Without this, filing a shared Space into
+        // an EMPTY local Space would hide it: the host has nothing of its own,
+        // so it would render with no way to expand and reveal what was just put
+        // inside it.
+        (this.sharedByLocalParent().get(container.id)?.length ?? 0) > 0)
     );
   }
 
