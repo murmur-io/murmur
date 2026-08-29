@@ -377,7 +377,23 @@ export class WorkspaceTreeComponent {
       return `From ${node.orgName} · ${node.authorHint} · ${this.sharedAccessLabel(node)}`;
     }
     if (line.sharedItem) {
-      return null;
+      const item = line.sharedItem;
+      const access = item.access === "edit" ? "Can edit" : "View only";
+      return `From ${item.orgName} · ${item.authorHint} · ${access}`;
+    }
+    // An ITEM row the user published on its own. Anything inside a shared
+    // container is deliberately unmarked here — that container's row already
+    // says it, and repeating the glyph on every child turns a quiet signal into
+    // noise. The backend read excludes container-owned rows for the same reason.
+    if (line.item) {
+      const target = this.sharedWorkspace
+        .shareByItem()
+        .get(`${line.item.kind}:${line.item.id}`);
+      if (!target) {
+        return null;
+      }
+      const access = target.access === "edit" ? "Can edit" : "View only";
+      return `Shared to ${target.orgName} · ${access}`;
     }
     const container = line.container;
     if (!container) {

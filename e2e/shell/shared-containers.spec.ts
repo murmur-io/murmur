@@ -364,3 +364,78 @@ test("a nested received folder can be filed too, and renders in exactly one plac
     .click();
   await expect(page.getByRole("treeitem", { name: /Contracts/ })).toHaveCount(1);
 });
+
+test("a received loose item and an own standalone share each carry the marker", async ({
+  page,
+}) => {
+  await mockTauri(
+    page,
+    {},
+    {
+      list_workspace_tree: [
+        {
+          ...LOCAL_FOREST[0],
+          groups: [
+            {
+              kind: "note",
+              total: 2,
+              items: [
+                { kind: "note", id: "n-shared", title: "Roadmap", durationS: null, sortAt: 20 },
+                { kind: "note", id: "n-private", title: "Scratch", durationS: null, sortAt: 10 },
+              ],
+            },
+          ],
+        },
+        ...LOCAL_FOREST.slice(1),
+      ],
+      list_shared_workspace: SHARED_WORKSPACE,
+      list_container_share_status: CONTAINER_SHARES,
+      list_org_share_targets: [
+        {
+          kind: "note",
+          id: "n-shared",
+          orgId: "org-siema",
+          orgName: "Siema",
+          access: "edit",
+        },
+      ],
+    },
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Spaces" }).click();
+  await page
+    .getByRole("treeitem", { name: /Acme/ })
+    .getByRole("button", { name: /Expand/ })
+    .click();
+
+  // The user's OWN note, published on its own, says where it went.
+  await expect(
+    page.getByRole("img", { name: /Shared to Siema · Can edit/ }),
+  ).toHaveCount(1);
+  // A note they did not share carries nothing — the marker must mean something.
+  const scratch = page.getByRole("treeitem", { name: /Scratch/ });
+  await expect(scratch.getByRole("img", { name: /Shared to/ })).toHaveCount(0);
+
+  // A RECEIVED loose item names who shared it.
+  await page
+    .getByRole("treeitem", { name: /Shared Brains/ })
+    .getByRole("button", { name: /Expand/ })
+    .click();
+  await expect(
+    page.getByRole("img", { name: /From Siema · kgm004a · View only/ }),
+  ).not.toHaveCount(0);
+});
+
+test("an item inside a shared container is not marked twice", async ({ page }) => {
+  // The container's own row already says it. Repeating the glyph on every child
+  // turns a quiet signal into noise, which is why the backend read excludes
+  // container-owned rows outright.
+  await openSidebar(page);
+  await page
+    .getByRole("treeitem", { name: /Partners/ })
+    .getByRole("button", { name: /Expand/ })
+    .click();
+  const kickoff = page.getByRole("treeitem", { name: /Partner kickoff/ });
+  await expect(kickoff).toBeVisible();
+  await expect(kickoff.getByRole("img", { name: /Shared to/ })).toHaveCount(0);
+});
