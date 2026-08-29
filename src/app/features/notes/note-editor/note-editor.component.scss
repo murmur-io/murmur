@@ -104,10 +104,13 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
-  /* Symmetric --space-3: the top was --space-4, which only existed to soften the drop from
-     app-main's 48px padding. With that padding cancelled on :host the header docks close to
-     the tab strip, and an even 12px band around the row reads cleaner than 16/12. */
-  padding: var(--space-3) var(--space-6);
+  /* The 16/12 asymmetry is LOAD-BEARING, not leftover: `.chat-head` (note-chat, `is-bare`)
+     carries the same `var(--space-4) … var(--space-3)` and a `min-height: 66px`, so in the
+     Ask-Brain split view the two header bands end on ONE shared divider line. Evening this
+     out to 12/12 shortens this band by 4px and breaks that alignment — visibly, and against
+     note-chat-drawer.spec.ts's `chatHeadBottom - headBottom <= 3`. Docking the editor to the
+     tab strip is done on :host above; it does not need this padding to change. */
+  padding: var(--space-4) var(--space-6) var(--space-3);
   /* A crisp full-width divider (mid-tier `--border`, not the faint `--border-subtle`): this is the
      seam the toolbar sits above — the note body AND the Ask Brain column both dock under it, so it
      needs to read as a clean cutoff between the buttons and the content below (2026-07-19). */
