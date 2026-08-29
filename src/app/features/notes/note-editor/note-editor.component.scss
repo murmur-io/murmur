@@ -14,7 +14,18 @@
      `margin-bottom` cancels that padding so the split (and its right pane) reaches the very bottom of
      the window instead of being cut off ~64px short. Total still nets to 100vh (top chrome + this
      host), so the PAGE never scrolls — `.editor-body` still owns the note scroll. */
-  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  /* DOCK TO THE CHROME (2026-08-28, user request "look how much space there is between
+     the tabs and the note — minimize it"): `.app-main` pays a generous `--space-7` (48px)
+     top padding on every route, which is right for a page that starts with content but
+     wrong here — this route's FIRST element is its own sticky header, which brings its own
+     padding and a full-width divider. Measured, the breadcrumb chip sat 67px below the tab
+     strip (48 app-main + 16 head), i.e. twice the height of the 32px chip in dead air.
+     Cancel app-main's top padding and keep a deliberate `--space-2` standoff instead, the
+     same way `margin-bottom` below already cancels its `--space-8` bottom padding. The
+     height gains back exactly what the margin removes, so the bottom edge — and the Ask
+     Brain column reaching it — is unchanged. */
+  margin-top: calc(var(--space-2) - var(--space-7));
+  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-2));
   margin-bottom: calc(-1 * var(--space-8));
   min-height: 0;
 }
@@ -38,7 +49,10 @@
   min-height: 0;
   height: 100%;
   /* Embedded (recording panel): fill the host panel exactly — NO negative bleed (that's a
-     routed-layout affordance for canceling app-main's bottom padding, which doesn't exist here). */
+     routed-layout affordance for canceling app-main's padding, which doesn't exist here).
+     The top margin matters as much as the bottom one: left alone it would drag the panel up
+     into the recording chrome above it. */
+  margin-top: 0;
   margin-bottom: 0;
 }
 .editor.is-embedded {
@@ -90,7 +104,10 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-4) var(--space-6) var(--space-3);
+  /* Symmetric --space-3: the top was --space-4, which only existed to soften the drop from
+     app-main's 48px padding. With that padding cancelled on :host the header docks close to
+     the tab strip, and an even 12px band around the row reads cleaner than 16/12. */
+  padding: var(--space-3) var(--space-6);
   /* A crisp full-width divider (mid-tier `--border`, not the faint `--border-subtle`): this is the
      seam the toolbar sits above — the note body AND the Ask Brain column both dock under it, so it
      needs to read as a clean cutoff between the buttons and the content below (2026-07-19). */
