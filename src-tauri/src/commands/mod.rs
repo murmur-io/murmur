@@ -13062,7 +13062,7 @@ pub(crate) fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<
 /// iff it is open (`locked=0`) OR its id is in the current session unlock set. Documents anchor on a
 /// folder directly (not a meeting), so the document commands gate on this. A non-existent folder
 /// reports `false` (fail-closed — there is nothing legitimate to read).
-fn folder_is_unlocked(state: &AppState, folder_id: &str) -> Result<bool, AppError> {
+pub(crate) fn folder_is_unlocked(state: &AppState, folder_id: &str) -> Result<bool, AppError> {
     let folder = match state.db.folder_by_id(folder_id)? {
         Some(f) => f,
         None => return Ok(false), // unknown folder → nothing to surface.

@@ -1414,3 +1414,70 @@ pub fn clear_shared_placement(
         .db
         .clear_local_placement(&org_id, &target_kind, &target_id)
 }
+
+/// One LOCAL item this user publishes to an org on its own — not because a container carries it.
+///
+/// Drives the sidebar's marker on the user's OWN rows. Deliberately excludes anything filed under
+/// a shared container: that container's row already says it, and repeating the glyph on every
+/// child turns a quiet signal into noise.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgShareTargetRow {
+    /// `"meeting"` or `"note"`.
+    pub kind: String,
+    pub id: String,
+    pub org_id: String,
+    pub org_name: String,
+    /// `"view"` or `"edit"`.
+    pub access: String,
+}
+
+#[tauri::command]
+pub fn list_org_share_targets(
+    state: State<'_, AppState>,
+) -> Result<Vec<OrgShareTargetRow>> {
+    let st = state.inner();
+    let org_names: HashMap<String, String> = st
+        .db
+        .list_org_states()?
+        .into_iter()
+        .map(|org| (org.org_id, org.name))
+        .collect();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for row in st.db.list_live_org_shares()? {
+        // A row the container sweep owns is represented by its container's marker.
+        if row.parent_container_id.is_some() {
+            continue;
+        }
+        let (kind, id) = match (row.meeting_id.clone(), row.document_id.clone()) {
+            (Some(meeting_id), None) => ("meeting", meeting_id),
+            (None, Some(document_id)) => ("note", document_id),
+            _ => continue,
+        };
+        if !seen.insert((id.clone(), row.org_id.clone())) {
+            continue;
+        }
+        // GATE: a sealed-and-not-session-unlocked source must not disclose its share status, for
+        // the same reason `list_meeting_org_shares` gates the meeting leg — knowing a note exists
+        // in an org is knowing something about the note.
+        let visible = match kind {
+            "meeting" => crate::commands::meeting_is_unlocked(st, &id)?,
+            _ => match st.db.document_folder_id(&id)? {
+                Some(folder_id) => crate::commands::folder_is_unlocked(st, &folder_id)?,
+                None => false,
+            },
+        };
+        if !visible {
+            continue;
+        }
+        out.push(OrgShareTargetRow {
+            kind: kind.to_string(),
+            id,
+            org_name: org_names.get(&row.org_id).cloned().unwrap_or_default(),
+            org_id: row.org_id,
+            access: row.access,
+        });
+    }
+    Ok(out)
+}
