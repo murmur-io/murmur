@@ -324,7 +324,7 @@ test.describe("Record — one final result and route-scoped presentation", () =>
     const result = page.getByTestId("recording-result");
     const masked = page.getByTestId("recording-location-masked");
     await expect(masked).toContainText("Location hidden");
-    await expect(masked).toContainText("Unlock its Space to view or change it");
+    await expect(masked).toContainText("Unlock its Workspace to view or change it");
     await expect(result).not.toContainText("Acme");
     await expect(result).not.toContainText("Weekly");
     await expect(result).not.toContainText("Unfiled");

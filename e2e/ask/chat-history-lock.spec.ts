@@ -97,7 +97,7 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
   // publishes the invalidation that scrubs them.
   await page
     .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Spaces", exact: true })
+    .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await expect(page).toHaveURL(/\/ask$/);
   await expect(page.locator("mur-chat-history")).toBeVisible();
@@ -106,7 +106,7 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
   ).toBeVisible();
 
   const spacesSidebar = page.getByRole("complementary", {
-    name: "Spaces sidebar",
+    name: "Workspaces sidebar",
   });
   await expect(spacesSidebar).toBeVisible();
   await spacesSidebar
@@ -202,11 +202,11 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
     page.getByText("Meeting-derived secret", { exact: true }),
   ).toBeVisible();
 
-  // Opening Spaces is contextual navigation: it must not unmount Ask or scrub
+  // Opening Workspaces is contextual navigation: it must not unmount Ask or scrub
   // the message before the actual lock transition occurs.
   await page
     .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Spaces", exact: true })
+    .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await expect(page).toHaveURL(/\/ask$/);
   await expect(
@@ -214,7 +214,7 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
   ).toBeVisible();
 
   const spacesSidebar = page.getByRole("complementary", {
-    name: "Spaces sidebar",
+    name: "Workspaces sidebar",
   });
   await expect(spacesSidebar).toBeVisible();
   await spacesSidebar

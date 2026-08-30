@@ -79,9 +79,9 @@ const FOREST = [
 async function openSidebar(page: Page): Promise<void> {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Spaces sidebar" }),
+    page.getByRole("complementary", { name: "Workspaces sidebar" }),
   ).toBeVisible();
   await page
     .getByRole("treeitem", { name: /Acme/ })

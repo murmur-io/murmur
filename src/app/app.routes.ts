@@ -157,8 +157,8 @@ export const routes: Routes = [
           ),
       },
       {
-        // The virtual "Shared Brains" Space. No longer a rail destination: it is
-        // a ROW in the Spaces sidebar, and this is the page behind it.
+        // The virtual "Shared Brains" Workspace. No longer a rail destination: it is
+        // a ROW in the Workspaces sidebar, and this is the page behind it.
         path: "shared-brains",
         loadComponent: () =>
           import("./features/shared-brains/shared-brains.component").then(
@@ -166,7 +166,7 @@ export const routes: Routes = [
           ),
       },
       {
-        // One RECEIVED container — a Space or folder somebody in the org shared.
+        // One RECEIVED container — a Workspace or folder somebody in the org shared.
         // Read-only structure at every access level; its owner keeps the tree.
         path: "shared/:orgId/:containerId",
         loadComponent: () =>

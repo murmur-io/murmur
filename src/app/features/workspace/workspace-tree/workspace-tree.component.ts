@@ -77,8 +77,8 @@ export interface TreeLine {
   seeAll?: boolean;
   /** Full visible item count across every kind in this container. */
   total?: number;
-  /** Present only on a RECEIVED container row (a shared Space, folder, or the
-   * virtual Shared Brains Space). */
+  /** Present only on a RECEIVED container row (a shared Workspace, folder, or the
+   * virtual Shared Brains Workspace). */
   shared?: SharedContainerNode;
   /** Present only on a RECEIVED item row. */
   sharedItem?: SharedItemRow;
@@ -261,8 +261,8 @@ export class WorkspaceTreeComponent {
     for (const project of this.workspace.forest()) {
       this.pushContainer(out, project, 0);
     }
-    // Received content comes LAST at the top level: a shared Space is the
-    // user's colleague's, not theirs, and it should not push their own Spaces
+    // Received content comes LAST at the top level: a shared Workspace is the
+    // user's colleague's, not theirs, and it should not push their own Workspaces
     // down the sidebar. Anything they have privately filed under a local
     // container was already emitted inside `pushContainer`.
     for (const space of this.unplacedSharedRoots()) {
@@ -276,7 +276,7 @@ export class WorkspaceTreeComponent {
   });
 
   /**
-   * Received Spaces the user has NOT filed anywhere of their own — those render
+   * Received Workspaces the user has NOT filed anywhere of their own — those render
    * at the top level. A placed one is emitted under its host container instead.
    */
   private readonly unplacedSharedRoots = computed(() =>
@@ -287,7 +287,7 @@ export class WorkspaceTreeComponent {
    * Received nodes this user privately filed under a local container, indexed by
    * that container.
    *
-   * Walks the WHOLE received forest, not just its roots: the "Keep in my Space…"
+   * Walks the WHOLE received forest, not just its roots: the "Keep in my Workspace…"
    * action is offered on every received container, including a nested one, and a
    * placement the merge could not find would be an affordance that silently does
    * nothing.
@@ -572,8 +572,8 @@ export class WorkspaceTreeComponent {
       (container.groups.length > 0 ||
         container.folders.length > 0 ||
         // Received content the user has privately filed here counts as content
-        // for the purpose of the caret. Without this, filing a shared Space into
-        // an EMPTY local Space would hide it: the host has nothing of its own,
+        // for the purpose of the caret. Without this, filing a shared Workspace into
+        // an EMPTY local Workspace would hide it: the host has nothing of its own,
         // so it would render with no way to expand and reveal what was just put
         // inside it.
         (this.sharedByLocalParent().get(container.id)?.length ?? 0) > 0)
@@ -653,7 +653,7 @@ export class WorkspaceTreeComponent {
   }
 
   /**
-   * Open a received container. The virtual Shared Brains Space has no container
+   * Open a received container. The virtual Shared Brains Workspace has no container
    * of its own — it is a view over everything loose — so it opens the list route
    * with its per-org filter.
    */
@@ -708,7 +708,7 @@ export class WorkspaceTreeComponent {
    * The received node the user is filing somewhere of their own, if any.
    *
    * Reuses the ordinary move sheet, deliberately: to the user this IS a move —
-   * "put that shared Space in my Clients Space". What differs is invisible to
+   * "put that shared Workspace in my Clients Workspace". What differs is invisible to
    * them and load-bearing underneath: nothing is published, the owner sees
    * nothing, and the content keeps updating from the org feed.
    */
@@ -1171,7 +1171,7 @@ export class WorkspaceTreeComponent {
    */
   protected lockLabel(container: ContainerNode): string {
     const nested = container.folders.length;
-    const noun = container.level === "project" ? "Space" : "folder";
+    const noun = container.level === "project" ? "Workspace" : "folder";
     if (nested === 0) {
       return `Lock ${noun}`;
     }
@@ -1189,7 +1189,7 @@ export class WorkspaceTreeComponent {
     const nested = container.folders.length;
     return nested === 0
       ? "Unlock for this session"
-      : `Unlock this ${container.level === "project" ? "Space" : "folder"} and its folders for this session`;
+      : `Unlock this ${container.level === "project" ? "Workspace" : "folder"} and its folders for this session`;
   }
 
   // ── AI organize, per container ────────────────────────────────────────────

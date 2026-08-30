@@ -31,12 +31,12 @@ export interface ContainerShareTarget {
   /** The local `folders.id`. */
   id: string;
   name: string;
-  /** `"project"` renders as "Space"; anything else as "Folder". */
+  /** `"project"` renders as "Workspace"; anything else as "Folder". */
   level: "project" | "folder";
 }
 
 /**
- * The "Share to Org" sheet for a whole Space or Folder — the container twin of
+ * The "Share to Org" sheet for a whole Workspace or Folder — the container twin of
  * {@link OrgShareSheetComponent}, in the same grammar so the two read as one
  * feature.
  *
@@ -65,7 +65,7 @@ export class ContainerShareSheetComponent {
   private readonly errorCopy = inject(ErrorCopyService);
   private readonly shared = inject(SharedWorkspaceService);
 
-  /** The Space or Folder being published. */
+  /** The Workspace or Folder being published. */
   readonly target = input.required<ContainerShareTarget>();
 
   /** Emitted after a successful publish (the host toasts + refreshes). */
@@ -107,9 +107,9 @@ export class ContainerShareSheetComponent {
     return total > 0 ? Math.round((this.progressDone() / total) * 100) : 0;
   });
 
-  /** "Space" or "Folder" — the word the user sees for this container. */
+  /** "Workspace" or "Folder" — the word the user sees for this container. */
   readonly noun = computed(() =>
-    this.target().level === "project" ? "Space" : "folder",
+    this.target().level === "project" ? "Workspace" : "folder",
   );
 
   /** The container's existing share in the CHOSEN org, if any. */

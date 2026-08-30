@@ -3,7 +3,7 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
- * The workspace hierarchy in the contextual sidebar: Spaces › Folders ›
+ * The workspace hierarchy in the contextual sidebar: Workspaces › Folders ›
  * mixed content rows.
  *
  * The forest below is written as the BACKEND serializes it (`ContainerNode` /
@@ -164,7 +164,7 @@ const AUDIT_FOREST = [
   FOREST[0],
   ...Array.from({ length: 18 }, (_, index) => ({
     id: `p-audit-${index + 1}`,
-    name: `Audit Space ${index + 1}`,
+    name: `Audit Workspace ${index + 1}`,
     kind: "meeting",
     level: "project",
     emoji: null,
@@ -201,9 +201,9 @@ async function expectMenuItemAtHitPoint(
 async function openWorkspace(page: Page): Promise<void> {
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Spaces sidebar" }),
+    page.getByRole("complementary", { name: "Workspaces sidebar" }),
   ).toBeVisible();
 }
 
@@ -243,7 +243,7 @@ test("audits the complete sidebar at tall and short viewports", async ({
     await page.setViewportSize(viewport);
     await page.goto("/meeting/m-standup");
 
-    const sidebar = page.getByRole("complementary", { name: "Spaces sidebar" });
+    const sidebar = page.getByRole("complementary", { name: "Workspaces sidebar" });
     const body = sidebar.locator(".context-body");
     const selected = sidebar.getByRole("treeitem", { name: "Standup" });
     await expect(sidebar).toBeVisible();
@@ -274,7 +274,7 @@ test("audits the complete sidebar at tall and short viewports", async ({
     }));
     expect(dimensions.scrollHeight).toBeGreaterThan(dimensions.clientHeight);
 
-    const lastRow = sidebar.getByRole("treeitem", { name: /Audit Space 18/ });
+    const lastRow = sidebar.getByRole("treeitem", { name: /Audit Workspace 18/ });
     await lastRow.scrollIntoViewIfNeeded();
     await expect(lastRow).toBeVisible();
     await expect
@@ -289,7 +289,7 @@ test("audits the complete sidebar at tall and short viewports", async ({
       .toEqual({ atBottom: true, scrolled: true });
 
     const footer = sidebar.getByRole("button", {
-      name: "Collapse Spaces sidebar",
+      name: "Collapse Workspaces sidebar",
     });
     await expect(footer).toBeVisible();
     await expect
@@ -306,11 +306,11 @@ test("audits the complete sidebar at tall and short viewports", async ({
       .toBe(true);
 
     const overflowTrigger = sidebar.getByRole("button", {
-      name: "Actions for Audit Space 18",
+      name: "Actions for Audit Workspace 18",
     });
     await overflowTrigger.click();
     const overflowMenu = page.getByRole("menu", {
-      name: "Actions for Audit Space 18",
+      name: "Actions for Audit Workspace 18",
     });
     await expect(overflowMenu).toBeVisible();
     await expect
@@ -372,7 +372,7 @@ test("keeps the single contextual container menu above following tree rows", asy
       .locator("mur-icon"),
   ).toHaveAttribute("data-icon", "folder-add");
   await expectMenuItemAtHitPoint(page, "Rename space");
-  await expect(page.getByText("Space actions", { exact: true })).toBeVisible();
+  await expect(page.getByText("Workspace actions", { exact: true })).toBeVisible();
   await expect(
     page.getByRole("menuitem", { name: "Rename space" }).locator("mur-icon"),
   ).toHaveAttribute("data-icon", "rename");
@@ -494,7 +494,7 @@ test("rename and delete use explicit contextual confirmation instead of native p
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
 
   await page.getByRole("button", { name: "Actions for Acme" }).click();
   await page.getByRole("menuitem", { name: "Rename space" }).click();
@@ -565,7 +565,7 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
 
   const inbox = page.getByRole("treeitem", { name: /Unfiled recordings/ });
   await expect(inbox).toBeVisible();
@@ -576,7 +576,7 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
   );
   await expect(inbox).not.toHaveAttribute("appfolderdrop");
 
-  const tree = page.getByRole("tree", { name: "Spaces" });
+  const tree = page.getByRole("tree", { name: "Workspaces" });
   const unfiledRows = tree.locator(".line--unfiled-item");
   await expect(unfiledRows).toHaveCount(8);
   await expect(unfiledRows).toHaveText([
@@ -595,12 +595,12 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
   await expect(moveNewest).toBeVisible();
   await moveNewest.click();
   await page
-    .getByRole("menuitem", { name: "Move to Space or folder…" })
+    .getByRole("menuitem", { name: "Move to Workspace or folder…" })
     .click();
   await expect(
     page
       .getByRole("dialog", {
-        name: "Move recording “Unfiled recording 12” to Space",
+        name: "Move recording “Unfiled recording 12” to Workspace",
       })
       .getByRole("button", { name: "Move to Acme", exact: true }),
   ).toBeVisible();
@@ -616,13 +616,13 @@ test("shows unfiled recordings as a real inbox and opens the complete meetings l
     ),
   ).toBe("false");
   await page.reload();
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(unfiledRows).toHaveCount(0);
   await page.getByRole("button", { name: "Expand Unfiled recordings" }).click();
   await expect(unfiledRows).toHaveCount(8);
 
   // Prove the destination clears an existing meeting-folder scope instead of
-  // merely changing the URL while Library remains filtered to that Space.
+  // merely changing the URL while Library remains filtered to that Workspace.
   await page
     .getByRole("treeitem", { name: /Acme/ })
     .getByRole("button", { name: "Acme", exact: true })
@@ -695,7 +695,7 @@ test("scrubs unfiled titles synchronously and drops a late pre-invalidation page
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
     page.getByText("Mounted private recording", { exact: true }),
   ).toBeVisible();
@@ -748,13 +748,13 @@ test("renders one flat mixed stream below each expanded container", async ({
 }) => {
   await openWorkspace(page);
 
-  const tree = page.getByRole("tree", { name: "Spaces" });
+  const tree = page.getByRole("tree", { name: "Workspaces" });
   await expect(tree).toBeVisible();
 
   await expect(page.getByRole("treeitem", { name: /Acme/ })).toBeVisible();
   await expect(page.getByRole("treeitem", { name: /Private/ })).toBeVisible();
 
-  // A selected Space can still be collapsed by the user.
+  // A selected Workspace can still be collapsed by the user.
   await expect(
     page.getByRole("treeitem", { name: /Launch brief/ }),
   ).toHaveCount(0);
@@ -790,7 +790,7 @@ test("renders one flat mixed stream below each expanded container", async ({
   await expect(page.getByRole("treeitem", { name: /Q3/ })).toBeVisible();
 });
 
-test("renders distinct, type-colored Space and content glyphs without washing out selection", async ({
+test("renders distinct, type-colored Workspace and content glyphs without washing out selection", async ({
   page,
 }) => {
   await mockTauri(
@@ -863,7 +863,7 @@ test("keeps an older selected leaf within the eight-row cap", async ({
   await mockTauri(page, {}, { list_workspace_tree: FOREST });
   await page.goto("/meeting/m-old");
 
-  const tree = page.getByRole("tree", { name: "Spaces" });
+  const tree = page.getByRole("tree", { name: "Workspaces" });
   await expect(tree).toBeVisible();
   const mixedRows = tree.locator(".line--item");
   await expect(mixedRows).toHaveCount(8);
@@ -977,7 +977,7 @@ test("treats a sealed container as an intrinsic leaf even when a stale payload i
   ).toHaveCount(0);
 });
 
-test("every rendered Space, folder and content row exposes exactly one ellipsis menu", async ({
+test("every rendered Workspace, folder and content row exposes exactly one ellipsis menu", async ({
   page,
 }) => {
   await openWorkspace(page);
