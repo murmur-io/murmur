@@ -131,18 +131,23 @@
      sits beside it. Capture takes the remaining width; the round one stays
      square, so a single size keeps them on one line. */
   --shell-footer-btn: 36px;
-  /* Collapsed, the panel is sized BY the macOS window buttons: it wraps them
-     with an equal margin on each side, so the rail is exactly as wide as the
-     chrome it carries.
+  /* Collapsed width. CALIBRATED with headroom, not derived — and deliberately
+     so, because deriving it failed twice.
 
-       buttons span    = x 20 .. 20 + 52            = 20..72px in the window
-       panel starts at = app-shell padding          =  8px
-       => 12px of margin before them, 12px after    => 76px wide
+     `trafficLightPosition` is { x: 32, y: 30 }, and the arithmetic that treats
+     those as the buttons' top-left corner has now been wrong on BOTH axes: y
+     turned out to be the CENTRE (the row sat 6px low until that was corrected),
+     and a width computed from x as a left edge still left the buttons
+     overhanging the panel. macOS also adds its own padding that no config
+     exposes, and no CSS can read the native buttons' real box.
 
-     This is why `trafficLightPosition.x` is 20 and not the 32 it used to be:
-     at 32 the left margin was 24px against 12 on the right, the panel had to be
-     88px to contain the buttons at all, and it still looked like a wide rail
-     with the buttons pushed into one corner. Move one and the other must
-     follow — they are two halves of the same measurement. */
-  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-3));
+     So this is picked to be correct under EITHER reading of x:
+
+       x as the left edge  -> buttons end at 32 + 52 = 84px
+       x as the centre     -> buttons end at 32 + 46 = 78px
+       panel spans         -> 8 .. 8 + 96          = 104px
+
+     Either way they sit on the glass with room to spare. If the window chrome
+     changes, widen this rather than trying to compute it. */
+  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-6));
 }
