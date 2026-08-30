@@ -133,11 +133,14 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   ]);
   for (const box of [captureBox, noteBox, moreBox]) {
     expect(box).not.toBeNull();
-    expect(box!.width).toBeCloseTo(box!.height, 0);
-    expect(box!.width).toBeLessThanOrEqual(40);
+    expect(box!.height).toBeLessThanOrEqual(40);
   }
+  // One height across the row; the PAIR is wider than tall, the chevron square.
+  expect(noteBox!.height).toBeCloseTo(captureBox!.height, 0);
+  expect(moreBox!.height).toBeCloseTo(captureBox!.height, 0);
   expect(noteBox!.width).toBeCloseTo(captureBox!.width, 0);
-  expect(moreBox!.width).toBeCloseTo(captureBox!.width, 0);
+  expect(captureBox!.width).toBeGreaterThan(captureBox!.height);
+  expect(moreBox!.width).toBeCloseTo(moreBox!.height, 0);
 
   // The pair is adjacent; the chevron is not.
   expect(noteBox!.x - (captureBox!.x + captureBox!.width)).toBeLessThan(12);
@@ -307,4 +310,18 @@ test("the sections run Workspaces, then Shared, then Browse", async ({ page }) =
   expect(workspaces!.y).toBeLessThan(shared!.y);
   expect(shared!.y).toBeLessThan(browse!.y);
   await expect(sb.getByText("Nothing shared with you yet")).toBeVisible();
+});
+
+/**
+ * The global "File recordings with Brain" action was removed from the
+ * Workspaces section. Filing by Brain is still reachable per container, from a
+ * container row's own menu — only the do-it-for-everything entry is gone.
+ */
+test("the Workspaces section carries no global Brain filing action", async ({
+  page,
+}) => {
+  await boot(page);
+  const sb = sidebar(page);
+  await expect(sb.getByText("File recordings with Brain")).toHaveCount(0);
+  await expect(sb.locator(".brain-action")).toHaveCount(0);
 });
