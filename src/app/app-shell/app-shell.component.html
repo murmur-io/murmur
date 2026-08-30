@@ -195,7 +195,7 @@
 
     <div class="sb-create">
       <a
-        class="btn sb-capture"
+        class="btn btn-primary sb-capture"
         [class.active]="isCaptureActive()"
         [attr.aria-current]="isCaptureActive() ? 'page' : null"
         routerLink="/record"
@@ -203,17 +203,15 @@
         title="Capture"
       >
         <mur-icon icon="record" />
-        <span class="sb-label">Capture</span>
       </a>
       <button
         type="button"
-        class="btn btn-primary sb-new-note"
+        class="btn sb-new-note"
         (click)="newNote()"
         aria-label="New note"
         title="New note (⌘N)"
       >
         <mur-icon icon="note-add" />
-        <span class="sb-label">New note</span>
       </button>
       <button
         type="button"

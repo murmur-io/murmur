@@ -110,12 +110,15 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
   await expect(sb.locator('mur-icon[data-icon="murmur"]')).toHaveCount(0);
 
-  // Capture is a button beside New note, not a nav row; New note is the primary.
+  // Capture and New note are ICON-ONLY buttons in the footer. Capture is the
+  // primary — recording is what the app is for — and New note the secondary.
   const capture = sb.getByRole("link", { name: "Capture" });
   const newNote = sb.getByRole("button", { name: "New note" });
-  await expect(capture).toHaveClass(/\bbtn\b/);
-  await expect(capture).not.toHaveClass(/btn-primary/);
-  await expect(newNote).toHaveClass(/btn-primary/);
+  await expect(capture).toHaveClass(/btn-primary/);
+  await expect(newNote).toHaveClass(/\bbtn\b/);
+  await expect(newNote).not.toHaveClass(/btn-primary/);
+  await expect(capture).toHaveText("");
+  await expect(newNote).toHaveText("");
 
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 });
