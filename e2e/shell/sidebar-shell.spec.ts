@@ -97,6 +97,14 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   expect(sbBox).not.toBeNull();
   expect(centres[0]).toBeLessThan(sbBox!.y);
 
+  // REGRESSION: the band belongs to the sidebar's column. As a full-width shell
+  // row it pushed the main column down too, leaving dead space above the tabs.
+  const main = page.locator(".main-col");
+  const mainBox = await main.boundingBox();
+  expect(mainBox).not.toBeNull();
+  expect(mainBox!.y).toBeLessThan(sbBox!.y);
+  expect(mainBox!.height).toBeGreaterThan(sbBox!.height);
+
   // The Murmur logo tile is gone — it was chrome that navigated nowhere.
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
   await expect(sb.locator('mur-icon[data-icon="murmur"]')).toHaveCount(0);
@@ -216,4 +224,26 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   const settingsAfter = await settings.boundingBox();
   expect(noteAfter!.y).toBeCloseTo(noteBox!.y, 0);
   expect(settingsAfter!.y).toBeCloseTo(settingsBox!.y, 0);
+});
+
+/**
+ * Collapsed, the band narrows with its column to 68px, which cannot hold three
+ * 32px controls. Search and Settings move into the rail rather than becoming
+ * reachable only by expanding first.
+ */
+test("collapsed keeps Search and Settings reachable in the rail", async ({
+  page,
+}) => {
+  await boot(page);
+  await topbar(page).getByRole("button", { name: "Collapse sidebar" }).click();
+
+  const sb = sidebar(page);
+  await expect(sb.getByRole("button", { name: "Search" })).toBeVisible();
+  await expect(sb.getByRole("link", { name: "Settings" })).toBeVisible();
+
+  // The band is down to the toggle alone.
+  const bar = topbar(page);
+  await expect(bar.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  await expect(bar.getByRole("button", { name: "Search" })).toHaveCount(0);
+  await expect(bar.getByRole("link", { name: "Settings" })).toHaveCount(0);
 });

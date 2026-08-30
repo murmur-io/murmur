@@ -346,10 +346,20 @@ app-shell {
    linked stylesheet. The rail chooses a surface; the adjacent panel contains
    only that surface's navigation. */
 app-shell {
-  flex-direction: column;
+  gap: var(--space-2);
   height: 100vh;
   padding: var(--space-2);
   overflow: hidden;
+}
+
+/* The band belongs to the SIDEBAR's column, not to the shell. As a full-width
+   shell row its height pushed the main column down too, leaving dead space
+   above the tab strip; here it offsets only the column it titles. */
+.shell-left {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  min-height: 0;
 }
 
 /* The band that carries Search, Collapse and Settings, level with the macOS
@@ -358,16 +368,15 @@ app-shell {
    sidebar — only 68px wide, narrower than the buttons themselves — no longer
    has to share a row it cannot fit. The whole strip drags the window; the
    controls opt out via their own `-webkit-app-region`. */
-/* Its width is the EXPANDED sidebar's, held even while the sidebar is
-   collapsed: three 32px controls do not fit in a 68px column, and a band that
-   resized with the sidebar would shuffle them on every toggle. */
+/* The band spans its column, so it narrows with a collapsed sidebar. Three
+   32px controls cannot fit 68px, which is why the template keeps only the
+   toggle here when collapsed and moves Search and Settings into the rail. */
 .shell-topbar {
   display: flex;
   flex: none;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-1);
-  width: var(--shell-sidebar-w);
   height: var(--shell-topbar-h);
   padding-top: var(--shell-topbar-pad-top);
   padding-right: var(--space-2);
@@ -406,13 +415,6 @@ app-shell {
   box-shadow: var(--shell-active-shadow);
 }
 
-.shell-body {
-  display: flex;
-  flex: 1 1 auto;
-  align-items: stretch;
-  gap: var(--space-2);
-  min-height: 0;
-}
 
 .shell-drag {
   position: fixed;
@@ -427,11 +429,12 @@ app-shell {
   align-self: auto;
   z-index: 9;
   display: flex;
-  flex: 0 0 var(--shell-sidebar-w);
+  flex: 1 1 auto;
   flex-direction: column;
   width: var(--shell-sidebar-w);
-  transition: flex-basis var(--transition-fast), width var(--transition-fast);
-  height: 100%;
+  min-height: 0;
+  height: auto;
+  transition: width var(--transition-fast);
   margin: 0;
   padding: 0;
   background:
@@ -450,7 +453,6 @@ app-shell {
    actions pinned to the bottom. Collapsed it keeps only the glyph column, so
    it reads as the old icon rail without being a second piece of chrome. */
 .app-sidebar.primary-sidebar.collapsed {
-  flex-basis: var(--shell-sidebar-w-collapsed);
   width: var(--shell-sidebar-w-collapsed);
 }
 
@@ -901,7 +903,7 @@ app-shell {
   color: var(--shell-active-icon);
 }
 
-.shell-body > .main-col {
+app-shell > .main-col {
   height: 100%;
   margin: 0;
   overflow: auto;
