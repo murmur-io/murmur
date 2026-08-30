@@ -611,56 +611,61 @@ app-shell {
   gap: var(--space-1);
 }
 
-/* Three identical squares: Capture and New note hug the LEFT, the create
-   menu's chevron is pushed to the RIGHT. All three sit on the global .btn, so
-   the border, hover and focus ring are the same control language — the chevron
-   used to be a bare glyph on transparent, which read as decoration rather than
-   as something you can press.
+/* The footer's action row, on the shape Notion uses: ONE wide button for the
+   thing you do most — start a recording — and a round button beside it holding
+   everything else you might create.
 
-   Icon-only, because two labelled buttons could not share this width without
-   truncating; the tooltip and aria-label carry the meaning. Capture is the
-   PRIMARY — making a recording is what the app is for. */
+   Why Capture and not New note: recording is what this app is for, and the
+   other three creations are occasional. Putting them behind one control keeps
+   the primary action unambiguous instead of offering two equal buttons and
+   making the user choose.
+
+   The round button carries `plus`; open, it rotates 45 degrees into an X. That
+   is the same affordance Notion uses, and it means the close state needs no
+   second glyph in the icon set. */
 .primary-sidebar .sb-create {
   justify-content: flex-start;
 }
 
-.primary-sidebar .sb-capture,
-.primary-sidebar .sb-new-note,
-.primary-sidebar .sb-create-more {
-  flex: none;
-  width: var(--shell-footer-btn);
+.primary-sidebar .sb-capture {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--space-2);
   height: var(--shell-footer-btn);
-  padding: 0;
-  border-radius: var(--radius-md);
-}
-
-.primary-sidebar .sb-capture,
-.primary-sidebar .sb-new-note {
-  width: var(--shell-footer-btn-w);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  font-size: 0.85rem;
 }
 
 .primary-sidebar .sb-capture.active {
   box-shadow: var(--shell-active-shadow);
 }
 
-/* The gap that separates the pair from the menu that extends them. */
 .primary-sidebar .sb-create-more {
-  margin-left: auto;
+  flex: none;
+  width: var(--shell-footer-btn);
+  height: var(--shell-footer-btn);
+  padding: 0;
+  border-radius: var(--radius-pill);
 }
 
-/* The chevron glyph points right; the menu opens upward. Rotating the GLYPH and
-   not the button keeps the focus ring square with the box. */
 .primary-sidebar .sb-create-more mur-icon {
-  transform: rotate(-90deg);
+  transition: transform var(--transition-fast);
 }
 
-/* Collapsed there is room for ONE control per line, so the three stack. */
+.primary-sidebar .sb-create-more.is-open mur-icon {
+  transform: rotate(45deg);
+}
+
+/* Collapsed there is room for ONE control per line, so the two stack and the
+   wide button gives up its label with every other label in the rail. */
 .primary-sidebar.collapsed .sb-create {
   flex-direction: column;
 }
 
-.primary-sidebar.collapsed .sb-create-more {
-  margin-left: 0;
+.primary-sidebar.collapsed .sb-capture {
+  width: 100%;
+  padding: 0;
 }
 
 /* Browse sits LAST, after Workspaces and Shared, so the user's own content is
