@@ -1,6 +1,10 @@
 <div class="shell-drag" data-tauri-drag-region></div>
 
-<nav class="global-rail" aria-label="Global navigation">
+<nav
+  class="global-rail"
+  [class.expanded]="railExpanded()"
+  aria-label="Global navigation"
+>
   <div class="rail-drag" data-tauri-drag-region></div>
   <div class="rail-brand" aria-hidden="true"><mur-icon icon="murmur" /></div>
 
@@ -14,6 +18,7 @@
     title="Capture"
   >
     <mur-icon icon="record" />
+    <span class="rail-label" aria-hidden="true">Capture</span>
   </a>
   <button
     type="button"
@@ -23,6 +28,7 @@
     title="Search (⌘K)"
   >
     <mur-icon icon="search" />
+    <span class="rail-label" aria-hidden="true">Search</span>
   </button>
   <button
     type="button"
@@ -30,10 +36,11 @@
     [class.active]="contextPanel() === 'spaces'"
     [attr.aria-pressed]="contextPanel() === 'spaces'"
     (click)="showSpaces()"
-    aria-label="Spaces"
-    title="Spaces"
+    aria-label="Workspaces"
+    title="Workspaces"
   >
     <mur-icon icon="spaces" />
+    <span class="rail-label" aria-hidden="true">Workspaces</span>
   </button>
   <a
     class="rail-item"
@@ -45,6 +52,7 @@
     title="Ask"
   >
     <mur-icon icon="ask" />
+    <span class="rail-label" aria-hidden="true">Ask</span>
   </a>
   <button
     type="button"
@@ -56,6 +64,7 @@
     title="Browse"
   >
     <mur-icon icon="browse" />
+    <span class="rail-label" aria-hidden="true">Browse</span>
   </button>
 
   <span class="rail-spacer"></span>
@@ -68,6 +77,7 @@
     title="New note (⌘N)"
   >
     <mur-icon icon="note-add" />
+    <span class="rail-label" aria-hidden="true">New note</span>
   </button>
   <a
     class="rail-item"
@@ -79,24 +89,36 @@
     title="Settings"
   >
     <mur-icon icon="settings" />
+    <span class="rail-label" aria-hidden="true">Settings</span>
   </a>
+  <button
+    type="button"
+    class="rail-item"
+    (click)="toggleRail()"
+    [attr.aria-expanded]="railExpanded()"
+    [attr.aria-label]="railExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+    [title]="railExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+  >
+    <mur-icon icon="sidebar" />
+    <span class="rail-label" aria-hidden="true">Collapse</span>
+  </button>
 </nav>
 
 @if (contextPanel() === "spaces") {
   <mur-sidebar
     class="app-sidebar spaces-sidebar"
     role="complementary"
-    aria-label="Spaces sidebar"
+    aria-label="Workspaces sidebar"
   >
     <div class="context-header spaces-header">
       <div class="context-header-main">
-        <h2>Spaces</h2>
+        <h2>Workspaces</h2>
         <div class="context-actions">
           <button
             type="button"
             class="context-action"
             (click)="openSearch()"
-            aria-label="Search Spaces"
+            aria-label="Search Workspaces"
             title="Search"
           >
             <mur-icon icon="search" />
@@ -105,8 +127,8 @@
             type="button"
             class="context-action context-action--label create-action"
             (click)="openWorkspaceCreate()"
-            aria-label="Create in Spaces"
-            title="Create in Spaces"
+            aria-label="Create in Workspaces"
+            title="Create in Workspaces"
           >
             <mur-icon icon="plus" />
             <span>New</span>
@@ -154,7 +176,7 @@
         type="button"
         class="collapse-context"
         (click)="collapseSpaces()"
-        aria-label="Collapse Spaces sidebar"
+        aria-label="Collapse Workspaces sidebar"
       >
         <mur-icon icon="sidebar" />
         <span>Collapse sidebar</span>

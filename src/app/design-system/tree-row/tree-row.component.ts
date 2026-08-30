@@ -83,7 +83,7 @@ export class MurTreeRowComponent {
   /** The leading glyph — `"locked"` for a sealed folder, `"folder"` otherwise. */
   readonly icon = input<TreeRowIcon>("folder");
   /**
-   * A user-chosen emoji that REPLACES the glyph (workspace Spaces can carry
+   * A user-chosen emoji that REPLACES the glyph (workspace Workspaces can carry
    * one). It stands in the icon's slot rather than beside it, so a row with an
    * emoji and a row without still align.
    */

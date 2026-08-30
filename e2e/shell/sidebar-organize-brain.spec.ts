@@ -4,7 +4,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
 
 const FOREST = Array.from({ length: 14 }, (_, index) => ({
   id: `space-${index + 1}`,
-  name: index === 0 ? "Acme" : `Space ${index + 1}`,
+  name: index === 0 ? "Acme" : `Workspace ${index + 1}`,
   kind: "meeting",
   level: "project",
   emoji: null,
@@ -86,7 +86,7 @@ const PLAN = {
       fromContainerId: null,
       fromContainer: "Unfiled",
       toContainerId: "space-2",
-      toContainer: "Space 2 / Hiring",
+      toContainer: "Workspace 2 / Hiring",
       reason: "Hiring discussion",
     },
   ],
@@ -104,13 +104,13 @@ const PLAN = {
       title: "Audio only",
       reason: "Two destinations look equally plausible",
       suggestedTargetId: "space-3",
-      suggestedTarget: "Space 3 / Research",
+      suggestedTarget: "Workspace 3 / Research",
     },
   ],
   targets: [
     { id: "space-1", label: "Acme / Standups" },
-    { id: "space-2", label: "Space 2 / Hiring" },
-    { id: "space-3", label: "Space 3 / Research" },
+    { id: "space-2", label: "Workspace 2 / Hiring" },
+    { id: "space-3", label: "Workspace 3 / Research" },
   ],
   totalScanned: 4,
 };
@@ -178,9 +178,9 @@ async function openWorkspace(page: Page): Promise<string[]> {
     (window as unknown as { __plan: unknown }).__plan = plan;
   }, PLAN);
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(
-    page.getByRole("complementary", { name: "Spaces sidebar" }),
+    page.getByRole("complementary", { name: "Workspaces sidebar" }),
   ).toBeVisible();
   return runtimeErrors;
 }
@@ -217,7 +217,7 @@ test("workspace menus use the shared menu primitive and close after an action", 
   expect(runtimeErrors).toEqual([]);
 });
 
-test("the scroller snaps a partial first row below the fixed Spaces header", async ({
+test("the scroller snaps a partial first row below the fixed Workspaces header", async ({
   page,
 }) => {
   const runtimeErrors = await openWorkspace(page);
@@ -270,7 +270,7 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
   ).toContainText(/Unfiled.*Acme \/ Standups/);
   await expect(sheet.getByText("Audio only", { exact: true })).toBeVisible();
   await expect(
-    sheet.getByText("Brain's best match: Space 3 / Research"),
+    sheet.getByText("Brain's best match: Workspace 3 / Research"),
   ).toBeVisible();
   await expect(sheet.getByLabel("Destination for Audio only")).toHaveValue(
     "space-3",
@@ -284,7 +284,7 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
 
   await sheet
     .getByRole("textbox", { name: "Filing guidance Optional" })
-    .fill("Prefer client Spaces over general folders");
+    .fill("Prefer client Workspaces over general folders");
   await sheet.getByRole("button", { name: "Replan" }).click();
   await expect
     .poll(() =>
@@ -296,7 +296,7 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
     )
     .toEqual([
       { guidance: null },
-      { guidance: "Prefer client Spaces over general folders" },
+      { guidance: "Prefer client Workspaces over general folders" },
     ]);
   await expect(sheet.getByLabel("Destination for Audio only")).toHaveValue(
     "space-3",
@@ -308,7 +308,7 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
   ).toBeChecked();
   await expect(
     sheet.getByRole("textbox", { name: "Filing guidance Optional" }),
-  ).toHaveValue("Prefer client Spaces over general folders");
+  ).toHaveValue("Prefer client Workspaces over general folders");
 
   // Zero selection is an honest close-only state, never a dead "Apply (0)".
   await sheet.getByRole("button", { name: "Clear all" }).click();
@@ -343,7 +343,7 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
             fromContainerId: null,
             fromContainer: "Unfiled",
             toContainerId: "space-3",
-            toContainer: "Space 3 / Research",
+            toContainer: "Workspace 3 / Research",
             reason:
               "Destination chosen during review. Two destinations look equally plausible",
           },
@@ -363,7 +363,7 @@ test("Brain reviews moves and skips, then applies only the selected recordings",
     .locator(".result-row.is-failed")
     .filter({ hasText: "Audio only" });
   await expect(failedResult).toContainText(
-    "Couldn’t move to Space 3 / Research",
+    "Couldn’t move to Workspace 3 / Research",
   );
   await expect(failedResult).toContainText("Destination was locked");
   await expect(
@@ -396,7 +396,7 @@ test("the visible Brain action exposes its planning state while the plan is pend
     { list_workspace_tree: FOREST, list_container_items: UNFILED },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
 
   const organize = page.getByRole("button", {
     name: "Review filing moves with Brain",

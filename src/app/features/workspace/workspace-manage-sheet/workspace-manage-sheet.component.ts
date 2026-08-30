@@ -14,7 +14,7 @@ import { MurIconComponent } from "../../../design-system/icon/icon.component";
 
 export type WorkspaceManageMode = "rename" | "delete";
 
-/** Explicit rename/delete confirmation for a Space hierarchy row. */
+/** Explicit rename/delete confirmation for a Workspace hierarchy row. */
 @Component({
   selector: "app-workspace-manage-sheet",
   changeDetection: ChangeDetectionStrategy.OnPush,

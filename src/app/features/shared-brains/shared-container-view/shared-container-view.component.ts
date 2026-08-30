@@ -14,7 +14,7 @@ import { MurIconComponent } from "../../../design-system/icon/icon.component";
 import { SharedWorkspaceService } from "../../../services/shared-workspace.service";
 
 /**
- * One RECEIVED container's page — a Space or folder somebody in the org shared.
+ * One RECEIVED container's page — a Workspace or folder somebody in the org shared.
  *
  * Deliberately read-only STRUCTURE at every access level. "Can edit" is about a
  * document's text, which the org viewer already owns; renaming, moving or
@@ -78,7 +78,7 @@ export class SharedContainerViewComponent {
   );
 
   readonly noun = computed(() =>
-    this.node()?.level === "folder" ? "folder" : "Space",
+    this.node()?.level === "folder" ? "folder" : "Workspace",
   );
 
   constructor() {

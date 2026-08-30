@@ -3055,7 +3055,7 @@ export interface OrgItemHeader {
   ownedSource?: { kind: "document" | "meeting"; id: string } | null;
 }
 
-/** Result of importing a received Shared Brain replica into a local Space. */
+/** Result of importing a received Shared Brain replica into a local Workspace. */
 export interface OrgItemImportResult {
   kind: "meeting" | "note";
   id: string;
@@ -3733,7 +3733,7 @@ export interface ItemPage {
   total: number;
 }
 
-// ── Shared containers: a whole Folder or Space published to an Org ────────────
+// ── Shared containers: a whole Folder or Workspace published to an Org ────────────
 
 /**
  * What sharing a container would publish — counts only, never content.
@@ -3798,7 +3798,7 @@ export interface SharedItemRow {
 }
 
 /**
- * One node of the received forest: a shared Space, a shared Folder, or the
+ * One node of the received forest: a shared Workspace, a shared Folder, or the
  * synthetic Shared Brains root. Mirrors the Rust `SharedContainerNode`.
  */
 export interface SharedContainerNode {
@@ -3825,11 +3825,11 @@ export interface SharedContainerNode {
 
 /** Everything shared WITH this user. Mirrors the Rust `SharedWorkspace`. */
 export interface SharedWorkspace {
-  /** Received Spaces — each becomes its own top-level sidebar row. */
+  /** Received Workspaces — each becomes its own top-level sidebar row. */
   spaces: SharedContainerNode[];
   /**
-   * Received Folders with no shared-Space parent, plus every received item with
-   * no container at all — one virtual Space so loose shared content has a home.
+   * Received Folders with no shared-Workspace parent, plus every received item with
+   * no container at all — one virtual Workspace so loose shared content has a home.
    */
   sharedBrains: SharedContainerNode;
 }

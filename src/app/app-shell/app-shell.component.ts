@@ -90,6 +90,7 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
 const BROWSE_GROUPS = ["Work", "Intelligence", "Insights"] as const;
 const NARROW_SHELL_QUERY = "(max-width: 760px)";
 const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
+const RAIL_EXPANDED_KEY = "murmur.shell.railExpanded";
 
 @Component({
   selector: "app-shell",
@@ -151,6 +152,17 @@ export class AppShellComponent {
     readStoredBoolean(SPACES_COLLAPSED_KEY, false),
   );
 
+  private readonly _railExpanded = signal(
+    readStoredBoolean(RAIL_EXPANDED_KEY, false),
+  );
+  /**
+   * Whether the global icon rail shows each destination's label beside its
+   * glyph. Collapsed is the default so an existing install opens unchanged, and
+   * the choice is persisted because a nav width the user has to re-set on every
+   * launch is worse than no toggle at all.
+   */
+  readonly railExpanded = this._railExpanded.asReadonly();
+
   private readonly isSpaceLeafRoute = computed(() => {
     const path = this.currentPath();
     return (
@@ -159,9 +171,9 @@ export class AppShellComponent {
       (path.startsWith("/notes/") && path !== "/notes/new") ||
       (path.startsWith("/tasks/") && path !== "/tasks/new") ||
       path.startsWith("/dashboards/") ||
-      // Shared Brains and a received container are now ROWS in the Spaces
+      // Shared Brains and a received container are now ROWS in the Workspaces
       // sidebar rather than a separate destination, so opening one must keep
-      // the tree beside it — the same as opening any Space of the user's own.
+      // the tree beside it — the same as opening any Workspace of the user's own.
       path === "/shared-brains" ||
       path.startsWith("/shared/")
     );
@@ -324,7 +336,7 @@ export class AppShellComponent {
         const id = await this.workspace.createSpace(request.name);
         this.workspaceCreateOpen.set(false);
         await this.router.navigate(["/container", id]);
-        this.toast.success(`Created Space “${request.name}”`);
+        this.toast.success(`Created Workspace “${request.name}”`);
         return;
       }
       const target = request.target;
@@ -375,6 +387,12 @@ export class AppShellComponent {
           : "";
     const normalized = raw.replace(/^invalid argument:\s*/i, "").trim();
     return normalized ? normalized.slice(0, 240) : null;
+  }
+
+  toggleRail(): void {
+    const next = !this._railExpanded();
+    this._railExpanded.set(next);
+    writeStoredBoolean(RAIL_EXPANDED_KEY, next);
   }
 
   collapseSpaces(): void {

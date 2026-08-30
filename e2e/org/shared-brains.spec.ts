@@ -274,14 +274,14 @@ test("a local membership gate closing evicts previously rendered Shared Brain me
   expect(runtimeErrors).toEqual([]);
 });
 
-test("Shared Brains keeps its org/type filters and explicit legacy rows beside the Spaces tree", async ({
+test("Shared Brains keeps its org/type filters and explicit legacy rows beside the Workspaces tree", async ({
   page,
 }) => {
   const runtimeErrors = watchRuntimeErrors(page);
   await boot(page);
 
   // Shared Brains stopped being a rail destination on 2026-08-29: it is now a
-  // ROW in the Spaces sidebar (a virtual Space holding everything shared with
+  // ROW in the Workspaces sidebar (a virtual Workspace holding everything shared with
   // you that has no container of its own), so there is no rail link to be
   // current, and the tree stays beside the page instead of being replaced by
   // it. What the page itself does — the org and type filters, and the honest
@@ -378,16 +378,16 @@ test("the received-item viewer resolves its organization locally", async ({
   expect(runtimeErrors).toEqual([]);
 });
 
-test("received replicas add a snapshot copy to a Space", async ({ page }) => {
+test("received replicas add a snapshot copy to a Workspace", async ({ page }) => {
   const runtimeErrors = watchRuntimeErrors(page);
   await boot(page);
 
   await page
     .getByRole("button", { name: "Actions for Research brief" })
     .click();
-  await page.getByRole("menuitem", { name: "Add a copy to Space…" }).click();
+  await page.getByRole("menuitem", { name: "Add a copy to Workspace…" }).click();
   const copySheet = page.getByRole("dialog", {
-    name: "Add a copy note “Research brief” to Space",
+    name: "Add a copy note “Research brief” to Workspace",
   });
   await expect(
     copySheet.getByRole("button", { name: "Add a copy to Unlocked private" }),
@@ -424,7 +424,7 @@ test("unclassified legacy replicas expose no copy action the backend would refus
     menu.getByRole("menuitem", { name: "Open shared item" }),
   ).toBeVisible();
   await expect(
-    menu.getByRole("menuitem", { name: "Add a copy to Space…" }),
+    menu.getByRole("menuitem", { name: "Add a copy to Workspace…" }),
   ).toHaveCount(0);
   expect(
     await page.evaluate(
@@ -445,7 +445,7 @@ test("owned sources open the local original", async ({ page }) => {
   expect(runtimeErrors).toEqual([]);
 });
 
-test("owned sources move the local original to a Space", async ({ page }) => {
+test("owned sources move the local original to a Workspace", async ({ page }) => {
   const runtimeErrors = watchRuntimeErrors(page);
   await boot(page);
 
@@ -454,10 +454,10 @@ test("owned sources move the local original to a Space", async ({ page }) => {
     .getByRole("button", { name: "Actions for Studio planning" })
     .click();
   await page
-    .getByRole("menuitem", { name: "Move local original to Space…" })
+    .getByRole("menuitem", { name: "Move local original to Workspace…" })
     .click();
   const moveSheet = page.getByRole("dialog", {
-    name: "Move recording “Studio planning” to Space",
+    name: "Move recording “Studio planning” to Workspace",
   });
   await expect(
     moveSheet.getByRole("button", { name: "Move to Unlocked private" }),
@@ -499,7 +499,7 @@ for (const viewport of [
     });
     await expect(menu).toBeVisible();
     await expect(
-      menu.getByRole("menuitem", { name: "Add a copy to Space…" }),
+      menu.getByRole("menuitem", { name: "Add a copy to Workspace…" }),
     ).toBeVisible();
     expect(runtimeErrors).toEqual([]);
   });

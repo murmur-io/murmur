@@ -88,22 +88,22 @@ async function boot(page: Page, path = "/record"): Promise<void> {
   await page.goto(path);
 }
 
-test("uses a persistent global rail beside a contextual Spaces panel", async ({ page }) => {
+test("uses a persistent global rail beside a contextual Workspaces panel", async ({ page }) => {
   await boot(page);
 
   const rail = page.getByRole("navigation", { name: "Global navigation" });
   await expect(rail).toBeVisible();
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toHaveCount(0);
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toHaveCount(0);
   await expect(rail.getByRole("link", { name: "Capture" })).toHaveAttribute(
     "aria-current",
     "page",
   );
 
-  await rail.getByRole("button", { name: "Spaces" }).click();
+  await rail.getByRole("button", { name: "Workspaces" }).click();
   await expect(page).toHaveURL(/\/record$/);
-  const spaces = page.getByRole("complementary", { name: "Spaces sidebar" });
+  const spaces = page.getByRole("complementary", { name: "Workspaces sidebar" });
   await expect(spaces).toBeVisible();
-  await expect(spaces.getByRole("tree", { name: "Spaces" })).toBeVisible();
+  await expect(spaces.getByRole("tree", { name: "Workspaces" })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Primary" })).toHaveCount(0);
   await expect(page.locator(".pill-bar")).toHaveCount(0);
 
@@ -123,7 +123,7 @@ test("uses a persistent global rail beside a contextual Spaces panel", async ({ 
 
   await expect(rail.getByRole("button", { name: "Search" })).toBeVisible();
   await expect(rail.getByRole("link", { name: "Capture" })).toBeVisible();
-  await expect(rail.getByRole("button", { name: "Spaces" })).toBeVisible();
+  await expect(rail.getByRole("button", { name: "Workspaces" })).toBeVisible();
   await expect(rail.getByRole("link", { name: "Ask" })).toBeVisible();
   await expect(rail.getByRole("button", { name: "Browse" })).toBeVisible();
   await expect(
@@ -132,34 +132,34 @@ test("uses a persistent global rail beside a contextual Spaces panel", async ({ 
   await expect(rail.getByRole("link", { name: "Settings" })).toBeVisible();
 });
 
-test("collapsing the whole Spaces panel persists on leaf routes and the rail restores it", async ({
+test("collapsing the whole Workspaces panel persists on leaf routes and the rail restores it", async ({
   page,
 }) => {
   await boot(page, "/container/p-acme");
-  const spaces = page.getByRole("complementary", { name: "Spaces sidebar" });
+  const spaces = page.getByRole("complementary", { name: "Workspaces sidebar" });
   await expect(spaces).toBeVisible();
 
-  await spaces.getByRole("button", { name: "Collapse Spaces sidebar" }).click();
+  await spaces.getByRole("button", { name: "Collapse Workspaces sidebar" }).click();
   await expect(spaces).toHaveCount(0);
   expect(
     await page.evaluate(() => localStorage.getItem("murmur.shell.spacesCollapsed")),
   ).toBe("true");
 
   await page.reload();
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toHaveCount(0);
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Workspaces" }).click();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toBeVisible();
   expect(
     await page.evaluate(() => localStorage.getItem("murmur.shell.spacesCollapsed")),
   ).toBe("false");
 });
 
-test("task and dashboard leaves keep Spaces visible and select the matching row", async ({
+test("task and dashboard leaves keep Workspaces visible and select the matching row", async ({
   page,
 }) => {
   await boot(page, "/tasks/t-ship");
   await expect(page).toHaveURL(/\/tasks\/t-ship$/);
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toBeVisible();
   await expect(page.getByRole("treeitem", { name: /Ship release/ })).toHaveAttribute(
     "aria-selected",
     "true",
@@ -167,7 +167,7 @@ test("task and dashboard leaves keep Spaces visible and select the matching row"
 
   await page.getByRole("treeitem", { name: /Release dashboard/ }).click();
   await expect(page).toHaveURL(/\/dashboards\/d-release$/);
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toBeVisible();
   await expect(page.getByRole("treeitem", { name: /Release dashboard/ })).toHaveAttribute(
     "aria-selected",
     "true",
@@ -178,29 +178,29 @@ test("rail surfaces switch from deep content and Settings through real routes", 
   page,
 }) => {
   await boot(page, "/settings");
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(page).toHaveURL(/\/container\/p-acme$/);
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toBeVisible();
 
   await page.getByRole("button", { name: "Browse" }).click();
   await expect(page).toHaveURL(/\/library$/);
   await expect(page.getByRole("complementary", { name: "Browse sidebar" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(page).toHaveURL(/\/library$/);
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toBeVisible();
 });
 
-test("opens Spaces without unmounting desktop Ask content", async ({ page }) => {
+test("opens Workspaces without unmounting desktop Ask content", async ({ page }) => {
   await boot(page, "/ask");
   const askHeading = page.getByRole("heading", { name: "Ask your meetings" });
   await expect(askHeading).toBeVisible();
 
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
 
   await expect(page).toHaveURL(/\/ask$/);
   await expect(askHeading).toBeVisible();
-  await expect(page.getByRole("complementary", { name: "Spaces sidebar" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toBeVisible();
 });
 
 for (const [count, label] of [
@@ -257,12 +257,12 @@ test("keeps task navigation usable at 390px without a side-by-side context panel
   await expect(page.getByLabel("Task title")).toHaveValue("Ship release");
   await expect(page.locator(".app-sidebar")).toBeHidden();
 
-  await page.getByRole("button", { name: "Spaces" }).click();
+  await page.getByRole("button", { name: "Workspaces" }).click();
   await expect(page).toHaveURL(/\/container\/p-acme$/);
   await expect(page.locator(".app-sidebar")).toBeHidden();
 });
 
-test("does not offer or dispatch top-level folder creation into a sealed first Space", async ({
+test("does not offer or dispatch top-level folder creation into a sealed first Workspace", async ({
   page,
 }) => {
   await mockTauri(
@@ -278,7 +278,7 @@ test("does not offer or dispatch top-level folder creation into a sealed first S
   );
   await page.goto("/container/p-sealed");
 
-  const create = page.getByRole("button", { name: "New folder in first Space" });
+  const create = page.getByRole("button", { name: "New folder in first Workspace" });
   await expect.soft(create).toHaveCount(0);
   if ((await create.count()) > 0) {
     await create.click();

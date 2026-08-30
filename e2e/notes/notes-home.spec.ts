@@ -42,7 +42,7 @@ test("notes home renders Browse navigation + the note table (incl. masked locked
   await expect(page.locator(".new-note-btn")).toBeVisible();
 
   // Exact list routes do not mount the hierarchy panel or its former section
-  // wrapper. The hierarchy is reserved for Space and leaf routes.
+  // wrapper. The hierarchy is reserved for Workspace and leaf routes.
   await expect(page.locator("mur-sidebar.spaces-sidebar")).toHaveCount(0);
   await expect(page.locator("mur-sidebar-section")).toHaveCount(0);
 
@@ -119,10 +119,10 @@ test("Notes Home hides auto-organize for a session-unlocked sealed folder", asyn
   await page.goto("/notes");
   await page
     .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Spaces", exact: true })
+    .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   const spacesSidebar = page.getByRole("complementary", {
-    name: "Spaces sidebar",
+    name: "Workspaces sidebar",
   });
   await spacesSidebar.getByRole("button", { name: "Expand Workspace" }).click();
   await spacesSidebar
@@ -158,7 +158,7 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
     list_workspace_tree: () => [
       {
         id: "sealed-space",
-        name: "Private Space",
+        name: "Private Workspace",
         kind: "meeting",
         level: "project",
         emoji: "🔒",
@@ -171,7 +171,7 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
       },
       {
         id: "open-space",
-        name: "Team Space",
+        name: "Team Workspace",
         kind: "meeting",
         level: "project",
         emoji: null,
@@ -215,9 +215,9 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
           itemId: "sealed-recording",
           title: "Private roadmap",
           fromContainerId: "sealed-space",
-          fromContainer: "Private Space",
+          fromContainer: "Private Workspace",
           toContainerId: "open-space",
-          toContainer: "Team Space",
+          toContainer: "Team Workspace",
           reason: "Matches the team's roadmap work",
         },
         {
@@ -226,20 +226,20 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
           fromContainerId: null,
           fromContainer: "Unfiled",
           toContainerId: "open-space",
-          toContainer: "Team Space",
+          toContainer: "Team Workspace",
           reason: "Recurring team sync",
         },
       ],
       review: [],
       skipped: [],
-      targets: [{ id: "open-space", label: "Team Space" }],
+      targets: [{ id: "open-space", label: "Team Workspace" }],
       totalScanned: 2,
     }),
   });
   await page.goto("/notes");
   await page
     .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Spaces", exact: true })
+    .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await page
     .getByRole("button", { name: "Review filing moves with Brain" })
@@ -249,10 +249,10 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
     name: "Review Brain filing plan",
   });
   const privateMove = sheet.getByRole("checkbox", {
-    name: "Move Private roadmap to Team Space",
+    name: "Move Private roadmap to Team Workspace",
   });
   const safeMove = sheet.getByRole("checkbox", {
-    name: "Move Public standup to Team Space",
+    name: "Move Public standup to Team Workspace",
   });
   const warning = sheet.getByTestId("organizer-unsealed-warning");
 
