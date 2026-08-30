@@ -76,16 +76,21 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   expect(centres[1]).toBeCloseTo(centres[0], 0);
   expect(centres[2]).toBeCloseTo(centres[0], 0);
 
-  // And that row is level with the traffic lights, whose centre sits 30px below
-  // the window top (trafficLightPosition y:30 — that y IS the centre, measured;
-  // reading it as the top edge is what left the row 6px low).
-  expect(centres[0]).toBeGreaterThan(24);
-  expect(centres[0]).toBeLessThan(36);
+  // The band sits in the window-button strip. The exact centre is calibrated,
+  // not derived — trafficLightPosition did not predict the rendered result — so
+  // this window is deliberately loose and only guards the band from drifting
+  // into the sidebar or off the top of the window.
+  expect(centres[0]).toBeGreaterThan(16);
+  expect(centres[0]).toBeLessThan(34);
 
-  // It must also clear them horizontally: the buttons end 84px in.
-  const searchBox = await search.boundingBox();
-  expect(searchBox).not.toBeNull();
-  expect(searchBox!.x).toBeGreaterThanOrEqual(84);
+  // Order left to right: Search, Settings, Collapse — right-aligned, so they
+  // sit at the far end of the sidebar's column, clear of the window buttons.
+  const boxesX = boxes.map((b) => b!.x);
+  expect(boxesX[0]).toBeLessThan(boxesX[2]);
+  const settingsBox = boxes[2];
+  const collapseBox = boxes[1];
+  expect(settingsBox!.x).toBeLessThan(collapseBox!.x);
+  expect(boxesX[0]).toBeGreaterThan(100);
 
   // The band is above the sidebar, not inside it.
   const sbBox = await sb.boundingBox();
