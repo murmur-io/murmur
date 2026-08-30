@@ -125,7 +125,13 @@
   /* The three footer controls — Capture, New note, and the create menu's
      chevron. One token because they must stay identical squares: the moment
      they differ, the row reads as two sizes of button rather than one action
-     bar. 36px sits between the 32px nav glyph and the 40px global .btn. */
+     bar. 36px sits between the 32px nav glyph and the 40px global .btn.
+
+     Capture and New note are WIDER than tall: at 36 square they were correct but
+     quiet, and a slightly wider hit area is what makes the pair read as the
+     footer's actions. The chevron stays square — it extends the pair rather
+     than being a third action, and matching their width would say otherwise. */
   --shell-footer-btn: 36px;
+  --shell-footer-btn-w: 46px;
   --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
 }
