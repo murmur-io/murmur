@@ -195,7 +195,7 @@
 
     <div class="sb-create">
       <a
-        class="sb-fab sb-fab-primary"
+        class="btn btn-primary sb-capture"
         [class.active]="isCaptureActive()"
         [attr.aria-current]="isCaptureActive() ? 'page' : null"
         routerLink="/record"
@@ -206,7 +206,7 @@
       </a>
       <button
         type="button"
-        class="sb-fab sb-fab-glass"
+        class="btn sb-new-note"
         (click)="newNote()"
         aria-label="New note"
         title="New note (⌘N)"
@@ -215,7 +215,7 @@
       </button>
       <button
         type="button"
-        class="sb-fab sb-fab-glass sb-create-more"
+        class="sb-create-more"
         (click)="toggleCreateMenu()"
         aria-haspopup="menu"
         [attr.aria-expanded]="createMenuOpen()"
