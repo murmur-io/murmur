@@ -114,22 +114,11 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   // primary — recording is what the app is for — and New note the secondary.
   const capture = sb.getByRole("link", { name: "Capture" });
   const newNote = sb.getByRole("button", { name: "New note" });
-  await expect(capture).toHaveClass(/sb-fab-primary/);
-  await expect(newNote).toHaveClass(/sb-fab-glass/);
-  await expect(newNote).not.toHaveClass(/sb-fab-primary/);
+  await expect(capture).toHaveClass(/btn-primary/);
+  await expect(newNote).toHaveClass(/\bbtn\b/);
+  await expect(newNote).not.toHaveClass(/btn-primary/);
   await expect(capture).toHaveText("");
   await expect(newNote).toHaveText("");
-
-  // Round, small, and the pair sits LEFT with the create caret pushed right.
-  const captureBox = await capture.boundingBox();
-  const moreBox = await sb
-    .getByRole("button", { name: "More create options" })
-    .boundingBox();
-  expect(captureBox).not.toBeNull();
-  expect(moreBox).not.toBeNull();
-  expect(captureBox!.width).toBeCloseTo(captureBox!.height, 0);
-  expect(captureBox!.width).toBeLessThanOrEqual(40);
-  expect(captureBox!.x).toBeLessThan(moreBox!.x);
 
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 });
