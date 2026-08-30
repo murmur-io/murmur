@@ -96,7 +96,7 @@ test("locking an authored-note folder evicts loaded vault Ask titles, messages, 
   // conversation and its sensitive source must remain present until locking
   // publishes the invalidation that scrubs them.
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await expect(page).toHaveURL(/\/ask$/);
@@ -205,7 +205,7 @@ test("locking a meeting folder evicts loaded vault Ask plaintext", async ({
   // Opening Workspaces is contextual navigation: it must not unmount Ask or scrub
   // the message before the actual lock transition occurs.
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await expect(page).toHaveURL(/\/ask$/);

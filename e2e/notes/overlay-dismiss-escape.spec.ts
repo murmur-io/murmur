@@ -31,7 +31,7 @@ async function backgroundAndReturnToCachedNote(
   page: import("@playwright/test").Page,
 ): Promise<void> {
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("link", { name: "Capture", exact: true })
     .dispatchEvent("click");
   await expect(page).toHaveURL(/\/record$/);
@@ -82,7 +82,7 @@ test("note selection overlays stay interactive and dismiss when the pointer leav
 
   // Leaving the owning editor for app chrome dismisses the transient overlay.
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("link", { name: "Capture", exact: true })
     .click();
   await expect(page).toHaveURL(/\/record$/);
@@ -180,7 +180,7 @@ test("main-shell Escape is consumed after its document-level overlay handler run
   await page.goto("/notes/n1");
 
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Search", exact: true })
     .click();
   await expect(page.locator(".qs-scrim")).toBeVisible();

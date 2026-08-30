@@ -42,7 +42,7 @@ test("Reminders: a live count cannot be lost or overwritten by a stale startup s
   });
 
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Browse", exact: true })
     .click();
   const reminderNav = page
@@ -2404,7 +2404,7 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
 
   // Routed authored-note context carries the note source into the same composer.
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Browse", exact: true })
     .click();
   await page

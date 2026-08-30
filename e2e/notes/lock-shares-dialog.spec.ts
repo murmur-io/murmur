@@ -46,7 +46,7 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
     // Open the hierarchy without navigating away from the mounted Notes list.
     // Its plaintext stays visible until the user actually confirms a lock.
     await page
-      .getByRole("navigation", { name: "Global navigation" })
+      .getByRole("navigation", { name: "Primary navigation" })
       .getByRole("button", { name: "Workspaces", exact: true })
       .click();
     await expect(page).toHaveURL(/\/notes$/);
