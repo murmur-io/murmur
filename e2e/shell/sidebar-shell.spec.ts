@@ -269,15 +269,20 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   await expect(bar.getByRole("button", { name: "Search" })).toHaveCount(0);
   await expect(bar.getByRole("link", { name: "Settings" })).toHaveCount(0);
 
-  // REGRESSION: collapsed, the panel is narrower than the macOS window buttons
-  // (which end 84px in), so the toggle must sit BELOW them rather than wedged
-  // between the yellow and the green one. It also has to stay ON the panel.
+  // REGRESSION: the collapsed panel is sized BY the window buttons — it wraps
+  // them with an equal margin either side (they span 20..72px). Before, it was
+  // narrower than they are: the green one overhung it and the toggle sat wedged
+  // between yellow and green. The toggle now drops below them.
   const expandBox = await expand.boundingBox();
   const sbBox = await sb.boundingBox();
   expect(expandBox).not.toBeNull();
   expect(sbBox).not.toBeNull();
   expect(expandBox!.y).toBeGreaterThan(40);
-  expect(sbBox!.x + sbBox!.width).toBeGreaterThanOrEqual(84);
+
+  const marginBefore = 20 - sbBox!.x;
+  const marginAfter = sbBox!.x + sbBox!.width - 72;
+  expect(marginAfter).toBeGreaterThan(0);
+  expect(marginAfter).toBeCloseTo(marginBefore, 0);
 });
 
 /**
