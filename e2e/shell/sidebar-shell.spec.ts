@@ -76,10 +76,11 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   expect(centres[1]).toBeCloseTo(centres[0], 0);
   expect(centres[2]).toBeCloseTo(centres[0], 0);
 
-  // And that row is level with the traffic lights, whose centre the shell puts
-  // 36px below the window top (trafficLightPosition y:30 + a 12px button).
-  expect(centres[0]).toBeGreaterThan(28);
-  expect(centres[0]).toBeLessThan(44);
+  // And that row is level with the traffic lights, whose centre sits 30px below
+  // the window top (trafficLightPosition y:30 — that y IS the centre, measured;
+  // reading it as the top edge is what left the row 6px low).
+  expect(centres[0]).toBeGreaterThan(24);
+  expect(centres[0]).toBeLessThan(36);
 
   // It must also clear them horizontally: the buttons end 84px in.
   const searchBox = await search.boundingBox();
