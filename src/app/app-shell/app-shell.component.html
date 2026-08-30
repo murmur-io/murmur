@@ -1,9 +1,16 @@
-<div class="shell-left">
-<header class="shell-topbar" data-tauri-drag-region>
+<div class="shell-drag" data-tauri-drag-region></div>
+
+<mur-sidebar
+  class="app-sidebar primary-sidebar"
+  [class.collapsed]="!sidebarExpanded()"
+  role="navigation"
+  aria-label="Primary navigation"
+>
+  <div class="sb-top" data-tauri-drag-region>
   @if (sidebarExpanded()) {
     <button
       type="button"
-      class="topbar-btn"
+      class="sb-top-btn"
       (click)="openSearch()"
       aria-label="Search"
       title="Search (⌘K)"
@@ -11,7 +18,7 @@
       <mur-icon icon="search" />
     </button>
     <a
-      class="topbar-btn"
+      class="sb-top-btn"
       [class.active]="isSettingsActive()"
       [attr.aria-current]="isSettingsActive() ? 'page' : null"
       routerLink="/settings"
@@ -23,7 +30,7 @@
   }
   <button
     type="button"
-    class="topbar-btn"
+    class="sb-top-btn"
     (click)="toggleSidebar()"
     [attr.aria-expanded]="sidebarExpanded()"
     [attr.aria-label]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
@@ -31,14 +38,8 @@
   >
     <mur-icon icon="sidebar" />
   </button>
-</header>
+  </div>
 
-<mur-sidebar
-  class="app-sidebar primary-sidebar"
-  [class.collapsed]="!sidebarExpanded()"
-  role="navigation"
-  aria-label="Primary navigation"
->
   <div class="sb-scroll">
   <nav class="sb-nav" aria-label="Destinations">
     @if (!sidebarExpanded()) {
@@ -231,7 +232,6 @@
 
   </div>
 </mur-sidebar>
-</div>
 
 <div class="main-col">
   <mur-tab-strip />

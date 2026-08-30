@@ -39,7 +39,7 @@ function sidebar(page: Page) {
 }
 
 function topbar(page: Page) {
-  return page.locator("header.shell-topbar");
+  return page.locator(".primary-sidebar .sb-top");
 }
 
 test("opens expanded, with search on top and no brand mark", async ({ page }) => {
@@ -48,8 +48,8 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
 
   await expect(sb).toBeVisible();
 
-  // Search, Collapse and Settings share ONE band that sits ABOVE the sidebar,
-  // in shell chrome rather than inside the panel's glass.
+  // Search, Settings and Collapse share the sidebar's own top row, INSIDE the
+  // panel's glass and level with the macOS window buttons on its left.
   const bar = topbar(page);
   const search = bar.getByRole("button", { name: "Search" });
   const collapse = bar.getByRole("button", { name: "Collapse sidebar" });
@@ -92,18 +92,18 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   expect(settingsBox!.x).toBeLessThan(collapseBox!.x);
   expect(boxesX[0]).toBeGreaterThan(100);
 
-  // The band is above the sidebar, not inside it.
+  // The row is INSIDE the panel, so the window buttons land on the glass.
   const sbBox = await sb.boundingBox();
   expect(sbBox).not.toBeNull();
-  expect(centres[0]).toBeLessThan(sbBox!.y);
+  expect(centres[0]).toBeGreaterThan(sbBox!.y);
+  expect(centres[0]).toBeLessThan(sbBox!.y + 40);
 
-  // REGRESSION: the band belongs to the sidebar's column. As a full-width shell
-  // row it pushed the main column down too, leaving dead space above the tabs.
+  // REGRESSION: the sidebar must not push the main column down — that is the
+  // dead space that appeared above the tab strip when the row lived outside.
   const main = page.locator(".main-col");
   const mainBox = await main.boundingBox();
   expect(mainBox).not.toBeNull();
-  expect(mainBox!.y).toBeLessThan(sbBox!.y);
-  expect(mainBox!.height).toBeGreaterThan(sbBox!.height);
+  expect(mainBox!.y).toBeCloseTo(sbBox!.y, 0);
 
   // The Murmur logo tile is gone — it was chrome that navigated nowhere.
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
@@ -241,7 +241,7 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   await expect(sb.getByRole("button", { name: "Search" })).toBeVisible();
   await expect(sb.getByRole("link", { name: "Settings" })).toBeVisible();
 
-  // The band is down to the toggle alone.
+  // The row is down to the toggle alone.
   const bar = topbar(page);
   await expect(bar.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
   await expect(bar.getByRole("button", { name: "Search" })).toHaveCount(0);

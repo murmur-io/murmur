@@ -352,15 +352,6 @@ app-shell {
   overflow: hidden;
 }
 
-/* The band belongs to the SIDEBAR's column, not to the shell. As a full-width
-   shell row its height pushed the main column down too, leaving dead space
-   above the tab strip; here it offsets only the column it titles. */
-.shell-left {
-  display: flex;
-  flex: none;
-  flex-direction: column;
-  min-height: 0;
-}
 
 /* The band that carries Search, Collapse and Settings, level with the macOS
    window buttons. It lives ABOVE the sidebar rather than inside its glass, so
@@ -368,21 +359,20 @@ app-shell {
    sidebar — only 68px wide, narrower than the buttons themselves — no longer
    has to share a row it cannot fit. The whole strip drags the window; the
    controls opt out via their own `-webkit-app-region`. */
-/* The band spans its column, so it narrows with a collapsed sidebar. Three
-   32px controls cannot fit 68px, which is why the template keeps only the
-   toggle here when collapsed and moves Search and Settings into the rail. */
-.shell-topbar {
+/* The sidebar's own top row: the window buttons occupy its left, the controls
+   its right. The whole strip drags the window; the controls opt out. Its HEIGHT
+   is what centres the controls on the buttons — see layout.css. */
+.primary-sidebar .sb-top {
   display: flex;
   flex: none;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-1);
   height: var(--shell-topbar-h);
-  padding-top: var(--shell-topbar-pad-top);
   padding-right: var(--space-2);
 }
 
-.topbar-btn {
+.primary-sidebar .sb-top-btn {
   display: grid;
   place-items: center;
   flex: none;
@@ -399,17 +389,17 @@ app-shell {
   transition: color var(--transition-fast), background var(--transition-fast);
 }
 
-.topbar-btn:hover {
+.primary-sidebar .sb-top-btn:hover {
   background: var(--surface-hover);
   color: var(--text-primary);
 }
 
-.topbar-btn:focus-visible {
+.primary-sidebar .sb-top-btn:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
-.topbar-btn.active {
+.primary-sidebar .sb-top-btn.active {
   background: var(--shell-active-bg);
   color: var(--shell-active-icon);
   box-shadow: var(--shell-active-shadow);
@@ -429,12 +419,11 @@ app-shell {
   align-self: auto;
   z-index: 9;
   display: flex;
-  flex: 1 1 auto;
+  flex: 0 0 var(--shell-sidebar-w);
   flex-direction: column;
   width: var(--shell-sidebar-w);
-  min-height: 0;
-  height: auto;
-  transition: width var(--transition-fast);
+  height: calc(100vh - var(--space-4));
+  transition: flex-basis var(--transition-fast), width var(--transition-fast);
   margin: 0;
   padding: 0;
   background:
@@ -453,6 +442,7 @@ app-shell {
    actions pinned to the bottom. Collapsed it keeps only the glyph column, so
    it reads as the old icon rail without being a second piece of chrome. */
 .app-sidebar.primary-sidebar.collapsed {
+  flex-basis: var(--shell-sidebar-w-collapsed);
   width: var(--shell-sidebar-w-collapsed);
 }
 
@@ -904,7 +894,7 @@ app-shell {
 }
 
 app-shell > .main-col {
-  height: 100%;
+  height: calc(100vh - var(--space-4));
   margin: 0;
   overflow: auto;
 }

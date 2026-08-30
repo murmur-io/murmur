@@ -103,26 +103,23 @@
      literals inside the shell chrome in styles.css. */
   --shell-sidebar-w: calc(var(--space-8) * 4);
 
-  /* The control band ABOVE the sidebar, level with the macOS window buttons.
+  /* The sidebar's own top row. It holds Search / Settings / Collapse at its
+     right end, while the macOS window buttons sit at its left — inside the
+     panel's glass, which is why the sidebar reaches the top of the window
+     instead of starting below a separate band.
 
-     The controls are RIGHT-aligned within the sidebar's own width, which puts
-     them at the far end of that column and well clear of the window buttons on
-     the left — so the band no longer needs a horizontal clearance at all.
+     Vertical is calibrated, not derived. `trafficLightPosition` in
+     src-tauri/tauri.conf.json says { y: 30 }, and that number has now failed to
+     predict the rendered result twice: a 36px centre (y read as the buttons'
+     top edge plus half a 12px button) sat clearly low, a 30px centre (y read as
+     the centre) still sat slightly low. 26px comes from those observations.
 
-     Vertical is the one value that cannot be derived. `trafficLightPosition`
-     in src-tauri/tauri.conf.json says { y: 30 }, but that number did not
-     predict the rendered result twice over: a 36px centre (reading y as the
-     buttons' top edge plus half a 12px button) sat clearly low, and a 30px
-     centre (reading y as the centre) still sat slightly low. 26px is calibrated
-     from those two observations, not derived.
+       sidebar's top    = app-shell padding + border =  9px
+       row is centred   = 9 + 34/2                   = 26px below the window top
 
-       band starts at   = app-shell padding        =  8px
-       => a 32px control centres at 26px with 2px above it; the band is 34px
-
-     No CSS can read the native buttons' real box, so if the window chrome or
-     trafficLightPosition changes, this is re-measured, not recomputed. It is
-     one value: --shell-topbar-pad-top, with the height following it. */
-  --shell-topbar-pad-top: 2px;
+     So the row's HEIGHT is what places it; there is no padding to keep in sync.
+     No CSS can read the native buttons' real box, so a change to the window
+     chrome means re-measuring this one value. */
   --shell-topbar-h: 34px;
   --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
 }
