@@ -1,23 +1,26 @@
+<div class="shell-left">
 <header class="shell-topbar" data-tauri-drag-region>
-  <button
-    type="button"
-    class="topbar-btn"
-    (click)="openSearch()"
-    aria-label="Search"
-    title="Search (⌘K)"
-  >
-    <mur-icon icon="search" />
-  </button>
-  <a
-    class="topbar-btn"
-    [class.active]="isSettingsActive()"
-    [attr.aria-current]="isSettingsActive() ? 'page' : null"
-    routerLink="/settings"
-    aria-label="Settings"
-    title="Settings"
-  >
-    <mur-icon icon="settings" />
-  </a>
+  @if (sidebarExpanded()) {
+    <button
+      type="button"
+      class="topbar-btn"
+      (click)="openSearch()"
+      aria-label="Search"
+      title="Search (⌘K)"
+    >
+      <mur-icon icon="search" />
+    </button>
+    <a
+      class="topbar-btn"
+      [class.active]="isSettingsActive()"
+      [attr.aria-current]="isSettingsActive() ? 'page' : null"
+      routerLink="/settings"
+      aria-label="Settings"
+      title="Settings"
+    >
+      <mur-icon icon="settings" />
+    </a>
+  }
   <button
     type="button"
     class="topbar-btn"
@@ -30,7 +33,6 @@
   </button>
 </header>
 
-<div class="shell-body">
 <mur-sidebar
   class="app-sidebar primary-sidebar"
   [class.collapsed]="!sidebarExpanded()"
@@ -39,6 +41,18 @@
 >
   <div class="sb-scroll">
   <nav class="sb-nav" aria-label="Destinations">
+    @if (!sidebarExpanded()) {
+      <button
+        type="button"
+        class="sb-row"
+        (click)="openSearch()"
+        aria-label="Search"
+        title="Search (⌘K)"
+      >
+        <mur-icon icon="search" />
+        <span class="sb-label">Search</span>
+      </button>
+    }
     <a
       class="sb-row"
       [class.active]="isCaptureActive()"
@@ -140,6 +154,19 @@
   </div>
 
   <div class="sb-footer">
+    @if (!sidebarExpanded()) {
+      <a
+        class="sb-row"
+        [class.active]="isSettingsActive()"
+        [attr.aria-current]="isSettingsActive() ? 'page' : null"
+        routerLink="/settings"
+        aria-label="Settings"
+        title="Settings"
+      >
+        <mur-icon icon="settings" />
+        <span class="sb-label">Settings</span>
+      </a>
+    }
     @if (unlockedCount() > 0 && sidebarExpanded()) {
       <button
         type="button"
@@ -204,13 +231,13 @@
 
   </div>
 </mur-sidebar>
+</div>
 
 <div class="main-col">
   <mur-tab-strip />
   <main class="app-main">
     <router-outlet (detach)="onOutletDetach($event)"></router-outlet>
   </main>
-</div>
 </div>
 
 @if (searchOpen()) {
