@@ -409,6 +409,7 @@ app-shell {
 
 .primary-sidebar .sb-top {
   display: flex;
+  flex: none;
   align-items: center;
   gap: var(--space-1);
   padding: 0 var(--space-2) var(--space-2);
@@ -498,7 +499,17 @@ app-shell {
   box-shadow: var(--shell-active-shadow);
 }
 
+.primary-sidebar .sb-scroll {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .primary-sidebar .sb-nav {
+  flex: none;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -538,9 +549,8 @@ app-shell {
    chrome, so the footer stays reachable no matter how deep the tree gets. */
 .primary-sidebar .sb-workspaces {
   display: flex;
-  flex: 1 1 auto;
+  flex: none;
   flex-direction: column;
-  min-height: 0;
   padding: var(--space-2) var(--space-2) 0;
 }
 
@@ -579,9 +589,7 @@ app-shell {
 }
 
 .primary-sidebar .sb-tree {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
+  flex: none;
 }
 
 .primary-sidebar .sb-footer {
@@ -589,7 +597,6 @@ app-shell {
   flex: none;
   flex-direction: column;
   gap: 2px;
-  margin-top: auto;
   padding: var(--space-2);
   border-top: 1px solid var(--border-subtle);
 }

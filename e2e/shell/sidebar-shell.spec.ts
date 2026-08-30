@@ -113,3 +113,54 @@ test("the footer offers New note plus a menu for the other create actions", asyn
   await expect(page).toHaveURL(/\/record$/);
   await expect(page.getByRole("menu")).toHaveCount(0);
 });
+
+/**
+ * REGRESSION (reported from a real window): with Browse expanded the sidebar
+ * column grew past the viewport, so "New note" and "Settings" were pushed off
+ * the bottom and overlapped the Workspaces section, with nothing to scroll.
+ *
+ * The footer is pinned chrome — it must stay reachable no matter how much the
+ * middle holds — and the middle must scroll rather than push.
+ */
+test("the footer stays visible and the middle scrolls when Browse is expanded", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1200, height: 620 });
+  await boot(page);
+  const sb = sidebar(page);
+
+  await sb.getByRole("button", { name: "Browse" }).click();
+  await expect(sb.getByText("People", { exact: true })).toBeVisible();
+
+  // Both pinned controls remain inside the sidebar's own box.
+  const newNote = sb.getByRole("button", { name: "New note" });
+  const settings = sb.getByRole("link", { name: "Settings" });
+  await expect(newNote).toBeVisible();
+  await expect(settings).toBeVisible();
+
+  const sbBox = await sb.boundingBox();
+  const noteBox = await newNote.boundingBox();
+  const settingsBox = await settings.boundingBox();
+  expect(sbBox).not.toBeNull();
+  expect(noteBox).not.toBeNull();
+  expect(settingsBox).not.toBeNull();
+  const sidebarBottom = sbBox!.y + sbBox!.height;
+  expect(noteBox!.y + noteBox!.height).toBeLessThanOrEqual(sidebarBottom + 1);
+  expect(settingsBox!.y + settingsBox!.height).toBeLessThanOrEqual(sidebarBottom + 1);
+
+  // The overflow lives in ONE scroll region, not in the sidebar itself.
+  const scroll = sb.locator(".sb-scroll");
+  const overflows = await scroll.evaluate(
+    (el) => el.scrollHeight > el.clientHeight,
+  );
+  expect(overflows).toBe(true);
+
+  await scroll.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  expect(await scroll.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+
+  // Scrolling the middle must not move the footer.
+  const afterScroll = await settings.boundingBox();
+  expect(afterScroll!.y).toBeCloseTo(settingsBox!.y, 0);
+});
