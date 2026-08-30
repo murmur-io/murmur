@@ -611,30 +611,84 @@ app-shell {
   gap: var(--space-1);
 }
 
-/* Icon-only: the glyph plus the tooltip and aria-label carry the meaning, and
-   two labelled buttons could not share the width without truncating. Capture is
-   the PRIMARY action — recording is what the app is for — and New note is the
-   secondary beside it. */
-.primary-sidebar .sb-capture,
-.primary-sidebar .sb-new-note {
-  flex: 1 1 0;
-  min-width: 0;
-  height: var(--space-7);
+/* Two round Liquid-Glass controls on the LEFT — Capture (the accent one; making
+   a recording is what the app is for) and New note — with the create menu's
+   caret pushed to the RIGHT. Round and small: at 32px they read as quick
+   actions rather than as two full-width bars competing with the tree above.
+
+   These are the one place glass sits on glass. The rest of the app forbids that
+   for OVERLAYS (a floating panel over content bleeds through — T3), but this is
+   chrome resting on chrome, where the rim and the highlight are what separate
+   the control from the panel behind it. */
+.primary-sidebar .sb-fab {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-6);
+  height: var(--space-6);
   padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast),
+    box-shadow var(--transition-fast);
 }
 
-.primary-sidebar .sb-capture.active {
-  box-shadow: var(--shell-active-shadow);
+.primary-sidebar .sb-fab-glass {
+  background:
+    linear-gradient(var(--shell-glass-veil), var(--shell-glass-veil)),
+    var(--shell-glass-bg);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
 }
 
-/* Collapsed there is room for ONE glyph per line, so the two buttons stack. */
+.primary-sidebar .sb-fab-glass:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.primary-sidebar .sb-fab-primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--text-on-accent);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.primary-sidebar .sb-fab-primary:hover {
+  background: var(--accent-hover);
+}
+
+.primary-sidebar .sb-fab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.primary-sidebar .sb-fab-primary.active {
+  box-shadow: var(--shell-active-shadow), inset 0 1px 0 var(--glass-highlight);
+}
+
+/* The caret sits apart from the pair it extends. The chevron glyph points
+   right, so it is rotated to point up — the menu opens upward. */
+.primary-sidebar .sb-create-more {
+  margin-left: auto;
+}
+
+.primary-sidebar .sb-create-more mur-icon {
+  transform: rotate(-90deg);
+}
+
+/* Collapsed there is room for ONE control per line, so the three stack. */
 .primary-sidebar.collapsed .sb-create {
   flex-direction: column;
 }
 
-.primary-sidebar.collapsed .sb-capture,
-.primary-sidebar.collapsed .sb-new-note {
-  width: 100%;
+.primary-sidebar.collapsed .sb-create-more {
+  margin-left: 0;
 }
 
 /* Browse sits LAST, after Workspaces and Shared, so the user's own content is
@@ -651,26 +705,6 @@ app-shell {
   flex: none;
   flex-direction: column;
   padding: var(--space-2) var(--space-2) 0;
-}
-
-.primary-sidebar .sb-create-more {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: var(--space-6);
-  height: var(--space-7);
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transform: rotate(-90deg);
-}
-
-.primary-sidebar .sb-create-more:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
 }
 
 /* The menu floats OVER the tree, so it takes the OPAQUE overlay surface — the

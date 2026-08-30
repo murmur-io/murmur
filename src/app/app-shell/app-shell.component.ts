@@ -35,7 +35,6 @@ import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-p
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
 import { ReminderComposerService } from "../features/reminders/reminder-composer/reminder-composer.service";
-import { SharedWorkspaceService } from "../services/shared-workspace.service";
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
 import { FilingRecoveryBannerComponent } from "../features/workspace/filing-recovery-banner/filing-recovery-banner.component";
@@ -134,14 +133,6 @@ export class AppShellComponent {
   private readonly tabs = inject(TabsService);
   private readonly reminders = inject(RemindersStore);
   private readonly reminderComposer = inject(ReminderComposerService);
-  private readonly sharedWorkspace = inject(SharedWorkspaceService);
-
-  /**
-   * Nothing shared in either direction. The Shared section is hidden entirely
-   * rather than shown empty: most installs have no org, and a permanent empty
-   * heading is noise in the one navigation surface.
-   */
-  readonly sharedEmpty = this.sharedWorkspace.isEmpty;
   protected readonly workspace = inject(WorkspaceService);
 
   readonly reminderCount = this.reminders.dueInboxCount;

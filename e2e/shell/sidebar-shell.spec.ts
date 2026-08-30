@@ -114,11 +114,22 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   // primary — recording is what the app is for — and New note the secondary.
   const capture = sb.getByRole("link", { name: "Capture" });
   const newNote = sb.getByRole("button", { name: "New note" });
-  await expect(capture).toHaveClass(/btn-primary/);
-  await expect(newNote).toHaveClass(/\bbtn\b/);
-  await expect(newNote).not.toHaveClass(/btn-primary/);
+  await expect(capture).toHaveClass(/sb-fab-primary/);
+  await expect(newNote).toHaveClass(/sb-fab-glass/);
+  await expect(newNote).not.toHaveClass(/sb-fab-primary/);
   await expect(capture).toHaveText("");
   await expect(newNote).toHaveText("");
+
+  // Round, small, and the pair sits LEFT with the create caret pushed right.
+  const captureBox = await capture.boundingBox();
+  const moreBox = await sb
+    .getByRole("button", { name: "More create options" })
+    .boundingBox();
+  expect(captureBox).not.toBeNull();
+  expect(moreBox).not.toBeNull();
+  expect(captureBox!.width).toBeCloseTo(captureBox!.height, 0);
+  expect(captureBox!.width).toBeLessThanOrEqual(40);
+  expect(captureBox!.x).toBeLessThan(moreBox!.x);
 
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 });
@@ -266,19 +277,22 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
  * surface — so this fixture asserts its absence, and the presence case belongs
  * to a fixture that actually returns shared content.
  */
-test("Workspaces leads, Browse trails, and Shared is absent when nothing is shared", async ({
-  page,
-}) => {
+test("the sections run Workspaces, then Shared, then Browse", async ({ page }) => {
   await boot(page);
   const sb = sidebar(page);
-
-  await expect(sb.getByRole("region", { name: "Shared" })).toHaveCount(0);
 
   const workspaces = await sb
     .getByRole("region", { name: "Workspaces" })
     .boundingBox();
+  const shared = await sb.getByRole("region", { name: "Shared" }).boundingBox();
   const browse = await sb.getByRole("button", { name: "Browse" }).boundingBox();
   expect(workspaces).not.toBeNull();
+  expect(shared).not.toBeNull();
   expect(browse).not.toBeNull();
-  expect(workspaces!.y).toBeLessThan(browse!.y);
+
+  // Shared is PERMANENT: it holds the order even with nothing shared, and says
+  // so rather than vanishing and leaving the user hunting for the section.
+  expect(workspaces!.y).toBeLessThan(shared!.y);
+  expect(shared!.y).toBeLessThan(browse!.y);
+  await expect(sb.getByText("Nothing shared with you yet")).toBeVisible();
 });
