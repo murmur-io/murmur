@@ -21,6 +21,14 @@
 </p>
 
 <p align="center">
+  <a href="https://murmurnotes.io/#product"><b>▶︎ Watch the 1-minute tour</b></a>
+</p>
+
+<p align="center">
+  <a href="https://murmurnotes.io/#product"><img src="docs/screenshots/promo-poster.jpg" alt="Play the Murmur tour: recording a meeting, the on-device transcript, asking across your vault with citations, the brain graph, and locking a Space" width="760"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/murmur-io/murmur/releases/latest"><b>⬇️ Download</b></a> ·
   <a href="#-quick-start">Quick start</a> ·
   <a href="#-the-brain--your-meeting-memory-you-can-talk-to">The brain</a> ·

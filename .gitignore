@@ -15,6 +15,12 @@
 *.gguf
 *.wav
 *.mp4
+# …except the published promo video. `*.mp4` above exists to keep stray captures
+# and test recordings out of the repo; the landing page's own H.264 asset is a
+# deliberate, reviewed artefact. Without this exception the <source> for it is
+# committed as a 404 — the page keeps working in every browser that takes the
+# VP9 alternate, and silently loses the video in the ones that do not.
+!landing/assets/*.mp4
 .angular
 /src-tauri/target
 # Build artifact: universal sidecar staged by build.rs for bundle.resources
@@ -43,3 +49,6 @@ meetnotes.db
 
 # Loadout run artifacts (inne narzedzie, nie nalezy do repo)
 .loadout/
+
+# Promo-video intermediates (scripts/promo) — large and rebuildable.
+.promo/
