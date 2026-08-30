@@ -262,6 +262,19 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   await expect(sb.getByRole("link", { name: "Ask" })).toBeVisible();
   await expect(sb.getByRole("link", { name: "Settings" })).toBeVisible();
 
+  // Workspaces and Shared cannot render their trees this narrow, so they get
+  // rows that reveal the sidebar — without them the collapsed rail simply had
+  // no sign that either section exists.
+  const workspaces = sb.getByRole("button", { name: "Workspaces" });
+  await expect(workspaces).toBeVisible();
+  await expect(sb.getByRole("button", { name: "Shared" })).toBeVisible();
+
+  await workspaces.click();
+  await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
+  await expect(
+    topbar(page).getByRole("button", { name: "Collapse sidebar" }),
+  ).toBeVisible();
+
   // The row is down to the toggle alone.
   const bar = topbar(page);
   const expand = bar.getByRole("button", { name: "Expand sidebar" });
@@ -281,7 +294,13 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   expect(expandBox).not.toBeNull();
   expect(sbBox).not.toBeNull();
   expect(expandBox!.y).toBeGreaterThan(40);
-  expect(sbBox!.x + sbBox!.width).toBeGreaterThan(84);
+
+  // The panel wraps the buttons (32..84px) with the SAME margin either side.
+  // The right one being tighter is what proved x is a left edge, not a centre.
+  const before = 32 - sbBox!.x;
+  const after = sbBox!.x + sbBox!.width - 84;
+  expect(after).toBeGreaterThan(0);
+  expect(after).toBeCloseTo(before, 0);
 });
 
 /**
