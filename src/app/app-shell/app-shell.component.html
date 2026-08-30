@@ -19,6 +19,16 @@
     </button>
     <a
       class="sb-top-btn"
+      [class.active]="isAskActive()"
+      [attr.aria-current]="isAskActive() ? 'page' : null"
+      routerLink="/ask"
+      aria-label="Ask"
+      title="Ask"
+    >
+      <mur-icon icon="ask" />
+    </a>
+    <a
+      class="sb-top-btn"
       [class.active]="isSettingsActive()"
       [attr.aria-current]="isSettingsActive() ? 'page' : null"
       routerLink="/settings"
@@ -53,64 +63,17 @@
         <mur-icon icon="search" />
         <span class="sb-label">Search</span>
       </button>
-    }
-    <a
-      class="sb-row"
-      [class.active]="isCaptureActive()"
-      [attr.aria-current]="isCaptureActive() ? 'page' : null"
-      routerLink="/record"
-      aria-label="Capture"
-      title="Capture"
-    >
-      <mur-icon icon="record" />
-      <span class="sb-label">Capture</span>
-    </a>
-    <a
-      class="sb-row"
-      [class.active]="isAskActive()"
-      [attr.aria-current]="isAskActive() ? 'page' : null"
-      routerLink="/ask"
-      aria-label="Ask"
-      title="Ask"
-    >
-      <mur-icon icon="ask" />
-      <span class="sb-label">Ask</span>
-    </a>
-
-    <button
-      type="button"
-      class="sb-row sb-disclosure"
-      (click)="toggleBrowse()"
-      [attr.aria-expanded]="browseExpanded()"
-      aria-label="Browse"
-      title="Browse"
-    >
-      <mur-icon icon="browse" />
-      <span class="sb-label">Browse</span>
-      <span class="sb-caret" [class.open]="browseExpanded()" aria-hidden="true">
-        <mur-icon icon="chevron-right" />
-      </span>
-    </button>
-    @if (browseExpanded() && sidebarExpanded()) {
-      <div class="sb-sublist">
-        @for (group of browseGroups; track group) {
-          <span class="sb-group-label">{{ group }}</span>
-          @for (item of itemsForGroup(group); track item.path) {
-            <a
-              class="sb-row sb-sub"
-              [routerLink]="item.path"
-              [class.active]="isBrowseItemActive(item.path)"
-              [attr.aria-current]="isBrowseItemActive(item.path) ? 'page' : null"
-            >
-              <mur-icon [icon]="item.icon" />
-              <span class="sb-label">{{ item.label }}</span>
-              @if (item.path === "/reminders" && reminderCount() > 0) {
-                <span class="count">{{ reminderCount() }}</span>
-              }
-            </a>
-          }
-        }
-      </div>
+      <a
+        class="sb-row"
+        [class.active]="isAskActive()"
+        [attr.aria-current]="isAskActive() ? 'page' : null"
+        routerLink="/ask"
+        aria-label="Ask"
+        title="Ask"
+      >
+        <mur-icon icon="ask" />
+        <span class="sb-label">Ask</span>
+      </a>
     }
   </nav>
 
@@ -152,6 +115,54 @@
       </div>
     </section>
   }
+  @if (sidebarExpanded() && !sharedEmpty()) {
+    <section class="sb-section sb-shared" aria-label="Shared">
+      <div class="sb-section-head">
+        <span class="sb-section-title">Shared</span>
+      </div>
+      <div class="sb-tree">
+        <app-workspace-tree scope="shared" [currentPath]="currentPath()" />
+      </div>
+    </section>
+  }
+
+  <nav class="sb-browse" aria-label="Browse destinations">
+    <button
+      type="button"
+      class="sb-row sb-disclosure"
+      (click)="toggleBrowse()"
+      [attr.aria-expanded]="browseExpanded()"
+      aria-label="Browse"
+      title="Browse"
+    >
+      <mur-icon icon="browse" />
+      <span class="sb-label">Browse</span>
+      <span class="sb-caret" [class.open]="browseExpanded()" aria-hidden="true">
+        <mur-icon icon="chevron-right" />
+      </span>
+    </button>
+    @if (browseExpanded() && sidebarExpanded()) {
+      <div class="sb-sublist">
+        @for (group of browseGroups; track group) {
+          <span class="sb-group-label">{{ group }}</span>
+          @for (item of itemsForGroup(group); track item.path) {
+            <a
+              class="sb-row sb-sub"
+              [routerLink]="item.path"
+              [class.active]="isBrowseItemActive(item.path)"
+              [attr.aria-current]="isBrowseItemActive(item.path) ? 'page' : null"
+            >
+              <mur-icon [icon]="item.icon" />
+              <span class="sb-label">{{ item.label }}</span>
+              @if (item.path === "/reminders" && reminderCount() > 0) {
+                <span class="count">{{ reminderCount() }}</span>
+              }
+            </a>
+          }
+        }
+      </div>
+    }
+  </nav>
   </div>
 
   <div class="sb-footer">
@@ -183,9 +194,20 @@
     }
 
     <div class="sb-create">
+      <a
+        class="btn sb-capture"
+        [class.active]="isCaptureActive()"
+        [attr.aria-current]="isCaptureActive() ? 'page' : null"
+        routerLink="/record"
+        aria-label="Capture"
+        title="Capture"
+      >
+        <mur-icon icon="record" />
+        <span class="sb-label">Capture</span>
+      </a>
       <button
         type="button"
-        class="sb-row sb-create-main"
+        class="btn btn-primary sb-new-note"
         (click)="newNote()"
         aria-label="New note"
         title="New note (⌘N)"
@@ -229,7 +251,6 @@
         </div>
       }
     </div>
-
   </div>
 </mur-sidebar>
 

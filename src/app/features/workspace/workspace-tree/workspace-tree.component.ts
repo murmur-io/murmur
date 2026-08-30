@@ -154,6 +154,18 @@ export class WorkspaceTreeComponent {
   readonly currentPath = input("");
 
   /**
+   * Which half of the forest this instance renders. The sidebar mounts the tree
+   * TWICE — once for the user's own Workspaces, once for what an org shared with
+   * them — so the two never interleave and a colleague's structure cannot be
+   * mistaken for the user's own.
+   *
+   * Shared content the user has PRIVATELY FILED under a local container is not
+   * affected: `pushContainer` still emits it in place, because they put it
+   * there. Only unplaced shared roots move to the shared section.
+   */
+  readonly scope = input<"own" | "shared">("own");
+
+  /**
    * Load the forest when this tree first appears.
    *
    * The section header's toggle also reloads, but it cannot be the only trigger:
@@ -258,13 +270,15 @@ export class WorkspaceTreeComponent {
    */
   protected readonly lines = computed<TreeLine[]>(() => {
     const out: TreeLine[] = [];
-    for (const project of this.workspace.forest()) {
-      this.pushContainer(out, project, 0);
+    if (this.scope() === "own") {
+      for (const project of this.workspace.forest()) {
+        this.pushContainer(out, project, 0);
+      }
+      return out;
     }
-    // Received content comes LAST at the top level: a shared Workspace is the
-    // user's colleague's, not theirs, and it should not push their own Workspaces
-    // down the sidebar. Anything they have privately filed under a local
-    // container was already emitted inside `pushContainer`.
+    // Received content now has its own section rather than trailing the user's
+    // own Workspaces. Anything privately filed under a local container was
+    // already emitted by `pushContainer` in the "own" pass and is not repeated.
     for (const space of this.unplacedSharedRoots()) {
       this.pushShared(out, space, 0);
     }
@@ -274,6 +288,15 @@ export class WorkspaceTreeComponent {
     }
     return out;
   });
+
+  /** True while this section has nothing of its own to render. */
+  protected readonly sectionEmpty = computed(() =>
+    this.scope() === "own"
+      ? this.workspace.workspaceEmpty()
+      : this.lines().length === 0,
+  );
+
+  protected readonly isOwnScope = computed(() => this.scope() === "own");
 
   /**
    * Received Workspaces the user has NOT filed anywhere of their own — those render
