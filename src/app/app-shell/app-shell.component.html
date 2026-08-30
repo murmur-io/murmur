@@ -30,6 +30,16 @@
     >
       <mur-icon icon="sidebar" />
     </button>
+    <a
+      class="sb-toggle"
+      [class.active]="isSettingsActive()"
+      [attr.aria-current]="isSettingsActive() ? 'page' : null"
+      routerLink="/settings"
+      aria-label="Settings"
+      title="Settings"
+    >
+      <mur-icon icon="settings" />
+    </a>
   </div>
 
   <div class="sb-scroll">
@@ -197,17 +207,6 @@
       }
     </div>
 
-    <a
-      class="sb-row"
-      [class.active]="isSettingsActive()"
-      [attr.aria-current]="isSettingsActive() ? 'page' : null"
-      routerLink="/settings"
-      aria-label="Settings"
-      title="Settings"
-    >
-      <mur-icon icon="settings" />
-      <span class="sb-label">Settings</span>
-    </a>
   </div>
 </mur-sidebar>
 

@@ -43,8 +43,33 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   const sb = sidebar(page);
 
   await expect(sb).toBeVisible();
-  await expect(sb.getByRole("button", { name: "Search" })).toBeVisible();
-  await expect(sb.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
+
+  // Search, Collapse and Settings share ONE band, level with the macOS window
+  // buttons. All three sit above everything that scrolls.
+  const search = sb.getByRole("button", { name: "Search" });
+  const collapse = sb.getByRole("button", { name: "Collapse sidebar" });
+  const settings = sb.getByRole("link", { name: "Settings" });
+  await expect(search).toBeVisible();
+  await expect(collapse).toBeVisible();
+  await expect(settings).toBeVisible();
+
+  const boxes = await Promise.all([
+    search.boundingBox(),
+    collapse.boundingBox(),
+    settings.boundingBox(),
+  ]);
+  const centres = boxes.map((b) => {
+    expect(b).not.toBeNull();
+    return b!.y + b!.height / 2;
+  });
+  // Same row: every centre within a pixel of the first.
+  expect(centres[1]).toBeCloseTo(centres[0], 0);
+  expect(centres[2]).toBeCloseTo(centres[0], 0);
+
+  // And that row is level with the traffic lights, whose centre the shell puts
+  // 36px below the window top (trafficLightPosition y:30 + a 12px button).
+  expect(centres[0]).toBeGreaterThan(28);
+  expect(centres[0]).toBeLessThan(44);
 
   // The Murmur logo tile is gone — it was chrome that navigated nowhere.
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
@@ -132,7 +157,8 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   await sb.getByRole("button", { name: "Browse" }).click();
   await expect(sb.getByText("People", { exact: true })).toBeVisible();
 
-  // Both pinned controls remain inside the sidebar's own box.
+  // Both pinned controls stay reachable: New note in the footer, Settings in the
+  // top band. Neither may be pushed outside the sidebar's own box.
   const newNote = sb.getByRole("button", { name: "New note" });
   const settings = sb.getByRole("link", { name: "Settings" });
   await expect(newNote).toBeVisible();
@@ -146,7 +172,7 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   expect(settingsBox).not.toBeNull();
   const sidebarBottom = sbBox!.y + sbBox!.height;
   expect(noteBox!.y + noteBox!.height).toBeLessThanOrEqual(sidebarBottom + 1);
-  expect(settingsBox!.y + settingsBox!.height).toBeLessThanOrEqual(sidebarBottom + 1);
+  expect(settingsBox!.y).toBeGreaterThanOrEqual(sbBox!.y - 1);
 
   // The overflow lives in ONE scroll region, not in the sidebar itself.
   const scroll = sb.locator(".sb-scroll");
@@ -160,7 +186,9 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   });
   expect(await scroll.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
 
-  // Scrolling the middle must not move the footer.
-  const afterScroll = await settings.boundingBox();
-  expect(afterScroll!.y).toBeCloseTo(settingsBox!.y, 0);
+  // Scrolling the middle moves neither the pinned footer nor the top band.
+  const noteAfter = await newNote.boundingBox();
+  const settingsAfter = await settings.boundingBox();
+  expect(noteAfter!.y).toBeCloseTo(noteBox!.y, 0);
+  expect(settingsAfter!.y).toBeCloseTo(settingsBox!.y, 0);
 });
