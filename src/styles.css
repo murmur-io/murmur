@@ -372,6 +372,16 @@ app-shell {
   padding-right: var(--space-2);
 }
 
+/* COLLAPSED the window buttons span the panel's full width, so the toggle
+   cannot share their line — it drops BELOW them and centres, instead of being
+   wedged between the yellow and the green one. */
+.primary-sidebar.collapsed .sb-top {
+  justify-content: center;
+  align-items: flex-end;
+  height: var(--space-8);
+  padding-right: 0;
+}
+
 .primary-sidebar .sb-top-btn {
   display: grid;
   place-items: center;
@@ -663,8 +673,19 @@ app-shell {
   flex-direction: column;
 }
 
+.primary-sidebar.collapsed .sb-create {
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Collapsed, Capture has no room for a label, so it becomes the same round
+   button as its neighbour rather than a stretched pill with a glyph adrift in
+   it. Two circles, one accented, reads as the same pair the expanded footer
+   shows. */
 .primary-sidebar.collapsed .sb-capture {
-  width: 100%;
+  flex: none;
+  width: var(--shell-footer-btn);
+  height: var(--shell-footer-btn);
   padding: 0;
 }
 

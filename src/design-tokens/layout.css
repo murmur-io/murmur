@@ -131,5 +131,10 @@
      sits beside it. Capture takes the remaining width; the round one stays
      square, so a single size keeps them on one line. */
   --shell-footer-btn: 36px;
-  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
+  /* Collapsed is wide enough to still HOLD the macOS window buttons, which end
+     84px from the window's left edge. At the old 72px they overhung the panel
+     and the green one sat on the content behind it, while the collapse toggle
+     landed in the middle of them. This is the narrowest width that keeps the
+     buttons on the glass they belong to. */
+  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-5));
 }
