@@ -2665,7 +2665,43 @@ impl Db {
                ON org_shares(org_id, parent_container_id);",
         )
         .map_err(map_err)?;
-        Self::repair_containers_mis_ingested_as_items(conn)
+        Self::repair_containers_mis_ingested_as_items(conn)?;
+        Self::backfill_placement_from_the_outbound_journal(conn)
+    }
+
+    /// REPAIR (2.1.2): restore the container placement of documents this device published.
+    ///
+    /// 2.1.1 taught the live pull to WRITE placement, but only for items it ingests from then on.
+    /// An item already in the replica is "converged" — its stored content hash matches the feed's —
+    /// so neither the live pull nor the anti-entropy sweep ever re-reads it, and the placement it
+    /// was ingested without is never filled in. The visible result is a shared Space that arrives
+    /// EMPTY while its documents sit loose in Shared Brains.
+    ///
+    /// For a document THIS device published, the outbound journal already knows the answer, so the
+    /// repair is a local join — no network, no re-ingest. A document published by another member
+    /// has no local journal; its placement arrives with that member's next publish.
+    fn backfill_placement_from_the_outbound_journal(conn: &Connection) -> Result<()> {
+        conn.execute(
+            "UPDATE org_items
+                SET parent_container_id = (
+                      SELECT s.parent_container_id FROM org_shares s
+                       WHERE s.item_id = org_items.item_id
+                         AND s.parent_container_id IS NOT NULL
+                       LIMIT 1),
+                    position = COALESCE((
+                      SELECT s.position FROM org_shares s
+                       WHERE s.item_id = org_items.item_id
+                         AND s.parent_container_id IS NOT NULL
+                       LIMIT 1), position)
+              WHERE parent_container_id IS NULL
+                AND EXISTS (
+                      SELECT 1 FROM org_shares s
+                       WHERE s.item_id = org_items.item_id
+                         AND s.parent_container_id IS NOT NULL)",
+            [],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     /// REPAIR (2.1.1): move container manifests that 2.1.0 wrote into `org_items` into
