@@ -131,10 +131,18 @@
      sits beside it. Capture takes the remaining width; the round one stays
      square, so a single size keeps them on one line. */
   --shell-footer-btn: 36px;
-  /* Collapsed is wide enough to still HOLD the macOS window buttons, which end
-     84px from the window's left edge. At the old 72px they overhung the panel
-     and the green one sat on the content behind it, while the collapse toggle
-     landed in the middle of them. This is the narrowest width that keeps the
-     buttons on the glass they belong to. */
-  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-5));
+  /* Collapsed, the panel is sized BY the macOS window buttons: it wraps them
+     with an equal margin on each side, so the rail is exactly as wide as the
+     chrome it carries.
+
+       buttons span    = x 20 .. 20 + 52            = 20..72px in the window
+       panel starts at = app-shell padding          =  8px
+       => 12px of margin before them, 12px after    => 76px wide
+
+     This is why `trafficLightPosition.x` is 20 and not the 32 it used to be:
+     at 32 the left margin was 24px against 12 on the right, the panel had to be
+     88px to contain the buttons at all, and it still looked like a wide rail
+     with the buttons pushed into one corner. Move one and the other must
+     follow — they are two halves of the same measurement. */
+  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-3));
 }
