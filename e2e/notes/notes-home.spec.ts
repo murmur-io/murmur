@@ -26,7 +26,7 @@ test("notes home renders Browse navigation + the note table (incl. masked locked
   await expect(page.locator(".notes-content")).toBeVisible();
 
   const globalNavigation = page.getByRole("navigation", {
-    name: "Global navigation",
+    name: "Primary navigation",
   });
   await expect(globalNavigation).toBeVisible();
 
@@ -118,7 +118,7 @@ test("Notes Home hides auto-organize for a session-unlocked sealed folder", asyn
   });
   await page.goto("/notes");
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   const spacesSidebar = page.getByRole("complementary", {
@@ -131,7 +131,7 @@ test("Notes Home hides auto-organize for a session-unlocked sealed folder", asyn
   await expect(page).toHaveURL(/\/container\/nf2$/);
 
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Browse", exact: true })
     .click();
   await page
@@ -238,7 +238,7 @@ test("workspace organizer warns before de-sealing and excludes that move from Se
   });
   await page.goto("/notes");
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await page

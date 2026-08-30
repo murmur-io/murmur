@@ -97,10 +97,10 @@
   --z-meeting-command-bar: 2;
   --z-account-session-banner: 65;
 
-  /* The global icon rail. It collapses to icons only (the default) and expands
-     to show each destination's label beside its glyph; the width animates
-     between the two, so both ends live here as tokens rather than as literals
-     inside the shell chrome in styles.css. */
-  --shell-rail-w: calc(var(--space-8) + var(--space-2));
-  --shell-rail-w-expanded: 13.5rem;
+  /* The one navigation sidebar. Expanded it carries labels, the Browse group
+     and the workspace tree; collapsed it narrows to icons only. The width
+     animates between the two, so both ends live here as tokens rather than as
+     literals inside the shell chrome in styles.css. */
+  --shell-sidebar-w: calc(var(--space-8) * 4);
+  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
 }
