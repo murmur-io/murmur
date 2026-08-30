@@ -334,6 +334,17 @@ export class AppShellComponent {
     }
   }
 
+  /**
+   * Reveal the sidebar from a collapsed rail row. The Workspaces and Shared
+   * trees cannot render in a 100px column, so their collapsed rows open the
+   * sidebar instead of navigating — the section they name is then right there.
+   */
+  expandSidebar(): void {
+    if (!this._sidebarExpanded()) {
+      this.toggleSidebar();
+    }
+  }
+
   toggleBrowse(): void {
     // Collapsed there is no room to render the group, so reveal the sidebar
     // first rather than toggling something the user cannot see.
