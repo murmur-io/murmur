@@ -115,7 +115,7 @@
       </div>
     </section>
   }
-  @if (sidebarExpanded() && !sharedEmpty()) {
+  @if (sidebarExpanded()) {
     <section class="sb-section sb-shared" aria-label="Shared">
       <div class="sb-section-head">
         <span class="sb-section-title">Shared</span>
@@ -195,7 +195,7 @@
 
     <div class="sb-create">
       <a
-        class="btn btn-primary sb-capture"
+        class="sb-fab sb-fab-primary"
         [class.active]="isCaptureActive()"
         [attr.aria-current]="isCaptureActive() ? 'page' : null"
         routerLink="/record"
@@ -206,7 +206,7 @@
       </a>
       <button
         type="button"
-        class="btn sb-new-note"
+        class="sb-fab sb-fab-glass"
         (click)="newNote()"
         aria-label="New note"
         title="New note (⌘N)"
@@ -215,7 +215,7 @@
       </button>
       <button
         type="button"
-        class="sb-create-more"
+        class="sb-fab sb-fab-glass sb-create-more"
         (click)="toggleCreateMenu()"
         aria-haspopup="menu"
         [attr.aria-expanded]="createMenuOpen()"
