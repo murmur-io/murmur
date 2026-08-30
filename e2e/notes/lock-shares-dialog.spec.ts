@@ -47,14 +47,14 @@ test.describe("Notes — folder lock runs the lock×shares dialog (PK-F1)", () =
     // Its plaintext stays visible until the user actually confirms a lock.
     await page
       .getByRole("navigation", { name: "Global navigation" })
-      .getByRole("button", { name: "Spaces", exact: true })
+      .getByRole("button", { name: "Workspaces", exact: true })
       .click();
     await expect(page).toHaveURL(/\/notes$/);
     await expect(page.locator(".notes-content")).toBeVisible();
     await expect(page.getByText("My First Note", { exact: true })).toBeVisible();
 
     const spacesSidebar = page.getByRole("complementary", {
-      name: "Spaces sidebar",
+      name: "Workspaces sidebar",
     });
     await expect(spacesSidebar).toBeVisible();
     await spacesSidebar

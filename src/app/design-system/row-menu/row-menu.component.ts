@@ -99,7 +99,7 @@ export class MurRowMenuComponent {
     this.toggle(event.detail === 0);
   }
 
-  /** Standard menu-button keyboard entry: Enter, Space or ArrowDown. */
+  /** Standard menu-button keyboard entry: Enter, Workspace or ArrowDown. */
   onTriggerKeydown(event: KeyboardEvent): void {
     if (!["Enter", " ", "ArrowDown"].includes(event.key)) {
       return;

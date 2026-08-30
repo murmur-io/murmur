@@ -63,7 +63,7 @@ export class WorkspaceService {
    */
   readonly forestEmpty = computed(() => this._forest().length === 0);
 
-  /** Nothing the Spaces tree can currently render. */
+  /** Nothing the Workspaces tree can currently render. */
   readonly workspaceEmpty = computed(
     () => this._forest().length === 0 && this._unfiledRecordings().total === 0,
   );
@@ -175,7 +175,7 @@ export class WorkspaceService {
     return id;
   }
 
-  /** Create a peer top-level Space, then refresh the cached forest. */
+  /** Create a peer top-level Workspace, then refresh the cached forest. */
   async createSpace(name: string): Promise<string> {
     const space = await this.ipc.createSpace(name);
     await this.reload();

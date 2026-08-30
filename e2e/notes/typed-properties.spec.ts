@@ -205,13 +205,13 @@ test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async 
   // nothing about what it holds, rather than showing a view of its contents.
   await page
     .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Spaces", exact: true })
+    .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await expect(page).toHaveURL(/\/notes$/);
   await expect(page.locator(".notes-content")).toBeVisible();
 
   const spacesSidebar = page.getByRole("complementary", {
-    name: "Spaces sidebar",
+    name: "Workspaces sidebar",
   });
   await expect(spacesSidebar).toBeVisible();
   await spacesSidebar

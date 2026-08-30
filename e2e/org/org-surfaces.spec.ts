@@ -256,7 +256,7 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     await expect(page.locator("app-library .library")).toBeVisible();
     await page
       .getByRole("navigation", { name: "Global navigation" })
-      .getByRole("button", { name: "Spaces", exact: true })
+      .getByRole("button", { name: "Workspaces", exact: true })
       .click();
     await expect(page).toHaveURL(/\/library$/);
     await expect(page.locator("app-library .library")).toBeVisible();
@@ -265,7 +265,7 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     // meetings surface. The shares gate remains unchanged: probe first, then
     // put the blocking dialog in front of the seal.
     const spacesSidebar = page.getByRole("complementary", {
-      name: "Spaces sidebar",
+      name: "Workspaces sidebar",
     });
     await expect(spacesSidebar).toBeVisible();
     const project = spacesSidebar.getByRole("treeitem").first();

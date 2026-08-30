@@ -365,11 +365,12 @@ app-shell {
   top: 0;
   z-index: 10;
   display: flex;
-  flex: 0 0 calc(var(--space-8) + var(--space-2));
+  flex: 0 0 var(--shell-rail-w);
   flex-direction: column;
   align-items: center;
   gap: var(--space-2);
-  width: calc(var(--space-8) + var(--space-2));
+  width: var(--shell-rail-w);
+  transition: flex-basis var(--transition-fast), width var(--transition-fast);
   height: calc(100vh - var(--space-4));
   padding: 0 var(--space-2) var(--space-3);
   background:
@@ -447,6 +448,48 @@ app-shell {
 
 .rail-spacer {
   flex: 1 1 auto;
+}
+
+/* EXPANDED rail — the same chrome, widened, with each glyph's label beside it.
+   Collapsed stays the default so the shell opens exactly as it always has; the
+   user's choice is restored from localStorage by the app shell.
+
+   The label is `aria-hidden` in the template because every rail control already
+   carries an `aria-label`; revealing the text must not make screen readers
+   announce the destination twice. */
+.global-rail.expanded {
+  flex-basis: var(--shell-rail-w-expanded);
+  width: var(--shell-rail-w-expanded);
+  align-items: stretch;
+}
+
+.global-rail.expanded .rail-brand {
+  margin-left: var(--space-1);
+}
+
+.global-rail.expanded .rail-item {
+  display: grid;
+  grid-template-columns: var(--space-7) 1fr;
+  align-items: center;
+  justify-items: start;
+  width: 100%;
+  padding-right: var(--space-3);
+}
+
+.rail-label {
+  overflow: hidden;
+  color: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Collapsed is the default, so the label is absent from the box model entirely
+   rather than merely transparent — a zero-width flex child still eats the gap
+   and would push the glyph off-centre in the narrow rail. */
+.global-rail:not(.expanded) .rail-label {
+  display: none;
 }
 
 .app-sidebar.spaces-sidebar,
