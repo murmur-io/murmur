@@ -279,7 +279,7 @@ export class WorkspaceTreeComponent {
     // Received content now has its own section rather than trailing the user's
     // own Workspaces. Anything privately filed under a local container was
     // already emitted by `pushContainer` in the "own" pass and is not repeated.
-    for (const space of this.unplacedSharedRoots()) {
+    for (const space of this.sharedWorkspace.spaces()) {
       this.pushShared(out, space, 0);
     }
     const brains = this.sharedWorkspace.sharedBrains();
@@ -297,55 +297,6 @@ export class WorkspaceTreeComponent {
   );
 
   protected readonly isOwnScope = computed(() => this.scope() === "own");
-
-  /**
-   * Received Workspaces the user has NOT filed anywhere of their own — those render
-   * at the top level. A placed one is emitted under its host container instead.
-   */
-  private readonly unplacedSharedRoots = computed(() =>
-    this.sharedWorkspace.spaces().filter((node) => !node.localParentId),
-  );
-
-  /**
-   * Received nodes this user privately filed under a local container, indexed by
-   * that container.
-   *
-   * Walks the WHOLE received forest, not just its roots: the "Keep in my Workspace…"
-   * action is offered on every received container, including a nested one, and a
-   * placement the merge could not find would be an affordance that silently does
-   * nothing.
-   */
-  private readonly sharedByLocalParent = computed(() => {
-    const map = new Map<string, SharedContainerNode[]>();
-    const walk = (node: SharedContainerNode): void => {
-      if (node.localParentId) {
-        const bucket = map.get(node.localParentId) ?? [];
-        bucket.push(node);
-        map.set(node.localParentId, bucket);
-      }
-      node.folders.forEach(walk);
-    };
-    this.sharedWorkspace.spaces().forEach(walk);
-    this.sharedWorkspace.sharedBrains()?.folders.forEach(walk);
-    return map;
-  });
-
-  /**
-   * Container ids that render under a LOCAL host instead of where their owner
-   * filed them. A node listed here is skipped by `pushShared` at its original
-   * position, so it appears exactly once.
-   */
-  private readonly placedSharedIds = computed(() => {
-    const ids = new Set<string>();
-    for (const bucket of this.sharedByLocalParent().values()) {
-      for (const node of bucket) {
-        if (node.containerId) {
-          ids.add(node.containerId);
-        }
-      }
-    }
-    return ids;
-  });
 
   private readonly _expandedShared = signal<ReadonlySet<string>>(
     readStoredSharedSet(),
@@ -445,11 +396,6 @@ export class WorkspaceTreeComponent {
       return;
     }
     for (const child of node.folders) {
-      // A child the user has filed somewhere of their own renders THERE, not
-      // here, or it would appear twice under two different parents.
-      if (child.containerId && this.placedSharedIds().has(child.containerId)) {
-        continue;
-      }
       this.pushShared(out, child, depth + 1);
     }
     for (const item of node.items) {
@@ -487,11 +433,6 @@ export class WorkspaceTreeComponent {
     out.push({ key: `c:${container.id}`, depth, container });
     if (this.isSealed(container) || !this.isContainerExpanded(container)) {
       return;
-    }
-    // Anything the user privately filed here. Their arrangement, their device —
-    // the owner and every other member see nothing of it.
-    for (const placed of this.sharedByLocalParent().get(container.id) ?? []) {
-      this.pushShared(out, placed, depth + 1);
     }
     const allItems = container.groups
       .flatMap((group) => group.items)
@@ -593,13 +534,7 @@ export class WorkspaceTreeComponent {
     return (
       !this.isSealed(container) &&
       (container.groups.length > 0 ||
-        container.folders.length > 0 ||
-        // Received content the user has privately filed here counts as content
-        // for the purpose of the caret. Without this, filing a shared Workspace into
-        // an EMPTY local Workspace would hide it: the host has nothing of its own,
-        // so it would render with no way to expand and reveal what was just put
-        // inside it.
-        (this.sharedByLocalParent().get(container.id)?.length ?? 0) > 0)
+        container.folders.length > 0)
     );
   }
 
