@@ -104,24 +104,32 @@
   --shell-sidebar-w: calc(var(--space-8) * 4);
 
   /* The control band ABOVE the sidebar, level with the macOS window buttons.
-     Both values are derived from `trafficLightPosition` in
-     src-tauri/tauri.conf.json ({ x: 32, y: 30 }) and the 12px button size.
+     Derived from `trafficLightPosition` in src-tauri/tauri.conf.json
+     ({ x: 32, y: 30 }) and the 12px button size.
 
-     The band is shell chrome, so it starts at app-shell's own 8px padding — it
-     is NOT inside the sidebar's glass any more, which is what used to add the
-     panel border and drag strip to every offset below:
+     `y` is the buttons' CENTRE, not their top edge. That was measured off the
+     rendered window rather than read from Tauri's docs: assuming a top edge put
+     the row 6px low, exactly the button's half-height.
 
-       buttons' centre = 30 + 6                     = 36px below the window top
-       band starts at  = app-shell padding          =  8px
-       => a 32px control is centred there with 12px of padding above it
-       buttons end at  = 32 + 52                    = 84px from the window left
-       band starts at  =  8px
-       => the first control clears them after 84px
+     Vertical — the band is shell chrome, so it starts at app-shell's own 8px
+     padding and nothing else. Inside the panel this used to be a chain of
+     app-shell padding + the panel border + its drag strip, all kept in sync by
+     hand; that is why it moved out.
+
+       buttons' centre  = y                        = 30px below the window top
+       band starts at   = app-shell padding        =  8px
+       => a 32px control centres there with 6px above it, so the band is 38px
+
+     Horizontal — the buttons overlap the band, so the first control clears them.
+
+       buttons end at   = x + 52                   = 84px from the window left
+       band starts at   =                             8px
+       => the first control begins 84px in
 
      Change trafficLightPosition and these must move with it; nothing
      recomputes them, and no CSS can read the native buttons' real box. */
-  --shell-topbar-pad-top: 12px;
-  --shell-topbar-h: 44px;
+  --shell-topbar-pad-top: 6px;
+  --shell-topbar-h: 38px;
   --shell-traffic-clearance: 84px;
   --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
 }
