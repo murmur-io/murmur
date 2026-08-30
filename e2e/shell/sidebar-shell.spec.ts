@@ -264,9 +264,20 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
 
   // The row is down to the toggle alone.
   const bar = topbar(page);
-  await expect(bar.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+  const expand = bar.getByRole("button", { name: "Expand sidebar" });
+  await expect(expand).toBeVisible();
   await expect(bar.getByRole("button", { name: "Search" })).toHaveCount(0);
   await expect(bar.getByRole("link", { name: "Settings" })).toHaveCount(0);
+
+  // REGRESSION: collapsed, the panel is narrower than the macOS window buttons
+  // (which end 84px in), so the toggle must sit BELOW them rather than wedged
+  // between the yellow and the green one. It also has to stay ON the panel.
+  const expandBox = await expand.boundingBox();
+  const sbBox = await sb.boundingBox();
+  expect(expandBox).not.toBeNull();
+  expect(sbBox).not.toBeNull();
+  expect(expandBox!.y).toBeGreaterThan(40);
+  expect(sbBox!.x + sbBox!.width).toBeGreaterThanOrEqual(84);
 });
 
 /**
