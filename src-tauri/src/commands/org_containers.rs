@@ -1220,6 +1220,21 @@ pub(crate) fn build_shared_workspace(state: &AppState) -> Result<SharedWorkspace
             continue;
         }
         let containers = state.db.list_org_containers(&org.org_id)?;
+        // A container THIS device published comes back down the feed like anyone else's. Rendering
+        // it would put a second, empty copy of the user's own Space beside the real one — which is
+        // exactly what a user hit: two "Sharing things" rows, one with content and one without.
+        // The original is the one they can actually act on, and its row already carries the
+        // "Shared to …" marker, so the received twin has nothing to add.
+        let published_here: HashSet<String> = state
+            .db
+            .list_container_shares(Some(&org.org_id))?
+            .into_iter()
+            .map(|row| row.container_id)
+            .collect();
+        let containers: Vec<_> = containers
+            .into_iter()
+            .filter(|c| !published_here.contains(&c.container_id))
+            .collect();
         let known: HashSet<String> = containers
             .iter()
             .map(|c| c.container_id.clone())

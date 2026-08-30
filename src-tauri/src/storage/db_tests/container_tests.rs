@@ -497,3 +497,62 @@ fn a_container_row_never_renders_as_an_item_even_if_one_survives() {
     }
     assert!(db.list_org_items("o1").unwrap().is_empty());
 }
+
+#[test]
+fn placement_is_backfilled_for_documents_this_device_published() {
+    // 2.1.1 taught the live pull to WRITE placement, but only for items it ingests from then on.
+    // An already-converged item is never re-read, so its missing placement is never filled in —
+    // and the visible result is a shared Space that arrives EMPTY while its documents sit loose.
+    let db = file_db("backfill-placement");
+    seed_org(&db, "o1");
+    {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO org_items(item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                   rev, generation, is_current, tombstoned, source_kind)
+             VALUES ('item-doc','o1',3,'h','Note-share','body','t',1,1,1,0,'document')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_shares(id,org_id,document_id,kind,state,item_id,
+                                    parent_container_id,position,explicit,created_at,updated_at)
+             VALUES ('s1','o1','d1','note','uploaded','item-doc','c-space',4,0,'t','t')",
+            [],
+        )
+        .unwrap();
+    }
+
+    db.migrate().unwrap();
+
+    let placement = db.org_item_container_placement("item-doc").unwrap().unwrap();
+    assert_eq!(placement.0.as_deref(), Some("c-space"));
+    assert_eq!(placement.1, 4, "the position travels with the container");
+}
+
+#[test]
+fn the_backfill_never_invents_a_placement_for_a_standalone_share() {
+    // A document shared on its own has no container, and the repair must not give it one.
+    let db = file_db("backfill-standalone");
+    seed_org(&db, "o1");
+    {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO org_items(item_id, org_id, seq, author_hint, title, markdown, created_at,
+                                   rev, generation, is_current, tombstoned, source_kind)
+             VALUES ('item-solo','o1',1,'h','Solo','body','t',1,1,1,0,'document')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_shares(id,org_id,document_id,kind,state,item_id,explicit,
+                                    created_at,updated_at)
+             VALUES ('s2','o1','d2','note','uploaded','item-solo',1,'t','t')",
+            [],
+        )
+        .unwrap();
+    }
+    db.migrate().unwrap();
+    let placement = db.org_item_container_placement("item-solo").unwrap().unwrap();
+    assert!(placement.0.is_none(), "a standalone share stays uncontained");
+}
