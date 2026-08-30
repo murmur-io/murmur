@@ -634,6 +634,11 @@ app-shell {
   border-radius: var(--radius-md);
 }
 
+.primary-sidebar .sb-capture,
+.primary-sidebar .sb-new-note {
+  width: var(--shell-footer-btn-w);
+}
+
 .primary-sidebar .sb-capture.active {
   box-shadow: var(--shell-active-shadow);
 }
