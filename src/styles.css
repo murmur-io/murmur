@@ -404,6 +404,14 @@ app-shell {
 
 .primary-sidebar .sb-drag {
   flex: none;
+  height: var(--shell-traffic-row-top);
+}
+
+/* COLLAPSED the sidebar is 68px wide while the window buttons span 32-84px from
+   the window's left edge — they cover it end to end. Sharing that band is not
+   possible there, so the drag strip stays full height and the controls sit
+   BELOW the buttons instead of under them. */
+.primary-sidebar.collapsed .sb-drag {
   height: var(--space-7);
 }
 
@@ -412,11 +420,19 @@ app-shell {
   flex: none;
   align-items: center;
   gap: var(--space-1);
-  padding: 0 var(--space-2) var(--space-2);
+  padding: 0 var(--space-2) var(--space-2) var(--shell-traffic-clearance);
 }
 
 .primary-sidebar.collapsed .sb-top {
   flex-direction: column;
+  padding: 0 var(--space-2) var(--space-2);
+}
+
+/* Three controls have to fit beside the window buttons, which leaves roughly
+   163px. The shortcut badge is the one that gives: the row still says "Search",
+   and ⌘K keeps working and is still named in the control's own tooltip. */
+.primary-sidebar:not(.collapsed) .sb-kbd {
+  display: none;
 }
 
 .primary-sidebar .sb-search {
@@ -434,15 +450,22 @@ app-shell {
   display: grid;
   place-items: center;
   flex: none;
-  width: var(--space-7);
-  height: var(--space-7);
+  width: var(--space-6);
+  height: var(--space-6);
   padding: 0;
   border: 0;
   border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
+  text-decoration: none;
   cursor: pointer;
   transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.primary-sidebar .sb-toggle.active {
+  background: var(--shell-active-bg);
+  color: var(--shell-active-icon);
+  box-shadow: var(--shell-active-shadow);
 }
 
 .primary-sidebar .sb-toggle:hover {

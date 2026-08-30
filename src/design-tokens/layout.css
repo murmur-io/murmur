@@ -102,5 +102,21 @@
      animates between the two, so both ends live here as tokens rather than as
      literals inside the shell chrome in styles.css. */
   --shell-sidebar-w: calc(var(--space-8) * 4);
+
+  /* Where the sidebar's top row sits so it reads as ONE band with the macOS
+     window buttons. Both values are derived from `trafficLightPosition` in
+     src-tauri/tauri.conf.json ({ x: 32, y: 30 }) and the 12px button size:
+
+       centre of the buttons = 30 + 6         = 36px below the window top
+       sidebar's own top     = app-shell pad  =  8px  (+1px border)
+       => a 32px row is centred there when it starts 11px into the sidebar
+
+       buttons end at 32 + 52                 = 84px from the window left
+       sidebar content starts at 8 + 1        =  9px
+       => the row must clear 83px before its first control
+
+     Change the config and these must move with it; nothing recomputes them. */
+  --shell-traffic-row-top: 11px;
+  --shell-traffic-clearance: 83px;
   --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
 }
