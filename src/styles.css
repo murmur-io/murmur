@@ -601,7 +601,9 @@ app-shell {
   border-top: 1px solid var(--border-subtle);
 }
 
-/* "New note" plus the caret that opens the rest of the create actions. */
+/* Capture (secondary) beside New note (primary), plus the caret that opens the
+   rest of the create actions. Both use the global .btn primitives so they read
+   as buttons rather than as two more nav rows. */
 .primary-sidebar .sb-create {
   position: relative;
   display: flex;
@@ -609,9 +611,49 @@ app-shell {
   gap: var(--space-1);
 }
 
-.primary-sidebar .sb-create-main {
-  flex: 1 1 auto;
+.primary-sidebar .sb-capture,
+.primary-sidebar .sb-new-note {
+  flex: 1 1 0;
   min-width: 0;
+  gap: var(--space-1);
+  height: var(--space-7);
+  padding: 0 var(--space-2);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.primary-sidebar .sb-capture.active {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+/* Collapsed there is room for ONE glyph per line, so the two buttons stack and
+   drop their labels rather than being squeezed side by side. */
+.primary-sidebar.collapsed .sb-create {
+  flex-direction: column;
+}
+
+.primary-sidebar.collapsed .sb-capture,
+.primary-sidebar.collapsed .sb-new-note {
+  width: 100%;
+  padding: 0;
+}
+
+/* Browse sits LAST, after Workspaces and Shared, so the user's own content is
+   what the sidebar leads with. */
+.primary-sidebar .sb-browse {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-2) 0;
+}
+
+.primary-sidebar .sb-shared {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  padding: var(--space-2) var(--space-2) 0;
 }
 
 .primary-sidebar .sb-create-more {

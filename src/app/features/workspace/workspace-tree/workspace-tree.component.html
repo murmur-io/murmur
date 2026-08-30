@@ -2,17 +2,18 @@
      on emptiness AND loading, so the first visit shows it and every return
      shows the previous tree while the (still unconditional) reload replaces it
      underneath. Gating on loading() alone is the 2026-07-12 "reload flash". -->
-@if (workspaceEmpty() && loading()) {
-  <p class="tree-state">Loading workspace…</p>
-} @else if (workspaceEmpty()) {
-  <p class="tree-state">No Workspaces yet</p>
+@if (sectionEmpty() && loading()) {
+  <p class="tree-state">Loading{{ isOwnScope() ? " workspace" : " shared content" }}…</p>
+} @else if (sectionEmpty()) {
+  <p class="tree-state">{{ isOwnScope() ? "No Workspaces yet" : "Nothing shared with you yet" }}</p>
 } @else {
   @if (error(); as message) {
     <!-- A failed refresh keeps the cached tree and says so, rather than
          blanking a view the user is navigating. -->
     <p class="tree-error" role="status">{{ message }}</p>
   }
-  <div class="tree" role="tree" aria-label="Workspaces">
+  <div class="tree" role="tree" [attr.aria-label]="isOwnScope() ? 'Workspaces' : 'Shared'">
+    @if (isOwnScope()) {
     @if (unfiledRecordings(); as inbox) {
       @if (inbox.total > 0) {
         <!-- `container_id = NULL` is an honest inbox, not a synthetic Workspace:
@@ -131,6 +132,7 @@
           }
         }
       }
+    }
     }
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {

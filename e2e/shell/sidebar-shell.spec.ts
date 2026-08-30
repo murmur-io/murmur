@@ -54,6 +54,7 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   const search = bar.getByRole("button", { name: "Search" });
   const collapse = bar.getByRole("button", { name: "Collapse sidebar" });
   const settings = bar.getByRole("link", { name: "Settings" });
+  await expect(bar.getByRole("link", { name: "Ask" })).toBeVisible();
   await expect(sb.getByRole("button", { name: "Search" })).toHaveCount(0);
 
   // Search is the icon alone — no label, no shortcut badge.
@@ -109,9 +110,13 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
   await expect(sb.locator('mur-icon[data-icon="murmur"]')).toHaveCount(0);
 
-  // Destinations and the workspace tree share this one surface.
-  await expect(sb.getByText("Capture", { exact: true })).toBeVisible();
-  await expect(sb.getByText("Ask", { exact: true })).toBeVisible();
+  // Capture is a button beside New note, not a nav row; New note is the primary.
+  const capture = sb.getByRole("link", { name: "Capture" });
+  const newNote = sb.getByRole("button", { name: "New note" });
+  await expect(capture).toHaveClass(/\bbtn\b/);
+  await expect(capture).not.toHaveClass(/btn-primary/);
+  await expect(newNote).toHaveClass(/btn-primary/);
+
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 });
 
@@ -124,7 +129,7 @@ test("collapsing hides the labels and the tree, and survives a reload", async ({
 
   await topbar(page).getByRole("button", { name: "Collapse sidebar" }).click();
 
-  await expect(sb.getByText("Capture", { exact: true })).toBeHidden();
+  await expect(sb.getByText("Browse", { exact: true })).toBeHidden();
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toHaveCount(0);
   await expect(sb.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
 
@@ -239,6 +244,7 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
 
   const sb = sidebar(page);
   await expect(sb.getByRole("button", { name: "Search" })).toBeVisible();
+  await expect(sb.getByRole("link", { name: "Ask" })).toBeVisible();
   await expect(sb.getByRole("link", { name: "Settings" })).toBeVisible();
 
   // The row is down to the toggle alone.
@@ -246,4 +252,30 @@ test("collapsed keeps Search and Settings reachable in the rail", async ({
   await expect(bar.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
   await expect(bar.getByRole("button", { name: "Search" })).toHaveCount(0);
   await expect(bar.getByRole("link", { name: "Settings" })).toHaveCount(0);
+});
+
+/**
+ * Section order is Workspaces, then Shared, then Browse: the user's own content
+ * leads, a colleague's follows it, and the app-wide destinations come last.
+ *
+ * Shared is HIDDEN when nothing is shared in either direction. Most installs
+ * have no org, and a permanent empty heading is noise in the only navigation
+ * surface — so this fixture asserts its absence, and the presence case belongs
+ * to a fixture that actually returns shared content.
+ */
+test("Workspaces leads, Browse trails, and Shared is absent when nothing is shared", async ({
+  page,
+}) => {
+  await boot(page);
+  const sb = sidebar(page);
+
+  await expect(sb.getByRole("region", { name: "Shared" })).toHaveCount(0);
+
+  const workspaces = await sb
+    .getByRole("region", { name: "Workspaces" })
+    .boundingBox();
+  const browse = await sb.getByRole("button", { name: "Browse" }).boundingBox();
+  expect(workspaces).not.toBeNull();
+  expect(browse).not.toBeNull();
+  expect(workspaces!.y).toBeLessThan(browse!.y);
 });
