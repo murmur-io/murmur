@@ -8,16 +8,6 @@
   >
     <mur-icon icon="search" />
   </button>
-  <button
-    type="button"
-    class="topbar-btn"
-    (click)="toggleSidebar()"
-    [attr.aria-expanded]="sidebarExpanded()"
-    [attr.aria-label]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
-    [title]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
-  >
-    <mur-icon icon="sidebar" />
-  </button>
   <a
     class="topbar-btn"
     [class.active]="isSettingsActive()"
@@ -28,6 +18,16 @@
   >
     <mur-icon icon="settings" />
   </a>
+  <button
+    type="button"
+    class="topbar-btn"
+    (click)="toggleSidebar()"
+    [attr.aria-expanded]="sidebarExpanded()"
+    [attr.aria-label]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+    [title]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+  >
+    <mur-icon icon="sidebar" />
+  </button>
 </header>
 
 <div class="shell-body">
