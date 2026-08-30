@@ -91,7 +91,7 @@ async function boot(page: Page, path = "/record"): Promise<void> {
 test("uses a persistent global rail beside a contextual Workspaces panel", async ({ page }) => {
   await boot(page);
 
-  const rail = page.getByRole("navigation", { name: "Global navigation" });
+  const rail = page.getByRole("navigation", { name: "Primary navigation" });
   await expect(rail).toBeVisible();
   await expect(page.getByRole("complementary", { name: "Workspaces sidebar" })).toHaveCount(0);
   await expect(rail.getByRole("link", { name: "Capture" })).toHaveAttribute(

@@ -255,7 +255,7 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
 
     await expect(page.locator("app-library .library")).toBeVisible();
     await page
-      .getByRole("navigation", { name: "Global navigation" })
+      .getByRole("navigation", { name: "Primary navigation" })
       .getByRole("button", { name: "Workspaces", exact: true })
       .click();
     await expect(page).toHaveURL(/\/library$/);

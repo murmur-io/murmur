@@ -204,7 +204,7 @@ test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async 
   // with the destination: a sealed container must present itself as locked and disclose
   // nothing about what it holds, rather than showing a view of its contents.
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Workspaces", exact: true })
     .click();
   await expect(page).toHaveURL(/\/notes$/);

@@ -124,7 +124,6 @@ body.bar-shell::after { display: none !important; }
   body.murmur-printing::before,
   body.murmur-printing::after { display: none !important; }
   body.murmur-printing .app-sidebar,
-  body.murmur-printing .global-rail,
   body.murmur-printing .shell-drag { display: none !important; }
   body.murmur-printing .app-main { max-width: none; margin: 0; padding: 0; }
   body.murmur-printing { background: #fff !important; color: #000 !important; }
@@ -360,52 +359,77 @@ app-shell {
   height: var(--space-6);
 }
 
-.global-rail {
+.app-sidebar.primary-sidebar {
   position: sticky;
   top: 0;
-  z-index: 10;
+  align-self: auto;
+  z-index: 9;
   display: flex;
-  flex: 0 0 var(--shell-rail-w);
+  flex: 0 0 var(--shell-sidebar-w);
   flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  width: var(--shell-rail-w);
+  width: var(--shell-sidebar-w);
   transition: flex-basis var(--transition-fast), width var(--transition-fast);
   height: calc(100vh - var(--space-4));
-  padding: 0 var(--space-2) var(--space-3);
+  margin: 0;
+  padding: 0;
   background:
     linear-gradient(var(--shell-glass-veil), var(--shell-glass-veil)),
     var(--shell-glass-bg);
   -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
   backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
   border: 1px solid var(--shell-glass-border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-xl);
   box-shadow: var(--shadow-md), var(--shell-glass-inner);
+  overflow: hidden;
 }
 
-.global-rail .rail-drag {
+/* ── The one sidebar ───────────────────────────────────────────────────────
+   Search + collapse on top, destinations, the workspace tree, and the create
+   actions pinned to the bottom. Collapsed it keeps only the glyph column, so
+   it reads as the old icon rail without being a second piece of chrome. */
+.app-sidebar.primary-sidebar.collapsed {
+  flex-basis: var(--shell-sidebar-w-collapsed);
+  width: var(--shell-sidebar-w-collapsed);
+}
+
+/* Collapsed, a label is absent from the box model rather than merely
+   transparent: a zero-width flex child still eats the gap and would push the
+   glyph off-centre in the narrow column. */
+.primary-sidebar.collapsed .sb-label,
+.primary-sidebar.collapsed .sb-kbd,
+.primary-sidebar.collapsed .sb-caret,
+.primary-sidebar.collapsed .count {
+  display: none;
+}
+
+.primary-sidebar .sb-drag {
   flex: none;
-  width: 100%;
   height: var(--space-7);
 }
 
-/* The brand tile carries the Murmur waveform mark (mur-icon "murmur"), which
-   paints in `currentColor` — so the bars follow the user's accent theme rather
-   than the fixed gradient the app-icon PNG bakes in. */
-.rail-brand {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: var(--space-6);
-  height: var(--space-6);
-  margin-bottom: var(--space-1);
-  border-radius: var(--radius-md);
-  background: var(--accent-soft);
-  color: var(--accent-hover);
+.primary-sidebar .sb-top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 var(--space-2) var(--space-2);
 }
 
-.rail-item {
-  position: relative;
+.primary-sidebar.collapsed .sb-top {
+  flex-direction: column;
+}
+
+.primary-sidebar .sb-search {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.primary-sidebar .sb-kbd {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 0.72rem;
+}
+
+.primary-sidebar .sb-toggle {
   display: grid;
   place-items: center;
   flex: none;
@@ -420,101 +444,209 @@ app-shell {
   transition: color var(--transition-fast), background var(--transition-fast);
 }
 
-.rail-item:hover {
+.primary-sidebar .sb-toggle:hover {
   background: var(--surface-hover);
   color: var(--text-primary);
 }
 
-.rail-item:focus-visible {
+.primary-sidebar .sb-toggle:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
-.rail-item.active {
+/* One row shape for every clickable line: destination, disclosure, footer. */
+.primary-sidebar .sb-row {
+  display: grid;
+  grid-template-columns: var(--space-6) 1fr auto;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: var(--space-7);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.primary-sidebar.collapsed .sb-row {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 0;
+}
+
+.primary-sidebar .sb-row:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.primary-sidebar .sb-row:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.primary-sidebar .sb-row.active {
   background: var(--shell-active-bg);
   color: var(--shell-active-icon);
   box-shadow: var(--shell-active-shadow);
 }
 
-.rail-item.active::before {
-  content: "";
-  position: absolute;
-  left: calc(-1 * var(--space-2));
-  width: var(--space-1);
-  height: var(--space-5);
-  border-radius: var(--radius-pill);
-  background: var(--accent);
-}
-
-.rail-spacer {
-  flex: 1 1 auto;
-}
-
-/* EXPANDED rail — the same chrome, widened, with each glyph's label beside it.
-   Collapsed stays the default so the shell opens exactly as it always has; the
-   user's choice is restored from localStorage by the app shell.
-
-   The label is `aria-hidden` in the template because every rail control already
-   carries an `aria-label`; revealing the text must not make screen readers
-   announce the destination twice. */
-.global-rail.expanded {
-  flex-basis: var(--shell-rail-w-expanded);
-  width: var(--shell-rail-w-expanded);
-  align-items: stretch;
-}
-
-.global-rail.expanded .rail-brand {
-  margin-left: var(--space-1);
-}
-
-.global-rail.expanded .rail-item {
-  display: grid;
-  grid-template-columns: var(--space-7) 1fr;
-  align-items: center;
-  justify-items: start;
-  width: 100%;
-  padding-right: var(--space-3);
-}
-
-.rail-label {
-  overflow: hidden;
-  color: inherit;
-  font-size: 0.9rem;
-  font-weight: 550;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-/* Collapsed is the default, so the label is absent from the box model entirely
-   rather than merely transparent — a zero-width flex child still eats the gap
-   and would push the glyph off-centre in the narrow rail. */
-.global-rail:not(.expanded) .rail-label {
-  display: none;
-}
-
-.app-sidebar.spaces-sidebar,
-.app-sidebar.browse-sidebar {
-  position: sticky;
-  top: 0;
-  align-self: auto;
-  z-index: 9;
+.primary-sidebar .sb-nav {
   display: flex;
-  flex: 0 0 calc(var(--space-8) * 4);
   flex-direction: column;
-  width: calc(var(--space-8) * 4);
-  height: calc(100vh - var(--space-4));
-  margin: 0;
-  padding: 0;
-  background:
-    linear-gradient(var(--shell-glass-veil), var(--shell-glass-veil)),
-    var(--shell-glass-bg);
-  -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
-  backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
-  border: 1px solid var(--shell-glass-border);
-  border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-md), var(--shell-glass-inner);
-  overflow: hidden;
+  gap: 2px;
+  padding: 0 var(--space-2);
 }
+
+.primary-sidebar .sb-caret {
+  display: grid;
+  place-items: center;
+  color: var(--text-tertiary);
+  transition: transform var(--transition-fast);
+}
+
+.primary-sidebar .sb-caret.open {
+  transform: rotate(90deg);
+}
+
+.primary-sidebar .sb-sublist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: var(--space-1) 0 var(--space-2) var(--space-4);
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--border-subtle);
+}
+
+.primary-sidebar .sb-group-label {
+  padding: var(--space-2) var(--space-2) var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 0.7rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* The workspace tree is the only part that scrolls; everything else is fixed
+   chrome, so the footer stays reachable no matter how deep the tree gets. */
+.primary-sidebar .sb-workspaces {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  padding: var(--space-2) var(--space-2) 0;
+}
+
+.primary-sidebar .sb-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+}
+
+.primary-sidebar .sb-section-title {
+  color: var(--text-tertiary);
+  font-size: 0.7rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.primary-sidebar .sb-section-action {
+  display: grid;
+  place-items: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.primary-sidebar .sb-section-action:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.primary-sidebar .sb-tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.primary-sidebar .sb-footer {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: auto;
+  padding: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* "New note" plus the caret that opens the rest of the create actions. */
+.primary-sidebar .sb-create {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.primary-sidebar .sb-create-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.primary-sidebar .sb-create-more {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-6);
+  height: var(--space-7);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transform: rotate(-90deg);
+}
+
+.primary-sidebar .sb-create-more:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+/* The menu floats OVER the tree, so it takes the OPAQUE overlay surface — the
+   frosted .card would let the rows behind it bleed through (T3). */
+.primary-sidebar .sb-create-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + var(--space-1));
+  z-index: 2;
+  min-width: 11rem;
+}
+
+.primary-sidebar .sb-menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: default;
+}
+
 
 .context-header {
   display: flex;
@@ -762,8 +894,7 @@ app-shell > .main-col {
 }
 
 @media (max-width: 760px) {
-  .app-sidebar.spaces-sidebar,
-  .app-sidebar.browse-sidebar {
+  .app-sidebar.primary-sidebar {
     display: none;
   }
 }

@@ -18,7 +18,7 @@ test.afterEach(({ page }) => {
 
 async function openPalette(page: Page): Promise<void> {
   await page
-    .getByRole("navigation", { name: "Global navigation" })
+    .getByRole("navigation", { name: "Primary navigation" })
     .getByRole("button", { name: "Search", exact: true })
     .click();
   await expect(page.getByRole("dialog", { name: "Quick search" })).toBeVisible();
