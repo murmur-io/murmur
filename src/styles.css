@@ -358,14 +358,19 @@ app-shell {
    sidebar — only 68px wide, narrower than the buttons themselves — no longer
    has to share a row it cannot fit. The whole strip drags the window; the
    controls opt out via their own `-webkit-app-region`. */
+/* Its width is the EXPANDED sidebar's, held even while the sidebar is
+   collapsed: three 32px controls do not fit in a 68px column, and a band that
+   resized with the sidebar would shuffle them on every toggle. */
 .shell-topbar {
   display: flex;
   flex: none;
   align-items: center;
+  justify-content: flex-end;
   gap: var(--space-1);
+  width: var(--shell-sidebar-w);
   height: var(--shell-topbar-h);
   padding-top: var(--shell-topbar-pad-top);
-  padding-left: var(--shell-traffic-clearance);
+  padding-right: var(--space-2);
 }
 
 .topbar-btn {

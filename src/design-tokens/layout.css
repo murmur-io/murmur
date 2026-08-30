@@ -104,32 +104,25 @@
   --shell-sidebar-w: calc(var(--space-8) * 4);
 
   /* The control band ABOVE the sidebar, level with the macOS window buttons.
-     Derived from `trafficLightPosition` in src-tauri/tauri.conf.json
-     ({ x: 32, y: 30 }) and the 12px button size.
 
-     `y` is the buttons' CENTRE, not their top edge. That was measured off the
-     rendered window rather than read from Tauri's docs: assuming a top edge put
-     the row 6px low, exactly the button's half-height.
+     The controls are RIGHT-aligned within the sidebar's own width, which puts
+     them at the far end of that column and well clear of the window buttons on
+     the left — so the band no longer needs a horizontal clearance at all.
 
-     Vertical — the band is shell chrome, so it starts at app-shell's own 8px
-     padding and nothing else. Inside the panel this used to be a chain of
-     app-shell padding + the panel border + its drag strip, all kept in sync by
-     hand; that is why it moved out.
+     Vertical is the one value that cannot be derived. `trafficLightPosition`
+     in src-tauri/tauri.conf.json says { y: 30 }, but that number did not
+     predict the rendered result twice over: a 36px centre (reading y as the
+     buttons' top edge plus half a 12px button) sat clearly low, and a 30px
+     centre (reading y as the centre) still sat slightly low. 26px is calibrated
+     from those two observations, not derived.
 
-       buttons' centre  = y                        = 30px below the window top
        band starts at   = app-shell padding        =  8px
-       => a 32px control centres there with 6px above it, so the band is 38px
+       => a 32px control centres at 26px with 2px above it; the band is 34px
 
-     Horizontal — the buttons overlap the band, so the first control clears them.
-
-       buttons end at   = x + 52                   = 84px from the window left
-       band starts at   =                             8px
-       => the first control begins 84px in
-
-     Change trafficLightPosition and these must move with it; nothing
-     recomputes them, and no CSS can read the native buttons' real box. */
-  --shell-topbar-pad-top: 6px;
-  --shell-topbar-h: 38px;
-  --shell-traffic-clearance: 84px;
+     No CSS can read the native buttons' real box, so if the window chrome or
+     trafficLightPosition changes, this is re-measured, not recomputed. It is
+     one value: --shell-topbar-pad-top, with the height following it. */
+  --shell-topbar-pad-top: 2px;
+  --shell-topbar-h: 34px;
   --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-2));
 }
