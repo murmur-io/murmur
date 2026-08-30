@@ -38,17 +38,27 @@ function sidebar(page: Page) {
   return page.getByRole("navigation", { name: "Primary navigation" });
 }
 
+function topbar(page: Page) {
+  return page.locator("header.shell-topbar");
+}
+
 test("opens expanded, with search on top and no brand mark", async ({ page }) => {
   await boot(page);
   const sb = sidebar(page);
 
   await expect(sb).toBeVisible();
 
-  // Search, Collapse and Settings share ONE band, level with the macOS window
-  // buttons. All three sit above everything that scrolls.
-  const search = sb.getByRole("button", { name: "Search" });
-  const collapse = sb.getByRole("button", { name: "Collapse sidebar" });
-  const settings = sb.getByRole("link", { name: "Settings" });
+  // Search, Collapse and Settings share ONE band that sits ABOVE the sidebar,
+  // in shell chrome rather than inside the panel's glass.
+  const bar = topbar(page);
+  const search = bar.getByRole("button", { name: "Search" });
+  const collapse = bar.getByRole("button", { name: "Collapse sidebar" });
+  const settings = bar.getByRole("link", { name: "Settings" });
+  await expect(sb.getByRole("button", { name: "Search" })).toHaveCount(0);
+
+  // Search is the icon alone — no label, no shortcut badge.
+  await expect(bar.getByText("Search", { exact: true })).toHaveCount(0);
+  await expect(search.locator("mur-icon")).toHaveAttribute("data-icon", "search");
   await expect(search).toBeVisible();
   await expect(collapse).toBeVisible();
   await expect(settings).toBeVisible();
@@ -71,6 +81,16 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   expect(centres[0]).toBeGreaterThan(28);
   expect(centres[0]).toBeLessThan(44);
 
+  // It must also clear them horizontally: the buttons end 84px in.
+  const searchBox = await search.boundingBox();
+  expect(searchBox).not.toBeNull();
+  expect(searchBox!.x).toBeGreaterThanOrEqual(84);
+
+  // The band is above the sidebar, not inside it.
+  const sbBox = await sb.boundingBox();
+  expect(sbBox).not.toBeNull();
+  expect(centres[0]).toBeLessThan(sbBox!.y);
+
   // The Murmur logo tile is gone — it was chrome that navigated nowhere.
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
   await expect(sb.locator('mur-icon[data-icon="murmur"]')).toHaveCount(0);
@@ -88,7 +108,7 @@ test("collapsing hides the labels and the tree, and survives a reload", async ({
   const sb = sidebar(page);
   const expandedBox = await sb.boundingBox();
 
-  await sb.getByRole("button", { name: "Collapse sidebar" }).click();
+  await topbar(page).getByRole("button", { name: "Collapse sidebar" }).click();
 
   await expect(sb.getByText("Capture", { exact: true })).toBeHidden();
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toHaveCount(0);
@@ -101,7 +121,7 @@ test("collapsing hides the labels and the tree, and survives a reload", async ({
 
   await page.reload();
   await expect(
-    sidebar(page).getByRole("button", { name: "Expand sidebar" }),
+    topbar(page).getByRole("button", { name: "Expand sidebar" }),
   ).toBeVisible();
 });
 
@@ -157,10 +177,10 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   await sb.getByRole("button", { name: "Browse" }).click();
   await expect(sb.getByText("People", { exact: true })).toBeVisible();
 
-  // Both pinned controls stay reachable: New note in the footer, Settings in the
-  // top band. Neither may be pushed outside the sidebar's own box.
+  // New note is pinned in the footer; Settings sits in the band above and is
+  // unaffected by the sidebar's own overflow.
   const newNote = sb.getByRole("button", { name: "New note" });
-  const settings = sb.getByRole("link", { name: "Settings" });
+  const settings = topbar(page).getByRole("link", { name: "Settings" });
   await expect(newNote).toBeVisible();
   await expect(settings).toBeVisible();
 
@@ -172,7 +192,6 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   expect(settingsBox).not.toBeNull();
   const sidebarBottom = sbBox!.y + sbBox!.height;
   expect(noteBox!.y + noteBox!.height).toBeLessThanOrEqual(sidebarBottom + 1);
-  expect(settingsBox!.y).toBeGreaterThanOrEqual(sbBox!.y - 1);
 
   // The overflow lives in ONE scroll region, not in the sidebar itself.
   const scroll = sb.locator(".sb-scroll");

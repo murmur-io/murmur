@@ -346,10 +346,67 @@ app-shell {
    linked stylesheet. The rail chooses a surface; the adjacent panel contains
    only that surface's navigation. */
 app-shell {
-  gap: var(--space-2);
+  flex-direction: column;
   height: 100vh;
   padding: var(--space-2);
   overflow: hidden;
+}
+
+/* The band that carries Search, Collapse and Settings, level with the macOS
+   window buttons. It lives ABOVE the sidebar rather than inside its glass, so
+   the panel's border and padding no longer offset it, and the collapsed
+   sidebar — only 68px wide, narrower than the buttons themselves — no longer
+   has to share a row it cannot fit. The whole strip drags the window; the
+   controls opt out via their own `-webkit-app-region`. */
+.shell-topbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  height: var(--shell-topbar-h);
+  padding-top: var(--shell-topbar-pad-top);
+  padding-left: var(--shell-traffic-clearance);
+}
+
+.topbar-btn {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-6);
+  height: var(--space-6);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.topbar-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.topbar-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.topbar-btn.active {
+  background: var(--shell-active-bg);
+  color: var(--shell-active-icon);
+  box-shadow: var(--shell-active-shadow);
+}
+
+.shell-body {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: stretch;
+  gap: var(--space-2);
+  min-height: 0;
 }
 
 .shell-drag {
@@ -369,7 +426,7 @@ app-shell {
   flex-direction: column;
   width: var(--shell-sidebar-w);
   transition: flex-basis var(--transition-fast), width var(--transition-fast);
-  height: calc(100vh - var(--space-4));
+  height: 100%;
   margin: 0;
   padding: 0;
   background:
@@ -396,86 +453,9 @@ app-shell {
    transparent: a zero-width flex child still eats the gap and would push the
    glyph off-centre in the narrow column. */
 .primary-sidebar.collapsed .sb-label,
-.primary-sidebar.collapsed .sb-kbd,
 .primary-sidebar.collapsed .sb-caret,
 .primary-sidebar.collapsed .count {
   display: none;
-}
-
-.primary-sidebar .sb-drag {
-  flex: none;
-  height: var(--shell-traffic-row-top);
-}
-
-/* COLLAPSED the sidebar is 68px wide while the window buttons span 32-84px from
-   the window's left edge — they cover it end to end. Sharing that band is not
-   possible there, so the drag strip stays full height and the controls sit
-   BELOW the buttons instead of under them. */
-.primary-sidebar.collapsed .sb-drag {
-  height: var(--space-7);
-}
-
-.primary-sidebar .sb-top {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: var(--space-1);
-  padding: 0 var(--space-2) var(--space-2) var(--shell-traffic-clearance);
-}
-
-.primary-sidebar.collapsed .sb-top {
-  flex-direction: column;
-  padding: 0 var(--space-2) var(--space-2);
-}
-
-/* Three controls have to fit beside the window buttons, which leaves roughly
-   163px. The shortcut badge is the one that gives: the row still says "Search",
-   and ⌘K keeps working and is still named in the control's own tooltip. */
-.primary-sidebar:not(.collapsed) .sb-kbd {
-  display: none;
-}
-
-.primary-sidebar .sb-search {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.primary-sidebar .sb-kbd {
-  margin-left: auto;
-  color: var(--text-tertiary);
-  font-size: 0.72rem;
-}
-
-.primary-sidebar .sb-toggle {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: var(--space-6);
-  height: var(--space-6);
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  text-decoration: none;
-  cursor: pointer;
-  transition: color var(--transition-fast), background var(--transition-fast);
-}
-
-.primary-sidebar .sb-toggle.active {
-  background: var(--shell-active-bg);
-  color: var(--shell-active-icon);
-  box-shadow: var(--shell-active-shadow);
-}
-
-.primary-sidebar .sb-toggle:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-
-.primary-sidebar .sb-toggle:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
 /* One row shape for every clickable line: destination, disclosure, footer. */
@@ -676,7 +656,6 @@ app-shell {
   background: transparent;
   cursor: default;
 }
-
 
 .context-header {
   display: flex;
@@ -917,8 +896,8 @@ app-shell {
   color: var(--shell-active-icon);
 }
 
-app-shell > .main-col {
-  height: calc(100vh - var(--space-4));
+.shell-body > .main-col {
+  height: 100%;
   margin: 0;
   overflow: auto;
 }
