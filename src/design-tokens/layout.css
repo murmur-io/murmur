@@ -131,23 +131,23 @@
      sits beside it. Capture takes the remaining width; the round one stays
      square, so a single size keeps them on one line. */
   --shell-footer-btn: 36px;
-  /* Collapsed width. CALIBRATED with headroom, not derived — and deliberately
-     so, because deriving it failed twice.
+  /* Collapsed width: the panel wraps the macOS window buttons with the SAME
+     margin on each side.
 
-     `trafficLightPosition` is { x: 32, y: 30 }, and the arithmetic that treats
-     those as the buttons' top-left corner has now been wrong on BOTH axes: y
-     turned out to be the CENTRE (the row sat 6px low until that was corrected),
-     and a width computed from x as a left edge still left the buttons
-     overhanging the panel. macOS also adds its own padding that no config
-     exposes, and no CSS can read the native buttons' real box.
+     `trafficLightPosition.x` is 32 and it IS the buttons' left edge — measured,
+     not assumed. At 96px the right margin came out visibly tighter than the
+     left, and that asymmetry is only explained by the buttons reaching 84px
+     (32 + their 52px span). Read as a centre they would end at 78 and the right
+     margin would have been the WIDER one.
 
-     So this is picked to be correct under EITHER reading of x:
+     Note this differs from `y`, which is the buttons' CENTRE — the two axes do
+     not agree, which is exactly why both had to be measured rather than
+     reasoned about.
 
-       x as the left edge  -> buttons end at 32 + 52 = 84px
-       x as the centre     -> buttons end at 32 + 46 = 78px
-       panel spans         -> 8 .. 8 + 96          = 104px
-
-     Either way they sit on the glass with room to spare. If the window chrome
-     changes, widen this rather than trying to compute it. */
-  --shell-sidebar-w-collapsed: calc(var(--space-8) + var(--space-6));
+       buttons span    = 32 .. 84
+       panel starts at = app-shell padding   =  8px  -> 24px before them
+       => 24px after them puts the edge at 108 -> 100px wide */
+  --shell-sidebar-w-collapsed: calc(
+    var(--space-8) + var(--space-6) + var(--space-1)
+  );
 }
