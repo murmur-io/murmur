@@ -185,26 +185,19 @@
         title="Capture"
       >
         <mur-icon icon="record" />
+        <span class="sb-label">Capture</span>
       </a>
       <button
         type="button"
-        class="btn sb-new-note"
-        (click)="newNote()"
-        aria-label="New note"
-        title="New note (⌘N)"
-      >
-        <mur-icon icon="note-add" />
-      </button>
-      <button
-        type="button"
         class="btn sb-create-more"
+        [class.is-open]="createMenuOpen()"
         (click)="toggleCreateMenu()"
         aria-haspopup="menu"
         [attr.aria-expanded]="createMenuOpen()"
-        aria-label="More create options"
-        title="More create options"
+        [attr.aria-label]="createMenuOpen() ? 'Close create menu' : 'Create'"
+        [title]="createMenuOpen() ? 'Close create menu' : 'Create'"
       >
-        <mur-icon icon="chevron-right" />
+        <mur-icon icon="plus" />
       </button>
 
       @if (createMenuOpen()) {
@@ -216,9 +209,9 @@
           tabindex="-1"
         ></button>
         <div class="menu sb-create-menu" role="menu">
-          <button type="button" class="menu-item" role="menuitem" (click)="newCapture()">
-            <mur-icon icon="record" />
-            <span>New capture</span>
+          <button type="button" class="menu-item" role="menuitem" (click)="newNote()">
+            <mur-icon icon="note-add" />
+            <span>New note</span>
           </button>
           <button type="button" class="menu-item" role="menuitem" (click)="newDashboard()">
             <mur-icon icon="dashboards" />

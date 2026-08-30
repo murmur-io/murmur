@@ -110,41 +110,26 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   await expect(sb.locator(".rail-brand")).toHaveCount(0);
   await expect(sb.locator('mur-icon[data-icon="murmur"]')).toHaveCount(0);
 
-  // Capture and New note are ICON-ONLY buttons in the footer. Capture is the
-  // primary — recording is what the app is for — and New note the secondary.
+  // ONE wide Capture button, and a round button beside it holding every other
+  // creation — the Notion shape. Capture takes the remaining width.
   const capture = sb.getByRole("link", { name: "Capture" });
-  const newNote = sb.getByRole("button", { name: "New note" });
+  const create = sb.getByRole("button", { name: "Create" });
   await expect(capture).toHaveClass(/btn-primary/);
-  await expect(newNote).toHaveClass(/\bbtn\b/);
-  await expect(newNote).not.toHaveClass(/btn-primary/);
-  await expect(capture).toHaveText("");
-  await expect(newNote).toHaveText("");
+  await expect(capture).toContainText("Capture");
 
-  // Three equal squares: the pair hugs the LEFT, the create chevron is pushed
-  // RIGHT, and the chevron carries the same .btn box as the other two — it read
-  // as decoration while it was a bare glyph on transparent.
-  const more = sb.getByRole("button", { name: "More create options" });
-  await expect(more).toHaveClass(/\bbtn\b/);
-
-  const [captureBox, noteBox, moreBox] = await Promise.all([
+  const [captureBox, createBox] = await Promise.all([
     capture.boundingBox(),
-    newNote.boundingBox(),
-    more.boundingBox(),
+    create.boundingBox(),
   ]);
-  for (const box of [captureBox, noteBox, moreBox]) {
-    expect(box).not.toBeNull();
-    expect(box!.height).toBeLessThanOrEqual(40);
-  }
-  // One height across the row; the PAIR is wider than tall, the chevron square.
-  expect(noteBox!.height).toBeCloseTo(captureBox!.height, 0);
-  expect(moreBox!.height).toBeCloseTo(captureBox!.height, 0);
-  expect(noteBox!.width).toBeCloseTo(captureBox!.width, 0);
-  expect(captureBox!.width).toBeGreaterThan(captureBox!.height);
-  expect(moreBox!.width).toBeCloseTo(moreBox!.height, 0);
+  expect(captureBox).not.toBeNull();
+  expect(createBox).not.toBeNull();
+  expect(createBox!.width).toBeCloseTo(createBox!.height, 0);
+  expect(captureBox!.width).toBeGreaterThan(createBox!.width * 2);
+  expect(captureBox!.height).toBeCloseTo(createBox!.height, 0);
+  expect(captureBox!.x).toBeLessThan(createBox!.x);
 
-  // The pair is adjacent; the chevron is not.
-  expect(noteBox!.x - (captureBox!.x + captureBox!.width)).toBeLessThan(12);
-  expect(moreBox!.x - (noteBox!.x + noteBox!.width)).toBeGreaterThan(24);
+  // New note is no longer a button of its own: it lives in that menu.
+  await expect(sb.getByRole("button", { name: "New note" })).toHaveCount(0);
 
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 });
@@ -188,28 +173,29 @@ test("Browse expands in place instead of opening a second panel", async ({
   await expect(page.getByRole("complementary", { name: "Browse sidebar" })).toHaveCount(0);
 });
 
-test("the footer offers New note plus a menu for the other create actions", async ({
+test("the footer offers Capture plus a menu for the other create actions", async ({
   page,
 }) => {
   await boot(page);
   const sb = sidebar(page);
 
-  await expect(sb.getByRole("button", { name: "New note" })).toBeVisible();
-
-  await sb.getByRole("button", { name: "More create options" }).click();
+  await sb.getByRole("button", { name: "Create" }).click();
   const menu = page.getByRole("menu");
-  await expect(menu.getByRole("menuitem", { name: "New capture" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "New note" })).toBeVisible();
   await expect(menu.getByRole("menuitem", { name: "New dashboard" })).toBeVisible();
   await expect(menu.getByRole("menuitem", { name: "New reminder" })).toBeVisible();
 
-  await menu.getByRole("menuitem", { name: "New capture" }).click();
-  await expect(page).toHaveURL(/\/record$/);
+  // Open, the same control closes the menu — the plus rotates into an X.
+  await expect(sb.getByRole("button", { name: "Close create menu" })).toBeVisible();
+
+  await menu.getByRole("menuitem", { name: "New note" }).click();
+  await expect(page).toHaveURL(/\/notes\/new$/);
   await expect(page.getByRole("menu")).toHaveCount(0);
 });
 
 /**
  * REGRESSION (reported from a real window): with Browse expanded the sidebar
- * column grew past the viewport, so "New note" and "Settings" were pushed off
+ * column grew past the viewport, so Capture and Settings were pushed off
  * the bottom and overlapped the Workspaces section, with nothing to scroll.
  *
  * The footer is pinned chrome — it must stay reachable no matter how much the
@@ -225,9 +211,9 @@ test("the footer stays visible and the middle scrolls when Browse is expanded", 
   await sb.getByRole("button", { name: "Browse" }).click();
   await expect(sb.getByText("People", { exact: true })).toBeVisible();
 
-  // New note is pinned in the footer; Settings sits in the band above and is
+  // Capture is pinned in the footer; Settings sits in the band above and is
   // unaffected by the sidebar's own overflow.
-  const newNote = sb.getByRole("button", { name: "New note" });
+  const newNote = sb.getByRole("link", { name: "Capture" });
   const settings = topbar(page).getByRole("link", { name: "Settings" });
   await expect(newNote).toBeVisible();
   await expect(settings).toBeVisible();

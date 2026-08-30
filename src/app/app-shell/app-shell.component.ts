@@ -356,11 +356,6 @@ export class AppShellComponent {
     this.createMenuOpen.set(false);
   }
 
-  newCapture(): void {
-    this.closeCreateMenu();
-    void this.router.navigate(["/record"]);
-  }
-
   newDashboard(): void {
     this.closeCreateMenu();
     this.openWorkspaceCreate();
