@@ -120,6 +120,29 @@ test("opens expanded, with search on top and no brand mark", async ({ page }) =>
   await expect(capture).toHaveText("");
   await expect(newNote).toHaveText("");
 
+  // Three equal squares: the pair hugs the LEFT, the create chevron is pushed
+  // RIGHT, and the chevron carries the same .btn box as the other two — it read
+  // as decoration while it was a bare glyph on transparent.
+  const more = sb.getByRole("button", { name: "More create options" });
+  await expect(more).toHaveClass(/\bbtn\b/);
+
+  const [captureBox, noteBox, moreBox] = await Promise.all([
+    capture.boundingBox(),
+    newNote.boundingBox(),
+    more.boundingBox(),
+  ]);
+  for (const box of [captureBox, noteBox, moreBox]) {
+    expect(box).not.toBeNull();
+    expect(box!.width).toBeCloseTo(box!.height, 0);
+    expect(box!.width).toBeLessThanOrEqual(40);
+  }
+  expect(noteBox!.width).toBeCloseTo(captureBox!.width, 0);
+  expect(moreBox!.width).toBeCloseTo(captureBox!.width, 0);
+
+  // The pair is adjacent; the chevron is not.
+  expect(noteBox!.x - (captureBox!.x + captureBox!.width)).toBeLessThan(12);
+  expect(moreBox!.x - (noteBox!.x + noteBox!.width)).toBeGreaterThan(24);
+
   await expect(sb.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 });
 
