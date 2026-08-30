@@ -1,47 +1,42 @@
-<div class="shell-drag" data-tauri-drag-region></div>
+<header class="shell-topbar" data-tauri-drag-region>
+  <button
+    type="button"
+    class="topbar-btn"
+    (click)="openSearch()"
+    aria-label="Search"
+    title="Search (⌘K)"
+  >
+    <mur-icon icon="search" />
+  </button>
+  <button
+    type="button"
+    class="topbar-btn"
+    (click)="toggleSidebar()"
+    [attr.aria-expanded]="sidebarExpanded()"
+    [attr.aria-label]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+    [title]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+  >
+    <mur-icon icon="sidebar" />
+  </button>
+  <a
+    class="topbar-btn"
+    [class.active]="isSettingsActive()"
+    [attr.aria-current]="isSettingsActive() ? 'page' : null"
+    routerLink="/settings"
+    aria-label="Settings"
+    title="Settings"
+  >
+    <mur-icon icon="settings" />
+  </a>
+</header>
 
+<div class="shell-body">
 <mur-sidebar
   class="app-sidebar primary-sidebar"
   [class.collapsed]="!sidebarExpanded()"
   role="navigation"
   aria-label="Primary navigation"
 >
-  <div class="sb-drag" data-tauri-drag-region></div>
-
-  <div class="sb-top">
-    <button
-      type="button"
-      class="sb-row sb-search"
-      (click)="openSearch()"
-      aria-label="Search"
-      title="Search (⌘K)"
-    >
-      <mur-icon icon="search" />
-      <span class="sb-label">Search</span>
-      <kbd class="sb-kbd" aria-hidden="true">⌘K</kbd>
-    </button>
-    <button
-      type="button"
-      class="sb-toggle"
-      (click)="toggleSidebar()"
-      [attr.aria-expanded]="sidebarExpanded()"
-      [attr.aria-label]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
-      [title]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
-    >
-      <mur-icon icon="sidebar" />
-    </button>
-    <a
-      class="sb-toggle"
-      [class.active]="isSettingsActive()"
-      [attr.aria-current]="isSettingsActive() ? 'page' : null"
-      routerLink="/settings"
-      aria-label="Settings"
-      title="Settings"
-    >
-      <mur-icon icon="settings" />
-    </a>
-  </div>
-
   <div class="sb-scroll">
   <nav class="sb-nav" aria-label="Destinations">
     <a
@@ -215,6 +210,7 @@
   <main class="app-main">
     <router-outlet (detach)="onOutletDetach($event)"></router-outlet>
   </main>
+</div>
 </div>
 
 @if (searchOpen()) {
