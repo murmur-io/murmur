@@ -30,13 +30,16 @@ const W = 1920;
 const H = 1080;
 
 function parseArgs(argv) {
-  const o = { fps: 60, out: join(PROMO, "render"), captions: true, endcard: true, scenes: null, to: null, from: 0, recycle: 400 };
+  const o = { fps: 60, out: join(PROMO, "render"), captions: true, endcard: true, scenes: null, to: null, from: 0, recycle: 400, blur: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--fps") o.fps = Number(argv[++i]);
     else if (a === "--out") o.out = argv[++i];
     else if (a === "--no-captions") o.captions = false;
     else if (a === "--no-endcard") o.endcard = false;
+    // Motion blur is the most expensive thing the compositor does (it rasters a
+    // filtered 3200×1800 source). Drop it for a framing probe, never for a take.
+    else if (a === "--no-blur") o.blur = false;
     else if (a === "--scenes") o.scenes = argv[++i].split(",").map((s) => s.trim()).filter(Boolean);
     else if (a === "--to") o.to = Number(argv[++i]);
     else if (a === "--from") o.from = Number(argv[++i]);
@@ -61,6 +64,7 @@ async function main() {
     captions: opt.captions,
     endcard: opt.endcard,
     scenes: opt.scenes,
+    blur: opt.blur,
     // file:// relative to compose.html, which lives beside the frames' parent.
     framesBase: `${PROMO.replace(/\/$/, "")}/frames/`.replace(/^/, "file://"),
   });
