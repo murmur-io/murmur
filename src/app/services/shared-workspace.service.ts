@@ -46,7 +46,7 @@ export class SharedWorkspaceService {
   /** Received SPACES — each renders as its own top-level sidebar row. */
   readonly spaces = this._spaces.asReadonly();
   /**
-   * The virtual "Shared Brains" Space: received folders with no shared-Space
+   * The virtual "Shared Brains" Workspace: received folders with no shared-Workspace
    * parent, plus every received item with no container at all. `null` until the
    * first load resolves.
    */
@@ -120,6 +120,24 @@ export class SharedWorkspaceService {
       .catch(() => {
         /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
       });
+  }
+
+  private ensureLoadedInFlight: Promise<void> | null = null;
+
+  /**
+   * Read the received forest unless it has been read already, coalescing
+   * concurrent callers. Both `app-workspace-tree` instances in the sidebar ask
+   * for this on construction, and neither sees the other's result yet — see the
+   * matching note on `WorkspaceService.ensureLoaded`.
+   */
+  ensureLoaded(): Promise<void> {
+    if (this._sharedBrains() !== null) {
+      return Promise.resolve();
+    }
+    this.ensureLoadedInFlight ??= this.load().finally(() => {
+      this.ensureLoadedInFlight = null;
+    });
+    return this.ensureLoadedInFlight;
   }
 
   /**
@@ -199,7 +217,7 @@ export class SharedWorkspaceService {
     await this.load();
   }
 
-  /** Publish a whole Space or Folder. Reloads so the marker appears at once. */
+  /** Publish a whole Workspace or Folder. Reloads so the marker appears at once. */
   async share(
     orgId: string,
     folderId: string,

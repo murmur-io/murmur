@@ -1,118 +1,121 @@
 <div class="shell-drag" data-tauri-drag-region></div>
 
-<nav class="global-rail" aria-label="Global navigation">
-  <div class="rail-drag" data-tauri-drag-region></div>
-  <div class="rail-brand" aria-hidden="true"><mur-icon icon="murmur" /></div>
-
-  <a
-    class="rail-item"
-    [class.active]="isCaptureActive()"
-    [attr.aria-current]="isCaptureActive() ? 'page' : null"
-    routerLink="/record"
-    (click)="clearContextOverride()"
-    aria-label="Capture"
-    title="Capture"
-  >
-    <mur-icon icon="record" />
-  </a>
+<mur-sidebar
+  class="app-sidebar primary-sidebar"
+  [class.collapsed]="!sidebarExpanded()"
+  role="navigation"
+  aria-label="Primary navigation"
+>
+  <div class="sb-top" data-tauri-drag-region>
+  @if (sidebarExpanded()) {
+    <button
+      type="button"
+      class="sb-top-btn"
+      (click)="openSearch()"
+      aria-label="Search"
+      title="Search (⌘K)"
+    >
+      <mur-icon icon="search" />
+    </button>
+    <a
+      class="sb-top-btn"
+      [class.active]="isAskActive()"
+      [attr.aria-current]="isAskActive() ? 'page' : null"
+      routerLink="/ask"
+      aria-label="Ask"
+      title="Ask"
+    >
+      <mur-icon icon="ask" />
+    </a>
+    <a
+      class="sb-top-btn"
+      [class.active]="isSettingsActive()"
+      [attr.aria-current]="isSettingsActive() ? 'page' : null"
+      routerLink="/settings"
+      aria-label="Settings"
+      title="Settings"
+    >
+      <mur-icon icon="settings" />
+    </a>
+  }
   <button
     type="button"
-    class="rail-item"
-    (click)="openSearch()"
-    aria-label="Search"
-    title="Search (⌘K)"
+    class="sb-top-btn"
+    (click)="toggleSidebar()"
+    [attr.aria-expanded]="sidebarExpanded()"
+    [attr.aria-label]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
+    [title]="sidebarExpanded() ? 'Collapse sidebar' : 'Expand sidebar'"
   >
-    <mur-icon icon="search" />
+    <mur-icon icon="sidebar" />
   </button>
-  <button
-    type="button"
-    class="rail-item"
-    [class.active]="contextPanel() === 'spaces'"
-    [attr.aria-pressed]="contextPanel() === 'spaces'"
-    (click)="showSpaces()"
-    aria-label="Spaces"
-    title="Spaces"
-  >
-    <mur-icon icon="spaces" />
-  </button>
-  <a
-    class="rail-item"
-    [class.active]="isAskActive()"
-    [attr.aria-current]="isAskActive() ? 'page' : null"
-    routerLink="/ask"
-    (click)="clearContextOverride()"
-    aria-label="Ask"
-    title="Ask"
-  >
-    <mur-icon icon="ask" />
-  </a>
-  <button
-    type="button"
-    class="rail-item"
-    [class.active]="contextPanel() === 'browse'"
-    [attr.aria-pressed]="contextPanel() === 'browse'"
-    (click)="showBrowse()"
-    aria-label="Browse"
-    title="Browse"
-  >
-    <mur-icon icon="browse" />
-  </button>
+  </div>
 
-  <span class="rail-spacer"></span>
+  <div class="sb-scroll">
+  <nav class="sb-nav" aria-label="Destinations">
+    @if (!sidebarExpanded()) {
+      <button
+        type="button"
+        class="sb-row"
+        (click)="openSearch()"
+        aria-label="Search"
+        title="Search (⌘K)"
+      >
+        <mur-icon icon="search" />
+        <span class="sb-label">Search</span>
+      </button>
+      <a
+        class="sb-row"
+        [class.active]="isAskActive()"
+        [attr.aria-current]="isAskActive() ? 'page' : null"
+        routerLink="/ask"
+        aria-label="Ask"
+        title="Ask"
+      >
+        <mur-icon icon="ask" />
+        <span class="sb-label">Ask</span>
+      </a>
+      <button
+        type="button"
+        class="sb-row"
+        (click)="expandSidebar()"
+        aria-label="Workspaces"
+        title="Workspaces"
+      >
+        <mur-icon icon="spaces" />
+        <span class="sb-label">Workspaces</span>
+      </button>
+      <button
+        type="button"
+        class="sb-row"
+        (click)="expandSidebar()"
+        aria-label="Shared"
+        title="Shared"
+      >
+        <mur-icon icon="shared-brains" />
+        <span class="sb-label">Shared</span>
+      </button>
+    }
+  </nav>
 
-  <button
-    type="button"
-    class="rail-item"
-    (click)="newNote()"
-    aria-label="New note"
-    title="New note (⌘N)"
-  >
-    <mur-icon icon="note-add" />
-  </button>
-  <a
-    class="rail-item"
-    [class.active]="isSettingsActive()"
-    [attr.aria-current]="isSettingsActive() ? 'page' : null"
-    routerLink="/settings"
-    (click)="clearContextOverride()"
-    aria-label="Settings"
-    title="Settings"
-  >
-    <mur-icon icon="settings" />
-  </a>
-</nav>
-
-@if (contextPanel() === "spaces") {
-  <mur-sidebar
-    class="app-sidebar spaces-sidebar"
-    role="complementary"
-    aria-label="Spaces sidebar"
-  >
-    <div class="context-header spaces-header">
-      <div class="context-header-main">
-        <h2>Spaces</h2>
-        <div class="context-actions">
-          <button
-            type="button"
-            class="context-action"
-            (click)="openSearch()"
-            aria-label="Search Spaces"
-            title="Search"
-          >
-            <mur-icon icon="search" />
-          </button>
-          <button
-            type="button"
-            class="context-action context-action--label create-action"
-            (click)="openWorkspaceCreate()"
-            aria-label="Create in Spaces"
-            title="Create in Spaces"
-          >
-            <mur-icon icon="plus" />
-            <span>New</span>
-          </button>
-        </div>
+  @if (sidebarExpanded()) {
+    <section class="sb-section sb-workspaces" aria-label="Workspaces">
+      <div class="sb-section-head">
+        <span class="sb-section-title">Workspaces</span>
+        <button
+          type="button"
+          class="sb-section-action"
+          (click)="openWorkspaceCreate()"
+          aria-label="Create in Workspaces"
+          title="Create in Workspaces"
+        >
+          <mur-icon icon="plus" />
+        </button>
       </div>
+
+      <!-- "File recordings with Brain" moved with the tree it acts on. The old
+           Spaces panel carried it in its header; dropping it in the rewrite left
+           `planWorkspaceOrganization()` and the organize sheet with no trigger,
+           i.e. the whole filing-review feature unreachable. -->
       <button
         type="button"
         class="brain-action"
@@ -130,75 +133,141 @@
           <span>File recordings with Brain</span>
         }
       </button>
-    </div>
 
-    <div class="context-body">
-      <app-workspace-tree [currentPath]="currentPath()" />
-    </div>
+      <div class="sb-tree">
+        <app-workspace-tree [currentPath]="currentPath()" />
+      </div>
+    </section>
+  }
+  @if (sidebarExpanded()) {
+    <section class="sb-section sb-shared" aria-label="Shared">
+      <div class="sb-section-head">
+        <span class="sb-section-title">Shared</span>
+      </div>
+      <div class="sb-tree">
+        <app-workspace-tree scope="shared" [currentPath]="currentPath()" />
+      </div>
+    </section>
+  }
 
-    <div class="context-footer">
-      @if (unlockedCount() > 0) {
+  <nav class="sb-browse" aria-label="Browse destinations">
+    <button
+      type="button"
+      class="sb-row sb-disclosure"
+      (click)="toggleBrowse()"
+      [attr.aria-expanded]="browseExpanded()"
+      aria-label="Browse"
+      title="Browse"
+    >
+      <mur-icon icon="browse" />
+      <span class="sb-label">Browse</span>
+      <span class="sb-caret" [class.open]="browseExpanded()" aria-hidden="true">
+        <mur-icon icon="chevron-right" />
+      </span>
+    </button>
+    @if (browseExpanded() && sidebarExpanded()) {
+      <div class="sb-sublist">
+        @for (group of browseGroups; track group) {
+          <span class="sb-group-label">{{ group }}</span>
+          @for (item of itemsForGroup(group); track item.path) {
+            <a
+              class="sb-row sb-sub"
+              [routerLink]="item.path"
+              [class.active]="isBrowseItemActive(item.path)"
+              [attr.aria-current]="isBrowseItemActive(item.path) ? 'page' : null"
+            >
+              <mur-icon [icon]="item.icon" />
+              <span class="sb-label">{{ item.label }}</span>
+              @if (item.path === "/reminders" && reminderCount() > 0) {
+                <span class="count">{{ reminderCount() }}</span>
+              }
+            </a>
+          }
+        }
+      </div>
+    }
+  </nav>
+  </div>
+
+  <div class="sb-footer">
+    @if (!sidebarExpanded()) {
+      <a
+        class="sb-row"
+        [class.active]="isSettingsActive()"
+        [attr.aria-current]="isSettingsActive() ? 'page' : null"
+        routerLink="/settings"
+        aria-label="Settings"
+        title="Settings"
+      >
+        <mur-icon icon="settings" />
+        <span class="sb-label">Settings</span>
+      </a>
+    }
+    @if (unlockedCount() > 0 && sidebarExpanded()) {
+      <button
+        type="button"
+        class="unlocked-pill"
+        [disabled]="relockingAll()"
+        (click)="relockAll()"
+        [attr.aria-label]="relockAllAriaLabel()"
+      >
+        <mur-icon icon="lock" />
+        <span>{{ unlockedCount() }} unlocked</span>
+        <span class="unlocked-action">Lock all</span>
+      </button>
+    }
+
+    <div class="sb-create">
+      <a
+        class="btn btn-primary sb-capture"
+        [class.active]="isCaptureActive()"
+        [attr.aria-current]="isCaptureActive() ? 'page' : null"
+        routerLink="/record"
+        aria-label="Capture"
+        title="Capture"
+      >
+        <mur-icon icon="record" />
+        <span class="sb-label">Capture</span>
+      </a>
+      <button
+        type="button"
+        class="btn sb-create-more"
+        [class.is-open]="createMenuOpen()"
+        (click)="toggleCreateMenu()"
+        aria-haspopup="menu"
+        [attr.aria-expanded]="createMenuOpen()"
+        [attr.aria-label]="createMenuOpen() ? 'Close create menu' : 'Create'"
+        [title]="createMenuOpen() ? 'Close create menu' : 'Create'"
+      >
+        <mur-icon icon="plus" />
+      </button>
+
+      @if (createMenuOpen()) {
         <button
           type="button"
-          class="unlocked-pill"
-          [disabled]="relockingAll()"
-          (click)="relockAll()"
-          [attr.aria-label]="relockAllAriaLabel()"
-        >
-          <mur-icon icon="lock" />
-          <span>{{ unlockedCount() }} unlocked</span>
-          <span class="unlocked-action">Lock all</span>
-        </button>
+          class="sb-menu-scrim"
+          (click)="closeCreateMenu()"
+          aria-label="Close create menu"
+          tabindex="-1"
+        ></button>
+        <div class="menu sb-create-menu" role="menu">
+          <button type="button" class="menu-item" role="menuitem" (click)="newNote()">
+            <mur-icon icon="note-add" />
+            <span>New note</span>
+          </button>
+          <button type="button" class="menu-item" role="menuitem" (click)="newDashboard()">
+            <mur-icon icon="dashboards" />
+            <span>New dashboard</span>
+          </button>
+          <button type="button" class="menu-item" role="menuitem" (click)="newReminder()">
+            <mur-icon icon="reminders" />
+            <span>New reminder</span>
+          </button>
+        </div>
       }
-      <button
-        type="button"
-        class="collapse-context"
-        (click)="collapseSpaces()"
-        aria-label="Collapse Spaces sidebar"
-      >
-        <mur-icon icon="sidebar" />
-        <span>Collapse sidebar</span>
-      </button>
     </div>
-  </mur-sidebar>
-} @else if (contextPanel() === "browse") {
-  <mur-sidebar
-    class="app-sidebar browse-sidebar"
-    role="complementary"
-    aria-label="Browse sidebar"
-  >
-    <div class="context-header">
-      <h2>Browse</h2>
-      <button
-        type="button"
-        class="context-action"
-        (click)="openSearch()"
-        aria-label="Search"
-        title="Search"
-      >
-        <mur-icon icon="search" />
-      </button>
-    </div>
-    <nav class="browse-nav" aria-label="Browse destinations">
-      @for (group of browseGroups; track group) {
-        <span class="context-group-label">{{ group }}</span>
-        @for (item of itemsForGroup(group); track item.path) {
-          <a
-            [routerLink]="item.path"
-            [class.active]="isBrowseItemActive(item.path)"
-            (click)="clearContextOverride()"
-          >
-            <mur-icon [icon]="item.icon" />
-            <span>{{ item.label }}</span>
-            @if (item.path === "/reminders" && reminderCount() > 0) {
-              <span class="count">{{ reminderCount() }}</span>
-            }
-          </a>
-        }
-      }
-    </nav>
-  </mur-sidebar>
-}
+  </div>
+</mur-sidebar>
 
 <div class="main-col">
   <mur-tab-strip />

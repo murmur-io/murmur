@@ -482,7 +482,7 @@ export class WorkspaceOrganizeSheetComponent {
       case "noDestination":
         return {
           label: "No open destination",
-          detail: "Create or unlock a Space or folder, then plan again.",
+          detail: "Create or unlock a Workspace or folder, then plan again.",
         };
       default:
         return {

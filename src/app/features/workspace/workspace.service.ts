@@ -63,7 +63,7 @@ export class WorkspaceService {
    */
   readonly forestEmpty = computed(() => this._forest().length === 0);
 
-  /** Nothing the Spaces tree can currently render. */
+  /** Nothing the Workspaces tree can currently render. */
   readonly workspaceEmpty = computed(
     () => this._forest().length === 0 && this._unfiledRecordings().total === 0,
   );
@@ -79,6 +79,22 @@ export class WorkspaceService {
    */
   private loadGeneration = 0;
 
+  private readonly _loaded = signal(false);
+  /**
+   * Whether a forest read has actually ANSWERED at least once.
+   *
+   * Emptiness is NOT a substitute: an empty forest is a legitimate result, so a
+   * caller guarding on `workspaceEmpty()` cannot tell "nobody has read it yet"
+   * from "there is nothing there" and re-reads every time. With the sidebar now
+   * mounting the tree twice AND the recording-destination picker asking as well,
+   * that turned one boot read into several.
+   *
+   * Set only on the success path, deliberately: a privacy-refused read and a
+   * failed one both leave the cache as-is, so they must stay retryable rather
+   * than pinning this flag true with nothing loaded.
+   */
+  readonly loaded = this._loaded.asReadonly();
+
   constructor() {
     const unregister = this.privacyBarrier.registerInvalidator(() => {
       this.scrubAndReload();
@@ -89,6 +105,31 @@ export class WorkspaceService {
         void this.reload();
       }
     });
+  }
+
+  private ensureLoadedInFlight: Promise<void> | null = null;
+
+  /**
+   * Load the forest unless it is already loaded, coalescing concurrent callers.
+   *
+   * The sidebar mounts `app-workspace-tree` TWICE — once for the user's own
+   * Workspaces, once for what an org shared with them — and both constructors
+   * run before the first `reload()` resolves. An emptiness check alone therefore
+   * let each instance issue its own `list_workspace_tree`, doubling the boot
+   * read. Oracle: `recording-placement.spec.ts`'s "an empty destination forest
+   * loads once, stays calm, and retries only on request".
+   *
+   * A DELIBERATE refresh still goes through `reload()` directly, so it is never
+   * folded into an in-flight load and always re-reads.
+   */
+  ensureLoaded(): Promise<void> {
+    if (this._loaded()) {
+      return Promise.resolve();
+    }
+    this.ensureLoadedInFlight ??= this.reload().finally(() => {
+      this.ensureLoadedInFlight = null;
+    });
+    return this.ensureLoadedInFlight;
   }
 
   /** Reload the whole forest. Safe to call repeatedly; the last write wins. */
@@ -118,6 +159,7 @@ export class WorkspaceService {
       this._forest.set(forest);
       this._unfiledRecordings.set(unfiledRecordings);
       this._error.set(null);
+      this._loaded.set(true);
     } catch (error) {
       if (generation !== this.loadGeneration) {
         return;
@@ -142,6 +184,7 @@ export class WorkspaceService {
     ++this.loadGeneration;
     this._forest.set([]);
     this._unfiledRecordings.set({ kind: "meeting", items: [], total: 0 });
+    this._loaded.set(false);
     void this.reload();
   }
 
@@ -175,7 +218,7 @@ export class WorkspaceService {
     return id;
   }
 
-  /** Create a peer top-level Space, then refresh the cached forest. */
+  /** Create a peer top-level Workspace, then refresh the cached forest. */
   async createSpace(name: string): Promise<string> {
     const space = await this.ipc.createSpace(name);
     await this.reload();

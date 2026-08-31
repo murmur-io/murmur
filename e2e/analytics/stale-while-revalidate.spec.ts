@@ -115,9 +115,14 @@ test("Analytics dashboard shows cached data instantly on a return visit, not a L
   // being tested). This is a plain SPA route swap to a route NOT covered by
   // `TabRouteReuseStrategy`, so `/analytics` and its children are genuinely
   // destroyed.
-  const browseSidebar = page.getByRole("complementary", {
-    name: "Browse sidebar",
+  // Browse is a disclosure group inside the one sidebar (it used to be a
+  // separate "Browse sidebar" complementary panel), and it starts collapsed.
+  const browseSidebar = page.getByRole("navigation", {
+    name: "Browse destinations",
   });
+  await browseSidebar
+    .getByRole("button", { name: "Browse", exact: true })
+    .click();
   await browseSidebar
     .getByRole("link", { name: "Meetings", exact: true })
     .click();

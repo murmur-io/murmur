@@ -2,7 +2,7 @@
   class="scrim"
   role="dialog"
   aria-modal="true"
-  aria-label="Create in Spaces"
+  aria-label="Create in Workspaces"
   [attr.aria-busy]="busy()"
   (click)="onScrimClick($event)"
   (keydown.escape)="busy() ? null : cancelled.emit()"
@@ -11,7 +11,7 @@
     <header class="sheet-head">
       <span class="sheet-mark"><mur-icon icon="plus" /></span>
       <div>
-        <h3>Create in Spaces</h3>
+        <h3>Create in Workspaces</h3>
         <p>Choose what to create and exactly where it belongs.</p>
       </div>
     </header>
@@ -25,7 +25,7 @@
         (click)="chooseKind('space')"
       >
         <mur-icon icon="spaces" />
-        Space
+        Workspace
       </button>
       <button
         type="button"
@@ -78,8 +78,8 @@
       <div class="space-copy">
         <mur-icon icon="spaces" />
         <div>
-          <strong>A new top-level Space</strong>
-          <span>It will appear beside your existing Spaces and can hold folders, recordings, notes, tasks, and dashboards.</span>
+          <strong>A new top-level Workspace</strong>
+          <span>It will appear beside your existing Workspaces and can hold folders, recordings, notes, tasks, and dashboards.</span>
         </div>
       </div>
     } @else {
@@ -112,7 +112,7 @@
             <mur-icon [icon]="target.container.level === 'project' ? 'spaces' : 'folder'" />
             <span>
               <strong>{{ target.label }}</strong>
-              <small>{{ target.container.level === "project" ? "Space" : "Folder" }}</small>
+              <small>{{ target.container.level === "project" ? "Workspace" : "Folder" }}</small>
             </span>
             @if (selectedTargetId() === target.container.id) {
               <span class="selected-mark" aria-hidden="true">✓</span>
@@ -141,7 +141,7 @@
         [disabled]="busy() || (kind() !== 'space' && !selectedTarget())"
         (click)="onCreate()"
       >
-        {{ busy() ? "Creating…" : kind() === "space" ? "Create Space" : "Create " + kind() }}
+        {{ busy() ? "Creating…" : kind() === "space" ? "Create Workspace" : "Create " + kind() }}
       </button>
     </footer>
   </section>

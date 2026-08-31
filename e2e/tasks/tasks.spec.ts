@@ -391,7 +391,10 @@ test("Dashboard Work is device-private and opens the shared task", async ({ page
   );
 
   await page.goto("/dashboards/board-1");
-  const work = page.getByRole("region", { name: "Work" });
+  // `exact`, because the sidebar's own `<section aria-label="Workspaces">`
+  // substring-matches "Work" and Playwright's accessible-name matching is
+  // substring by default.
+  const work = page.getByRole("region", { name: "Work", exact: true });
   await expect(work).toBeVisible();
   await expect(work.getByText("Finish onboarding")).toBeVisible();
   await work.getByRole("button", { name: /Finish onboarding/ }).click();

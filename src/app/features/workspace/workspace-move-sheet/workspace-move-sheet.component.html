@@ -2,7 +2,7 @@
   class="scrim"
   role="dialog"
   aria-modal="true"
-  [attr.aria-label]="actionVerb() + ' ' + itemKind() + ' “' + title() + '” to Space'"
+  [attr.aria-label]="actionVerb() + ' ' + itemKind() + ' “' + title() + '” to Workspace'"
   [attr.aria-busy]="busy()"
   (click)="onScrimClick($event)"
   (keydown.escape)="busy() ? null : cancelled.emit()"
@@ -11,7 +11,7 @@
     <header class="sheet-head">
       <span class="sheet-mark"><mur-icon icon="move" /></span>
       <div class="sheet-copy">
-        <h3>{{ actionVerb() }} {{ itemKind() }} “{{ title() }}” to Space</h3>
+        <h3>{{ actionVerb() }} {{ itemKind() }} “{{ title() }}” to Workspace</h3>
         <p>From <strong>{{ fromLabel() }}</strong></p>
       </div>
     </header>
@@ -46,7 +46,7 @@
           </span>
           <span class="destination-copy">
             <strong>{{ target.label }}</strong>
-            <span>{{ target.container.level === "project" ? "Space" : "Folder" }}</span>
+            <span>{{ target.container.level === "project" ? "Workspace" : "Folder" }}</span>
           </span>
           @if (busy()) {
             <span class="busy-copy">{{ actionVerb() === "Move" ? "Moving…" : "Copying…" }}</span>
@@ -57,7 +57,7 @@
       } @empty {
         <div class="empty-state">
           <strong>No matching destination</strong>
-          <span>Try a folder or Space name.</span>
+          <span>Try a folder or Workspace name.</span>
         </div>
       }
     </div>

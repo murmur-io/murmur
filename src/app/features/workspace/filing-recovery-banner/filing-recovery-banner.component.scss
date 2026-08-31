@@ -9,7 +9,7 @@ mur-banner.recovery-card.banner {
   position: fixed;
   z-index: var(--z-account-session-banner);
   bottom: var(--space-4);
-  left: calc(var(--space-8) + var(--space-4));
+  left: calc(var(--shell-content-inset) + var(--space-2));
   width: min(38rem, calc(100vw - 2 * var(--space-4)));
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--warning);
@@ -149,7 +149,11 @@ mur-banner.recovery-card.banner {
 }
 
 @media (max-width: 760px) {
-  .recovery-card {
+  /* Must match the specificity of the `mur-banner.recovery-card.banner` rule
+     above, or this narrow-viewport override silently loses to it and the fixed
+     card keeps its wide-layout `left`/`width` — overflowing the viewport and
+     pushing its trailing action button off-screen. */
+  mur-banner.recovery-card.banner {
     top: 50%;
     right: var(--space-4);
     bottom: auto;

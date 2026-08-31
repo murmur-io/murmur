@@ -265,7 +265,7 @@ export const EVENT_ASK_HISTORY_INVALIDATED = "murmur://ask-history-invalidated";
 export class IpcService {
   private readonly _workspaceMutationRevision = signal(0);
   /**
-   * Content writes that can change the mixed Space hierarchy without going through
+   * Content writes that can change the mixed Workspace hierarchy without going through
    * `WorkspaceService` bump this revision after backend confirmation. Consumers refetch
    * canonical SQLite state; no content is mirrored in the signal itself.
    */
@@ -2786,7 +2786,7 @@ export class IpcService {
     return invoke<ContainerNode[]>("list_workspace_tree");
   }
 
-  /** Create one new top-level Space and its safe vault-relative directory. */
+  /** Create one new top-level Workspace and its safe vault-relative directory. */
   createSpace(name: string): Promise<Folder> {
     return invoke<Folder>("create_space", { name });
   }
@@ -3642,7 +3642,7 @@ export class IpcService {
   // ── Shared containers ──────────────────────────────────────────────────────
 
   /**
-   * What sharing this Space or Folder would publish — counts only, no egress.
+   * What sharing this Workspace or Folder would publish — counts only, no egress.
    * Refuses a SEALED container: its content is not readable, and letting the
    * user "share" it and see nothing arrive would be a silent failure.
    */
@@ -3657,7 +3657,7 @@ export class IpcService {
   }
 
   /**
-   * Publish a whole Space or Folder to an Org: every manifest, then every
+   * Publish a whole Workspace or Folder to an Org: every manifest, then every
    * eligible document, all under one inherited `access`. Emits
    * {@link onContainerShareProgress} after each item.
    */

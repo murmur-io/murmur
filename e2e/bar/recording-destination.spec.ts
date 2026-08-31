@@ -229,14 +229,14 @@ test.describe("Floating bar — recording destination", () => {
     expect(failures).toEqual({ consoleErrors: [], pageErrors: [] });
   });
 
-  test("sends the exact open folder ID with a Space/Folder breadcrumb", async ({
+  test("sends the exact open folder ID with a Workspace/Folder breadcrumb", async ({
     page,
   }) => {
     const failures = await openBar(page);
     const picker = page.getByTestId("bar-recording-destination");
 
     await expect(picker.locator("option[value='p-acme']")).toContainText(
-      "Space · Acme",
+      "Workspace · Acme",
     );
     await expect(picker.locator("option[value='f-weekly']")).toContainText(
       "Folder · Acme / Weekly",
