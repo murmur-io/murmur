@@ -149,8 +149,7 @@ async function open(page: Page): Promise<void> {
     { list_workspace_tree: FOREST },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
+  await expect(page.getByRole("tree", { name: "Workspaces" })).toBeVisible();
   await page.getByRole("button", { name: "Expand Acme" }).click();
 }
 
@@ -168,9 +167,9 @@ test("an item can be filed without a pointer", async ({ page }) => {
 
   await page.getByRole("button", { name: "Actions for meeting Standup" }).focus();
   await page.keyboard.press("Enter");
-  await page.getByRole("menuitem", { name: "Move to Space or folder…" }).focus();
+  await page.getByRole("menuitem", { name: "Move to Workspace or folder…" }).focus();
   await page.keyboard.press("Enter");
-  const sheet = page.getByRole("dialog", { name: "Move recording “Standup” to Space" });
+  const sheet = page.getByRole("dialog", { name: "Move recording “Standup” to Workspace" });
   await expect(sheet).toBeVisible();
   await sheet.getByRole("button", { name: /Beta \/ Shared/ }).focus();
   await page.keyboard.press("Enter");
@@ -185,8 +184,8 @@ test("the move sheet disambiguates duplicate names, filters full paths, and repo
   await open(page);
 
   await page.getByRole("button", { name: "Actions for meeting Standup" }).click();
-  await page.getByRole("menuitem", { name: "Move to Space or folder…" }).click();
-  const sheet = page.getByRole("dialog", { name: "Move recording “Standup” to Space" });
+  await page.getByRole("menuitem", { name: "Move to Workspace or folder…" }).click();
+  const sheet = page.getByRole("dialog", { name: "Move recording “Standup” to Workspace" });
   await expect(sheet.getByRole("button", { name: /Beta \/ Shared/ })).toBeVisible();
   await expect(sheet.getByRole("button", { name: /Gamma \/ Shared/ })).toBeVisible();
   await expect(
@@ -229,12 +228,12 @@ test("the move sheet disambiguates duplicate names, filters full paths, and repo
   await expect(sheet).toBeVisible();
 });
 
-test("the move picker never exposes stale descendants below a sealed Space", async ({ page }) => {
+test("the move picker never exposes stale descendants below a sealed Workspace", async ({ page }) => {
   await open(page);
 
   await page.getByRole("button", { name: "Actions for meeting Standup" }).click();
-  await page.getByRole("menuitem", { name: "Move to Space or folder…" }).click();
-  const sheet = page.getByRole("dialog", { name: "Move recording “Standup” to Space" });
+  await page.getByRole("menuitem", { name: "Move to Workspace or folder…" }).click();
+  const sheet = page.getByRole("dialog", { name: "Move recording “Standup” to Workspace" });
   await expect(sheet).toBeVisible();
   await expect(sheet).not.toContainText("Secret child");
   await expect(sheet.getByRole("button", { name: "Move to Clients / Secret child" })).toHaveCount(0);

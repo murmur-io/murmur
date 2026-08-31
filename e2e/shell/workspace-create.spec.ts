@@ -97,8 +97,7 @@ async function open(page: Page, forest: unknown[]): Promise<void> {
     { list_workspace_tree: forest },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await expect(page.getByRole("tree", { name: "Spaces" })).toBeVisible();
+  await expect(page.getByRole("tree", { name: "Workspaces" })).toBeVisible();
 }
 
 test("header New opens an explicit sheet without writing, then creates the chosen type at a full path", async ({
@@ -106,8 +105,8 @@ test("header New opens an explicit sheet without writing, then creates the chose
 }) => {
   await open(page, [OPEN_PROJECT]);
 
-  await page.getByRole("button", { name: "Create in Spaces" }).click();
-  const sheet = page.getByRole("dialog", { name: "Create in Spaces" });
+  await page.getByRole("button", { name: "Create in Workspaces" }).click();
+  const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
   await expect(sheet).toBeVisible();
   expect(
     await page.evaluate(
@@ -165,10 +164,9 @@ test("a create failure stays in the sheet with the chosen context visible", asyn
     { list_workspace_tree: [OPEN_PROJECT] },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await page.getByRole("button", { name: "Create in Spaces" }).click();
+  await page.getByRole("button", { name: "Create in Workspaces" }).click();
 
-  const sheet = page.getByRole("dialog", { name: "Create in Spaces" });
+  const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
   await sheet.getByRole("button", { name: "Dashboard", exact: true }).click();
   await sheet.getByLabel("Name").fill("Roadmap pulse");
   await sheet.getByRole("button", { name: /Acme \/ Shared \/ Planning/ }).click();
@@ -178,7 +176,7 @@ test("a create failure stays in the sheet with the chosen context visible", asyn
   await expect(sheet.getByRole("alert")).toContainText("write failed");
 });
 
-test("global New creates multiple peer Spaces even when there are no destinations", async ({
+test("global New creates multiple peer Workspaces even when there are no destinations", async ({
   page,
 }) => {
   await mockTauri(
@@ -194,19 +192,18 @@ test("global New creates multiple peer Spaces even when there are no destination
     { list_workspace_tree: [], list_container_items: { kind: "meeting", items: [], total: 0 } },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
-  await expect(page.getByText("No Spaces yet", { exact: true })).toBeVisible();
+  await expect(page.getByText("No Workspaces yet", { exact: true })).toBeVisible();
 
   const createSpace = async (name: string): Promise<void> => {
-    await page.getByRole("button", { name: "Create in Spaces" }).click();
-    const sheet = page.getByRole("dialog", { name: "Create in Spaces" });
-    await expect(sheet.getByRole("button", { name: "Space", exact: true })).toHaveAttribute(
+    await page.getByRole("button", { name: "Create in Workspaces" }).click();
+    const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
+    await expect(sheet.getByRole("button", { name: "Workspace", exact: true })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
     await expect(sheet.getByText("Destination", { exact: true })).toHaveCount(0);
     await sheet.getByLabel("Name").fill(name);
-    await sheet.getByRole("button", { name: "Create Space" }).click();
+    await sheet.getByRole("button", { name: "Create Workspace" }).click();
   };
 
   await createSpace("Product");
@@ -231,10 +228,10 @@ test("a sealed container offers no way to create inside it", async ({ page }) =>
   await page.getByRole("button", { name: "Actions for Clients" }).click();
   await expect(page.getByRole("menuitem", { name: /Create .* here/ })).toHaveCount(0);
 
-  // A stale backend payload must not turn a descendant of the sealed Space into a
+  // A stale backend payload must not turn a descendant of the sealed Workspace into a
   // destination or leak its name/breadcrumb through the explicit create picker.
-  await page.getByRole("button", { name: "Create in Spaces" }).click();
-  const sheet = page.getByRole("dialog", { name: "Create in Spaces" });
+  await page.getByRole("button", { name: "Create in Workspaces" }).click();
+  const sheet = page.getByRole("dialog", { name: "Create in Workspaces" });
   await expect(sheet).not.toContainText("Secret child");
   await expect(sheet.getByText(/Clients \/ Secret child/)).toHaveCount(0);
 });

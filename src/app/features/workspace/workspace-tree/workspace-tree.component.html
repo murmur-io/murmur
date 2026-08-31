@@ -2,20 +2,21 @@
      on emptiness AND loading, so the first visit shows it and every return
      shows the previous tree while the (still unconditional) reload replaces it
      underneath. Gating on loading() alone is the 2026-07-12 "reload flash". -->
-@if (workspaceEmpty() && loading()) {
-  <p class="tree-state">Loading workspace…</p>
-} @else if (workspaceEmpty()) {
-  <p class="tree-state">No Spaces yet</p>
+@if (sectionEmpty() && loading()) {
+  <p class="tree-state">Loading{{ isOwnScope() ? " workspace" : " shared content" }}…</p>
+} @else if (sectionEmpty()) {
+  <p class="tree-state">{{ isOwnScope() ? "No Workspaces yet" : "Nothing shared with you yet" }}</p>
 } @else {
   @if (error(); as message) {
     <!-- A failed refresh keeps the cached tree and says so, rather than
          blanking a view the user is navigating. -->
     <p class="tree-error" role="status">{{ message }}</p>
   }
-  <div class="tree" role="tree" aria-label="Spaces">
+  <div class="tree" role="tree" [attr.aria-label]="isOwnScope() ? 'Workspaces' : 'Shared'">
+    @if (isOwnScope()) {
     @if (unfiledRecordings(); as inbox) {
       @if (inbox.total > 0) {
-        <!-- `container_id = NULL` is an honest inbox, not a synthetic Space:
+        <!-- `container_id = NULL` is an honest inbox, not a synthetic Workspace:
              it has no lock/manage/create affordances and cannot accept drops. -->
         <mur-tree-row
           class="line line--unfiled"
@@ -60,7 +61,7 @@
                     (click)="openMove(item, null, targets)"
                   >
                     <mur-icon icon="move" />
-                    {{ targets.length > 0 ? "Move to Space or folder…" : "No open destination" }}
+                    {{ targets.length > 0 ? "Move to Workspace or folder…" : "No open destination" }}
                   </button>
                 </mur-row-menu>
               }
@@ -132,6 +133,7 @@
         }
       }
     }
+    }
     @for (line of lines(); track line.key) {
       @if (line.item; as item) {
         <!-- An ITEM row: a leaf, so the gutter renders the equal-width spacer
@@ -173,7 +175,7 @@
                   (click)="openMove(item, owner, targets)"
                 >
                   <mur-icon icon="move" />
-                  {{ targets.length > 0 ? "Move to Space or folder…" : "No other open destination" }}
+                  {{ targets.length > 0 ? "Move to Workspace or folder…" : "No other open destination" }}
                 </button>
               </mur-row-menu>
             }
@@ -219,8 +221,8 @@
             }
         </mur-tree-row>
       } @else if (line.shared; as shared) {
-        <!-- A RECEIVED container: a shared Space, a shared folder, or the
-             virtual Shared Brains Space. Structure belongs to whoever shared it,
+        <!-- A RECEIVED container: a shared Workspace, a shared folder, or the
+             virtual Shared Brains Workspace. Structure belongs to whoever shared it,
              so this row offers no rename, delete or create-here at ANY access
              level — "Can edit" is about a document's text, not the tree. -->
         <mur-tree-row
@@ -254,7 +256,7 @@
                 data-testid="place-shared"
               >
                 <mur-icon icon="move" />
-                Keep in my Space…
+                Keep in my Workspace…
               </button>
               @if (shared.localParentId) {
                 <button
@@ -308,7 +310,7 @@
             [label]="'Actions for ' + container.name"
           >
             <span class="menu-group-label">
-              {{ container.level === "project" ? "Space" : "Folder" }} actions
+              {{ container.level === "project" ? "Workspace" : "Folder" }} actions
             </span>
             @if (isSealed(container)) {
               <button

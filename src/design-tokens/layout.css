@@ -96,4 +96,58 @@
   --brain-spinner-border-width: 2px;
   --z-meeting-command-bar: 2;
   --z-account-session-banner: 65;
+
+  /* The one navigation sidebar. Expanded it carries labels, the Browse group
+     and the workspace tree; collapsed it narrows to icons only. The width
+     animates between the two, so both ends live here as tokens rather than as
+     literals inside the shell chrome in styles.css. */
+  --shell-sidebar-w: calc(var(--space-8) * 4);
+
+  /* The sidebar's own top row. It holds Search / Settings / Collapse at its
+     right end, while the macOS window buttons sit at its left — inside the
+     panel's glass, which is why the sidebar reaches the top of the window
+     instead of starting below a separate band.
+
+     Vertical is calibrated, not derived. `trafficLightPosition` in
+     src-tauri/tauri.conf.json says { y: 30 }, and that number has now failed to
+     predict the rendered result twice: a 36px centre (y read as the buttons'
+     top edge plus half a 12px button) sat clearly low, a 30px centre (y read as
+     the centre) still sat slightly low. 26px comes from those observations.
+
+       sidebar's top    = app-shell padding + border =  9px
+       row is centred   = 9 + 34/2                   = 26px below the window top
+
+     So the row's HEIGHT is what places it; there is no padding to keep in sync.
+     No CSS can read the native buttons' real box, so a change to the window
+     chrome means re-measuring this one value. */
+  --shell-topbar-h: 34px;
+
+  /* The three footer controls — Capture, New note, and the create menu's
+     chevron. One token because they must stay identical squares: the moment
+     they differ, the row reads as two sizes of button rather than one action
+     bar. 36px sits between the 32px nav glyph and the 40px global .btn.
+
+     One height for both: the wide Capture pill and the round create button that
+     sits beside it. Capture takes the remaining width; the round one stays
+     square, so a single size keeps them on one line. */
+  --shell-footer-btn: 36px;
+  /* Collapsed width: the panel wraps the macOS window buttons with the SAME
+     margin on each side.
+
+     `trafficLightPosition.x` is 32 and it IS the buttons' left edge — measured,
+     not assumed. At 96px the right margin came out visibly tighter than the
+     left, and that asymmetry is only explained by the buttons reaching 84px
+     (32 + their 52px span). Read as a centre they would end at 78 and the right
+     margin would have been the WIDER one.
+
+     Note this differs from `y`, which is the buttons' CENTRE — the two axes do
+     not agree, which is exactly why both had to be measured rather than
+     reasoned about.
+
+       buttons span    = 32 .. 84
+       panel starts at = app-shell padding   =  8px  -> 24px before them
+       => 24px after them puts the edge at 108 -> 100px wide */
+  --shell-sidebar-w-collapsed: calc(
+    var(--space-8) + var(--space-6) + var(--space-1)
+  );
 }

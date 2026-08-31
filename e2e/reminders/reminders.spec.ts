@@ -1,6 +1,21 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 import { enterEditMode } from "../notes/mock-invoke";
+
+/**
+ * Browse is a disclosure group inside the ONE sidebar now — it used to be a
+ * separate "Browse sidebar" complementary panel — and it starts collapsed, so
+ * the Reminders destination (and its unread `.count`) is not in the DOM until
+ * the group is opened. Idempotent, so callers that already opened it are safe.
+ */
+async function openBrowse(page: Page) {
+  const browse = page.getByRole("navigation", { name: "Browse destinations" });
+  const toggle = browse.getByRole("button", { name: "Browse", exact: true });
+  if ((await toggle.getAttribute("aria-expanded")) !== "true") {
+    await toggle.click();
+  }
+  return browse;
+}
 
 const REMINDER_VISIBILITY_EVENT = "murmur://reminder-visibility-invalidated";
 const REMINDERS_UPDATED_EVENT = "murmur://reminders-updated";
@@ -41,13 +56,9 @@ test("Reminders: a live count cannot be lost or overwritten by a stale startup s
     target.__resolveReminderSummary?.({ dueInboxCount: 2 });
   });
 
-  await page
-    .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Browse", exact: true })
-    .click();
-  const reminderNav = page
-    .getByRole("complementary", { name: "Browse sidebar" })
-    .getByRole("link", { name: "Reminders" });
+  const reminderNav = (await openBrowse(page)).getByRole("link", {
+    name: "Reminders",
+  });
   await expect(reminderNav.locator(".count")).toHaveText("4");
 });
 
@@ -230,8 +241,7 @@ test("Reminders: an event supersedes the first in-flight list snapshot", async (
   await expect(page.getByText("Current event row 1")).toBeVisible();
   await expect(page.getByText("Stale first row 1")).toHaveCount(0);
   await expect(
-    page
-      .getByRole("complementary", { name: "Browse sidebar" })
+    (await openBrowse(page))
       .getByRole("link", { name: "Reminders" })
       .locator(".count"),
   ).toHaveText("4");
@@ -744,8 +754,7 @@ test("Reminders: a newer list count beats a delayed startup summary", async ({
 
   await page.goto("/reminders");
   await expect(page.getByText("Newest list row 1")).toBeVisible();
-  const reminderCount = page
-    .getByRole("complementary", { name: "Browse sidebar" })
+  const reminderCount = (await openBrowse(page))
     .getByRole("link", { name: "Reminders" })
     .locator(".count");
   await expect(reminderCount).toHaveText("3");
@@ -2201,9 +2210,9 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
 
   await page.goto("/reminders");
 
-  const reminderNav = page
-    .getByRole("complementary", { name: "Browse sidebar" })
-    .getByRole("link", { name: "Reminders" });
+  const reminderNav = (await openBrowse(page)).getByRole("link", {
+    name: "Reminders",
+  });
   await expect(reminderNav).toBeVisible();
   await expect(reminderNav.locator(".count")).toHaveText("2");
   await expect(page.getByRole("heading", { name: "Reminders" })).toBeVisible();
@@ -2403,12 +2412,7 @@ test("Reminders: route, composer, inbox, Smart review, context, and event refres
   ).toBe(true);
 
   // Routed authored-note context carries the note source into the same composer.
-  await page
-    .getByRole("navigation", { name: "Global navigation" })
-    .getByRole("button", { name: "Browse", exact: true })
-    .click();
-  await page
-    .getByRole("complementary", { name: "Browse sidebar" })
+  await (await openBrowse(page))
     .getByRole("link", { name: "Notes", exact: true })
     .click();
   await page

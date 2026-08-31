@@ -30,7 +30,7 @@ test("settings keeps normal tab-strip padding and clears the global rail", async
   await expect(strip).toHaveCSS("padding-left", "24px");
 
   const globalNavigation = page.getByRole("navigation", {
-    name: "Global navigation",
+    name: "Primary navigation",
   });
   await globalNavigation
     .getByRole("link", { name: "Settings", exact: true })

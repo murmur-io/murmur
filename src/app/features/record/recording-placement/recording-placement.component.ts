@@ -96,12 +96,19 @@ export class RecordingPlacementComponent {
       return;
     }
     if (
-      this.workspace.forestEmpty() &&
+      !this.workspace.loaded() &&
       !this.workspace.loading() &&
       this.destinationLoadMeetingId !== meetingId
     ) {
+      // `ensureLoaded()`, not `reload()`, and keyed on `loaded()` rather than
+      // emptiness: the sidebar's two tree instances also ask for the forest at
+      // boot, and an empty forest is a legitimate RESULT — so an emptiness
+      // guard re-read a forest that had just been read and come back empty.
+      // `recording-placement.spec.ts`'s "an empty destination forest loads once,
+      // stays calm, and retries only on request" is the oracle. The explicit
+      // "Refresh locations" button still calls `reload()` directly.
       this.destinationLoadMeetingId = meetingId;
-      void this.workspace.reload();
+      void this.workspace.ensureLoaded();
     }
   });
 

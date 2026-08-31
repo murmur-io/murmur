@@ -34,6 +34,7 @@ import { DocumentPreviewComponent } from "../features/brain/document-preview/doc
 import { TilePaletteComponent } from "../features/dashboards/tile-palette/tile-palette.component";
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { ReminderComposerComponent } from "../features/reminders/reminder-composer/reminder-composer.component";
+import { ReminderComposerService } from "../features/reminders/reminder-composer/reminder-composer.service";
 import { RemindersStore } from "../features/reminders/reminders.store";
 import { AccountSessionBannerComponent } from "../features/sharing/account-session-banner/account-session-banner.component";
 import { FilingRecoveryBannerComponent } from "../features/workspace/filing-recovery-banner/filing-recovery-banner.component";
@@ -63,8 +64,6 @@ interface BrowseItem {
   readonly group: "Work" | "Intelligence" | "Insights";
 }
 
-type ContextPanel = "spaces" | "browse" | "none";
-
 const BROWSE_ITEMS: readonly BrowseItem[] = [
   { path: "/library", label: "Meetings", icon: "meetings", group: "Work" },
   { path: "/notes", label: "Notes", icon: "notes", group: "Work" },
@@ -88,8 +87,13 @@ const BROWSE_ITEMS: readonly BrowseItem[] = [
 ];
 
 const BROWSE_GROUPS = ["Work", "Intelligence", "Insights"] as const;
-const NARROW_SHELL_QUERY = "(max-width: 760px)";
-const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
+/**
+ * The sidebar opens EXPANDED by default. It is now the ONLY navigation surface —
+ * destinations, the workspace tree and the create actions all live in it — so a
+ * collapsed first launch would hide the whole app behind a single icon.
+ */
+const SIDEBAR_EXPANDED_KEY = "murmur.shell.sidebarExpanded";
+const BROWSE_EXPANDED_KEY = "murmur.shell.browseExpanded";
 
 @Component({
   selector: "app-shell",
@@ -112,7 +116,10 @@ const SPACES_COLLAPSED_KEY = "murmur.shell.spacesCollapsed";
     FilingRecoveryBannerComponent,
   ],
   host: {
-    "[class.context-visible]": "contextPanel() !== 'none'",
+    // Publishes the sidebar's CURRENT width to `--shell-content-inset` in
+    // styles.css, so a `position: fixed` view (/settings) knows where the
+    // content pane really starts instead of hardcoding a rail width.
+    "[class.sidebar-collapsed]": "!sidebarExpanded()",
     "(document:keydown)": "onGlobalKeydown($event)",
     "(window:keydown.escape)": "onWindowEscape($event)",
   },
@@ -129,6 +136,7 @@ export class AppShellComponent {
   private readonly router = inject(Router);
   private readonly tabs = inject(TabsService);
   private readonly reminders = inject(RemindersStore);
+  private readonly reminderComposer = inject(ReminderComposerService);
   protected readonly workspace = inject(WorkspaceService);
 
   readonly reminderCount = this.reminders.dueInboxCount;
@@ -146,48 +154,24 @@ export class AppShellComponent {
 
   readonly currentPath = computed(() => this.currentUrl().split(/[?#]/)[0]);
 
-  private readonly _contextOverride = signal<ContextPanel | null>(null);
-  private readonly _spacesCollapsed = signal(
-    readStoredBoolean(SPACES_COLLAPSED_KEY, false),
+  private readonly _sidebarExpanded = signal(
+    readStoredBoolean(SIDEBAR_EXPANDED_KEY, true),
   );
+  /**
+   * Expanded shows labels, the Browse group and the workspace tree; collapsed
+   * narrows to icons only. Persisted, because a nav width the user has to re-set
+   * on every launch is worse than no toggle at all.
+   */
+  readonly sidebarExpanded = this._sidebarExpanded.asReadonly();
 
-  private readonly isSpaceLeafRoute = computed(() => {
-    const path = this.currentPath();
-    return (
-      path.startsWith("/container/") ||
-      path.startsWith("/meeting/") ||
-      (path.startsWith("/notes/") && path !== "/notes/new") ||
-      (path.startsWith("/tasks/") && path !== "/tasks/new") ||
-      path.startsWith("/dashboards/") ||
-      // Shared Brains and a received container are now ROWS in the Spaces
-      // sidebar rather than a separate destination, so opening one must keep
-      // the tree beside it — the same as opening any Space of the user's own.
-      path === "/shared-brains" ||
-      path.startsWith("/shared/")
-    );
-  });
-
-  private readonly isBrowseRoute = computed(() =>
-    BROWSE_ITEMS.some((item) => this.currentPath() === item.path),
+  private readonly _browseExpanded = signal(
+    readStoredBoolean(BROWSE_EXPANDED_KEY, false),
   );
+  /** Disclosure state of the Browse group (Meetings, Notes, Tasks, …). */
+  readonly browseExpanded = this._browseExpanded.asReadonly();
 
-  readonly contextPanel = computed<ContextPanel>(() => {
-    const path = this.currentPath();
-    if (path.startsWith("/settings") || path.startsWith("/org-item/")) {
-      return "none";
-    }
-    const override = this._contextOverride();
-    if (override) {
-      return override;
-    }
-    if (this.isSpaceLeafRoute()) {
-      return this._spacesCollapsed() ? "none" : "spaces";
-    }
-    if (this.isBrowseRoute()) {
-      return "browse";
-    }
-    return "none";
-  });
+  /** The create menu behind the caret beside "New note". */
+  readonly createMenuOpen = signal(false);
 
   readonly browseItems = BROWSE_ITEMS;
   readonly browseGroups = BROWSE_GROUPS;
@@ -238,44 +222,12 @@ export class AppShellComponent {
     void this.reminders.initSummary();
   }
 
-  async showSpaces(): Promise<void> {
-    if (this.workspace.forestEmpty()) {
-      await this.workspace.reload();
-    }
-    const firstSpace = this.workspace.forest()[0];
-    const path = this.currentPath();
-    const fixedDrilldown =
-      path.startsWith("/settings") || path.startsWith("/org-item/");
-    const narrowViewport = window.matchMedia(NARROW_SHELL_QUERY).matches;
-    this.setSpacesCollapsed(false);
-    if ((fixedDrilldown || narrowViewport) && firstSpace) {
-      this._contextOverride.set(null);
-      await this.router.navigate(["/container", firstSpace.id]);
-      return;
-    }
-    this._contextOverride.set("spaces");
-    if (fixedDrilldown) {
-      await this.router.navigate(["/record"]);
-    }
-  }
-
-  showBrowse(): void {
-    this._contextOverride.set(null);
-    void this.router.navigate(["/library"]);
-  }
-
-  clearContextOverride(): void {
-    this._contextOverride.set(null);
-  }
-
   isCaptureActive(): boolean {
-    return this.currentPath() === "/record" && this.contextPanel() === "none";
+    return this.currentPath() === "/record";
   }
 
   isAskActive(): boolean {
-    return (
-      this.currentPath().startsWith("/ask") && this.contextPanel() === "none"
-    );
+    return this.currentPath().startsWith("/ask");
   }
 
   isSettingsActive(): boolean {
@@ -296,7 +248,7 @@ export class AppShellComponent {
 
   newNote(): void {
     this.searchOpen.set(false);
-    this._contextOverride.set(null);
+    this.closeCreateMenu();
     void this.router.navigate(["/notes/new"]);
   }
 
@@ -324,7 +276,7 @@ export class AppShellComponent {
         const id = await this.workspace.createSpace(request.name);
         this.workspaceCreateOpen.set(false);
         await this.router.navigate(["/container", id]);
-        this.toast.success(`Created Space “${request.name}”`);
+        this.toast.success(`Created Workspace “${request.name}”`);
         return;
       }
       const target = request.target;
@@ -377,14 +329,56 @@ export class AppShellComponent {
     return normalized ? normalized.slice(0, 240) : null;
   }
 
-  collapseSpaces(): void {
-    this.setSpacesCollapsed(true);
-    this._contextOverride.set("none");
+  toggleSidebar(): void {
+    const next = !this._sidebarExpanded();
+    this._sidebarExpanded.set(next);
+    writeStoredBoolean(SIDEBAR_EXPANDED_KEY, next);
+    if (!next) {
+      this.createMenuOpen.set(false);
+    }
   }
 
-  private setSpacesCollapsed(collapsed: boolean): void {
-    this._spacesCollapsed.set(collapsed);
-    writeStoredBoolean(SPACES_COLLAPSED_KEY, collapsed);
+  /**
+   * Reveal the sidebar from a collapsed rail row. The Workspaces and Shared
+   * trees cannot render in a 100px column, so their collapsed rows open the
+   * sidebar instead of navigating — the section they name is then right there.
+   */
+  expandSidebar(): void {
+    if (!this._sidebarExpanded()) {
+      this.toggleSidebar();
+    }
+  }
+
+  toggleBrowse(): void {
+    // Collapsed there is no room to render the group, so reveal the sidebar
+    // first rather than toggling something the user cannot see.
+    if (!this._sidebarExpanded()) {
+      this.toggleSidebar();
+      this._browseExpanded.set(true);
+      writeStoredBoolean(BROWSE_EXPANDED_KEY, true);
+      return;
+    }
+    const next = !this._browseExpanded();
+    this._browseExpanded.set(next);
+    writeStoredBoolean(BROWSE_EXPANDED_KEY, next);
+  }
+
+  toggleCreateMenu(): void {
+    this.createMenuOpen.update((open) => !open);
+  }
+
+  closeCreateMenu(): void {
+    this.createMenuOpen.set(false);
+  }
+
+  newDashboard(): void {
+    this.closeCreateMenu();
+    this.openWorkspaceCreate();
+  }
+
+  newReminder(): void {
+    this.closeCreateMenu();
+    this.reminderComposer.openCreate();
   }
 
   async planWorkspaceOrganization(

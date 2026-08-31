@@ -23,7 +23,7 @@ export interface WorkspaceCreateRequest {
   readonly target: WorkspaceDestination | null;
 }
 
-/** Explicit create flow for the Spaces header; opening it never writes anything. */
+/** Explicit create flow for the Workspaces header; opening it never writes anything. */
 @Component({
   selector: "app-workspace-create-sheet",
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -66,7 +66,7 @@ export class WorkspaceCreateSheetComponent {
   readonly defaultName = computed(() => {
     switch (this.kind()) {
       case "space":
-        return "New Space";
+        return "New Workspace";
       case "note":
         return "Untitled";
       case "dashboard":

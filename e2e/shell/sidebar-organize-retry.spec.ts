@@ -143,7 +143,6 @@ async function openOrganizer(
     { plan: PLAN, applyScenario: scenario },
   );
   await page.goto("/");
-  await page.getByRole("button", { name: "Spaces" }).click();
   await page.getByRole("button", { name: "Review filing moves with Brain" }).click();
   await expect(
     page.getByRole("dialog", { name: "Review Brain filing plan" }),

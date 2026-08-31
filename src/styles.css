@@ -124,7 +124,6 @@ body.bar-shell::after { display: none !important; }
   body.murmur-printing::before,
   body.murmur-printing::after { display: none !important; }
   body.murmur-printing .app-sidebar,
-  body.murmur-printing .global-rail,
   body.murmur-printing .shell-drag { display: none !important; }
   body.murmur-printing .app-main { max-width: none; margin: 0; padding: 0; }
   body.murmur-printing { background: #fff !important; color: #000 !important; }
@@ -351,7 +350,93 @@ app-shell {
   height: 100vh;
   padding: var(--space-2);
   overflow: hidden;
+
+  /* Where the content pane actually begins: the shell's own padding, the
+     sidebar, and the flex gap between them. A view that takes itself OUT of
+     flow (`position: fixed`, to escape `.app-main`'s padding) can no longer
+     read that offset from the box model, so it reads it from here.
+
+     This has to be a variable rather than a literal because the sidebar has
+     two widths now. `/settings` hardcoded the OLD 64px icon rail
+     (8 + 64 + 8 + 8 = 88px) and, once the rail became a 256px sidebar, its
+     section list rendered UNDERNEATH the sidebar: still "visible" to a
+     `toBeVisible()` assertion, but every click landed on `.sb-scroll`
+     instead — which is why ~30 settings e2e tests timed out on a click
+     rather than failing an assertion. */
+  --shell-content-inset: calc(
+    var(--space-2) + var(--shell-sidebar-w) + var(--space-2)
+  );
 }
+
+app-shell.sidebar-collapsed {
+  --shell-content-inset: calc(
+    var(--space-2) + var(--shell-sidebar-w-collapsed) + var(--space-2)
+  );
+}
+
+
+/* The band that carries Search, Collapse and Settings, level with the macOS
+   window buttons. It lives ABOVE the sidebar rather than inside its glass, so
+   the panel's border and padding no longer offset it, and the collapsed
+   sidebar — only 68px wide, narrower than the buttons themselves — no longer
+   has to share a row it cannot fit. The whole strip drags the window; the
+   controls opt out via their own `-webkit-app-region`. */
+/* The sidebar's own top row: the window buttons occupy its left, the controls
+   its right. The whole strip drags the window; the controls opt out. Its HEIGHT
+   is what centres the controls on the buttons — see layout.css. */
+.primary-sidebar .sb-top {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  height: var(--shell-topbar-h);
+  padding-right: var(--space-2);
+}
+
+/* COLLAPSED the window buttons span the panel's full width, so the toggle
+   cannot share their line — it drops BELOW them and centres, instead of being
+   wedged between the yellow and the green one. */
+.primary-sidebar.collapsed .sb-top {
+  justify-content: center;
+  align-items: flex-end;
+  height: var(--space-8);
+  padding-right: 0;
+}
+
+.primary-sidebar .sb-top-btn {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--space-6);
+  height: var(--space-6);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.primary-sidebar .sb-top-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.primary-sidebar .sb-top-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.primary-sidebar .sb-top-btn.active {
+  background: var(--shell-active-bg);
+  color: var(--shell-active-icon);
+  box-shadow: var(--shell-active-shadow);
+}
+
 
 .shell-drag {
   position: fixed;
@@ -360,106 +445,17 @@ app-shell {
   height: var(--space-6);
 }
 
-.global-rail {
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  display: flex;
-  flex: 0 0 calc(var(--space-8) + var(--space-2));
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  width: calc(var(--space-8) + var(--space-2));
-  height: calc(100vh - var(--space-4));
-  padding: 0 var(--space-2) var(--space-3);
-  background:
-    linear-gradient(var(--shell-glass-veil), var(--shell-glass-veil)),
-    var(--shell-glass-bg);
-  -webkit-backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
-  backdrop-filter: blur(var(--shell-glass-blur)) saturate(var(--shell-glass-saturate));
-  border: 1px solid var(--shell-glass-border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md), var(--shell-glass-inner);
-}
-
-.global-rail .rail-drag {
-  flex: none;
-  width: 100%;
-  height: var(--space-7);
-}
-
-/* The brand tile carries the Murmur waveform mark (mur-icon "murmur"), which
-   paints in `currentColor` — so the bars follow the user's accent theme rather
-   than the fixed gradient the app-icon PNG bakes in. */
-.rail-brand {
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: var(--space-6);
-  height: var(--space-6);
-  margin-bottom: var(--space-1);
-  border-radius: var(--radius-md);
-  background: var(--accent-soft);
-  color: var(--accent-hover);
-}
-
-.rail-item {
-  position: relative;
-  display: grid;
-  place-items: center;
-  flex: none;
-  width: var(--space-7);
-  height: var(--space-7);
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: color var(--transition-fast), background var(--transition-fast);
-}
-
-.rail-item:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-
-.rail-item:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-
-.rail-item.active {
-  background: var(--shell-active-bg);
-  color: var(--shell-active-icon);
-  box-shadow: var(--shell-active-shadow);
-}
-
-.rail-item.active::before {
-  content: "";
-  position: absolute;
-  left: calc(-1 * var(--space-2));
-  width: var(--space-1);
-  height: var(--space-5);
-  border-radius: var(--radius-pill);
-  background: var(--accent);
-}
-
-.rail-spacer {
-  flex: 1 1 auto;
-}
-
-.app-sidebar.spaces-sidebar,
-.app-sidebar.browse-sidebar {
+.app-sidebar.primary-sidebar {
   position: sticky;
   top: 0;
   align-self: auto;
   z-index: 9;
   display: flex;
-  flex: 0 0 calc(var(--space-8) * 4);
+  flex: 0 0 var(--shell-sidebar-w);
   flex-direction: column;
-  width: calc(var(--space-8) * 4);
+  width: var(--shell-sidebar-w);
   height: calc(100vh - var(--space-4));
+  transition: flex-basis var(--transition-fast), width var(--transition-fast);
   margin: 0;
   padding: 0;
   background:
@@ -471,6 +467,284 @@ app-shell {
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-md), var(--shell-glass-inner);
   overflow: hidden;
+}
+
+/* ── The one sidebar ───────────────────────────────────────────────────────
+   Search + collapse on top, destinations, the workspace tree, and the create
+   actions pinned to the bottom. Collapsed it keeps only the glyph column, so
+   it reads as the old icon rail without being a second piece of chrome. */
+.app-sidebar.primary-sidebar.collapsed {
+  flex-basis: var(--shell-sidebar-w-collapsed);
+  width: var(--shell-sidebar-w-collapsed);
+}
+
+/* Collapsed, a label is absent from the box model rather than merely
+   transparent: a zero-width flex child still eats the gap and would push the
+   glyph off-centre in the narrow column. */
+.primary-sidebar.collapsed .sb-label,
+.primary-sidebar.collapsed .sb-caret,
+.primary-sidebar.collapsed .count {
+  display: none;
+}
+
+/* One row shape for every clickable line: destination, disclosure, footer. */
+.primary-sidebar .sb-row {
+  display: grid;
+  grid-template-columns: var(--space-6) 1fr auto;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: var(--space-7);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.primary-sidebar.collapsed .sb-row {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 0;
+}
+
+.primary-sidebar .sb-row:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.primary-sidebar .sb-row:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.primary-sidebar .sb-row.active {
+  background: var(--shell-active-bg);
+  color: var(--shell-active-icon);
+  box-shadow: var(--shell-active-shadow);
+}
+
+.primary-sidebar .sb-scroll {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.primary-sidebar .sb-nav {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 var(--space-2);
+}
+
+.primary-sidebar .sb-caret {
+  display: grid;
+  place-items: center;
+  color: var(--text-tertiary);
+  transition: transform var(--transition-fast);
+}
+
+.primary-sidebar .sb-caret.open {
+  transform: rotate(90deg);
+}
+
+.primary-sidebar .sb-sublist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: var(--space-1) 0 var(--space-2) var(--space-4);
+  padding-left: var(--space-2);
+  border-left: 1px solid var(--border-subtle);
+}
+
+.primary-sidebar .sb-group-label {
+  padding: var(--space-2) var(--space-2) var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 0.7rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* The workspace tree is the only part that scrolls; everything else is fixed
+   chrome, so the footer stays reachable no matter how deep the tree gets. */
+.primary-sidebar .sb-workspaces {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  padding: var(--space-2) var(--space-2) 0;
+}
+
+.primary-sidebar .sb-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+}
+
+.primary-sidebar .sb-section-title {
+  color: var(--text-tertiary);
+  font-size: 0.7rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.primary-sidebar .sb-section-action {
+  display: grid;
+  place-items: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.primary-sidebar .sb-section-action:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.primary-sidebar .sb-tree {
+  flex: none;
+}
+
+.primary-sidebar .sb-footer {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* Capture (secondary) beside New note (primary), plus the caret that opens the
+   rest of the create actions. Both use the global .btn primitives so they read
+   as buttons rather than as two more nav rows. */
+.primary-sidebar .sb-create {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* The footer's action row, on the shape Notion uses: ONE wide button for the
+   thing you do most — start a recording — and a round button beside it holding
+   everything else you might create.
+
+   Why Capture and not New note: recording is what this app is for, and the
+   other three creations are occasional. Putting them behind one control keeps
+   the primary action unambiguous instead of offering two equal buttons and
+   making the user choose.
+
+   The round button carries `plus`; open, it rotates 45 degrees into an X. That
+   is the same affordance Notion uses, and it means the close state needs no
+   second glyph in the icon set. */
+.primary-sidebar .sb-create {
+  justify-content: flex-start;
+}
+
+.primary-sidebar .sb-capture {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--space-2);
+  height: var(--shell-footer-btn);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  font-size: 0.85rem;
+}
+
+.primary-sidebar .sb-capture.active {
+  box-shadow: var(--shell-active-shadow);
+}
+
+.primary-sidebar .sb-create-more {
+  flex: none;
+  width: var(--shell-footer-btn);
+  height: var(--shell-footer-btn);
+  padding: 0;
+  border-radius: var(--radius-pill);
+}
+
+.primary-sidebar .sb-create-more mur-icon {
+  transition: transform var(--transition-fast);
+}
+
+.primary-sidebar .sb-create-more.is-open mur-icon {
+  transform: rotate(45deg);
+}
+
+/* Collapsed there is room for ONE control per line, so the two stack and the
+   wide button gives up its label with every other label in the rail. */
+.primary-sidebar.collapsed .sb-create {
+  flex-direction: column;
+}
+
+.primary-sidebar.collapsed .sb-create {
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Collapsed, Capture has no room for a label, so it becomes the same round
+   button as its neighbour rather than a stretched pill with a glyph adrift in
+   it. Two circles, one accented, reads as the same pair the expanded footer
+   shows. */
+.primary-sidebar.collapsed .sb-capture {
+  flex: none;
+  width: var(--shell-footer-btn);
+  height: var(--shell-footer-btn);
+  padding: 0;
+}
+
+/* Browse sits LAST, after Workspaces and Shared, so the user's own content is
+   what the sidebar leads with. */
+.primary-sidebar .sb-browse {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-2) 0;
+}
+
+.primary-sidebar .sb-shared {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  padding: var(--space-2) var(--space-2) 0;
+}
+
+/* The menu floats OVER the tree, so it takes the OPAQUE overlay surface — the
+   frosted .card would let the rows behind it bleed through (T3). */
+.primary-sidebar .sb-create-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + var(--space-1));
+  z-index: 2;
+  min-width: 11rem;
+}
+
+.primary-sidebar .sb-menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: default;
 }
 
 .context-header {
@@ -719,8 +993,7 @@ app-shell > .main-col {
 }
 
 @media (max-width: 760px) {
-  .app-sidebar.spaces-sidebar,
-  .app-sidebar.browse-sidebar {
+  .app-sidebar.primary-sidebar {
     display: none;
   }
 }
