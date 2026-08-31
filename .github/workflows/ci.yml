@@ -187,11 +187,17 @@ jobs:
 
   # ── Web lane: ng lint + ng build + Playwright UI E2E. Node only — no Rust. ──
   web:
-    name: web lane ${{ matrix.shard }}/4 (ci.sh web)
+    name: web lane ${{ matrix.shard }}/6 (ci.sh web)
     # Playwright bylo 98.6% tej lane (zmierzone: ng lint 6.3 s + ng build 14.9 s + e2e 27 min 28 s),
-    # a runner ma 3 rdzenie, wiec pojedynczy job byl ograniczony CPU, nie iloscia pracy. Cztery
-    # shardy tna sciane do ~6-7 min i bramka przestaje byc ograniczona frontem — wiazacy staje sie
-    # rust lane (~9.6 min), dlatego CZTERY, nie osiem: wiecej nie skroci juz `gate`.
+    # a runner ma 3 rdzenie, wiec pojedynczy job byl ograniczony CPU, nie iloscia pracy.
+    #
+    # SZESC, nie cztery — i to jest wynik pomiaru, nie wyboru. Playwright dzieli po LICZBIE testow,
+    # a suite to dokladnie 488 chromium + 488 webkit, wiec przy czterech shardach granica podzialu
+    # trafia w granice projektow: 1-2 to czyste chromium, 3-4 czysty webkit. Zmierzone na realnym
+    # przebiegu: 3.5 / 3.9 / 10.7 / 9.0 min — nierownowaga 3x, bo webkit na trzech rdzeniach kosztuje
+    # ~2.2 s na test wobec ~0.8 s w chromium. Bramka zostawala wiec ograniczona frontem (10.7 min
+    # przy rust lane 9.0 min). Przy szesciu najciezszy shard schodzi do ~7 min i wiazacy staje sie
+    # rust lane. Osiem nie da juz nic: `gate` jest wtedy ograniczony rustem, nie frontem.
     #
     # Nazwa tego joba zmienia sie przez matryce, a to JEST bezpieczne: jedynym wymaganym kontekstem
     # branch ruleset jest agregat "gate (full ci.sh — release parity)", ktory czyta `needs.web.result`
@@ -200,7 +206,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     # macos-14 to mirror the release/dev WebKit + Chromium behavior of the shipped app.
     runs-on: macos-14
     timeout-minutes: 45
@@ -228,7 +234,7 @@ jobs:
 
       - name: Run the Web lane (scripts/ci.sh web)
         env:
-          MURMUR_E2E_SHARD: ${{ matrix.shard }}/4
+          MURMUR_E2E_SHARD: ${{ matrix.shard }}/6
         run: bash scripts/ci.sh web
 
   # ── Aggregation: the SINGLE required status check. Its name is the branch-
