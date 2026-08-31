@@ -9,9 +9,10 @@ Measured: a no-op build cost 18.6 s; 0.33 s once fixed. It was paid by every `ca
 `cargo clippy`, `cargo build`, every dev-watcher rebuild, every harness check and three steps of
 this gate.
 
-The check is general, not a grep for that one path: it runs `cargo build` twice and fails if the
-second one recompiles any WORKSPACE unit. That covers a phantom `rerun-if-changed`, a build script
-writing into its own watched inputs, and a generated file with a moving mtime.
+The check is general within its scope, not a grep for that one path: for EVERY workspace member it
+repeats `cargo build` until nothing recompiles, and fails if that never happens. That covers a
+phantom `rerun-if-changed`, a build script writing into its own watched inputs, and a generated file
+with a moving mtime — in `src-tauri` AND in `crates/murmur-brain`, which `ci.sh` also builds.
 
 Only path-dependencies (our own crates) fail the gate. A registry crate rebuilding is reported but
 does not fail: it is not ours to fix, and a gate that goes red on someone else's build script is a
@@ -73,38 +74,54 @@ def stale_units(messages: list) -> tuple:
     return sorted(ours), sorted(theirs)
 
 
+# `ci.sh` builds BOTH workspace members, so the oracle must watch both. A phantom in
+# `crates/murmur-brain/build.rs` was demonstrably invisible to a src-tauri-only check.
+MANIFEST_DIRS = ("src-tauri", "crates/murmur-brain")
+
+# A healthy COLD tree self-dirties a bounded number of times before it settles: `build.rs` stages
+# `binaries/<helper>` on the first compile, and `binaries/murmur-brain` flips from the 0-byte
+# placeholder to the real binary — and `tauri_build` declares every `bundle.resources` entry as
+# `rerun-if-changed`. Rather than hard-code "two settling builds" (which was measured to have ZERO
+# margin on a cold runner), retry until a build comes back clean. A genuine phantom is PERMANENT and
+# can never settle, so it still fails — just after a few cheap sub-second builds.
+MAX_ATTEMPTS = 5
+
+
+def check_dir(manifest_dir: Path) -> bool:
+    """True when this directory reaches a state where a repeat build recompiles nothing."""
+    reported_third_party = False
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        ours, theirs = stale_units(build(manifest_dir, json_output=True))
+        if theirs and not reported_third_party:
+            print(f"  note: third-party units rebuilt in {manifest_dir}: {' '.join(theirs)}")
+            print("  (reported, not fatal — not our build scripts)")
+            reported_third_party = True
+        if not ours:
+            settled = "" if attempt == 1 else f" (settled after {attempt} builds)"
+            print(f"  ok — {manifest_dir} rebuilt nothing{settled}")
+            return True
+    print(f"  {manifest_dir}: a repeat `cargo build` still recompiled: {' '.join(ours)}")
+    print(f"  after {MAX_ATTEMPTS} attempts, so this is not a cold-tree settle — some input is")
+    print("  PERMANENTLY stale. Usual cause: a `cargo:rerun-if-changed` naming a path that does")
+    print("  not exist (cargo treats a missing watched path as permanently stale). Diagnose with:")
+    print(f"    cd {manifest_dir} && CARGO_LOG=cargo::core::compiler::fingerprint=info \\")
+    print("      cargo build 2>&1 | grep -i stale")
+    return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="fail if an unchanged tree recompiles anything")
     ap.add_argument(
         "--manifest-dir",
-        default=str(REPO_ROOT / "src-tauri"),
-        help="directory to run `cargo build` in (default: src-tauri)",
+        action="append",
+        default=None,
+        help="directory to run `cargo build` in; repeatable (default: every workspace member)",
     )
     args = ap.parse_args()
-    manifest_dir = Path(args.manifest_dir)
+    dirs = [Path(d) for d in (args.manifest_dir or [REPO_ROOT / d for d in MANIFEST_DIRS])]
 
-    # Two settling builds first. On a COLD checkout `build.rs` itself creates `binaries/<helper>`
-    # (the `bundle.resources` mount points tauri_build watches), so the build right after a
-    # first-ever compile legitimately sees those as new. That settles in one pass; a genuine
-    # phantom is permanent and survives any number of them.
-    build(manifest_dir, json_output=False)
-    build(manifest_dir, json_output=False)
-
-    ours, theirs = stale_units(build(manifest_dir, json_output=True))
-
-    if theirs:
-        print(f"  note: third-party units rebuilt on an unchanged tree: {' '.join(theirs)}")
-        print("  (reported, not fatal — not our build scripts)")
-    if ours:
-        print(f"  a second identical `cargo build` recompiled: {' '.join(ours)}")
-        print("  an unchanged tree must rebuild NOTHING. Usual cause: a `cargo:rerun-if-changed`")
-        print("  in src-tauri/build.rs naming a path that does not exist (cargo treats a missing")
-        print("  watched path as permanently stale). Diagnose with:")
-        print("    cd src-tauri && CARGO_LOG=cargo::core::compiler::fingerprint=info \\")
-        print("      cargo build 2>&1 | grep -i stale")
+    if not all([check_dir(d) for d in dirs]):
         raise SystemExit(1)
-
-    print("  ok — unchanged tree rebuilt nothing")
 
 
 if __name__ == "__main__":
