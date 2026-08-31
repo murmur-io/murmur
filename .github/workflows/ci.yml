@@ -187,7 +187,20 @@ jobs:
 
   # ── Web lane: ng lint + ng build + Playwright UI E2E. Node only — no Rust. ──
   web:
-    name: web lane (ci.sh web)
+    name: web lane ${{ matrix.shard }}/4 (ci.sh web)
+    # Playwright bylo 98.6% tej lane (zmierzone: ng lint 6.3 s + ng build 14.9 s + e2e 27 min 28 s),
+    # a runner ma 3 rdzenie, wiec pojedynczy job byl ograniczony CPU, nie iloscia pracy. Cztery
+    # shardy tna sciane do ~6-7 min i bramka przestaje byc ograniczona frontem — wiazacy staje sie
+    # rust lane (~9.6 min), dlatego CZTERY, nie osiem: wiecej nie skroci juz `gate`.
+    #
+    # Nazwa tego joba zmienia sie przez matryce, a to JEST bezpieczne: jedynym wymaganym kontekstem
+    # branch ruleset jest agregat "gate (full ci.sh — release parity)", ktory czyta `needs.web.result`
+    # — a dla matrycy jest ono `success` tylko wtedy, gdy KAZDY shard przeszedl. Sprawdzone w ruleset
+    # 18402368 przed ta zmiana. `fail-fast: false`, zeby jeden czerwony shard nie ukryl pozostalych.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # macos-14 to mirror the release/dev WebKit + Chromium behavior of the shipped app.
     runs-on: macos-14
     timeout-minutes: 45
@@ -214,6 +227,8 @@ jobs:
         run: npx playwright install chromium webkit
 
       - name: Run the Web lane (scripts/ci.sh web)
+        env:
+          MURMUR_E2E_SHARD: ${{ matrix.shard }}/4
         run: bash scripts/ci.sh web
 
   # ── Aggregation: the SINGLE required status check. Its name is the branch-
